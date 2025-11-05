@@ -32,7 +32,7 @@ AREA      = "LineA"
 EQUIPMENT = "MACHINE-01"
 
 INTERVAL_SEC = 1.0
-TIMEOUT_SEC  = 10
+TIMEOUT_SEC  = 20
 MAX_RETRIES = 5  # Maximum retries before giving up on API connection
 # --------------------------------
 
@@ -103,7 +103,7 @@ class PLCGateway:
             self.plc_retry_count += 1
             return False
 
-    def test_api_connection(self):
+    def test_api_connection_old(self):
         """Test API connection with a simple request"""
         if not REQUESTS_AVAILABLE:
             self.api_connection_error = "Requests module not available"
@@ -141,10 +141,54 @@ class PLCGateway:
             self.api_retry_count += 1
             return False
 
+    def test_api_connection(self):
+        """Very light API check – just try to open a connection."""
+        if not REQUESTS_AVAILABLE:
+            self.api_connection_error = "Requests module not available"
+            return False
+
+        try:
+            # HEAD is lighter than POST; PHP will still say 405 or 401 but it's fine
+            response = requests.head(API_URL, headers=self.headers, timeout=TIMEOUT_SEC)
+
+            # Any response code means the server answered, so connection is OK
+            self.last_api_connection_time = time.time()
+            self.api_connection_error = None
+            self.api_retry_count = 0
+            return True
+        except requests.exceptions.ConnectionError:
+            self.api_connection_error = "API connection error: Cannot connect to server"
+            self.api_retry_count += 1
+            return False
+        except requests.exceptions.Timeout:
+            self.api_connection_error = "API connection error: Request timeout"
+            self.api_retry_count += 1
+            return False
+        except Exception as e:
+            self.api_connection_error = f"API connection error: {str(e)}"
+            self.api_retry_count += 1
+            return False
+
+
+
+
+
+
     def check_connections(self):
         """Check both PLC and API connections"""
-        plc_ok = self.test_plc_connection()
-        api_ok = self.test_api_connection()
+        #plc_ok = self.test_plc_connection()
+        #api_ok = self.test_api_connection()
+
+                # Check connections every _conn_check_interval seconds
+        now = time.time()
+        if now - self._last_conn_check > self._conn_check_interval:
+            plc_ok = self.test_plc_connection()
+            api_ok = self.test_api_connection()
+            self._last_conn_check = now
+        else:
+            plc_ok = True   # assume ok between checks
+            api_ok = True
+
         
         if plc_ok and api_ok:
             # Check if connection was just restored

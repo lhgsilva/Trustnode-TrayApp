@@ -14,7 +14,7 @@ def create_high_res_icon():
     
     # Define multiple sizes for the ICO file (high quality)
     sizes = [
-        (16, 16),    # Small icon
+        (64, 64),    # Small icon
         (24, 24),    # Small icon
         (32, 32),    # Standard icon
         (48, 48),    # Large icon
@@ -37,7 +37,7 @@ def create_high_res_icon():
         output_file,
         format="ICO",
         sizes=[(s, s) for s in [16, 24, 32, 48, 64, 128, 256, 512]],
-        append_images=ico_images[1:],  # Add all other sizes
+        append_images=ico_images[8:],  # Add all other sizes
         compress_level=6  # Good balance between size and quality
     )
     
