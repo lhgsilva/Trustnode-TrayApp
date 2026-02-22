@@ -1,0 +1,79 @@
+{
+  "name": "trustnode-desktop",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Trustnode Edge desktop tray app",
+  "author": "Trustnode",
+  "main": "main.js",
+  "scripts": {
+    "dev:ui": "npm --prefix ../frontend run dev",
+    "dev:electron": "cross-env TRUSTNODE_UI_URL=http://127.0.0.1:5173 electron .",
+    "dev": "concurrently -k \"npm:dev:ui\" \"npm:dev:electron\"",
+    "start": "electron .",
+    "build:ui": "npm --prefix ../frontend install && npm --prefix ../frontend run build",
+    "build:backend": "powershell -ExecutionPolicy Bypass -File ..\\scripts\\build-backend.ps1",
+    "build:prepare": "npm run build:ui && npm run build:backend",
+    "dist:installer": "npm run build:prepare && electron-builder --win nsis",
+    "dist:portable": "npm run build:prepare && electron-builder --win portable",
+    "dist": "npm run build:prepare && electron-builder --win nsis portable"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "cross-env": "^7.0.3",
+    "electron": "^31.7.7",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.trustnode.edge",
+    "productName": "Trustnode",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "ui-source.json",
+        "to": "ui-source.json"
+      },
+      {
+        "from": "../frontend/dist",
+        "to": "frontend/dist"
+      },
+      {
+        "from": "../backend/dist/trustnode-service.exe",
+        "to": "backend/trustnode-service.exe"
+      },
+      {
+        "from": "assets/trustnode_logo.ico",
+        "to": "trustnode_logo.ico"
+      }
+    ],
+    "win": {
+      "executableName": "Trustnode",
+      "icon": "assets/trustnode_logo.ico",
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

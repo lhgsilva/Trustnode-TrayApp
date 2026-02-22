@@ -1,0 +1,12 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pydantic==2.11.7
+pydantic-settings==2.10.1
+python-dotenv==1.1.1
+requests==2.32.3
+psycopg[binary]==3.2.9
+SQLAlchemy==2.0.36
+opcua==0.98.13
+pycomm3==1.2.14
+pylogix==1.0.3
+python-snap7==2.0.2
