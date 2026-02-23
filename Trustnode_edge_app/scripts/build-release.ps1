@@ -80,8 +80,7 @@ if (-not $webCloudUrl) {
 Write-Host "Building cloud web bundle (admin-capable by default)..."
 powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "build-web-cloud-readonly.ps1") `
     -CloudApiUrl $webCloudUrl `
-    -BasePath $WebBasePath `
-    -ReadOnly:$false
+    -BasePath $WebBasePath
 if ($LASTEXITCODE -ne 0) {
     throw "Cloud web bundle build failed (exit code: $LASTEXITCODE)."
 }

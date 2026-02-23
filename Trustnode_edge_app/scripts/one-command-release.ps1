@@ -12,6 +12,9 @@ Set-Location $projectRoot
 if (-not $SkipLocalBuild) {
     Write-Host "Building local release (desktop/backend/web)..."
     powershell -ExecutionPolicy Bypass -File ".\Trustnode_edge_app\scripts\build-release.ps1" -CloudApiUrl $CloudApiUrl -WebBasePath "/"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Local release build failed (exit code: $LASTEXITCODE). Aborting commit/push."
+    }
 }
 
 if (-not $CommitMessage) {
