@@ -146,16 +146,17 @@ jobs:
           fi
 
           if [ -n "$VPS_SSH_KEY" ]; then
-            $RSYNC_CMD -e "ssh $SSH_OPTS" ./Trustnode_edge_app/backend/ "$VPS_USER@$VPS_HOST:$VPS_APP_ROOT/Trustnode_edge_app/backend/"
+            tar -C ./Trustnode_edge_app/backend -czf - . | ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" "mkdir -p '$VPS_APP_ROOT/Trustnode_edge_app/backend' && tar -xzf - -C '$VPS_APP_ROOT/Trustnode_edge_app/backend'"
             REMOTE_RUN="ssh $SSH_OPTS \"$VPS_USER@$VPS_HOST\""
           else
-            sshpass -p "$VPS_PASSWORD" $RSYNC_CMD -e "ssh $SSH_OPTS" ./Trustnode_edge_app/backend/ "$VPS_USER@$VPS_HOST:$VPS_APP_ROOT/Trustnode_edge_app/backend/"
+            tar -C ./Trustnode_edge_app/backend -czf - . | sshpass -p "$VPS_PASSWORD" ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" "mkdir -p '$VPS_APP_ROOT/Trustnode_edge_app/backend' && tar -xzf - -C '$VPS_APP_ROOT/Trustnode_edge_app/backend'"
             REMOTE_RUN="sshpass -p \"$VPS_PASSWORD\" ssh $SSH_OPTS \"$VPS_USER@$VPS_HOST\""
           fi
           eval "$REMOTE_RUN" '
             set -euo pipefail
             mkdir -p "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend"
             cd "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend"
+            test -f requirements.txt || { echo "backend copy failed: requirements.txt missing"; ls -la; exit 1; }
             PY_BIN="$(command -v python3.11 || command -v python3 || command -v python || true)"
             if [ -z "$PY_BIN" ]; then
               echo "No Python interpreter found on VPS" >&2
