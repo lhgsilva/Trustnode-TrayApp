@@ -165,7 +165,16 @@ jobs:
               "$PY_BIN" -m venv .venv
             fi
             ./.venv/bin/python -m pip install --upgrade pip
-            ./.venv/bin/python -m pip install -r requirements.txt
+            REQ_FILE="'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend/requirements.txt"
+            if [ ! -f "$REQ_FILE" ]; then
+              REQ_FILE="$(find "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend" -maxdepth 3 -type f -name requirements.txt | head -n1 || true)"
+            fi
+            if [ -z "${REQ_FILE:-}" ] || [ ! -f "$REQ_FILE" ]; then
+              echo "requirements.txt not found under '"$VPS_APP_ROOT"'/Trustnode_edge_app/backend" >&2
+              ls -la "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend" || true
+              exit 1
+            fi
+            ./.venv/bin/python -m pip install -r "$REQ_FILE"
 
             mkdir -p /etc/systemd/system/'"$BACKEND_SERVICE"'.service.d
             cat >/etc/systemd/system/'"$BACKEND_SERVICE"'.service.d/override.conf <<EOF
