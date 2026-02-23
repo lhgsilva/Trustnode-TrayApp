@@ -32,7 +32,16 @@ class AppStore:
         self._db_path = self._resolve_db_path()
         self._stop_event = threading.Event()
         self._sync_wakeup_event = threading.Event()
-        self._sync_interval_seconds = max(5, int(os.environ.get("TRUSTNODE_CONFIG_SYNC_SECONDS", "10") or "10"))
+        # Fast default cadence for cloud/live products; tunable via env.
+        self._sync_interval_seconds = max(1, int(os.environ.get("TRUSTNODE_CONFIG_SYNC_SECONDS", "2") or "2"))
+        self._data_sync_batch_size = max(
+            200,
+            min(10000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "2500") or "2500")),
+        )
+        self._live_sync_sample_rows = max(
+            500,
+            min(50000, int(os.environ.get("TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS", "20000") or "20000")),
+        )
         self._ensure_schema()
         self._ensure_required_config_domains()
         self._compact_sync_outbox_for_domains()
@@ -577,6 +586,69 @@ class AppStore:
             except Exception:
                 pass
 
+    def _fetch_live_rows_from_cloud(self, limit: int) -> list[dict[str, Any]]:
+        cloud = self._get_cloud_database_target()
+        if not cloud:
+            return []
+        try:
+            from sqlalchemy import create_engine, text  # type: ignore
+        except Exception:
+            return []
+        schema = str(cloud.get("schema") or "public")
+        lim = max(1, min(int(limit or 1000), 20000))
+        url = self._build_pg_sqlalchemy_url(
+            str(cloud.get("host") or ""),
+            int(cloud.get("port") or 5432),
+            str(cloud.get("database") or "postgres"),
+            str(cloud.get("username") or ""),
+            str(cloud.get("password") or ""),
+        )
+        connect_args = {
+            "sslmode": "require" if cloud.get("tls", True) else "disable",
+            "connect_timeout": 8,
+            "prepare_threshold": None,
+        }
+        engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+        try:
+            with engine.begin() as conn:
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                               tag_name, value, quality, quality_label
+                        FROM "{schema}"."live_latest"
+                        ORDER BY ts_utc DESC
+                        LIMIT :lim
+                        """
+                    ),
+                    {"lim": lim},
+                ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "ts": str(r[0] or ""),
+                        "source": str(r[1] or ""),
+                        "gateway_id": str(r[2] or ""),
+                        "gateway_name": str(r[3] or ""),
+                        "device_name": str(r[4] or ""),
+                        "plc_ip": str(r[5] or ""),
+                        "database_name": str(r[6] or ""),
+                        "tag": str(r[7] or ""),
+                        "value": r[8],
+                        "quality": r[9],
+                        "quality_label": str(r[10] or ""),
+                    }
+                )
+            return out
+        except Exception:
+            return []
+        finally:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
     def _get_data_sync_state(self) -> dict[str, Any]:
         with self._lock:
             with self._connect() as conn:
@@ -678,6 +750,8 @@ class AppStore:
         state = self._get_data_sync_state()
         last_hist_id = int(state.get("last_historian_id", 0))
         last_log_id = int(state.get("last_log_id", 0))
+        batch_size = int(self._data_sync_batch_size)
+        live_sample_size = int(self._live_sync_sample_rows)
 
         try:
             with self._lock:
@@ -689,9 +763,9 @@ class AppStore:
                         FROM historian_readings
                         WHERE id > ?
                         ORDER BY id ASC
-                        LIMIT 1000
+                        LIMIT ?
                         """,
-                        (last_hist_id,),
+                        (last_hist_id, batch_size),
                     ).fetchall()
                     log_rows = conn.execute(
                         """
@@ -699,12 +773,50 @@ class AppStore:
                         FROM app_logs
                         WHERE id > ?
                         ORDER BY id ASC
-                        LIMIT 1000
+                        LIMIT ?
                         """,
-                        (last_log_id,),
+                        (last_log_id, batch_size),
+                    ).fetchall()
+                    live_sample_rows = conn.execute(
+                        """
+                        SELECT id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                               tag_name, value, quality, quality_label, source
+                        FROM historian_readings
+                        ORDER BY id DESC
+                        LIMIT ?
+                        """,
+                        (live_sample_size,),
                     ).fetchall()
 
-            if not hist_rows and not log_rows:
+            live_latest_rows: list[dict[str, Any]] = []
+            seen_live_keys: set[tuple[str, str]] = set()
+            for r in live_sample_rows:
+                gateway_id = str(r["gateway_id"] or "")
+                tag_name = str(r["tag_name"] or "")
+                if not tag_name:
+                    continue
+                key = (gateway_id, tag_name)
+                if key in seen_live_keys:
+                    continue
+                seen_live_keys.add(key)
+                live_latest_rows.append(
+                    {
+                        "gateway_id": gateway_id,
+                        "tag_name": tag_name,
+                        "ts_utc": str(r["ts_utc"] or ""),
+                        "source": str(r["source"] or ""),
+                        "gateway_name": str(r["gateway_name"] or ""),
+                        "device_name": str(r["device_name"] or ""),
+                        "plc_ip": str(r["plc_ip"] or ""),
+                        "database_name": str(r["database_name"] or ""),
+                        "value": r["value"],
+                        "quality": r["quality"],
+                        "quality_label": str(r["quality_label"] or ""),
+                        "updated_utc": self._utc_now(),
+                    }
+                )
+
+            if not hist_rows and not log_rows and not live_latest_rows:
                 self._set_data_sync_state(last_data_sync_utc=self._utc_now(), last_data_error="")
                 return
 
@@ -786,6 +898,35 @@ class AppStore:
                         """
                     )
                 )
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS "{schema}"."live_latest" (
+                          gateway_id TEXT NOT NULL DEFAULT '',
+                          tag_name TEXT NOT NULL,
+                          ts_utc TIMESTAMPTZ NOT NULL,
+                          source TEXT NULL,
+                          gateway_name TEXT NULL,
+                          device_name TEXT NULL,
+                          plc_ip TEXT NULL,
+                          database_name TEXT NULL,
+                          value DOUBLE PRECISION NULL,
+                          quality INTEGER NULL,
+                          quality_label TEXT NULL,
+                          updated_utc TIMESTAMPTZ NULL,
+                          PRIMARY KEY(gateway_id, tag_name)
+                        )
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE INDEX IF NOT EXISTS "ix_live_latest_ts"
+                        ON "{schema}"."live_latest"(ts_utc DESC)
+                        """
+                    )
+                )
 
                 if hist_rows:
                     conn.execute(
@@ -843,6 +984,29 @@ class AppStore:
                             }
                             for r in log_rows
                         ],
+                    )
+                if live_latest_rows:
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."live_latest"
+                            (gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
+                            VALUES
+                            (:gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
+                            ON CONFLICT(gateway_id, tag_name) DO UPDATE SET
+                              ts_utc = excluded.ts_utc,
+                              source = excluded.source,
+                              gateway_name = excluded.gateway_name,
+                              device_name = excluded.device_name,
+                              plc_ip = excluded.plc_ip,
+                              database_name = excluded.database_name,
+                              value = excluded.value,
+                              quality = excluded.quality,
+                              quality_label = excluded.quality_label,
+                              updated_utc = excluded.updated_utc
+                            """
+                        ),
+                        live_latest_rows,
                     )
 
             if hist_rows:
@@ -1843,6 +2007,19 @@ class AppStore:
 
     def get_historian_rows(self, limit: int = 1000) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 1000), 10000))
+        # Hosted/web deployments should prefer cloud-backed historian reads so the
+        # website mirrors edge-collected data even when no local gateways run on VPS.
+        prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if prefer_cloud:
+            cloud_rows = self._fetch_historian_rows_from_cloud(lim)
+            if cloud_rows:
+                return cloud_rows
+
         with self._lock:
             with self._connect() as conn:
                 rows = conn.execute(
@@ -1878,8 +2055,78 @@ class AppStore:
                 return cloud_rows
         return out
 
+    def get_live_rows(self, limit: int = 5000) -> list[dict[str, Any]]:
+        lim = max(100, min(int(limit or 5000), 50000))
+        prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if prefer_cloud:
+            cloud_live = self._fetch_live_rows_from_cloud(lim)
+            if cloud_live:
+                return cloud_live
+
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                           tag_name, value, quality, quality_label
+                    FROM historian_readings
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (max(lim, 20000),),
+                ).fetchall()
+
+        latest: dict[tuple[str, str], dict[str, Any]] = {}
+        for r in rows:
+            gateway_id = str(r["gateway_id"] or "").strip()
+            tag = str(r["tag_name"] or "").strip()
+            if not tag:
+                continue
+            key = (gateway_id, tag)
+            if key in latest:
+                continue
+            latest[key] = {
+                "ts": str(r["ts_utc"] or ""),
+                "source": str(r["source"] or ""),
+                "gateway_id": gateway_id,
+                "gateway_name": str(r["gateway_name"] or ""),
+                "device_name": str(r["device_name"] or ""),
+                "plc_ip": str(r["plc_ip"] or ""),
+                "database_name": str(r["database_name"] or ""),
+                "tag": tag,
+                "value": r["value"],
+                "quality": r["quality"],
+                "quality_label": str(r["quality_label"] or ""),
+            }
+            if len(latest) >= lim:
+                break
+
+        if latest:
+            return list(latest.values())
+        cloud_live = self._fetch_live_rows_from_cloud(lim)
+        if cloud_live:
+            return cloud_live
+        return []
+
     def get_log_rows(self, limit: int = 2000) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 2000), 10000))
+        # Hosted/web deployments should prefer cloud-backed log reads.
+        prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if prefer_cloud:
+            cloud_rows = self._fetch_log_rows_from_cloud(lim)
+            if cloud_rows:
+                return cloud_rows
+
         with self._lock:
             with self._connect() as conn:
                 rows = conn.execute(

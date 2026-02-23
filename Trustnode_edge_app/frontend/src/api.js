@@ -1,7 +1,11 @@
 const STORAGE_MODE_KEY = "trustnode_backend_mode";
 const STORAGE_CLOUD_URL_KEY = "trustnode_backend_cloud_url";
 const AUTH_TOKEN_KEY = "trustnode_auth_token";
-const FORCE_CLOUD_URL = normalizeBaseUrl(import.meta.env.VITE_TRUSTNODE_FORCE_CLOUD_URL || "");
+const FORCE_CLOUD_URL_RAW = normalizeBaseUrl(import.meta.env.VITE_TRUSTNODE_FORCE_CLOUD_URL || "");
+const FORCE_CLOUD_URL =
+  /(^https?:\/\/your-cloud-backend\.example\.com$)|(^https?:\/\/api\.example\.com$)/i.test(FORCE_CLOUD_URL_RAW)
+    ? ""
+    : FORCE_CLOUD_URL_RAW;
 const FORCE_READONLY = String(import.meta.env.VITE_TRUSTNODE_READONLY || "").toLowerCase() === "true";
 
 function normalizeBaseUrl(raw) {
@@ -12,7 +16,12 @@ function normalizeBaseUrl(raw) {
 function getDefaultLocalApiBase() {
   const fromQuery = new URLSearchParams(window.location.search).get("backendUrl");
   if (fromQuery) return normalizeBaseUrl(fromQuery);
-  return window.location.protocol === "file:" ? "http://127.0.0.1:8000" : "";
+  if (window.location.protocol === "file:") return "http://127.0.0.1:8000";
+  if (window.location.protocol === "https:" || window.location.protocol === "http:") {
+    // For hosted web deployments, default to same-origin API to avoid mixed-content ws:// issues.
+    return normalizeBaseUrl(window.location.origin);
+  }
+  return "";
 }
 
 export function getBackendTarget() {
@@ -44,7 +53,10 @@ export function isForcedReadonlyCloudMode() {
 export function getWsStreamUrl() {
   const apiBase = getApiBase();
   const token = getAuthToken();
-  if (!apiBase) return `ws://${window.location.host}/ws/stream${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  if (!apiBase) {
+    const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+    return `${scheme}://${window.location.host}/ws/stream${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  }
   const wsBase = apiBase.startsWith("https://")
     ? apiBase.replace("https://", "wss://")
     : apiBase.replace("http://", "ws://");
@@ -436,6 +448,12 @@ export async function appendAppStoreLogs(rows) {
 export async function getAppStoreHistorian(limit = 1000) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/historian?limit=${encodeURIComponent(String(limit))}`);
   if (!res.ok) throw new Error("App store historian fetch failed");
+  return res.json();
+}
+
+export async function getAppStoreLive(limit = 5000) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/live?limit=${encodeURIComponent(String(limit))}`);
+  if (!res.ok) throw new Error("App store live fetch failed");
   return res.json();
 }
 

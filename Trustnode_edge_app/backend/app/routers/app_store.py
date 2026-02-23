@@ -91,6 +91,11 @@ def get_historian(limit: int = 1000) -> dict:
     return {"ok": True, "rows": app_store.get_historian_rows(limit=limit)}
 
 
+@router.get("/live")
+def get_live(limit: int = 5000) -> dict:
+    return {"ok": True, "rows": app_store.get_live_rows(limit=limit)}
+
+
 @router.get("/logs")
 def get_logs(limit: int = 2000) -> dict:
     return {"ok": True, "rows": app_store.get_log_rows(limit=limit)}

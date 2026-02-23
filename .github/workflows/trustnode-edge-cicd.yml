@@ -1,0 +1,182 @@
+name: Trustnode Edge CI/CD
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "Trustnode_edge_app/**"
+      - ".github/workflows/trustnode-edge-cicd.yml"
+  workflow_dispatch:
+
+env:
+  PROJECT_DIR: Trustnode_edge_app
+  WEB_OUT_DIR: Trustnode_edge_app/web_cloud_readonly
+  VPS_APP_ROOT: /opt/trustnode-edge/app
+  VPS_WEB_ROOT: /var/www/trustnode
+  BACKEND_SERVICE: trustnode-backend
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            Trustnode_edge_app/frontend/package-lock.json
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r Trustnode_edge_app/backend/requirements.txt
+
+      - name: Backend syntax check
+        run: |
+          python -m py_compile Trustnode_edge_app/backend/app/routers/app_store.py
+          python -m py_compile Trustnode_edge_app/backend/app/services/app_store.py
+          python -m py_compile Trustnode_edge_app/backend/app/main.py
+
+      - name: Build cloud web bundle
+        shell: pwsh
+        run: |
+          $cloudApi = "${{ secrets.TRUSTNODE_CLOUD_API_URL }}"
+          if (-not $cloudApi) { $cloudApi = "https://trustnode.lsapps.app" }
+          powershell -ExecutionPolicy Bypass -File ".\Trustnode_edge_app\scripts\build-web-cloud-readonly.ps1" -CloudApiUrl $cloudApi -BasePath "/"
+
+      - name: Validate web bundle wiring
+        run: |
+          test -f Trustnode_edge_app/web_cloud_readonly/index.html
+          js_file="$(grep -o 'assets/index-[^"]*\.js' Trustnode_edge_app/web_cloud_readonly/index.html | head -n1)"
+          test -n "$js_file"
+          test -f "Trustnode_edge_app/web_cloud_readonly/$js_file"
+          grep -q "/api/app-store/live" "Trustnode_edge_app/web_cloud_readonly/$js_file"
+
+      - name: Upload web artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web_cloud_readonly
+          path: Trustnode_edge_app/web_cloud_readonly
+          if-no-files-found: error
+
+  deploy-vps:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: ${{ secrets.VPS_HOST != '' && secrets.VPS_USER != '' && (secrets.VPS_SSH_KEY != '' || secrets.VPS_PASSWORD != '') }}
+
+    steps:
+      - name: Download web artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: web_cloud_readonly
+          path: web_cloud_readonly
+
+      - name: Configure SSH
+        if: ${{ secrets.VPS_SSH_KEY != '' }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Install sshpass (password auth)
+        if: ${{ secrets.VPS_SSH_KEY == '' && secrets.VPS_PASSWORD != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Deploy code and restart backend on VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          SSH_CMD="ssh -o StrictHostKeyChecking=accept-new"
+          if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then
+            REMOTE_RUN="$SSH_CMD \"$VPS_USER@$VPS_HOST\""
+          else
+            REMOTE_RUN="sshpass -p \"$VPS_PASSWORD\" $SSH_CMD \"$VPS_USER@$VPS_HOST\""
+          fi
+          eval "$REMOTE_RUN" '
+            set -euo pipefail
+            cd "'"$VPS_APP_ROOT"'"
+            git config --global --add safe.directory "'"$VPS_APP_ROOT"'" || true
+            git pull --ff-only
+
+            cd "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend"
+            ./.venv/bin/pip install -r requirements.txt
+
+            mkdir -p /etc/systemd/system/'"$BACKEND_SERVICE"'.service.d
+            cat >/etc/systemd/system/'"$BACKEND_SERVICE"'.service.d/override.conf <<EOF
+[Service]
+TimeoutStopSec=10
+KillMode=mixed
+Environment=TRUSTNODE_PREFER_CLOUD_READS=true
+Environment=TRUSTNODE_CONFIG_SYNC_SECONDS=2
+Environment=TRUSTNODE_DATA_SYNC_BATCH_SIZE=5000
+Environment=TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS=30000
+ExecStart=
+ExecStart='"$VPS_APP_ROOT"'/Trustnode_edge_app/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
+EOF
+
+            systemctl daemon-reload
+            systemctl restart '"$BACKEND_SERVICE"'
+          '
+
+      - name: Deploy web bundle to VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          RSYNC_CMD="rsync -az --delete"
+          SSH_CMD="ssh -o StrictHostKeyChecking=accept-new"
+          if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then
+            eval "$RSYNC_CMD ./web_cloud_readonly/ \"$VPS_USER@$VPS_HOST:$VPS_WEB_ROOT/\""
+            REMOTE_RUN="$SSH_CMD \"$VPS_USER@$VPS_HOST\""
+          else
+            eval "sshpass -p \"$VPS_PASSWORD\" $RSYNC_CMD -e \"$SSH_CMD\" ./web_cloud_readonly/ \"$VPS_USER@$VPS_HOST:$VPS_WEB_ROOT/\""
+            REMOTE_RUN="sshpass -p \"$VPS_PASSWORD\" $SSH_CMD \"$VPS_USER@$VPS_HOST\""
+          fi
+          eval "$REMOTE_RUN" '
+            set -euo pipefail
+            chown -R nginx:nginx "'"$VPS_WEB_ROOT"'"
+            restorecon -Rv "'"$VPS_WEB_ROOT"'" || true
+            nginx -t
+            systemctl reload nginx
+          '
+
+      - name: VPS smoke checks
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        run: |
+          SSH_CMD="ssh -o StrictHostKeyChecking=accept-new"
+          if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then
+            REMOTE_RUN="$SSH_CMD \"$VPS_USER@$VPS_HOST\""
+          else
+            REMOTE_RUN="sshpass -p \"$VPS_PASSWORD\" $SSH_CMD \"$VPS_USER@$VPS_HOST\""
+          fi
+          eval "$REMOTE_RUN" '
+            set -euo pipefail
+            systemctl is-active '"$BACKEND_SERVICE"'
+            curl -fsS http://127.0.0.1:8000/api/health >/dev/null
+            curl -fsS http://127.0.0.1:8000/api/app-store/live?limit=1 >/dev/null
+            curl -fsS https://trustnode.lsapps.app/api/health >/dev/null
+            curl -fsS https://trustnode.lsapps.app/api/app-store/live?limit=1 >/dev/null
+            html=$(curl -fsS https://trustnode.lsapps.app/)
+            js=$(printf "%s" "$html" | grep -o "assets/index-[^\"]*\.js" | head -n1)
+            test -n "$js"
+            curl -fsS "https://trustnode.lsapps.app/$js" | grep -q "/api/app-store/live"
+          '

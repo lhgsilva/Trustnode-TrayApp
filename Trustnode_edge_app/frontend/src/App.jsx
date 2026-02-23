@@ -18,6 +18,7 @@ import {
   saveAppStoreBootstrap,
   appendAppStoreHistorian,
   appendAppStoreLogs,
+  getAppStoreLive,
   getAppStoreHistorian,
   getAppStoreLogs,
   getAppStoreInspector,
@@ -1236,6 +1237,7 @@ function AppShell() {
   };
 
   const flushAppStoreOutbox = async () => {
+    if (!currentUser) return;
     if (outboxFlushBusyRef.current) return;
     if (!historianOutboxRef.current.length && !logsOutboxRef.current.length) return;
     outboxFlushBusyRef.current = true;
@@ -2076,6 +2078,18 @@ function AppShell() {
 
   useEffect(() => {
     let stopped = false;
+    if (!currentUser) {
+      setWsState("disconnected");
+      return () => {
+        stopped = true;
+      };
+    }
+    if (endpointMode === "cloud") {
+      setWsState("cloud_polling");
+      return () => {
+        stopped = true;
+      };
+    }
     let ws = null;
     const wsStreamUrl = getWsStreamUrl();
 
@@ -2336,7 +2350,88 @@ function AppShell() {
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       if (ws) ws.close();
     };
-  }, [endpointVersion]);
+  }, [endpointVersion, endpointMode, currentUser]);
+
+  useEffect(() => {
+    if (endpointMode !== "cloud") return;
+    if (!currentUser) return;
+    let stopped = false;
+    let running = false;
+    const pollCloud = async () => {
+      if (stopped || running) return;
+      running = true;
+      try {
+        const [liveRes, histRes, logRes] = await Promise.all([
+          getAppStoreLive(5000),
+          getAppStoreHistorian(1500),
+          getAppStoreLogs(2500)
+        ]);
+        if (stopped) return;
+
+        if (liveRes?.ok && Array.isArray(liveRes.rows)) {
+          const nextLive = {};
+          const nextReadings = [];
+          for (const row of liveRes.rows) {
+            const gatewayId = String(row?.gateway_id || "");
+            const rawTag = String(row?.tag || row?.tag_name || "");
+            const normTag = normalizeTagName(rawTag);
+            if (!normTag) continue;
+            const key = `${gatewayId}::${normTag}`;
+            const readingTs = String(row?.ts || tsNow());
+            const quality = row?.quality;
+            const qualityLabel = row?.quality_label || qualityLabelFromCode(quality);
+            nextLive[key] = {
+              gateway_id: gatewayId,
+              tag: rawTag,
+              ts: readingTs,
+              value: row?.value,
+              quality,
+              quality_label: qualityLabel
+            };
+            nextReadings.push({
+              ts_utc: readingTs,
+              source: row?.source || "",
+              gateway_id: gatewayId,
+              gateway_name: row?.gateway_name || "",
+              device_name: row?.device_name || "",
+              plc_ip: row?.plc_ip || "",
+              tag_name: rawTag,
+              value: row?.value,
+              quality,
+              quality_label: qualityLabel
+            });
+          }
+          setLiveTagValues(nextLive);
+          setReadings(nextReadings);
+        }
+        if (histRes?.ok && Array.isArray(histRes.rows)) {
+          setDataLog(histRes.rows);
+        }
+        if (logRes?.ok && Array.isArray(logRes.rows)) {
+          setAppLogs(logRes.rows);
+        }
+        setWsState("cloud_polling");
+      } catch (err) {
+        if (!stopped) {
+          setWsState("reconnecting");
+          addAppLog({
+            level: "warning",
+            category: "connectivity",
+            message: `Cloud polling failed: ${String(err)}`
+          });
+        }
+      } finally {
+        running = false;
+      }
+    };
+
+    pollCloud();
+    const timer = setInterval(pollCloud, 2000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [endpointMode, endpointVersion, currentUser]);
 
   const canEditPage = (page) => {
     if (isReadonlyCloudMode) return false;
