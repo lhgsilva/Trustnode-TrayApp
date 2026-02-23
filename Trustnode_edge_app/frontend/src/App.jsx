@@ -772,6 +772,7 @@ function AppShell() {
   const [bootState, setBootState] = useState("initializing");
   const [endpointMode, setEndpointMode] = useState("local");
   const [cloudUrl, setCloudUrl] = useState("");
+  const [edgeLinkState, setEdgeLinkState] = useState({ state: "unknown", message: "Not checked" });
   const [endpointVersion, setEndpointVersion] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [activePage, setActivePage] = useState("dashboard");
@@ -1096,6 +1097,11 @@ function AppShell() {
     wsState: "",
     bootState: "",
     lastHeartbeatMs: 0
+  });
+  const cloudStatusStabilityRef = useRef({
+    gateway: {},
+    device: {},
+    database: {}
   });
   const [devicesSeeded, setDevicesSeeded] = useState(false);
 
@@ -2052,8 +2058,17 @@ function AppShell() {
 
   useEffect(() => {
     const target = getBackendTarget();
-    setEndpointMode(target.mode || "local");
-    setCloudUrl(target.cloudUrl || "");
+    const host = String(window.location.hostname || "").toLowerCase();
+    const hostIsLocal = host === "localhost" || host === "127.0.0.1" || host === "::1";
+    let nextMode = target.mode || "local";
+    let nextCloud = target.cloudUrl || "";
+    if (!hostIsLocal && nextMode !== "cloud") {
+      nextMode = "cloud";
+      if (!nextCloud) nextCloud = String(window.location.origin || "").replace(/\/+$/, "");
+      setBackendTarget("cloud", nextCloud);
+    }
+    setEndpointMode(nextMode);
+    setCloudUrl(nextCloud);
 
     getUiSourceConfig()
       .then((cfg) => {
@@ -2063,6 +2078,44 @@ function AppShell() {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (endpointMode !== "cloud") {
+      setEdgeLinkState({ state: "unknown", message: "Local check disabled (local mode)" });
+      return;
+    }
+    let stopped = false;
+    const probe = async () => {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 1600);
+      try {
+        const res = await fetch("http://127.0.0.1:8000/api/health", {
+          method: "GET",
+          mode: "cors",
+          cache: "no-store",
+          signal: controller.signal
+        });
+        if (stopped) return;
+        if (res.ok) {
+          setEdgeLinkState({ state: "online", message: "Reachable from this browser" });
+        } else {
+          setEdgeLinkState({ state: "offline", message: `HTTP ${res.status}` });
+        }
+      } catch (e) {
+        if (stopped) return;
+        const msg = String(e || "unreachable");
+        setEdgeLinkState({ state: "offline", message: msg.includes("Mixed Content") ? "Blocked by browser mixed-content policy" : msg });
+      } finally {
+        clearTimeout(t);
+      }
+    };
+    probe();
+    const timer = setInterval(probe, 15000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [endpointMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2439,9 +2492,12 @@ function AppShell() {
                 if (!gid) continue;
                 const ts = latestByGateway[gid];
                 const cur = next[gid] || { gateway_id: gid };
-                if (ts) {
+                const rawOnline = Boolean(ts) && (() => {
                   const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
-                  const online = Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                  return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                })();
+                const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 3);
+                if (ts) {
                   next[gid] = {
                     ...cur,
                     gateway_id: gid,
@@ -2450,8 +2506,8 @@ function AppShell() {
                     db_last_error: null,
                     last_check_utc: ts
                   };
-                } else if (cur.running) {
-                  next[gid] = { ...cur, gateway_id: gid, running: false };
+                } else if (cur.running || !online) {
+                  next[gid] = { ...cur, gateway_id: gid, running: online };
                 }
               }
               return next;
@@ -2468,9 +2524,13 @@ function AppShell() {
                 const tsFromGw = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
                 const tsFromIp = latestByPlcIp[String(d?.plc_ip || "").trim()] || "";
                 const ts = tsFromGw || tsFromIp;
-                if (!ts) return d;
-                const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
-                const online = Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                const rawOnline = ts
+                  ? (() => {
+                      const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                      return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                    })()
+                  : false;
+                const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 3);
                 return {
                   ...d,
                   connection_ok: online,
@@ -2478,7 +2538,7 @@ function AppShell() {
                   port_ok: online,
                   protocol_ok: online,
                   last_test: online ? "Live cloud reading" : "No recent cloud reading",
-                  last_check_utc: ts
+                  last_check_utc: ts || d.last_check_utc || ""
                 };
               })
             );
@@ -2487,7 +2547,8 @@ function AppShell() {
                 const ts = latestByDbName[String(c.name || "").trim()];
                 if (!ts) return c;
                 const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
-                const online = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
+                const rawOnline = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
+                const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 3);
                 return {
                   ...c,
                   connection_ok: online,
@@ -2711,9 +2772,12 @@ function AppShell() {
               if (!gid) continue;
               const ts = latestByGateway[gid];
               const cur = next[gid] || { gateway_id: gid };
-              if (ts) {
+              const rawOnline = Boolean(ts) && (() => {
                 const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
-                const online = Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+              })();
+              const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 3);
+              if (ts) {
                 next[gid] = {
                   ...cur,
                   gateway_id: gid,
@@ -2722,8 +2786,8 @@ function AppShell() {
                   db_last_error: null,
                   last_check_utc: ts
                 };
-              } else if (cur.running) {
-                next[gid] = { ...cur, gateway_id: gid, running: false };
+              } else if (cur.running || !online) {
+                next[gid] = { ...cur, gateway_id: gid, running: online };
               }
             }
             return next;
@@ -2734,32 +2798,37 @@ function AppShell() {
               return ts ? { ...g, last_check_utc: ts } : g;
             })
           );
-          setDevices((prev) =>
-            (prev || []).map((d) => {
-              const relatedGw = (gatewayConfigsRef.current || []).find((g) => String(g.device_id || "") === String(d.id || ""));
-              const tsFromGw = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
-              const tsFromIp = latestByPlcIp[String(d?.plc_ip || "").trim()] || "";
-              const ts = tsFromGw || tsFromIp;
-              if (!ts) return d;
-              const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
-              const online = Number.isFinite(ageMs) ? ageMs <= 10000 : true;
-              return {
-                ...d,
-                connection_ok: online,
-                ping_ok: online,
-                port_ok: online,
-                protocol_ok: online,
-                last_test: online ? "Live cloud reading" : "No recent cloud reading",
-                last_check_utc: ts
-              };
-            })
-          );
+            setDevices((prev) =>
+              (prev || []).map((d) => {
+                const relatedGw = (gatewayConfigsRef.current || []).find((g) => String(g.device_id || "") === String(d.id || ""));
+                const tsFromGw = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
+                const tsFromIp = latestByPlcIp[String(d?.plc_ip || "").trim()] || "";
+                const ts = tsFromGw || tsFromIp;
+                const rawOnline = ts
+                  ? (() => {
+                      const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                      return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                    })()
+                  : false;
+                const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 3);
+                return {
+                  ...d,
+                  connection_ok: online,
+                  ping_ok: online,
+                  port_ok: online,
+                  protocol_ok: online,
+                  last_test: online ? "Live cloud reading" : "No recent cloud reading",
+                  last_check_utc: ts || d.last_check_utc || ""
+                };
+              })
+            );
           setDbConnections((prev) =>
             (prev || []).map((c) => {
               const ts = latestByDbName[String(c.name || "").trim()];
               if (!ts) return c;
               const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
-              const online = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
+              const rawOnline = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
+              const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 3);
               return {
                 ...c,
                 connection_ok: online,
@@ -3185,6 +3254,39 @@ function AppShell() {
       pending += Number(rt.db_pending_count || 0);
     }
     return `W:${writes} | P:${pending}`;
+  };
+
+  const getStableCloudOnline = (bucket, key, rawOnline, riseThreshold = 1, dropThreshold = 3) => {
+    if (!key) return Boolean(rawOnline);
+    const stores = cloudStatusStabilityRef.current || {};
+    const bucketStore = stores[bucket] || {};
+    stores[bucket] = bucketStore;
+    const prev = bucketStore[key] || { stable: Boolean(rawOnline), rise: 0, drop: 0 };
+    if (rawOnline) {
+      prev.drop = 0;
+      if (!prev.stable) {
+        prev.rise += 1;
+        if (prev.rise >= riseThreshold) {
+          prev.stable = true;
+          prev.rise = 0;
+        }
+      } else {
+        prev.rise = 0;
+      }
+    } else {
+      prev.rise = 0;
+      if (prev.stable) {
+        prev.drop += 1;
+        if (prev.drop >= dropThreshold) {
+          prev.stable = false;
+          prev.drop = 0;
+        }
+      } else {
+        prev.drop = 0;
+      }
+    }
+    bucketStore[key] = prev;
+    return Boolean(prev.stable);
   };
 
   const getDbLastCheckLabel = (dbConn) => formatElapsedFromUtc(dbConn?.last_check_utc || "");
@@ -6601,6 +6703,24 @@ function AppShell() {
                     {forceSyncBusy ? "Syncing..." : "Force Sync Now"}
                   </button>
                 </div>
+                {endpointMode === "cloud" ? (
+                  <div className="info-note" style={{ marginTop: 8 }}>
+                    Local Edge Connection:
+                    <span
+                      className={`status-pill ${
+                        edgeLinkState.state === "online"
+                          ? "status-online"
+                          : edgeLinkState.state === "offline"
+                            ? "status-offline"
+                            : "status-warning"
+                      }`}
+                      style={{ marginLeft: 8 }}
+                    >
+                      {edgeLinkState.state === "online" ? "REACHABLE" : edgeLinkState.state === "offline" ? "UNREACHABLE" : "UNKNOWN"}
+                    </span>
+                    <span style={{ marginLeft: 8 }}>{edgeLinkState.message}</span>
+                  </div>
+                ) : null}
                 {websiteStatusResult ? <div className="info-note" style={{ marginTop: 8 }}>{websiteStatusResult}</div> : null}
                 {forceSyncResult ? <div className="info-note" style={{ marginTop: 8 }}>{forceSyncResult}</div> : null}
               </section>
