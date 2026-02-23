@@ -52,7 +52,7 @@ jobs:
         run: |
           $cloudApi = "${{ secrets.TRUSTNODE_CLOUD_API_URL }}"
           if (-not $cloudApi) { $cloudApi = "https://trustnode.lsapps.app" }
-          powershell -ExecutionPolicy Bypass -File ".\Trustnode_edge_app\scripts\build-web-cloud-readonly.ps1" -CloudApiUrl $cloudApi -BasePath "/"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File "./Trustnode_edge_app/scripts/build-web-cloud-readonly.ps1" -CloudApiUrl $cloudApi -BasePath "/"
 
       - name: Validate web bundle wiring
         run: |
