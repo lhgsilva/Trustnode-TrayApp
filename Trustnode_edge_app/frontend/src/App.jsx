@@ -116,6 +116,10 @@ function buildOpcUrlFromIp(ip) {
 const DEFAULT_OPC_NODE_ID = "";
 const REPORT_SERIES_COLORS = ["#16a34a", "#2563eb", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#0ea5e9", "#f59e0b"];
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
+const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
+const CLOUD_LIVE_POLL_MS = 1000;
+const CLOUD_AUX_POLL_MS = 3000;
 
 class AppErrorBoundary extends Component {
   constructor(props) {
@@ -1317,7 +1321,8 @@ function AppShell() {
       }
     };
     refresh();
-    const timer = setInterval(refresh, 2000);
+    const intervalMs = endpointMode === "cloud" ? GATEWAY_STATUS_POLL_MS_CLOUD : GATEWAY_STATUS_POLL_MS_LOCAL;
+    const timer = setInterval(refresh, intervalMs);
     return () => {
       stopped = true;
       clearInterval(timer);
@@ -2356,18 +2361,14 @@ function AppShell() {
     if (endpointMode !== "cloud") return;
     if (!currentUser) return;
     let stopped = false;
-    let running = false;
-    const pollCloud = async () => {
-      if (stopped || running) return;
-      running = true;
+    let runningLive = false;
+    let runningAux = false;
+    const pollCloudLive = async () => {
+      if (stopped || runningLive) return;
+      runningLive = true;
       try {
-        const [liveRes, histRes, logRes] = await Promise.all([
-          getAppStoreLive(5000),
-          getAppStoreHistorian(1500),
-          getAppStoreLogs(2500)
-        ]);
+        const liveRes = await getAppStoreLive(5000);
         if (stopped) return;
-
         if (liveRes?.ok && Array.isArray(liveRes.rows)) {
           const nextLive = {};
           const nextReadings = [];
@@ -2404,6 +2405,29 @@ function AppShell() {
           setLiveTagValues(nextLive);
           setReadings(nextReadings);
         }
+        setWsState("cloud_polling");
+      } catch (err) {
+        if (!stopped) {
+          setWsState("reconnecting");
+          addAppLog({
+            level: "warning",
+            category: "connectivity",
+            message: `Cloud live polling failed: ${String(err)}`
+          });
+        }
+      } finally {
+        runningLive = false;
+      }
+    };
+    const pollCloudAux = async () => {
+      if (stopped || runningAux) return;
+      runningAux = true;
+      try {
+        const [histRes, logRes] = await Promise.all([
+          getAppStoreHistorian(1500),
+          getAppStoreLogs(2500)
+        ]);
+        if (stopped) return;
         if (histRes?.ok && Array.isArray(histRes.rows)) {
           setDataLog(histRes.rows);
         }
@@ -2417,19 +2441,22 @@ function AppShell() {
           addAppLog({
             level: "warning",
             category: "connectivity",
-            message: `Cloud polling failed: ${String(err)}`
+            message: `Cloud aux polling failed: ${String(err)}`
           });
         }
       } finally {
-        running = false;
+        runningAux = false;
       }
     };
 
-    pollCloud();
-    const timer = setInterval(pollCloud, 2000);
+    pollCloudLive();
+    pollCloudAux();
+    const liveTimer = setInterval(pollCloudLive, CLOUD_LIVE_POLL_MS);
+    const auxTimer = setInterval(pollCloudAux, CLOUD_AUX_POLL_MS);
     return () => {
       stopped = true;
-      clearInterval(timer);
+      clearInterval(liveTimer);
+      clearInterval(auxTimer);
     };
   }, [endpointMode, endpointVersion, currentUser]);
 

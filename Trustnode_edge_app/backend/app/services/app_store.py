@@ -33,14 +33,14 @@ class AppStore:
         self._stop_event = threading.Event()
         self._sync_wakeup_event = threading.Event()
         # Fast default cadence for cloud/live products; tunable via env.
-        self._sync_interval_seconds = max(1, int(os.environ.get("TRUSTNODE_CONFIG_SYNC_SECONDS", "2") or "2"))
+        self._sync_interval_seconds = max(1, int(os.environ.get("TRUSTNODE_CONFIG_SYNC_SECONDS", "1") or "1"))
         self._data_sync_batch_size = max(
             200,
-            min(10000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "2500") or "2500")),
+            min(10000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "8000") or "8000")),
         )
         self._live_sync_sample_rows = max(
             500,
-            min(50000, int(os.environ.get("TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS", "20000") or "20000")),
+            min(50000, int(os.environ.get("TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS", "10000") or "10000")),
         )
         self._ensure_schema()
         self._ensure_required_config_domains()

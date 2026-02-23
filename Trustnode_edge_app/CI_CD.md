@@ -36,6 +36,6 @@ This command builds locally, commits, pushes to `main`, and triggers automatic C
 Pipeline enforces these service env vars:
 
 - `TRUSTNODE_PREFER_CLOUD_READS=true`
-- `TRUSTNODE_CONFIG_SYNC_SECONDS=2`
-- `TRUSTNODE_DATA_SYNC_BATCH_SIZE=5000`
-- `TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS=30000`
+- `TRUSTNODE_CONFIG_SYNC_SECONDS=1`
+- `TRUSTNODE_DATA_SYNC_BATCH_SIZE=8000`
+- `TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS=10000`
