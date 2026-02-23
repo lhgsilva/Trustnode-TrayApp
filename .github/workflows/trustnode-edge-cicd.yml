@@ -145,11 +145,12 @@ jobs:
             sshpass -p "$VPS_PASSWORD" ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" "$REMOTE_PREFLIGHT"
           fi
 
+          test -f ./Trustnode_edge_app/backend/requirements.txt
           if [ -n "$VPS_SSH_KEY" ]; then
-            tar -C ./Trustnode_edge_app/backend -czf - . | ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" "mkdir -p '$VPS_APP_ROOT/Trustnode_edge_app/backend' && tar -xzf - -C '$VPS_APP_ROOT/Trustnode_edge_app/backend'"
+            $RSYNC_CMD -e "ssh $SSH_OPTS" ./Trustnode_edge_app/backend/ "$VPS_USER@$VPS_HOST:$VPS_APP_ROOT/Trustnode_edge_app/backend/"
             REMOTE_RUN="ssh $SSH_OPTS \"$VPS_USER@$VPS_HOST\""
           else
-            tar -C ./Trustnode_edge_app/backend -czf - . | sshpass -p "$VPS_PASSWORD" ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" "mkdir -p '$VPS_APP_ROOT/Trustnode_edge_app/backend' && tar -xzf - -C '$VPS_APP_ROOT/Trustnode_edge_app/backend'"
+            sshpass -p "$VPS_PASSWORD" $RSYNC_CMD -e "ssh $SSH_OPTS" ./Trustnode_edge_app/backend/ "$VPS_USER@$VPS_HOST:$VPS_APP_ROOT/Trustnode_edge_app/backend/"
             REMOTE_RUN="sshpass -p \"$VPS_PASSWORD\" ssh $SSH_OPTS \"$VPS_USER@$VPS_HOST\""
           fi
           eval "$REMOTE_RUN" '
