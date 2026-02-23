@@ -125,16 +125,16 @@ jobs:
 
             mkdir -p /etc/systemd/system/'"$BACKEND_SERVICE"'.service.d
             cat >/etc/systemd/system/'"$BACKEND_SERVICE"'.service.d/override.conf <<EOF
-[Service]
-TimeoutStopSec=10
-KillMode=mixed
-Environment=TRUSTNODE_PREFER_CLOUD_READS=true
-Environment=TRUSTNODE_CONFIG_SYNC_SECONDS=1
-Environment=TRUSTNODE_DATA_SYNC_BATCH_SIZE=8000
-Environment=TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS=10000
-ExecStart=
-ExecStart='"$VPS_APP_ROOT"'/Trustnode_edge_app/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
-EOF
+            [Service]
+            TimeoutStopSec=10
+            KillMode=mixed
+            Environment=TRUSTNODE_PREFER_CLOUD_READS=true
+            Environment=TRUSTNODE_CONFIG_SYNC_SECONDS=1
+            Environment=TRUSTNODE_DATA_SYNC_BATCH_SIZE=8000
+            Environment=TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS=10000
+            ExecStart=
+            ExecStart='"$VPS_APP_ROOT"'/Trustnode_edge_app/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
+            EOF
 
             systemctl daemon-reload
             systemctl restart '"$BACKEND_SERVICE"'
