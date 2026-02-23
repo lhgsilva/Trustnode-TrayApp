@@ -63,6 +63,19 @@ export function getWsStreamUrl() {
   return `${wsBase}/ws/stream${token ? `?token=${encodeURIComponent(token)}` : ""}`;
 }
 
+export function getCloudWsStreamUrl() {
+  const apiBase = getApiBase();
+  const token = getAuthToken();
+  if (!apiBase) {
+    const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+    return `${scheme}://${window.location.host}/ws/cloud-stream${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  }
+  const wsBase = apiBase.startsWith("https://")
+    ? apiBase.replace("https://", "wss://")
+    : apiBase.replace("http://", "ws://");
+  return `${wsBase}/ws/cloud-stream${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);

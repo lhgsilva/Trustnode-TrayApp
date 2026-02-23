@@ -75,6 +75,9 @@ jobs:
     if: ${{ secrets.VPS_HOST != '' && secrets.VPS_USER != '' && (secrets.VPS_SSH_KEY != '' || secrets.VPS_PASSWORD != '') }}
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download web artifact
         uses: actions/download-artifact@v4
         with:
@@ -93,7 +96,7 @@ jobs:
         if: ${{ secrets.VPS_SSH_KEY == '' && secrets.VPS_PASSWORD != '' }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y sshpass
+          sudo apt-get install -y sshpass rsync
 
       - name: Deploy code and restart backend on VPS
         env:

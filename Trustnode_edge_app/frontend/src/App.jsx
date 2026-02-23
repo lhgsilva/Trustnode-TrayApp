@@ -9,6 +9,7 @@ import {
   discoverPlcTags,
   browseOpcUaNodes,
   getWsStreamUrl,
+  getCloudWsStreamUrl,
   provisionDatabaseObjects,
   setUiSourceConfig,
   testDatabaseConnection,
@@ -767,6 +768,7 @@ function AppShell() {
   const [trendChartType, setTrendChartType] = useState("line");
   const [tagMonitorChartType, setTagMonitorChartType] = useState("line");
   const [wsState, setWsState] = useState("connecting");
+  const [cloudStreamConnected, setCloudStreamConnected] = useState(false);
   const [bootState, setBootState] = useState("initializing");
   const [endpointMode, setEndpointMode] = useState("local");
   const [cloudUrl, setCloudUrl] = useState("");
@@ -1920,6 +1922,7 @@ function AppShell() {
   }, [config]);
 
   useEffect(() => {
+    if (endpointMode === "cloud") return;
     let stopped = false;
     let running = false;
     const checkDevices = async () => {
@@ -1981,9 +1984,10 @@ function AppShell() {
       stopped = true;
       clearInterval(timer);
     };
-  }, []);
+  }, [endpointMode]);
 
   useEffect(() => {
+    if (endpointMode === "cloud") return;
     let stopped = false;
     let running = false;
     const checkDbConnections = async () => {
@@ -2030,7 +2034,7 @@ function AppShell() {
       stopped = true;
       clearInterval(timer);
     };
-  }, []);
+  }, [endpointMode]);
 
   useEffect(() => {
     if (currentUser?.username && rememberUser) {
@@ -2090,7 +2094,7 @@ function AppShell() {
       };
     }
     if (endpointMode === "cloud") {
-      setWsState("cloud_polling");
+      setWsState(cloudStreamConnected ? "connected" : "cloud_polling");
       return () => {
         stopped = true;
       };
@@ -2355,11 +2359,104 @@ function AppShell() {
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       if (ws) ws.close();
     };
-  }, [endpointVersion, endpointMode, currentUser]);
+  }, [endpointVersion, endpointMode, currentUser, cloudStreamConnected]);
+
+  useEffect(() => {
+    if (endpointMode !== "cloud") {
+      setCloudStreamConnected(false);
+      return;
+    }
+    if (!currentUser) {
+      setCloudStreamConnected(false);
+      return;
+    }
+    let stopped = false;
+    let ws = null;
+    const connect = () => {
+      if (stopped) return;
+      ws = new WebSocket(getCloudWsStreamUrl());
+      ws.onopen = () => {
+        setCloudStreamConnected(true);
+        setWsState("connected");
+      };
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data || "{}");
+          if (data.type !== "cloud_snapshot") return;
+          if (Array.isArray(data.live_rows) && data.live_rows.length) {
+            const nextLive = {};
+            const nextReadings = [];
+            for (const row of data.live_rows) {
+              const gatewayId = String(row?.gateway_id || "");
+              const rawTag = String(row?.tag || row?.tag_name || "");
+              const normTag = normalizeTagName(rawTag);
+              if (!normTag) continue;
+              const key = `${gatewayId}::${normTag}`;
+              const readingTs = String(row?.ts || tsNow());
+              const quality = row?.quality;
+              const qualityLabel = row?.quality_label || qualityLabelFromCode(quality);
+              nextLive[key] = {
+                gateway_id: gatewayId,
+                tag: rawTag,
+                ts: readingTs,
+                value: row?.value,
+                quality,
+                quality_label: qualityLabel
+              };
+              nextReadings.push({
+                ts_utc: readingTs,
+                source: row?.source || "",
+                gateway_id: gatewayId,
+                gateway_name: row?.gateway_name || "",
+                device_name: row?.device_name || "",
+                plc_ip: row?.plc_ip || "",
+                tag_name: rawTag,
+                value: row?.value,
+                quality,
+                quality_label: qualityLabel
+              });
+            }
+            setLiveTagValues(nextLive);
+            setReadings(nextReadings);
+          }
+          if (Array.isArray(data.historian_rows) && data.historian_rows.length) setDataLog(data.historian_rows);
+          if (Array.isArray(data.log_rows) && data.log_rows.length) setAppLogs(data.log_rows);
+          if (data.inspector) setDatabaseInspector(data.inspector);
+          if (Array.isArray(data.gateway_statuses)) {
+            const map = {};
+            for (const row of data.gateway_statuses) {
+              if (row?.gateway_id) map[row.gateway_id] = row;
+            }
+            setGatewayRuntimeStatuses((prev) => ({ ...prev, ...map }));
+          }
+          setWsState("connected");
+        } catch {}
+      };
+      ws.onclose = () => {
+        if (stopped) return;
+        setCloudStreamConnected(false);
+        setWsState("reconnecting");
+        reconnectTimerRef.current = setTimeout(connect, 1500);
+      };
+      ws.onerror = () => {
+        setCloudStreamConnected(false);
+        setWsState("reconnecting");
+        ws?.close();
+      };
+    };
+    connect();
+    return () => {
+      stopped = true;
+      setCloudStreamConnected(false);
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (ws) ws.close();
+    };
+  }, [endpointMode, endpointVersion, currentUser]);
 
   useEffect(() => {
     if (endpointMode !== "cloud") return;
     if (!currentUser) return;
+    if (cloudStreamConnected) return;
     let stopped = false;
     let runningLive = false;
     let runningAux = false;
@@ -2373,6 +2470,8 @@ function AppShell() {
           const nextLive = {};
           const nextReadings = [];
           const nextDataRows = [];
+          const latestByGateway = {};
+          const latestByDbName = {};
           for (const row of liveRes.rows) {
             const gatewayId = String(row?.gateway_id || "");
             const rawTag = String(row?.tag || row?.tag_name || "");
@@ -2415,9 +2514,73 @@ function AppShell() {
               quality,
               quality_label: qualityLabel
             });
+            if (gatewayId && !latestByGateway[gatewayId]) latestByGateway[gatewayId] = readingTs;
+            const dbName = String(row?.database_name || "").trim();
+            if (dbName && !latestByDbName[dbName]) latestByDbName[dbName] = readingTs;
           }
           setLiveTagValues(nextLive);
           setReadings(nextReadings);
+          const nowMs = Date.now();
+          setGatewayRuntimeStatuses((prev) => {
+            const next = { ...prev };
+            for (const g of gatewayConfigsRef.current || []) {
+              const gid = String(g?.id || "");
+              if (!gid) continue;
+              const ts = latestByGateway[gid];
+              const cur = next[gid] || { gateway_id: gid };
+              if (ts) {
+                next[gid] = {
+                  ...cur,
+                  gateway_id: gid,
+                  running: true,
+                  last_error: null,
+                  db_last_error: null,
+                  last_check_utc: ts
+                };
+              } else if (cur.running) {
+                next[gid] = { ...cur, gateway_id: gid, running: false };
+              }
+            }
+            return next;
+          });
+          setGatewayConfigs((prev) =>
+            (prev || []).map((g) => {
+              const ts = latestByGateway[String(g.id || "")];
+              return ts ? { ...g, last_check_utc: ts } : g;
+            })
+          );
+          setDevices((prev) =>
+            (prev || []).map((d) => {
+              const relatedGw = (gatewayConfigsRef.current || []).find((g) => String(g.device_id || "") === String(d.id || ""));
+              const ts = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
+              if (!ts) return d;
+              const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+              const online = Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+              return {
+                ...d,
+                connection_ok: online,
+                ping_ok: online,
+                port_ok: online,
+                protocol_ok: online,
+                last_test: online ? "Live cloud reading" : "No recent cloud reading",
+                last_check_utc: ts
+              };
+            })
+          );
+          setDbConnections((prev) =>
+            (prev || []).map((c) => {
+              const ts = latestByDbName[String(c.name || "").trim()];
+              if (!ts) return c;
+              const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+              const online = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
+              return {
+                ...c,
+                connection_ok: online,
+                last_test: online ? "Live cloud reading" : "No recent cloud reading",
+                last_check_utc: ts
+              };
+            })
+          );
           // Keep charts/historian visibly live in cloud mode even when historian replay lags.
           if (nextDataRows.length) {
             setDataLog((prev) => {
@@ -2454,9 +2617,10 @@ function AppShell() {
       if (stopped || runningAux) return;
       runningAux = true;
       try {
-        const [histRes, logRes] = await Promise.all([
+        const [histRes, logRes, inspectorRes] = await Promise.all([
           getAppStoreHistorian(1500),
-          getAppStoreLogs(2500)
+          getAppStoreLogs(2500),
+          getAppStoreInspector(20)
         ]);
         if (stopped) return;
         if (histRes?.ok && Array.isArray(histRes.rows)) {
@@ -2464,6 +2628,9 @@ function AppShell() {
         }
         if (logRes?.ok && Array.isArray(logRes.rows)) {
           setAppLogs(logRes.rows);
+        }
+        if (inspectorRes?.ok && inspectorRes?.inspector) {
+          setDatabaseInspector(inspectorRes.inspector);
         }
         setWsState("cloud_polling");
       } catch (err) {
@@ -2489,7 +2656,7 @@ function AppShell() {
       clearInterval(liveTimer);
       clearInterval(auxTimer);
     };
-  }, [endpointMode, endpointVersion, currentUser]);
+  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected]);
 
   const canEditPage = (page) => {
     if (isReadonlyCloudMode) return false;

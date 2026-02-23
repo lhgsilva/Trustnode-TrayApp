@@ -1,4 +1,6 @@
+import asyncio
 import json
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -92,6 +94,37 @@ async def websocket_stream(websocket: WebSocket) -> None:
         pass
     finally:
         plc_manager.unsubscribe(queue)
+
+
+@app.websocket("/ws/cloud-stream")
+async def websocket_cloud_stream(websocket: WebSocket) -> None:
+    token = (websocket.query_params.get("token") or "").strip()
+    if not token:
+        await websocket.close(code=1008)
+        return
+    try:
+        decode_access_token(token)
+    except Exception:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    try:
+        while True:
+            payload = {
+                "type": "cloud_snapshot",
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+                "live_rows": app_store.get_live_rows(limit=5000),
+                "historian_rows": app_store.get_historian_rows(limit=1500),
+                "log_rows": app_store.get_log_rows(limit=2500),
+                "inspector": app_store.get_inspector_snapshot(preview_limit=20),
+                "gateway_statuses": plc_manager.list_gateway_statuses(),
+                "gateway_status": plc_manager.get_status().model_dump(),
+            }
+            await websocket.send_text(json.dumps(payload))
+            await asyncio.sleep(1.0)
+    except WebSocketDisconnect:
+        pass
 
 
 @app.on_event("shutdown")
