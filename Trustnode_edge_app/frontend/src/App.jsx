@@ -755,6 +755,10 @@ function buildDefaultUsers() {
 
 function AppShell() {
   const isReadonlyCloudMode = isForcedReadonlyCloudMode();
+  const browserProtocol = String(window.location.protocol || "").toLowerCase();
+  const browserHost = String(window.location.hostname || "").toLowerCase();
+  const isLocalHost = browserHost === "localhost" || browserHost === "127.0.0.1" || browserHost === "::1";
+  const isHostedWebClient = (browserProtocol === "https:" || browserProtocol === "http:") && !isLocalHost;
   const getFullscreenState = () => {
     const doc = document;
     return Boolean(doc.fullscreenElement || doc.webkitFullscreenElement);
@@ -2058,14 +2062,15 @@ function AppShell() {
 
   useEffect(() => {
     const target = getBackendTarget();
-    const host = String(window.location.hostname || "").toLowerCase();
-    const hostIsLocal = host === "localhost" || host === "127.0.0.1" || host === "::1";
     let nextMode = target.mode || "local";
     let nextCloud = target.cloudUrl || "";
-    if (!hostIsLocal && nextMode !== "cloud") {
+    if (isHostedWebClient && nextMode !== "cloud") {
       nextMode = "cloud";
       if (!nextCloud) nextCloud = String(window.location.origin || "").replace(/\/+$/, "");
       setBackendTarget("cloud", nextCloud);
+    } else if (!isHostedWebClient && nextMode !== "local") {
+      nextMode = "local";
+      setBackendTarget("local", nextCloud);
     }
     setEndpointMode(nextMode);
     setCloudUrl(nextCloud);
@@ -2077,10 +2082,10 @@ function AppShell() {
         setUiSourceLocalPath(cfg.local_path || "");
       })
       .catch(() => {});
-  }, []);
+  }, [isHostedWebClient]);
 
   useEffect(() => {
-    if (endpointMode !== "cloud") {
+    if (!isHostedWebClient || endpointMode !== "cloud") {
       setEdgeLinkState({ state: "unknown", message: "Local check disabled (local mode)" });
       return;
     }
@@ -2115,7 +2120,7 @@ function AppShell() {
       stopped = true;
       clearInterval(timer);
     };
-  }, [endpointMode]);
+  }, [endpointMode, isHostedWebClient]);
 
   useEffect(() => {
     let cancelled = false;
@@ -6274,7 +6279,25 @@ function AppShell() {
             </div>
           </div>
         </div>
-        <div className="header-center" />
+        <div className="header-center">
+          {isHostedWebClient && endpointMode === "cloud" ? (
+            <div className="row" style={{ gap: 8 }}>
+              <span>Edge Link</span>
+              <span
+                className={`status-pill ${
+                  edgeLinkState.state === "online"
+                    ? "status-online"
+                    : edgeLinkState.state === "offline"
+                      ? "status-offline"
+                      : "status-warning"
+                }`}
+                title={edgeLinkState.message}
+              >
+                {edgeLinkState.state === "online" ? "HEALTHY" : edgeLinkState.state === "offline" ? "UNREACHABLE" : "UNKNOWN"}
+              </span>
+            </div>
+          ) : null}
+        </div>
         <div className="header-right">
           <button className="icon-btn" title="Notifications" onClick={() => handleNavClick("alarms")}>
             <BellIcon />
@@ -6703,7 +6726,7 @@ function AppShell() {
                     {forceSyncBusy ? "Syncing..." : "Force Sync Now"}
                   </button>
                 </div>
-                {endpointMode === "cloud" ? (
+                {isHostedWebClient && endpointMode === "cloud" ? (
                   <div className="info-note" style={{ marginTop: 8 }}>
                     Local Edge Connection:
                     <span
