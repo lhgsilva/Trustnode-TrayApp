@@ -124,10 +124,20 @@ jobs:
           RSYNC_CMD="rsync -az --delete"
           SSH_CMD="ssh -o StrictHostKeyChecking=accept-new"
 
+          REMOTE_PREFLIGHT='
+            set -euo pipefail
+            if ! command -v rsync >/dev/null 2>&1; then
+              if command -v dnf >/dev/null 2>&1; then dnf install -y rsync;
+              elif command -v yum >/dev/null 2>&1; then yum install -y rsync;
+              elif command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y rsync;
+              fi
+            fi
+            mkdir -p "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend" "'"$VPS_WEB_ROOT"'"
+          '
           if [ -n "$VPS_SSH_KEY" ]; then
-            $SSH_CMD "$VPS_USER@$VPS_HOST" "mkdir -p '$VPS_APP_ROOT/Trustnode_edge_app/backend' '$VPS_WEB_ROOT'"
+            $SSH_CMD "$VPS_USER@$VPS_HOST" "$REMOTE_PREFLIGHT"
           else
-            sshpass -p "$VPS_PASSWORD" $SSH_CMD "$VPS_USER@$VPS_HOST" "mkdir -p '$VPS_APP_ROOT/Trustnode_edge_app/backend' '$VPS_WEB_ROOT'"
+            sshpass -p "$VPS_PASSWORD" $SSH_CMD "$VPS_USER@$VPS_HOST" "$REMOTE_PREFLIGHT"
           fi
 
           if [ -n "$VPS_SSH_KEY" ]; then
