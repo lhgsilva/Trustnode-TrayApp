@@ -1,6 +1,7 @@
 param(
     [string]$CloudApiUrl,
-    [string]$BasePath
+    [string]$BasePath,
+    [switch]$ReadOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,12 +49,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "Frontend dependency install failed."
 }
 
-$env:VITE_TRUSTNODE_READONLY = "true"
+$env:VITE_TRUSTNODE_READONLY = $(if ($ReadOnly) { "true" } else { "false" })
 $env:VITE_TRUSTNODE_FORCE_CLOUD_URL = $CloudApiUrl
-& $npmCmd run build:cloudro -- --base $BasePath
+& $npmCmd run build -- --outDir dist_cloud_readonly --base $BasePath
 if ($LASTEXITCODE -ne 0) {
     Pop-Location
-    throw "Cloud read-only build failed."
+    throw "Cloud web build failed."
 }
 Pop-Location
 
@@ -64,15 +65,15 @@ New-Item -ItemType Directory -Path $outputRoot | Out-Null
 Copy-Item -Recurse -Force (Join-Path $frontendRoot "dist_cloud_readonly\*") $outputRoot
 
 $readme = @"
-Trustnode Cloud Read-Only Web Build
+Trustnode Cloud Web Build
 
 This folder contains a static frontend bundle configured as:
 - Forced cloud backend URL: $CloudApiUrl
-- Read-only mode: enabled
+- Read-only mode: $($ReadOnly.IsPresent)
 - Base path: $BasePath
 
 Deploy this folder content under your web server subfolder.
 "@
 Set-Content -Path (Join-Path $outputRoot "README.txt") -Value $readme -Encoding UTF8
 
-Write-Host "Cloud read-only web bundle created at: $outputRoot"
+Write-Host "Cloud web bundle created at: $outputRoot"

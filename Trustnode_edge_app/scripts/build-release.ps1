@@ -77,12 +77,13 @@ if (-not $webCloudUrl) {
     $webCloudUrl = "https://api.example.com"
 }
 
-Write-Host "Building cloud read-only web bundle..."
+Write-Host "Building cloud web bundle (admin-capable by default)..."
 powershell -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "build-web-cloud-readonly.ps1") `
     -CloudApiUrl $webCloudUrl `
-    -BasePath $WebBasePath
+    -BasePath $WebBasePath `
+    -ReadOnly:$false
 if ($LASTEXITCODE -ne 0) {
-    throw "Cloud read-only web bundle build failed (exit code: $LASTEXITCODE)."
+    throw "Cloud web bundle build failed (exit code: $LASTEXITCODE)."
 }
 if (-not $CloudApiUrl) {
     Write-Host "WARNING: CloudApiUrl not provided. Web build used placeholder https://api.example.com"

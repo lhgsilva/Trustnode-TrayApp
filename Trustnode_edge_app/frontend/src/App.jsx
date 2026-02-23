@@ -1309,6 +1309,11 @@ function AppShell() {
 
   useEffect(() => {
     let stopped = false;
+    if (endpointMode === "cloud") {
+      return () => {
+        stopped = true;
+      };
+    }
     const refresh = async () => {
       try {
         const list = await getGatewayInstanceStatuses();
@@ -1329,7 +1334,7 @@ function AppShell() {
       stopped = true;
       clearInterval(timer);
     };
-  }, [endpointVersion, currentUser?.username]);
+  }, [endpointMode, endpointVersion, currentUser?.username]);
 
   useEffect(() => {
     const onFullscreenChange = () => {
