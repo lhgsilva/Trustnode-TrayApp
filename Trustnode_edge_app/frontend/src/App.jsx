@@ -2393,6 +2393,7 @@ function AppShell() {
             const nextReadings = [];
             const latestByGateway = {};
             const latestByDbName = {};
+            const latestByPlcIp = {};
             for (const row of data.live_rows) {
               const gatewayId = String(row?.gateway_id || "");
               const rawTag = String(row?.tag || row?.tag_name || "");
@@ -2425,6 +2426,8 @@ function AppShell() {
               if (gatewayId && !latestByGateway[gatewayId]) latestByGateway[gatewayId] = readingTs;
               const dbName = String(row?.database_name || "").trim();
               if (dbName && !latestByDbName[dbName]) latestByDbName[dbName] = readingTs;
+              const plcIp = String(row?.plc_ip || "").trim();
+              if (plcIp && !latestByPlcIp[plcIp]) latestByPlcIp[plcIp] = readingTs;
             }
             setLiveTagValues(nextLive);
             setReadings(nextReadings);
@@ -2437,10 +2440,12 @@ function AppShell() {
                 const ts = latestByGateway[gid];
                 const cur = next[gid] || { gateway_id: gid };
                 if (ts) {
+                  const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                  const online = Number.isFinite(ageMs) ? ageMs <= 10000 : true;
                   next[gid] = {
                     ...cur,
                     gateway_id: gid,
-                    running: true,
+                    running: online,
                     last_error: null,
                     db_last_error: null,
                     last_check_utc: ts
@@ -2460,7 +2465,9 @@ function AppShell() {
             setDevices((prev) =>
               (prev || []).map((d) => {
                 const relatedGw = (gatewayConfigsRef.current || []).find((g) => String(g.device_id || "") === String(d.id || ""));
-                const ts = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
+                const tsFromGw = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
+                const tsFromIp = latestByPlcIp[String(d?.plc_ip || "").trim()] || "";
+                const ts = tsFromGw || tsFromIp;
                 if (!ts) return d;
                 const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
                 const online = Number.isFinite(ageMs) ? ageMs <= 10000 : true;
@@ -2645,6 +2652,7 @@ function AppShell() {
           const nextDataRows = [];
           const latestByGateway = {};
           const latestByDbName = {};
+          const latestByPlcIp = {};
           for (const row of liveRes.rows) {
             const gatewayId = String(row?.gateway_id || "");
             const rawTag = String(row?.tag || row?.tag_name || "");
@@ -2690,6 +2698,8 @@ function AppShell() {
             if (gatewayId && !latestByGateway[gatewayId]) latestByGateway[gatewayId] = readingTs;
             const dbName = String(row?.database_name || "").trim();
             if (dbName && !latestByDbName[dbName]) latestByDbName[dbName] = readingTs;
+            const plcIp = String(row?.plc_ip || "").trim();
+            if (plcIp && !latestByPlcIp[plcIp]) latestByPlcIp[plcIp] = readingTs;
           }
           setLiveTagValues(nextLive);
           setReadings(nextReadings);
@@ -2702,10 +2712,12 @@ function AppShell() {
               const ts = latestByGateway[gid];
               const cur = next[gid] || { gateway_id: gid };
               if (ts) {
+                const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                const online = Number.isFinite(ageMs) ? ageMs <= 10000 : true;
                 next[gid] = {
                   ...cur,
                   gateway_id: gid,
-                  running: true,
+                  running: online,
                   last_error: null,
                   db_last_error: null,
                   last_check_utc: ts
@@ -2725,7 +2737,9 @@ function AppShell() {
           setDevices((prev) =>
             (prev || []).map((d) => {
               const relatedGw = (gatewayConfigsRef.current || []).find((g) => String(g.device_id || "") === String(d.id || ""));
-              const ts = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
+              const tsFromGw = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
+              const tsFromIp = latestByPlcIp[String(d?.plc_ip || "").trim()] || "";
+              const ts = tsFromGw || tsFromIp;
               if (!ts) return d;
               const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
               const online = Number.isFinite(ageMs) ? ageMs <= 10000 : true;
