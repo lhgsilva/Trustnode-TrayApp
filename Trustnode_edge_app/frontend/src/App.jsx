@@ -2372,6 +2372,7 @@ function AppShell() {
         if (liveRes?.ok && Array.isArray(liveRes.rows)) {
           const nextLive = {};
           const nextReadings = [];
+          const nextDataRows = [];
           for (const row of liveRes.rows) {
             const gatewayId = String(row?.gateway_id || "");
             const rawTag = String(row?.tag || row?.tag_name || "");
@@ -2401,9 +2402,39 @@ function AppShell() {
               quality,
               quality_label: qualityLabel
             });
+            nextDataRows.push({
+              ts: readingTs,
+              source: row?.source || "",
+              gateway_id: gatewayId,
+              gateway_name: row?.gateway_name || "",
+              device_name: row?.device_name || "",
+              plc_ip: row?.plc_ip || "",
+              database_name: row?.database_name || "",
+              tag: rawTag,
+              value: row?.value,
+              quality,
+              quality_label: qualityLabel
+            });
           }
           setLiveTagValues(nextLive);
           setReadings(nextReadings);
+          // Keep charts/historian visibly live in cloud mode even when historian replay lags.
+          if (nextDataRows.length) {
+            setDataLog((prev) => {
+              const incoming = [...nextDataRows].sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+              const merged = [...incoming];
+              const seen = new Set(
+                incoming.map((r) => `${String(r.gateway_id)}::${String(r.tag)}::${String(r.ts)}`)
+              );
+              for (const r of prev || []) {
+                const key = `${String(r.gateway_id || "")}::${String(r.tag || "")}::${String(r.ts || "")}`;
+                if (seen.has(key)) continue;
+                merged.push(r);
+                if (merged.length >= 5000) break;
+              }
+              return merged;
+            });
+          }
         }
         setWsState("cloud_polling");
       } catch (err) {
