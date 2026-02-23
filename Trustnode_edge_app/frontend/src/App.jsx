@@ -2391,6 +2391,8 @@ function AppShell() {
           if (Array.isArray(data.live_rows) && data.live_rows.length) {
             const nextLive = {};
             const nextReadings = [];
+            const latestByGateway = {};
+            const latestByDbName = {};
             for (const row of data.live_rows) {
               const gatewayId = String(row?.gateway_id || "");
               const rawTag = String(row?.tag || row?.tag_name || "");
@@ -2420,9 +2422,175 @@ function AppShell() {
                 quality,
                 quality_label: qualityLabel
               });
+              if (gatewayId && !latestByGateway[gatewayId]) latestByGateway[gatewayId] = readingTs;
+              const dbName = String(row?.database_name || "").trim();
+              if (dbName && !latestByDbName[dbName]) latestByDbName[dbName] = readingTs;
             }
             setLiveTagValues(nextLive);
             setReadings(nextReadings);
+            const nowMs = Date.now();
+            setGatewayRuntimeStatuses((prev) => {
+              const next = { ...prev };
+              for (const g of gatewayConfigsRef.current || []) {
+                const gid = String(g?.id || "");
+                if (!gid) continue;
+                const ts = latestByGateway[gid];
+                const cur = next[gid] || { gateway_id: gid };
+                if (ts) {
+                  next[gid] = {
+                    ...cur,
+                    gateway_id: gid,
+                    running: true,
+                    last_error: null,
+                    db_last_error: null,
+                    last_check_utc: ts
+                  };
+                } else if (cur.running) {
+                  next[gid] = { ...cur, gateway_id: gid, running: false };
+                }
+              }
+              return next;
+            });
+            setGatewayConfigs((prev) =>
+              (prev || []).map((g) => {
+                const ts = latestByGateway[String(g.id || "")];
+                return ts ? { ...g, last_check_utc: ts } : g;
+              })
+            );
+            setDevices((prev) =>
+              (prev || []).map((d) => {
+                const relatedGw = (gatewayConfigsRef.current || []).find((g) => String(g.device_id || "") === String(d.id || ""));
+                const ts = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
+                if (!ts) return d;
+                const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                const online = Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                return {
+                  ...d,
+                  connection_ok: online,
+                  ping_ok: online,
+                  port_ok: online,
+                  protocol_ok: online,
+                  last_test: online ? "Live cloud reading" : "No recent cloud reading",
+                  last_check_utc: ts
+                };
+              })
+            );
+            setDbConnections((prev) =>
+              (prev || []).map((c) => {
+                const ts = latestByDbName[String(c.name || "").trim()];
+                if (!ts) return c;
+                const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                const online = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
+                return {
+                  ...c,
+                  connection_ok: online,
+                  last_test: online ? "Live cloud reading" : "No recent cloud reading",
+                  last_check_utc: ts
+                };
+              })
+            );
+
+            const activeRules = triggerRulesRef.current.filter((rule) => rule.enabled !== false);
+            const newAlarms = [];
+            for (const row of data.live_rows) {
+              const gatewayId = String(row?.gateway_id || "").trim();
+              const tagName = String(row?.tag || row?.tag_name || "").trim();
+              const valueNum = Number(row?.value);
+              if (!gatewayId || !tagName || Number.isNaN(valueNum)) continue;
+              const tagAlarmEnabled = isTagAlarmEnabled(gatewayId, tagName);
+              const matchedRules = activeRules.filter(
+                (rule) => String(rule.gateway_id) === gatewayId && String(rule.tag_name || "").trim() === tagName
+              );
+              for (const rule of matchedRules) {
+                const lowerHit = Boolean(rule.lower_enabled) &&
+                  compareByOperator(valueNum, String(rule.lower_operator || "<"), Number(rule.lower_value));
+                const upperHit = Boolean(rule.upper_enabled) &&
+                  compareByOperator(valueNum, String(rule.upper_operator || ">="), Number(rule.upper_value));
+                const violated = lowerHit || upperHit;
+                const ruleKey = `${gatewayId}:${tagName}:${rule.id}`;
+                const wasActive = Boolean(triggerActiveStateRef.current[ruleKey]);
+                const gatewayName = String(row?.gateway_name || gatewayId);
+                const alarmTs = String(row?.ts || tsNow());
+                const lowerText = rule.lower_enabled ? `${rule.lower_operator} ${rule.lower_value}` : "-";
+                const upperText = rule.upper_enabled ? `${rule.upper_operator} ${rule.upper_value}` : "-";
+                if (violated && !wasActive) {
+                  if (!tagAlarmEnabled) {
+                    newAlarms.push({
+                      id: `${rule.id}-${tagName}-${Date.now()}-paused`,
+                      ts: alarmTs,
+                      severity: "Info",
+                      message: `[${gatewayName}] ${tagName} violated limits but alarm is PAUSED (L: ${lowerText}, U: ${upperText})`,
+                      value: row?.value,
+                      tag: tagName,
+                      alert_key: ruleKey,
+                      event_type: "active",
+                      gateway_id: gatewayId,
+                      gateway_name: gatewayName,
+                      acknowledged: true,
+                      notification_paused: true,
+                      paused_by_tag: true
+                    });
+                  } else {
+                    newAlarms.push({
+                      id: `${rule.id}-${tagName}-${Date.now()}`,
+                      ts: alarmTs,
+                      severity: "Critical",
+                      message: `[${gatewayName}] ${tagName} violated limits (L: ${lowerText}, U: ${upperText})`,
+                      value: row?.value,
+                      tag: tagName,
+                      alert_key: ruleKey,
+                      event_type: "active",
+                      gateway_id: gatewayId,
+                      gateway_name: gatewayName,
+                      acknowledged: false,
+                      notification_paused: false,
+                      paused_by_tag: false
+                    });
+                  }
+                } else if (!violated && wasActive) {
+                  if (!tagAlarmEnabled) {
+                    newAlarms.push({
+                      id: `${rule.id}-${tagName}-${Date.now()}-clear-paused`,
+                      ts: alarmTs,
+                      severity: "Info",
+                      message: `[${gatewayName}] ${tagName} back within limits but alarm is PAUSED`,
+                      value: row?.value,
+                      tag: tagName,
+                      alert_key: ruleKey,
+                      event_type: "clear",
+                      gateway_id: gatewayId,
+                      gateway_name: gatewayName,
+                      acknowledged: true,
+                      notification_paused: true,
+                      paused_by_tag: true
+                    });
+                  } else {
+                    newAlarms.push({
+                      id: `${rule.id}-${tagName}-${Date.now()}-clear`,
+                      ts: alarmTs,
+                      severity: "Info",
+                      message: `[${gatewayName}] ${tagName} back within limits`,
+                      value: row?.value,
+                      tag: tagName,
+                      alert_key: ruleKey,
+                      event_type: "clear",
+                      gateway_id: gatewayId,
+                      gateway_name: gatewayName,
+                      acknowledged: false,
+                      notification_paused: false,
+                      paused_by_tag: false
+                    });
+                  }
+                }
+                triggerActiveStateRef.current[ruleKey] = violated;
+              }
+            }
+            if (newAlarms.length) {
+              setAlarms((prev) => [...newAlarms, ...prev].slice(0, 300));
+              newAlarms.forEach((alarm) => {
+                if (!alarm.acknowledged && !alarm.notification_paused) sendAlarmEmailNotification(alarm);
+              });
+            }
           }
           if (Array.isArray(data.historian_rows) && data.historian_rows.length) setDataLog(data.historian_rows);
           if (Array.isArray(data.log_rows) && data.log_rows.length) setAppLogs(data.log_rows);
