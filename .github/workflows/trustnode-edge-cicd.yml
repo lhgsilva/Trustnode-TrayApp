@@ -72,41 +72,57 @@ jobs:
   deploy-vps:
     runs-on: ubuntu-latest
     needs: build-and-test
-    if: ${{ secrets.VPS_HOST != '' && secrets.VPS_USER != '' && (secrets.VPS_SSH_KEY != '' || secrets.VPS_PASSWORD != '') }}
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Evaluate deploy readiness
+        id: gate
+        run: |
+          if [ -z "$VPS_HOST" ] || [ -z "$VPS_USER" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Missing VPS_HOST or VPS_USER, skipping deploy."
+          elif [ -z "$VPS_SSH_KEY" ] && [ -z "$VPS_PASSWORD" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Missing both VPS_SSH_KEY and VPS_PASSWORD, skipping deploy."
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            echo "Deploy prerequisites found."
+          fi
+
       - name: Download web artifact
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
         uses: actions/download-artifact@v4
         with:
           name: web_cloud_readonly
           path: web_cloud_readonly
 
       - name: Configure SSH
-        if: ${{ secrets.VPS_SSH_KEY != '' }}
+        if: ${{ steps.gate.outputs.deploy == 'true' && env.VPS_SSH_KEY != '' }}
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_rsa
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
 
       - name: Install sshpass (password auth)
-        if: ${{ secrets.VPS_SSH_KEY == '' && secrets.VPS_PASSWORD != '' }}
+        if: ${{ steps.gate.outputs.deploy == 'true' && env.VPS_SSH_KEY == '' && env.VPS_PASSWORD != '' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y sshpass rsync
 
       - name: Deploy code and restart backend on VPS
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
         run: |
           RSYNC_CMD="rsync -az --delete"
           SSH_CMD="ssh -o StrictHostKeyChecking=accept-new"
-          if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then
+          if [ -n "$VPS_SSH_KEY" ]; then
             eval "$RSYNC_CMD ./Trustnode_edge_app/backend/ \"$VPS_USER@$VPS_HOST:$VPS_APP_ROOT/Trustnode_edge_app/backend/\""
             REMOTE_RUN="$SSH_CMD \"$VPS_USER@$VPS_HOST\""
           else
@@ -141,14 +157,11 @@ jobs:
           '
 
       - name: Deploy web bundle to VPS
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
         run: |
           RSYNC_CMD="rsync -az --delete"
           SSH_CMD="ssh -o StrictHostKeyChecking=accept-new"
-          if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then
+          if [ -n "$VPS_SSH_KEY" ]; then
             eval "$RSYNC_CMD ./web_cloud_readonly/ \"$VPS_USER@$VPS_HOST:$VPS_WEB_ROOT/\""
             REMOTE_RUN="$SSH_CMD \"$VPS_USER@$VPS_HOST\""
           else
@@ -164,13 +177,10 @@ jobs:
           '
 
       - name: VPS smoke checks
-        env:
-          VPS_HOST: ${{ secrets.VPS_HOST }}
-          VPS_USER: ${{ secrets.VPS_USER }}
-          VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
         run: |
           SSH_CMD="ssh -o StrictHostKeyChecking=accept-new"
-          if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then
+          if [ -n "$VPS_SSH_KEY" ]; then
             REMOTE_RUN="$SSH_CMD \"$VPS_USER@$VPS_HOST\""
           else
             REMOTE_RUN="sshpass -p \"$VPS_PASSWORD\" $SSH_CMD \"$VPS_USER@$VPS_HOST\""
