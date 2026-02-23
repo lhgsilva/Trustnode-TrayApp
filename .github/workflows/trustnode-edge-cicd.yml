@@ -101,19 +101,23 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
           VPS_PASSWORD: ${{ secrets.VPS_PASSWORD }}
         run: |
+          RSYNC_CMD="rsync -az --delete"
           SSH_CMD="ssh -o StrictHostKeyChecking=accept-new"
           if [ -n "${{ secrets.VPS_SSH_KEY }}" ]; then
+            eval "$RSYNC_CMD ./Trustnode_edge_app/backend/ \"$VPS_USER@$VPS_HOST:$VPS_APP_ROOT/Trustnode_edge_app/backend/\""
             REMOTE_RUN="$SSH_CMD \"$VPS_USER@$VPS_HOST\""
           else
+            eval "sshpass -p \"$VPS_PASSWORD\" $RSYNC_CMD -e \"$SSH_CMD\" ./Trustnode_edge_app/backend/ \"$VPS_USER@$VPS_HOST:$VPS_APP_ROOT/Trustnode_edge_app/backend/\""
             REMOTE_RUN="sshpass -p \"$VPS_PASSWORD\" $SSH_CMD \"$VPS_USER@$VPS_HOST\""
           fi
           eval "$REMOTE_RUN" '
             set -euo pipefail
-            cd "'"$VPS_APP_ROOT"'"
-            git config --global --add safe.directory "'"$VPS_APP_ROOT"'" || true
-            git pull --ff-only
-
+            mkdir -p "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend"
             cd "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend"
+            if [ ! -x ./.venv/bin/python ]; then
+              python3.11 -m venv .venv
+            fi
+            ./.venv/bin/pip install --upgrade pip
             ./.venv/bin/pip install -r requirements.txt
 
             mkdir -p /etc/systemd/system/'"$BACKEND_SERVICE"'.service.d
