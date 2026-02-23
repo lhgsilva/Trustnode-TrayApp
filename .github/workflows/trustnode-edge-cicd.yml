@@ -146,16 +146,19 @@ jobs:
           fi
 
           test -f ./Trustnode_edge_app/backend/requirements.txt
+          tar -C "$GITHUB_WORKSPACE/Trustnode_edge_app/backend" -czf "$RUNNER_TEMP/trustnode-backend.tgz" .
           if [ -n "$VPS_SSH_KEY" ]; then
-            $RSYNC_CMD -e "ssh $SSH_OPTS" ./Trustnode_edge_app/backend/ "$VPS_USER@$VPS_HOST:$VPS_APP_ROOT/Trustnode_edge_app/backend/"
+            scp $SSH_OPTS "$RUNNER_TEMP/trustnode-backend.tgz" "$VPS_USER@$VPS_HOST:/tmp/trustnode-backend.tgz"
             REMOTE_RUN="ssh $SSH_OPTS \"$VPS_USER@$VPS_HOST\""
           else
-            sshpass -p "$VPS_PASSWORD" $RSYNC_CMD -e "ssh $SSH_OPTS" ./Trustnode_edge_app/backend/ "$VPS_USER@$VPS_HOST:$VPS_APP_ROOT/Trustnode_edge_app/backend/"
+            sshpass -p "$VPS_PASSWORD" scp $SSH_OPTS "$RUNNER_TEMP/trustnode-backend.tgz" "$VPS_USER@$VPS_HOST:/tmp/trustnode-backend.tgz"
             REMOTE_RUN="sshpass -p \"$VPS_PASSWORD\" ssh $SSH_OPTS \"$VPS_USER@$VPS_HOST\""
           fi
           eval "$REMOTE_RUN" '
             set -euo pipefail
             mkdir -p "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend"
+            tar -xzf /tmp/trustnode-backend.tgz -C "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend"
+            rm -f /tmp/trustnode-backend.tgz
             cd "'"$VPS_APP_ROOT"'/Trustnode_edge_app/backend"
             test -f requirements.txt || { echo "backend copy failed: requirements.txt missing"; ls -la; exit 1; }
             PY_BIN="$(command -v python3.11 || command -v python3 || command -v python || true)"
