@@ -456,9 +456,10 @@ class AppStore:
     def _config_sync_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
+                self._flush_data_outbox_once()
+                # Prioritize live/data freshness; config sync can follow.
                 self._pull_config_from_cloud_once()
                 self._flush_config_outbox_once()
-                self._flush_data_outbox_once()
             except Exception as exc:
                 self._upsert_sync_target_state(enabled=True, config={}, last_error=f"Config sync loop error: {exc}")
             self._sync_wakeup_event.wait(timeout=self._sync_interval_seconds)
@@ -928,6 +929,29 @@ class AppStore:
                     )
                 )
 
+                if live_latest_rows:
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."live_latest"
+                            (gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
+                            VALUES
+                            (:gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
+                            ON CONFLICT(gateway_id, tag_name) DO UPDATE SET
+                              ts_utc = excluded.ts_utc,
+                              source = excluded.source,
+                              gateway_name = excluded.gateway_name,
+                              device_name = excluded.device_name,
+                              plc_ip = excluded.plc_ip,
+                              database_name = excluded.database_name,
+                              value = excluded.value,
+                              quality = excluded.quality,
+                              quality_label = excluded.quality_label,
+                              updated_utc = excluded.updated_utc
+                            """
+                        ),
+                        live_latest_rows,
+                    )
                 if hist_rows:
                     conn.execute(
                         text(
@@ -984,29 +1008,6 @@ class AppStore:
                             }
                             for r in log_rows
                         ],
-                    )
-                if live_latest_rows:
-                    conn.execute(
-                        text(
-                            f"""
-                            INSERT INTO "{schema}"."live_latest"
-                            (gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
-                            VALUES
-                            (:gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
-                            ON CONFLICT(gateway_id, tag_name) DO UPDATE SET
-                              ts_utc = excluded.ts_utc,
-                              source = excluded.source,
-                              gateway_name = excluded.gateway_name,
-                              device_name = excluded.device_name,
-                              plc_ip = excluded.plc_ip,
-                              database_name = excluded.database_name,
-                              value = excluded.value,
-                              quality = excluded.quality,
-                              quality_label = excluded.quality_label,
-                              updated_utc = excluded.updated_utc
-                            """
-                        ),
-                        live_latest_rows,
                     )
 
             if hist_rows:
@@ -1972,6 +1973,7 @@ class AppStore:
                     """,
                     safe_rows,
                 )
+        self._sync_wakeup_event.set()
         return len(safe_rows)
 
     def append_log_rows(self, rows: list[dict[str, Any]]) -> int:
@@ -2003,6 +2005,7 @@ class AppStore:
                     """,
                     safe_rows,
                 )
+        self._sync_wakeup_event.set()
         return len(safe_rows)
 
     def get_historian_rows(self, limit: int = 1000) -> list[dict[str, Any]]:
