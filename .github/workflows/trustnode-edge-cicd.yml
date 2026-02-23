@@ -120,8 +120,16 @@ jobs:
       - name: Deploy code and restart backend on VPS
         if: ${{ steps.gate.outputs.deploy == 'true' }}
         run: |
+          set -euo pipefail
           RSYNC_CMD="rsync -az --delete"
           SSH_CMD="ssh -o StrictHostKeyChecking=accept-new"
+
+          if [ -n "$VPS_SSH_KEY" ]; then
+            $SSH_CMD "$VPS_USER@$VPS_HOST" "mkdir -p '$VPS_APP_ROOT/Trustnode_edge_app/backend' '$VPS_WEB_ROOT'"
+          else
+            sshpass -p "$VPS_PASSWORD" $SSH_CMD "$VPS_USER@$VPS_HOST" "mkdir -p '$VPS_APP_ROOT/Trustnode_edge_app/backend' '$VPS_WEB_ROOT'"
+          fi
+
           if [ -n "$VPS_SSH_KEY" ]; then
             eval "$RSYNC_CMD ./Trustnode_edge_app/backend/ \"$VPS_USER@$VPS_HOST:$VPS_APP_ROOT/Trustnode_edge_app/backend/\""
             REMOTE_RUN="$SSH_CMD \"$VPS_USER@$VPS_HOST\""
@@ -153,7 +161,12 @@ jobs:
             EOF
 
             systemctl daemon-reload
-            systemctl restart '"$BACKEND_SERVICE"'
+            systemctl reset-failed '"$BACKEND_SERVICE"' || true
+            systemctl stop '"$BACKEND_SERVICE"' || true
+            pkill -9 -f "uvicorn app.main:app" || true
+            systemctl start '"$BACKEND_SERVICE"'
+            sleep 2
+            curl -fsS http://127.0.0.1:8000/api/health >/dev/null
           '
 
       - name: Deploy web bundle to VPS
