@@ -170,12 +170,26 @@ jobs:
             ExecStart=${{ env.VPS_APP_ROOT }}/Trustnode_edge_app/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
             EOF
             systemctl daemon-reload
+            systemctl reset-failed ${{ env.BACKEND_SERVICE }} || true
             systemctl restart ${{ env.BACKEND_SERVICE }}
+            ok=0
+            for i in $(seq 1 20); do
+              if curl -fsS http://127.0.0.1:8000/api/health >/dev/null; then
+                ok=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "Backend did not become healthy on :8000"
+              systemctl status ${{ env.BACKEND_SERVICE }} --no-pager || true
+              journalctl -u ${{ env.BACKEND_SERVICE }} -n 120 --no-pager || true
+              exit 1
+            fi
             chown -R nginx:nginx "${{ env.VPS_WEB_ROOT }}"
             restorecon -Rv "${{ env.VPS_WEB_ROOT }}" || true
             nginx -t
             systemctl reload nginx
-            curl -fsS http://127.0.0.1:8000/api/health >/dev/null
             curl -fsS https://trustnode.lsapps.app/api/health >/dev/null
             curl -fsS https://trustnode.lsapps.app/api/app-store/live?limit=1 >/dev/null
 
@@ -211,11 +225,25 @@ jobs:
             ExecStart=${{ env.VPS_APP_ROOT }}/Trustnode_edge_app/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
             EOF
             systemctl daemon-reload
+            systemctl reset-failed ${{ env.BACKEND_SERVICE }} || true
             systemctl restart ${{ env.BACKEND_SERVICE }}
+            ok=0
+            for i in $(seq 1 20); do
+              if curl -fsS http://127.0.0.1:8000/api/health >/dev/null; then
+                ok=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "Backend did not become healthy on :8000"
+              systemctl status ${{ env.BACKEND_SERVICE }} --no-pager || true
+              journalctl -u ${{ env.BACKEND_SERVICE }} -n 120 --no-pager || true
+              exit 1
+            fi
             chown -R nginx:nginx "${{ env.VPS_WEB_ROOT }}"
             restorecon -Rv "${{ env.VPS_WEB_ROOT }}" || true
             nginx -t
             systemctl reload nginx
-            curl -fsS http://127.0.0.1:8000/api/health >/dev/null
             curl -fsS https://trustnode.lsapps.app/api/health >/dev/null
             curl -fsS https://trustnode.lsapps.app/api/app-store/live?limit=1 >/dev/null
