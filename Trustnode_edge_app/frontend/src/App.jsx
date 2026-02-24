@@ -58,6 +58,7 @@ const COLLECTION_TRIGGERS_STORAGE_KEY = "trustnode_collection_triggers";
 const DASHBOARD_WIDGETS_STORAGE_KEY = "trustnode_dashboard_widgets";
 const DASHBOARD_LAYOUT_STORAGE_KEY = "trustnode_dashboard_layout";
 const EMAIL_SETTINGS_STORAGE_KEY = "trustnode_email_settings";
+const DEFAULT_LOCAL_DB_BADGE_DISMISS_KEY = "trustnode_default_local_db_badge_dismissed";
 const LOCAL_DB_ENGINES = new Set(["sqlite", "csv_file", "txt_file"]);
 
 const NAV_SECTIONS = [
@@ -931,6 +932,8 @@ function AppShell() {
   const [databaseInspector, setDatabaseInspector] = useState(null);
   const [databaseInspectorBusy, setDatabaseInspectorBusy] = useState(false);
   const [databaseInspectorError, setDatabaseInspectorError] = useState("");
+  const [appMetadata, setAppMetadata] = useState({});
+  const [showDefaultLocalDbBadge, setShowDefaultLocalDbBadge] = useState(false);
   const [forceSyncBusy, setForceSyncBusy] = useState(false);
   const [forceSyncResult, setForceSyncResult] = useState("");
   const [retentionPolicy, setRetentionPolicy] = useState({
@@ -1155,6 +1158,7 @@ function AppShell() {
       active_profile_id: activeEmailProfileId
     },
     metadata: {
+      ...appMetadata,
       saved_utc: tsNow(),
       app_version: "edge-2026-02-21-db-primary-1"
     }
@@ -1170,6 +1174,7 @@ function AppShell() {
     const reportingSetup = data.reporting_setup || {};
     const tagsSetup = data.tags || {};
     const emailSetup = data.email_notifications || {};
+    const metadata = data.metadata && typeof data.metadata === "object" && !Array.isArray(data.metadata) ? data.metadata : {};
 
     if (appSettings.theme === "light" || appSettings.theme === "dark") setTheme(appSettings.theme);
     if (typeof appSettings.remember_user === "boolean") setRememberUser(appSettings.remember_user);
@@ -1225,6 +1230,31 @@ function AppShell() {
         setActiveEmailProfileId(emailSetup.active_profile_id);
       }
     }
+    setAppMetadata(metadata);
+  };
+
+  useEffect(() => {
+    const seeded = Boolean(appMetadata?.default_local_db_seeded);
+    const seededUtc = String(appMetadata?.default_local_db_seeded_utc || "").trim();
+    const hasDefaultLocalDb = dbConnections.some((c) => String(c.id || "") === "local-sqlite-default");
+    if (!seeded || !seededUtc || !hasDefaultLocalDb) {
+      setShowDefaultLocalDbBadge(false);
+      return;
+    }
+    try {
+      const dismissed = localStorage.getItem(DEFAULT_LOCAL_DB_BADGE_DISMISS_KEY) || "";
+      setShowDefaultLocalDbBadge(dismissed !== seededUtc);
+    } catch {
+      setShowDefaultLocalDbBadge(true);
+    }
+  }, [appMetadata, dbConnections]);
+
+  const dismissDefaultLocalDbBadge = () => {
+    const seededUtc = String(appMetadata?.default_local_db_seeded_utc || "").trim();
+    try {
+      if (seededUtc) localStorage.setItem(DEFAULT_LOCAL_DB_BADGE_DISMISS_KEY, seededUtc);
+    } catch {}
+    setShowDefaultLocalDbBadge(false);
   };
 
   const buildDbRecoveryConnections = () => {
@@ -6746,6 +6776,12 @@ function AppShell() {
                 ) : null}
                 {websiteStatusResult ? <div className="info-note" style={{ marginTop: 8 }}>{websiteStatusResult}</div> : null}
                 {forceSyncResult ? <div className="info-note" style={{ marginTop: 8 }}>{forceSyncResult}</div> : null}
+                {showDefaultLocalDbBadge ? (
+                  <div className="info-note" style={{ marginTop: 8, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                    <span>Auto-created default local DB: <b>Local SQLite</b>. It is ready for gateway selection.</span>
+                    <button className="btn btn-primary btn-sm" onClick={dismissDefaultLocalDbBadge}>Dismiss</button>
+                  </div>
+                ) : null}
               </section>
               <section className="db-scope-grid">
               <div className="card">
@@ -6886,6 +6922,12 @@ function AppShell() {
                   </div>
                 </div>
                 {databaseOverviewResult ? <div className="info-note" style={{ marginTop: 10 }}>{databaseOverviewResult}</div> : null}
+                {showDefaultLocalDbBadge ? (
+                  <div className="info-note" style={{ marginTop: 10, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                    <span>Auto-created default local DB: <b>Local SQLite</b>. It is ready for gateway selection.</span>
+                    <button className="btn btn-primary btn-sm" onClick={dismissDefaultLocalDbBadge}>Dismiss</button>
+                  </div>
+                ) : null}
               </section>
               <section className="card">
                 <div className="info-note">Retention controls moved to <b>Backup and Retention</b> submenu.</div>

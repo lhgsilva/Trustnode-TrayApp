@@ -26,6 +26,7 @@ class AppStore:
         "email_notifications": {"settings": {}, "profiles": [], "active_profile_id": ""},
         "metadata": {},
     }
+    DEFAULT_LOCAL_DB_ID = "local-sqlite-default"
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -44,6 +45,7 @@ class AppStore:
         )
         self._ensure_schema()
         self._ensure_required_config_domains()
+        self._ensure_default_database_configuration()
         self._compact_sync_outbox_for_domains()
         self._backfill_outbox_for_existing_domains()
         self._scheduler_thread = threading.Thread(target=self._retention_scheduler_loop, daemon=True)
@@ -1271,6 +1273,69 @@ class AppStore:
                         """,
                         (domain, json.dumps(payload), now),
                     )
+
+    def _default_local_database_configuration(self) -> Dict[str, Any]:
+        # First-run safe local sink so gateway setup has a selectable database immediately.
+        return {
+            "id": self.DEFAULT_LOCAL_DB_ID,
+            "name": "Local SQLite",
+            "engine": "sqlite",
+            "location": "local",
+            "enabled": True,
+            "use_gateway": True,
+            "use_app": False,
+            "use_backup": False,
+            "cloud_sync_enabled": False,
+            "sqlite_path": "./data/trustnode_edge.db",
+            "table": "historian_readings",
+            "schema": "",
+            "tls": False,
+        }
+
+    def _ensure_default_database_configuration(self) -> None:
+        should_seed = False
+        seeded_utc = self._utc_now()
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM config_documents WHERE domain = ?",
+                    ("database_configurations",),
+                ).fetchone()
+                if not row:
+                    should_seed = True
+                else:
+                    try:
+                        payload = json.loads(str(row["payload_json"] or "[]"))
+                    except Exception:
+                        payload = []
+                    should_seed = isinstance(payload, list) and len(payload) == 0
+
+        if should_seed:
+            self.upsert_domain(
+                "database_configurations",
+                [self._default_local_database_configuration()],
+                actor="system",
+            )
+            self._mark_default_local_database_seeded(seeded_utc)
+
+    def _mark_default_local_database_seeded(self, seeded_utc: str) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM config_documents WHERE domain = ?",
+                    ("metadata",),
+                ).fetchone()
+                metadata: Dict[str, Any] = {}
+                if row:
+                    try:
+                        raw = json.loads(str(row["payload_json"] or "{}"))
+                        if isinstance(raw, dict):
+                            metadata = raw
+                    except Exception:
+                        metadata = {}
+        metadata["default_local_db_seeded"] = True
+        metadata["default_local_db_seeded_utc"] = str(seeded_utc or self._utc_now())
+        self.upsert_domain("metadata", metadata, actor="system")
 
     def _compact_sync_outbox_for_domains(self) -> None:
         # Keep only latest unsent row per domain so config sync backlog does not
