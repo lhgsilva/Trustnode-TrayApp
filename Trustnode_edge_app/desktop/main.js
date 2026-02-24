@@ -234,15 +234,30 @@ async function resolveBackendTarget() {
     const port = BACKEND_PORT + i;
     const alive = await checkBackendHealth(BACKEND_HOST, port, 1200);
     if (alive) {
-      // Never reuse an already-running backend process. It may come from an older
-      // packaged build and can return stale/incorrect runtime behavior.
-      logBackend(`Backend already running at http://${BACKEND_HOST}:${port}; reserving this port.`);
+      const compatible = await checkBackendCompatibility(BACKEND_HOST, port);
+      if (compatible) {
+        logBackend(`Backend already running at http://${BACKEND_HOST}:${port}; reusing compatible process.`);
+        return { host: BACKEND_HOST, port, reuse: true };
+      }
+      logBackend(`Backend already running at http://${BACKEND_HOST}:${port} but not compatible; reserving this port.`);
       continue;
     }
     const free = await checkPortFree(BACKEND_HOST, port, 800);
     if (free) return { host: BACKEND_HOST, port, reuse: false };
   }
   return { host: BACKEND_HOST, port: BACKEND_PORT, reuse: false };
+}
+
+async function findCompatibleRunningBackend() {
+  const maxPortsToTry = 10;
+  for (let i = 0; i < maxPortsToTry; i += 1) {
+    const port = BACKEND_PORT + i;
+    const alive = await checkBackendHealth(BACKEND_HOST, port, 1000);
+    if (!alive) continue;
+    const compatible = await checkBackendCompatibility(BACKEND_HOST, port);
+    if (compatible) return { host: BACKEND_HOST, port };
+  }
+  return null;
 }
 
 function killBackendImageNamesWindows() {
@@ -329,9 +344,27 @@ async function startBackend() {
 
   backendProc.on("exit", (code) => {
     backendExited = true;
-    backendExitCode = code;
-    logBackend(`Backend exited with code ${code}`);
+    backendExitCode = code ?? null;
+    logBackend(`Backend exited with code ${code ?? "null"}`);
     backendProc = null;
+    if (code && code !== 0) {
+      // Some packaged backends are singleton-style and exit non-zero when another
+      // compatible instance already owns the local API port. Attach instead of fail.
+      setTimeout(async () => {
+        const running = await findCompatibleRunningBackend();
+        if (!running) return;
+        currentBackendHost = running.host;
+        currentBackendPort = running.port;
+        backendExited = false;
+        backendExitCode = null;
+        ownsBackendProcess = false;
+        logBackend(`Attached to compatible running backend at http://${currentBackendHost}:${currentBackendPort} after local exit.`);
+      }, 350);
+    }
+  });
+
+  backendProc.on("error", (err) => {
+    logBackend(`Backend process spawn error: ${String(err)}`);
   });
 }
 
@@ -495,12 +528,27 @@ function createWindow() {
 
 function monitorBackendStartup() {
   if (!app.isPackaged) return;
-  setTimeout(() => {
-    if (!mainWindow || !mainWindow.webContents || mainWindow.isDestroyed()) return;
+  // On slower or security-constrained machines the backend can take longer
+  // to stabilize (or restart once) after process spawn. Keep polling first,
+  // and only show an error page if it stays unhealthy for an extended period.
+  const startedAt = Date.now();
+  const maxWaitMs = 35000;
+  const pollMs = 2000;
+  const timer = setInterval(() => {
+    if (!mainWindow || !mainWindow.webContents || mainWindow.isDestroyed()) {
+      clearInterval(timer);
+      return;
+    }
     checkBackendHealth(currentBackendHost, currentBackendPort, 2000).then((alive) => {
-      if (alive) return;
+      if (alive) {
+        clearInterval(timer);
+        return;
+      }
+      const elapsed = Date.now() - startedAt;
+      if (elapsed < maxWaitMs) return;
+      clearInterval(timer);
       if (!backendExited) {
-        logBackend("Backend not healthy after startup grace period.");
+        logBackend("Backend not healthy after extended startup grace period.");
       }
       const logPath = path.join(app.getPath("userData"), "backend.log");
       const details = backendLogs.slice(-30).join("\n");
@@ -511,7 +559,7 @@ function monitorBackendStartup() {
           )
       );
     });
-  }, 8000);
+  }, pollMs);
 }
 
 function startBackendSupervisor() {
