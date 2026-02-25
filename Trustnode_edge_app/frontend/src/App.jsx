@@ -191,6 +191,13 @@ function tsNow() {
   return new Date().toISOString();
 }
 
+function rowTsMs(row) {
+  const raw = String(row?.ts || row?.ts_utc || "").trim();
+  if (!raw) return Number.NaN;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : Number.NaN;
+}
+
 function formatElapsedFromUtc(rawTs) {
   const txt = String(rawTs || "").trim();
   if (!txt) return "-";
@@ -2913,7 +2920,32 @@ function AppShell() {
         ]);
         if (stopped) return;
         if (histRes?.ok && Array.isArray(histRes.rows)) {
-          setDataLog(histRes.rows);
+          setDataLog((prev) => {
+            const incoming = histRes.rows || [];
+            const newestIncomingMs = incoming.reduce((max, r) => {
+              const ms = rowTsMs(r);
+              return Number.isFinite(ms) && ms > max ? ms : max;
+            }, -1);
+            const newestPrevMs = (prev || []).reduce((max, r) => {
+              const ms = rowTsMs(r);
+              return Number.isFinite(ms) && ms > max ? ms : max;
+            }, -1);
+            // Do not overwrite fresh live data with stale historian snapshots.
+            if (newestPrevMs > 0 && newestIncomingMs > 0 && newestIncomingMs < newestPrevMs - 1500) {
+              return prev;
+            }
+            const merged = [];
+            const seen = new Set();
+            const combined = [...incoming, ...(prev || [])];
+            for (const r of combined) {
+              const key = `${String(r?.gateway_id || "")}::${String(r?.tag || r?.tag_name || "")}::${String(r?.ts || r?.ts_utc || "")}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              merged.push(r);
+              if (merged.length >= 5000) break;
+            }
+            return merged;
+          });
         }
         if (logRes?.ok && Array.isArray(logRes.rows)) {
           setAppLogs(logRes.rows);
@@ -6522,12 +6554,12 @@ function AppShell() {
         </div>
         <div className="header-center">
           {isHostedWebClient && endpointMode === "cloud" ? (
-            <div className="row" style={{ gap: 8 }}>
+            <div className="header-cloud-controls">
               <span>Edge</span>
               <select
+                className="header-edge-select"
                 value={selectedCloudEdgeKey}
                 onChange={(e) => setSelectedCloudEdgeKey(e.target.value)}
-                style={{ minWidth: 220 }}
                 title="Select which edge source to monitor"
               >
                 <option value={CLOUD_EDGE_ALL_KEY}>All edges</option>

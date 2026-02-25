@@ -265,6 +265,26 @@ body {
   flex: 1;
   justify-content: center;
   min-width: 0;
+  padding: 0 8px;
+}
+
+.header-cloud-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.header-cloud-controls > span {
+  white-space: nowrap;
+}
+
+.header-edge-select {
+  min-width: 220px;
+  max-width: min(44vw, 420px);
 }
 
 .header-all-toggle {
@@ -2130,6 +2150,22 @@ input[type="checkbox"] {
 
   .header-right {
     gap: 6px;
+  }
+
+  .header-center {
+    justify-content: flex-start;
+    padding: 0 4px;
+  }
+
+  .header-cloud-controls {
+    gap: 6px;
+    justify-content: flex-start;
+  }
+
+  .header-edge-select {
+    min-width: 140px;
+    max-width: 48vw;
+    font-size: 12px;
   }
 
   .icon-btn {
