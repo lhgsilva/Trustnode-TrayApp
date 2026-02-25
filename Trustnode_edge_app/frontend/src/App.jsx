@@ -1038,6 +1038,7 @@ function AppShell() {
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [rememberUser, setRememberUser] = useState(true);
   const [loginError, setLoginError] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
   const [newUserForm, setNewUserForm] = useState({
     username: "",
     password: "",
@@ -1111,6 +1112,7 @@ function AppShell() {
     database: {}
   });
   const [devicesSeeded, setDevicesSeeded] = useState(false);
+  const [startupWarningsReady, setStartupWarningsReady] = useState(false);
 
   const buildAppStorePayload = () => ({
     app_settings: {
@@ -1707,6 +1709,11 @@ function AppShell() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(() => setStartupWarningsReady(true), 8000);
+    return () => clearTimeout(t);
   }, []);
 
   useEffect(() => {
@@ -4813,7 +4820,7 @@ function AppShell() {
         tested_for: `${deviceForm.gateway_type}|${deviceForm.plc_ip.trim()}|${deviceForm.opc_url.trim()}|${nodeListKey}`
       });
     } catch (err) {
-      setDeviceTestResult({ ok: false, message: String(err) });
+      setDeviceTestResult({ ok: false, message: String(err?.message || err || "Connection test failed") });
     } finally {
       setDeviceTestBusy(false);
     }
@@ -6098,6 +6105,22 @@ function AppShell() {
     }
   };
 
+  const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const isNetworkFetchError = (err) => /failed to fetch|networkerror|aborterror/i.test(String(err?.message || err || ""));
+  const waitForBackendReady = async (timeoutMs = 5000, pollMs = 500) => {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      try {
+        await getHealth();
+        return true;
+      } catch (_) {
+        // keep polling until timeout
+      }
+      await sleepMs(pollMs);
+    }
+    return false;
+  };
+
   const submitLogin = async () => {
     const username = String(loginForm.username || "").trim();
     const password = String(loginForm.password || "");
@@ -6105,8 +6128,17 @@ function AppShell() {
       setLoginError("Enter username and password");
       return;
     }
+    setLoginBusy(true);
     try {
-      const res = await loginAuth({ username, password });
+      let res;
+      try {
+        res = await loginAuth({ username, password });
+      } catch (firstErr) {
+        if (!isNetworkFetchError(firstErr)) throw firstErr;
+        setLoginError("Backend is starting, retrying...");
+        await waitForBackendReady(6000, 500);
+        res = await loginAuth({ username, password });
+      }
       const u = res?.user || null;
       if (!u?.username) {
         setLoginError("Login failed");
@@ -6124,7 +6156,13 @@ function AppShell() {
       setLoginForm({ username: "", password: "" });
     } catch (err) {
       clearAuthToken();
-      setLoginError(String(err?.message || "Invalid username or password"));
+      if (isNetworkFetchError(err)) {
+        setLoginError("Backend not ready yet. Please try again in a moment.");
+      } else {
+        setLoginError(String(err?.message || "Invalid username or password"));
+      }
+    } finally {
+      setLoginBusy(false);
     }
   };
 
@@ -6262,8 +6300,8 @@ function AppShell() {
             <span className="remember-label">Remember this user</span>
           </label>
           {loginError ? <div className="error">{loginError}</div> : null}
-          <button className="btn btn-primary auth-submit" onClick={submitLogin}>
-            Sign In
+          <button className="btn btn-primary auth-submit" onClick={submitLogin} disabled={loginBusy}>
+            {loginBusy ? "Signing in..." : "Sign In"}
           </button>
           <div className="auth-help">
             Default admin credentials: <strong>admin / admin</strong>
@@ -6427,7 +6465,7 @@ function AppShell() {
           <div className="content-scroll" style={{ paddingBottom: `${contentBottomPad}px` }}>
           {error ? <div className="error">{error}</div> : null}
           {status?.db_last_error ? <div className="error">Database write error: {status.db_last_error}</div> : null}
-          {unknownRunningGateways.length ? (
+          {activePage === "gateway_configuration" && appStoreHydrated && startupWarningsReady && unknownRunningGateways.length ? (
             <div className="error">
               Found running gateway workers not mapped in this page ({unknownRunningGateways.map((g) => g.gateway_id).join(", ")}).
               Use "Stop All" to stop every worker.

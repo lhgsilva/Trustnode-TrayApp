@@ -91,6 +91,21 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientFetchError(err) {
+  const msg = String(err?.message || err || "").toLowerCase();
+  return (
+    msg.includes("aborterror") ||
+    msg.includes("failed to fetch") ||
+    msg.includes("networkerror") ||
+    msg.includes("load failed") ||
+    msg.includes("signal is aborted")
+  );
+}
+
 export function setAuthToken(token) {
   if (token) localStorage.setItem(AUTH_TOKEN_KEY, String(token));
 }
@@ -205,11 +220,33 @@ export async function stopAllGatewayInstances() {
 }
 
 export async function testPlcConnection(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/test-connection`, {
+  const request = {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  });
+  };
+  let res;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      // PLC checks can be slow on first hit (ARP/NIC wakeups/edge startup).
+      res = await fetchWithTimeout(`${getApiBase()}/api/plc/test-connection`, request, 20000);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientFetchError(err) || attempt === 3) break;
+      await sleep(300 * attempt);
+    }
+  }
+  if (!res) {
+    if (isTransientFetchError(lastErr)) {
+      throw new Error(
+        "Connection test transport timeout. Backend may still be starting or local network route is unstable. Please retry."
+      );
+    }
+    throw lastErr || new Error("Connection test request failed");
+  }
   if (!res.ok) {
     let detail = "";
     try {
