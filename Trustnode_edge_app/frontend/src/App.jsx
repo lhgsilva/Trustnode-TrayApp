@@ -122,6 +122,7 @@ const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
 const CLOUD_LIVE_POLL_MS = 1000;
 const CLOUD_AUX_POLL_MS = 3000;
+const CLOUD_EDGE_ALL_KEY = "__all_edges__";
 
 class AppErrorBoundary extends Component {
   constructor(props) {
@@ -777,6 +778,7 @@ function AppShell() {
   const [bootState, setBootState] = useState("initializing");
   const [endpointMode, setEndpointMode] = useState("local");
   const [cloudUrl, setCloudUrl] = useState("");
+  const [selectedCloudEdgeKey, setSelectedCloudEdgeKey] = useState(CLOUD_EDGE_ALL_KEY);
   const [edgeLinkState, setEdgeLinkState] = useState({ state: "unknown", message: "Not checked" });
   const [endpointVersion, setEndpointVersion] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
@@ -2101,7 +2103,7 @@ function AppShell() {
     const target = getBackendTarget();
     let nextMode = target.mode || "local";
     let nextCloud = target.cloudUrl || "";
-    if (isHostedWebClient && nextMode !== "cloud") {
+    if (isHostedWebClient) {
       nextMode = "cloud";
       if (!nextCloud) nextCloud = String(window.location.origin || "").replace(/\/+$/, "");
       setBackendTarget("cloud", nextCloud);
@@ -2123,32 +2125,18 @@ function AppShell() {
 
   useEffect(() => {
     if (!isHostedWebClient || endpointMode !== "cloud") {
-      setEdgeLinkState({ state: "unknown", message: "Local check disabled (local mode)" });
+      setEdgeLinkState({ state: "unknown", message: "Cloud link check disabled (local mode)" });
       return;
     }
     let stopped = false;
     const probe = async () => {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 1600);
       try {
-        const res = await fetch("http://127.0.0.1:8000/api/health", {
-          method: "GET",
-          mode: "cors",
-          cache: "no-store",
-          signal: controller.signal
-        });
+        const res = await getHealth();
         if (stopped) return;
-        if (res.ok) {
-          setEdgeLinkState({ state: "online", message: "Reachable from this browser" });
-        } else {
-          setEdgeLinkState({ state: "offline", message: `HTTP ${res.status}` });
-        }
+        setEdgeLinkState({ state: "online", message: `Cloud API healthy (${res?.api_build || "ok"})` });
       } catch (e) {
         if (stopped) return;
-        const msg = String(e || "unreachable");
-        setEdgeLinkState({ state: "offline", message: msg.includes("Mixed Content") ? "Blocked by browser mixed-content policy" : msg });
-      } finally {
-        clearTimeout(t);
+        setEdgeLinkState({ state: "offline", message: String(e || "unreachable") });
       }
     };
     probe();
@@ -2788,6 +2776,9 @@ function AppShell() {
             nextDataRows.push({
               ts: readingTs,
               source: row?.source || "",
+              site: row?.site || "",
+              area: row?.area || "",
+              equipment: row?.equipment || "",
               gateway_id: gatewayId,
               gateway_name: row?.gateway_name || "",
               device_name: row?.device_name || "",
@@ -3406,27 +3397,204 @@ function AppShell() {
     const cloud = dbConnections.filter((d) => ["postgresql", "mysql", "mssql", "influxdb", "legacy_http"].includes(String(d.engine || ""))).length;
     return { total, online, offline, local, cloud };
   }, [dbConnections]);
+  const cloudSourceRows = useMemo(() => {
+    if (endpointMode !== "cloud") return [];
+
+    const groups = new Map();
+    const dbGroupKeyByName = new Map();
+
+    const ensureGroup = (source, site, area, equipment) => {
+      const normSource = String(source || "").trim() || "unknown-source";
+      const normSite = String(site || "").trim() || "unknown-site";
+      const normArea = String(area || "").trim() || "unknown-area";
+      const normEquipment = String(equipment || "").trim() || "unknown-equipment";
+      const key = `${normSource}||${normSite}||${normArea}||${normEquipment}`.toLowerCase();
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          source: normSource,
+          site: normSite,
+          area: normArea,
+          equipment: normEquipment,
+          dbNames: new Set(),
+          gatewayIds: new Set(),
+          lastConfigUtc: "",
+          lastLiveUtc: "",
+          liveRows: 0,
+        });
+      }
+      return groups.get(key);
+    };
+
+    for (const db of dbConnections || []) {
+      if (dbLocationFromEngine(db.engine) !== "remote") continue;
+      if (db.enabled === false) continue;
+      if (db.cloud_sync_enabled === false) continue;
+      const g = ensureGroup(db.source, db.site, db.area, db.equipment);
+      const dbName = String(db.name || "").trim();
+      if (dbName) {
+        g.dbNames.add(dbName);
+        dbGroupKeyByName.set(dbName.toLowerCase(), g.key);
+      }
+      if (db.last_check_utc && (!g.lastConfigUtc || String(db.last_check_utc) > String(g.lastConfigUtc))) {
+        g.lastConfigUtc = String(db.last_check_utc);
+      }
+    }
+
+    for (const gw of gatewayConfigs || []) {
+      const db = (dbConnections || []).find((d) => String(d.id || "") === String(gw.database_id || ""));
+      if (!db) continue;
+      const dbName = String(db.name || "").trim();
+      const groupKey = dbName ? dbGroupKeyByName.get(dbName.toLowerCase()) : "";
+      if (!groupKey) continue;
+      const g = groups.get(groupKey);
+      if (!g) continue;
+      g.gatewayIds.add(String(gw.id || ""));
+    }
+
+    for (const row of dataLog || []) {
+      const dbName = String(row?.database_name || "").trim();
+      const directGroup = ensureGroup(row?.source, row?.site, row?.area, row?.equipment);
+      const mappedGroupKey = dbName ? dbGroupKeyByName.get(dbName.toLowerCase()) : "";
+      const g = mappedGroupKey && groups.get(mappedGroupKey) ? groups.get(mappedGroupKey) : directGroup;
+      g.liveRows += 1;
+      if (dbName) g.dbNames.add(dbName);
+      const gid = String(row?.gateway_id || "").trim();
+      if (gid) g.gatewayIds.add(gid);
+      const ts = String(row?.ts || row?.ts_utc || "").trim();
+      if (ts && (!g.lastLiveUtc || ts > g.lastLiveUtc)) g.lastLiveUtc = ts;
+    }
+
+    return Array.from(groups.values())
+      .map((g) => {
+        const ageMs = g.lastLiveUtc ? Date.now() - new Date(g.lastLiveUtc).getTime() : Number.POSITIVE_INFINITY;
+        const liveHealthy = Number.isFinite(ageMs) ? ageMs <= 10000 : false;
+        return {
+          ...g,
+          dbCount: g.dbNames.size,
+          gatewayCount: g.gatewayIds.size,
+          liveHealthy,
+          dbNamesText: Array.from(g.dbNames).sort().join(", "),
+        };
+      })
+      .sort((a, b) => String(b.lastLiveUtc || b.lastConfigUtc || "").localeCompare(String(a.lastLiveUtc || a.lastConfigUtc || "")));
+  }, [endpointMode, dbConnections, gatewayConfigs, dataLog]);
+  const selectedCloudEdge = useMemo(() => {
+    if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY) return null;
+    return cloudSourceRows.find((r) => String(r.key) === String(selectedCloudEdgeKey)) || null;
+  }, [selectedCloudEdgeKey, cloudSourceRows]);
+  const isCloudEdgeFilterActive = Boolean(isHostedWebClient && endpointMode === "cloud" && selectedCloudEdge);
+  const normEdge = (v) => String(v || "").trim().toLowerCase();
+  const edgeMatches = (source, site, area, equipment) => {
+    if (!isCloudEdgeFilterActive || !selectedCloudEdge) return true;
+    return (
+      normEdge(source) === normEdge(selectedCloudEdge.source) &&
+      normEdge(site) === normEdge(selectedCloudEdge.site) &&
+      normEdge(area) === normEdge(selectedCloudEdge.area) &&
+      normEdge(equipment) === normEdge(selectedCloudEdge.equipment)
+    );
+  };
+  const matchesDbEdge = (db) => {
+    if (!db) return false;
+    if (!isCloudEdgeFilterActive) return true;
+    if (dbLocationFromEngine(db.engine) !== "remote") return false;
+    return edgeMatches(db.source, db.site, db.area, db.equipment);
+  };
+  const dbConnectionsView = useMemo(() => {
+    if (!isCloudEdgeFilterActive) return dbConnections;
+    return dbConnections.filter((db) => dbLocationFromEngine(db.engine) !== "remote" || matchesDbEdge(db));
+  }, [dbConnections, isCloudEdgeFilterActive, selectedCloudEdgeKey]);
+  const gatewayConfigsView = useMemo(() => {
+    if (!isCloudEdgeFilterActive) return gatewayConfigs;
+    return gatewayConfigs.filter((g) => {
+      const db = dbConnections.find((d) => String(d.id || "") === String(g.database_id || ""));
+      return matchesDbEdge(db);
+    });
+  }, [gatewayConfigs, dbConnections, isCloudEdgeFilterActive, selectedCloudEdgeKey]);
+  const visibleGatewayIdSet = useMemo(
+    () => new Set((gatewayConfigsView || []).map((g) => String(g.id || ""))),
+    [gatewayConfigsView]
+  );
+  const devicesView = useMemo(() => {
+    if (!isCloudEdgeFilterActive) return devices;
+    return devices.filter((d) =>
+      gatewayConfigsView.some((g) => String(g.device_id || "") === String(d.id || ""))
+    );
+  }, [devices, gatewayConfigsView, isCloudEdgeFilterActive]);
+  const dataLogView = useMemo(() => {
+    if (!isCloudEdgeFilterActive) return dataLog;
+    return dataLog.filter((row) => {
+      const gid = String(row?.gateway_id || "");
+      if (gid && visibleGatewayIdSet.has(gid)) return true;
+      const dbName = String(row?.database_name || "").trim().toLowerCase();
+      if (dbName) {
+        const db = dbConnections.find((d) => String(d.name || "").trim().toLowerCase() === dbName);
+        if (db && matchesDbEdge(db)) return true;
+      }
+      return edgeMatches(row?.source, row?.site, row?.area, row?.equipment);
+    });
+  }, [dataLog, isCloudEdgeFilterActive, visibleGatewayIdSet, dbConnections, selectedCloudEdgeKey]);
+  const appLogsView = useMemo(() => {
+    if (!isCloudEdgeFilterActive) return appLogs;
+    return appLogs.filter((row) => {
+      const gid = String(row?.gateway_id || "");
+      if (gid && visibleGatewayIdSet.has(gid)) return true;
+      const dbName = String(row?.database_name || "").trim().toLowerCase();
+      if (dbName) {
+        const db = dbConnections.find((d) => String(d.name || "").trim().toLowerCase() === dbName);
+        if (db && matchesDbEdge(db)) return true;
+      }
+      return false;
+    });
+  }, [appLogs, isCloudEdgeFilterActive, visibleGatewayIdSet, dbConnections, selectedCloudEdgeKey]);
+  const liveTagValuesView = useMemo(() => {
+    if (!isCloudEdgeFilterActive) return liveTagValues;
+    const next = {};
+    for (const [key, val] of Object.entries(liveTagValues || {})) {
+      const gid = String(val?.gateway_id || key.split("::")[0] || "");
+      if (visibleGatewayIdSet.has(gid)) next[key] = val;
+    }
+    return next;
+  }, [liveTagValues, isCloudEdgeFilterActive, visibleGatewayIdSet]);
+  const gatewayRuntimeStatusesView = useMemo(() => {
+    if (!isCloudEdgeFilterActive) return gatewayRuntimeStatuses;
+    const next = {};
+    for (const g of gatewayConfigsView) {
+      const gid = String(g.id || "");
+      if (gatewayRuntimeStatuses[gid]) next[gid] = gatewayRuntimeStatuses[gid];
+    }
+    return next;
+  }, [gatewayRuntimeStatuses, gatewayConfigsView, isCloudEdgeFilterActive]);
+  useEffect(() => {
+    if (!(isHostedWebClient && endpointMode === "cloud")) {
+      if (selectedCloudEdgeKey !== CLOUD_EDGE_ALL_KEY) setSelectedCloudEdgeKey(CLOUD_EDGE_ALL_KEY);
+      return;
+    }
+    if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY) return;
+    if (cloudSourceRows.some((r) => String(r.key) === String(selectedCloudEdgeKey))) return;
+    setSelectedCloudEdgeKey(CLOUD_EDGE_ALL_KEY);
+  }, [isHostedWebClient, endpointMode, selectedCloudEdgeKey, cloudSourceRows]);
   const getScopeDbs = (scope) => {
     const key = scope === "app" ? "use_app" : scope === "backup" ? "use_backup" : "use_gateway";
-    const rows = dbConnections.filter((d) => Boolean(d?.[key]));
+    const rows = dbConnectionsView.filter((d) => Boolean(d?.[key]));
     const local = rows.filter((d) => dbLocationFromEngine(d.engine) === "local");
     const remote = rows.filter((d) => dbLocationFromEngine(d.engine) === "remote");
     return { all: rows, local, remote };
   };
   const unknownRunningGateways = useMemo(() => {
-    const known = new Set(gatewayConfigs.map((g) => g.id));
-    return Object.values(gatewayRuntimeStatuses).filter(
+    const known = new Set(gatewayConfigsView.map((g) => g.id));
+    return Object.values(gatewayRuntimeStatusesView).filter(
       (s) => Boolean(s?.running) && !known.has(String(s?.gateway_id || ""))
     );
-  }, [gatewayRuntimeStatuses, gatewayConfigs]);
+  }, [gatewayRuntimeStatusesView, gatewayConfigsView]);
 
   const isGatewayRunning = (gateway) => {
     if (!gateway) return false;
-    return Boolean(gatewayRuntimeStatuses[gateway.id]?.running);
+    return Boolean(gatewayRuntimeStatusesView[gateway.id]?.running);
   };
   const anyGatewayRunning = useMemo(
-    () => gatewayConfigs.some((g) => Boolean(gatewayRuntimeStatuses[g.id]?.running)),
-    [gatewayConfigs, gatewayRuntimeStatuses]
+    () => gatewayConfigsView.some((g) => Boolean(gatewayRuntimeStatusesView[g.id]?.running)),
+    [gatewayConfigsView, gatewayRuntimeStatusesView]
   );
   const contentBottomPad = useMemo(
     () => (footerCollapsed ? 16 : Math.max(footerHeight + 18, 140)),
@@ -3441,11 +3609,11 @@ function AppShell() {
     readHeight();
     window.addEventListener("resize", readHeight);
     return () => window.removeEventListener("resize", readHeight);
-  }, [footerCollapsed, gatewayConfigs.length, gatewayRuntimeStatuses]);
+  }, [footerCollapsed, gatewayConfigsView.length, gatewayRuntimeStatusesView]);
 
   const deviceRows = useMemo(
     () =>
-      devices.map((d) => {
+      devicesView.map((d) => {
         const protocolOk = d.protocol_ok ?? d.port_ok;
         let status = "Offline";
         let statusKey = "offline";
@@ -3461,21 +3629,21 @@ function AppShell() {
         }
         return { ...d, protocolOk, status, statusKey };
       }),
-    [devices]
+    [devicesView]
   );
 
   const tagRows = useMemo(() => {
     const rows = [];
-    for (const gw of gatewayConfigs) {
-      const device = devices.find((d) => d.id === gw.device_id);
+    for (const gw of gatewayConfigsView) {
+      const device = devicesView.find((d) => d.id === gw.device_id);
       const tags = Array.isArray(gw.tags) ? gw.tags : [];
       for (const tag of tags) {
-        const latest = dataLog.find(
+        const latest = dataLogView.find(
           (r) =>
             String(r.tag || "") === String(tag) &&
             (!r.gateway_id || String(r.gateway_id) === String(gw.id))
         );
-        const live = liveTagValues[`${String(gw.id)}::${normalizeTagName(tag)}`];
+        const live = liveTagValuesView[`${String(gw.id)}::${normalizeTagName(tag)}`];
         rows.push({
           key: `${gw.id}::${tag}`,
           tag_name: tag,
@@ -3489,7 +3657,7 @@ function AppShell() {
       }
     }
     return rows;
-  }, [gatewayConfigs, devices, dataLog, liveTagValues]);
+  }, [gatewayConfigsView, devicesView, dataLogView, liveTagValuesView]);
 
   const filteredTagRows = useMemo(() => {
     const deviceNeedle = String(tagFilters.device || "").trim().toLowerCase();
@@ -3506,9 +3674,10 @@ function AppShell() {
 
   const dashboardItems = useMemo(() => {
     return dashboardWidgets.map((w) => {
-      const gateway = gatewayConfigs.find((g) => String(g.id) === String(w.gateway_id)) || null;
-      const device = devices.find((d) => String(d.id) === String(gateway?.device_id || "")) || null;
-      const points = dataLog
+      const gateway = gatewayConfigsView.find((g) => String(g.id) === String(w.gateway_id)) || null;
+      if (!gateway) return null;
+      const device = devicesView.find((d) => String(d.id) === String(gateway?.device_id || "")) || null;
+      const points = dataLogView
         .filter(
           (r) =>
             String(r.gateway_id || "") === String(w.gateway_id || "") &&
@@ -3545,12 +3714,12 @@ function AppShell() {
         series: points,
         monitorRow
       };
-    });
-  }, [dashboardWidgets, gatewayConfigs, devices, dataLog]);
+    }).filter(Boolean);
+  }, [dashboardWidgets, gatewayConfigsView, devicesView, dataLogView]);
 
   const tagMonitorSeries = useMemo(() => {
     if (!tagMonitorSelection) return [];
-    return dataLog
+    return dataLogView
       .filter(
         (r) =>
           String(r.tag || "") === String(tagMonitorSelection.tag_name || "") &&
@@ -3563,16 +3732,16 @@ function AppShell() {
         ts: r.ts ? fmtTs(r.ts).slice(11, 19) : "",
         value: Number(r.value)
       }));
-  }, [dataLog, tagMonitorSelection]);
+  }, [dataLogView, tagMonitorSelection]);
 
   const tagMonitorLatest = useMemo(() => {
     if (!tagMonitorSelection) return null;
-    return dataLog.find(
+    return dataLogView.find(
       (r) =>
         String(r.tag || "") === String(tagMonitorSelection.tag_name || "") &&
         (!r.gateway_id || String(r.gateway_id) === String(tagMonitorSelection.gateway_id || ""))
     ) || null;
-  }, [dataLog, tagMonitorSelection]);
+  }, [dataLogView, tagMonitorSelection]);
 
   const tagMonitorKpi = useMemo(() => {
     if (!tagMonitorSeries.length) {
@@ -3596,8 +3765,8 @@ function AppShell() {
   }, [tagMonitorSeries, tagMonitorSelection, tagMonitorLatest]);
 
   const historianRows = useMemo(() => {
-    const gatewayNameById = Object.fromEntries(gatewayConfigs.map((g) => [g.id, g.name]));
-    return dataLog.filter((row) => {
+    const gatewayNameById = Object.fromEntries(gatewayConfigsView.map((g) => [g.id, g.name]));
+    return dataLogView.filter((row) => {
       if (!inRange(row.ts, historianFilters.from, historianFilters.to)) return false;
       if (historianFilters.tag && !String(row.tag || "").toLowerCase().includes(historianFilters.tag.toLowerCase())) return false;
       if (historianFilters.gatewayId && row.gateway_id !== historianFilters.gatewayId) return false;
@@ -3608,10 +3777,10 @@ function AppShell() {
       ...row,
       gateway_name: row.gateway_name || gatewayNameById[row.gateway_id] || row.gateway_id || "-"
     }));
-  }, [dataLog, historianFilters, gatewayConfigs]);
+  }, [dataLogView, historianFilters, gatewayConfigsView]);
 
   const filteredLogs = useMemo(() => {
-    return appLogs.filter((row) => {
+    return appLogsView.filter((row) => {
       if (!inRange(row.ts, logFilters.from, logFilters.to)) return false;
       if (logFilters.level !== "all" && String(row.level || "").toLowerCase() !== logFilters.level) return false;
       if (logFilters.category !== "all" && String(row.category || "").toLowerCase() !== logFilters.category) return false;
@@ -3623,7 +3792,7 @@ function AppShell() {
       }
       return true;
     });
-  }, [appLogs, logFilters]);
+  }, [appLogsView, logFilters]);
 
   const toggleTheme = () => setTheme((prev) => (prev === "dark" ? "light" : "dark"));
   const toggleFullscreen = async () => {
@@ -3751,8 +3920,8 @@ function AppShell() {
   };
 
   const onApplyEndpoint = () => {
-    const nextMode = endpointMode === "cloud" ? "cloud" : "local";
-    const normalizedCloud = cloudUrl.trim().replace(/\/+$/, "");
+    const nextMode = isHostedWebClient ? "cloud" : (endpointMode === "cloud" ? "cloud" : "local");
+    const normalizedCloud = String(cloudUrl || window.location.origin || "").trim().replace(/\/+$/, "");
     if (nextMode === "cloud" && !/^https?:\/\//i.test(normalizedCloud)) {
       setError("Cloud URL must start with http:// or https://");
       return;
@@ -5212,15 +5381,19 @@ function AppShell() {
   const runWebsiteStatusCheck = async () => {
     setWebsiteStatusResult("");
     try {
-      const [health, cfg] = await Promise.all([getHealth(), getUiSourceConfig()]);
+      const health = await getHealth();
       const msg = [
         `Backend: ${health?.ok ? "ONLINE" : "CHECK"}`,
         `Mode: ${String(endpointMode || "local").toUpperCase()}`,
-        `UI Source: ${(cfg?.mode || uiSourceMode || "local").toUpperCase()}`
+        `UI Source: ${(uiSourceMode || "local").toUpperCase()}`
       ];
-      if ((cfg?.mode || uiSourceMode) === "remote" && (cfg?.remote_url || uiSourceRemoteUrl)) {
-        const t = await testUiSourceRemoteUrl((cfg?.remote_url || uiSourceRemoteUrl).trim());
-        msg.push(`Website URL: ${t?.ok ? "REACHABLE" : "FAILED"}`);
+      if (!isHostedWebClient || endpointMode !== "cloud") {
+        const cfg = await getUiSourceConfig();
+        msg[2] = `UI Source: ${(cfg?.mode || uiSourceMode || "local").toUpperCase()}`;
+        if ((cfg?.mode || uiSourceMode) === "remote" && (cfg?.remote_url || uiSourceRemoteUrl)) {
+          const t = await testUiSourceRemoteUrl((cfg?.remote_url || uiSourceRemoteUrl).trim());
+          msg.push(`Website URL: ${t?.ok ? "REACHABLE" : "FAILED"}`);
+        }
       }
       setWebsiteStatusResult(msg.join(" | "));
     } catch (err) {
@@ -6350,6 +6523,20 @@ function AppShell() {
         <div className="header-center">
           {isHostedWebClient && endpointMode === "cloud" ? (
             <div className="row" style={{ gap: 8 }}>
+              <span>Edge</span>
+              <select
+                value={selectedCloudEdgeKey}
+                onChange={(e) => setSelectedCloudEdgeKey(e.target.value)}
+                style={{ minWidth: 220 }}
+                title="Select which edge source to monitor"
+              >
+                <option value={CLOUD_EDGE_ALL_KEY}>All edges</option>
+                {cloudSourceRows.map((s) => (
+                  <option key={`edge-opt-${s.key}`} value={s.key}>
+                    {`${s.source} | ${s.site} | ${s.area} | ${s.equipment}`}
+                  </option>
+                ))}
+              </select>
               <span>Edge Link</span>
               <span
                 className={`status-pill ${
@@ -6690,7 +6877,7 @@ function AppShell() {
                   <div className="thead">
                     <span>Name</span><span>Device</span><span>Protocol</span><span>Address</span><span>Database</span><span>Interval</span><span>Status</span><span>Tags</span><span>Actions</span>
                   </div>
-                  {gatewayConfigs.map((g) => {
+                  {gatewayConfigsView.map((g) => {
                     const dbName = dbConnections.find((db) => db.id === g.database_id)?.name || "-";
                     const deviceName = devices.find((d) => d.id === g.device_id)?.name || "-";
                     const rt = gatewayRuntimeStatuses[g.id] || null;
@@ -6767,9 +6954,9 @@ function AppShell() {
                     <select
                       value={endpointMode}
                       onChange={(e) => setEndpointMode(e.target.value)}
-                      disabled={!canEditPage("database")}
+                      disabled={!canEditPage("database") || isHostedWebClient}
                     >
-                      <option value="local">Local Edge (127.0.0.1)</option>
+                      {!isHostedWebClient ? <option value="local">Local Edge (127.0.0.1)</option> : null}
                       <option value="cloud">Cloud API</option>
                     </select>
                   </label>
@@ -6796,7 +6983,7 @@ function AppShell() {
                 </div>
                 {isHostedWebClient && endpointMode === "cloud" ? (
                   <div className="info-note" style={{ marginTop: 8 }}>
-                    Local Edge Connection:
+                    Cloud API Connection:
                     <span
                       className={`status-pill ${
                         edgeLinkState.state === "online"
@@ -6807,7 +6994,7 @@ function AppShell() {
                       }`}
                       style={{ marginLeft: 8 }}
                     >
-                      {edgeLinkState.state === "online" ? "REACHABLE" : edgeLinkState.state === "offline" ? "UNREACHABLE" : "UNKNOWN"}
+                      {edgeLinkState.state === "online" ? "HEALTHY" : edgeLinkState.state === "offline" ? "UNREACHABLE" : "UNKNOWN"}
                     </span>
                     <span style={{ marginLeft: 8 }}>{edgeLinkState.message}</span>
                   </div>
@@ -6821,6 +7008,43 @@ function AppShell() {
                   </div>
                 ) : null}
               </section>
+              {endpointMode === "cloud" ? (
+                <section className="card">
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                    <h3 style={{ margin: 0 }}>Cloud Sources</h3>
+                    <div className="info-note" style={{ margin: 0 }}>
+                      Groups by source/site/area/equipment from cloud data and DB metadata.
+                    </div>
+                  </div>
+                  <div className="table db-table db-role-table">
+                    <div className="thead">
+                      <span>Source</span><span>Site</span><span>Area</span><span>Equipment</span><span>Databases</span><span>Gateways</span><span>Live</span><span>Last Live</span><span>Last Config</span>
+                    </div>
+                    {cloudSourceRows.map((s) => (
+                      <div key={`cloud-source-${s.key}`} className="trow">
+                        <span className="db-cell">{s.source}</span>
+                        <span className="db-cell">{s.site}</span>
+                        <span className="db-cell">{s.area}</span>
+                        <span className="db-cell">{s.equipment}</span>
+                        <span className="db-cell" title={s.dbNamesText || "-"}>{s.dbCount}</span>
+                        <span className="db-cell">{s.gatewayCount}</span>
+                        <span className="db-cell">
+                          <span className={`status-pill ${s.liveHealthy ? "status-online" : "status-offline"}`}>
+                            {s.liveHealthy ? "LIVE" : "STALE"}
+                          </span>
+                        </span>
+                        <span className="db-cell">{s.lastLiveUtc ? formatElapsedFromUtc(s.lastLiveUtc) : "-"}</span>
+                        <span className="db-cell">{s.lastConfigUtc ? formatElapsedFromUtc(s.lastConfigUtc) : "-"}</span>
+                      </div>
+                    ))}
+                    {!cloudSourceRows.length ? (
+                      <div className="trow">
+                        <span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">0</span><span className="db-cell">0</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span>
+                      </div>
+                    ) : null}
+                  </div>
+                </section>
+              ) : null}
               <section className="db-scope-grid">
               <div className="card">
                 <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
@@ -6973,7 +7197,7 @@ function AppShell() {
               <section className="card">
                 <div className="table db-table">
                   <div className="thead"><span>Name</span><span>Engine</span><span>URL</span><span>Database</span><span>Status</span><span>Writing</span><span>Last Check</span></div>
-                  {dbConnections.map((c) => (
+                  {dbConnectionsView.map((c) => (
                     <div key={`overview-${c.id}`} className="trow">
                       <span className="db-cell" title={c.name}>{c.name}</span>
                       <span className="db-cell">{c.engine}</span>
@@ -7831,7 +8055,7 @@ function AppShell() {
                       onChange={(e) => setHistorianFilters((p) => ({ ...p, gatewayId: e.target.value }))}
                     >
                       <option value="">All gateways</option>
-                      {gatewayConfigs.map((g) => (
+                      {gatewayConfigsView.map((g) => (
                         <option key={g.id} value={g.id}>{g.name}</option>
                       ))}
                     </select>
@@ -7965,7 +8189,7 @@ function AppShell() {
                     Gateway
                     <select value={logFilters.gatewayId} onChange={(e) => setLogFilters((p) => ({ ...p, gatewayId: e.target.value }))}>
                       <option value="">All gateways</option>
-                      {gatewayConfigs.map((g) => (
+                      {gatewayConfigsView.map((g) => (
                         <option key={g.id} value={g.id}>{g.name}</option>
                       ))}
                     </select>
@@ -8135,7 +8359,7 @@ function AppShell() {
                       onChange={(e) => setTagFilters((p) => ({ ...p, gatewayId: e.target.value }))}
                     >
                       <option value="">All gateways</option>
-                      {gatewayConfigs.map((g) => (
+                      {gatewayConfigsView.map((g) => (
                         <option key={g.id} value={g.id}>{g.name}</option>
                       ))}
                     </select>
@@ -8526,7 +8750,7 @@ function AppShell() {
               <div className="gateway-footer-head">
                 <span>Gateway Name</span><span>IP Address</span><span>Status</span><span>Interval</span><span>Database Writing Status</span><span>Actions</span>
               </div>
-              {gatewayConfigs.map((g) => {
+              {gatewayConfigsView.map((g) => {
                 const health = getGatewayHealth(g);
                 const running = isGatewayRunning(g);
                 return (
@@ -9391,7 +9615,7 @@ function AppShell() {
                   }}
                 >
                   <option value="">Select gateway</option>
-                  {gatewayConfigs.map((g) => (
+                  {gatewayConfigsView.map((g) => (
                     <option key={g.id} value={g.id}>{g.name}</option>
                   ))}
                 </select>
@@ -9452,7 +9676,7 @@ function AppShell() {
                   disabled={!canEditPage("triggers_and_limits")}
                 >
                   <option value="">Select gateway</option>
-                  {gatewayConfigs.map((g) => (
+                  {gatewayConfigsView.map((g) => (
                     <option key={g.id} value={g.id}>{g.name}</option>
                   ))}
                 </select>
@@ -9545,7 +9769,7 @@ function AppShell() {
                   disabled={!canEditPage("triggers_and_limits")}
                 >
                   <option value="">Select gateway</option>
-                  {gatewayConfigs.map((g) => (
+                  {gatewayConfigsView.map((g) => (
                     <option key={g.id} value={g.id}>{g.name}</option>
                   ))}
                 </select>

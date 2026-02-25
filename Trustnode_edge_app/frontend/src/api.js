@@ -24,9 +24,20 @@ function getDefaultLocalApiBase() {
   return "";
 }
 
+function isHostedWebClientRuntime() {
+  const protocol = String(window.location.protocol || "").toLowerCase();
+  const host = String(window.location.hostname || "").toLowerCase();
+  const isLocalHost = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  return (protocol === "https:" || protocol === "http:") && !isLocalHost;
+}
+
 export function getBackendTarget() {
   if (FORCE_CLOUD_URL) {
     return { mode: "cloud", cloudUrl: FORCE_CLOUD_URL, forced: true };
+  }
+  if (isHostedWebClientRuntime()) {
+    const cloudUrl = normalizeBaseUrl(localStorage.getItem(STORAGE_CLOUD_URL_KEY) || window.location.origin || "");
+    return { mode: "cloud", cloudUrl, forced: false };
   }
   const mode = localStorage.getItem(STORAGE_MODE_KEY) || "local";
   const cloudUrl = localStorage.getItem(STORAGE_CLOUD_URL_KEY) || "";
@@ -35,8 +46,13 @@ export function getBackendTarget() {
 
 export function setBackendTarget(mode, cloudUrl = "") {
   if (FORCE_CLOUD_URL) return;
-  localStorage.setItem(STORAGE_MODE_KEY, mode);
-  localStorage.setItem(STORAGE_CLOUD_URL_KEY, normalizeBaseUrl(cloudUrl));
+  const hosted = isHostedWebClientRuntime();
+  const nextMode = hosted ? "cloud" : mode;
+  const nextCloud = hosted
+    ? normalizeBaseUrl(cloudUrl || window.location.origin || "")
+    : normalizeBaseUrl(cloudUrl);
+  localStorage.setItem(STORAGE_MODE_KEY, nextMode);
+  localStorage.setItem(STORAGE_CLOUD_URL_KEY, nextCloud);
 }
 
 function getApiBase() {
