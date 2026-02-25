@@ -1294,6 +1294,7 @@ class AppStore:
 
     def _ensure_default_database_configuration(self) -> None:
         should_seed = False
+        merged_payload: list[Dict[str, Any]] | None = None
         seeded_utc = self._utc_now()
         with self._lock:
             with self._connect() as conn:
@@ -1308,12 +1309,26 @@ class AppStore:
                         payload = json.loads(str(row["payload_json"] or "[]"))
                     except Exception:
                         payload = []
-                    should_seed = isinstance(payload, list) and len(payload) == 0
+                    if isinstance(payload, list) and len(payload) == 0:
+                        should_seed = True
+                    elif isinstance(payload, list):
+                        has_default_id = any(
+                            isinstance(item, dict) and str(item.get("id") or "").strip() == self.DEFAULT_LOCAL_DB_ID
+                            for item in payload
+                        )
+                        has_any_local_db = any(
+                            isinstance(item, dict)
+                            and str(item.get("engine") or "").strip().lower() in ("sqlite", "csv_file", "txt_file", "legacy_http")
+                            for item in payload
+                        )
+                        if (not has_default_id) and (not has_any_local_db):
+                            merged_payload = [*payload, self._default_local_database_configuration()]
+                            should_seed = True
 
         if should_seed:
             self.upsert_domain(
                 "database_configurations",
-                [self._default_local_database_configuration()],
+                merged_payload if isinstance(merged_payload, list) else [self._default_local_database_configuration()],
                 actor="system",
             )
             self._mark_default_local_database_seeded(seeded_utc)
