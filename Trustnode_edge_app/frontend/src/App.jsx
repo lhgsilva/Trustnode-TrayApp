@@ -1189,8 +1189,18 @@ function AppShell() {
 
     if (appSettings.theme === "light" || appSettings.theme === "dark") setTheme(appSettings.theme);
     if (typeof appSettings.remember_user === "boolean") setRememberUser(appSettings.remember_user);
-    if (typeof appSettings.endpoint_mode === "string") setEndpointMode(appSettings.endpoint_mode);
-    if (typeof appSettings.cloud_url === "string") setCloudUrl(appSettings.cloud_url);
+    if (!isHostedWebClient && typeof appSettings.endpoint_mode === "string") {
+      setEndpointMode(appSettings.endpoint_mode);
+    }
+    if (typeof appSettings.cloud_url === "string") {
+      setCloudUrl(appSettings.cloud_url);
+    }
+    if (isHostedWebClient) {
+      const forcedCloud = String(appSettings.cloud_url || window.location.origin || "").trim().replace(/\/+$/, "");
+      setEndpointMode("cloud");
+      if (forcedCloud) setCloudUrl(forcedCloud);
+      setBackendTarget("cloud", forcedCloud);
+    }
     if (typeof appSettings.ui_source_mode === "string") setUiSourceMode(appSettings.ui_source_mode);
     if (typeof appSettings.ui_source_remote_url === "string") setUiSourceRemoteUrl(appSettings.ui_source_remote_url);
     if (typeof appSettings.ui_source_local_path === "string") setUiSourceLocalPath(appSettings.ui_source_local_path);
