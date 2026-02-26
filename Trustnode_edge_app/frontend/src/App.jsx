@@ -2745,6 +2745,17 @@ function AppShell() {
         const liveRes = await getAppStoreLive(5000);
         if (stopped) return;
         if (liveRes?.ok && Array.isArray(liveRes.rows)) {
+          const dbMetaByName = new Map();
+          for (const db of dbConnectionsRef.current || []) {
+            const nameKey = String(db?.name || "").trim().toLowerCase();
+            if (!nameKey) continue;
+            dbMetaByName.set(nameKey, {
+              source: String(db?.source || "").trim(),
+              site: String(db?.site || "").trim(),
+              area: String(db?.area || "").trim(),
+              equipment: String(db?.equipment || "").trim(),
+            });
+          }
           const nextLive = {};
           const nextReadings = [];
           const nextDataRows = [];
@@ -2760,6 +2771,8 @@ function AppShell() {
             const readingTs = String(row?.ts || tsNow());
             const quality = row?.quality;
             const qualityLabel = row?.quality_label || qualityLabelFromCode(quality);
+            const dbName = String(row?.database_name || "").trim();
+            const dbMeta = dbMetaByName.get(dbName.toLowerCase()) || null;
             nextLive[key] = {
               gateway_id: gatewayId,
               tag: rawTag,
@@ -2782,22 +2795,21 @@ function AppShell() {
             });
             nextDataRows.push({
               ts: readingTs,
-              source: row?.source || "",
-              site: row?.site || "",
-              area: row?.area || "",
-              equipment: row?.equipment || "",
+              source: dbMeta?.source || row?.source || "",
+              site: dbMeta?.site || row?.site || "",
+              area: dbMeta?.area || row?.area || "",
+              equipment: dbMeta?.equipment || row?.equipment || "",
               gateway_id: gatewayId,
               gateway_name: row?.gateway_name || "",
               device_name: row?.device_name || "",
               plc_ip: row?.plc_ip || "",
-              database_name: row?.database_name || "",
+              database_name: dbName,
               tag: rawTag,
               value: row?.value,
               quality,
               quality_label: qualityLabel
             });
             if (gatewayId && !latestByGateway[gatewayId]) latestByGateway[gatewayId] = readingTs;
-            const dbName = String(row?.database_name || "").trim();
             if (dbName && !latestByDbName[dbName]) latestByDbName[dbName] = readingTs;
             const plcIp = String(row?.plc_ip || "").trim();
             if (plcIp && !latestByPlcIp[plcIp]) latestByPlcIp[plcIp] = readingTs;
