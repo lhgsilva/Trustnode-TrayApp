@@ -198,6 +198,34 @@ function rowTsMs(row) {
   return Number.isFinite(ms) ? ms : Number.NaN;
 }
 
+function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000) {
+  const incoming = Array.isArray(incomingRows) ? incomingRows : [];
+  const prev = Array.isArray(prevRows) ? prevRows : [];
+  if (!incoming.length) return prev;
+  const newestIncomingMs = incoming.reduce((max, r) => {
+    const ms = rowTsMs(r);
+    return Number.isFinite(ms) && ms > max ? ms : max;
+  }, -1);
+  const newestPrevMs = prev.reduce((max, r) => {
+    const ms = rowTsMs(r);
+    return Number.isFinite(ms) && ms > max ? ms : max;
+  }, -1);
+  if (newestPrevMs > 0 && newestIncomingMs > 0 && newestIncomingMs < newestPrevMs - 1500) {
+    return prev;
+  }
+  const merged = [];
+  const seen = new Set();
+  const combined = [...incoming, ...prev];
+  for (const r of combined) {
+    const key = `${String(r?.gateway_id || "")}::${String(r?.tag || r?.tag_name || "")}::${String(r?.ts || r?.ts_utc || "")}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(r);
+    if (merged.length >= limit) break;
+  }
+  return merged;
+}
+
 function formatElapsedFromUtc(rawTs) {
   const txt = String(rawTs || "").trim();
   if (!txt) return "-";
@@ -2141,6 +2169,15 @@ function AppShell() {
   }, [isHostedWebClient]);
 
   useEffect(() => {
+    if (!isHostedWebClient) return;
+    if (endpointMode === "cloud") return;
+    const forcedCloud = String(cloudUrl || window.location.origin || "").trim().replace(/\/+$/, "");
+    setEndpointMode("cloud");
+    if (forcedCloud) setCloudUrl(forcedCloud);
+    setBackendTarget("cloud", forcedCloud);
+  }, [isHostedWebClient, endpointMode, cloudUrl]);
+
+  useEffect(() => {
     if (!isHostedWebClient || endpointMode !== "cloud") {
       setEdgeLinkState({ state: "unknown", message: "Cloud link check disabled (local mode)" });
       return;
@@ -2707,7 +2744,9 @@ function AppShell() {
               });
             }
           }
-          if (Array.isArray(data.historian_rows) && data.historian_rows.length) setDataLog(data.historian_rows);
+          if (Array.isArray(data.historian_rows) && data.historian_rows.length) {
+            setDataLog((prev) => mergeHistorianRowsStable(data.historian_rows, prev, 5000));
+          }
           if (Array.isArray(data.log_rows) && data.log_rows.length) setAppLogs(data.log_rows);
           if (data.inspector) setDatabaseInspector(data.inspector);
           if (Array.isArray(data.gateway_statuses)) {
@@ -2941,32 +2980,7 @@ function AppShell() {
         ]);
         if (stopped) return;
         if (histRes?.ok && Array.isArray(histRes.rows)) {
-          setDataLog((prev) => {
-            const incoming = histRes.rows || [];
-            const newestIncomingMs = incoming.reduce((max, r) => {
-              const ms = rowTsMs(r);
-              return Number.isFinite(ms) && ms > max ? ms : max;
-            }, -1);
-            const newestPrevMs = (prev || []).reduce((max, r) => {
-              const ms = rowTsMs(r);
-              return Number.isFinite(ms) && ms > max ? ms : max;
-            }, -1);
-            // Do not overwrite fresh live data with stale historian snapshots.
-            if (newestPrevMs > 0 && newestIncomingMs > 0 && newestIncomingMs < newestPrevMs - 1500) {
-              return prev;
-            }
-            const merged = [];
-            const seen = new Set();
-            const combined = [...incoming, ...(prev || [])];
-            for (const r of combined) {
-              const key = `${String(r?.gateway_id || "")}::${String(r?.tag || r?.tag_name || "")}::${String(r?.ts || r?.ts_utc || "")}`;
-              if (seen.has(key)) continue;
-              seen.add(key);
-              merged.push(r);
-              if (merged.length >= 5000) break;
-            }
-            return merged;
-          });
+          setDataLog((prev) => mergeHistorianRowsStable(histRes.rows, prev, 5000));
         }
         if (logRes?.ok && Array.isArray(logRes.rows)) {
           setAppLogs(logRes.rows);
@@ -3315,6 +3329,14 @@ function AppShell() {
   };
   const getGatewayHealth = (gateway) => {
     if (!gateway) return { ok: false, label: "Not Ready" };
+    const rt = gatewayRuntimeStatusesView[gateway.id] || gatewayRuntimeStatuses[gateway.id] || null;
+    const runtimeStoppedClean =
+      endpointMode === "cloud" &&
+      rt &&
+      rt.running === false &&
+      !String(rt.last_error || "").trim() &&
+      !String(rt.db_last_error || "").trim();
+    if (runtimeStoppedClean) return { ok: false, label: "Stopped" };
     const device = devices.find((d) => d.id === gateway.device_id) || null;
     const db = dbConnections.find((c) => c.id === gateway.database_id) || null;
     const deviceProtocolOk = Boolean(device && (device.protocol_ok ?? device.port_ok));
@@ -3667,10 +3689,25 @@ function AppShell() {
   const deviceRows = useMemo(
     () =>
       devicesView.map((d) => {
+        const relatedGateways = gatewayConfigsView.filter((g) => String(g.device_id || "") === String(d.id || ""));
+        const relatedRuntime = relatedGateways.map((g) => gatewayRuntimeStatusesView[g.id]).filter(Boolean);
+        const hasRelated = relatedRuntime.length > 0;
+        const allStoppedClean =
+          endpointMode === "cloud" &&
+          hasRelated &&
+          relatedRuntime.every(
+            (rt) =>
+              rt?.running === false &&
+              !String(rt?.last_error || "").trim() &&
+              !String(rt?.db_last_error || "").trim()
+          );
         const protocolOk = d.protocol_ok ?? d.port_ok;
         let status = "Offline";
         let statusKey = "offline";
-        if (d.ping_ok && protocolOk) {
+        if (allStoppedClean) {
+          status = "Stopped";
+          statusKey = "warning";
+        } else if (d.ping_ok && protocolOk) {
           status = "Online";
           statusKey = "online";
         } else if (d.ping_ok && !protocolOk) {
@@ -3682,7 +3719,7 @@ function AppShell() {
         }
         return { ...d, protocolOk, status, statusKey };
       }),
-    [devicesView]
+    [devicesView, gatewayConfigsView, gatewayRuntimeStatusesView, endpointMode]
   );
 
   const tagRows = useMemo(() => {
