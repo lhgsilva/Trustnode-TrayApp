@@ -2734,7 +2734,6 @@ function AppShell() {
   useEffect(() => {
     if (endpointMode !== "cloud") return;
     if (!currentUser) return;
-    if (cloudStreamConnected) return;
     let stopped = false;
     let runningLive = false;
     let runningAux = false;
@@ -6573,7 +6572,7 @@ function AppShell() {
           </div>
         </div>
         <div className="header-center">
-          {isHostedWebClient && endpointMode === "cloud" ? (
+          {endpointMode === "cloud" ? (
             <div className="header-cloud-controls">
               <span>Edge</span>
               <select
