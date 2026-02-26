@@ -492,18 +492,33 @@ class AppStore:
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
             with engine.begin() as conn:
-                rows = conn.execute(
-                    text(
-                        f"""
-                        SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                               tag_name, value, quality, quality_label
-                        FROM "{schema}"."historian_readings"
-                        ORDER BY id DESC
-                        LIMIT :lim
-                        """
-                    ),
-                    {"lim": lim},
-                ).fetchall()
+                try:
+                    rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                   tag_name, value, quality, quality_label
+                            FROM "{schema}"."historian_readings"
+                            ORDER BY id DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": lim},
+                    ).fetchall()
+                except Exception:
+                    # Compatibility fallback for deployments that only have plc_readings.
+                    rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                   tag_name, value, quality, quality_label
+                            FROM "{schema}"."plc_readings"
+                            ORDER BY id DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": lim},
+                    ).fetchall()
             out: list[dict[str, Any]] = []
             for r in rows:
                 out.append(
@@ -614,35 +629,77 @@ class AppStore:
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
             with engine.begin() as conn:
-                rows = conn.execute(
-                    text(
-                        f"""
-                        SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                               tag_name, value, quality, quality_label
-                        FROM "{schema}"."live_latest"
-                        ORDER BY ts_utc DESC
-                        LIMIT :lim
-                        """
-                    ),
-                    {"lim": lim},
-                ).fetchall()
+                try:
+                    rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                   tag_name, value, quality, quality_label
+                            FROM "{schema}"."live_latest"
+                            ORDER BY ts_utc DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": lim},
+                    ).fetchall()
+                except Exception:
+                    rows = []
+                if not rows:
+                    # Compatibility fallback: derive latest-per-tag from historian/plc_readings.
+                    try:
+                        rows = conn.execute(
+                            text(
+                                f"""
+                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                       tag_name, value, quality, quality_label
+                                FROM "{schema}"."historian_readings"
+                                ORDER BY id DESC
+                                LIMIT :lim
+                                """
+                            ),
+                            {"lim": max(lim, 20000)},
+                        ).fetchall()
+                    except Exception:
+                        rows = conn.execute(
+                            text(
+                                f"""
+                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                       tag_name, value, quality, quality_label
+                                FROM "{schema}"."plc_readings"
+                                ORDER BY id DESC
+                                LIMIT :lim
+                                """
+                            ),
+                            {"lim": max(lim, 20000)},
+                        ).fetchall()
             out: list[dict[str, Any]] = []
+            seen: set[tuple[str, str]] = set()
             for r in rows:
+                gateway_id = str(r[2] or "")
+                tag_name = str(r[7] or "")
+                if not tag_name:
+                    continue
+                key = (gateway_id, tag_name)
+                if key in seen:
+                    continue
+                seen.add(key)
                 out.append(
                     {
                         "ts": str(r[0] or ""),
                         "source": str(r[1] or ""),
-                        "gateway_id": str(r[2] or ""),
+                        "gateway_id": gateway_id,
                         "gateway_name": str(r[3] or ""),
                         "device_name": str(r[4] or ""),
                         "plc_ip": str(r[5] or ""),
                         "database_name": str(r[6] or ""),
-                        "tag": str(r[7] or ""),
+                        "tag": tag_name,
                         "value": r[8],
                         "quality": r[9],
                         "quality_label": str(r[10] or ""),
                     }
                 )
+                if len(out) >= lim:
+                    break
             return out
         except Exception:
             return []
@@ -848,6 +905,44 @@ class AppStore:
                         """
                     )
                 )
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS "{schema}"."plc_readings" (
+                          id BIGSERIAL PRIMARY KEY,
+                          local_id BIGINT UNIQUE NOT NULL,
+                          ts_utc TIMESTAMPTZ NOT NULL,
+                          gateway_id TEXT NULL,
+                          gateway_name TEXT NULL,
+                          device_name TEXT NULL,
+                          plc_ip TEXT NULL,
+                          database_name TEXT NULL,
+                          tag_name TEXT NOT NULL,
+                          value DOUBLE PRECISION NULL,
+                          quality INTEGER NULL,
+                          quality_label TEXT NULL,
+                          source TEXT NULL,
+                          created_utc TIMESTAMPTZ NULL
+                        )
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS local_id BIGINT
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE UNIQUE INDEX IF NOT EXISTS "ux_plc_local_id"
+                        ON "{schema}"."plc_readings"(local_id)
+                        """
+                    )
+                )
                 # Backward-compatible migration for existing cloud tables that
                 # were created without local_id in older builds.
                 conn.execute(
@@ -959,6 +1054,36 @@ class AppStore:
                         text(
                             f"""
                             INSERT INTO "{schema}"."historian_readings"
+                            (local_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
+                            VALUES
+                            (:local_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
+                            ON CONFLICT(local_id) DO NOTHING
+                            """
+                        ),
+                        [
+                            {
+                                "local_id": int(r["id"]),
+                                "ts_utc": str(r["ts_utc"] or ""),
+                                "gateway_id": str(r["gateway_id"] or ""),
+                                "gateway_name": str(r["gateway_name"] or ""),
+                                "device_name": str(r["device_name"] or ""),
+                                "plc_ip": str(r["plc_ip"] or ""),
+                                "database_name": str(r["database_name"] or ""),
+                                "tag_name": str(r["tag_name"] or ""),
+                                "value": r["value"],
+                                "quality": r["quality"],
+                                "quality_label": str(r["quality_label"] or ""),
+                                "source": str(r["source"] or ""),
+                                "created_utc": str(r["created_utc"] or ""),
+                            }
+                            for r in hist_rows
+                        ],
+                    )
+                    # Keep legacy/default table in sync for compatibility.
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."plc_readings"
                             (local_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
                             VALUES
                             (:local_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
@@ -1727,6 +1852,19 @@ class AppStore:
             return {"ok": False, "run_utc": run_utc, "dry_run": dry_run, "details": details, "message": str(exc)}
 
     def get_bootstrap(self) -> Dict[str, Any]:
+        prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if prefer_cloud:
+            try:
+                # In hosted mode, refresh local config cache from cloud first so
+                # web clients see the latest edge-pushed configuration.
+                self._pull_config_from_cloud_once()
+            except Exception:
+                pass
         out: Dict[str, Any] = {}
         with self._lock:
             with self._connect() as conn:
@@ -2146,10 +2284,64 @@ class AppStore:
             "yes",
             "on",
         }
+        def _row_ts_ms(row: dict[str, Any]) -> int:
+            raw = str(row.get("ts") or row.get("ts_utc") or "").strip()
+            if not raw:
+                return 0
+            try:
+                text = raw.replace("Z", "+00:00")
+                if " " in text and "T" not in text:
+                    text = text.replace(" ", "T")
+                return int(datetime.fromisoformat(text).timestamp() * 1000)
+            except Exception:
+                return 0
+
+        def _latest_per_gateway_tag(rows: list[dict[str, Any]], take: int) -> list[dict[str, Any]]:
+            out_latest: dict[tuple[str, str], dict[str, Any]] = {}
+            for row in rows:
+                gateway_id = str(row.get("gateway_id") or "").strip()
+                tag = str(row.get("tag") or row.get("tag_name") or "").strip()
+                if not tag:
+                    continue
+                key = (gateway_id, tag)
+                if key in out_latest:
+                    continue
+                out_latest[key] = {
+                    "ts": str(row.get("ts") or row.get("ts_utc") or ""),
+                    "source": str(row.get("source") or ""),
+                    "gateway_id": gateway_id,
+                    "gateway_name": str(row.get("gateway_name") or ""),
+                    "device_name": str(row.get("device_name") or ""),
+                    "plc_ip": str(row.get("plc_ip") or ""),
+                    "database_name": str(row.get("database_name") or ""),
+                    "tag": tag,
+                    "value": row.get("value"),
+                    "quality": row.get("quality"),
+                    "quality_label": str(row.get("quality_label") or ""),
+                }
+                if len(out_latest) >= take:
+                    break
+            return list(out_latest.values())
+
         if prefer_cloud:
             cloud_live = self._fetch_live_rows_from_cloud(lim)
+            cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim, 2000), 10000))
+            if cloud_live and cloud_hist:
+                latest_live_ms = max((_row_ts_ms(r) for r in cloud_live), default=0)
+                latest_hist_ms = max((_row_ts_ms(r) for r in cloud_hist), default=0)
+                # If live_latest lags materially behind historian, serve latest rows
+                # derived from historian so web charts remain visibly live.
+                if latest_hist_ms > 0 and latest_hist_ms > latest_live_ms + 1500:
+                    hist_live = _latest_per_gateway_tag(cloud_hist, lim)
+                    if hist_live:
+                        return hist_live
+                return cloud_live
             if cloud_live:
                 return cloud_live
+            if cloud_hist:
+                hist_live = _latest_per_gateway_tag(cloud_hist, lim)
+                if hist_live:
+                    return hist_live
 
         with self._lock:
             with self._connect() as conn:
