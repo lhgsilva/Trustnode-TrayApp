@@ -5431,17 +5431,25 @@ function AppShell() {
         `Mode: ${String(endpointMode || "local").toUpperCase()}`,
         `UI Source: ${(uiSourceMode || "local").toUpperCase()}`
       ];
-      if (!isHostedWebClient || endpointMode !== "cloud") {
+      const inCloudWebMode = Boolean(isHostedWebClient && endpointMode === "cloud");
+      if (!inCloudWebMode) {
         const cfg = await getUiSourceConfig();
         msg[2] = `UI Source: ${(cfg?.mode || uiSourceMode || "local").toUpperCase()}`;
         if ((cfg?.mode || uiSourceMode) === "remote" && (cfg?.remote_url || uiSourceRemoteUrl)) {
           const t = await testUiSourceRemoteUrl((cfg?.remote_url || uiSourceRemoteUrl).trim());
           msg.push(`Website URL: ${t?.ok ? "REACHABLE" : "FAILED"}`);
         }
+      } else {
+        msg.push("Cloud web mode: skipping local UI-source probes");
       }
       setWebsiteStatusResult(msg.join(" | "));
     } catch (err) {
-      setWebsiteStatusResult(`Status check failed: ${String(err)}`);
+      const raw = String(err || "");
+      if (isHostedWebClient && endpointMode === "cloud" && raw.toLowerCase().includes("ui source")) {
+        setWebsiteStatusResult("Backend: ONLINE | Mode: CLOUD | Cloud web mode active");
+        return;
+      }
+      setWebsiteStatusResult(`Status check failed: ${raw}`);
     }
   };
 

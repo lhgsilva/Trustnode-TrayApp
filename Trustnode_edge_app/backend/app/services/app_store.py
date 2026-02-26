@@ -938,6 +938,86 @@ class AppStore:
                 conn.execute(
                     text(
                         f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS gateway_id TEXT
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS gateway_name TEXT
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS device_name TEXT
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS plc_ip TEXT
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS database_name TEXT
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS tag_name TEXT
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS quality INTEGER
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS quality_label TEXT
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS source TEXT
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        ALTER TABLE "{schema}"."plc_readings"
+                        ADD COLUMN IF NOT EXISTS created_utc TIMESTAMPTZ
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
                         CREATE UNIQUE INDEX IF NOT EXISTS "ux_plc_local_id"
                         ON "{schema}"."plc_readings"(local_id)
                         """
