@@ -30,6 +30,8 @@ class AppStore:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._cloud_schema_lock = threading.Lock()
+        self._cloud_schema_ready_keys: set[str] = set()
         self._db_path = self._resolve_db_path()
         self._stop_event = threading.Event()
         self._sync_wakeup_event = threading.Event()
@@ -52,6 +54,135 @@ class AppStore:
         self._sync_thread = threading.Thread(target=self._config_sync_loop, daemon=True)
         self._scheduler_thread.start()
         self._sync_thread.start()
+
+    def _cloud_target_schema_key(self, cloud: dict[str, Any], schema: str) -> str:
+        return "|".join(
+            [
+                str(cloud.get("host") or "").strip().lower(),
+                str(cloud.get("port") or "").strip(),
+                str(cloud.get("database") or "").strip().lower(),
+                str(cloud.get("username") or "").strip().lower(),
+                str(schema or "public").strip().lower(),
+            ]
+        )
+
+    def _ensure_cloud_schema_once(self, engine: Any, schema: str, target_key: str) -> None:
+        if target_key in self._cloud_schema_ready_keys:
+            return
+        with self._cloud_schema_lock:
+            if target_key in self._cloud_schema_ready_keys:
+                return
+            from sqlalchemy import text  # type: ignore
+
+            with engine.begin() as conn:
+                if schema != "public":
+                    conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS "{schema}"."historian_readings" (
+                          id BIGSERIAL PRIMARY KEY,
+                          local_id BIGINT UNIQUE NOT NULL,
+                          ts_utc TIMESTAMPTZ NOT NULL,
+                          gateway_id TEXT NULL,
+                          gateway_name TEXT NULL,
+                          device_name TEXT NULL,
+                          plc_ip TEXT NULL,
+                          database_name TEXT NULL,
+                          tag_name TEXT NOT NULL,
+                          value DOUBLE PRECISION NULL,
+                          quality INTEGER NULL,
+                          quality_label TEXT NULL,
+                          source TEXT NULL,
+                          created_utc TIMESTAMPTZ NULL
+                        )
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS "{schema}"."plc_readings" (
+                          id BIGSERIAL PRIMARY KEY,
+                          local_id BIGINT UNIQUE NOT NULL,
+                          ts_utc TIMESTAMPTZ NOT NULL,
+                          gateway_id TEXT NULL,
+                          gateway_name TEXT NULL,
+                          device_name TEXT NULL,
+                          plc_ip TEXT NULL,
+                          database_name TEXT NULL,
+                          tag_name TEXT NOT NULL,
+                          value DOUBLE PRECISION NULL,
+                          quality INTEGER NULL,
+                          quality_label TEXT NULL,
+                          source TEXT NULL,
+                          created_utc TIMESTAMPTZ NULL
+                        )
+                        """
+                    )
+                )
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS local_id BIGINT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS gateway_id TEXT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS gateway_name TEXT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS device_name TEXT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS plc_ip TEXT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS database_name TEXT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS tag_name TEXT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS quality INTEGER'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS quality_label TEXT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS source TEXT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS created_utc TIMESTAMPTZ'))
+                conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_plc_local_id" ON "{schema}"."plc_readings"(local_id)'))
+
+                # Compatibility migration for pre-local_id deployments.
+                conn.execute(text(f'ALTER TABLE "{schema}"."historian_readings" ADD COLUMN IF NOT EXISTS local_id BIGINT'))
+                conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_hist_local_id" ON "{schema}"."historian_readings"(local_id)'))
+
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS "{schema}"."app_logs" (
+                          id BIGSERIAL PRIMARY KEY,
+                          local_id BIGINT UNIQUE NOT NULL,
+                          ts_utc TIMESTAMPTZ NOT NULL,
+                          level TEXT NOT NULL,
+                          category TEXT NOT NULL,
+                          message TEXT NOT NULL,
+                          gateway_id TEXT NULL,
+                          gateway_name TEXT NULL,
+                          device_name TEXT NULL,
+                          database_name TEXT NULL,
+                          created_utc TIMESTAMPTZ NULL
+                        )
+                        """
+                    )
+                )
+                conn.execute(text(f'ALTER TABLE "{schema}"."app_logs" ADD COLUMN IF NOT EXISTS local_id BIGINT'))
+                conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_logs_local_id" ON "{schema}"."app_logs"(local_id)'))
+
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS "{schema}"."live_latest" (
+                          gateway_id TEXT NOT NULL DEFAULT '',
+                          tag_name TEXT NOT NULL,
+                          ts_utc TIMESTAMPTZ NOT NULL,
+                          source TEXT NULL,
+                          gateway_name TEXT NULL,
+                          device_name TEXT NULL,
+                          plc_ip TEXT NULL,
+                          database_name TEXT NULL,
+                          value DOUBLE PRECISION NULL,
+                          quality INTEGER NULL,
+                          quality_label TEXT NULL,
+                          updated_utc TIMESTAMPTZ NULL,
+                          PRIMARY KEY(gateway_id, tag_name)
+                        )
+                        """
+                    )
+                )
+                conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_ts" ON "{schema}"."live_latest"(ts_utc DESC)'))
+            self._cloud_schema_ready_keys.add(target_key)
 
     def _resolve_db_path(self) -> str:
         env_path = os.environ.get("TRUSTNODE_APP_STORE_PATH", "").strip()
@@ -837,6 +968,7 @@ class AppStore:
             "prepare_threshold": None,
         }
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+        target_key = self._cloud_target_schema_key(cloud, schema)
         state = self._get_data_sync_state()
         last_hist_id = int(state.get("last_historian_id", 0))
         last_log_id = int(state.get("last_log_id", 0))
@@ -910,232 +1042,14 @@ class AppStore:
                 self._set_data_sync_state(last_data_sync_utc=self._utc_now(), last_data_error="")
                 return
 
-            with engine.begin() as conn:
-                if schema != "public":
-                    conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE TABLE IF NOT EXISTS "{schema}"."historian_readings" (
-                          id BIGSERIAL PRIMARY KEY,
-                          local_id BIGINT UNIQUE NOT NULL,
-                          ts_utc TIMESTAMPTZ NOT NULL,
-                          gateway_id TEXT NULL,
-                          gateway_name TEXT NULL,
-                          device_name TEXT NULL,
-                          plc_ip TEXT NULL,
-                          database_name TEXT NULL,
-                          tag_name TEXT NOT NULL,
-                          value DOUBLE PRECISION NULL,
-                          quality INTEGER NULL,
-                          quality_label TEXT NULL,
-                          source TEXT NULL,
-                          created_utc TIMESTAMPTZ NULL
-                        )
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE TABLE IF NOT EXISTS "{schema}"."plc_readings" (
-                          id BIGSERIAL PRIMARY KEY,
-                          local_id BIGINT UNIQUE NOT NULL,
-                          ts_utc TIMESTAMPTZ NOT NULL,
-                          gateway_id TEXT NULL,
-                          gateway_name TEXT NULL,
-                          device_name TEXT NULL,
-                          plc_ip TEXT NULL,
-                          database_name TEXT NULL,
-                          tag_name TEXT NOT NULL,
-                          value DOUBLE PRECISION NULL,
-                          quality INTEGER NULL,
-                          quality_label TEXT NULL,
-                          source TEXT NULL,
-                          created_utc TIMESTAMPTZ NULL
-                        )
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS local_id BIGINT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS gateway_id TEXT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS gateway_name TEXT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS device_name TEXT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS plc_ip TEXT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS database_name TEXT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS tag_name TEXT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS quality INTEGER
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS quality_label TEXT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS source TEXT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."plc_readings"
-                        ADD COLUMN IF NOT EXISTS created_utc TIMESTAMPTZ
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE UNIQUE INDEX IF NOT EXISTS "ux_plc_local_id"
-                        ON "{schema}"."plc_readings"(local_id)
-                        """
-                    )
-                )
-                # Backward-compatible migration for existing cloud tables that
-                # were created without local_id in older builds.
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."historian_readings"
-                        ADD COLUMN IF NOT EXISTS local_id BIGINT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE UNIQUE INDEX IF NOT EXISTS "ux_hist_local_id"
-                        ON "{schema}"."historian_readings"(local_id)
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE TABLE IF NOT EXISTS "{schema}"."app_logs" (
-                          id BIGSERIAL PRIMARY KEY,
-                          local_id BIGINT UNIQUE NOT NULL,
-                          ts_utc TIMESTAMPTZ NOT NULL,
-                          level TEXT NOT NULL,
-                          category TEXT NOT NULL,
-                          message TEXT NOT NULL,
-                          gateway_id TEXT NULL,
-                          gateway_name TEXT NULL,
-                          device_name TEXT NULL,
-                          database_name TEXT NULL,
-                          created_utc TIMESTAMPTZ NULL
-                        )
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        ALTER TABLE "{schema}"."app_logs"
-                        ADD COLUMN IF NOT EXISTS local_id BIGINT
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE UNIQUE INDEX IF NOT EXISTS "ux_logs_local_id"
-                        ON "{schema}"."app_logs"(local_id)
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE TABLE IF NOT EXISTS "{schema}"."live_latest" (
-                          gateway_id TEXT NOT NULL DEFAULT '',
-                          tag_name TEXT NOT NULL,
-                          ts_utc TIMESTAMPTZ NOT NULL,
-                          source TEXT NULL,
-                          gateway_name TEXT NULL,
-                          device_name TEXT NULL,
-                          plc_ip TEXT NULL,
-                          database_name TEXT NULL,
-                          value DOUBLE PRECISION NULL,
-                          quality INTEGER NULL,
-                          quality_label TEXT NULL,
-                          updated_utc TIMESTAMPTZ NULL,
-                          PRIMARY KEY(gateway_id, tag_name)
-                        )
-                        """
-                    )
-                )
-                conn.execute(
-                    text(
-                        f"""
-                        CREATE INDEX IF NOT EXISTS "ix_live_latest_ts"
-                        ON "{schema}"."live_latest"(ts_utc DESC)
-                        """
-                    )
-                )
+            try:
+                self._ensure_cloud_schema_once(engine, schema, target_key)
+            except Exception:
+                # Do not block data flow on transient DDL deadlocks/locks.
+                # Writes below will still work if schema already exists.
+                pass
 
+            with engine.begin() as conn:
                 if live_latest_rows:
                     conn.execute(
                         text(
