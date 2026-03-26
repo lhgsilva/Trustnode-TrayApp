@@ -247,7 +247,7 @@ body {
   background: var(--header);
   color: var(--header-text);
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(200px, auto) minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   padding: 0 14px;
@@ -264,7 +264,7 @@ body {
 
 .header-center {
   flex: 1;
-  justify-content: center;
+  justify-content: flex-start;
   min-width: 0;
   padding: 0 8px;
   overflow: hidden;
@@ -273,10 +273,11 @@ body {
 .header-cloud-controls {
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 8px;
   flex-wrap: nowrap;
   min-width: 0;
+  width: 100%;
   max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
@@ -287,9 +288,14 @@ body {
   white-space: nowrap;
 }
 
+.header-cloud-label {
+  opacity: .9;
+  font-size: 12px;
+}
+
 .header-edge-select {
-  min-width: 240px;
-  max-width: min(52vw, 560px);
+  min-width: 200px;
+  max-width: min(42vw, 420px);
 }
 
 .header-all-toggle {
@@ -1173,6 +1179,90 @@ body {
 .db-add-btn {
   min-width: 120px;
   justify-content: center;
+}
+
+.db-simple-card {
+  display: grid;
+  gap: 12px;
+}
+
+.db-simple-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.db-simple-grid {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr;
+  gap: 14px;
+}
+
+.db-kv-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.db-kv {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.db-kv > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.db-kv > b {
+  font-size: 12px;
+  text-align: right;
+}
+
+.db-usage-meter {
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid var(--stroke);
+  background: color-mix(in oklab, var(--surface) 84%, #ffffff 16%);
+}
+
+.db-usage-fill {
+  height: 100%;
+  border-radius: 999px;
+}
+
+.db-usage-fill.low {
+  background: #16a34a;
+}
+
+.db-usage-fill.medium {
+  background: #d97706;
+}
+
+.db-usage-fill.high {
+  background: #dc2626;
+}
+
+.db-simple-controls {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+.db-simple-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .gateway-table .thead,
@@ -2165,12 +2255,12 @@ input[type="checkbox"] {
   .header-cloud-controls {
     gap: 6px;
     justify-content: flex-start;
-    max-width: calc(100vw - 168px);
+    max-width: calc(100vw - 164px);
   }
 
   .header-edge-select {
-    min-width: 170px;
-    max-width: 68vw;
+    min-width: 150px;
+    max-width: 58vw;
     font-size: 12px;
   }
 
@@ -2251,5 +2341,21 @@ input[type="checkbox"] {
 
   .retention-policy-grid {
     grid-template-columns: repeat(2, minmax(180px, 1fr));
+  }
+}
+
+@media (max-width: 1100px) {
+  .db-simple-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .db-simple-controls {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .db-simple-controls {
+    grid-template-columns: 1fr;
   }
 }
