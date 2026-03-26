@@ -1186,12 +1186,33 @@ body {
   gap: 12px;
 }
 
+.db-head-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .db-simple-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.db-card-top-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.db-card-bottom-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 10px;
+  align-items: end;
 }
 
 .db-simple-grid {
@@ -1263,6 +1284,33 @@ body {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.db-actions-row-end {
+  justify-content: flex-end;
+}
+
+.db-inline-toggle {
+  margin: 0;
+}
+
+.db-table .trow.selected-row {
+  outline: 1px solid #5b7fc5;
+}
+
+.local-data-table .thead,
+.local-data-table .trow {
+  grid-template-columns: 1fr .9fr 1.8fr 1fr .8fr 1fr 110px;
+}
+
+.cloud-data-table .thead,
+.cloud-data-table .trow {
+  grid-template-columns: 1fr .9fr 1.5fr .9fr 1.5fr .85fr 1.05fr 110px;
+}
+
+.other-data-table .thead,
+.other-data-table .trow {
+  grid-template-columns: 1fr .9fr 1.5fr 1fr .85fr .85fr 1.05fr 110px;
 }
 
 .gateway-table .thead,
@@ -2352,10 +2400,18 @@ input[type="checkbox"] {
   .db-simple-controls {
     grid-template-columns: 1fr 1fr;
   }
+
+  .db-card-bottom-actions {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 @media (max-width: 760px) {
   .db-simple-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .db-card-bottom-actions {
     grid-template-columns: 1fr;
   }
 }
