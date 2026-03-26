@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Set
@@ -38,6 +39,16 @@ class GatewayWorker:
         self.db_pending_count = 0
         self.collection_blocked = False
         self.collection_block_reason: str | None = None
+        self._remote_flush_inflight = False
+        self._remote_flush_lock = threading.Lock()
+        self._remote_last_flush_started_monotonic = 0.0
+        self._remote_last_pending_probe_monotonic = 0.0
+        self._remote_flush_min_interval_seconds = max(
+            0.1, float(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MIN_SECONDS", "0.4") or "0.4")
+        )
+        self._remote_pending_probe_seconds = max(
+            0.1, float(os.environ.get("TRUSTNODE_REMOTE_PENDING_PROBE_SECONDS", "0.5") or "0.5")
+        )
 
     def set_config(self, config: GatewayConfig) -> None:
         self.config = config
@@ -48,6 +59,10 @@ class GatewayWorker:
         self.db_last_write_utc = None
         self.db_last_error = None
         self.db_pending_count = 0
+        with self._remote_flush_lock:
+            self._remote_flush_inflight = False
+            self._remote_last_flush_started_monotonic = 0.0
+            self._remote_last_pending_probe_monotonic = 0.0
         self._dispose_db_engine()
 
     def set_collection_gate_cb(self, cb) -> None:
@@ -64,6 +79,8 @@ class GatewayWorker:
         if not self.running:
             return
         self.running = False
+        with self._remote_flush_lock:
+            self._remote_flush_inflight = False
         if self._task:
             self._task.cancel()
             try:
@@ -100,8 +117,6 @@ class GatewayWorker:
                     collection_allowed, block_reason = self._is_collection_allowed(readings)
                 self.collection_blocked = not collection_allowed
                 self.collection_block_reason = block_reason
-                if collection_allowed:
-                    self._persist_readings(readings)
                 await emit_event(
                     {
                         "type": "reading",
@@ -112,6 +127,8 @@ class GatewayWorker:
                         "readings": [r.model_dump() for r in readings],
                     }
                 )
+                if collection_allowed:
+                    self._persist_readings(readings)
             except Exception as exc:
                 self.last_error = str(exc)
                 # Do not keep stale values visible when a read cycle fails.
@@ -779,31 +796,13 @@ class GatewayWorker:
         if engine in ("postgresql", "legacy_http"):
             try:
                 self._enqueue_outbox(readings)
-                pending = self._load_pending(300)
-                pending_readings = [
-                    GatewayReading(
-                        ts_utc=str(r.get("ts_utc") or ""),
-                        tag_name=str(r.get("tag_name") or ""),
-                        value=float(r.get("value") if r.get("value") is not None else 0.0),
-                        quality=int(r.get("quality") if r.get("quality") is not None else 0),
-                        quality_label=str(r.get("quality_label") or "UNKNOWN"),
-                        source=str(r.get("source") or ""),
-                        site=str(r.get("site") or ""),
-                        area=str(r.get("area") or ""),
-                        equipment=str(r.get("equipment") or ""),
-                    )
-                    for r in pending
-                ]
-                ok = self._persist_postgresql(pending_readings) if engine == "postgresql" else self._persist_legacy_http(pending_readings)
-                ids = [int(r["id"]) for r in pending if r.get("id") is not None]
-                if ok:
-                    self._mark_sent(ids)
-                else:
-                    self._mark_failed(ids, self.db_last_error or "remote write failed")
+                now_mono = time.monotonic()
+                if now_mono - self._remote_last_pending_probe_monotonic >= self._remote_pending_probe_seconds:
+                    self._remote_last_pending_probe_monotonic = now_mono
+                    self.db_pending_count = self._count_pending()
+                self._schedule_remote_flush(engine)
             except Exception as exc:
                 self._mark_db_write_error(f"Store-forward pipeline error: {exc}")
-            finally:
-                self.db_pending_count = self._count_pending()
             return
         if engine == "sqlite":
             self._persist_sqlite(readings)
@@ -818,6 +817,62 @@ class GatewayWorker:
             self.db_pending_count = 0
             return
         self.db_pending_count = 0
+
+    def _schedule_remote_flush(self, engine_name: str) -> None:
+        now_mono = time.monotonic()
+        with self._remote_flush_lock:
+            if self._remote_flush_inflight:
+                return
+            if now_mono - self._remote_last_flush_started_monotonic < self._remote_flush_min_interval_seconds:
+                return
+            self._remote_flush_inflight = True
+            self._remote_last_flush_started_monotonic = now_mono
+        thread = threading.Thread(
+            target=self._flush_remote_outbox_once,
+            args=(engine_name,),
+            daemon=True,
+            name=f"tn-flush-{self.gateway_id}",
+        )
+        thread.start()
+
+    def _flush_remote_outbox_once(self, engine_name: str) -> None:
+        try:
+            max_batches = max(1, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MAX_BATCHES", "6") or "6"))
+            for _ in range(max_batches):
+                pending = self._load_pending(300)
+                if not pending:
+                    break
+                pending_readings = [
+                    GatewayReading(
+                        ts_utc=str(r.get("ts_utc") or ""),
+                        tag_name=str(r.get("tag_name") or ""),
+                        value=float(r.get("value") if r.get("value") is not None else 0.0),
+                        quality=int(r.get("quality") if r.get("quality") is not None else 0),
+                        quality_label=str(r.get("quality_label") or "UNKNOWN"),
+                        source=str(r.get("source") or ""),
+                        site=str(r.get("site") or ""),
+                        area=str(r.get("area") or ""),
+                        equipment=str(r.get("equipment") or ""),
+                    )
+                    for r in pending
+                ]
+                ok = self._persist_postgresql(pending_readings) if engine_name == "postgresql" else self._persist_legacy_http(pending_readings)
+                ids = [int(r["id"]) for r in pending if r.get("id") is not None]
+                if ok:
+                    self._mark_sent(ids)
+                else:
+                    self._mark_failed(ids, self.db_last_error or "remote write failed")
+                    break
+            self.db_pending_count = self._count_pending()
+        except Exception as exc:
+            self._mark_db_write_error(f"Store-forward flush error: {exc}")
+            try:
+                self.db_pending_count = self._count_pending()
+            except Exception:
+                pass
+        finally:
+            with self._remote_flush_lock:
+                self._remote_flush_inflight = False
 
     def _resolve_output_file_path(self, raw_path: str, fallback_name: str) -> str:
         path_in = (raw_path or "").strip()
