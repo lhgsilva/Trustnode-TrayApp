@@ -492,8 +492,10 @@ class AppStore:
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
             with engine.begin() as conn:
+                hist_rows: list[Any] = []
+                plc_rows: list[Any] = []
                 try:
-                    rows = conn.execute(
+                    hist_rows = conn.execute(
                         text(
                             f"""
                             SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
@@ -506,8 +508,9 @@ class AppStore:
                         {"lim": lim},
                     ).fetchall()
                 except Exception:
-                    # Compatibility fallback for deployments that only have plc_readings.
-                    rows = conn.execute(
+                    hist_rows = []
+                try:
+                    plc_rows = conn.execute(
                         text(
                             f"""
                             SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
@@ -519,6 +522,33 @@ class AppStore:
                         ),
                         {"lim": lim},
                     ).fetchall()
+                except Exception:
+                    plc_rows = []
+
+                def _top_ts_ms(rows_in: list[Any]) -> int:
+                    if not rows_in:
+                        return 0
+                    raw = str(rows_in[0][0] or "").strip()
+                    if not raw:
+                        return 0
+                    try:
+                        txt = raw.replace("Z", "+00:00")
+                        if " " in txt and "T" not in txt:
+                            txt = txt.replace(" ", "T")
+                        return int(datetime.fromisoformat(txt).timestamp() * 1000)
+                    except Exception:
+                        return 0
+
+                hist_top = _top_ts_ms(hist_rows)
+                plc_top = _top_ts_ms(plc_rows)
+                # Prefer the freshest data source. This avoids stale historian pages
+                # when deployments actively write to plc_readings.
+                if hist_rows and (hist_top >= plc_top or not plc_rows):
+                    rows = hist_rows
+                elif plc_rows:
+                    rows = plc_rows
+                else:
+                    rows = []
             out: list[dict[str, Any]] = []
             for r in rows:
                 out.append(

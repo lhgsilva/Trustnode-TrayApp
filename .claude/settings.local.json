@@ -2,6 +2,9 @@
   "permissions": {
     "additionalDirectories": [
       "d:\\Trustnode\\Trustnode-AB\\Tray_app\\.claude"
+    ],
+    "allow": [
+      "Bash(ls -la \"d:\\\\Trustnode\\\\Trustnode-AB\\\\Tray_app\\\\Trustnode_edge_app\\\\frontend\\\\src\"\" 2>/dev/null || echo \"Path not found \")"
     ]
   }
 }
