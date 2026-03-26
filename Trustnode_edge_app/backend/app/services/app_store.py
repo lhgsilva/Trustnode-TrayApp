@@ -2380,9 +2380,29 @@ class AppStore:
                     "quality_label": r["quality_label"] or "",
                 }
             )
-        if not out:
-            cloud_rows = self._fetch_historian_rows_from_cloud(lim)
-            if cloud_rows:
+        # If local historian exists but is stale on hosted/VPS, serve cloud rows
+        # when they are clearly fresher.
+        cloud_rows = self._fetch_historian_rows_from_cloud(lim)
+        if cloud_rows and not out:
+            return cloud_rows
+        if cloud_rows and out:
+            def _top_ts_ms(rows_in: list[dict[str, Any]]) -> int:
+                if not rows_in:
+                    return 0
+                raw = str(rows_in[0].get("ts") or rows_in[0].get("ts_utc") or "").strip()
+                if not raw:
+                    return 0
+                try:
+                    txt = raw.replace("Z", "+00:00")
+                    if " " in txt and "T" not in txt:
+                        txt = txt.replace(" ", "T")
+                    return int(datetime.fromisoformat(txt).timestamp() * 1000)
+                except Exception:
+                    return 0
+
+            local_top = _top_ts_ms(out)
+            cloud_top = _top_ts_ms(cloud_rows)
+            if cloud_top > local_top + 1500:
                 return cloud_rows
         return out
 
