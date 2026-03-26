@@ -1300,7 +1300,7 @@ body {
 
 .local-data-table .thead,
 .local-data-table .trow {
-  grid-template-columns: 1fr .9fr 1.8fr 1fr .8fr 1fr 110px;
+  grid-template-columns: 1fr .8fr 1.6fr 1.2fr 1.2fr .9fr 1fr 110px;
 }
 
 .cloud-data-table .thead,

@@ -60,6 +60,20 @@ const DASHBOARD_LAYOUT_STORAGE_KEY = "trustnode_dashboard_layout";
 const EMAIL_SETTINGS_STORAGE_KEY = "trustnode_email_settings";
 const DEFAULT_LOCAL_DB_BADGE_DISMISS_KEY = "trustnode_default_local_db_badge_dismissed";
 const LOCAL_DB_ENGINES = new Set(["sqlite", "csv_file", "txt_file"]);
+const MAIN_LOCAL_SQLITE_FALLBACK_ID = "__main_local_sqlite__";
+const KNOWN_SUPABASE_DEFAULTS = {
+  host: "aws-1-eu-west-1.pooler.supabase.com",
+  port: "6543",
+  database: "postgres",
+  username: "postgres.tsfreqjcrgbxdwvmxeuk",
+  password: "Apolo020@25t",
+  schema: "public",
+  table: "plc_readings",
+  source: "edge-01",
+  site: "Limerick",
+  area: "LineA",
+  equipment: "MACHINE-01",
+};
 
 const NAV_SECTIONS = [
   { id: "overview", title: "Overview", items: ["Dashboard"] },
@@ -1038,6 +1052,8 @@ function AppShell() {
   const [cleanupMode, setCleanupMode] = useState("last_day");
   const [cleanupBusy, setCleanupBusy] = useState(false);
   const [cleanupResult, setCleanupResult] = useState("");
+  const [retentionResultScope, setRetentionResultScope] = useState("global");
+  const [cleanupResultScope, setCleanupResultScope] = useState("global");
   const [emailSettings, setEmailSettings] = useState({
     transport: "smtp",
     host: "",
@@ -3553,27 +3569,57 @@ function AppShell() {
 
   const cloudDbRows = useMemo(
     () =>
-      (dbConnectionsView || []).filter((db) => {
+      (dbConnections || []).filter((db) => {
         const engine = String(db.engine || "").toLowerCase();
         if (dbLocationFromEngine(db.engine) !== "remote") return false;
         return engine === "postgresql" || engine === "legacy_http";
       }),
-    [dbConnectionsView]
+    [dbConnections]
   );
 
   const otherDatabaseRows = useMemo(
-    () =>
-      (dbConnectionsView || [])
+    () => {
+      const sqliteRows = (dbConnections || []).filter((db) => String(db.engine || "").toLowerCase() === "sqlite");
+      const mainLocalId =
+        String(
+          sqliteRows.find((db) => String(db.id || "") === "local-sqlite-default")?.id ||
+          sqliteRows.find((db) => Boolean(db.use_app))?.id ||
+          sqliteRows[0]?.id ||
+          ""
+        );
+      return (dbConnections || [])
         .filter((db) => Boolean(db.use_backup))
-        .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))),
-    [dbConnectionsView]
+        .filter((db) => String(db.id || "") !== mainLocalId)
+        .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+    },
+    [dbConnections]
   );
   const localDatabaseRows = useMemo(
-    () =>
-      (dbConnectionsView || [])
-        .filter((db) => dbLocationFromEngine(db.engine) === "local")
-        .sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))),
-    [dbConnectionsView]
+    () => {
+      const sqliteRows = (dbConnections || []).filter((db) => String(db.engine || "").toLowerCase() === "sqlite");
+      const preferred =
+        sqliteRows.find((db) => String(db.id || "") === "local-sqlite-default") ||
+        sqliteRows.find((db) => Boolean(db.use_app)) ||
+        sqliteRows[0] ||
+        null;
+      if (preferred) return [preferred];
+      return [
+        {
+          id: MAIN_LOCAL_SQLITE_FALLBACK_ID,
+          name: "Local SQLite",
+          engine: "sqlite",
+          sqlite_path: String(databaseInspector?.db_path || "./data/trustnode_app_store.db"),
+          table: "historian_readings",
+          enabled: true,
+          use_gateway: true,
+          use_app: true,
+          use_backup: false,
+          connection_ok: Boolean(databaseInspector?.db_exists),
+          last_check_utc: String(databaseInspector?.data_sync?.last_data_sync_utc || ""),
+        },
+      ];
+    },
+    [dbConnections, databaseInspector]
   );
 
   const getGatewayFooterAddress = (gateway) => {
@@ -3817,6 +3863,12 @@ function AppShell() {
     if (!selectedLocalDbId || !localDatabaseRows.some((db) => String(db.id || "") === String(selectedLocalDbId))) {
       setSelectedLocalDbId(String(localDatabaseRows[0].id || ""));
     }
+  }, [localDatabaseRows, selectedLocalDbId]);
+
+  const selectedLocalDbIsMain = useMemo(() => {
+    const selected = localDatabaseRows.find((db) => String(db.id || "") === String(selectedLocalDbId || ""));
+    if (!selected) return true;
+    return String(selected.id || "") === MAIN_LOCAL_SQLITE_FALLBACK_ID || String(selected.id || "") === "local-sqlite-default";
   }, [localDatabaseRows, selectedLocalDbId]);
 
   useEffect(() => {
@@ -5910,11 +5962,19 @@ function AppShell() {
     if (!isAdminDatabaseUser) return;
     const mode = String(cloudDbPickerType || "supabase").toLowerCase();
     if (mode === "dolibarr") {
+      const existingDolibarr = (dbConnections || []).find((db) => {
+        const engine = String(db.engine || "").toLowerCase();
+        return engine === "legacy_http" && dbLocationFromEngine(db.engine) === "remote";
+      });
       openAddDbConnection("gateway", {
-        name: "Dolibarr",
+        name: String(existingDolibarr?.name || "Dolibarr"),
         engine: "legacy_http",
-        legacy_url: "https://www.rcltd.ie/Trustnode/htdocs/custom/mfp/api_trustnode_write.php",
-        legacy_api_token: "qVeH6tCUeGe9Qe4qQmzYqZC3PdEYwHEAaI4h3",
+        legacy_url: String(existingDolibarr?.legacy_url || "https://www.rcltd.ie/Trustnode/htdocs/custom/mfp/api_trustnode_write.php"),
+        legacy_api_token: String(existingDolibarr?.legacy_api_token || "qVeH6tCUeGe9Qe4qQmzYqZC3PdEYwHEAaI4h3"),
+        source: String(existingDolibarr?.source || "edge-01"),
+        site: String(existingDolibarr?.site || "Limerick"),
+        area: String(existingDolibarr?.area || "LineA"),
+        equipment: String(existingDolibarr?.equipment || "MACHINE-01"),
         enabled: true,
         use_gateway: true,
         use_app: true,
@@ -5922,15 +5982,27 @@ function AppShell() {
         cloud_sync_enabled: true,
       });
     } else {
+      const existingSupabase = (dbConnections || []).find((db) => {
+        const engine = String(db.engine || "").toLowerCase();
+        if (engine !== "postgresql" || dbLocationFromEngine(db.engine) !== "remote") return false;
+        return String(db.host || "").toLowerCase().includes("supabase");
+      });
+      const source = existingSupabase || KNOWN_SUPABASE_DEFAULTS;
       openAddDbConnection("gateway", {
-        name: "Supabase",
+        name: String(existingSupabase?.name || "Supabase"),
         engine: "postgresql",
-        host: "aws-1-eu-west-1.pooler.supabase.com",
-        port: "6543",
-        database: "postgres",
-        schema: "public",
-        table: "plc_readings",
-        tls: true,
+        host: String(source.host || KNOWN_SUPABASE_DEFAULTS.host),
+        port: String(source.port || KNOWN_SUPABASE_DEFAULTS.port),
+        database: String(source.database || KNOWN_SUPABASE_DEFAULTS.database),
+        username: String(source.username || KNOWN_SUPABASE_DEFAULTS.username),
+        password: String(source.password || KNOWN_SUPABASE_DEFAULTS.password),
+        schema: String(source.schema || KNOWN_SUPABASE_DEFAULTS.schema),
+        table: String(source.table || KNOWN_SUPABASE_DEFAULTS.table),
+        source: String(source.source || KNOWN_SUPABASE_DEFAULTS.source),
+        site: String(source.site || KNOWN_SUPABASE_DEFAULTS.site),
+        area: String(source.area || KNOWN_SUPABASE_DEFAULTS.area),
+        equipment: String(source.equipment || KNOWN_SUPABASE_DEFAULTS.equipment),
+        tls: existingSupabase ? Boolean(existingSupabase.tls) : true,
         enabled: true,
         use_gateway: true,
         use_app: true,
@@ -6031,8 +6103,9 @@ function AppShell() {
     setShowOtherDbPickerModal(false);
   };
 
-  const saveRetentionPolicy = async () => {
+  const saveRetentionPolicy = async (scope = "global") => {
     if (!isAdminDatabaseUser) return;
+    setRetentionResultScope(scope);
     setRetentionBusy(true);
     setRetentionResult("");
     try {
@@ -6059,8 +6132,9 @@ function AppShell() {
     }
   };
 
-  const executeRetentionRun = async (dryRun) => {
+  const executeRetentionRun = async (dryRun, scope = "global") => {
     if (!isAdminDatabaseUser) return;
+    setRetentionResultScope(scope);
     setRetentionBusy(true);
     setRetentionResult("");
     try {
@@ -6163,14 +6237,22 @@ function AppShell() {
     document.body.removeChild(a);
   };
 
-  const runCleanupData = () => {
+  const runCleanupData = (scope = "global") => {
+    const scopeLabel = scope === "local"
+      ? "Local Data"
+      : scope === "cloud"
+        ? "Trustnode Cloud"
+        : scope === "other"
+          ? "Other Databases"
+          : "Backup and Retention";
+    setCleanupResultScope(scope);
     if (currentUser?.role !== "admin") {
       setCleanupResult("Only admin can run data cleanup.");
       return;
     }
     withConfirm(
       "Clean Data",
-      `Delete data for '${cleanupMode}'? This action removes historian/log data.`,
+      `[${scopeLabel}] Delete data for '${cleanupMode}'? This action removes historian/log data.`,
       async () => {
         setCleanupBusy(true);
         setCleanupResult("");
@@ -6190,6 +6272,69 @@ function AppShell() {
       }
     );
   };
+
+  const renderSectionRetentionControls = (scope) => (
+    <>
+      <div className="db-card-bottom-actions">
+        <label>
+          Keep PLC Tag Data
+          <select
+            value={retentionPresetKey}
+            onChange={(e) => applyRetentionPreset(e.target.value)}
+            disabled={!isAdminDatabaseUser}
+          >
+            <option value="day">Last day</option>
+            <option value="week">Last week</option>
+            <option value="month">Last month</option>
+          </select>
+        </label>
+        <label>
+          Cleanup Schedule (minutes)
+          <input
+            type="number"
+            min="5"
+            value={retentionPolicy.schedule_minutes}
+            onChange={(e) => setRetentionPolicy((prev) => ({ ...prev, schedule_minutes: Number(e.target.value || 60) }))}
+            disabled={!isAdminDatabaseUser}
+          />
+        </label>
+        <div className="db-simple-actions db-actions-row-end">
+          <select
+            value={cleanupMode}
+            onChange={(e) => setCleanupMode(e.target.value)}
+            disabled={!isAdminDatabaseUser || cleanupBusy}
+            title="Cleanup scope"
+          >
+            <option value="period">Period</option>
+            <option value="last_hours">Last Hour</option>
+            <option value="last_day">Last Day</option>
+            <option value="last_week">Last Week</option>
+            <option value="last_month">Last Month</option>
+            <option value="all">All</option>
+          </select>
+          <button className="btn btn-primary btn-sm" onClick={() => saveRetentionPolicy(scope)} disabled={!isAdminDatabaseUser || retentionBusy}>
+            {retentionBusy ? "Saving..." : "Save Retention"}
+          </button>
+          <button className="btn btn-danger btn-sm" onClick={() => executeRetentionRun(false, scope)} disabled={!isAdminDatabaseUser || retentionBusy}>
+            Run Retention Now
+          </button>
+          <button className="btn btn-danger btn-sm" onClick={() => runCleanupData(scope)} disabled={!isAdminDatabaseUser || cleanupBusy}>
+            {cleanupBusy ? "Cleaning..." : "Run Cleanup Now"}
+          </button>
+        </div>
+      </div>
+      {retentionResult && retentionResultScope === scope ? (
+        <div className={retentionResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 8 }}>
+          {retentionResult}
+        </div>
+      ) : null}
+      {cleanupResult && cleanupResultScope === scope ? (
+        <div className={cleanupResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 8 }}>
+          {cleanupResult}
+        </div>
+      ) : null}
+    </>
+  );
 
   useEffect(() => {
     if (!appStoreHydrated) return;
@@ -7524,90 +7669,59 @@ function AppShell() {
                           setDatabaseOverviewResult("Select a local database row to remove.");
                           return;
                         }
+                        if (selectedLocalDbIsMain) {
+                          setDatabaseOverviewResult("Main local SQLite cannot be removed.");
+                          return;
+                        }
                         removeDbConnection(selectedLocalDbId);
                       }}
-                      disabled={!isAdminDatabaseUser || !selectedLocalDbId}
+                      disabled={!isAdminDatabaseUser || !selectedLocalDbId || selectedLocalDbIsMain}
                     >
                       Remove
                     </button>
                   </div>
                 </div>
-                <div className="db-simple-grid">
-                  <div className="db-kv-grid">
-                    <div className="db-kv"><span>Local DB Path</span><b title={databaseInspector?.db_path || "-"}>{databaseInspector?.db_path || "-"}</b></div>
-                    <div className="db-kv"><span>Current Size</span><b>{formatBytes(localDbUsage.sizeBytes)}</b></div>
-                    <div className="db-kv"><span>Usage Level</span><b>{localDbUsage.label}</b></div>
-                    <div className="db-kv"><span>Last Cloud Sync</span><b>{formatElapsedFromUtc(databaseInspector?.data_sync?.last_data_sync_utc || "")}</b></div>
-                    <div className="db-kv"><span>Retention Profile</span><b>{retentionPresetKey}</b></div>
-                  </div>
-                  <div>
-                    <div className="db-usage-meter">
-                      <div className={`db-usage-fill ${localDbUsage.level}`} style={{ width: `${Math.max(8, localDbUsage.percent)}%` }} />
-                    </div>
-                    <div className="muted" style={{ marginTop: 6 }}>Storage pressure: {localDbUsage.percent}%</div>
-                    <div className="table db-table local-data-table" style={{ marginTop: 10 }}>
-                      <div className="thead"><span>Name</span><span>Engine</span><span>Path / Endpoint</span><span>Roles</span><span>Status</span><span>Last Check</span><span>Actions</span></div>
-                      {localDatabaseRows.map((c) => (
-                        <div
-                          key={`local-db-${c.id}`}
-                          className={`trow ${String(selectedLocalDbId || "") === String(c.id || "") ? "selected-row" : ""}`}
-                          onClick={() => setSelectedLocalDbId(String(c.id || ""))}
-                        >
-                          <span className="db-cell">{c.name}</span>
-                          <span className="db-cell">{String(c.engine || "").toUpperCase()}</span>
-                          <span className="db-cell db-url-cell" title={getDbEndpointLabel(c)}>{getDbEndpointLabel(c)}</span>
-                          <span className="db-cell">{getDbRoleLabel(c)}</span>
-                          <span className="db-cell">
-                            <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
-                              {c.connection_ok ? "ONLINE" : "OFFLINE"}
-                            </span>
-                          </span>
-                          <span className="db-cell db-last-check-cell" title={c.last_check_utc || ""}>{getDbSyncLastCheckLabel(c)}</span>
+                <div className="table db-table local-data-table">
+                  <div className="thead"><span>Name</span><span>Engine</span><span>Path / Endpoint</span><span>Retention</span><span>Size / Usage</span><span>Status</span><span>Last Check</span><span>Actions</span></div>
+                  {localDatabaseRows.map((c) => (
+                    <div
+                      key={`local-db-${c.id}`}
+                      className={`trow ${String(selectedLocalDbId || "") === String(c.id || "") ? "selected-row" : ""}`}
+                      onClick={() => setSelectedLocalDbId(String(c.id || ""))}
+                    >
+                      <span className="db-cell">{c.name}</span>
+                      <span className="db-cell">{String(c.engine || "").toUpperCase()}</span>
+                      <span className="db-cell db-url-cell" title={getDbEndpointLabel(c)}>{getDbEndpointLabel(c)}</span>
+                      <span className="db-cell">{`Last ${retentionPresetKey} | ${Number(retentionPolicy.schedule_minutes || 60)}m`}</span>
+                      <span className="db-cell">{`${formatBytes(localDbUsage.sizeBytes)} | ${localDbUsage.label} ${localDbUsage.percent}%`}</span>
+                      <span className="db-cell">
+                        <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
+                          {c.connection_ok ? "ONLINE" : "OFFLINE"}
+                        </span>
+                      </span>
+                      <span className="db-cell db-last-check-cell" title={c.last_check_utc || ""}>{getDbSyncLastCheckLabel(c)}</span>
                           <span className="row-actions db-actions-cell">
                             <button className="icon-btn table-action-btn" onClick={(e) => { e.stopPropagation(); openEditDbConnection(c); }} disabled={!isAdminDatabaseUser} title="Edit local DB"><EditIcon /></button>
-                            <button className="icon-btn table-action-btn danger" onClick={(e) => { e.stopPropagation(); removeDbConnection(c.id); }} disabled={!isAdminDatabaseUser} title="Delete local DB"><DeleteIcon /></button>
+                            <button
+                              className="icon-btn table-action-btn danger"
+                              onClick={(e) => { e.stopPropagation(); removeDbConnection(c.id); }}
+                              disabled={
+                                !isAdminDatabaseUser ||
+                                String(c.id || "") === MAIN_LOCAL_SQLITE_FALLBACK_ID ||
+                                String(c.id || "") === "local-sqlite-default"
+                              }
+                              title="Delete local DB"
+                            >
+                              <DeleteIcon />
+                            </button>
                           </span>
-                        </div>
-                      ))}
-                      {!localDatabaseRows.length ? (
-                        <div className="trow"><span className="db-cell">-</span><span className="db-cell">No local databases configured</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span></div>
-                      ) : null}
                     </div>
-                  </div>
+                  ))}
+                  {!localDatabaseRows.length ? (
+                    <div className="trow"><span className="db-cell">-</span><span className="db-cell">No local databases configured</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span></div>
+                  ) : null}
                 </div>
-                <div className="db-card-bottom-actions">
-                  <label>
-                    Keep PLC Tag Data
-                    <select
-                      value={retentionPresetKey}
-                      onChange={(e) => applyRetentionPreset(e.target.value)}
-                      disabled={!isAdminDatabaseUser}
-                    >
-                      <option value="day">Last day</option>
-                      <option value="week">Last week</option>
-                      <option value="month">Last month</option>
-                    </select>
-                  </label>
-                  <label>
-                    Cleanup Schedule (minutes)
-                    <input
-                      type="number"
-                      min="5"
-                      value={retentionPolicy.schedule_minutes}
-                      onChange={(e) => setRetentionPolicy((prev) => ({ ...prev, schedule_minutes: Number(e.target.value || 60) }))}
-                      disabled={!isAdminDatabaseUser}
-                    />
-                  </label>
-                  <div className="db-simple-actions db-actions-row-end">
-                    <button className="btn btn-primary btn-sm" onClick={saveRetentionPolicy} disabled={!isAdminDatabaseUser || retentionBusy}>
-                      {retentionBusy ? "Saving..." : "Save Retention"}
-                    </button>
-                    <button className="btn btn-danger btn-sm" onClick={() => executeRetentionRun(false)} disabled={!isAdminDatabaseUser || retentionBusy}>
-                      Run Cleanup Now
-                    </button>
-                  </div>
-                </div>
-                {retentionResult ? <div className="info-note" style={{ marginTop: 8 }}>{retentionResult}</div> : null}
+                {renderSectionRetentionControls("local")}
               </section>
 
               <section className="card db-simple-card">
@@ -7647,51 +7761,43 @@ function AppShell() {
                     </button>
                   </div>
                 </div>
-                <div className="db-simple-grid">
-                  <div className="db-kv-grid">
-                    <div className="db-kv"><span>Last Data Sync</span><b>{formatElapsedFromUtc(databaseInspector?.data_sync?.last_data_sync_utc || "")}</b></div>
-                    <div className="db-kv"><span>Outbox Pending</span><b>{Number(databaseInspector?.sync_outbox_status?.pending || 0)}</b></div>
-                    <div className="db-kv"><span>Historian Backlog</span><b>{Number(databaseInspector?.data_sync?.historian_backlog || 0)}</b></div>
-                    <div className="db-kv"><span>Current Cloud Target</span><b>{databaseInspector?.cloud_target?.name || "-"}</b></div>
-                  </div>
-                  <div className="table db-table cloud-data-table">
-                    <div className="thead"><span>Name</span><span>Type</span><span>Endpoint</span><span>Sync</span><span>Writing</span><span>Status</span><span>Last Check</span><span>Actions</span></div>
-                    {cloudDbRows.map((c) => (
-                      <div
-                        key={`cloud-db-${c.id}`}
-                        className={`trow ${String(selectedCloudDbId || "") === String(c.id || "") ? "selected-row" : ""}`}
-                        onClick={() => {
-                          setSelectedCloudDbId(String(c.id || ""));
-                          if (String(c.engine || "").toLowerCase() === "postgresql") {
-                            setCloudProviderDbId(String(c.id || ""));
-                          }
-                        }}
-                      >
-                        <span className="db-cell">{c.name}</span>
-                        <span className="db-cell">{String(c.engine || "").toUpperCase()}</span>
-                        <span className="db-cell db-url-cell" title={getDbEndpointLabel(c)}>{getDbEndpointLabel(c)}</span>
-                        <span className="db-cell">
-                          <span className={`status-pill ${c.cloud_sync_enabled ? "status-online" : "status-offline"}`}>
-                            {c.cloud_sync_enabled ? "ENABLED" : "DISABLED"}
-                          </span>
+                <div className="table db-table cloud-data-table">
+                  <div className="thead"><span>Name</span><span>Type</span><span>Endpoint</span><span>Sync</span><span>Writing</span><span>Status</span><span>Last Check</span><span>Actions</span></div>
+                  {cloudDbRows.map((c) => (
+                    <div
+                      key={`cloud-db-${c.id}`}
+                      className={`trow ${String(selectedCloudDbId || "") === String(c.id || "") ? "selected-row" : ""}`}
+                      onClick={() => {
+                        setSelectedCloudDbId(String(c.id || ""));
+                        if (String(c.engine || "").toLowerCase() === "postgresql") {
+                          setCloudProviderDbId(String(c.id || ""));
+                        }
+                      }}
+                    >
+                      <span className="db-cell">{c.name}</span>
+                      <span className="db-cell">{String(c.engine || "").toUpperCase()}</span>
+                      <span className="db-cell db-url-cell" title={getDbEndpointLabel(c)}>{getDbEndpointLabel(c)}</span>
+                      <span className="db-cell">
+                        <span className={`status-pill ${c.cloud_sync_enabled ? "status-online" : "status-offline"}`}>
+                          {c.cloud_sync_enabled ? "ENABLED" : "DISABLED"}
                         </span>
-                        <span className="db-cell db-writing-cell" title={getDbSyncWritingTooltip(c)}>{getDbSyncWritingLabel(c)}</span>
-                        <span className="db-cell">
-                          <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
-                            {c.connection_ok ? "ONLINE" : "OFFLINE"}
-                          </span>
+                      </span>
+                      <span className="db-cell db-writing-cell" title={getDbSyncWritingTooltip(c)}>{getDbSyncWritingLabel(c)}</span>
+                      <span className="db-cell">
+                        <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
+                          {c.connection_ok ? "ONLINE" : "OFFLINE"}
                         </span>
-                        <span className="db-cell db-last-check-cell" title={c.last_check_utc || ""}>{getDbSyncLastCheckLabel(c)}</span>
-                        <span className="row-actions db-actions-cell">
-                          <button className="icon-btn table-action-btn" onClick={(e) => { e.stopPropagation(); openEditDbConnection(c); }} disabled={!isAdminDatabaseUser} title="Edit cloud DB"><EditIcon /></button>
-                          <button className="icon-btn table-action-btn danger" onClick={(e) => { e.stopPropagation(); removeDbConnection(c.id); }} disabled={!isAdminDatabaseUser} title="Delete cloud DB"><DeleteIcon /></button>
-                        </span>
-                      </div>
-                    ))}
-                    {!cloudDbRows.length ? (
-                      <div className="trow"><span className="db-cell">-</span><span className="db-cell">No cloud databases configured</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span></div>
-                    ) : null}
-                  </div>
+                      </span>
+                      <span className="db-cell db-last-check-cell" title={c.last_check_utc || ""}>{getDbSyncLastCheckLabel(c)}</span>
+                      <span className="row-actions db-actions-cell">
+                        <button className="icon-btn table-action-btn" onClick={(e) => { e.stopPropagation(); openEditDbConnection(c); }} disabled={!isAdminDatabaseUser} title="Edit cloud DB"><EditIcon /></button>
+                        <button className="icon-btn table-action-btn danger" onClick={(e) => { e.stopPropagation(); removeDbConnection(c.id); }} disabled={!isAdminDatabaseUser} title="Delete cloud DB"><DeleteIcon /></button>
+                      </span>
+                    </div>
+                  ))}
+                  {!cloudDbRows.length ? (
+                    <div className="trow"><span className="db-cell">-</span><span className="db-cell">No cloud databases configured</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span></div>
+                  ) : null}
                 </div>
                 <div className="db-card-bottom-actions">
                   <label>
@@ -7753,6 +7859,7 @@ function AppShell() {
                   />
                   <span className="remember-label">Enable Dolibarr mirror output</span>
                 </label>
+                {renderSectionRetentionControls("cloud")}
                 {databaseInspector?.data_sync?.last_data_error ? (
                   <div className="error" style={{ marginTop: 8 }}>
                     {String(databaseInspector.data_sync.last_data_error)}
@@ -7869,6 +7976,7 @@ function AppShell() {
                   </div>
                 </div>
                 {backupResult ? <div className="info-note" style={{ marginTop: 8 }}>{backupResult}</div> : null}
+                {renderSectionRetentionControls("other")}
               </section>
 
               {databaseOverviewResult ? <section className="card"><div className="info-note">{databaseOverviewResult}</div></section> : null}
@@ -8019,7 +8127,7 @@ function AppShell() {
                     <span className="remember-label">Backup before cleanup</span>
                   </label>
                 </div>
-                {retentionResult ? <div className={retentionResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 10 }}>{retentionResult}</div> : null}
+                {retentionResult && retentionResultScope === "global" ? <div className={retentionResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 10 }}>{retentionResult}</div> : null}
                 <div className="table retention-runs-table" style={{ marginTop: 12 }}>
                   <div className="thead"><span>Run UTC</span><span>Mode</span><span>Status</span><span>Delete Candidates</span><span>Backup</span></div>
                   {retentionRuns.map((r) => {
@@ -8060,7 +8168,7 @@ function AppShell() {
                     {cleanupBusy ? "Cleaning..." : "Clean Data"}
                   </button>
                 </div>
-                {cleanupResult ? <div className={cleanupResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 10 }}>{cleanupResult}</div> : null}
+                {cleanupResult && cleanupResultScope === "global" ? <div className={cleanupResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 10 }}>{cleanupResult}</div> : null}
               </section>
             </>
           ) : null}
