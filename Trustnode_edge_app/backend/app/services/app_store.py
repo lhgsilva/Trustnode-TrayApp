@@ -265,6 +265,50 @@ class AppStore:
         out["users"] = out_users
         return out
 
+    def _normalize_database_configurations_payload(self, payload: Any, previous_payload: Any) -> Any:
+        incoming = payload if isinstance(payload, list) else []
+        previous = previous_payload if isinstance(previous_payload, list) else []
+        prev_by_id: Dict[str, Dict[str, Any]] = {}
+        for item in previous:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "").strip()
+            if item_id:
+                prev_by_id[item_id] = item
+
+        out: list[Any] = []
+        for item in incoming:
+            if not isinstance(item, dict):
+                out.append(item)
+                continue
+            next_item = dict(item)
+            item_id = str(next_item.get("id") or "").strip()
+            prev_item = prev_by_id.get(item_id) if item_id else None
+            if isinstance(prev_item, dict):
+                prev_engine = str(prev_item.get("engine") or "").strip().lower()
+                prev_host = str(prev_item.get("host") or "").strip().lower()
+                prev_port = int(prev_item.get("port") or 0)
+                next_host = str(next_item.get("host") or "").strip().lower()
+                next_port = int(next_item.get("port") or 0)
+                # Guard against stale clients reverting known-good direct Supabase
+                # credentials back to pooler host/port.
+                prev_is_direct_supabase = (
+                    prev_engine == "postgresql"
+                    and prev_host.startswith("db.")
+                    and prev_host.endswith(".supabase.co")
+                    and prev_port == 5432
+                )
+                next_is_pooler_supabase = (
+                    next_host.endswith(".pooler.supabase.com")
+                    and next_port in (5432, 6543)
+                )
+                if prev_is_direct_supabase and next_is_pooler_supabase:
+                    for key in ("host", "port", "username", "password", "database", "schema", "table", "tls"):
+                        if key in prev_item:
+                            next_item[key] = prev_item.get(key)
+            out.append(next_item)
+        return out
+
     def _build_pg_sqlalchemy_url(self, host: str, port: int, database: str, username: str, password: str) -> str:
         user = quote_plus(username or "")
         pwd = quote_plus(password or "")
@@ -2654,10 +2698,18 @@ class AppStore:
         with self._lock:
             with self._connect() as conn:
                 prev = conn.execute(
-                    "SELECT version FROM config_documents WHERE domain = ?",
+                    "SELECT version, payload_json FROM config_documents WHERE domain = ?",
                     (domain,),
                 ).fetchone()
                 old_version = int(prev["version"]) if prev else 0
+                if str(domain or "").strip() == "database_configurations":
+                    prev_payload: Any = []
+                    if prev and prev["payload_json"] is not None:
+                        try:
+                            prev_payload = json.loads(str(prev["payload_json"] or "[]"))
+                        except Exception:
+                            prev_payload = []
+                    payload_to_store = self._normalize_database_configurations_payload(payload_to_store, prev_payload)
                 new_version = old_version + 1
                 payload_json = json.dumps(payload_to_store)
                 conn.execute(
