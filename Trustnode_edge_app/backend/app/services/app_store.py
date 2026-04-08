@@ -10,6 +10,8 @@ from datetime import timedelta
 from datetime import datetime, timezone
 from typing import Any, Dict
 
+from app.tenant import get_current_tenant, normalize_tenant_id
+
 
 class AppStore:
     REQUIRED_CONFIG_DOMAINS: Dict[str, Any] = {
@@ -66,6 +68,9 @@ class AppStore:
             ]
         )
 
+    def _current_tenant_id(self) -> str:
+        return normalize_tenant_id(get_current_tenant())
+
     def _ensure_cloud_schema_once(self, engine: Any, schema: str, target_key: str) -> None:
         if target_key in self._cloud_schema_ready_keys:
             return
@@ -83,6 +88,7 @@ class AppStore:
                         CREATE TABLE IF NOT EXISTS "{schema}"."historian_readings" (
                           id BIGSERIAL PRIMARY KEY,
                           local_id BIGINT UNIQUE NOT NULL,
+                          tenant_id TEXT NOT NULL DEFAULT 'default',
                           ts_utc TIMESTAMPTZ NOT NULL,
                           gateway_id TEXT NULL,
                           gateway_name TEXT NULL,
@@ -105,6 +111,7 @@ class AppStore:
                         CREATE TABLE IF NOT EXISTS "{schema}"."plc_readings" (
                           id BIGSERIAL PRIMARY KEY,
                           local_id BIGINT UNIQUE NOT NULL,
+                          tenant_id TEXT NOT NULL DEFAULT 'default',
                           ts_utc TIMESTAMPTZ NOT NULL,
                           gateway_id TEXT NULL,
                           gateway_name TEXT NULL,
@@ -122,6 +129,7 @@ class AppStore:
                     )
                 )
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS local_id BIGINT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS tenant_id TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS gateway_id TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS gateway_name TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS device_name TEXT'))
@@ -133,10 +141,13 @@ class AppStore:
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS source TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS created_utc TIMESTAMPTZ'))
                 conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_plc_local_id" ON "{schema}"."plc_readings"(local_id)'))
+                conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_plc_tenant_ts" ON "{schema}"."plc_readings"(tenant_id, ts_utc DESC)'))
 
                 # Compatibility migration for pre-local_id deployments.
+                conn.execute(text(f'ALTER TABLE "{schema}"."historian_readings" ADD COLUMN IF NOT EXISTS tenant_id TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."historian_readings" ADD COLUMN IF NOT EXISTS local_id BIGINT'))
                 conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_hist_local_id" ON "{schema}"."historian_readings"(local_id)'))
+                conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_hist_tenant_ts" ON "{schema}"."historian_readings"(tenant_id, ts_utc DESC)'))
 
                 conn.execute(
                     text(
@@ -144,6 +155,7 @@ class AppStore:
                         CREATE TABLE IF NOT EXISTS "{schema}"."app_logs" (
                           id BIGSERIAL PRIMARY KEY,
                           local_id BIGINT UNIQUE NOT NULL,
+                          tenant_id TEXT NOT NULL DEFAULT 'default',
                           ts_utc TIMESTAMPTZ NOT NULL,
                           level TEXT NOT NULL,
                           category TEXT NOT NULL,
@@ -158,12 +170,15 @@ class AppStore:
                     )
                 )
                 conn.execute(text(f'ALTER TABLE "{schema}"."app_logs" ADD COLUMN IF NOT EXISTS local_id BIGINT'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."app_logs" ADD COLUMN IF NOT EXISTS tenant_id TEXT'))
                 conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_logs_local_id" ON "{schema}"."app_logs"(local_id)'))
+                conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_logs_tenant_ts" ON "{schema}"."app_logs"(tenant_id, ts_utc DESC)'))
 
                 conn.execute(
                     text(
                         f"""
                         CREATE TABLE IF NOT EXISTS "{schema}"."live_latest" (
+                          tenant_id TEXT NOT NULL DEFAULT 'default',
                           gateway_id TEXT NOT NULL DEFAULT '',
                           tag_name TEXT NOT NULL,
                           ts_utc TIMESTAMPTZ NOT NULL,
@@ -176,12 +191,23 @@ class AppStore:
                           quality INTEGER NULL,
                           quality_label TEXT NULL,
                           updated_utc TIMESTAMPTZ NULL,
-                          PRIMARY KEY(gateway_id, tag_name)
+                          PRIMARY KEY(tenant_id, gateway_id, tag_name)
                         )
                         """
                     )
                 )
+                conn.execute(text(f'ALTER TABLE "{schema}"."live_latest" ADD COLUMN IF NOT EXISTS tenant_id TEXT'))
+                try:
+                    conn.execute(text(f'ALTER TABLE "{schema}"."live_latest" DROP CONSTRAINT IF EXISTS live_latest_pkey'))
+                except Exception:
+                    pass
+                try:
+                    conn.execute(text(f'ALTER TABLE "{schema}"."live_latest" ADD PRIMARY KEY (tenant_id, gateway_id, tag_name)'))
+                except Exception:
+                    pass
+                conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_live_latest_tenant_gateway_tag" ON "{schema}"."live_latest"(tenant_id, gateway_id, tag_name)'))
                 conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_ts" ON "{schema}"."live_latest"(ts_utc DESC)'))
+                conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_tenant_ts" ON "{schema}"."live_latest"(tenant_id, ts_utc DESC)'))
             self._cloud_schema_ready_keys.add(target_key)
 
     def _resolve_db_path(self) -> str:
@@ -343,6 +369,27 @@ class AppStore:
             return None
         supabase = [c for c in candidates if "supabase.co" in c["host"].lower()]
         return supabase[0] if supabase else candidates[0]
+
+    def _get_app_settings(self) -> Dict[str, Any]:
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM config_documents WHERE domain = ?",
+                    ("app_settings",),
+                ).fetchone()
+        if not row:
+            return {}
+        try:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def _is_cloud_auto_sync_enabled(self) -> bool:
+        settings = self._get_app_settings()
+        if "cloud_auto_sync_enabled" in settings:
+            return bool(settings.get("cloud_auto_sync_enabled"))
+        return True
 
     def _mark_outbox_row_sent(self, row_id: int, when_utc: str) -> None:
         with self._lock:
@@ -589,7 +636,8 @@ class AppStore:
     def _config_sync_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                self._flush_data_outbox_once()
+                if self._is_cloud_auto_sync_enabled():
+                    self._flush_data_outbox_once()
                 # Prioritize live/data freshness; config sync can follow.
                 self._pull_config_from_cloud_once()
                 self._flush_config_outbox_once()
@@ -602,6 +650,7 @@ class AppStore:
         cloud = self._get_cloud_database_target()
         if not cloud:
             return []
+        tenant_id = self._current_tenant_id()
         try:
             from sqlalchemy import create_engine, text  # type: ignore
         except Exception:
@@ -632,14 +681,29 @@ class AppStore:
                             SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                    tag_name, value, quality, quality_label
                             FROM "{schema}"."historian_readings"
+                            WHERE tenant_id = :tenant
                             ORDER BY id DESC
                             LIMIT :lim
                             """
                         ),
-                        {"lim": lim},
+                        {"lim": lim, "tenant": tenant_id},
                     ).fetchall()
                 except Exception:
-                    hist_rows = []
+                    try:
+                        hist_rows = conn.execute(
+                            text(
+                                f"""
+                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                       tag_name, value, quality, quality_label
+                                FROM "{schema}"."historian_readings"
+                                ORDER BY id DESC
+                                LIMIT :lim
+                                """
+                            ),
+                            {"lim": lim},
+                        ).fetchall()
+                    except Exception:
+                        hist_rows = []
                 try:
                     plc_rows = conn.execute(
                         text(
@@ -647,14 +711,29 @@ class AppStore:
                             SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                    tag_name, value, quality, quality_label
                             FROM "{schema}"."plc_readings"
+                            WHERE tenant_id = :tenant
                             ORDER BY id DESC
                             LIMIT :lim
                             """
                         ),
-                        {"lim": lim},
+                        {"lim": lim, "tenant": tenant_id},
                     ).fetchall()
                 except Exception:
-                    plc_rows = []
+                    try:
+                        plc_rows = conn.execute(
+                            text(
+                                f"""
+                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                       tag_name, value, quality, quality_label
+                                FROM "{schema}"."plc_readings"
+                                ORDER BY id DESC
+                                LIMIT :lim
+                                """
+                            ),
+                            {"lim": lim},
+                        ).fetchall()
+                    except Exception:
+                        plc_rows = []
 
                 def _top_ts_ms(rows_in: list[Any]) -> int:
                     if not rows_in:
@@ -685,6 +764,7 @@ class AppStore:
                 out.append(
                     {
                         "ts": str(r[0] or ""),
+                        "tenant_id": tenant_id,
                         "source": str(r[1] or ""),
                         "gateway_id": str(r[2] or ""),
                         "gateway_name": str(r[3] or ""),
@@ -710,6 +790,7 @@ class AppStore:
         cloud = self._get_cloud_database_target()
         if not cloud:
             return []
+        tenant_id = self._current_tenant_id()
         try:
             from sqlalchemy import create_engine, text  # type: ignore
         except Exception:
@@ -731,22 +812,37 @@ class AppStore:
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
             with engine.begin() as conn:
-                rows = conn.execute(
-                    text(
-                        f"""
-                        SELECT ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
-                        FROM "{schema}"."app_logs"
-                        ORDER BY id DESC
-                        LIMIT :lim
-                        """
-                    ),
-                    {"lim": lim},
-                ).fetchall()
+                try:
+                    rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
+                            FROM "{schema}"."app_logs"
+                            WHERE tenant_id = :tenant
+                            ORDER BY id DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": lim, "tenant": tenant_id},
+                    ).fetchall()
+                except Exception:
+                    rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
+                            FROM "{schema}"."app_logs"
+                            ORDER BY id DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": lim},
+                    ).fetchall()
             out: list[dict[str, Any]] = []
             for r in rows:
                 out.append(
                     {
                         "ts": str(r[0] or ""),
+                        "tenant_id": tenant_id,
                         "level": str(r[1] or "info"),
                         "category": str(r[2] or "system"),
                         "message": str(r[3] or ""),
@@ -769,6 +865,7 @@ class AppStore:
         cloud = self._get_cloud_database_target()
         if not cloud:
             return []
+        tenant_id = self._current_tenant_id()
         try:
             from sqlalchemy import create_engine, text  # type: ignore
         except Exception:
@@ -797,14 +894,29 @@ class AppStore:
                             SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                    tag_name, value, quality, quality_label
                             FROM "{schema}"."live_latest"
+                            WHERE tenant_id = :tenant
                             ORDER BY ts_utc DESC
                             LIMIT :lim
                             """
                         ),
-                        {"lim": lim},
+                        {"lim": lim, "tenant": tenant_id},
                     ).fetchall()
                 except Exception:
-                    rows = []
+                    try:
+                        rows = conn.execute(
+                            text(
+                                f"""
+                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                       tag_name, value, quality, quality_label
+                                FROM "{schema}"."live_latest"
+                                ORDER BY ts_utc DESC
+                                LIMIT :lim
+                                """
+                            ),
+                            {"lim": lim},
+                        ).fetchall()
+                    except Exception:
+                        rows = []
                 if not rows:
                     # Compatibility fallback: derive latest-per-tag from historian/plc_readings.
                     try:
@@ -814,25 +926,41 @@ class AppStore:
                                 SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                        tag_name, value, quality, quality_label
                                 FROM "{schema}"."historian_readings"
+                                WHERE tenant_id = :tenant
                                 ORDER BY id DESC
                                 LIMIT :lim
                                 """
                             ),
-                            {"lim": max(lim, 20000)},
+                            {"lim": max(lim, 20000), "tenant": tenant_id},
                         ).fetchall()
                     except Exception:
-                        rows = conn.execute(
-                            text(
-                                f"""
-                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                                       tag_name, value, quality, quality_label
-                                FROM "{schema}"."plc_readings"
-                                ORDER BY id DESC
-                                LIMIT :lim
-                                """
-                            ),
-                            {"lim": max(lim, 20000)},
-                        ).fetchall()
+                        try:
+                            rows = conn.execute(
+                                text(
+                                    f"""
+                                    SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                           tag_name, value, quality, quality_label
+                                    FROM "{schema}"."plc_readings"
+                                    WHERE tenant_id = :tenant
+                                    ORDER BY id DESC
+                                    LIMIT :lim
+                                    """
+                                ),
+                                {"lim": max(lim, 20000), "tenant": tenant_id},
+                            ).fetchall()
+                        except Exception:
+                            rows = conn.execute(
+                                text(
+                                    f"""
+                                    SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                           tag_name, value, quality, quality_label
+                                    FROM "{schema}"."plc_readings"
+                                    ORDER BY id DESC
+                                    LIMIT :lim
+                                    """
+                                ),
+                                {"lim": max(lim, 20000)},
+                            ).fetchall()
             out: list[dict[str, Any]] = []
             seen: set[tuple[str, str]] = set()
             for r in rows:
@@ -847,6 +975,7 @@ class AppStore:
                 out.append(
                     {
                         "ts": str(r[0] or ""),
+                        "tenant_id": tenant_id,
                         "source": str(r[1] or ""),
                         "gateway_id": gateway_id,
                         "gateway_name": str(r[3] or ""),
@@ -980,7 +1109,7 @@ class AppStore:
                 with self._connect() as conn:
                     hist_rows = conn.execute(
                         """
-                        SELECT id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                        SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                tag_name, value, quality, quality_label, source, created_utc
                         FROM historian_readings
                         WHERE id > ?
@@ -991,7 +1120,7 @@ class AppStore:
                     ).fetchall()
                     log_rows = conn.execute(
                         """
-                        SELECT id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc
+                        SELECT id, tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc
                         FROM app_logs
                         WHERE id > ?
                         ORDER BY id ASC
@@ -1001,7 +1130,7 @@ class AppStore:
                     ).fetchall()
                     live_sample_rows = conn.execute(
                         """
-                        SELECT id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                        SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                tag_name, value, quality, quality_label, source
                         FROM historian_readings
                         ORDER BY id DESC
@@ -1013,16 +1142,18 @@ class AppStore:
             live_latest_rows: list[dict[str, Any]] = []
             seen_live_keys: set[tuple[str, str]] = set()
             for r in live_sample_rows:
+                tenant_id = normalize_tenant_id(str(r["tenant_id"] or "default"))
                 gateway_id = str(r["gateway_id"] or "")
                 tag_name = str(r["tag_name"] or "")
                 if not tag_name:
                     continue
-                key = (gateway_id, tag_name)
+                key = (tenant_id, gateway_id, tag_name)
                 if key in seen_live_keys:
                     continue
                 seen_live_keys.add(key)
                 live_latest_rows.append(
                     {
+                        "tenant_id": tenant_id,
                         "gateway_id": gateway_id,
                         "tag_name": tag_name,
                         "ts_utc": str(r["ts_utc"] or ""),
@@ -1055,10 +1186,11 @@ class AppStore:
                         text(
                             f"""
                             INSERT INTO "{schema}"."live_latest"
-                            (gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
+                            (tenant_id, gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
                             VALUES
-                            (:gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
-                            ON CONFLICT(gateway_id, tag_name) DO UPDATE SET
+                            (:tenant_id, :gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
+                            ON CONFLICT(tenant_id, gateway_id, tag_name) DO UPDATE SET
+                              tenant_id = excluded.tenant_id,
                               ts_utc = excluded.ts_utc,
                               source = excluded.source,
                               gateway_name = excluded.gateway_name,
@@ -1078,15 +1210,16 @@ class AppStore:
                         text(
                             f"""
                             INSERT INTO "{schema}"."historian_readings"
-                            (local_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
+                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
                             VALUES
-                            (:local_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
+                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
                             ON CONFLICT(local_id) DO NOTHING
                             """
                         ),
                         [
                             {
                                 "local_id": int(r["id"]),
+                                "tenant_id": normalize_tenant_id(str(r["tenant_id"] or "default")),
                                 "ts_utc": str(r["ts_utc"] or ""),
                                 "gateway_id": str(r["gateway_id"] or ""),
                                 "gateway_name": str(r["gateway_name"] or ""),
@@ -1108,15 +1241,16 @@ class AppStore:
                         text(
                             f"""
                             INSERT INTO "{schema}"."plc_readings"
-                            (local_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
+                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
                             VALUES
-                            (:local_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
+                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
                             ON CONFLICT(local_id) DO NOTHING
                             """
                         ),
                         [
                             {
                                 "local_id": int(r["id"]),
+                                "tenant_id": normalize_tenant_id(str(r["tenant_id"] or "default")),
                                 "ts_utc": str(r["ts_utc"] or ""),
                                 "gateway_id": str(r["gateway_id"] or ""),
                                 "gateway_name": str(r["gateway_name"] or ""),
@@ -1138,15 +1272,16 @@ class AppStore:
                         text(
                             f"""
                             INSERT INTO "{schema}"."app_logs"
-                            (local_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc)
+                            (local_id, tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc)
                             VALUES
-                            (:local_id, CAST(:ts_utc AS timestamptz), :level, :category, :message, :gateway_id, :gateway_name, :device_name, :database_name, CAST(:created_utc AS timestamptz))
+                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :level, :category, :message, :gateway_id, :gateway_name, :device_name, :database_name, CAST(:created_utc AS timestamptz))
                             ON CONFLICT(local_id) DO NOTHING
                             """
                         ),
                         [
                             {
                                 "local_id": int(r["id"]),
+                                "tenant_id": normalize_tenant_id(str(r["tenant_id"] or "default")),
                                 "ts_utc": str(r["ts_utc"] or ""),
                                 "level": str(r["level"] or "info"),
                                 "category": str(r["category"] or "system"),
@@ -1193,6 +1328,10 @@ class AppStore:
             with self._connect() as conn:
                 conn.executescript(
                     """
+                    PRAGMA journal_mode=WAL;
+                    PRAGMA synchronous=NORMAL;
+                    PRAGMA foreign_keys=ON;
+
                     CREATE TABLE IF NOT EXISTS config_documents (
                       domain TEXT PRIMARY KEY,
                       payload_json TEXT NOT NULL,
@@ -1211,6 +1350,7 @@ class AppStore:
 
                     CREATE TABLE IF NOT EXISTS historian_readings (
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
                       ts_utc TEXT NOT NULL,
                       gateway_id TEXT NULL,
                       gateway_name TEXT NULL,
@@ -1230,6 +1370,7 @@ class AppStore:
 
                     CREATE TABLE IF NOT EXISTS app_logs (
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
                       ts_utc TEXT NOT NULL,
                       level TEXT NOT NULL,
                       category TEXT NOT NULL,
@@ -1364,6 +1505,14 @@ class AppStore:
                     );
                     """
                 )
+                hist_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(historian_readings)").fetchall()}
+                if "tenant_id" not in hist_cols:
+                    conn.execute('ALTER TABLE historian_readings ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "default"')
+                log_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(app_logs)").fetchall()}
+                if "tenant_id" not in log_cols:
+                    conn.execute('ALTER TABLE app_logs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "default"')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_hist_tenant_ts ON historian_readings(tenant_id, ts_utc DESC)')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_tenant_ts ON app_logs(tenant_id, ts_utc DESC)')
                 now = self._utc_now()
                 conn.execute(
                     """
@@ -1876,6 +2025,7 @@ class AppStore:
             return {"ok": False, "run_utc": run_utc, "dry_run": dry_run, "details": details, "message": str(exc)}
 
     def get_bootstrap(self) -> Dict[str, Any]:
+        tenant_id = self._current_tenant_id()
         prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
             "1",
             "true",
@@ -1915,6 +2065,13 @@ class AppStore:
                             out[domain] = json.loads(payload_text)
                         except Exception:
                             out[domain] = None
+        out.setdefault("metadata", {})
+        if isinstance(out.get("metadata"), dict):
+            out["metadata"]["tenant_id"] = tenant_id
+        out["tenant_context"] = {
+            "tenant_id": tenant_id,
+            "base_host": "trustnode.lsapps.app",
+        }
         return out
 
     def force_sync_now(self, actor: str = "manual") -> Dict[str, Any]:
@@ -1969,7 +2126,382 @@ class AppStore:
             "inspector": snap,
         }
 
+    def clear_sync_queue(self, actor: str = "manual", include_sent: bool = False) -> Dict[str, Any]:
+        now = self._utc_now()
+        with self._lock:
+            with self._connect() as conn:
+                if include_sent:
+                    deleted = int(conn.execute("DELETE FROM sync_outbox").rowcount or 0)
+                else:
+                    deleted = int(conn.execute("DELETE FROM sync_outbox WHERE status IN ('pending','failed')").rowcount or 0)
+        return {
+            "ok": True,
+            "actor": actor,
+            "run_utc": now,
+            "include_sent": bool(include_sent),
+            "deleted_rows": deleted,
+        }
+
+    def drop_data_backlog(self, actor: str = "manual") -> Dict[str, Any]:
+        now = self._utc_now()
+        with self._lock:
+            with self._connect() as conn:
+                row_hist = conn.execute("SELECT COALESCE(MAX(id), 0) AS v FROM historian_readings").fetchone()
+                row_logs = conn.execute("SELECT COALESCE(MAX(id), 0) AS v FROM app_logs").fetchone()
+        max_hist = int((row_hist["v"] if row_hist else 0) or 0)
+        max_logs = int((row_logs["v"] if row_logs else 0) or 0)
+        self._set_data_sync_state(
+            last_historian_id=max_hist,
+            last_log_id=max_logs,
+            last_data_sync_utc=now,
+            last_data_error="",
+        )
+        return {
+            "ok": True,
+            "actor": actor,
+            "run_utc": now,
+            "last_historian_id": max_hist,
+            "last_log_id": max_logs,
+        }
+
+    def manual_sync_data_period(
+        self,
+        from_utc: str,
+        to_utc: str,
+        actor: str = "manual",
+        max_rows: int = 20000,
+        include_logs: bool = False,
+    ) -> Dict[str, Any]:
+        cloud = self._get_cloud_database_target()
+        if not cloud:
+            return {"ok": False, "message": "No enabled PostgreSQL cloud target configured"}
+
+        try:
+            from_dt = datetime.fromisoformat(str(from_utc).replace("Z", "+00:00")).astimezone(timezone.utc)
+            to_dt = datetime.fromisoformat(str(to_utc).replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            return {"ok": False, "message": "Invalid period format. Use UTC datetime values."}
+        if to_dt <= from_dt:
+            return {"ok": False, "message": "Invalid period: 'to' must be greater than 'from'."}
+
+        lim = max(100, min(int(max_rows or 20000), 200000))
+        tenant_id = self._current_tenant_id()
+        from_txt = from_dt.strftime("%Y-%m-%d %H:%M:%S")
+        to_txt = to_dt.strftime("%Y-%m-%d %H:%M:%S")
+        run_utc = self._utc_now()
+
+        try:
+            from sqlalchemy import create_engine, text  # type: ignore
+        except Exception as exc:
+            return {"ok": False, "message": f"SQLAlchemy unavailable: {exc}"}
+
+        with self._lock:
+            with self._connect() as conn:
+                hist_rows = conn.execute(
+                    """
+                    SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                           tag_name, value, quality, quality_label, source, created_utc
+                    FROM historian_readings
+                    WHERE tenant_id = ? AND ts_utc >= ? AND ts_utc <= ?
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (tenant_id, from_txt, to_txt, lim),
+                ).fetchall()
+                log_rows = []
+                if include_logs:
+                    log_rows = conn.execute(
+                        """
+                        SELECT id, tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc
+                        FROM app_logs
+                        WHERE tenant_id = ? AND ts_utc >= ? AND ts_utc <= ?
+                        ORDER BY id ASC
+                        LIMIT ?
+                        """,
+                        (tenant_id, from_txt, to_txt, lim),
+                    ).fetchall()
+
+        if not hist_rows and not log_rows:
+            return {
+                "ok": True,
+                "actor": actor,
+                "run_utc": run_utc,
+                "hist_rows": 0,
+                "log_rows": 0,
+                "message": "No local rows found in selected period.",
+            }
+
+        schema = str(cloud.get("schema") or "public")
+        url = self._build_pg_sqlalchemy_url(
+            str(cloud.get("host") or ""),
+            int(cloud.get("port") or 5432),
+            str(cloud.get("database") or "postgres"),
+            str(cloud.get("username") or ""),
+            str(cloud.get("password") or ""),
+        )
+        connect_args = {
+            "sslmode": "require" if cloud.get("tls", True) else "disable",
+            "connect_timeout": 8,
+            "prepare_threshold": None,
+        }
+        engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+        target_key = self._cloud_target_schema_key(cloud, schema)
+        try:
+            try:
+                self._ensure_cloud_schema_once(engine, schema, target_key)
+            except Exception:
+                pass
+
+            live_latest_rows: list[dict[str, Any]] = []
+            seen_latest: set[tuple[str, str, str]] = set()
+            for r in reversed(hist_rows):
+                t_id = normalize_tenant_id(str(r["tenant_id"] or "default"))
+                gateway_id = str(r["gateway_id"] or "")
+                tag_name = str(r["tag_name"] or "")
+                if not tag_name:
+                    continue
+                key = (t_id, gateway_id, tag_name)
+                if key in seen_latest:
+                    continue
+                seen_latest.add(key)
+                live_latest_rows.append(
+                    {
+                        "tenant_id": t_id,
+                        "gateway_id": gateway_id,
+                        "tag_name": tag_name,
+                        "ts_utc": str(r["ts_utc"] or ""),
+                        "source": str(r["source"] or ""),
+                        "gateway_name": str(r["gateway_name"] or ""),
+                        "device_name": str(r["device_name"] or ""),
+                        "plc_ip": str(r["plc_ip"] or ""),
+                        "database_name": str(r["database_name"] or ""),
+                        "value": r["value"],
+                        "quality": r["quality"],
+                        "quality_label": str(r["quality_label"] or ""),
+                        "updated_utc": run_utc,
+                    }
+                )
+
+            hist_payload = [
+                {
+                    "local_id": int(r["id"]),
+                    "tenant_id": normalize_tenant_id(str(r["tenant_id"] or "default")),
+                    "ts_utc": str(r["ts_utc"] or ""),
+                    "gateway_id": str(r["gateway_id"] or ""),
+                    "gateway_name": str(r["gateway_name"] or ""),
+                    "device_name": str(r["device_name"] or ""),
+                    "plc_ip": str(r["plc_ip"] or ""),
+                    "database_name": str(r["database_name"] or ""),
+                    "tag_name": str(r["tag_name"] or ""),
+                    "value": r["value"],
+                    "quality": r["quality"],
+                    "quality_label": str(r["quality_label"] or ""),
+                    "source": str(r["source"] or ""),
+                    "created_utc": str(r["created_utc"] or ""),
+                }
+                for r in hist_rows
+            ]
+            logs_payload = [
+                {
+                    "local_id": int(r["id"]),
+                    "tenant_id": normalize_tenant_id(str(r["tenant_id"] or "default")),
+                    "ts_utc": str(r["ts_utc"] or ""),
+                    "level": str(r["level"] or "info"),
+                    "category": str(r["category"] or "system"),
+                    "message": str(r["message"] or ""),
+                    "gateway_id": str(r["gateway_id"] or ""),
+                    "gateway_name": str(r["gateway_name"] or ""),
+                    "device_name": str(r["device_name"] or ""),
+                    "database_name": str(r["database_name"] or ""),
+                    "created_utc": str(r["created_utc"] or ""),
+                }
+                for r in log_rows
+            ]
+
+            with engine.begin() as conn:
+                if live_latest_rows:
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."live_latest"
+                            (tenant_id, gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
+                            VALUES
+                            (:tenant_id, :gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
+                            ON CONFLICT(tenant_id, gateway_id, tag_name) DO UPDATE SET
+                              ts_utc = excluded.ts_utc,
+                              source = excluded.source,
+                              gateway_name = excluded.gateway_name,
+                              device_name = excluded.device_name,
+                              plc_ip = excluded.plc_ip,
+                              database_name = excluded.database_name,
+                              value = excluded.value,
+                              quality = excluded.quality,
+                              quality_label = excluded.quality_label,
+                              updated_utc = excluded.updated_utc
+                            """
+                        ),
+                        live_latest_rows,
+                    )
+                if hist_payload:
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."historian_readings"
+                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
+                            VALUES
+                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
+                            ON CONFLICT(local_id) DO NOTHING
+                            """
+                        ),
+                        hist_payload,
+                    )
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."plc_readings"
+                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
+                            VALUES
+                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
+                            ON CONFLICT(local_id) DO NOTHING
+                            """
+                        ),
+                        hist_payload,
+                    )
+                if logs_payload:
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."app_logs"
+                            (local_id, tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc)
+                            VALUES
+                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :level, :category, :message, :gateway_id, :gateway_name, :device_name, :database_name, CAST(:created_utc AS timestamptz))
+                            ON CONFLICT(local_id) DO NOTHING
+                            """
+                        ),
+                        logs_payload,
+                    )
+
+            self._set_data_sync_state(last_data_sync_utc=run_utc, last_data_error="")
+            return {
+                "ok": True,
+                "actor": actor,
+                "run_utc": run_utc,
+                "from_utc": from_txt,
+                "to_utc": to_txt,
+                "hist_rows": len(hist_rows),
+                "log_rows": len(log_rows),
+                "truncated": bool(len(hist_rows) >= lim or len(log_rows) >= lim),
+            }
+        except Exception as exc:
+            self._set_data_sync_state(last_data_error=f"Manual sync failed: {exc}")
+            return {"ok": False, "message": f"Manual sync failed: {exc}"}
+        finally:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
+    def reset_all_data_and_config(self, actor: str = "manual", clear_cloud_data: bool = True) -> Dict[str, Any]:
+        now = self._utc_now()
+        cloud_result: Dict[str, Any] = {"attempted": False, "ok": True, "message": ""}
+        if clear_cloud_data:
+            cloud = self._get_cloud_database_target()
+            if cloud:
+                cloud_result["attempted"] = True
+                try:
+                    from sqlalchemy import create_engine, text  # type: ignore
+
+                    schema = str(cloud.get("schema") or "public")
+                    url = self._build_pg_sqlalchemy_url(
+                        str(cloud.get("host") or ""),
+                        int(cloud.get("port") or 5432),
+                        str(cloud.get("database") or "postgres"),
+                        str(cloud.get("username") or ""),
+                        str(cloud.get("password") or ""),
+                    )
+                    connect_args = {
+                        "sslmode": "require" if cloud.get("tls", True) else "disable",
+                        "connect_timeout": 8,
+                        "prepare_threshold": None,
+                    }
+                    engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+                    try:
+                        with engine.begin() as conn:
+                            for table_name in (
+                                "live_latest",
+                                "historian_readings",
+                                "plc_readings",
+                                "app_logs",
+                                "config_audit",
+                                "config_documents",
+                                "sync_outbox",
+                                "sync_targets",
+                            ):
+                                try:
+                                    conn.execute(text(f'DELETE FROM "{schema}"."{table_name}"'))
+                                except Exception:
+                                    pass
+                    finally:
+                        try:
+                            engine.dispose()
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    cloud_result["ok"] = False
+                    cloud_result["message"] = str(exc)
+
+        with self._lock:
+            with self._connect() as conn:
+                for table_name in (
+                    "historian_readings",
+                    "app_logs",
+                    "historian_agg_minute",
+                    "historian_agg_hour",
+                    "historian_agg_day",
+                    "sync_outbox",
+                    "config_audit",
+                    "retention_runs",
+                ):
+                    try:
+                        conn.execute(f"DELETE FROM {table_name}")
+                    except Exception:
+                        pass
+                try:
+                    conn.execute("DELETE FROM config_documents")
+                except Exception:
+                    pass
+                conn.execute(
+                    """
+                    INSERT INTO data_sync_state
+                    (id, last_historian_id, last_log_id, last_data_sync_utc, last_data_error, total_historian_synced, total_logs_synced, updated_utc)
+                    VALUES(1, 0, 0, ?, '', 0, 0, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                      last_historian_id = 0,
+                      last_log_id = 0,
+                      last_data_sync_utc = excluded.last_data_sync_utc,
+                      last_data_error = '',
+                      total_historian_synced = 0,
+                      total_logs_synced = 0,
+                      updated_utc = excluded.updated_utc
+                    """,
+                    (now, now),
+                )
+
+        # Re-seed required docs/default local DB after wipe.
+        self._ensure_required_config_domains()
+        self._ensure_default_database_configuration()
+        self._backfill_outbox_for_existing_domains()
+
+        return {
+            "ok": bool(cloud_result.get("ok", True)),
+            "actor": actor,
+            "run_utc": now,
+            "cloud": cloud_result,
+            "message": "Reset completed. Local data/config cleared and defaults re-seeded.",
+        }
+
     def get_inspector_snapshot(self, preview_limit: int = 10) -> Dict[str, Any]:
+        tenant_id = self._current_tenant_id()
         lim = max(1, min(int(preview_limit or 10), 100))
         db_exists = os.path.exists(self._db_path)
         db_size = os.path.getsize(self._db_path) if db_exists else 0
@@ -2101,6 +2633,7 @@ class AppStore:
             }
 
         return {
+            "tenant_id": tenant_id,
             "db_path": self._db_path,
             "db_exists": db_exists,
             "db_size_bytes": int(db_size),
@@ -2173,7 +2706,7 @@ class AppStore:
                         (domain, domain, payload_json, now, now),
                     )
         self._sync_wakeup_event.set()
-        return {"domain": domain, "version": new_version, "updated_utc": now}
+        return {"domain": domain, "tenant_id": self._current_tenant_id(), "version": new_version, "updated_utc": now}
 
     def save_bootstrap(self, data: Dict[str, Any], actor: str = "system") -> Dict[str, Any]:
         versions: Dict[str, Any] = {}
@@ -2185,10 +2718,13 @@ class AppStore:
 
     def append_historian_rows(self, rows: list[dict[str, Any]]) -> int:
         now = self._utc_now()
+        tenant_id = self._current_tenant_id()
         safe_rows = []
         for r in rows or []:
+            row_tenant = normalize_tenant_id(str(r.get("tenant_id") or tenant_id))
             safe_rows.append(
                 (
+                    row_tenant,
                     str(r.get("ts_utc") or r.get("ts") or now),
                     str(r.get("gateway_id") or ""),
                     str(r.get("gateway_name") or ""),
@@ -2210,8 +2746,8 @@ class AppStore:
                 conn.executemany(
                     """
                     INSERT INTO historian_readings
-                    (ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     safe_rows,
                 )
@@ -2220,10 +2756,13 @@ class AppStore:
 
     def append_log_rows(self, rows: list[dict[str, Any]]) -> int:
         now = self._utc_now()
+        tenant_id = self._current_tenant_id()
         safe_rows = []
         for r in rows or []:
+            row_tenant = normalize_tenant_id(str(r.get("tenant_id") or tenant_id))
             safe_rows.append(
                 (
+                    row_tenant,
                     str(r.get("ts") or r.get("ts_utc") or now),
                     str(r.get("level") or "info"),
                     str(r.get("category") or "system"),
@@ -2242,8 +2781,8 @@ class AppStore:
                 conn.executemany(
                     """
                     INSERT INTO app_logs
-                    (ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     safe_rows,
                 )
@@ -2252,6 +2791,7 @@ class AppStore:
 
     def get_historian_rows(self, limit: int = 1000) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 1000), 10000))
+        tenant_id = self._current_tenant_id()
         # Hosted/web deployments should prefer cloud-backed historian reads so the
         # website mirrors edge-collected data even when no local gateways run on VPS.
         prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
@@ -2269,19 +2809,21 @@ class AppStore:
             with self._connect() as conn:
                 rows = conn.execute(
                     """
-                    SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                    SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                            tag_name, value, quality, quality_label
                     FROM historian_readings
+                    WHERE tenant_id = ?
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    (lim,),
+                    (tenant_id, lim),
                 ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
             out.append(
                 {
                     "ts": r["ts_utc"],
+                    "tenant_id": str(r["tenant_id"] or tenant_id),
                     "source": r["source"] or "",
                     "gateway_id": r["gateway_id"] or "",
                     "gateway_name": r["gateway_name"] or "",
@@ -2322,6 +2864,7 @@ class AppStore:
 
     def get_live_rows(self, limit: int = 5000) -> list[dict[str, Any]]:
         lim = max(100, min(int(limit or 5000), 50000))
+        tenant_id = self._current_tenant_id()
         prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
             "1",
             "true",
@@ -2391,13 +2934,14 @@ class AppStore:
             with self._connect() as conn:
                 rows = conn.execute(
                     """
-                    SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                    SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                            tag_name, value, quality, quality_label
                     FROM historian_readings
+                    WHERE tenant_id = ?
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    (max(lim, 20000),),
+                    (tenant_id, max(lim, 20000)),
                 ).fetchall()
 
         latest: dict[tuple[str, str], dict[str, Any]] = {}
@@ -2411,6 +2955,7 @@ class AppStore:
                 continue
             latest[key] = {
                 "ts": str(r["ts_utc"] or ""),
+                "tenant_id": str(r["tenant_id"] or tenant_id),
                 "source": str(r["source"] or ""),
                 "gateway_id": gateway_id,
                 "gateway_name": str(r["gateway_name"] or ""),
@@ -2434,6 +2979,7 @@ class AppStore:
 
     def get_log_rows(self, limit: int = 2000) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 2000), 10000))
+        tenant_id = self._current_tenant_id()
         # Hosted/web deployments should prefer cloud-backed log reads.
         prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
             "1",
@@ -2450,18 +2996,20 @@ class AppStore:
             with self._connect() as conn:
                 rows = conn.execute(
                     """
-                    SELECT ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
+                    SELECT tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
                     FROM app_logs
+                    WHERE tenant_id = ?
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    (lim,),
+                    (tenant_id, lim),
                 ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
             out.append(
                 {
                     "ts": r["ts_utc"],
+                    "tenant_id": str(r["tenant_id"] or tenant_id),
                     "level": r["level"] or "info",
                     "category": r["category"] or "system",
                     "message": r["message"] or "",
@@ -2478,6 +3026,7 @@ class AppStore:
         return out
 
     def cleanup_data(self, mode: str, actor: str = "manual") -> Dict[str, Any]:
+        tenant_id = self._current_tenant_id()
         mode_clean = str(mode or "").strip().lower()
         now_dt = datetime.now(timezone.utc)
         cutoff: datetime | None
@@ -2507,18 +3056,18 @@ class AppStore:
         with self._lock:
             with self._connect() as conn:
                 if cutoff is None:
-                    deleted["historian_readings"] = int(conn.execute("DELETE FROM historian_readings").rowcount or 0)
-                    deleted["app_logs"] = int(conn.execute("DELETE FROM app_logs").rowcount or 0)
+                    deleted["historian_readings"] = int(conn.execute("DELETE FROM historian_readings WHERE tenant_id = ?", (tenant_id,)).rowcount or 0)
+                    deleted["app_logs"] = int(conn.execute("DELETE FROM app_logs WHERE tenant_id = ?", (tenant_id,)).rowcount or 0)
                     deleted["historian_agg_minute"] = int(conn.execute("DELETE FROM historian_agg_minute").rowcount or 0)
                     deleted["historian_agg_hour"] = int(conn.execute("DELETE FROM historian_agg_hour").rowcount or 0)
                     deleted["historian_agg_day"] = int(conn.execute("DELETE FROM historian_agg_day").rowcount or 0)
                 else:
                     cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-                    deleted["historian_readings"] = int(conn.execute("DELETE FROM historian_readings WHERE ts_utc >= ?", (cutoff_text,)).rowcount or 0)
-                    deleted["app_logs"] = int(conn.execute("DELETE FROM app_logs WHERE ts_utc >= ?", (cutoff_text,)).rowcount or 0)
-                    deleted["historian_agg_minute"] = int(conn.execute("DELETE FROM historian_agg_minute WHERE bucket_utc >= ?", (cutoff_text,)).rowcount or 0)
-                    deleted["historian_agg_hour"] = int(conn.execute("DELETE FROM historian_agg_hour WHERE bucket_utc >= ?", (cutoff_text,)).rowcount or 0)
-                    deleted["historian_agg_day"] = int(conn.execute("DELETE FROM historian_agg_day WHERE bucket_utc >= ?", (cutoff_text,)).rowcount or 0)
+                    deleted["historian_readings"] = int(conn.execute("DELETE FROM historian_readings WHERE tenant_id = ? AND ts_utc < ?", (tenant_id, cutoff_text)).rowcount or 0)
+                    deleted["app_logs"] = int(conn.execute("DELETE FROM app_logs WHERE tenant_id = ? AND ts_utc < ?", (tenant_id, cutoff_text)).rowcount or 0)
+                    deleted["historian_agg_minute"] = int(conn.execute("DELETE FROM historian_agg_minute WHERE bucket_utc < ?", (cutoff_text,)).rowcount or 0)
+                    deleted["historian_agg_hour"] = int(conn.execute("DELETE FROM historian_agg_hour WHERE bucket_utc < ?", (cutoff_text,)).rowcount or 0)
+                    deleted["historian_agg_day"] = int(conn.execute("DELETE FROM historian_agg_day WHERE bucket_utc < ?", (cutoff_text,)).rowcount or 0)
 
         summary = (
             f"Cleanup '{mode_clean}' complete by {actor}. "

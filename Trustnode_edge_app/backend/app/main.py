@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
 from app.auth import decode_access_token
 from app.config import settings
@@ -16,12 +17,14 @@ from app.routers.plc import router as plc_router
 from app.routers.ui_source import router as ui_source_router
 from app.routers.notifications import router as notifications_router
 from app.state import plc_manager, app_store
+from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
 
 app = FastAPI(title="Trustnode Edge API", version="0.1.0")
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,24 +39,33 @@ app.include_router(ui_source_router)
 app.include_router(notifications_router)
 
 
+PUBLIC_PATHS = {
+    "/api/health",
+    "/api/auth/login",
+    "/api/auth/me",
+}
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
+    tenant_id = set_current_tenant(resolve_request_tenant(request))
     path = request.url.path or ""
     method = (request.method or "GET").upper()
     if method == "OPTIONS":
         return await call_next(request)
     if not path.startswith("/api/"):
         return await call_next(request)
-    if path.startswith("/api/health") or path.startswith("/api/auth/"):
-        return await call_next(request)
-    if method in ("GET", "HEAD"):
+    if request.url.path in PUBLIC_PATHS:
         return await call_next(request)
     auth = request.headers.get("Authorization", "")
     token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""
     if not token:
         return JSONResponse(status_code=401, content={"detail": "Authentication required"})
     try:
-        decode_access_token(token)
+        payload = decode_access_token(token)
+        token_tenant = str(payload.get("tenant_id") or "").strip()
+        if token_tenant and token_tenant != tenant_id:
+            return JSONResponse(status_code=403, content={"detail": "Token tenant mismatch"})
     except Exception as exc:
         return JSONResponse(status_code=401, content={"detail": f"Invalid token: {exc}"})
     return await call_next(request)
@@ -66,12 +78,17 @@ def root() -> dict[str, str]:
 
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket) -> None:
+    tenant_id = set_current_tenant(resolve_websocket_tenant(websocket))
     token = (websocket.query_params.get("token") or "").strip()
     if not token:
         await websocket.close(code=1008)
         return
     try:
-        decode_access_token(token)
+        payload = decode_access_token(token)
+        token_tenant = str(payload.get("tenant_id") or "").strip()
+        if token_tenant and token_tenant != tenant_id:
+            await websocket.close(code=1008)
+            return
     except Exception:
         await websocket.close(code=1008)
         return
@@ -98,12 +115,17 @@ async def websocket_stream(websocket: WebSocket) -> None:
 
 @app.websocket("/ws/cloud-stream")
 async def websocket_cloud_stream(websocket: WebSocket) -> None:
+    tenant_id = set_current_tenant(resolve_websocket_tenant(websocket))
     token = (websocket.query_params.get("token") or "").strip()
     if not token:
         await websocket.close(code=1008)
         return
     try:
-        decode_access_token(token)
+        payload = decode_access_token(token)
+        token_tenant = str(payload.get("tenant_id") or "").strip()
+        if token_tenant and token_tenant != tenant_id:
+            await websocket.close(code=1008)
+            return
     except Exception:
         await websocket.close(code=1008)
         return
@@ -113,6 +135,7 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
         while True:
             payload = {
                 "type": "cloud_snapshot",
+                "tenant_id": tenant_id,
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
                 "live_rows": app_store.get_live_rows(limit=5000),
                 "historian_rows": app_store.get_historian_rows(limit=1500),

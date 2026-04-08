@@ -342,11 +342,21 @@ export async function browseOpcUaNodes(payload) {
 }
 
 export async function testDatabaseConnection(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/database/test-connection`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
+  let res;
+  try {
+    res = await fetchWithTimeout(`${getApiBase()}/api/database/test-connection`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }, 15000);
+  } catch (err) {
+    if (isTransientFetchError(err)) {
+      throw new Error(
+        "Database test request failed (network interrupted). Please retry."
+      );
+    }
+    throw err || new Error("Database test request failed");
+  }
   if (!res.ok) {
     let detail = "";
     try {
@@ -488,6 +498,12 @@ export async function saveAppStoreBootstrap(data, actor = "system") {
     body: JSON.stringify({ data, actor })
   });
   if (!res.ok) throw new Error("App store bootstrap save failed");
+  return res.json();
+}
+
+export async function getAppStoreTenantContext() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/tenant/context`);
+  if (!res.ok) throw new Error("Tenant context fetch failed");
   return res.json();
 }
 
@@ -644,5 +660,45 @@ export async function forceAppStoreSyncNow(payload = {}) {
     body: JSON.stringify(payload)
   });
   if (!res.ok) throw new Error("Force sync failed");
+  return res.json();
+}
+
+export async function manualPeriodSyncAppStore(payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/sync/manual-period`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }, 30000);
+  if (!res.ok) throw new Error("Manual period sync failed");
+  return res.json();
+}
+
+export async function clearAppStoreSyncQueue(payload = {}) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/sync/queue/clear`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) throw new Error("Clear sync queue failed");
+  return res.json();
+}
+
+export async function dropAppStoreSyncBacklog(payload = {}) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/sync/backlog/drop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) throw new Error("Drop sync backlog failed");
+  return res.json();
+}
+
+export async function resetAppStoreFull(payload = {}) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/reset/full`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }, 120000);
+  if (!res.ok) throw new Error("Full reset failed");
   return res.json();
 }

@@ -190,6 +190,7 @@ def _ensure_app_tables_postgresql(conn: Any, schema_name: str) -> None:
             f"""
             CREATE TABLE IF NOT EXISTS "{schema_name}"."historian_readings" (
               id BIGSERIAL PRIMARY KEY,
+              local_id BIGINT,
               ts_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
               gateway_id TEXT NULL,
               gateway_name TEXT NULL,

@@ -16,6 +16,7 @@ import {
   testUiSourceRemoteUrl,
   testPlcConnection,
   getAppStoreBootstrap,
+  getAppStoreTenantContext,
   saveAppStoreBootstrap,
   appendAppStoreHistorian,
   appendAppStoreLogs,
@@ -34,6 +35,10 @@ import {
   deleteAppStoreBackup,
   cleanupAppStoreData,
   forceAppStoreSyncNow,
+  manualPeriodSyncAppStore,
+  clearAppStoreSyncQueue,
+  dropAppStoreSyncBacklog,
+  resetAppStoreFull,
   sendNotificationEmail,
   loginAuth,
   getAuthMe,
@@ -74,6 +79,7 @@ const KNOWN_SUPABASE_DEFAULTS = {
   area: "LineA",
   equipment: "MACHINE-01",
 };
+const KNOWN_SUPABASE_POOLER_HOST = "aws-1-eu-west-1.pooler.supabase.com";
 
 const NAV_SECTIONS = [
   { id: "overview", title: "Overview", items: ["Dashboard"] },
@@ -170,6 +176,61 @@ function detectRetentionPreset(policy) {
   if (rawDays <= 7) return "week";
   if (rawDays <= 30) return "month";
   return "month";
+}
+
+function inferSupabaseProjectRef(db) {
+  const username = String(db?.username || "").trim().toLowerCase();
+  if (username.includes(".")) {
+    const maybeRef = username.split(".").slice(1).join(".");
+    if (/^[a-z0-9]{10,}$/.test(maybeRef)) return maybeRef;
+  }
+  const host = String(db?.host || "").trim().toLowerCase();
+  const dbMatch = host.match(/^db\.([a-z0-9]{10,})\.supabase\.co$/);
+  if (dbMatch?.[1]) return dbMatch[1];
+  return "";
+}
+
+function resolveSupabaseConnectionProfile(mode, hasIpv4AddOn, baseDb) {
+  const requestedMode = String(mode || "auto").toLowerCase();
+  const effectiveMode = requestedMode === "auto"
+    ? (hasIpv4AddOn ? "direct_ipv4" : "session_pooler")
+    : requestedMode;
+  const projectRef = inferSupabaseProjectRef(baseDb);
+  const directHost = projectRef ? `db.${projectRef}.supabase.co` : "";
+  if (effectiveMode === "direct_ipv4") {
+    return {
+      effectiveMode,
+      host: directHost || String(baseDb?.host || KNOWN_SUPABASE_POOLER_HOST),
+      port: "5432",
+      summary: directHost
+        ? "Direct PostgreSQL (IPv4 add-on)"
+        : "Direct mode selected (project ref not inferred; verify host)",
+    };
+  }
+  if (effectiveMode === "transaction_pooler") {
+    return {
+      effectiveMode,
+      host: String(baseDb?.host || KNOWN_SUPABASE_POOLER_HOST),
+      port: "6543",
+      summary: "Transaction pooler (serverless/short-lived)",
+    };
+  }
+  return {
+    effectiveMode: "session_pooler",
+    host: String(baseDb?.host || KNOWN_SUPABASE_POOLER_HOST),
+    port: "5432",
+    summary: "Session pooler (persistent edge writers)",
+  };
+}
+
+function normalizeSupabaseDirectUsername(engine, host, port, username) {
+  const isPg = String(engine || "").toLowerCase() === "postgresql";
+  const hostText = String(host || "").trim().toLowerCase();
+  const portNum = Number(port || 0);
+  const userText = String(username || "").trim();
+  const isSupabaseDirect = isPg && hostText.startsWith("db.") && hostText.endsWith(".supabase.co") && portNum === 5432;
+  if (!isSupabaseDirect) return userText;
+  return "postgres";
 }
 
 class AppErrorBoundary extends Component {
@@ -1033,12 +1094,29 @@ function AppShell() {
   });
   const [retentionPresetKey, setRetentionPresetKey] = useState("week");
   const [cloudProviderDbId, setCloudProviderDbId] = useState("");
+  const [currentTenantId, setCurrentTenantId] = useState("default");
+  const [cloudAutoSyncEnabled, setCloudAutoSyncEnabled] = useState(true);
+  const [tenantWebClientUrl, setTenantWebClientUrl] = useState("https://trustnode.lsapps.app");
+  const [tenantCompanyName, setTenantCompanyName] = useState("");
+  const [tenantLoginRealm, setTenantLoginRealm] = useState("");
+  const [cloudSupabaseMode, setCloudSupabaseMode] = useState("auto");
+  const [cloudSupabaseHasIpv4AddOn, setCloudSupabaseHasIpv4AddOn] = useState(true);
+  const [cloudSupabaseApplyResult, setCloudSupabaseApplyResult] = useState("");
   const [dolibarrMirrorEnabled, setDolibarrMirrorEnabled] = useState(false);
   const [trustnodeCloudEnabled, setTrustnodeCloudEnabled] = useState(true);
   const [selectedCloudDbId, setSelectedCloudDbId] = useState("");
   const [selectedOtherDbId, setSelectedOtherDbId] = useState("");
   const [selectedLocalDbId, setSelectedLocalDbId] = useState("");
   const [showCloudDbPickerModal, setShowCloudDbPickerModal] = useState(false);
+  const [showCloudSyncModal, setShowCloudSyncModal] = useState(false);
+  const [cloudSyncForm, setCloudSyncForm] = useState({
+    from_utc: "",
+    to_utc: "",
+    max_rows: 20000,
+    include_logs: false,
+    clear_queue_after: false,
+    drop_backlog_after: false,
+  });
   const [showOtherDbPickerModal, setShowOtherDbPickerModal] = useState(false);
   const [cloudDbPickerType, setCloudDbPickerType] = useState("supabase");
   const [otherDbPickerType, setOtherDbPickerType] = useState("sqlite");
@@ -1218,10 +1296,14 @@ function AppShell() {
       remember_user: rememberUser,
       endpoint_mode: endpointMode,
       cloud_url: cloudUrl,
+      cloud_auto_sync_enabled: cloudAutoSyncEnabled,
       ui_source_mode: uiSourceMode,
       ui_source_remote_url: uiSourceRemoteUrl,
       ui_source_local_path: uiSourceLocalPath,
       website_env_text: websiteEnvText,
+      tenant_web_client_url: tenantWebClientUrl,
+      tenant_company_name: tenantCompanyName,
+      tenant_login_realm: tenantLoginRealm,
       active_page: activePage
     },
     users_access: {
@@ -1284,6 +1366,9 @@ function AppShell() {
     if (typeof appSettings.cloud_url === "string") {
       setCloudUrl(appSettings.cloud_url);
     }
+    if (typeof appSettings.cloud_auto_sync_enabled === "boolean") {
+      setCloudAutoSyncEnabled(appSettings.cloud_auto_sync_enabled);
+    }
     if (isHostedWebClient) {
       const forcedCloud = String(appSettings.cloud_url || window.location.origin || "").trim().replace(/\/+$/, "");
       setEndpointMode("cloud");
@@ -1294,6 +1379,9 @@ function AppShell() {
     if (typeof appSettings.ui_source_remote_url === "string") setUiSourceRemoteUrl(appSettings.ui_source_remote_url);
     if (typeof appSettings.ui_source_local_path === "string") setUiSourceLocalPath(appSettings.ui_source_local_path);
     if (typeof appSettings.website_env_text === "string") setWebsiteEnvText(appSettings.website_env_text);
+    if (typeof appSettings.tenant_web_client_url === "string") setTenantWebClientUrl(appSettings.tenant_web_client_url);
+    if (typeof appSettings.tenant_company_name === "string") setTenantCompanyName(appSettings.tenant_company_name);
+    if (typeof appSettings.tenant_login_realm === "string") setTenantLoginRealm(appSettings.tenant_login_realm);
     if (typeof appSettings.active_page === "string") {
       const mappedPage = appSettings.active_page === "database_overview" ? "database" : appSettings.active_page;
       setActivePage(mappedPage);
@@ -1812,6 +1900,7 @@ function AppShell() {
       try {
         const res = await getAppStoreBootstrap();
         if (cancelled) return;
+        if (res?.tenant_id) setCurrentTenantId(String(res.tenant_id));
         if (res?.ok && res?.data && Object.keys(res.data).length) {
           applyAppStorePayload(res.data);
         }
@@ -1822,6 +1911,16 @@ function AppShell() {
       }
     };
     loadAppStore();
+    const loadTenantCtx = async () => {
+      try {
+        const res = await getAppStoreTenantContext();
+        if (cancelled) return;
+        if (res?.tenant_id) setCurrentTenantId(String(res.tenant_id));
+      } catch (_) {
+        // no-op fallback
+      }
+    };
+    loadTenantCtx();
     return () => {
       cancelled = true;
     };
@@ -2020,9 +2119,13 @@ function AppShell() {
     rememberUser,
     endpointMode,
     cloudUrl,
+    cloudAutoSyncEnabled,
     uiSourceMode,
     uiSourceRemoteUrl,
     uiSourceLocalPath,
+    tenantWebClientUrl,
+    tenantCompanyName,
+    tenantLoginRealm,
     activePage,
     users,
     currentUser,
@@ -2177,7 +2280,7 @@ function AppShell() {
                 legacy_url: c.legacy_url || "",
                 legacy_api_token: c.legacy_api_token || "",
                 tls: Boolean(c.tls),
-                timeout_ms: 4000
+                timeout_ms: String(c.engine || "").toLowerCase() === "postgresql" ? 12000 : 4000
               });
               return { id: c.id, connection_ok: Boolean(res.ok), last_test: res.message, last_check_utc: tsNow() };
             } catch (err) {
@@ -3841,6 +3944,27 @@ function AppShell() {
   }, [dolibarrCandidates]);
 
   useEffect(() => {
+    const selected = cloudProviderCandidates.find(
+      (db) => String(db.id || "") === String(cloudProviderDbId || "")
+    );
+    if (!selected) return;
+    const host = String(selected.host || "").toLowerCase();
+    const port = Number(selected.port || 0);
+    if (host.includes(".pooler.supabase.com")) {
+      if (port === 6543) setCloudSupabaseMode("transaction_pooler");
+      else setCloudSupabaseMode("session_pooler");
+      setCloudSupabaseHasIpv4AddOn(false);
+      return;
+    }
+    if (host.startsWith("db.") && host.endsWith(".supabase.co") && port === 5432) {
+      setCloudSupabaseMode("direct_ipv4");
+      setCloudSupabaseHasIpv4AddOn(true);
+      return;
+    }
+    setCloudSupabaseMode("auto");
+  }, [cloudProviderDbId, cloudProviderCandidates]);
+
+  useEffect(() => {
     if (!cloudDbRows.length) {
       if (selectedCloudDbId) setSelectedCloudDbId("");
       if (trustnodeCloudEnabled) setTrustnodeCloudEnabled(false);
@@ -5455,6 +5579,15 @@ function AppShell() {
     const isFileSink = dbForm.engine === "csv_file" || dbForm.engine === "txt_file";
     const host = dbForm.host.trim();
     const port = Number(dbForm.port);
+    const normalizedUsername = normalizeSupabaseDirectUsername(
+      dbForm.engine,
+      host,
+      port,
+      dbForm.username.trim()
+    );
+    if (normalizedUsername !== dbForm.username.trim()) {
+      setDbForm((prev) => ({ ...prev, username: normalizedUsername }));
+    }
     const sqlitePath = dbForm.sqlite_path.trim();
     const filePath = dbForm.file_path.trim();
     if (!isLegacy && !isSqlite && !isFileSink && (!host || !port)) {
@@ -5480,14 +5613,14 @@ function AppShell() {
         host,
         port,
         database: dbForm.database.trim(),
-        username: dbForm.username.trim(),
+        username: normalizedUsername,
         password: dbForm.password,
         sqlite_path: sqlitePath,
         file_path: filePath,
         legacy_url: dbForm.legacy_url.trim(),
         legacy_api_token: dbForm.legacy_api_token.trim(),
         tls: Boolean(dbForm.tls),
-        timeout_ms: 2500
+        timeout_ms: dbForm.engine === "postgresql" ? 10000 : 2500
       });
       const testedFor = isLegacy
         ? `legacy:${dbForm.legacy_url.trim()}`
@@ -5512,6 +5645,15 @@ function AppShell() {
     const isFileSink = dbForm.engine === "csv_file" || dbForm.engine === "txt_file";
     const host = dbForm.host.trim();
     const port = Number(dbForm.port);
+    const normalizedUsername = normalizeSupabaseDirectUsername(
+      dbForm.engine,
+      host,
+      port,
+      dbForm.username.trim()
+    );
+    if (normalizedUsername !== dbForm.username.trim()) {
+      setDbForm((prev) => ({ ...prev, username: normalizedUsername }));
+    }
     const sqlitePath = dbForm.sqlite_path.trim();
     const filePath = dbForm.file_path.trim();
     if (!name || (!isLegacy && !isSqlite && !isFileSink && (!host || !port))) {
@@ -5559,7 +5701,7 @@ function AppShell() {
         host: isLegacy || isSqlite ? "" : host,
         port: isLegacy || isSqlite ? 0 : port,
         database: isLegacy ? "" : dbForm.database.trim(),
-        username: isLegacy || isSqlite ? "" : dbForm.username.trim(),
+        username: isLegacy || isSqlite ? "" : normalizedUsername,
         password: isLegacy || isSqlite ? "" : dbForm.password,
         sqlite_path: isSqlite ? sqlitePath : "",
         file_path: isFileSink ? filePath : "",
@@ -5602,7 +5744,7 @@ function AppShell() {
           host,
           port,
           database: dbForm.database.trim(),
-          username: dbForm.username.trim(),
+          username: normalizedUsername,
           password: dbForm.password,
           sqlite_path: sqlitePath,
           file_path: filePath,
@@ -5818,6 +5960,89 @@ function AppShell() {
     }
   };
 
+  const openCloudSyncModal = () => {
+    const now = new Date();
+    const from = new Date(now.getTime() - 60 * 60 * 1000);
+    const toLocalInput = (d) => {
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+    setCloudSyncForm((prev) => ({
+      ...prev,
+      from_utc: prev.from_utc || toLocalInput(from),
+      to_utc: prev.to_utc || toLocalInput(now),
+    }));
+    setShowCloudSyncModal(true);
+  };
+
+  const runManualCloudPeriodSync = async () => {
+    if (!canEditPage("database")) return;
+    const fromUtc = String(cloudSyncForm.from_utc || "").trim();
+    const toUtc = String(cloudSyncForm.to_utc || "").trim();
+    if (!fromUtc || !toUtc) {
+      setForceSyncResult("Select a valid sync period (From/To).");
+      return;
+    }
+    setForceSyncBusy(true);
+    setForceSyncResult("");
+    try {
+      const periodRes = await manualPeriodSyncAppStore({
+        from_utc: new Date(fromUtc).toISOString(),
+        to_utc: new Date(toUtc).toISOString(),
+        max_rows: Number(cloudSyncForm.max_rows || 20000),
+        include_logs: Boolean(cloudSyncForm.include_logs),
+        actor: currentUser?.username || "manual",
+      });
+      const parts = [
+        `Manual period sync: H:${Number(periodRes?.hist_rows || 0)} L:${Number(periodRes?.log_rows || 0)}`,
+      ];
+      if (periodRes?.message) parts.push(String(periodRes.message));
+
+      if (cloudSyncForm.clear_queue_after) {
+        const clearRes = await clearAppStoreSyncQueue({ actor: currentUser?.username || "manual", include_sent: false });
+        parts.push(`Queue cleared: ${Number(clearRes?.deleted_rows || 0)}`);
+      }
+      if (cloudSyncForm.drop_backlog_after) {
+        await dropAppStoreSyncBacklog({ actor: currentUser?.username || "manual" });
+        parts.push("Backlog dropped to current head.");
+      }
+      setForceSyncResult(parts.join(" | "));
+      setShowCloudSyncModal(false);
+      await refreshDatabaseInspector();
+    } catch (err) {
+      setForceSyncResult(`Manual sync failed: ${String(err)}`);
+    } finally {
+      setForceSyncBusy(false);
+    }
+  };
+
+  const runResetLocalAndSync = async () => {
+    if (!canEditPage("database")) return;
+    const confirmed = window.confirm(
+      "This will delete local PLC readings/logs, reset app configuration, clear pending sync queue, and force a fresh sync. Continue?"
+    );
+    if (!confirmed) return;
+    setForceSyncBusy(true);
+    setForceSyncResult("");
+    try {
+      await stopAllGatewayInstances();
+      const resetRes = await resetAppStoreFull({
+        actor: currentUser?.username || "manual",
+        clear_cloud_data: true,
+      });
+      setForceSyncResult(
+        resetRes?.ok
+          ? "Reset complete. Local + cloud tables cleaned and default configuration re-seeded."
+          : `Reset completed with cloud warning: ${String(resetRes?.cloud?.message || "unknown cloud error")}`
+      );
+      await refreshDatabaseOverviewCards("Reset + Sync");
+    } catch (err) {
+      setForceSyncResult(`Reset + Sync failed: ${String(err)}`);
+    } finally {
+      setForceSyncBusy(false);
+    }
+  };
+
   const refreshDatabaseInspector = async () => {
     setDatabaseInspectorBusy(true);
     setDatabaseInspectorError("");
@@ -5876,9 +6101,9 @@ function AppShell() {
     }));
   };
 
-  const applyCloudRoutingPolicy = () => {
+  const applyCloudRoutingPolicy = (selectedIdOverride = "") => {
     if (!isAdminDatabaseUser) return;
-    const selectedId = String(cloudProviderDbId || "").trim();
+    const selectedId = String(selectedIdOverride || cloudProviderDbId || "").trim();
     if (!selectedId) {
       setDatabaseOverviewResult("Select a PostgreSQL cloud target first.");
       return;
@@ -5922,6 +6147,59 @@ function AppShell() {
     );
   };
 
+  const applySupabaseBestProfile = () => {
+    if (!isAdminDatabaseUser) return;
+    const preferredId = String(cloudProviderDbId || selectedCloudDbId || "").trim();
+    const supabaseCandidates = cloudProviderCandidates.filter((db) =>
+      String(db.host || "").toLowerCase().includes("supabase")
+    );
+    const targetDb =
+      cloudProviderCandidates.find((db) => String(db.id || "") === preferredId) ||
+      supabaseCandidates[0] ||
+      cloudProviderCandidates[0] ||
+      null;
+    if (!targetDb) {
+      setCloudSupabaseApplyResult("No PostgreSQL cloud target found. Add Supabase first.");
+      return;
+    }
+    const profile = resolveSupabaseConnectionProfile(
+      cloudSupabaseMode,
+      cloudSupabaseHasIpv4AddOn,
+      targetDb
+    );
+    const normalizedUsername =
+      profile.effectiveMode === "direct_ipv4"
+        ? "postgres"
+        : String(targetDb.username || KNOWN_SUPABASE_DEFAULTS.username);
+    const targetId = String(targetDb.id || "").trim();
+    setDbConnections((prev) =>
+      prev.map((db) => {
+        if (String(db.id || "") !== targetId) return db;
+        return {
+          ...db,
+          engine: "postgresql",
+          host: profile.host,
+          port: Number(profile.port || 5432),
+          username: normalizedUsername,
+          tls: true,
+          enabled: true,
+          use_gateway: true,
+          use_app: true,
+          cloud_sync_enabled: true,
+          connection_ok: true,
+          last_check_utc: tsNow(),
+          last_test: `Trustnode Cloud profile applied: ${profile.summary}`,
+        };
+      })
+    );
+    setCloudProviderDbId(targetId);
+    setSelectedCloudDbId(targetId);
+    applyCloudRoutingPolicy(targetId);
+    setCloudSupabaseApplyResult(
+      `Applied ${profile.summary} to ${targetDb.name} (${profile.host}:${profile.port}, user ${normalizedUsername}).`
+    );
+  };
+
   const refreshDatabaseOverviewCards = async (label = "Database") => {
     try {
       await Promise.all([refreshDatabaseInspector(), refreshRetentionData(), refreshBackups()]);
@@ -5950,6 +6228,21 @@ function AppShell() {
       })
     );
     setDatabaseOverviewResult(`Trustnode Cloud ${enabled ? "enabled" : "disabled"} for configured cloud targets.`);
+  };
+
+  const applyWebClientLinkSettings = () => {
+    const normalizedUrl = String(tenantWebClientUrl || "").trim().replace(/\/+$/, "");
+    if (!/^https?:\/\//i.test(normalizedUrl)) {
+      setDatabaseOverviewResult("Web client URL must start with http:// or https://");
+      return;
+    }
+    setTenantWebClientUrl(normalizedUrl);
+    if (endpointMode === "cloud") {
+      setCloudUrl(normalizedUrl);
+    }
+    setDatabaseOverviewResult(
+      `Web client linked for tenant '${currentTenantId}'${tenantCompanyName ? ` (${tenantCompanyName})` : ""}.`
+    );
   };
 
   const openCloudDbPicker = () => {
@@ -5988,13 +6281,22 @@ function AppShell() {
         return String(db.host || "").toLowerCase().includes("supabase");
       });
       const source = existingSupabase || KNOWN_SUPABASE_DEFAULTS;
+      const profile = resolveSupabaseConnectionProfile(
+        cloudSupabaseMode,
+        cloudSupabaseHasIpv4AddOn,
+        source
+      );
+      const normalizedUsername =
+        profile.effectiveMode === "direct_ipv4"
+          ? "postgres"
+          : String(source.username || KNOWN_SUPABASE_DEFAULTS.username);
       openAddDbConnection("gateway", {
         name: String(existingSupabase?.name || "Supabase"),
         engine: "postgresql",
-        host: String(source.host || KNOWN_SUPABASE_DEFAULTS.host),
-        port: String(source.port || KNOWN_SUPABASE_DEFAULTS.port),
+        host: String(profile.host || source.host || KNOWN_SUPABASE_DEFAULTS.host),
+        port: String(profile.port || source.port || KNOWN_SUPABASE_DEFAULTS.port),
         database: String(source.database || KNOWN_SUPABASE_DEFAULTS.database),
-        username: String(source.username || KNOWN_SUPABASE_DEFAULTS.username),
+        username: normalizedUsername,
         password: String(source.password || KNOWN_SUPABASE_DEFAULTS.password),
         schema: String(source.schema || KNOWN_SUPABASE_DEFAULTS.schema),
         table: String(source.table || KNOWN_SUPABASE_DEFAULTS.table),
@@ -6009,6 +6311,7 @@ function AppShell() {
         use_backup: false,
         cloud_sync_enabled: true,
       });
+      setCloudSupabaseApplyResult(`Prepared Supabase form with ${profile.summary} (user ${normalizedUsername}).`);
     }
     setShowCloudDbPickerModal(false);
   };
@@ -6272,69 +6575,6 @@ function AppShell() {
       }
     );
   };
-
-  const renderSectionRetentionControls = (scope) => (
-    <>
-      <div className="db-card-bottom-actions">
-        <label>
-          Keep PLC Tag Data
-          <select
-            value={retentionPresetKey}
-            onChange={(e) => applyRetentionPreset(e.target.value)}
-            disabled={!isAdminDatabaseUser}
-          >
-            <option value="day">Last day</option>
-            <option value="week">Last week</option>
-            <option value="month">Last month</option>
-          </select>
-        </label>
-        <label>
-          Cleanup Schedule (minutes)
-          <input
-            type="number"
-            min="5"
-            value={retentionPolicy.schedule_minutes}
-            onChange={(e) => setRetentionPolicy((prev) => ({ ...prev, schedule_minutes: Number(e.target.value || 60) }))}
-            disabled={!isAdminDatabaseUser}
-          />
-        </label>
-        <div className="db-simple-actions db-actions-row-end">
-          <select
-            value={cleanupMode}
-            onChange={(e) => setCleanupMode(e.target.value)}
-            disabled={!isAdminDatabaseUser || cleanupBusy}
-            title="Cleanup scope"
-          >
-            <option value="period">Period</option>
-            <option value="last_hours">Last Hour</option>
-            <option value="last_day">Last Day</option>
-            <option value="last_week">Last Week</option>
-            <option value="last_month">Last Month</option>
-            <option value="all">All</option>
-          </select>
-          <button className="btn btn-primary btn-sm" onClick={() => saveRetentionPolicy(scope)} disabled={!isAdminDatabaseUser || retentionBusy}>
-            {retentionBusy ? "Saving..." : "Save Retention"}
-          </button>
-          <button className="btn btn-danger btn-sm" onClick={() => executeRetentionRun(false, scope)} disabled={!isAdminDatabaseUser || retentionBusy}>
-            Run Retention Now
-          </button>
-          <button className="btn btn-danger btn-sm" onClick={() => runCleanupData(scope)} disabled={!isAdminDatabaseUser || cleanupBusy}>
-            {cleanupBusy ? "Cleaning..." : "Run Cleanup Now"}
-          </button>
-        </div>
-      </div>
-      {retentionResult && retentionResultScope === scope ? (
-        <div className={retentionResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 8 }}>
-          {retentionResult}
-        </div>
-      ) : null}
-      {cleanupResult && cleanupResultScope === scope ? (
-        <div className={cleanupResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 8 }}>
-          {cleanupResult}
-        </div>
-      ) : null}
-    </>
-  );
 
   useEffect(() => {
     if (!appStoreHydrated) return;
@@ -7721,7 +7961,6 @@ function AppShell() {
                     <div className="trow"><span className="db-cell">-</span><span className="db-cell">No local databases configured</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span></div>
                   ) : null}
                 </div>
-                {renderSectionRetentionControls("local")}
               </section>
 
               <section className="card db-simple-card">
@@ -7819,20 +8058,29 @@ function AppShell() {
                       {!cloudProviderCandidates.length ? <option value="">No PostgreSQL cloud DB found</option> : null}
                       {cloudProviderCandidates.map((db) => (
                         <option key={`cloud-db-${db.id}`} value={db.id}>
-                          {db.host?.toLowerCase().includes("supabase") ? `[Default Supabase] ${db.name}` : db.name}
+                          {db.name}
                         </option>
                       ))}
                     </select>
                   </label>
                   <div className="db-simple-actions db-actions-row-end">
-                    <button className="btn btn-primary btn-sm" onClick={applyCloudRoutingPolicy} disabled={!isAdminDatabaseUser}>
-                      Apply Routing
-                    </button>
-                    <button className="btn btn-primary btn-sm" onClick={() => runProvisionProfile("cloud")} disabled={!isAdminDatabaseUser}>
-                      Provision
+                    <label className="remember-row db-inline-toggle">
+                      <input
+                        type="checkbox"
+                        checked={cloudAutoSyncEnabled}
+                        onChange={(e) => setCloudAutoSyncEnabled(e.target.checked)}
+                        disabled={!isAdminDatabaseUser}
+                      />
+                      <span className="remember-label">Auto Sync</span>
+                    </label>
+                    <button className="btn btn-primary btn-sm" onClick={openCloudSyncModal} disabled={!isAdminDatabaseUser || forceSyncBusy}>
+                      Sync Period...
                     </button>
                     <button className="btn btn-success btn-sm" onClick={runForceCloudSyncNow} disabled={!isAdminDatabaseUser || forceSyncBusy}>
                       {forceSyncBusy ? "Syncing..." : "Force Sync"}
+                    </button>
+                    <button className="btn btn-danger btn-sm" onClick={runResetLocalAndSync} disabled={!isAdminDatabaseUser || forceSyncBusy}>
+                      Reset Local + Sync
                     </button>
                     <button
                       className="btn btn-primary btn-sm"
@@ -7859,7 +8107,6 @@ function AppShell() {
                   />
                   <span className="remember-label">Enable Dolibarr mirror output</span>
                 </label>
-                {renderSectionRetentionControls("cloud")}
                 {databaseInspector?.data_sync?.last_data_error ? (
                   <div className="error" style={{ marginTop: 8 }}>
                     {String(databaseInspector.data_sync.last_data_error)}
@@ -7897,8 +8144,8 @@ function AppShell() {
                     </button>
                   </div>
                 </div>
-                <div className="table db-table other-data-table">
-                  <div className="thead"><span>Name</span><span>Engine</span><span>Endpoint</span><span>Roles</span><span>Parallel</span><span>Status</span><span>Last Check</span><span>Actions</span></div>
+                <div className="table db-table">
+                  <div className="thead"><span>Name</span><span>Engine</span><span>Endpoint</span><span>Role</span><span>Status</span><span>Last Check</span><span>Actions</span></div>
                   {otherDatabaseRows.map((c) => (
                     <div
                       key={`other-db-${c.id}`}
@@ -7909,11 +8156,6 @@ function AppShell() {
                       <span className="db-cell">{String(c.engine || "").toUpperCase()}</span>
                       <span className="db-cell db-url-cell" title={getDbEndpointLabel(c)}>{getDbEndpointLabel(c)}</span>
                       <span className="db-cell">{getDbRoleLabel(c)}</span>
-                      <span className="db-cell">
-                        <span className={`status-pill ${c.use_backup ? "status-online" : "status-offline"}`}>
-                          {c.use_backup ? "ENABLED" : "DISABLED"}
-                        </span>
-                      </span>
                       <span className="db-cell">
                         <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
                           {c.connection_ok ? "ONLINE" : "OFFLINE"}
@@ -7927,56 +8169,9 @@ function AppShell() {
                     </div>
                   ))}
                   {!otherDatabaseRows.length ? (
-                    <div className="trow"><span className="db-cell">-</span><span className="db-cell">No other databases configured</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span></div>
+                    <div className="trow"><span className="db-cell">-</span><span className="db-cell">No other databases configured</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span></div>
                   ) : null}
                 </div>
-                <div className="db-card-bottom-actions">
-                  <label>
-                    Snapshot
-                    <select
-                      value={selectedBackupFilename}
-                      onChange={(e) => setSelectedBackupFilename(e.target.value)}
-                      disabled={!isAdminDatabaseUser || !backupRows.length}
-                    >
-                      {!backupRows.length ? <option value="">No snapshots</option> : null}
-                      {backupRows.map((row) => (
-                        <option key={`snap-${row.filename}`} value={row.filename}>
-                          {row.filename}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <div className="db-simple-actions db-actions-row-end">
-                    <button
-                      className="btn btn-primary btn-sm"
-                      onClick={() => {
-                        const selected = otherDatabaseRows.find((db) => String(db.id || "") === String(selectedOtherDbId || ""));
-                        if (!selected) {
-                          setDatabaseOverviewResult("Select an 'Other Databases' row to edit.");
-                          return;
-                        }
-                        openEditDbConnection(selected);
-                      }}
-                      disabled={!isAdminDatabaseUser || !selectedOtherDbId}
-                    >
-                      Edit Selected
-                    </button>
-                    <button className="btn btn-primary btn-sm" onClick={() => openAddDbConnection("backup", { name: "CSV Mirror", engine: "csv_file", file_path: "./data/trustnode_backup.csv", enabled: true, use_gateway: true, use_backup: true, use_app: false, cloud_sync_enabled: false })} disabled={!isAdminDatabaseUser}>
-                      Add CSV
-                    </button>
-                    <button className="btn btn-primary btn-sm" onClick={() => runProvisionProfile("backup")} disabled={!isAdminDatabaseUser}>
-                      Provision
-                    </button>
-                    <button className="btn btn-primary btn-sm" onClick={runCreateBackup} disabled={!isAdminDatabaseUser || backupBusy}>
-                      {backupBusy ? "Working..." : "Create Snapshot"}
-                    </button>
-                    <button className="btn btn-success btn-sm" onClick={() => runRestoreBackup(selectedBackupFilename)} disabled={!isAdminDatabaseUser || !selectedBackupFilename || backupBusy}>
-                      Restore Snapshot
-                    </button>
-                  </div>
-                </div>
-                {backupResult ? <div className="info-note" style={{ marginTop: 8 }}>{backupResult}</div> : null}
-                {renderSectionRetentionControls("other")}
               </section>
 
               {databaseOverviewResult ? <section className="card"><div className="info-note">{databaseOverviewResult}</div></section> : null}
@@ -8057,12 +8252,110 @@ function AppShell() {
           {activePage === "backup_and_retention" ? (
             <>
               <section className="card">
+                <div className="table db-overview-table">
+                  <div className="thead"><span>Backup Targets</span><span>Snapshots</span><span>Scheduler</span><span>Retention</span><span>Last Run</span></div>
+                  <div className="trow">
+                    <span>{otherDatabaseRows.length}</span>
+                    <span>{backupRows.length}</span>
+                    <span>{retentionPolicy.enabled ? "ENABLED" : "DISABLED"}</span>
+                    <span>{`Raw ${Number(retentionPolicy.raw_keep_days || 7)}d | Min ${Number(retentionPolicy.minute_keep_days || 30)}d`}</span>
+                    <span>{retentionRuns?.[0]?.run_utc || "-"}</span>
+                  </div>
+                </div>
+              </section>
+
+              <section className="card db-simple-card">
+                <div className="db-simple-head">
+                  <div className="db-head-title-wrap">
+                    <h3 style={{ margin: 0 }}>Backup Databases</h3>
+                    <span className="status-pill status-online">Parallel Backup Targets</span>
+                  </div>
+                  <div className="db-card-top-actions">
+                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openOtherDbPicker} disabled={!isAdminDatabaseUser}>
+                      <AddIcon />
+                      <span>Add</span>
+                    </button>
+                    <button className="btn btn-primary btn-sm" onClick={() => refreshDatabaseOverviewCards("Backup Targets")}>
+                      Load
+                    </button>
+                    <button
+                      className="btn btn-danger btn-sm"
+                      onClick={() => {
+                        if (!selectedOtherDbId) {
+                          setBackupResult("Select a backup database row to remove.");
+                          return;
+                        }
+                        removeDbConnection(selectedOtherDbId);
+                      }}
+                      disabled={!isAdminDatabaseUser || !selectedOtherDbId}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </div>
+                <div className="table db-table other-data-table">
+                  <div className="thead"><span>Name</span><span>Engine</span><span>Endpoint</span><span>Role</span><span>Enabled</span><span>Status</span><span>Last Check</span><span>Actions</span></div>
+                  {otherDatabaseRows.map((c) => (
+                    <div
+                      key={`backup-target-${c.id}`}
+                      className={`trow ${String(selectedOtherDbId || "") === String(c.id || "") ? "selected-row" : ""}`}
+                      onClick={() => setSelectedOtherDbId(String(c.id || ""))}
+                    >
+                      <span className="db-cell">{c.name}</span>
+                      <span className="db-cell">{String(c.engine || "").toUpperCase()}</span>
+                      <span className="db-cell db-url-cell" title={getDbEndpointLabel(c)}>{getDbEndpointLabel(c)}</span>
+                      <span className="db-cell">{getDbRoleLabel(c)}</span>
+                      <span className="db-cell">
+                        <span className={`status-pill ${c.enabled !== false ? "status-online" : "status-offline"}`}>
+                          {c.enabled !== false ? "ENABLED" : "DISABLED"}
+                        </span>
+                      </span>
+                      <span className="db-cell">
+                        <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
+                          {c.connection_ok ? "ONLINE" : "OFFLINE"}
+                        </span>
+                      </span>
+                      <span className="db-cell db-last-check-cell" title={c.last_check_utc || ""}>{getDbSyncLastCheckLabel(c)}</span>
+                      <span className="row-actions db-actions-cell">
+                        <button className="icon-btn table-action-btn" onClick={(e) => { e.stopPropagation(); openEditDbConnection(c); }} disabled={!isAdminDatabaseUser} title="Edit backup DB"><EditIcon /></button>
+                        <button className="icon-btn table-action-btn danger" onClick={(e) => { e.stopPropagation(); removeDbConnection(c.id); }} disabled={!isAdminDatabaseUser} title="Delete backup DB"><DeleteIcon /></button>
+                      </span>
+                    </div>
+                  ))}
+                  {!otherDatabaseRows.length ? (
+                    <div className="trow">
+                      <span className="db-cell">-</span><span className="db-cell">No backup databases configured</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="db-simple-actions db-actions-row-end">
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={() => {
+                      const selected = otherDatabaseRows.find((db) => String(db.id || "") === String(selectedOtherDbId || ""));
+                      if (!selected) {
+                        setBackupResult("Select a backup database row to edit.");
+                        return;
+                      }
+                      openEditDbConnection(selected);
+                    }}
+                    disabled={!isAdminDatabaseUser || !selectedOtherDbId}
+                  >
+                    Edit Selected
+                  </button>
+                  <button className="btn btn-primary btn-sm" onClick={() => runProvisionProfile("backup")} disabled={!isAdminDatabaseUser}>
+                    Provision Template
+                  </button>
+                </div>
+              </section>
+
+              <section className="card">
                 <div className="row backup-card-header">
-                  <h3 className="card-title">Backups</h3>
+                  <h3 className="card-title">Snapshot Backups</h3>
                   <div className="row">
                     <button className="btn btn-primary icon-text-btn" onClick={runCreateBackup} disabled={!canEditPage("backup_and_retention") || backupBusy}>
                       <AddIcon />
-                      <span>{backupBusy ? "Working..." : "Create Backup"}</span>
+                      <span>{backupBusy ? "Working..." : "Create Snapshot"}</span>
                     </button>
                     <button
                       className="btn btn-success"
@@ -8073,7 +8366,7 @@ function AppShell() {
                     </button>
                   </div>
                 </div>
-                <div className="table email-profiles-table">
+                <div className="table backup-files-table">
                   <div className="thead"><span>Select</span><span>Created (UTC)</span><span>File</span><span>Size</span><span>Actions</span></div>
                   {backupRows.map((b) => (
                     <div key={`bk-${b.filename}`} className="trow">
@@ -8102,9 +8395,10 @@ function AppShell() {
                 </div>
                 {backupResult ? <div className={backupResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 10 }}>{backupResult}</div> : null}
               </section>
+
               <section className="card">
                 <div className="row backup-card-header">
-                  <h3 className="card-title">Retention Policy</h3>
+                  <h3 className="card-title">Retention and Cleanup Policy</h3>
                   <div className="row">
                     <button className="btn btn-primary" onClick={saveRetentionPolicy} disabled={!canEditPage("backup_and_retention") || retentionBusy}>Save Policy</button>
                     <button className="btn btn-success" onClick={() => executeRetentionRun(true)} disabled={!canEditPage("backup_and_retention") || retentionBusy}>Dry Run</button>
@@ -8115,6 +8409,14 @@ function AppShell() {
                   <label className="remember-row">
                     <input type="checkbox" checked={Boolean(retentionPolicy.enabled)} onChange={(e) => setRetentionPolicy((p) => ({ ...p, enabled: e.target.checked }))} disabled={!canEditPage("backup_and_retention")} />
                     <span className="remember-label">Enable scheduler</span>
+                  </label>
+                  <label>
+                    Keep PLC Tag Data
+                    <select value={retentionPresetKey} onChange={(e) => applyRetentionPreset(e.target.value)} disabled={!canEditPage("backup_and_retention")}>
+                      <option value="day">Last day</option>
+                      <option value="week">Last week</option>
+                      <option value="month">Last month</option>
+                    </select>
                   </label>
                   <label>Schedule (minutes)<input type="number" min="5" value={retentionPolicy.schedule_minutes} onChange={(e) => setRetentionPolicy((p) => ({ ...p, schedule_minutes: Number(e.target.value || 60) }))} disabled={!canEditPage("backup_and_retention")} /></label>
                   <label>Keep Raw (days)<input type="number" min="1" value={retentionPolicy.raw_keep_days} onChange={(e) => setRetentionPolicy((p) => ({ ...p, raw_keep_days: Number(e.target.value || 7) }))} disabled={!canEditPage("backup_and_retention")} /></label>
@@ -10108,6 +10410,79 @@ function AppShell() {
             <div className="row modal-actions">
               <button className="btn btn-primary" onClick={createCloudDbFromPicker} disabled={!isAdminDatabaseUser}>Continue</button>
               <button className="btn btn-danger" onClick={() => setShowCloudDbPickerModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showCloudSyncModal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card trigger-modal-card">
+            <h3>Manual Cloud Sync</h3>
+            <div className="trigger-form-grid">
+              <label>
+                From (UTC)
+                <input
+                  type="datetime-local"
+                  value={cloudSyncForm.from_utc}
+                  onChange={(e) => setCloudSyncForm((prev) => ({ ...prev, from_utc: e.target.value }))}
+                  disabled={!isAdminDatabaseUser || forceSyncBusy}
+                />
+              </label>
+              <label>
+                To (UTC)
+                <input
+                  type="datetime-local"
+                  value={cloudSyncForm.to_utc}
+                  onChange={(e) => setCloudSyncForm((prev) => ({ ...prev, to_utc: e.target.value }))}
+                  disabled={!isAdminDatabaseUser || forceSyncBusy}
+                />
+              </label>
+              <label>
+                Max Rows
+                <input
+                  type="number"
+                  min="100"
+                  max="200000"
+                  value={cloudSyncForm.max_rows}
+                  onChange={(e) => setCloudSyncForm((prev) => ({ ...prev, max_rows: Number(e.target.value || 20000) }))}
+                  disabled={!isAdminDatabaseUser || forceSyncBusy}
+                />
+              </label>
+              <label className="remember-row">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cloudSyncForm.include_logs)}
+                  onChange={(e) => setCloudSyncForm((prev) => ({ ...prev, include_logs: e.target.checked }))}
+                  disabled={!isAdminDatabaseUser || forceSyncBusy}
+                />
+                <span className="remember-label">Include app logs</span>
+              </label>
+              <label className="remember-row">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cloudSyncForm.clear_queue_after)}
+                  onChange={(e) => setCloudSyncForm((prev) => ({ ...prev, clear_queue_after: e.target.checked }))}
+                  disabled={!isAdminDatabaseUser || forceSyncBusy}
+                />
+                <span className="remember-label">Clear pending/failed queue after sync</span>
+              </label>
+              <label className="remember-row">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cloudSyncForm.drop_backlog_after)}
+                  onChange={(e) => setCloudSyncForm((prev) => ({ ...prev, drop_backlog_after: e.target.checked }))}
+                  disabled={!isAdminDatabaseUser || forceSyncBusy}
+                />
+                <span className="remember-label">Drop remaining backlog after sync</span>
+              </label>
+            </div>
+            <div className="row modal-actions">
+              <button className="btn btn-primary" onClick={runManualCloudPeriodSync} disabled={!isAdminDatabaseUser || forceSyncBusy}>
+                {forceSyncBusy ? "Syncing..." : "Run Sync"}
+              </button>
+              <button className="btn btn-danger" onClick={() => setShowCloudSyncModal(false)} disabled={forceSyncBusy}>
+                Cancel
+              </button>
             </div>
           </div>
         </div>
