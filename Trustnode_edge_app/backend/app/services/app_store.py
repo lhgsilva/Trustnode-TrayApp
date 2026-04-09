@@ -5,6 +5,7 @@ import threading
 import shutil
 import hashlib
 import secrets
+import time
 from urllib.parse import quote_plus
 from datetime import timedelta
 from datetime import datetime, timezone
@@ -37,8 +38,14 @@ class AppStore:
         self._db_path = self._resolve_db_path()
         self._stop_event = threading.Event()
         self._sync_wakeup_event = threading.Event()
+        self._live_sync_wakeup_event = threading.Event()
+        self._cloud_live_cache_lock = threading.Lock()
         # Fast default cadence for cloud/live products; tunable via env.
         self._sync_interval_seconds = max(1, int(os.environ.get("TRUSTNODE_CONFIG_SYNC_SECONDS", "1") or "1"))
+        self._config_pull_interval_seconds = max(
+            self._sync_interval_seconds,
+            int(os.environ.get("TRUSTNODE_CONFIG_PULL_SECONDS", "20") or "20"),
+        )
         self._disable_config_push = str(os.environ.get("TRUSTNODE_DISABLE_CONFIG_PUSH", "")).strip().lower() in {
             "1",
             "true",
@@ -49,9 +56,32 @@ class AppStore:
             200,
             min(10000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "8000") or "8000")),
         )
-        self._live_sync_sample_rows = max(
-            500,
-            min(50000, int(os.environ.get("TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS", "10000") or "10000")),
+        self._data_bulk_sync_interval_seconds = max(
+            self._sync_interval_seconds,
+            int(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "5") or "5"),
+        )
+        self._live_fast_batch_size = max(
+            200,
+            min(10000, int(os.environ.get("TRUSTNODE_LIVE_FAST_BATCH_SIZE", "2000") or "2000")),
+        )
+        self._live_fast_initial_rows = max(
+            self._live_fast_batch_size,
+            min(20000, int(os.environ.get("TRUSTNODE_LIVE_FAST_INITIAL_ROWS", "4000") or "4000")),
+        )
+        self._live_sync_interval_seconds = max(
+            0.25,
+            float(os.environ.get("TRUSTNODE_LIVE_SYNC_SECONDS", "0.5") or "0.5"),
+        )
+        self._live_fast_last_local_id = 0
+        self._cloud_live_cache_rows: list[dict[str, Any]] = []
+        self._cloud_live_cache_updated_utc = ""
+        self._cloud_live_cache_limit = max(
+            200,
+            min(5000, int(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_LIMIT", "1200") or "1200")),
+        )
+        self._cloud_live_cache_interval_seconds = max(
+            0.5,
+            float(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_SECONDS", "1.0") or "1.0"),
         )
         self._ensure_schema()
         self._ensure_required_config_domains()
@@ -60,8 +90,12 @@ class AppStore:
             self._compact_sync_outbox_for_domains()
             self._backfill_outbox_for_existing_domains()
         self._scheduler_thread = threading.Thread(target=self._retention_scheduler_loop, daemon=True)
+        self._live_sync_thread = threading.Thread(target=self._live_sync_loop, daemon=True)
+        self._cloud_live_cache_thread = threading.Thread(target=self._cloud_live_cache_loop, daemon=True)
         self._sync_thread = threading.Thread(target=self._config_sync_loop, daemon=True)
         self._scheduler_thread.start()
+        self._live_sync_thread.start()
+        self._cloud_live_cache_thread.start()
         self._sync_thread.start()
 
     def _cloud_target_schema_key(self, cloud: dict[str, Any], schema: str) -> str:
@@ -696,12 +730,32 @@ class AppStore:
                     payload_text = str(r[1] or "null")
                     remote_version = int(r[2] or 0)
                     remote_updated = str(r[3] or now)
+
+                    def _ts_ms(value: Any) -> int:
+                        txt = str(value or "").strip()
+                        if not txt:
+                            return 0
+                        try:
+                            return int(datetime.fromisoformat(txt.replace("Z", "+00:00")).timestamp() * 1000)
+                        except Exception:
+                            return 0
+
                     local = conn.execute(
-                        "SELECT version FROM config_documents WHERE domain = ?",
+                        "SELECT version, payload_json, updated_utc FROM config_documents WHERE domain = ?",
                         (domain,),
                     ).fetchone()
                     local_version = int(local["version"] or 0) if local else 0
-                    if remote_version <= local_version:
+                    local_payload_text = str(local["payload_json"] or "null") if local else "null"
+                    local_updated = str(local["updated_utc"] or "") if local else ""
+                    remote_updated_ms = _ts_ms(remote_updated)
+                    local_updated_ms = _ts_ms(local_updated)
+                    should_apply = (
+                        (not local)
+                        or (remote_version > local_version)
+                        or (remote_updated_ms > local_updated_ms)
+                        or (payload_text != local_payload_text and remote_updated_ms >= local_updated_ms)
+                    )
+                    if not should_apply:
                         continue
                     conn.execute(
                         """
@@ -730,18 +784,56 @@ class AppStore:
             )
 
     def _config_sync_loop(self) -> None:
+        next_config_pull_mono = 0.0
+        next_bulk_sync_mono = 0.0
         while not self._stop_event.is_set():
             try:
                 if self._is_cloud_auto_sync_enabled():
-                    self._flush_data_outbox_once()
-                # Prioritize live/data freshness; config sync can follow.
-                self._pull_config_from_cloud_once()
-                if not self._disable_config_push:
-                    self._flush_config_outbox_once()
+                    now_mono = time.monotonic()
+                    if now_mono >= next_bulk_sync_mono:
+                        self._flush_data_outbox_once()
+                        next_bulk_sync_mono = now_mono + float(self._data_bulk_sync_interval_seconds)
+                # Keep config operations on a slower cadence so they do not block
+                # continuous data sync and cloud live updates.
+                now_mono = time.monotonic()
+                if now_mono >= next_config_pull_mono:
+                    self._pull_config_from_cloud_once()
+                    if not self._disable_config_push:
+                        self._flush_config_outbox_once()
+                    next_config_pull_mono = now_mono + float(self._config_pull_interval_seconds)
             except Exception as exc:
                 self._upsert_sync_target_state(enabled=True, config={}, last_error=f"Config sync loop error: {exc}")
             self._sync_wakeup_event.wait(timeout=self._sync_interval_seconds)
             self._sync_wakeup_event.clear()
+
+    def _live_sync_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                if self._is_cloud_auto_sync_enabled():
+                    self._flush_live_outbox_once()
+            except Exception as exc:
+                self._set_data_sync_state(last_data_error=f"Live sync loop error: {exc}")
+            self._live_sync_wakeup_event.wait(timeout=self._live_sync_interval_seconds)
+            self._live_sync_wakeup_event.clear()
+
+    def _cloud_live_cache_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                if prefer_cloud:
+                    rows = self._fetch_live_rows_from_cloud(self._cloud_live_cache_limit)
+                    if rows:
+                        with self._cloud_live_cache_lock:
+                            self._cloud_live_cache_rows = rows
+                            self._cloud_live_cache_updated_utc = self._utc_now()
+            except Exception:
+                pass
+            self._stop_event.wait(timeout=self._cloud_live_cache_interval_seconds)
 
     def _fetch_historian_rows_from_cloud(self, limit: int) -> list[dict[str, Any]]:
         cloud = self._get_cloud_database_target()
@@ -1051,8 +1143,9 @@ class AppStore:
 
                 # Fetch historian/plc rows and prefer whichever source is freshest.
                 # This prevents stale cloud live widgets when live_latest lags behind.
-                hist_rows = _fetch_rows_with_freshness_fallback(conn, "historian_readings", "id DESC", max(lim, 20000))
-                plc_rows = _fetch_rows_with_freshness_fallback(conn, "plc_readings", "id DESC", max(lim, 20000))
+                sample_limit = min(max(lim, 2000), 8000)
+                hist_rows = _fetch_rows_with_freshness_fallback(conn, "historian_readings", "id DESC", sample_limit)
+                plc_rows = _fetch_rows_with_freshness_fallback(conn, "plc_readings", "id DESC", sample_limit)
 
                 live_top = _top_ts_ms(live_rows)
                 hist_top = _top_ts_ms(hist_rows)
@@ -1177,6 +1270,140 @@ class AppStore:
                     (hist_id, log_id, sync_utc, sync_err, total_hist, total_logs, now),
                 )
 
+    def _upsert_cloud_live_latest_rows(self, conn: Any, schema: str, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        from sqlalchemy import text  # type: ignore
+
+        conn.execute(
+            text(
+                f"""
+                INSERT INTO "{schema}"."live_latest"
+                (tenant_id, gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
+                VALUES
+                (:tenant_id, :gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
+                ON CONFLICT(tenant_id, gateway_id, tag_name) DO UPDATE SET
+                  tenant_id = excluded.tenant_id,
+                  ts_utc = excluded.ts_utc,
+                  source = excluded.source,
+                  gateway_name = excluded.gateway_name,
+                  device_name = excluded.device_name,
+                  plc_ip = excluded.plc_ip,
+                  database_name = excluded.database_name,
+                  value = excluded.value,
+                  quality = excluded.quality,
+                  quality_label = excluded.quality_label,
+                  updated_utc = excluded.updated_utc
+                """
+            ),
+            rows,
+        )
+
+    def _collect_live_latest_incremental_rows(self) -> tuple[list[dict[str, Any]], int]:
+        now = self._utc_now()
+        latest_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        max_id = int(self._live_fast_last_local_id or 0)
+        with self._lock:
+            with self._connect() as conn:
+                if max_id <= 0:
+                    db_rows = conn.execute(
+                        """
+                        SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                               tag_name, value, quality, quality_label, source
+                        FROM historian_readings
+                        ORDER BY id DESC
+                        LIMIT ?
+                        """,
+                        (self._live_fast_initial_rows,),
+                    ).fetchall()
+                else:
+                    db_rows = conn.execute(
+                        """
+                        SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                               tag_name, value, quality, quality_label, source
+                        FROM historian_readings
+                        WHERE id > ?
+                        ORDER BY id ASC
+                        LIMIT ?
+                        """,
+                        (max_id, self._live_fast_batch_size),
+                    ).fetchall()
+
+        if not db_rows:
+            return [], max_id
+
+        for r in db_rows:
+            row_id = int(r["id"] or 0)
+            if row_id > max_id:
+                max_id = row_id
+            tenant_id = normalize_tenant_id(str(r["tenant_id"] or "default"))
+            gateway_id = str(r["gateway_id"] or "")
+            tag_name = str(r["tag_name"] or "")
+            if not tag_name or not gateway_id:
+                continue
+            key = (tenant_id, gateway_id, tag_name)
+            latest_by_key[key] = {
+                "tenant_id": tenant_id,
+                "gateway_id": gateway_id,
+                "tag_name": tag_name,
+                "ts_utc": str(r["ts_utc"] or ""),
+                "source": str(r["source"] or ""),
+                "gateway_name": str(r["gateway_name"] or ""),
+                "device_name": str(r["device_name"] or ""),
+                "plc_ip": str(r["plc_ip"] or ""),
+                "database_name": str(r["database_name"] or ""),
+                "value": r["value"],
+                "quality": r["quality"],
+                "quality_label": str(r["quality_label"] or ""),
+                "updated_utc": now,
+            }
+
+        return list(latest_by_key.values()), max_id
+
+    def _flush_live_outbox_once(self) -> None:
+        cloud = self._get_cloud_database_target()
+        if not cloud:
+            return
+        live_rows, max_local_id = self._collect_live_latest_incremental_rows()
+        if not live_rows:
+            return
+        try:
+            from sqlalchemy import create_engine  # type: ignore
+        except Exception as exc:
+            self._set_data_sync_state(last_data_error=f"Live sync unavailable: {exc}")
+            return
+
+        schema = str(cloud.get("schema") or "public")
+        url = self._build_pg_sqlalchemy_url(
+            str(cloud.get("host") or ""),
+            int(cloud.get("port") or 5432),
+            str(cloud.get("database") or "postgres"),
+            str(cloud.get("username") or ""),
+            str(cloud.get("password") or ""),
+        )
+        connect_args = {
+            "sslmode": "require" if cloud.get("tls", True) else "disable",
+            "connect_timeout": 8,
+            "prepare_threshold": None,
+        }
+        engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+        target_key = self._cloud_target_schema_key(cloud, schema)
+        try:
+            try:
+                self._ensure_cloud_schema_once(engine, schema, target_key)
+            except Exception:
+                pass
+            with engine.begin() as conn:
+                self._upsert_cloud_live_latest_rows(conn, schema, live_rows)
+            self._live_fast_last_local_id = max(self._live_fast_last_local_id, int(max_local_id or 0))
+        except Exception as exc:
+            self._set_data_sync_state(last_data_error=f"Live sync failed: {exc}")
+        finally:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+
     def _flush_data_outbox_once(self) -> None:
         cloud = self._get_cloud_database_target()
         if not cloud:
@@ -1207,7 +1434,6 @@ class AppStore:
         last_hist_id = int(state.get("last_historian_id", 0))
         last_log_id = int(state.get("last_log_id", 0))
         batch_size = int(self._data_sync_batch_size)
-        live_sample_size = int(self._live_sync_sample_rows)
 
         try:
             with self._lock:
@@ -1233,48 +1459,7 @@ class AppStore:
                         """,
                         (last_log_id, batch_size),
                     ).fetchall()
-                    live_sample_rows = conn.execute(
-                        """
-                        SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                               tag_name, value, quality, quality_label, source
-                        FROM historian_readings
-                        ORDER BY id DESC
-                        LIMIT ?
-                        """,
-                        (live_sample_size,),
-                    ).fetchall()
-
-            live_latest_rows: list[dict[str, Any]] = []
-            seen_live_keys: set[tuple[str, str]] = set()
-            for r in live_sample_rows:
-                tenant_id = normalize_tenant_id(str(r["tenant_id"] or "default"))
-                gateway_id = str(r["gateway_id"] or "")
-                tag_name = str(r["tag_name"] or "")
-                if not tag_name:
-                    continue
-                key = (tenant_id, gateway_id, tag_name)
-                if key in seen_live_keys:
-                    continue
-                seen_live_keys.add(key)
-                live_latest_rows.append(
-                    {
-                        "tenant_id": tenant_id,
-                        "gateway_id": gateway_id,
-                        "tag_name": tag_name,
-                        "ts_utc": str(r["ts_utc"] or ""),
-                        "source": str(r["source"] or ""),
-                        "gateway_name": str(r["gateway_name"] or ""),
-                        "device_name": str(r["device_name"] or ""),
-                        "plc_ip": str(r["plc_ip"] or ""),
-                        "database_name": str(r["database_name"] or ""),
-                        "value": r["value"],
-                        "quality": r["quality"],
-                        "quality_label": str(r["quality_label"] or ""),
-                        "updated_utc": self._utc_now(),
-                    }
-                )
-
-            if not hist_rows and not log_rows and not live_latest_rows:
+            if not hist_rows and not log_rows:
                 self._set_data_sync_state(last_data_sync_utc=self._utc_now(), last_data_error="")
                 return
 
@@ -1286,31 +1471,26 @@ class AppStore:
                 pass
 
             with engine.begin() as conn:
-                if live_latest_rows:
-                    conn.execute(
-                        text(
-                            f"""
-                            INSERT INTO "{schema}"."live_latest"
-                            (tenant_id, gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
-                            VALUES
-                            (:tenant_id, :gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
-                            ON CONFLICT(tenant_id, gateway_id, tag_name) DO UPDATE SET
-                              tenant_id = excluded.tenant_id,
-                              ts_utc = excluded.ts_utc,
-                              source = excluded.source,
-                              gateway_name = excluded.gateway_name,
-                              device_name = excluded.device_name,
-                              plc_ip = excluded.plc_ip,
-                              database_name = excluded.database_name,
-                              value = excluded.value,
-                              quality = excluded.quality,
-                              quality_label = excluded.quality_label,
-                              updated_utc = excluded.updated_utc
-                            """
-                        ),
-                        live_latest_rows,
-                    )
                 if hist_rows:
+                    hist_payload_rows = [
+                        {
+                            "local_id": int(r["id"]),
+                            "tenant_id": normalize_tenant_id(str(r["tenant_id"] or "default")),
+                            "ts_utc": str(r["ts_utc"] or ""),
+                            "gateway_id": str(r["gateway_id"] or ""),
+                            "gateway_name": str(r["gateway_name"] or ""),
+                            "device_name": str(r["device_name"] or ""),
+                            "plc_ip": str(r["plc_ip"] or ""),
+                            "database_name": str(r["database_name"] or ""),
+                            "tag_name": str(r["tag_name"] or ""),
+                            "value": r["value"],
+                            "quality": r["quality"],
+                            "quality_label": str(r["quality_label"] or ""),
+                            "source": str(r["source"] or ""),
+                            "created_utc": str(r["created_utc"] or ""),
+                        }
+                        for r in hist_rows
+                    ]
                     conn.execute(
                         text(
                             f"""
@@ -1321,25 +1501,7 @@ class AppStore:
                             ON CONFLICT(local_id) DO NOTHING
                             """
                         ),
-                        [
-                            {
-                                "local_id": int(r["id"]),
-                                "tenant_id": normalize_tenant_id(str(r["tenant_id"] or "default")),
-                                "ts_utc": str(r["ts_utc"] or ""),
-                                "gateway_id": str(r["gateway_id"] or ""),
-                                "gateway_name": str(r["gateway_name"] or ""),
-                                "device_name": str(r["device_name"] or ""),
-                                "plc_ip": str(r["plc_ip"] or ""),
-                                "database_name": str(r["database_name"] or ""),
-                                "tag_name": str(r["tag_name"] or ""),
-                                "value": r["value"],
-                                "quality": r["quality"],
-                                "quality_label": str(r["quality_label"] or ""),
-                                "source": str(r["source"] or ""),
-                                "created_utc": str(r["created_utc"] or ""),
-                            }
-                            for r in hist_rows
-                        ],
+                        hist_payload_rows,
                     )
                     # Keep legacy/default table in sync for compatibility.
                     conn.execute(
@@ -1352,26 +1514,29 @@ class AppStore:
                             ON CONFLICT(local_id) DO NOTHING
                             """
                         ),
-                        [
-                            {
-                                "local_id": int(r["id"]),
-                                "tenant_id": normalize_tenant_id(str(r["tenant_id"] or "default")),
-                                "ts_utc": str(r["ts_utc"] or ""),
-                                "gateway_id": str(r["gateway_id"] or ""),
-                                "gateway_name": str(r["gateway_name"] or ""),
-                                "device_name": str(r["device_name"] or ""),
-                                "plc_ip": str(r["plc_ip"] or ""),
-                                "database_name": str(r["database_name"] or ""),
-                                "tag_name": str(r["tag_name"] or ""),
-                                "value": r["value"],
-                                "quality": r["quality"],
-                                "quality_label": str(r["quality_label"] or ""),
-                                "source": str(r["source"] or ""),
-                                "created_utc": str(r["created_utc"] or ""),
-                            }
-                            for r in hist_rows
-                        ],
+                        hist_payload_rows,
                     )
+                    # Fallback: keep live_latest current even when fast-lane local
+                    # delta source is unavailable on some edge runtimes.
+                    live_latest_rows = {}
+                    for row in hist_payload_rows:
+                        key = (
+                            str(row.get("tenant_id") or "default"),
+                            str(row.get("gateway_id") or ""),
+                            str(row.get("tag_name") or ""),
+                        )
+                        if not key[1] or not key[2]:
+                            continue
+                        prev = live_latest_rows.get(key)
+                        if not prev:
+                            live_latest_rows[key] = row
+                            continue
+                        prev_id = int(prev.get("local_id") or 0)
+                        curr_id = int(row.get("local_id") or 0)
+                        if curr_id >= prev_id:
+                            live_latest_rows[key] = row
+                    if live_latest_rows:
+                        self._upsert_cloud_live_latest_rows(conn, schema, list(live_latest_rows.values()))
                 if log_rows:
                     conn.execute(
                         text(
@@ -1794,9 +1959,20 @@ class AppStore:
     def shutdown(self) -> None:
         self._stop_event.set()
         self._sync_wakeup_event.set()
+        self._live_sync_wakeup_event.set()
         try:
             if self._scheduler_thread.is_alive():
                 self._scheduler_thread.join(timeout=1.5)
+        except Exception:
+            pass
+        try:
+            if self._live_sync_thread.is_alive():
+                self._live_sync_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        try:
+            if self._cloud_live_cache_thread.is_alive():
+                self._cloud_live_cache_thread.join(timeout=1.5)
         except Exception:
             pass
         try:
@@ -2309,6 +2485,10 @@ class AppStore:
             self._flush_config_outbox_once()
         except Exception as exc:
             errors.append(f"push_config: {exc}")
+        try:
+            self._flush_live_outbox_once()
+        except Exception as exc:
+            errors.append(f"push_live: {exc}")
         try:
             self._flush_data_outbox_once()
         except Exception as exc:
@@ -2981,6 +3161,7 @@ class AppStore:
                     safe_rows,
                 )
         self._sync_wakeup_event.set()
+        self._live_sync_wakeup_event.set()
         return len(safe_rows)
 
     def append_log_rows(self, rows: list[dict[str, Any]]) -> int:
@@ -3065,30 +3246,6 @@ class AppStore:
                     "quality_label": r["quality_label"] or "",
                 }
             )
-        # If local historian exists but is stale on hosted/VPS, serve cloud rows
-        # when they are clearly fresher.
-        cloud_rows = self._fetch_historian_rows_from_cloud(lim)
-        if cloud_rows and not out:
-            return cloud_rows
-        if cloud_rows and out:
-            def _top_ts_ms(rows_in: list[dict[str, Any]]) -> int:
-                if not rows_in:
-                    return 0
-                raw = str(rows_in[0].get("ts") or rows_in[0].get("ts_utc") or "").strip()
-                if not raw:
-                    return 0
-                try:
-                    txt = raw.replace("Z", "+00:00")
-                    if " " in txt and "T" not in txt:
-                        txt = txt.replace(" ", "T")
-                    return int(datetime.fromisoformat(txt).timestamp() * 1000)
-                except Exception:
-                    return 0
-
-            local_top = _top_ts_ms(out)
-            cloud_top = _top_ts_ms(cloud_rows)
-            if cloud_top > local_top + 1500:
-                return cloud_rows
         return out
 
     def get_live_rows(self, limit: int = 5000) -> list[dict[str, Any]]:
@@ -3140,6 +3297,16 @@ class AppStore:
             return list(out_latest.values())
 
         if prefer_cloud:
+            with self._cloud_live_cache_lock:
+                cached_rows = list(self._cloud_live_cache_rows)
+                cache_updated = str(self._cloud_live_cache_updated_utc or "")
+            if cached_rows and cache_updated:
+                try:
+                    age_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(cache_updated.replace("Z", "+00:00"))).total_seconds() * 1000)
+                except Exception:
+                    age_ms = 999999
+                if age_ms <= 3000:
+                    return cached_rows[:lim]
             cloud_live = self._fetch_live_rows_from_cloud(lim)
             cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim, 2000), 10000))
             if cloud_live and cloud_hist:

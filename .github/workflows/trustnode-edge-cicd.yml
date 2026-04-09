@@ -165,8 +165,8 @@ jobs:
             Environment=TRUSTNODE_PREFER_CLOUD_READS=true
             Environment=TRUSTNODE_DISABLE_CONFIG_PUSH=true
             Environment=TRUSTNODE_CONFIG_SYNC_SECONDS=1
+            Environment=TRUSTNODE_DATA_BULK_SYNC_SECONDS=5
             Environment=TRUSTNODE_DATA_SYNC_BATCH_SIZE=8000
-            Environment=TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS=10000
             ExecStart=
             ExecStart=${{ env.VPS_APP_ROOT }}/Trustnode_edge_app/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
             EOF
@@ -221,8 +221,8 @@ jobs:
             Environment=TRUSTNODE_PREFER_CLOUD_READS=true
             Environment=TRUSTNODE_DISABLE_CONFIG_PUSH=true
             Environment=TRUSTNODE_CONFIG_SYNC_SECONDS=1
+            Environment=TRUSTNODE_DATA_BULK_SYNC_SECONDS=5
             Environment=TRUSTNODE_DATA_SYNC_BATCH_SIZE=8000
-            Environment=TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS=10000
             ExecStart=
             ExecStart=${{ env.VPS_APP_ROOT }}/Trustnode_edge_app/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
             EOF

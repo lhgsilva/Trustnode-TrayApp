@@ -62,6 +62,11 @@ function getApiBase() {
   return getDefaultLocalApiBase();
 }
 
+function withNoCache(url) {
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}_ts=${Date.now()}`;
+}
+
 export function isForcedReadonlyCloudMode() {
   return Boolean(FORCE_CLOUD_URL && FORCE_READONLY);
 }
@@ -101,7 +106,11 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
     if (token && !headers.Authorization) {
       headers.Authorization = `Bearer ${token}`;
     }
-    return await fetch(url, { ...options, headers, signal: controller.signal });
+    const hasCacheOption = Object.prototype.hasOwnProperty.call(options || {}, "cache");
+    const finalOptions = hasCacheOption
+      ? { ...options, headers, signal: controller.signal }
+      : { ...options, headers, signal: controller.signal, cache: "no-store" };
+    return await fetch(url, finalOptions);
   } finally {
     clearTimeout(timeout);
   }
@@ -486,7 +495,9 @@ export async function sendNotificationEmail(payload) {
 }
 
 export async function getAppStoreBootstrap() {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/bootstrap`);
+  const res = await fetchWithTimeout(withNoCache(`${getApiBase()}/api/app-store/bootstrap`), {
+    headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" }
+  });
   if (!res.ok) throw new Error("App store bootstrap fetch failed");
   return res.json();
 }
@@ -502,7 +513,9 @@ export async function saveAppStoreBootstrap(data, actor = "system") {
 }
 
 export async function getAppStoreTenantContext() {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/tenant/context`);
+  const res = await fetchWithTimeout(withNoCache(`${getApiBase()}/api/app-store/tenant/context`), {
+    headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" }
+  });
   if (!res.ok) throw new Error("Tenant context fetch failed");
   return res.json();
 }
@@ -528,26 +541,36 @@ export async function appendAppStoreLogs(rows) {
 }
 
 export async function getAppStoreHistorian(limit = 1000) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/historian?limit=${encodeURIComponent(String(limit))}`);
+  const res = await fetchWithTimeout(
+    withNoCache(`${getApiBase()}/api/app-store/historian?limit=${encodeURIComponent(String(limit))}`),
+    { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
+  );
   if (!res.ok) throw new Error("App store historian fetch failed");
   return res.json();
 }
 
 export async function getAppStoreLive(limit = 5000) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/live?limit=${encodeURIComponent(String(limit))}`);
+  const res = await fetchWithTimeout(
+    withNoCache(`${getApiBase()}/api/app-store/live?limit=${encodeURIComponent(String(limit))}`),
+    { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
+  );
   if (!res.ok) throw new Error("App store live fetch failed");
   return res.json();
 }
 
 export async function getAppStoreLogs(limit = 2000) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/logs?limit=${encodeURIComponent(String(limit))}`);
+  const res = await fetchWithTimeout(
+    withNoCache(`${getApiBase()}/api/app-store/logs?limit=${encodeURIComponent(String(limit))}`),
+    { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
+  );
   if (!res.ok) throw new Error("App store logs fetch failed");
   return res.json();
 }
 
 export async function getAppStoreInspector(previewLimit = 15) {
   const res = await fetchWithTimeout(
-    `${getApiBase()}/api/app-store/inspector?preview_limit=${encodeURIComponent(String(previewLimit))}`
+    withNoCache(`${getApiBase()}/api/app-store/inspector?preview_limit=${encodeURIComponent(String(previewLimit))}`),
+    { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
   );
   if (!res.ok) throw new Error("App store inspector fetch failed");
   return res.json();

@@ -270,6 +270,11 @@ body {
   overflow: hidden;
 }
 
+.header-right {
+  justify-self: end;
+  flex-shrink: 0;
+}
+
 .header-cloud-controls {
   display: flex;
   align-items: center;
@@ -294,7 +299,8 @@ body {
 }
 
 .header-edge-select {
-  min-width: 200px;
+  min-width: 140px;
+  flex: 1 1 300px;
   max-width: min(42vw, 420px);
 }
 
@@ -2307,7 +2313,8 @@ input[type="checkbox"] {
   }
 
   .header-edge-select {
-    min-width: 150px;
+    min-width: 120px;
+    flex: 1 1 180px;
     max-width: 58vw;
     font-size: 12px;
   }

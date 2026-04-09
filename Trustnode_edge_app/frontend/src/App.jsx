@@ -142,6 +142,7 @@ const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
 const CLOUD_LIVE_POLL_MS = 1000;
 const CLOUD_AUX_POLL_MS = 3000;
+const CLOUD_LIVE_FETCH_LIMIT = 1200;
 const CLOUD_EDGE_ALL_KEY = "__all_edges__";
 const RETENTION_PRESETS = {
   day: {
@@ -1261,6 +1262,7 @@ function AppShell() {
   const appStorePersistInFlightRef = useRef(false);
   const appStoreLastPersistSignatureRef = useRef("");
   const liveTagValuesRef = useRef({});
+  const cloudNewestLiveTsMsRef = useRef(0);
   const tagAlarmPrefsRef = useRef({});
   const emailSettingsRef = useRef({});
   const historianOutboxRef = useRef([]);
@@ -2755,6 +2757,7 @@ function AppShell() {
   useEffect(() => {
     if (endpointMode !== "cloud") {
       setCloudStreamConnected(false);
+      cloudNewestLiveTsMsRef.current = 0;
       return;
     }
     if (!currentUser) {
@@ -2775,9 +2778,24 @@ function AppShell() {
           const data = JSON.parse(event.data || "{}");
           if (data.type !== "cloud_snapshot") return;
           if (Array.isArray(data.live_rows) && data.live_rows.length) {
+            const newestLiveMs = data.live_rows.reduce((max, row) => {
+              const ms = rowTsMs(row);
+              return Number.isFinite(ms) && ms > max ? ms : max;
+            }, -1);
+            if (
+              newestLiveMs > 0 &&
+              cloudNewestLiveTsMsRef.current > 0 &&
+              newestLiveMs < cloudNewestLiveTsMsRef.current - 1500
+            ) {
+              return;
+            }
+            if (newestLiveMs > cloudNewestLiveTsMsRef.current) {
+              cloudNewestLiveTsMsRef.current = newestLiveMs;
+            }
             const nextLive = {};
             const nextReadings = [];
             const latestByGateway = {};
+            const rowCountByGateway = {};
             const latestByDbName = {};
             const latestByPlcIp = {};
             for (const row of data.live_rows) {
@@ -2810,6 +2828,7 @@ function AppShell() {
                 quality_label: qualityLabel
               });
               if (gatewayId && !latestByGateway[gatewayId]) latestByGateway[gatewayId] = readingTs;
+              if (gatewayId) rowCountByGateway[gatewayId] = Number(rowCountByGateway[gatewayId] || 0) + 1;
               const dbName = String(row?.database_name || "").trim();
               if (dbName && !latestByDbName[dbName]) latestByDbName[dbName] = readingTs;
               const plcIp = String(row?.plc_ip || "").trim();
@@ -2831,12 +2850,16 @@ function AppShell() {
                 })();
                 const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 3);
                 if (ts) {
+                  const sampleRows = Number(rowCountByGateway[gid] || 0);
+                  const prevWrites = Number(cur?.db_write_count || 0);
                   next[gid] = {
                     ...cur,
                     gateway_id: gid,
                     running: online,
                     last_error: null,
                     db_last_error: null,
+                    db_write_count: prevWrites + sampleRows,
+                    db_pending_count: 0,
                     last_check_utc: ts
                   };
                 } else if (cur.running || !online) {
@@ -3003,7 +3026,9 @@ function AppShell() {
             for (const row of data.gateway_statuses) {
               if (row?.gateway_id) map[row.gateway_id] = row;
             }
-            setGatewayRuntimeStatuses((prev) => ({ ...prev, ...map }));
+            if (!(isHostedWebClient && endpointMode === "cloud")) {
+              setGatewayRuntimeStatuses((prev) => ({ ...prev, ...map }));
+            }
           }
           setWsState("connected");
         } catch {}
@@ -3027,7 +3052,7 @@ function AppShell() {
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       if (ws) ws.close();
     };
-  }, [endpointMode, endpointVersion, currentUser]);
+  }, [endpointMode, endpointVersion, currentUser, isHostedWebClient]);
 
   useEffect(() => {
     if (endpointMode !== "cloud") return;
@@ -3039,9 +3064,24 @@ function AppShell() {
       if (stopped || runningLive) return;
       runningLive = true;
       try {
-        const liveRes = await getAppStoreLive(5000);
+        const liveRes = await getAppStoreLive(CLOUD_LIVE_FETCH_LIMIT);
         if (stopped) return;
         if (liveRes?.ok && Array.isArray(liveRes.rows)) {
+          const newestLiveMs = liveRes.rows.reduce((max, row) => {
+            const ms = rowTsMs(row);
+            return Number.isFinite(ms) && ms > max ? ms : max;
+          }, -1);
+          if (
+            newestLiveMs > 0 &&
+            cloudNewestLiveTsMsRef.current > 0 &&
+            newestLiveMs < cloudNewestLiveTsMsRef.current - 1500
+          ) {
+            setWsState("cloud_polling");
+            return;
+          }
+          if (newestLiveMs > cloudNewestLiveTsMsRef.current) {
+            cloudNewestLiveTsMsRef.current = newestLiveMs;
+          }
           const dbMetaByName = new Map();
           for (const db of dbConnectionsRef.current || []) {
             const nameKey = String(db?.name || "").trim().toLowerCase();
@@ -3057,6 +3097,7 @@ function AppShell() {
           const nextReadings = [];
           const nextDataRows = [];
           const latestByGateway = {};
+          const rowCountByGateway = {};
           const latestByDbName = {};
           const latestByPlcIp = {};
           for (const row of liveRes.rows) {
@@ -3107,6 +3148,7 @@ function AppShell() {
               quality_label: qualityLabel
             });
             if (gatewayId && !latestByGateway[gatewayId]) latestByGateway[gatewayId] = readingTs;
+            if (gatewayId) rowCountByGateway[gatewayId] = Number(rowCountByGateway[gatewayId] || 0) + 1;
             if (dbName && !latestByDbName[dbName]) latestByDbName[dbName] = readingTs;
             const plcIp = String(row?.plc_ip || "").trim();
             if (plcIp && !latestByPlcIp[plcIp]) latestByPlcIp[plcIp] = readingTs;
@@ -3127,12 +3169,16 @@ function AppShell() {
               })();
               const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 3);
               if (ts) {
+                const sampleRows = Number(rowCountByGateway[gid] || 0);
+                const prevWrites = Number(cur?.db_write_count || 0);
                 next[gid] = {
                   ...cur,
                   gateway_id: gid,
                   running: online,
                   last_error: null,
                   db_last_error: null,
+                  db_write_count: prevWrites + sampleRows,
+                  db_pending_count: 0,
                   last_check_utc: ts
                 };
               } else if (cur.running || !online) {
@@ -3808,6 +3854,13 @@ function AppShell() {
     return gateway.plc_ip || "-";
   };
 
+  const isFreshCloudTs = (tsValue, maxAgeMs = 12000) => {
+    if (!tsValue) return false;
+    const tsMs = new Date(tsValue).getTime();
+    if (!Number.isFinite(tsMs)) return false;
+    return Math.max(0, Date.now() - tsMs) <= maxAgeMs;
+  };
+
   const getGatewayFooterDbWriting = (gateway) => {
     if (!gateway?.database_id) return "No DB selected";
     const db = dbConnections.find((c) => c.id === gateway.database_id);
@@ -3815,6 +3868,11 @@ function AppShell() {
     const rt = gatewayRuntimeStatuses[gateway.id] || null;
     const writes = Number(rt?.db_write_count || 0);
     const pending = Number(rt?.db_pending_count || 0);
+    const lastCheckUtc = String(rt?.last_check_utc || "");
+    if (isHostedWebClient && endpointMode === "cloud") {
+      const cloudState = isFreshCloudTs(lastCheckUtc, 15000) ? "LIVE" : "STALE";
+      return `${dbName} | Rows ${writes} | Pending ${pending} | ${cloudState}`;
+    }
     return `${dbName} | Writes ${writes} | Pending ${pending}`;
   };
   const dbOverviewStats = useMemo(() => {
@@ -3891,6 +3949,10 @@ function AppShell() {
       if (gid) g.gatewayIds.add(gid);
       const ts = String(row?.ts || row?.ts_utc || "").trim();
       if (ts && (!g.lastLiveUtc || ts > g.lastLiveUtc)) g.lastLiveUtc = ts;
+      if (gid && isFreshCloudTs(ts, 90000)) {
+        if (!g.liveGatewayIds) g.liveGatewayIds = new Set();
+        g.liveGatewayIds.add(gid);
+      }
     }
 
     return Array.from(groups.values())
@@ -3901,6 +3963,7 @@ function AppShell() {
           ...g,
           dbCount: g.dbNames.size,
           gatewayCount: g.gatewayIds.size,
+          liveGatewayIds: Array.from(g.liveGatewayIds || []),
           liveHealthy,
           dbNamesText: Array.from(g.dbNames).sort().join(", "),
         };
@@ -3934,11 +3997,15 @@ function AppShell() {
   }, [dbConnections, isCloudEdgeFilterActive, selectedCloudEdgeKey]);
   const gatewayConfigsView = useMemo(() => {
     if (!isCloudEdgeFilterActive) return gatewayConfigs;
+    const selectedLiveGatewayIds = new Set((selectedCloudEdge?.liveGatewayIds || []).map((v) => String(v || "")));
+    if (selectedLiveGatewayIds.size) {
+      return gatewayConfigs.filter((g) => selectedLiveGatewayIds.has(String(g.id || "")));
+    }
     return gatewayConfigs.filter((g) => {
       const db = dbConnections.find((d) => String(d.id || "") === String(g.database_id || ""));
       return matchesDbEdge(db);
     });
-  }, [gatewayConfigs, dbConnections, isCloudEdgeFilterActive, selectedCloudEdgeKey]);
+  }, [gatewayConfigs, dbConnections, isCloudEdgeFilterActive, selectedCloudEdgeKey, selectedCloudEdge]);
   const visibleGatewayIdSet = useMemo(
     () => new Set((gatewayConfigsView || []).map((g) => String(g.id || ""))),
     [gatewayConfigsView]
@@ -4105,7 +4172,12 @@ function AppShell() {
 
   const isGatewayRunning = (gateway) => {
     if (!gateway) return false;
-    return Boolean(gatewayRuntimeStatusesView[gateway.id]?.running);
+    const rt = gatewayRuntimeStatusesView[gateway.id];
+    if (rt && typeof rt.running === "boolean") return Boolean(rt.running);
+    if (isHostedWebClient && endpointMode === "cloud") {
+      return isFreshCloudTs(rt?.last_check_utc || gateway?.last_check_utc || "", 15000);
+    }
+    return false;
   };
   const anyGatewayRunning = useMemo(
     () => gatewayConfigsView.some((g) => Boolean(gatewayRuntimeStatusesView[g.id]?.running)),

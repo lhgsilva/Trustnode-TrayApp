@@ -48,20 +48,31 @@ PUBLIC_PATHS = {
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
+    def _apply_no_cache_headers(response):
+        try:
+            path = request.url.path or ""
+            if path.startswith("/api/"):
+                response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+                response.headers["Pragma"] = "no-cache"
+                response.headers["Expires"] = "0"
+        except Exception:
+            pass
+        return response
+
     tenant_id = resolve_request_tenant(request)
     set_current_tenant(tenant_id)
     path = request.url.path or ""
     method = (request.method or "GET").upper()
     if method == "OPTIONS":
-        return await call_next(request)
+        return _apply_no_cache_headers(await call_next(request))
     if not path.startswith("/api/"):
         return await call_next(request)
     if request.url.path in PUBLIC_PATHS:
-        return await call_next(request)
+        return _apply_no_cache_headers(await call_next(request))
     auth = request.headers.get("Authorization", "")
     token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""
     if not token:
-        return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+        return _apply_no_cache_headers(JSONResponse(status_code=401, content={"detail": "Authentication required"}))
     try:
         payload = decode_access_token(token)
         token_tenant = str(payload.get("tenant_id") or "").strip()
@@ -69,13 +80,13 @@ async def auth_middleware(request: Request, call_next):
             normalized_token_tenant = set_current_tenant(token_tenant)
             # Strict mismatch only when request explicitly targets a non-default tenant.
             if tenant_id != "default" and normalized_token_tenant != tenant_id:
-                return JSONResponse(status_code=403, content={"detail": "Token tenant mismatch"})
+                return _apply_no_cache_headers(JSONResponse(status_code=403, content={"detail": "Token tenant mismatch"}))
             tenant_id = normalized_token_tenant
         elif tenant_id:
             set_current_tenant(tenant_id)
     except Exception as exc:
-        return JSONResponse(status_code=401, content={"detail": f"Invalid token: {exc}"})
-    return await call_next(request)
+        return _apply_no_cache_headers(JSONResponse(status_code=401, content={"detail": f"Invalid token: {exc}"}))
+    return _apply_no_cache_headers(await call_next(request))
 
 
 @app.get("/")
@@ -146,16 +157,20 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
+    tick = 0
+    live_limit = 1200
     try:
         while True:
+            tick += 1
+            include_heavy = (tick % 8) == 0
             payload = {
                 "type": "cloud_snapshot",
                 "tenant_id": tenant_id,
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
-                "live_rows": app_store.get_live_rows(limit=5000),
-                "historian_rows": app_store.get_historian_rows(limit=1500),
-                "log_rows": app_store.get_log_rows(limit=2500),
-                "inspector": app_store.get_inspector_snapshot(preview_limit=20),
+                "live_rows": app_store.get_live_rows(limit=live_limit),
+                "historian_rows": app_store.get_historian_rows(limit=250) if include_heavy else [],
+                "log_rows": app_store.get_log_rows(limit=300) if include_heavy else [],
+                "inspector": app_store.get_inspector_snapshot(preview_limit=20) if include_heavy else None,
                 "gateway_statuses": plc_manager.list_gateway_statuses(),
                 "gateway_status": plc_manager.get_status().model_dump(),
             }
