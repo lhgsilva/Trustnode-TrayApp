@@ -1071,7 +1071,7 @@ class AppStore:
             for r in rows:
                 gateway_id = str(r[2] or "")
                 tag_name = str(r[7] or "")
-                if not tag_name:
+                if not tag_name or not gateway_id:
                     continue
                 key = (gateway_id, tag_name)
                 if key in seen:
