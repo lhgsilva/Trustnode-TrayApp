@@ -498,6 +498,8 @@ class AppStore:
         if not cloud:
             self._upsert_sync_target_state(enabled=False, config={}, last_error="No enabled PostgreSQL cloud target configured")
             return
+        tenant_id = self._current_tenant_id()
+        tenant_prefix = f"{tenant_id}::"
 
         with self._lock:
             with self._connect() as conn:
@@ -575,12 +577,13 @@ class AppStore:
         for row in rows:
             row_id = int(row["id"])
             domain = str(row["domain"] or "")
+            cloud_domain = f"{tenant_prefix}{domain}"
             payload_json = str(row["payload_json"] or "null")
             try:
                 with engine.begin() as conn:
                     old_v_row = conn.execute(
                         text(f'SELECT version FROM "{schema}"."config_documents" WHERE domain = :domain'),
-                        {"domain": domain},
+                        {"domain": cloud_domain},
                     ).fetchone()
                     old_version = int(old_v_row[0]) if old_v_row else 0
                     new_version = old_version + 1
@@ -595,7 +598,7 @@ class AppStore:
                               updated_utc = excluded.updated_utc
                             """
                         ),
-                        {"domain": domain, "payload_json": payload_json, "new_version": new_version},
+                        {"domain": cloud_domain, "payload_json": payload_json, "new_version": new_version},
                     )
                     conn.execute(
                         text(
@@ -604,7 +607,7 @@ class AppStore:
                             VALUES(:domain, 'local_sync', :old_version, :new_version, NOW())
                             """
                         ),
-                        {"domain": domain, "old_version": old_version if old_version > 0 else None, "new_version": new_version},
+                        {"domain": cloud_domain, "old_version": old_version if old_version > 0 else None, "new_version": new_version},
                     )
                 now = self._utc_now()
                 self._mark_outbox_row_sent(row_id, now)
@@ -626,6 +629,8 @@ class AppStore:
         cloud = self._get_cloud_database_target()
         if not cloud:
             return
+        tenant_id = self._current_tenant_id()
+        tenant_prefix = f"{tenant_id}::"
         try:
             from sqlalchemy import create_engine, text  # type: ignore
         except Exception:
@@ -652,10 +657,24 @@ class AppStore:
                         f"""
                         SELECT domain, payload_json::text AS payload_json_text, version, updated_utc
                         FROM "{schema}"."config_documents"
+                        WHERE domain LIKE :prefix
                         ORDER BY domain
                         """
-                    )
+                    ),
+                    {"prefix": f"{tenant_prefix}%"},
                 ).fetchall()
+                # Backward compatibility for legacy global config rows.
+                if not rows and tenant_id == "default":
+                    rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT domain, payload_json::text AS payload_json_text, version, updated_utc
+                            FROM "{schema}"."config_documents"
+                            WHERE domain NOT LIKE '%::%'
+                            ORDER BY domain
+                            """
+                        )
+                    ).fetchall()
         except Exception:
             engine.dispose()
             return
@@ -670,7 +689,8 @@ class AppStore:
         with self._lock:
             with self._connect() as conn:
                 for r in rows or []:
-                    domain = str(r[0] or "").strip()
+                    raw_domain = str(r[0] or "").strip()
+                    domain = raw_domain[len(tenant_prefix):] if raw_domain.startswith(tenant_prefix) else raw_domain
                     if not domain:
                         continue
                     payload_text = str(r[1] or "null")
