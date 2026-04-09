@@ -2096,6 +2096,13 @@ function AppShell() {
       if (appStorePersistInFlightRef.current) return;
       const payload = buildAppStorePayload();
       const signature = JSON.stringify(payload);
+      // Seed baseline from hydrated data and skip first implicit write.
+      // This prevents stale browser sessions from overwriting cloud config
+      // immediately on page load.
+      if (!appStoreLastPersistSignatureRef.current) {
+        appStoreLastPersistSignatureRef.current = signature;
+        return;
+      }
       if (signature === appStoreLastPersistSignatureRef.current) return;
       appStorePersistInFlightRef.current = true;
       try {
