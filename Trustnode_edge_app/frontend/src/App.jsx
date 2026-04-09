@@ -3959,15 +3959,21 @@ function AppShell() {
       .map((g) => {
         const ageMs = g.lastLiveUtc ? Date.now() - new Date(g.lastLiveUtc).getTime() : Number.POSITIVE_INFINITY;
         const liveHealthy = Number.isFinite(ageMs) ? ageMs <= 10000 : false;
+        const hasConfigMetadata = g.dbNames.size > 0;
+        const liveRecent = Number.isFinite(ageMs) ? ageMs <= 15 * 60 * 1000 : false;
+        const configMs = g.lastConfigUtc ? new Date(g.lastConfigUtc).getTime() : Number.NaN;
+        const configRecent = Number.isFinite(configMs) ? Math.max(0, Date.now() - configMs) <= 24 * 60 * 60 * 1000 : false;
         return {
           ...g,
           dbCount: g.dbNames.size,
           gatewayCount: g.gatewayIds.size,
           liveGatewayIds: Array.from(g.liveGatewayIds || []),
           liveHealthy,
+          includeInSelector: liveRecent || (hasConfigMetadata && configRecent),
           dbNamesText: Array.from(g.dbNames).sort().join(", "),
         };
       })
+      .filter((g) => g.includeInSelector)
       .sort((a, b) => String(b.lastLiveUtc || b.lastConfigUtc || "").localeCompare(String(a.lastLiveUtc || a.lastConfigUtc || "")));
   }, [endpointMode, dbConnections, gatewayConfigs, dataLog]);
   const selectedCloudEdge = useMemo(() => {
