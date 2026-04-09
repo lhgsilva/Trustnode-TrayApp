@@ -68,8 +68,33 @@ class AppStore:
             ]
         )
 
+    def _configured_tenant_id(self) -> str:
+        forced = normalize_tenant_id(str(os.environ.get("TRUSTNODE_TENANT_ID") or "").strip())
+        if forced and forced != "default":
+            return forced
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM config_documents WHERE domain = 'app_settings' LIMIT 1"
+                ).fetchone()
+            payload = json.loads(str(row["payload_json"] or "{}")) if row else {}
+            if isinstance(payload, dict):
+                realm = str(payload.get("tenant_login_realm") or payload.get("tenant_id") or "").strip()
+                normalized = normalize_tenant_id(realm)
+                if normalized and normalized != "default":
+                    return normalized
+        except Exception:
+            pass
+        return "default"
+
     def _current_tenant_id(self) -> str:
-        return normalize_tenant_id(get_current_tenant())
+        request_tenant = normalize_tenant_id(get_current_tenant())
+        if request_tenant and request_tenant != "default":
+            return request_tenant
+        configured_tenant = self._configured_tenant_id()
+        if configured_tenant and configured_tenant != "default":
+            return configured_tenant
+        return request_tenant or "default"
 
     def _ensure_cloud_schema_once(self, engine: Any, schema: str, target_key: str) -> None:
         if target_key in self._cloud_schema_ready_keys:

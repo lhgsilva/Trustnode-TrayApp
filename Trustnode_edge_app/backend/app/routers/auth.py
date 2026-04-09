@@ -53,11 +53,22 @@ def _load_users_payload() -> Dict[str, Any]:
 
 
 def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
+    configured_tenant = "default"
+    try:
+        bootstrap = app_store.get_bootstrap()
+        app_settings = bootstrap.get("app_settings") if isinstance(bootstrap, dict) else {}
+        if isinstance(app_settings, dict):
+            configured_tenant = normalize_tenant_id(
+                str(app_settings.get("tenant_login_realm") or app_settings.get("tenant_id") or "").strip()
+            )
+    except Exception:
+        configured_tenant = "default"
+    fallback_tenant = configured_tenant if configured_tenant != "default" else normalize_tenant_id(get_current_tenant())
     return {
         "username": str(user_row.get("username") or ""),
         "role": str(user_row.get("role") or "viewer"),
         "permissions": user_row.get("permissions") or {},
-        "tenant_id": normalize_tenant_id(str(user_row.get("tenant_id") or get_current_tenant())),
+        "tenant_id": normalize_tenant_id(str(user_row.get("tenant_id") or fallback_tenant)),
     }
 
 

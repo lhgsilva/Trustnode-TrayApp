@@ -48,7 +48,8 @@ PUBLIC_PATHS = {
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    tenant_id = set_current_tenant(resolve_request_tenant(request))
+    tenant_id = resolve_request_tenant(request)
+    set_current_tenant(tenant_id)
     path = request.url.path or ""
     method = (request.method or "GET").upper()
     if method == "OPTIONS":
@@ -64,8 +65,14 @@ async def auth_middleware(request: Request, call_next):
     try:
         payload = decode_access_token(token)
         token_tenant = str(payload.get("tenant_id") or "").strip()
-        if token_tenant and token_tenant != tenant_id:
-            return JSONResponse(status_code=403, content={"detail": "Token tenant mismatch"})
+        if token_tenant:
+            normalized_token_tenant = set_current_tenant(token_tenant)
+            # Strict mismatch only when request explicitly targets a non-default tenant.
+            if tenant_id != "default" and normalized_token_tenant != tenant_id:
+                return JSONResponse(status_code=403, content={"detail": "Token tenant mismatch"})
+            tenant_id = normalized_token_tenant
+        elif tenant_id:
+            set_current_tenant(tenant_id)
     except Exception as exc:
         return JSONResponse(status_code=401, content={"detail": f"Invalid token: {exc}"})
     return await call_next(request)
@@ -78,7 +85,8 @@ def root() -> dict[str, str]:
 
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket) -> None:
-    tenant_id = set_current_tenant(resolve_websocket_tenant(websocket))
+    tenant_id = resolve_websocket_tenant(websocket)
+    set_current_tenant(tenant_id)
     token = (websocket.query_params.get("token") or "").strip()
     if not token:
         await websocket.close(code=1008)
@@ -86,9 +94,12 @@ async def websocket_stream(websocket: WebSocket) -> None:
     try:
         payload = decode_access_token(token)
         token_tenant = str(payload.get("tenant_id") or "").strip()
-        if token_tenant and token_tenant != tenant_id:
-            await websocket.close(code=1008)
-            return
+        if token_tenant:
+            normalized_token_tenant = set_current_tenant(token_tenant)
+            if tenant_id != "default" and normalized_token_tenant != tenant_id:
+                await websocket.close(code=1008)
+                return
+            tenant_id = normalized_token_tenant
     except Exception:
         await websocket.close(code=1008)
         return
@@ -115,7 +126,8 @@ async def websocket_stream(websocket: WebSocket) -> None:
 
 @app.websocket("/ws/cloud-stream")
 async def websocket_cloud_stream(websocket: WebSocket) -> None:
-    tenant_id = set_current_tenant(resolve_websocket_tenant(websocket))
+    tenant_id = resolve_websocket_tenant(websocket)
+    set_current_tenant(tenant_id)
     token = (websocket.query_params.get("token") or "").strip()
     if not token:
         await websocket.close(code=1008)
@@ -123,9 +135,12 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
     try:
         payload = decode_access_token(token)
         token_tenant = str(payload.get("tenant_id") or "").strip()
-        if token_tenant and token_tenant != tenant_id:
-            await websocket.close(code=1008)
-            return
+        if token_tenant:
+            normalized_token_tenant = set_current_tenant(token_tenant)
+            if tenant_id != "default" and normalized_token_tenant != tenant_id:
+                await websocket.close(code=1008)
+                return
+            tenant_id = normalized_token_tenant
     except Exception:
         await websocket.close(code=1008)
         return
