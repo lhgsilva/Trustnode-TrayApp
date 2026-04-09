@@ -3930,6 +3930,13 @@ function AppShell() {
       if (selectedCloudEdgeKey !== CLOUD_EDGE_ALL_KEY) setSelectedCloudEdgeKey(CLOUD_EDGE_ALL_KEY);
       return;
     }
+    if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY && cloudSourceRows.length) {
+      const preferred = cloudSourceRows.find((r) => r.liveHealthy) || cloudSourceRows[0];
+      if (preferred?.key) {
+        setSelectedCloudEdgeKey(String(preferred.key));
+        return;
+      }
+    }
     if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY) return;
     if (cloudSourceRows.some((r) => String(r.key) === String(selectedCloudEdgeKey))) return;
     setSelectedCloudEdgeKey(CLOUD_EDGE_ALL_KEY);
@@ -4127,8 +4134,36 @@ function AppShell() {
     });
   }, [tagRows, tagFilters]);
 
+  const dashboardWidgetsView = useMemo(() => {
+    if (!isCloudEdgeFilterActive) return dashboardWidgets;
+    const allowedGatewayIds = new Set((gatewayConfigsView || []).map((g) => String(g.id || "")));
+    const filtered = (dashboardWidgets || []).filter((w) => allowedGatewayIds.has(String(w.gateway_id || "")));
+    if (filtered.length) return filtered;
+    const fallback = [];
+    const seen = new Set();
+    for (const row of tagRows) {
+      const gid = String(row.gateway_id || "");
+      const tag = String(row.tag_name || "");
+      if (!gid || !tag || !allowedGatewayIds.has(gid)) continue;
+      const key = `${gid}::${tag}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      fallback.push({
+        id: `auto-${key}`,
+        color: "#16a34a",
+        title: tag,
+        tag_name: tag,
+        chart_type: "line",
+        gateway_id: gid,
+        readings_count: 120,
+      });
+      if (fallback.length >= 8) break;
+    }
+    return fallback;
+  }, [dashboardWidgets, gatewayConfigsView, tagRows, isCloudEdgeFilterActive]);
+
   const dashboardItems = useMemo(() => {
-    return dashboardWidgets.map((w) => {
+    return dashboardWidgetsView.map((w) => {
       const gateway = gatewayConfigsView.find((g) => String(g.id) === String(w.gateway_id)) || null;
       if (!gateway) return null;
       const device = devicesView.find((d) => String(d.id) === String(gateway?.device_id || "")) || null;
@@ -4170,7 +4205,7 @@ function AppShell() {
         monitorRow
       };
     }).filter(Boolean);
-  }, [dashboardWidgets, gatewayConfigsView, devicesView, dataLogView]);
+  }, [dashboardWidgetsView, gatewayConfigsView, devicesView, dataLogView]);
 
   const tagMonitorSeries = useMemo(() => {
     if (!tagMonitorSelection) return [];
