@@ -163,6 +163,7 @@ jobs:
             TimeoutStopSec=10
             KillMode=mixed
             Environment=TRUSTNODE_PREFER_CLOUD_READS=true
+            Environment=TRUSTNODE_DISABLE_CONFIG_PUSH=true
             Environment=TRUSTNODE_CONFIG_SYNC_SECONDS=1
             Environment=TRUSTNODE_DATA_SYNC_BATCH_SIZE=8000
             Environment=TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS=10000
@@ -218,6 +219,7 @@ jobs:
             TimeoutStopSec=10
             KillMode=mixed
             Environment=TRUSTNODE_PREFER_CLOUD_READS=true
+            Environment=TRUSTNODE_DISABLE_CONFIG_PUSH=true
             Environment=TRUSTNODE_CONFIG_SYNC_SECONDS=1
             Environment=TRUSTNODE_DATA_SYNC_BATCH_SIZE=8000
             Environment=TRUSTNODE_LIVE_SYNC_SAMPLE_ROWS=10000

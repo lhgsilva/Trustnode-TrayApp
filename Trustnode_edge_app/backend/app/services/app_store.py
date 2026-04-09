@@ -39,6 +39,12 @@ class AppStore:
         self._sync_wakeup_event = threading.Event()
         # Fast default cadence for cloud/live products; tunable via env.
         self._sync_interval_seconds = max(1, int(os.environ.get("TRUSTNODE_CONFIG_SYNC_SECONDS", "1") or "1"))
+        self._disable_config_push = str(os.environ.get("TRUSTNODE_DISABLE_CONFIG_PUSH", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self._data_sync_batch_size = max(
             200,
             min(10000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "8000") or "8000")),
@@ -50,8 +56,9 @@ class AppStore:
         self._ensure_schema()
         self._ensure_required_config_domains()
         self._ensure_default_database_configuration()
-        self._compact_sync_outbox_for_domains()
-        self._backfill_outbox_for_existing_domains()
+        if not self._disable_config_push:
+            self._compact_sync_outbox_for_domains()
+            self._backfill_outbox_for_existing_domains()
         self._scheduler_thread = threading.Thread(target=self._retention_scheduler_loop, daemon=True)
         self._sync_thread = threading.Thread(target=self._config_sync_loop, daemon=True)
         self._scheduler_thread.start()
@@ -709,7 +716,8 @@ class AppStore:
                     self._flush_data_outbox_once()
                 # Prioritize live/data freshness; config sync can follow.
                 self._pull_config_from_cloud_once()
-                self._flush_config_outbox_once()
+                if not self._disable_config_push:
+                    self._flush_config_outbox_once()
             except Exception as exc:
                 self._upsert_sync_target_state(enabled=True, config={}, last_error=f"Config sync loop error: {exc}")
             self._sync_wakeup_event.wait(timeout=self._sync_interval_seconds)
@@ -2766,33 +2774,34 @@ class AppStore:
                     """,
                     (domain, actor, old_version if old_version > 0 else None, new_version, now),
                 )
-                pending_row = conn.execute(
-                    """
-                    SELECT id
-                    FROM sync_outbox
-                    WHERE domain = ? AND status IN ('pending', 'failed')
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (domain,),
-                ).fetchone()
-                if pending_row:
-                    conn.execute(
+                if not self._disable_config_push:
+                    pending_row = conn.execute(
                         """
-                        UPDATE sync_outbox
-                        SET payload_json = ?, status = 'pending', retries = 0, last_error = NULL, updated_utc = ?
-                        WHERE id = ?
+                        SELECT id
+                        FROM sync_outbox
+                        WHERE domain = ? AND status IN ('pending', 'failed')
+                        ORDER BY id DESC
+                        LIMIT 1
                         """,
-                        (payload_json, now, int(pending_row["id"])),
-                    )
-                else:
-                    conn.execute(
-                        """
-                        INSERT INTO sync_outbox(domain, entity_key, payload_json, status, retries, last_error, created_utc, updated_utc)
-                        VALUES(?, ?, ?, 'pending', 0, NULL, ?, ?)
-                        """,
-                        (domain, domain, payload_json, now, now),
-                    )
+                        (domain,),
+                    ).fetchone()
+                    if pending_row:
+                        conn.execute(
+                            """
+                            UPDATE sync_outbox
+                            SET payload_json = ?, status = 'pending', retries = 0, last_error = NULL, updated_utc = ?
+                            WHERE id = ?
+                            """,
+                            (payload_json, now, int(pending_row["id"])),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO sync_outbox(domain, entity_key, payload_json, status, retries, last_error, created_utc, updated_utc)
+                            VALUES(?, ?, ?, 'pending', 0, NULL, ?, ?)
+                            """,
+                            (domain, domain, payload_json, now, now),
+                        )
         self._sync_wakeup_event.set()
         return {"domain": domain, "tenant_id": self._current_tenant_id(), "version": new_version, "updated_utc": now}
 
