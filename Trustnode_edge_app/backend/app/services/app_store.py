@@ -1488,6 +1488,7 @@ class AppStore:
                             "quality_label": str(r["quality_label"] or ""),
                             "source": str(r["source"] or ""),
                             "created_utc": str(r["created_utc"] or ""),
+                            "updated_utc": str(r["created_utc"] or self._utc_now()),
                         }
                         for r in hist_rows
                     ]
