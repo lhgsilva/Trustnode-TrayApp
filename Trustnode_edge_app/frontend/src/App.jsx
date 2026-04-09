@@ -2091,6 +2091,7 @@ function AppShell() {
 
   useEffect(() => {
     if (!appStoreHydrated) return;
+    if (isHostedWebClient) return;
     if (appStoreSaveTimerRef.current) clearTimeout(appStoreSaveTimerRef.current);
     appStoreSaveTimerRef.current = setTimeout(async () => {
       if (appStorePersistInFlightRef.current) return;
@@ -2122,6 +2123,7 @@ function AppShell() {
     };
   }, [
     appStoreHydrated,
+    isHostedWebClient,
     theme,
     rememberUser,
     endpointMode,

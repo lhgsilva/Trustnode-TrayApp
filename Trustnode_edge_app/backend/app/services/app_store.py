@@ -2076,14 +2076,17 @@ class AppStore:
             self._save_retention_run(run_utc, dry_run=dry_run, status="error", details=details)
             return {"ok": False, "run_utc": run_utc, "dry_run": dry_run, "details": details, "message": str(exc)}
 
-    def get_bootstrap(self) -> Dict[str, Any]:
+    def get_bootstrap(self, prefer_cloud_reads: bool | None = None) -> Dict[str, Any]:
         tenant_id = self._current_tenant_id()
-        prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        if prefer_cloud_reads is None:
+            prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        else:
+            prefer_cloud = bool(prefer_cloud_reads)
         if prefer_cloud:
             try:
                 # In hosted mode, refresh local config cache from cloud first so

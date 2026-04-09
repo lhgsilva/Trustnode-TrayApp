@@ -1,6 +1,6 @@
 from typing import Any, Dict, Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from app.state import app_store
@@ -81,8 +81,14 @@ class FullResetRequest(BaseModel):
 
 
 @router.get("/bootstrap")
-def get_bootstrap() -> dict:
-    return {"ok": True, "tenant_id": get_current_tenant(), "data": app_store.get_bootstrap()}
+def get_bootstrap(request: Request) -> dict:
+    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
+    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    return {
+        "ok": True,
+        "tenant_id": get_current_tenant(),
+        "data": app_store.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads),
+    }
 
 
 @router.put("/bootstrap")
