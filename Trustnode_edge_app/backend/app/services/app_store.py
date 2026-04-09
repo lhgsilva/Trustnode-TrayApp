@@ -930,9 +930,26 @@ class AppStore:
         }
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
-            with engine.begin() as conn:
+            def _top_ts_ms(rows_in: list[Any]) -> int:
+                if not rows_in:
+                    return 0
+                raw = str(rows_in[0][0] or "").strip()
+                if not raw:
+                    return 0
                 try:
-                    rows = conn.execute(
+                    txt = raw.replace("Z", "+00:00")
+                    if " " in txt and "T" not in txt:
+                        txt = txt.replace(" ", "T")
+                    return int(datetime.fromisoformat(txt).timestamp() * 1000)
+                except Exception:
+                    return 0
+
+            with engine.begin() as conn:
+                live_rows: list[Any] = []
+                hist_rows: list[Any] = []
+                plc_rows: list[Any] = []
+                try:
+                    live_rows = conn.execute(
                         text(
                             f"""
                             SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
@@ -947,7 +964,7 @@ class AppStore:
                     ).fetchall()
                 except Exception:
                     try:
-                        rows = conn.execute(
+                        live_rows = conn.execute(
                             text(
                                 f"""
                                 SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
@@ -960,51 +977,84 @@ class AppStore:
                             {"lim": lim},
                         ).fetchall()
                     except Exception:
-                        rows = []
-                if not rows:
-                    # Compatibility fallback: derive latest-per-tag from historian/plc_readings.
+                        live_rows = []
+
+                # Fetch historian/plc rows and prefer whichever source is freshest.
+                # This prevents stale cloud live widgets when live_latest lags behind.
+                try:
+                    hist_rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                   tag_name, value, quality, quality_label
+                            FROM "{schema}"."historian_readings"
+                            WHERE tenant_id = :tenant
+                            ORDER BY id DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": max(lim, 20000), "tenant": tenant_id},
+                    ).fetchall()
+                except Exception:
                     try:
-                        rows = conn.execute(
+                        hist_rows = conn.execute(
                             text(
                                 f"""
                                 SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                        tag_name, value, quality, quality_label
                                 FROM "{schema}"."historian_readings"
-                                WHERE tenant_id = :tenant
                                 ORDER BY id DESC
                                 LIMIT :lim
                                 """
                             ),
-                            {"lim": max(lim, 20000), "tenant": tenant_id},
+                            {"lim": max(lim, 20000)},
                         ).fetchall()
                     except Exception:
-                        try:
-                            rows = conn.execute(
-                                text(
-                                    f"""
-                                    SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                                           tag_name, value, quality, quality_label
-                                    FROM "{schema}"."plc_readings"
-                                    WHERE tenant_id = :tenant
-                                    ORDER BY id DESC
-                                    LIMIT :lim
-                                    """
-                                ),
-                                {"lim": max(lim, 20000), "tenant": tenant_id},
-                            ).fetchall()
-                        except Exception:
-                            rows = conn.execute(
-                                text(
-                                    f"""
-                                    SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                                           tag_name, value, quality, quality_label
-                                    FROM "{schema}"."plc_readings"
-                                    ORDER BY id DESC
-                                    LIMIT :lim
-                                    """
-                                ),
-                                {"lim": max(lim, 20000)},
-                            ).fetchall()
+                        hist_rows = []
+
+                try:
+                    plc_rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                   tag_name, value, quality, quality_label
+                            FROM "{schema}"."plc_readings"
+                            WHERE tenant_id = :tenant
+                            ORDER BY id DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": max(lim, 20000), "tenant": tenant_id},
+                    ).fetchall()
+                except Exception:
+                    try:
+                        plc_rows = conn.execute(
+                            text(
+                                f"""
+                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                       tag_name, value, quality, quality_label
+                                FROM "{schema}"."plc_readings"
+                                ORDER BY id DESC
+                                LIMIT :lim
+                                """
+                            ),
+                            {"lim": max(lim, 20000)},
+                        ).fetchall()
+                    except Exception:
+                        plc_rows = []
+
+                live_top = _top_ts_ms(live_rows)
+                hist_top = _top_ts_ms(hist_rows)
+                plc_top = _top_ts_ms(plc_rows)
+                freshest = max(hist_top, plc_top)
+                if live_rows and live_top >= freshest - 1500:
+                    rows = live_rows
+                elif hist_rows and hist_top >= plc_top:
+                    rows = hist_rows
+                elif plc_rows:
+                    rows = plc_rows
+                else:
+                    rows = live_rows
             out: list[dict[str, Any]] = []
             seen: set[tuple[str, str]] = set()
             for r in rows:
