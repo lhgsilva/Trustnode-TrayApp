@@ -2176,10 +2176,122 @@ class AppStore:
         out.setdefault("metadata", {})
         if isinstance(out.get("metadata"), dict):
             out["metadata"]["tenant_id"] = tenant_id
+        if prefer_cloud:
+            try:
+                out = self._apply_live_config_overrides(out)
+            except Exception:
+                pass
         out["tenant_context"] = {
             "tenant_id": tenant_id,
             "base_host": "trustnode.lsapps.app",
         }
+        return out
+
+    def _apply_live_config_overrides(self, bootstrap: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(bootstrap or {})
+        live_rows = self._fetch_live_rows_from_cloud(limit=5000)
+        if not live_rows:
+            return out
+        live_gateway_ids = {str(r.get("gateway_id") or "").strip() for r in live_rows if str(r.get("gateway_id") or "").strip()}
+        if not live_gateway_ids:
+            return out
+
+        existing_gateways = out.get("gateway_configurations")
+        configured_ids = set()
+        if isinstance(existing_gateways, list):
+            configured_ids = {str(g.get("id") or "").strip() for g in existing_gateways if isinstance(g, dict)}
+            configured_ids.discard("")
+        if configured_ids and configured_ids.intersection(live_gateway_ids):
+            return out
+
+        db_configs = out.get("database_configurations")
+        db_lookup: Dict[str, str] = {}
+        if isinstance(db_configs, list):
+            for db in db_configs:
+                if not isinstance(db, dict):
+                    continue
+                db_name = str(db.get("name") or "").strip().lower()
+                db_id = str(db.get("id") or "").strip()
+                if db_name and db_id:
+                    db_lookup[db_name] = db_id
+
+        by_gateway: Dict[str, Dict[str, Any]] = {}
+        for row in live_rows:
+            gid = str(row.get("gateway_id") or "").strip()
+            if not gid:
+                continue
+            gw = by_gateway.get(gid)
+            if not gw:
+                source = str(row.get("source") or "").strip().lower()
+                gw = {
+                    "id": gid,
+                    "name": str(row.get("gateway_name") or gid),
+                    "tags": [],
+                    "plc_ip": str(row.get("plc_ip") or ""),
+                    "opc_url": "",
+                    "device_id": f"dev-auto-{gid}",
+                    "database_id": "",
+                    "interval_ms": 1000,
+                    "gateway_type": "siemens_opcua" if "siemens" in source else "allen_bradley",
+                    "last_check_utc": str(row.get("ts") or ""),
+                }
+                by_gateway[gid] = gw
+            tag = str(row.get("tag") or row.get("tag_name") or "").strip()
+            if tag and tag not in gw["tags"]:
+                gw["tags"].append(tag)
+            db_name = str(row.get("database_name") or "").strip().lower()
+            if db_name and not gw.get("database_id"):
+                gw["database_id"] = db_lookup.get(db_name, "")
+
+        inferred_gateways = list(by_gateway.values())
+        inferred_devices = [
+            {
+                "id": g["device_id"],
+                "name": g["name"] or g["id"],
+                "notes": "Auto-inferred from live cloud rows",
+                "plc_ip": g.get("plc_ip", ""),
+                "opc_url": g.get("opc_url", ""),
+                "ping_ok": True,
+                "port_ok": True,
+                "last_test": "Live cloud reading",
+                "opc_node_id": "",
+                "protocol_ok": True,
+                "gateway_type": g.get("gateway_type", "allen_bradley"),
+                "opc_node_ids": [],
+                "connection_ok": True,
+                "opc_node_ids_text": "",
+                "last_check_utc": g.get("last_check_utc", ""),
+            }
+            for g in inferred_gateways
+        ]
+        inferred_widgets = []
+        for g in inferred_gateways:
+            for tag in list(g.get("tags") or [])[:4]:
+                inferred_widgets.append(
+                    {
+                        "id": f"dw-auto-{g['id']}-{hashlib.md5(tag.encode('utf-8')).hexdigest()[:8]}",
+                        "color": "#16a34a",
+                        "title": tag,
+                        "tag_name": tag,
+                        "chart_type": "line",
+                        "gateway_id": g["id"],
+                        "readings_count": 120,
+                    }
+                )
+                if len(inferred_widgets) >= 12:
+                    break
+            if len(inferred_widgets) >= 12:
+                break
+
+        out["devices"] = inferred_devices
+        out["gateway_configurations"] = inferred_gateways
+        dash = out.get("dashboard_configurations")
+        if not isinstance(dash, dict):
+            dash = {}
+        dash["widgets"] = inferred_widgets
+        dash["mode"] = dash.get("mode") or "chart"
+        dash["per_row"] = int(dash.get("per_row") or 2)
+        out["dashboard_configurations"] = dash
         return out
 
     def force_sync_now(self, actor: str = "manual") -> Dict[str, Any]:
