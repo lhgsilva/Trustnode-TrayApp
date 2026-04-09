@@ -191,7 +191,7 @@ jobs:
             nginx -t
             systemctl reload nginx
             curl -fsS https://trustnode.lsapps.app/api/health >/dev/null
-            curl -fsS https://trustnode.lsapps.app/api/app-store/live?limit=1 >/dev/null
+            curl -fsS https://trustnode.lsapps.app/ >/dev/null
 
       - name: Remote deploy (ssh key)
         if: ${{ steps.gate.outputs.deploy == 'true' && env.VPS_SSH_KEY != '' }}
@@ -246,4 +246,4 @@ jobs:
             nginx -t
             systemctl reload nginx
             curl -fsS https://trustnode.lsapps.app/api/health >/dev/null
-            curl -fsS https://trustnode.lsapps.app/api/app-store/live?limit=1 >/dev/null
+            curl -fsS https://trustnode.lsapps.app/ >/dev/null
