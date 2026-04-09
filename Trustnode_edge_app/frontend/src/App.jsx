@@ -1618,6 +1618,15 @@ function AppShell() {
   }, [theme]);
 
   useEffect(() => {
+    if (isHostedWebClient) {
+      const normalizedUsers = buildDefaultUsers().map((u) => ({
+        ...u,
+        permissions: normalizePermissions(u.permissions, u.role)
+      }));
+      setUsers(normalizedUsers);
+      setCurrentUser(null);
+      return;
+    }
     const savedUsers = localStorage.getItem(USERS_STORAGE_KEY);
     let sourceUsers = buildDefaultUsers();
     if (savedUsers) {
@@ -1686,6 +1695,10 @@ function AppShell() {
   }, [users]);
 
   useEffect(() => {
+    if (isHostedWebClient) {
+      setDbConnections([]);
+      return;
+    }
     try {
       const saved = localStorage.getItem(DB_CONNECTIONS_STORAGE_KEY);
       if (saved) {
@@ -1716,6 +1729,7 @@ function AppShell() {
   }, [emailSettings]);
 
   useEffect(() => {
+    if (isHostedWebClient) return;
     try {
       const saved = localStorage.getItem(EMAIL_SETTINGS_STORAGE_KEY);
       if (!saved) return;
@@ -1730,7 +1744,7 @@ function AppShell() {
         if (typeof parsed.active_profile_id === "string") setActiveEmailProfileId(parsed.active_profile_id);
       }
     } catch {}
-  }, []);
+  }, [isHostedWebClient]);
 
   useEffect(() => {
     try {
@@ -1770,6 +1784,10 @@ function AppShell() {
   }, [gatewayForm.gateway_type, gatewayForm.plc_ip, gatewayForm.opc_url, gatewayForm.tags_text, gatewayOpcValidatedFor]);
 
   useEffect(() => {
+    if (isHostedWebClient) {
+      setGatewayConfigs([]);
+      return;
+    }
     try {
       const saved = localStorage.getItem(GATEWAY_CONFIGS_STORAGE_KEY);
       if (saved) {
@@ -1781,7 +1799,7 @@ function AppShell() {
       }
     } catch {}
     setGatewayConfigs([]);
-  }, []);
+  }, [isHostedWebClient]);
 
   useEffect(() => {
     localStorage.setItem(GATEWAY_CONFIGS_STORAGE_KEY, JSON.stringify(gatewayConfigs));
@@ -1799,6 +1817,12 @@ function AppShell() {
   }, [gatewayConfigs, selectedGatewayId]);
 
   useEffect(() => {
+    if (isHostedWebClient) {
+      setDashboardWidgets([]);
+      setDashboardMode("kpi");
+      setDashboardPerRow(2);
+      return;
+    }
     try {
       const saved = localStorage.getItem(DASHBOARD_WIDGETS_STORAGE_KEY);
       if (saved) {
@@ -1815,7 +1839,7 @@ function AppShell() {
       setDashboardMode(mode);
       setDashboardPerRow(perRow);
     } catch {}
-  }, []);
+  }, [isHostedWebClient]);
 
   useEffect(() => {
     localStorage.setItem(DASHBOARD_WIDGETS_STORAGE_KEY, JSON.stringify(dashboardWidgets));
@@ -1829,6 +1853,10 @@ function AppShell() {
   }, [dashboardMode, dashboardPerRow]);
 
   useEffect(() => {
+    if (isHostedWebClient) {
+      setCollectionTriggers([]);
+      return;
+    }
     try {
       const saved = localStorage.getItem(COLLECTION_TRIGGERS_STORAGE_KEY);
       if (saved) {
@@ -1840,7 +1868,7 @@ function AppShell() {
       }
     } catch {}
     setCollectionTriggers([]);
-  }, []);
+  }, [isHostedWebClient]);
 
   useEffect(() => {
     localStorage.setItem(COLLECTION_TRIGGERS_STORAGE_KEY, JSON.stringify(collectionTriggers));
@@ -1851,6 +1879,10 @@ function AppShell() {
   }, [collectionTriggers]);
 
   useEffect(() => {
+    if (isHostedWebClient) {
+      setTriggerRules([]);
+      return;
+    }
     try {
       const saved = localStorage.getItem(TRIGGER_RULES_STORAGE_KEY);
       if (saved) {
@@ -1862,7 +1894,7 @@ function AppShell() {
       }
     } catch {}
     setTriggerRules([]);
-  }, []);
+  }, [isHostedWebClient]);
 
   useEffect(() => {
     localStorage.setItem(TRIGGER_RULES_STORAGE_KEY, JSON.stringify(triggerRules));
@@ -1873,6 +1905,10 @@ function AppShell() {
   }, [triggerRules]);
 
   useEffect(() => {
+    if (isHostedWebClient) {
+      setDevices([]);
+      return;
+    }
     try {
       const saved = localStorage.getItem(DEVICES_STORAGE_KEY);
       if (saved) {
@@ -1884,7 +1920,7 @@ function AppShell() {
       }
     } catch {}
     setDevices([]);
-  }, []);
+  }, [isHostedWebClient]);
 
   useEffect(() => {
     localStorage.setItem(DEVICES_STORAGE_KEY, JSON.stringify(devices));
@@ -1924,12 +1960,44 @@ function AppShell() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isHostedWebClient]);
+
+  useEffect(() => {
+    if (!(isHostedWebClient && endpointMode === "cloud")) return;
+    let cancelled = false;
+    let inFlight = false;
+    let lastSig = "";
+    const refresh = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const res = await getAppStoreBootstrap();
+        if (cancelled) return;
+        if (res?.tenant_id) setCurrentTenantId(String(res.tenant_id));
+        const data = res?.data;
+        if (!data || typeof data !== "object") return;
+        const sig = JSON.stringify(data);
+        if (sig === lastSig) return;
+        lastSig = sig;
+        applyAppStorePayload(data);
+      } catch (_) {
+        // Keep current state if one refresh cycle fails.
+      } finally {
+        inFlight = false;
+      }
+    };
+    refresh();
+    const timer = setInterval(refresh, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [isHostedWebClient, endpointMode]);
 
   useEffect(() => {
     const t = setTimeout(() => setStartupWarningsReady(true), 8000);
     return () => clearTimeout(t);
-  }, []);
+  }, [isHostedWebClient]);
 
   useEffect(() => {
     if (!appStoreHydrated) return;
