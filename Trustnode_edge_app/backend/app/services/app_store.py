@@ -960,16 +960,26 @@ class AppStore:
                     rows = []
             out: list[dict[str, Any]] = []
             for r in rows:
+                source = str(r[1] or "")
+                gateway_id_raw = str(r[2] or "").strip()
+                gateway_name_raw = str(r[3] or "").strip()
+                plc_ip_raw = str(r[5] or "").strip()
+                database_name_raw = str(r[6] or "").strip()
+                fallback_gateway = "|".join(
+                    [x for x in [source, plc_ip_raw, database_name_raw] if x]
+                ) or "unknown_gateway"
+                gateway_id = gateway_id_raw or gateway_name_raw or fallback_gateway
+                gateway_name = gateway_name_raw or gateway_id_raw or fallback_gateway
                 out.append(
                     {
                         "ts": str(r[0] or ""),
                         "tenant_id": tenant_id,
-                        "source": str(r[1] or ""),
-                        "gateway_id": str(r[2] or ""),
-                        "gateway_name": str(r[3] or ""),
+                        "source": source,
+                        "gateway_id": gateway_id,
+                        "gateway_name": gateway_name,
                         "device_name": str(r[4] or ""),
-                        "plc_ip": str(r[5] or ""),
-                        "database_name": str(r[6] or ""),
+                        "plc_ip": plc_ip_raw,
+                        "database_name": database_name_raw,
                         "tag": str(r[7] or ""),
                         "value": r[8],
                         "quality": r[9],
@@ -1172,9 +1182,17 @@ class AppStore:
             out: list[dict[str, Any]] = []
             seen: set[tuple[str, str]] = set()
             for r in rows:
-                gateway_id = str(r[2] or "")
+                source = str(r[1] or "")
+                gateway_id_raw = str(r[2] or "").strip()
+                gateway_name_raw = str(r[3] or "").strip()
+                plc_ip_raw = str(r[5] or "").strip()
+                database_name_raw = str(r[6] or "").strip()
+                fallback_gateway = "|".join(
+                    [x for x in [source, plc_ip_raw, database_name_raw] if x]
+                ) or "unknown_gateway"
+                gateway_id = gateway_id_raw or gateway_name_raw or fallback_gateway
                 tag_name = str(r[7] or "")
-                if not tag_name or not gateway_id:
+                if not tag_name:
                     continue
                 key = (gateway_id, tag_name)
                 if key in seen:
@@ -1184,12 +1202,12 @@ class AppStore:
                     {
                         "ts": str(r[0] or ""),
                         "tenant_id": tenant_id,
-                        "source": str(r[1] or ""),
+                        "source": source,
                         "gateway_id": gateway_id,
-                        "gateway_name": str(r[3] or ""),
+                        "gateway_name": gateway_name_raw or gateway_id_raw or fallback_gateway,
                         "device_name": str(r[4] or ""),
-                        "plc_ip": str(r[5] or ""),
-                        "database_name": str(r[6] or ""),
+                        "plc_ip": plc_ip_raw,
+                        "database_name": database_name_raw,
                         "tag": tag_name,
                         "value": r[8],
                         "quality": r[9],
