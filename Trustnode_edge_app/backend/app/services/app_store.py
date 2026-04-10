@@ -134,6 +134,9 @@ class AppStore:
             ]
         )
 
+    def _canonical_json(self, payload: Any) -> str:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
     def _get_or_create_cloud_engine(self, cloud: dict[str, Any], schema: str) -> tuple[Any, str]:
         from sqlalchemy import create_engine  # type: ignore
 
@@ -3386,8 +3389,14 @@ class AppStore:
                         except Exception:
                             prev_payload = []
                     payload_to_store = self._normalize_database_configurations_payload(payload_to_store, prev_payload)
-                payload_json = json.dumps(payload_to_store)
-                prev_payload_json = str(prev["payload_json"] or "") if prev else ""
+                payload_json = self._canonical_json(payload_to_store)
+                prev_payload_json = ""
+                if prev:
+                    prev_raw = str(prev["payload_json"] or "")
+                    try:
+                        prev_payload_json = self._canonical_json(json.loads(prev_raw))
+                    except Exception:
+                        prev_payload_json = prev_raw
                 # No-op write: avoid audit/outbox churn when payload is unchanged.
                 if prev and prev_payload_json == payload_json:
                     return {
