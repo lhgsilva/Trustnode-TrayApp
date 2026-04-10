@@ -1158,6 +1158,31 @@ class GatewayWorker:
                     conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS database_name TEXT'))
                     conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS tenant_id TEXT'))
                     conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS created_utc TIMESTAMPTZ'))
+                    # Keep a lightweight latest-value table hot for cloud clients.
+                    conn.execute(
+                        text(
+                            f"""
+                            CREATE TABLE IF NOT EXISTS "{schema}"."live_latest" (
+                              tenant_id TEXT NOT NULL DEFAULT 'default',
+                              gateway_id TEXT NOT NULL,
+                              tag_name TEXT NOT NULL,
+                              ts_utc TIMESTAMPTZ NOT NULL,
+                              source TEXT NULL,
+                              gateway_name TEXT NULL,
+                              device_name TEXT NULL,
+                              plc_ip TEXT NULL,
+                              database_name TEXT NULL,
+                              value DOUBLE PRECISION NULL,
+                              quality INTEGER NULL,
+                              quality_label TEXT NULL,
+                              updated_utc TIMESTAMPTZ NULL,
+                              PRIMARY KEY (tenant_id, gateway_id, tag_name)
+                            )
+                            """
+                        )
+                    )
+                    conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_tenant_ts" ON "{schema}"."live_latest"(tenant_id, ts_utc DESC)'))
+                    conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_ts" ON "{schema}"."live_latest"(ts_utc DESC)'))
                 self._db_schema_ready_key = key
             tenant_id = normalize_tenant_id(str(self.db_sink.get("tenant_id") or os.environ.get("TRUSTNODE_TENANT_ID") or "default"))
             db_name = str(self.db_sink.get("name") or database or "").strip()
@@ -1184,6 +1209,37 @@ class GatewayWorker:
                 }
                 for r in readings
             ]
+            latest_by_tag: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                tag_name = str(row.get("tag_name") or "")
+                if not tag_name:
+                    continue
+                prev = latest_by_tag.get(tag_name)
+                if not prev:
+                    latest_by_tag[tag_name] = row
+                    continue
+                prev_ts = str(prev.get("ts_utc") or "")
+                cur_ts = str(row.get("ts_utc") or "")
+                if cur_ts >= prev_ts:
+                    latest_by_tag[tag_name] = row
+            live_rows = [
+                {
+                    "tenant_id": str(r.get("tenant_id") or tenant_id),
+                    "gateway_id": str(r.get("gateway_id") or self.gateway_id),
+                    "tag_name": str(r.get("tag_name") or ""),
+                    "ts_utc": str(r.get("ts_utc") or now_utc),
+                    "source": str(r.get("source") or ""),
+                    "gateway_name": str(r.get("gateway_name") or self.gateway_id),
+                    "device_name": str(r.get("device_name") or ""),
+                    "plc_ip": str(r.get("plc_ip") or self.config.plc_ip),
+                    "database_name": str(r.get("database_name") or db_name),
+                    "value": r.get("value"),
+                    "quality": r.get("quality"),
+                    "quality_label": str(r.get("quality_label") or ""),
+                    "updated_utc": now_utc,
+                }
+                for r in latest_by_tag.values()
+            ]
             with self._db_engine.begin() as conn:
                 conn.execute(
                     text(
@@ -1195,6 +1251,29 @@ class GatewayWorker:
                     ),
                     rows,
                 )
+                if live_rows:
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."live_latest"
+                            (tenant_id, gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
+                            VALUES
+                            (:tenant_id, :gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
+                            ON CONFLICT(tenant_id, gateway_id, tag_name) DO UPDATE SET
+                              ts_utc = excluded.ts_utc,
+                              source = excluded.source,
+                              gateway_name = excluded.gateway_name,
+                              device_name = excluded.device_name,
+                              plc_ip = excluded.plc_ip,
+                              database_name = excluded.database_name,
+                              value = excluded.value,
+                              quality = excluded.quality,
+                              quality_label = excluded.quality_label,
+                              updated_utc = excluded.updated_utc
+                            """
+                        ),
+                        live_rows,
+                    )
             self._mark_db_write_success(len(rows))
             return True
         except Exception as exc:
