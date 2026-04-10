@@ -140,8 +140,8 @@ const REPORT_SERIES_COLORS = ["#16a34a", "#2563eb", "#d97706", "#dc2626", "#7c3a
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
-const CLOUD_LIVE_POLL_MS = 2000;
-const CLOUD_AUX_POLL_MS = 5000;
+const CLOUD_LIVE_POLL_MS = 1000;
+const CLOUD_AUX_POLL_MS = 2500;
 const CLOUD_LIVE_FETCH_LIMIT = 600;
 const CLOUD_EDGE_ALL_KEY = "__all_edges__";
 const RETENTION_PRESETS = {
@@ -1270,6 +1270,7 @@ function AppShell() {
   const appStoreLastPersistSignatureRef = useRef("");
   const liveTagValuesRef = useRef({});
   const cloudNewestLiveTsMsRef = useRef(0);
+  const cloudLastApplyMsRef = useRef(0);
   const tagAlarmPrefsRef = useRef({});
   const emailSettingsRef = useRef({});
   const historianOutboxRef = useRef([]);
@@ -2816,11 +2817,12 @@ function AppShell() {
               const ms = rowTsMs(row);
               return Number.isFinite(ms) && ms > max ? ms : max;
             }, -1);
-            if (
+            const isStalePacket =
               newestLiveMs > 0 &&
               cloudNewestLiveTsMsRef.current > 0 &&
-              newestLiveMs < cloudNewestLiveTsMsRef.current - 1500
-            ) {
+              newestLiveMs < cloudNewestLiveTsMsRef.current - 1500;
+            if (isStalePacket) {
+              // Ignore backward/live-reordered packets but keep stream alive.
               return;
             }
             if (newestLiveMs > cloudNewestLiveTsMsRef.current) {
@@ -2980,6 +2982,7 @@ function AppShell() {
             if (nextDataRows.length) {
               setDataLog((prev) => mergeHistorianRowsStable(nextDataRows, prev, 3000));
             }
+            cloudLastApplyMsRef.current = Date.now();
 
             const activeRules = triggerRulesRef.current.filter((rule) => rule.enabled !== false);
             const newAlarms = [];
@@ -3126,7 +3129,7 @@ function AppShell() {
     let runningLive = false;
     let runningAux = false;
     const pollCloudLive = async () => {
-      if (cloudStreamConnected) return;
+      if (cloudStreamConnected && Date.now() - cloudLastApplyMsRef.current < 2500) return;
       if (stopped || runningLive) return;
       runningLive = true;
       try {
@@ -3137,11 +3140,12 @@ function AppShell() {
             const ms = rowTsMs(row);
             return Number.isFinite(ms) && ms > max ? ms : max;
           }, -1);
-          if (
+          const isStalePollFrame =
             newestLiveMs > 0 &&
             cloudNewestLiveTsMsRef.current > 0 &&
-            newestLiveMs < cloudNewestLiveTsMsRef.current - 1500
-          ) {
+            newestLiveMs < cloudNewestLiveTsMsRef.current - 1500;
+          if (isStalePollFrame) {
+            // Do not regress UI timestamps on stale poll frames.
             setWsState("cloud_polling");
             return;
           }
@@ -3302,6 +3306,7 @@ function AppShell() {
           if (nextDataRows.length) {
             setDataLog((prev) => mergeHistorianRowsStable(nextDataRows, prev, 3000));
           }
+          cloudLastApplyMsRef.current = Date.now();
         }
         setWsState("cloud_polling");
       } catch (err) {

@@ -47,7 +47,7 @@ class GatewayWorker:
         self._remote_last_flush_started_monotonic = 0.0
         self._remote_last_pending_probe_monotonic = 0.0
         self._remote_flush_min_interval_seconds = max(
-            0.1, float(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MIN_SECONDS", "0.4") or "0.4")
+            0.05, float(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MIN_SECONDS", "0.1") or "0.1")
         )
         self._remote_pending_probe_seconds = max(
             0.1, float(os.environ.get("TRUSTNODE_REMOTE_PENDING_PROBE_SECONDS", "0.5") or "0.5")
@@ -1003,9 +1003,9 @@ class GatewayWorker:
 
     def _flush_remote_outbox_once(self, engine_name: str) -> None:
         try:
-            max_batches = max(1, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MAX_BATCHES", "6") or "6"))
+            max_batches = max(1, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MAX_BATCHES", "12") or "12"))
             for _ in range(max_batches):
-                pending = self._load_pending(300)
+                pending = self._load_pending(150)
                 if not pending:
                     break
                 pending_readings = [

@@ -62,8 +62,8 @@ class AppStore:
             min(10000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "500") or "500")),
         )
         self._data_bulk_sync_interval_seconds = max(
-            0.5,
-            float(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "0.5") or "0.5"),
+            0.25,
+            float(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "0.25") or "0.25"),
         )
         self._live_fast_batch_size = max(
             200,
@@ -74,8 +74,8 @@ class AppStore:
             min(20000, int(os.environ.get("TRUSTNODE_LIVE_FAST_INITIAL_ROWS", "4000") or "4000")),
         )
         self._live_sync_interval_seconds = max(
-            0.25,
-            float(os.environ.get("TRUSTNODE_LIVE_SYNC_SECONDS", "0.5") or "0.5"),
+            0.15,
+            float(os.environ.get("TRUSTNODE_LIVE_SYNC_SECONDS", "0.2") or "0.2"),
         )
         self._live_fast_last_local_id = 0
         self._cloud_live_cache_rows: list[dict[str, Any]] = []
@@ -85,8 +85,8 @@ class AppStore:
             min(5000, int(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_LIMIT", "1200") or "1200")),
         )
         self._cloud_live_cache_interval_seconds = max(
-            0.5,
-            float(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_SECONDS", "0.5") or "0.5"),
+            0.2,
+            float(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_SECONDS", "0.25") or "0.25"),
         )
         self._ensure_schema()
         self._ensure_required_config_domains()
@@ -1600,6 +1600,7 @@ class AppStore:
     def _collect_live_latest_incremental_rows(self) -> tuple[list[dict[str, Any]], int]:
         now = self._utc_now()
         latest_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        latest_id_by_key: dict[tuple[str, str, str], int] = {}
         max_id = int(self._live_fast_last_local_id or 0)
         with self._lock:
             with self._connect() as conn:
@@ -1640,6 +1641,12 @@ class AppStore:
             if not tag_name or not gateway_id:
                 continue
             key = (tenant_id, gateway_id, tag_name)
+            prev_row_id = int(latest_id_by_key.get(key) or 0)
+            # Keep only the newest row per (tenant, gateway, tag), regardless of
+            # scan direction (initial DESC or incremental ASC).
+            if prev_row_id and row_id <= prev_row_id:
+                continue
+            latest_id_by_key[key] = row_id
             latest_by_key[key] = {
                 "tenant_id": tenant_id,
                 "gateway_id": gateway_id,
