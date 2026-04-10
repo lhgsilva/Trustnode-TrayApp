@@ -715,6 +715,7 @@ class AppStore:
             "sslmode": "require" if cloud.get("tls", True) else "disable",
             "connect_timeout": 8,
             "prepare_threshold": None,
+            "options": "-c lock_timeout=1000ms -c statement_timeout=5000ms",
         }
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
@@ -885,6 +886,7 @@ class AppStore:
             "sslmode": "require" if cloud.get("tls", True) else "disable",
             "connect_timeout": 8,
             "prepare_threshold": None,
+            "options": "-c lock_timeout=1000ms -c statement_timeout=5000ms",
         }
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
@@ -1049,6 +1051,7 @@ class AppStore:
             "sslmode": "require" if cloud.get("tls", True) else "disable",
             "connect_timeout": 8,
             "prepare_threshold": None,
+            "options": "-c lock_timeout=1000ms -c statement_timeout=5000ms",
         }
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
