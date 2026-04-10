@@ -144,6 +144,7 @@ const CLOUD_LIVE_POLL_MS = 1000;
 const CLOUD_AUX_POLL_MS = 2500;
 const CLOUD_LIVE_FETCH_LIMIT = 600;
 const CLOUD_EDGE_ALL_KEY = "__all_edges__";
+const UI_RENDER_TICK_MS = 250;
 const RETENTION_PRESETS = {
   day: {
     key: "day",
@@ -306,6 +307,48 @@ function rowTsMs(row) {
   if (!raw) return Number.NaN;
   const ms = Date.parse(raw);
   return Number.isFinite(ms) ? ms : Number.NaN;
+}
+
+function computeFreshness(tsRaw, nowMs = Date.now()) {
+  const ms = Date.parse(String(tsRaw || "").trim());
+  if (!Number.isFinite(ms)) {
+    return { ageMs: Number.POSITIVE_INFINITY, label: "No data", level: "stale" };
+  }
+  const ageMs = Math.max(0, nowMs - ms);
+  if (ageMs <= 2000) return { ageMs, label: `Live ${(ageMs / 1000).toFixed(1)}s`, level: "live" };
+  if (ageMs <= 10000) return { ageMs, label: `Delayed ${Math.round(ageMs / 1000)}s`, level: "delay" };
+  return { ageMs, label: `Stale ${Math.round(ageMs / 1000)}s`, level: "stale" };
+}
+
+function freshnessBadgeClass(level) {
+  if (level === "live") return "status-online";
+  if (level === "delay") return "status-warning";
+  return "status-offline";
+}
+
+function buildSmoothedSeries(points, renderNowMs, periodMs = 1000) {
+  const src = Array.isArray(points) ? points : [];
+  if (src.length < 2) return src;
+  const out = src.map((p) => ({ ...p }));
+  const last = out[out.length - 1];
+  const prev = out[out.length - 2];
+  const lastTs = Number(last?.ts_ms || 0);
+  const prevTs = Number(prev?.ts_ms || 0);
+  const dt = lastTs - prevTs;
+  if (!Number.isFinite(lastTs) || !Number.isFinite(prevTs) || dt <= 0) return out;
+  const elapsed = Math.max(0, renderNowMs - lastTs);
+  const maxTailMs = Math.max(1000, Math.min(8000, Math.max(periodMs * 3, dt)));
+  if (elapsed <= 0 || elapsed > maxTailMs) return out;
+  const slope = (Number(last.value || 0) - Number(prev.value || 0)) / dt;
+  const projected = Number(last.value || 0) + slope * Math.min(elapsed, dt) * 0.6;
+  out.push({
+    idx: Number(last.idx || out.length) + 0.5,
+    ts: new Date(renderNowMs).toISOString().slice(11, 19),
+    ts_ms: renderNowMs,
+    value: projected,
+    synthetic: true,
+  });
+  return out;
 }
 
 function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000) {
@@ -1068,6 +1111,7 @@ function AppShell() {
   const [dbProvisionBusy, setDbProvisionBusy] = useState(false);
   const [footerCollapsed, setFooterCollapsed] = useState(true);
   const [footerHeight, setFooterHeight] = useState(0);
+  const [renderNowMs, setRenderNowMs] = useState(() => Date.now());
   const [confirmDialog, setConfirmDialog] = useState({
     open: false,
     title: "",
@@ -1298,6 +1342,11 @@ function AppShell() {
     device: {},
     database: {}
   });
+
+  useEffect(() => {
+    const timer = setInterval(() => setRenderNowMs(Date.now()), UI_RENDER_TICK_MS);
+    return () => clearInterval(timer);
+  }, []);
   const [devicesSeeded, setDevicesSeeded] = useState(false);
   const [startupWarningsReady, setStartupWarningsReady] = useState(false);
 
@@ -4389,11 +4438,15 @@ function AppShell() {
         .map((r, idx) => ({
           idx: idx + 1,
           ts: r.ts ? fmtTs(r.ts).slice(11, 19) : "",
+          ts_ms: rowTsMs(r),
           value: Number(r.value)
         }));
+      const series = buildSmoothedSeries(points, renderNowMs, Number(gateway?.interval_ms || 1000));
       const last = points.length ? points[points.length - 1] : null;
       const prev = points.length > 1 ? points[points.length - 2] : null;
       const delta = last && prev ? Number(last.value) - Number(prev.value) : 0;
+      const visualLast = series.length ? series[series.length - 1] : null;
+      const freshness = computeFreshness(last?.ts_ms || null, renderNowMs);
       const monitorRow = {
         key: `${w.id}`,
         tag_name: w.tag_name,
@@ -4401,7 +4454,7 @@ function AppShell() {
         gateway_id: w.gateway_id,
         gateway_name: gateway?.name || w.gateway_id || "-",
         period_ms: Number(gateway?.interval_ms || 0),
-        last_value: last ? Number(last.value).toFixed(3) : "-",
+        last_value: visualLast ? Number(visualLast.value).toFixed(3) : "-",
         last_ts: last?.ts || "-"
       };
       return {
@@ -4409,18 +4462,19 @@ function AppShell() {
         title: w.title || w.tag_name,
         gateway_name: gateway?.name || "-",
         device_name: device?.name || "-",
-        last_value: last ? Number(last.value) : null,
+        last_value: visualLast ? Number(visualLast.value) : null,
         last_ts: last?.ts || "-",
         delta,
-        series: points,
+        series,
+        freshness,
         monitorRow
       };
     }).filter(Boolean);
-  }, [dashboardWidgetsView, gatewayConfigsView, devicesView, dataLogView]);
+  }, [dashboardWidgetsView, gatewayConfigsView, devicesView, dataLogView, renderNowMs]);
 
   const tagMonitorSeries = useMemo(() => {
     if (!tagMonitorSelection) return [];
-    return dataLogView
+    const base = dataLogView
       .filter(
         (r) =>
           String(r.tag || "") === String(tagMonitorSelection.tag_name || "") &&
@@ -4431,9 +4485,11 @@ function AppShell() {
       .map((r, idx) => ({
         idx: idx + 1,
         ts: r.ts ? fmtTs(r.ts).slice(11, 19) : "",
+        ts_ms: rowTsMs(r),
         value: Number(r.value)
       }));
-  }, [dataLogView, tagMonitorSelection]);
+    return buildSmoothedSeries(base, renderNowMs, Number(tagMonitorSelection?.period_ms || 1000));
+  }, [dataLogView, tagMonitorSelection, renderNowMs]);
 
   const tagMonitorLatest = useMemo(() => {
     if (!tagMonitorSelection) return null;
@@ -4461,9 +4517,10 @@ function AppShell() {
       min: min.toFixed(3),
       max: max.toFixed(3),
       delta: prev == null ? "-" : (last - prev).toFixed(3),
-      lastTs: tagMonitorLatest?.ts ? fmtTs(tagMonitorLatest.ts) : (tagMonitorSelection?.last_ts || "-")
+      lastTs: tagMonitorLatest?.ts ? fmtTs(tagMonitorLatest.ts) : (tagMonitorSelection?.last_ts || "-"),
+      freshness: computeFreshness(tagMonitorLatest?.ts || null, renderNowMs)
     };
-  }, [tagMonitorSeries, tagMonitorSelection, tagMonitorLatest]);
+  }, [tagMonitorSeries, tagMonitorSelection, tagMonitorLatest, renderNowMs]);
 
   const historianRows = useMemo(() => {
     const gatewayNameById = Object.fromEntries(gatewayConfigsView.map((g) => [g.id, g.name]));
@@ -7951,6 +8008,11 @@ function AppShell() {
                           <div>Tag: {item.tag_name || "-"}</div>
                           <div>Gateway: {item.gateway_name}</div>
                           <div>Device: {item.device_name}</div>
+                          <div>
+                            <span className={`status-pill ${freshnessBadgeClass(item.freshness?.level)}`}>
+                              {item.freshness?.label || "No data"}
+                            </span>
+                          </div>
                         </div>
                                                 <div className="dashboard-kpi-actions">
                           <div className="dashboard-kpi-main-actions">
@@ -8008,6 +8070,11 @@ function AppShell() {
                         <div className="meta">
                           <span>Value: {item.last_value === null ? "-" : item.last_value.toFixed(3)}</span>
                           <span>Last: {item.last_ts}</span>
+                          <span>
+                            <span className={`status-pill ${freshnessBadgeClass(item.freshness?.level)}`}>
+                              {item.freshness?.label || "No data"}
+                            </span>
+                          </span>
                           <span>Device: {item.device_name}</span>
                           <span>Gateway: {item.gateway_name}</span>
                         </div>
@@ -10298,6 +10365,11 @@ function AppShell() {
               <span>Min: {tagMonitorKpi.min}</span>
               <span>Max: {tagMonitorKpi.max}</span>
               <span>Points: {tagMonitorSeries.length}</span>
+              <span>
+                <span className={`status-pill ${freshnessBadgeClass(tagMonitorKpi.freshness?.level)}`}>
+                  {tagMonitorKpi.freshness?.label || "No data"}
+                </span>
+              </span>
             </div>
             <div className="chart-wrap">
               {tagMonitorChartType === "line" ? (
