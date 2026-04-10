@@ -1444,8 +1444,7 @@ function AppShell() {
   const filterCloudRowsMonotonic = useCallback((rows) => {
     const src = Array.isArray(rows) ? rows : [];
     if (!src.length) return [];
-    const out = [];
-    const nextMap = new Map(cloudLastAcceptedTsByKeyRef.current || []);
+    const latestPerTag = new Map();
     for (const row of src) {
       const gatewayId = String(row?.gateway_id || "").trim();
       const tagName = normalizeTagName(String(row?.tag || row?.tag_name || ""));
@@ -1453,11 +1452,24 @@ function AppShell() {
       const tsMs = rowTsMs(row);
       if (!Number.isFinite(tsMs)) continue;
       const key = `${gatewayId}::${tagName}`;
+      const prev = latestPerTag.get(key);
+      if (!prev || tsMs > prev.tsMs) latestPerTag.set(key, { row, tsMs, gatewayId });
+    }
+    if (!latestPerTag.size) return [];
+
+    const out = [];
+    const nextMap = new Map(cloudLastAcceptedTsByKeyRef.current || []);
+    for (const [key, payload] of latestPerTag.entries()) {
+      const { row, tsMs, gatewayId } = payload;
+      const gatewayCfg = (gatewayConfigsRef.current || []).find((g) => String(g?.id || "") === gatewayId);
+      const intervalMs = Math.max(100, Number(gatewayCfg?.interval_ms || 1000));
       const prevMs = Number(nextMap.get(key) || -1);
       if (tsMs <= prevMs) continue;
+      if (prevMs > 0 && tsMs - prevMs < Math.floor(intervalMs * 0.9)) continue;
       nextMap.set(key, tsMs);
       out.push(row);
     }
+    out.sort((a, b) => rowTsMs(a) - rowTsMs(b));
     cloudLastAcceptedTsByKeyRef.current = nextMap;
     return out;
   }, []);
