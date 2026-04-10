@@ -1198,7 +1198,7 @@ class AppStore:
 
                 # Fetch historian/plc rows and prefer whichever source is freshest.
                 # This prevents stale cloud live widgets when live_latest lags behind.
-                sample_limit = min(max(lim, 2000), 8000)
+                sample_limit = min(max(lim * 2, 500), 3000)
                 hist_rows = _fetch_rows_with_freshness_fallback(conn, "historian_readings", "ts_utc DESC", sample_limit)
                 plc_rows = _fetch_rows_with_freshness_fallback(conn, "plc_readings", "ts_utc DESC", sample_limit)
 
@@ -3384,7 +3384,7 @@ class AppStore:
                 if age_ms <= 3000:
                     return cached_rows[:lim]
             cloud_live = self._fetch_live_rows_from_cloud(lim)
-            cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim, 2000), 10000))
+            cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim * 2, 500), 3000))
             if cloud_live and cloud_hist:
                 latest_live_ms = max((_row_ts_ms(r) for r in cloud_live), default=0)
                 latest_hist_ms = max((_row_ts_ms(r) for r in cloud_hist), default=0)

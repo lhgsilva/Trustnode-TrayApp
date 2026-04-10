@@ -158,7 +158,7 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
 
     await websocket.accept()
     tick = 0
-    live_limit = 1200
+    live_limit = 400
     try:
         while True:
             tick += 1
