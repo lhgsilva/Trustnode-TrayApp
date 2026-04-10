@@ -59,11 +59,19 @@ class AppStore:
         }
         self._data_sync_batch_size = max(
             200,
-            min(10000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "500") or "500")),
+            min(20000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "1000") or "1000")),
         )
         self._data_bulk_sync_interval_seconds = max(
             0.25,
             float(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "0.25") or "0.25"),
+        )
+        self._data_sync_burst_batches = max(
+            1,
+            min(12, int(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_BATCHES", "4") or "4")),
+        )
+        self._data_sync_burst_seconds = max(
+            0.1,
+            float(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_SECONDS", "0.8") or "0.8"),
         )
         self._live_fast_batch_size = max(
             200,
@@ -870,7 +878,7 @@ class AppStore:
                 if self._is_cloud_auto_sync_enabled():
                     now_mono = time.monotonic()
                     if now_mono >= next_bulk_sync_mono:
-                        self._flush_data_outbox_once()
+                        self._flush_data_outbox_burst()
                         next_bulk_sync_mono = now_mono + float(self._data_bulk_sync_interval_seconds)
                 # Keep config operations on a slower cadence so they do not block
                 # continuous data sync and cloud live updates.
@@ -894,6 +902,18 @@ class AppStore:
                 self._set_data_sync_state(last_data_error=f"Live sync loop error: {exc}")
             self._live_sync_wakeup_event.wait(timeout=self._live_sync_interval_seconds)
             self._live_sync_wakeup_event.clear()
+
+    def _flush_data_outbox_burst(self) -> int:
+        total_rows = 0
+        started = time.monotonic()
+        for _ in range(int(self._data_sync_burst_batches)):
+            synced_rows = int(self._flush_data_outbox_once() or 0)
+            if synced_rows <= 0:
+                break
+            total_rows += synced_rows
+            if (time.monotonic() - started) >= float(self._data_sync_burst_seconds):
+                break
+        return total_rows
 
     def _cloud_live_cache_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -1696,23 +1716,23 @@ class AppStore:
         except Exception as exc:
             self._set_data_sync_state(last_data_error=f"Live sync failed: {exc}")
 
-    def _flush_data_outbox_once(self) -> None:
+    def _flush_data_outbox_once(self) -> int:
         cloud = self._get_cloud_database_target()
         if not cloud:
             self._set_data_sync_state(last_data_error="No enabled PostgreSQL cloud target configured")
-            return
+            return 0
         try:
             from sqlalchemy import text  # type: ignore
         except Exception as exc:
             self._set_data_sync_state(last_data_error=f"SQLAlchemy unavailable: {exc}")
-            return
+            return 0
 
         schema = str(cloud.get("schema") or "public")
         try:
             engine, target_key = self._get_or_create_cloud_engine(cloud, schema)
         except Exception as exc:
             self._set_data_sync_state(last_data_error=f"Cloud engine setup failed: {exc}")
-            return
+            return 0
         state = self._get_data_sync_state()
         last_hist_id = int(state.get("last_historian_id", 0))
         last_log_id = int(state.get("last_log_id", 0))
@@ -1744,7 +1764,7 @@ class AppStore:
                     ).fetchall()
             if not hist_rows and not log_rows:
                 self._set_data_sync_state(last_data_sync_utc=self._utc_now(), last_data_error="")
-                return
+                return 0
 
             try:
                 self._ensure_cloud_schema_once(engine, schema, target_key)
@@ -1867,6 +1887,7 @@ class AppStore:
                 config={"name": cloud.get("name"), "host": cloud.get("host"), "schema": schema},
                 last_sync_utc=self._utc_now(),
             )
+            return len(hist_rows) + len(log_rows)
         except Exception as exc:
             self._set_data_sync_state(last_data_error=f"Data sync failed: {exc}")
             self._upsert_sync_target_state(
@@ -1874,6 +1895,7 @@ class AppStore:
                 config={"name": cloud.get("name"), "host": cloud.get("host"), "schema": schema},
                 last_error=f"Data sync failed: {exc}",
             )
+            return 0
 
     def _ensure_schema(self) -> None:
         with self._lock:

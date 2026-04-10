@@ -140,8 +140,8 @@ const REPORT_SERIES_COLORS = ["#16a34a", "#2563eb", "#d97706", "#dc2626", "#7c3a
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
-const CLOUD_LIVE_POLL_MS = 1000;
-const CLOUD_AUX_POLL_MS = 2500;
+const CLOUD_LIVE_POLL_MS = 500;
+const CLOUD_AUX_POLL_MS = 1500;
 const CLOUD_LIVE_FETCH_LIMIT = 600;
 const CLOUD_EDGE_ALL_KEY = "__all_edges__";
 const UI_RENDER_TICK_MS = 250;
@@ -2962,7 +2962,7 @@ function AppShell() {
                   const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
                   return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
                 })();
-                const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 3);
+                const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
                 if (ts) {
                   const sampleRows = Number(rowCountByGateway[gid] || 0);
                   const prevWrites = Number(cur?.db_write_count || 0);
@@ -3000,7 +3000,7 @@ function AppShell() {
                       return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
                     })()
                   : false;
-                const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 3);
+                const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 5);
                 return {
                   ...d,
                   connection_ok: online,
@@ -3018,7 +3018,7 @@ function AppShell() {
                 if (!ts) return c;
                 const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
                 const rawOnline = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
-                const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 3);
+                const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 5);
                 return {
                   ...c,
                   connection_ok: online,
@@ -3178,7 +3178,7 @@ function AppShell() {
     let runningLive = false;
     let runningAux = false;
     const pollCloudLive = async () => {
-      if (cloudStreamConnected && Date.now() - cloudLastApplyMsRef.current < 2500) return;
+      if (cloudStreamConnected && Date.now() - cloudLastApplyMsRef.current < 1200) return;
       if (stopped || runningLive) return;
       runningLive = true;
       try {
@@ -3286,7 +3286,7 @@ function AppShell() {
                 const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
                 return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
               })();
-              const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 3);
+              const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
               if (ts) {
                 const sampleRows = Number(rowCountByGateway[gid] || 0);
                 const prevWrites = Number(cur?.db_write_count || 0);
@@ -3324,7 +3324,7 @@ function AppShell() {
                       return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
                     })()
                   : false;
-                const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 3);
+                const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 5);
                 return {
                   ...d,
                   connection_ok: online,
@@ -3342,7 +3342,7 @@ function AppShell() {
               if (!ts) return c;
               const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
               const rawOnline = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
-              const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 3);
+              const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 5);
               return {
                 ...c,
                 connection_ok: online,
@@ -11581,5 +11581,6 @@ export default function App() {
     </AppErrorBoundary>
   );
 }
+
 
 
