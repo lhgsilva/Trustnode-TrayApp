@@ -135,7 +135,41 @@ async def websocket_stream(websocket: WebSocket) -> None:
         plc_manager.unsubscribe(queue)
 
 
+async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> None:
+    live_limit = 300
+    sample_interval_seconds = 0.8
+    try:
+        while True:
+            live_rows = app_store.get_live_rows(limit=live_limit)
+            gateway_statuses = app_store.build_gateway_statuses_from_live_rows(live_rows)
+            running_gateways = [g for g in gateway_statuses if bool(g.get("running"))]
+            newest_ts = max((str(g.get("last_check_utc") or "") for g in gateway_statuses), default="")
+            payload = {
+                # Keep legacy type for older web clients.
+                "type": "cloud_snapshot",
+                "stream": "cloud_live",
+                "tenant_id": tenant_id,
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+                "live_rows": live_rows,
+                "historian_rows": [],
+                "log_rows": [],
+                "inspector": None,
+                "gateway_statuses": gateway_statuses,
+                "gateway_status": {
+                    "running": bool(running_gateways),
+                    "gateway_count": len(gateway_statuses),
+                    "running_count": len(running_gateways),
+                    "last_check_utc": newest_ts,
+                },
+            }
+            await websocket.send_text(json.dumps(payload))
+            await asyncio.sleep(sample_interval_seconds)
+    except WebSocketDisconnect:
+        pass
+
+
 @app.websocket("/ws/cloud-stream")
+@app.websocket("/ws/cloud-live")
 async def websocket_cloud_stream(websocket: WebSocket) -> None:
     tenant_id = resolve_websocket_tenant(websocket)
     set_current_tenant(tenant_id)
@@ -157,27 +191,7 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
-    tick = 0
-    live_limit = 400
-    try:
-        while True:
-            tick += 1
-            include_heavy = (tick % 8) == 0
-            payload = {
-                "type": "cloud_snapshot",
-                "tenant_id": tenant_id,
-                "ts_utc": datetime.now(timezone.utc).isoformat(),
-                "live_rows": app_store.get_live_rows(limit=live_limit),
-                "historian_rows": app_store.get_historian_rows(limit=250) if include_heavy else [],
-                "log_rows": app_store.get_log_rows(limit=300) if include_heavy else [],
-                "inspector": app_store.get_inspector_snapshot(preview_limit=20) if include_heavy else None,
-                "gateway_statuses": plc_manager.list_gateway_statuses(),
-                "gateway_status": plc_manager.get_status().model_dump(),
-            }
-            await websocket.send_text(json.dumps(payload))
-            await asyncio.sleep(1.0)
-    except WebSocketDisconnect:
-        pass
+    await _websocket_cloud_live_loop(websocket, tenant_id)
 
 
 @app.on_event("shutdown")

@@ -3449,6 +3449,100 @@ class AppStore:
             return cloud_live
         return []
 
+    def build_gateway_statuses_from_live_rows(
+        self,
+        live_rows: list[dict[str, Any]] | None,
+        freshness_ms: int = 12000,
+    ) -> list[dict[str, Any]]:
+        rows = live_rows if isinstance(live_rows, list) else []
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        min_fresh_ms = max(3000, int(freshness_ms or 12000))
+
+        def _parse_ts_ms(raw: Any) -> int:
+            text = str(raw or "").strip()
+            if not text:
+                return 0
+            try:
+                iso = text.replace("Z", "+00:00")
+                if " " in iso and "T" not in iso:
+                    iso = iso.replace(" ", "T")
+                return int(datetime.fromisoformat(iso).timestamp() * 1000)
+            except Exception:
+                return 0
+
+        gateway_rows: dict[str, dict[str, Any]] = {}
+        gateway_counts: dict[str, int] = {}
+        for row in rows:
+            gateway_id = str(row.get("gateway_id") or "").strip()
+            if not gateway_id:
+                continue
+            gateway_counts[gateway_id] = int(gateway_counts.get(gateway_id, 0)) + 1
+            ts_txt = str(row.get("ts") or row.get("ts_utc") or "")
+            ts_ms = _parse_ts_ms(ts_txt)
+            prev = gateway_rows.get(gateway_id)
+            if prev and int(prev.get("_ts_ms", 0)) >= ts_ms:
+                continue
+            gateway_rows[gateway_id] = {
+                "_ts_ms": ts_ms,
+                "last_check_utc": ts_txt,
+                "source": str(row.get("source") or ""),
+                "plc_ip": str(row.get("plc_ip") or ""),
+                "gateway_name": str(row.get("gateway_name") or gateway_id),
+            }
+
+        gateway_cfg_raw = self.get_config_domain("gateway_configurations")
+        gateway_cfgs = gateway_cfg_raw if isinstance(gateway_cfg_raw, list) else []
+        gateway_cfg_by_id = {
+            str(g.get("id") or "").strip(): g
+            for g in gateway_cfgs
+            if isinstance(g, dict) and str(g.get("id") or "").strip()
+        }
+
+        db_cfg_raw = self.get_config_domain("database_configurations")
+        db_cfgs = db_cfg_raw if isinstance(db_cfg_raw, list) else []
+        db_cfg_by_id = {
+            str(d.get("id") or "").strip(): d
+            for d in db_cfgs
+            if isinstance(d, dict) and str(d.get("id") or "").strip()
+        }
+
+        statuses: list[dict[str, Any]] = []
+        all_gateway_ids = set(gateway_cfg_by_id.keys()) | set(gateway_rows.keys())
+        for gateway_id in sorted(all_gateway_ids):
+            cfg = gateway_cfg_by_id.get(gateway_id) if gateway_id in gateway_cfg_by_id else {}
+            cfg = cfg if isinstance(cfg, dict) else {}
+            row = gateway_rows.get(gateway_id, {})
+            ts_ms = int(row.get("_ts_ms", 0))
+            interval_ms = int(cfg.get("interval_ms") or 1000)
+            adaptive_fresh_ms = max(min_fresh_ms, min(60000, max(1, interval_ms) * 8))
+            running = ts_ms > 0 and max(0, now_ms - ts_ms) <= adaptive_fresh_ms
+            db_cfg = db_cfg_by_id.get(str(cfg.get("database_id") or "").strip(), {})
+            db_cfg = db_cfg if isinstance(db_cfg, dict) else {}
+
+            statuses.append(
+                {
+                    "running": bool(running),
+                    "gateway_type": str(cfg.get("gateway_type") or row.get("source") or ""),
+                    "plc_ip": str(cfg.get("plc_ip") or row.get("plc_ip") or ""),
+                    "interval_ms": interval_ms,
+                    "tags": cfg.get("tags") if isinstance(cfg.get("tags"), list) else [],
+                    "last_error": None,
+                    "db_sink_engine": str(db_cfg.get("engine") or ""),
+                    "db_write_count": int(gateway_counts.get(gateway_id, 0)),
+                    "db_last_write_utc": str(row.get("last_check_utc") or ""),
+                    "db_last_error": None,
+                    "db_pending_count": 0,
+                    "collection_blocked": False,
+                    "collection_block_reason": None,
+                    "gateway_id": gateway_id,
+                    "gateway_name": str(cfg.get("name") or row.get("gateway_name") or gateway_id),
+                    "last_check_utc": str(row.get("last_check_utc") or ""),
+                }
+            )
+
+        statuses.sort(key=lambda r: str(r.get("last_check_utc") or ""), reverse=True)
+        return statuses
+
     def get_log_rows(self, limit: int = 2000, prefer_cloud_reads: bool | None = None) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 2000), 10000))
         tenant_id = self._current_tenant_id()

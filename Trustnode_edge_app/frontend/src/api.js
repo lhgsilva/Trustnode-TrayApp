@@ -89,12 +89,12 @@ export function getCloudWsStreamUrl() {
   const token = getAuthToken();
   if (!apiBase) {
     const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-    return `${scheme}://${window.location.host}/ws/cloud-stream${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+    return `${scheme}://${window.location.host}/ws/cloud-live${token ? `?token=${encodeURIComponent(token)}` : ""}`;
   }
   const wsBase = apiBase.startsWith("https://")
     ? apiBase.replace("https://", "wss://")
     : apiBase.replace("http://", "ws://");
-  return `${wsBase}/ws/cloud-stream${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+  return `${wsBase}/ws/cloud-live${token ? `?token=${encodeURIComponent(token)}` : ""}`;
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {

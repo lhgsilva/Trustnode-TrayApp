@@ -140,8 +140,8 @@ const REPORT_SERIES_COLORS = ["#16a34a", "#2563eb", "#d97706", "#dc2626", "#7c3a
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
-const CLOUD_LIVE_POLL_MS = 1000;
-const CLOUD_AUX_POLL_MS = 3000;
+const CLOUD_LIVE_POLL_MS = 2000;
+const CLOUD_AUX_POLL_MS = 5000;
 const CLOUD_LIVE_FETCH_LIMIT = 1200;
 const CLOUD_EDGE_ALL_KEY = "__all_edges__";
 const RETENTION_PRESETS = {
@@ -2776,7 +2776,7 @@ function AppShell() {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data || "{}");
-          if (data.type !== "cloud_snapshot") return;
+          if (data.type !== "cloud_snapshot" && data.type !== "cloud_live") return;
           if (Array.isArray(data.live_rows) && data.live_rows.length) {
             const newestLiveMs = data.live_rows.reduce((max, row) => {
               const ms = rowTsMs(row);
@@ -2792,8 +2792,20 @@ function AppShell() {
             if (newestLiveMs > cloudNewestLiveTsMsRef.current) {
               cloudNewestLiveTsMsRef.current = newestLiveMs;
             }
+            const dbMetaByName = new Map();
+            for (const db of dbConnectionsRef.current || []) {
+              const nameKey = String(db?.name || "").trim().toLowerCase();
+              if (!nameKey) continue;
+              dbMetaByName.set(nameKey, {
+                source: String(db?.source || "").trim(),
+                site: String(db?.site || "").trim(),
+                area: String(db?.area || "").trim(),
+                equipment: String(db?.equipment || "").trim(),
+              });
+            }
             const nextLive = {};
             const nextReadings = [];
+            const nextDataRows = [];
             const latestByGateway = {};
             const rowCountByGateway = {};
             const latestByDbName = {};
@@ -2807,6 +2819,8 @@ function AppShell() {
               const readingTs = String(row?.ts || tsNow());
               const quality = row?.quality;
               const qualityLabel = row?.quality_label || qualityLabelFromCode(quality);
+              const dbName = String(row?.database_name || "").trim();
+              const dbMeta = dbMetaByName.get(dbName.toLowerCase()) || null;
               nextLive[key] = {
                 gateway_id: gatewayId,
                 tag: rawTag,
@@ -2827,9 +2841,24 @@ function AppShell() {
                 quality,
                 quality_label: qualityLabel
               });
+              nextDataRows.push({
+                ts: readingTs,
+                source: dbMeta?.source || row?.source || "",
+                site: dbMeta?.site || row?.site || "",
+                area: dbMeta?.area || row?.area || "",
+                equipment: dbMeta?.equipment || row?.equipment || "",
+                gateway_id: gatewayId,
+                gateway_name: row?.gateway_name || "",
+                device_name: row?.device_name || "",
+                plc_ip: row?.plc_ip || "",
+                database_name: dbName,
+                tag: rawTag,
+                value: row?.value,
+                quality,
+                quality_label: qualityLabel
+              });
               if (gatewayId && !latestByGateway[gatewayId]) latestByGateway[gatewayId] = readingTs;
               if (gatewayId) rowCountByGateway[gatewayId] = Number(rowCountByGateway[gatewayId] || 0) + 1;
-              const dbName = String(row?.database_name || "").trim();
               if (dbName && !latestByDbName[dbName]) latestByDbName[dbName] = readingTs;
               const plcIp = String(row?.plc_ip || "").trim();
               if (plcIp && !latestByPlcIp[plcIp]) latestByPlcIp[plcIp] = readingTs;
@@ -2913,6 +2942,23 @@ function AppShell() {
                 };
               })
             );
+            // Keep edge selector/charts/historian responsive in cloud mode from live frames.
+            if (nextDataRows.length) {
+              setDataLog((prev) => {
+                const incoming = [...nextDataRows].sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
+                const merged = [...incoming];
+                const seen = new Set(
+                  incoming.map((r) => `${String(r.gateway_id)}::${String(r.tag)}::${String(r.ts)}`)
+                );
+                for (const r of prev || []) {
+                  const key = `${String(r.gateway_id || "")}::${String(r.tag || "")}::${String(r.ts || "")}`;
+                  if (seen.has(key)) continue;
+                  merged.push(r);
+                  if (merged.length >= 5000) break;
+                }
+                return merged;
+              });
+            }
 
             const activeRules = triggerRulesRef.current.filter((rule) => rule.enabled !== false);
             const newAlarms = [];
@@ -3026,9 +3072,7 @@ function AppShell() {
             for (const row of data.gateway_statuses) {
               if (row?.gateway_id) map[row.gateway_id] = row;
             }
-            if (!(isHostedWebClient && endpointMode === "cloud")) {
-              setGatewayRuntimeStatuses((prev) => ({ ...prev, ...map }));
-            }
+            setGatewayRuntimeStatuses((prev) => ({ ...prev, ...map }));
           }
           setWsState("connected");
         } catch {}
@@ -3061,6 +3105,7 @@ function AppShell() {
     let runningLive = false;
     let runningAux = false;
     const pollCloudLive = async () => {
+      if (cloudStreamConnected) return;
       if (stopped || runningLive) return;
       runningLive = true;
       try {
