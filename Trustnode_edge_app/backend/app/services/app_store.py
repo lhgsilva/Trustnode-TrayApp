@@ -925,13 +925,53 @@ class AppStore:
         except Exception:
             return []
         try:
+            def _top_ts_ms(rows_in: list[Any]) -> int:
+                if not rows_in:
+                    return 0
+                raw = str(rows_in[0][0] or "").strip()
+                if not raw:
+                    return 0
+                try:
+                    txt = raw.replace("Z", "+00:00")
+                    if " " in txt and "T" not in txt:
+                        txt = txt.replace(" ", "T")
+                    return int(datetime.fromisoformat(txt).timestamp() * 1000)
+                except Exception:
+                    return 0
+
+            gateway_configs_raw = self.get_config_domain("gateway_configurations")
+            gateway_configs = gateway_configs_raw if isinstance(gateway_configs_raw, list) else []
+
+            def _infer_gateway_id(source: str, tag: str, plc_ip: str) -> str:
+                candidates: list[str] = []
+                for g in gateway_configs:
+                    if not isinstance(g, dict):
+                        continue
+                    gid = str(g.get("id") or "").strip()
+                    if not gid:
+                        continue
+                    g_type = str(g.get("gateway_type") or "").strip()
+                    g_ip = str(g.get("plc_ip") or "").strip()
+                    g_tags_raw = g.get("tags")
+                    g_tags = [str(t or "").strip() for t in g_tags_raw] if isinstance(g_tags_raw, list) else []
+                    if source and g_type and source != g_type:
+                        continue
+                    if plc_ip and g_ip and plc_ip != g_ip:
+                        continue
+                    if tag and g_tags and tag not in g_tags:
+                        continue
+                    candidates.append(gid)
+                if len(candidates) == 1:
+                    return candidates[0]
+                return ""
+
             with engine.begin() as conn:
                 try:
                     conn.execute(text("SET LOCAL lock_timeout = '500ms'"))
                     conn.execute(text("SET LOCAL statement_timeout = '1500ms'"))
                 except Exception:
                     pass
-                rows = conn.execute(
+                live_rows = conn.execute(
                     text(
                         f"""
                         SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
@@ -944,8 +984,8 @@ class AppStore:
                     ),
                     {"tenant": tenant_id, "lim": lim},
                 ).fetchall()
-                if not rows and tenant_id == "default":
-                    rows = conn.execute(
+                if not live_rows and tenant_id == "default":
+                    live_rows = conn.execute(
                         text(
                             f"""
                             SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
@@ -957,24 +997,74 @@ class AppStore:
                         ),
                         {"lim": lim},
                     ).fetchall()
+                sample_limit = min(max(lim * 4, 500), 4000)
+                plc_rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                               tag_name, value, quality, quality_label
+                        FROM "{schema}"."plc_readings"
+                        WHERE tenant_id = :tenant
+                        ORDER BY ts_utc DESC
+                        LIMIT :lim
+                        """
+                    ),
+                    {"tenant": tenant_id, "lim": sample_limit},
+                ).fetchall()
+                if not plc_rows and tenant_id == "default":
+                    plc_rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                   tag_name, value, quality, quality_label
+                            FROM "{schema}"."plc_readings"
+                            ORDER BY ts_utc DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": sample_limit},
+                    ).fetchall()
+
+            live_top = _top_ts_ms(live_rows)
+            plc_top = _top_ts_ms(plc_rows)
+            source_rows = plc_rows if plc_top > live_top + 1500 else live_rows
+
             out: list[dict[str, Any]] = []
-            for r in rows:
+            seen: set[tuple[str, str]] = set()
+            for r in source_rows:
+                source = str(r[1] or "")
+                gateway_id_raw = str(r[2] or "").strip()
+                gateway_name_raw = str(r[3] or "").strip()
+                plc_ip_raw = str(r[5] or "").strip()
+                database_name_raw = str(r[6] or "").strip()
+                tag_name = str(r[7] or "")
+                inferred_id = _infer_gateway_id(source, tag_name, plc_ip_raw)
+                fallback_gateway = "|".join([x for x in [source, plc_ip_raw, database_name_raw] if x]) or "unknown_gateway"
+                gateway_id = gateway_id_raw or gateway_name_raw or inferred_id or fallback_gateway
+                if not tag_name:
+                    continue
+                key = (gateway_id, tag_name)
+                if key in seen:
+                    continue
+                seen.add(key)
                 out.append(
                     {
                         "ts": str(r[0] or ""),
                         "tenant_id": tenant_id,
-                        "source": str(r[1] or ""),
-                        "gateway_id": str(r[2] or ""),
-                        "gateway_name": str(r[3] or r[2] or ""),
+                        "source": source,
+                        "gateway_id": gateway_id,
+                        "gateway_name": gateway_name_raw or gateway_id_raw or inferred_id or fallback_gateway,
                         "device_name": str(r[4] or ""),
-                        "plc_ip": str(r[5] or ""),
-                        "database_name": str(r[6] or ""),
-                        "tag": str(r[7] or ""),
+                        "plc_ip": plc_ip_raw,
+                        "database_name": database_name_raw,
+                        "tag": tag_name,
                         "value": r[8],
                         "quality": r[9],
                         "quality_label": str(r[10] or ""),
                     }
                 )
+                if len(out) >= lim:
+                    break
             return out
         except Exception:
             return []
