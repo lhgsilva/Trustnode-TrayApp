@@ -116,18 +116,36 @@ def append_logs(payload: AppendRowsRequest) -> dict:
 
 
 @router.get("/historian")
-def get_historian(limit: int = 1000) -> dict:
-    return {"ok": True, "tenant_id": get_current_tenant(), "rows": app_store.get_historian_rows(limit=limit)}
+def get_historian(request: Request, limit: int = 1000) -> dict:
+    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
+    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    return {
+        "ok": True,
+        "tenant_id": get_current_tenant(),
+        "rows": app_store.get_historian_rows(limit=limit, prefer_cloud_reads=prefer_cloud_reads),
+    }
 
 
 @router.get("/live")
-def get_live(limit: int = 5000) -> dict:
-    return {"ok": True, "tenant_id": get_current_tenant(), "rows": app_store.get_live_rows(limit=limit)}
+def get_live(request: Request, limit: int = 5000) -> dict:
+    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
+    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    return {
+        "ok": True,
+        "tenant_id": get_current_tenant(),
+        "rows": app_store.get_live_rows(limit=limit, prefer_cloud_reads=prefer_cloud_reads),
+    }
 
 
 @router.get("/logs")
-def get_logs(limit: int = 2000) -> dict:
-    return {"ok": True, "tenant_id": get_current_tenant(), "rows": app_store.get_log_rows(limit=limit)}
+def get_logs(request: Request, limit: int = 2000) -> dict:
+    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
+    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    return {
+        "ok": True,
+        "tenant_id": get_current_tenant(),
+        "rows": app_store.get_log_rows(limit=limit, prefer_cloud_reads=prefer_cloud_reads),
+    }
 
 
 @router.get("/inspector")

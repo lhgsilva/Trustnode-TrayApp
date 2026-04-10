@@ -3264,12 +3264,12 @@ class AppStore:
         self._sync_wakeup_event.set()
         return len(safe_rows)
 
-    def get_historian_rows(self, limit: int = 1000) -> list[dict[str, Any]]:
+    def get_historian_rows(self, limit: int = 1000, prefer_cloud_reads: bool | None = None) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 1000), 10000))
         tenant_id = self._current_tenant_id()
         # Hosted/web deployments should prefer cloud-backed historian reads so the
         # website mirrors edge-collected data even when no local gateways run on VPS.
-        prefer_cloud = self._prefer_cloud_reads()
+        prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
         if prefer_cloud:
             cloud_rows = self._fetch_historian_rows_from_cloud(lim)
             if cloud_rows:
@@ -3308,10 +3308,10 @@ class AppStore:
             )
         return out
 
-    def get_live_rows(self, limit: int = 5000) -> list[dict[str, Any]]:
+    def get_live_rows(self, limit: int = 5000, prefer_cloud_reads: bool | None = None) -> list[dict[str, Any]]:
         lim = max(100, min(int(limit or 5000), 50000))
         tenant_id = self._current_tenant_id()
-        prefer_cloud = self._prefer_cloud_reads()
+        prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
         def _row_ts_ms(row: dict[str, Any]) -> int:
             raw = str(row.get("ts") or row.get("ts_utc") or "").strip()
             if not raw:
@@ -3428,11 +3428,11 @@ class AppStore:
             return cloud_live
         return []
 
-    def get_log_rows(self, limit: int = 2000) -> list[dict[str, Any]]:
+    def get_log_rows(self, limit: int = 2000, prefer_cloud_reads: bool | None = None) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 2000), 10000))
         tenant_id = self._current_tenant_id()
         # Hosted/web deployments should prefer cloud-backed log reads.
-        prefer_cloud = self._prefer_cloud_reads()
+        prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
         if prefer_cloud:
             cloud_rows = self._fetch_log_rows_from_cloud(lim)
             if cloud_rows:
