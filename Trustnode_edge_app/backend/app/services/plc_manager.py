@@ -794,7 +794,31 @@ class GatewayWorker:
         if not readings or not self.db_sink:
             return
         engine = (self.db_sink.get("engine") or "").strip().lower()
-        if engine in ("postgresql", "legacy_http"):
+        if engine == "postgresql":
+            try:
+                # Fast path: write immediately so cloud mirrors local with minimal lag.
+                if self._persist_postgresql(readings):
+                    now_mono = time.monotonic()
+                    if now_mono - self._remote_last_pending_probe_monotonic >= self._remote_pending_probe_seconds:
+                        self._remote_last_pending_probe_monotonic = now_mono
+                        self.db_pending_count = self._count_pending()
+                    if self.db_pending_count > 0:
+                        self._schedule_remote_flush(engine)
+                    return
+            except Exception:
+                # Fall through to store-forward fallback.
+                pass
+            try:
+                self._enqueue_outbox(readings)
+                now_mono = time.monotonic()
+                if now_mono - self._remote_last_pending_probe_monotonic >= self._remote_pending_probe_seconds:
+                    self._remote_last_pending_probe_monotonic = now_mono
+                    self.db_pending_count = self._count_pending()
+                self._schedule_remote_flush(engine)
+            except Exception as exc:
+                self._mark_db_write_error(f"Store-forward pipeline error: {exc}")
+            return
+        if engine == "legacy_http":
             try:
                 self._enqueue_outbox(readings)
                 now_mono = time.monotonic()
