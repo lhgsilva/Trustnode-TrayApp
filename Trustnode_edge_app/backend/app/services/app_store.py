@@ -54,11 +54,11 @@ class AppStore:
         }
         self._data_sync_batch_size = max(
             200,
-            min(10000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "8000") or "8000")),
+            min(10000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "500") or "500")),
         )
         self._data_bulk_sync_interval_seconds = max(
             self._sync_interval_seconds,
-            int(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "5") or "5"),
+            int(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "1") or "1"),
         )
         self._live_fast_batch_size = max(
             200,
