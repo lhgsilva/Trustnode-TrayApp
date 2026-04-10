@@ -905,8 +905,10 @@ function AppShell() {
   const browserProtocol = String(window.location.protocol || "").toLowerCase();
   const browserHost = String(window.location.hostname || "").toLowerCase();
   const isLocalHost = browserHost === "localhost" || browserHost === "127.0.0.1" || browserHost === "::1";
+  const isElectronRuntime = /electron/i.test(String(window.navigator?.userAgent || ""));
   const hasDesktopBackendOverride = Boolean(new URLSearchParams(window.location.search).get("backendUrl"));
   const isHostedWebClient =
+    !isElectronRuntime &&
     !hasDesktopBackendOverride &&
     (browserProtocol === "https:" || browserProtocol === "http:") &&
     !isLocalHost;

@@ -28,6 +28,9 @@ function isHostedWebClientRuntime() {
   const protocol = String(window.location.protocol || "").toLowerCase();
   const host = String(window.location.hostname || "").toLowerCase();
   const isLocalHost = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  const userAgent = String(window.navigator?.userAgent || "");
+  const isElectronRuntime = /electron/i.test(userAgent);
+  if (isElectronRuntime) return false;
   const hasDesktopBackendOverride = Boolean(new URLSearchParams(window.location.search).get("backendUrl"));
   if (hasDesktopBackendOverride) return false;
   return (protocol === "https:" || protocol === "http:") && !isLocalHost;
