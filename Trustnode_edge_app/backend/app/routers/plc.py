@@ -731,7 +731,9 @@ def _synthesize_gateway_status_from_cloud() -> list[dict]:
     for _, group in grouped.items():
         latest = group.pop("_latest_dt", None)
         interval_ms = int(group.get("interval_ms") or 1000)
-        freshness_window_s = max(3.0, (interval_ms / 1000.0) * 3.0)
+        # Cloud mirrors can have short transport jitter; use a wider window to
+        # avoid false OFFLINE flips in web view.
+        freshness_window_s = max(15.0, (interval_ms / 1000.0) * 10.0)
         if latest is not None:
             age_s = (now_utc - latest.astimezone(timezone.utc)).total_seconds()
             is_running = age_s <= freshness_window_s
