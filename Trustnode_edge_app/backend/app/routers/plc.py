@@ -2,14 +2,15 @@ import platform
 import re
 import socket
 import subprocess
+from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import parse_qs, urlparse
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from app.models import GatewayConfig, GatewayReading, GatewayStatus
-from app.state import plc_manager
+from app.state import app_store, plc_manager
 
 router = APIRouter(prefix="/api/plc", tags=["plc"])
 
@@ -640,5 +641,110 @@ async def stop_all_gateway_runtime() -> dict[str, str | bool]:
 
 
 @router.get("/gateways/status")
-def list_gateway_runtime_status() -> list[dict]:
-    return plc_manager.list_gateway_statuses()
+def list_gateway_runtime_status(request: Request) -> list[dict]:
+    statuses = plc_manager.list_gateway_statuses()
+    if statuses:
+        return statuses
+
+    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
+    prefer_cloud = bool(host and host not in {"localhost", "127.0.0.1"})
+    if not prefer_cloud:
+        return statuses
+
+    return _synthesize_gateway_status_from_cloud()
+
+
+def _parse_utc(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        text = raw.replace("Z", "+00:00")
+        if " " in text and "T" not in text:
+            text = text.replace(" ", "T")
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+
+def _synthesize_gateway_status_from_cloud() -> list[dict]:
+    rows = app_store.get_live_rows(limit=5000, prefer_cloud_reads=True)
+    if not rows:
+        return []
+
+    bootstrap = app_store.get_bootstrap(prefer_cloud_reads=True) or {}
+    gateway_cfgs = bootstrap.get("gateway_configurations")
+    interval_by_gateway: dict[str, int] = {}
+    if isinstance(gateway_cfgs, list):
+        for item in gateway_cfgs:
+            if not isinstance(item, dict):
+                continue
+            gid = str(item.get("id") or "").strip()
+            if not gid:
+                continue
+            try:
+                interval_by_gateway[gid] = max(100, int(item.get("interval_ms") or 1000))
+            except Exception:
+                interval_by_gateway[gid] = 1000
+
+    now_utc = datetime.now(timezone.utc)
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        gid = str(row.get("gateway_id") or "").strip()
+        if not gid:
+            continue
+        group = grouped.get(gid)
+        if not group:
+            source = str(row.get("source") or "").strip().lower()
+            group = {
+                "running": False,
+                "gateway_type": "siemens_opcua" if "siemens" in source else "allen_bradley",
+                "plc_ip": str(row.get("plc_ip") or ""),
+                "interval_ms": int(interval_by_gateway.get(gid, 1000)),
+                "tags": [],
+                "last_error": None,
+                "db_sink_engine": "cloud_mirror",
+                "db_write_count": 0,
+                "db_last_write_utc": "",
+                "db_last_error": None,
+                "db_pending_count": 0,
+                "collection_blocked": True,
+                "collection_block_reason": "No fresh cloud rows",
+                "gateway_id": gid,
+                "_latest_dt": None,
+            }
+            grouped[gid] = group
+
+        tag = str(row.get("tag") or row.get("tag_name") or "").strip()
+        if tag and tag not in group["tags"]:
+            group["tags"].append(tag)
+        group["db_write_count"] = int(group["db_write_count"]) + 1
+
+        ts_text = str(row.get("ts") or row.get("ts_utc") or "")
+        ts_dt = _parse_utc(ts_text)
+        latest = group.get("_latest_dt")
+        if ts_dt and (latest is None or ts_dt > latest):
+            group["_latest_dt"] = ts_dt
+            group["db_last_write_utc"] = ts_text
+
+    out: list[dict] = []
+    for _, group in grouped.items():
+        latest = group.pop("_latest_dt", None)
+        interval_ms = int(group.get("interval_ms") or 1000)
+        freshness_window_s = max(3.0, (interval_ms / 1000.0) * 3.0)
+        if latest is not None:
+            age_s = (now_utc - latest.astimezone(timezone.utc)).total_seconds()
+            is_running = age_s <= freshness_window_s
+            group["running"] = bool(is_running)
+            group["collection_blocked"] = not bool(is_running)
+            group["collection_block_reason"] = None if is_running else f"Stale cloud feed ({int(age_s)}s old)"
+        out.append(group)
+
+    out.sort(
+        key=lambda s: (
+            0 if s.get("running") else 1,
+            str(s.get("db_last_write_utc") or ""),
+        ),
+        reverse=False,
+    )
+    return out
