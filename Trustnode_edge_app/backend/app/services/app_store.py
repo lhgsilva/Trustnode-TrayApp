@@ -855,7 +855,9 @@ class AppStore:
             try:
                 prefer_cloud = self._prefer_cloud_reads()
                 if prefer_cloud:
-                    rows = self._fetch_live_rows_from_cloud(self._cloud_live_cache_limit)
+                    rows = self._fetch_live_rows_from_cloud_fast(self._cloud_live_cache_limit)
+                    if not rows:
+                        rows = self._fetch_live_rows_from_cloud(self._cloud_live_cache_limit)
                     if rows:
                         with self._cloud_live_cache_lock:
                             self._cloud_live_cache_rows = rows
@@ -863,6 +865,87 @@ class AppStore:
             except Exception:
                 pass
             self._stop_event.wait(timeout=self._cloud_live_cache_interval_seconds)
+
+    def _fetch_live_rows_from_cloud_fast(self, limit: int) -> list[dict[str, Any]]:
+        cloud = self._get_cloud_database_target()
+        if not cloud:
+            return []
+        tenant_id = self._current_tenant_id()
+        try:
+            from sqlalchemy import create_engine, text  # type: ignore
+        except Exception:
+            return []
+
+        schema = str(cloud.get("schema") or "public")
+        lim = max(50, min(int(limit or 1000), 5000))
+        url = self._build_pg_sqlalchemy_url(
+            str(cloud.get("host") or ""),
+            int(cloud.get("port") or 5432),
+            str(cloud.get("database") or "postgres"),
+            str(cloud.get("username") or ""),
+            str(cloud.get("password") or ""),
+        )
+        connect_args = {
+            "sslmode": "require" if cloud.get("tls", True) else "disable",
+            "connect_timeout": 5,
+            "prepare_threshold": None,
+            "options": "-c lock_timeout=500ms -c statement_timeout=1500ms",
+        }
+        engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+        try:
+            with engine.begin() as conn:
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                               tag_name, value, quality, quality_label
+                        FROM "{schema}"."live_latest"
+                        WHERE tenant_id = :tenant
+                        ORDER BY ts_utc DESC
+                        LIMIT :lim
+                        """
+                    ),
+                    {"tenant": tenant_id, "lim": lim},
+                ).fetchall()
+                if not rows and tenant_id == "default":
+                    rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                   tag_name, value, quality, quality_label
+                            FROM "{schema}"."live_latest"
+                            ORDER BY ts_utc DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": lim},
+                    ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "ts": str(r[0] or ""),
+                        "tenant_id": tenant_id,
+                        "source": str(r[1] or ""),
+                        "gateway_id": str(r[2] or ""),
+                        "gateway_name": str(r[3] or r[2] or ""),
+                        "device_name": str(r[4] or ""),
+                        "plc_ip": str(r[5] or ""),
+                        "database_name": str(r[6] or ""),
+                        "tag": str(r[7] or ""),
+                        "value": r[8],
+                        "quality": r[9],
+                        "quality_label": str(r[10] or ""),
+                    }
+                )
+            return out
+        except Exception:
+            return []
+        finally:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
 
     def _fetch_historian_rows_from_cloud(self, limit: int) -> list[dict[str, Any]]:
         cloud = self._get_cloud_database_target()
@@ -3381,7 +3464,7 @@ class AppStore:
                     age_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(cache_updated.replace("Z", "+00:00"))).total_seconds() * 1000)
                 except Exception:
                     age_ms = 999999
-                if age_ms <= 3000:
+                if age_ms <= 12000:
                     return cached_rows[:lim]
             cloud_live = self._fetch_live_rows_from_cloud(lim)
             cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim * 2, 500), 3000))
