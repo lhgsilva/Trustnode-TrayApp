@@ -302,15 +302,24 @@ function tsNow() {
   return new Date().toISOString();
 }
 
-function rowTsMs(row) {
-  const raw = String(row?.ts || row?.ts_utc || "").trim();
+function parseTimestampMs(rawValue) {
+  const raw = String(rawValue || "").trim();
   if (!raw) return Number.NaN;
-  const ms = Date.parse(raw);
+  let text = raw.replace(" ", "T");
+  const hasOffset = /(?:Z|[+\-]\d{2}:\d{2})$/i.test(text);
+  if (!hasOffset) text = `${text}Z`;
+  const ms = Date.parse(text);
   return Number.isFinite(ms) ? ms : Number.NaN;
 }
 
+function rowTsMs(row) {
+  const raw = String(row?.ts || row?.ts_utc || "").trim();
+  if (!raw) return Number.NaN;
+  return parseTimestampMs(raw);
+}
+
 function computeFreshness(tsRaw, nowMs = Date.now()) {
-  const ms = Date.parse(String(tsRaw || "").trim());
+  const ms = parseTimestampMs(tsRaw);
   if (!Number.isFinite(ms)) {
     return { ageMs: Number.POSITIVE_INFINITY, label: "No data", level: "stale" };
   }
@@ -374,15 +383,69 @@ function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000) {
     if (seen.has(key)) continue;
     seen.add(key);
     merged.push(r);
-    if (merged.length >= limit) break;
   }
-  return merged;
+  merged.sort((a, b) => {
+    const ams = rowTsMs(a);
+    const bms = rowTsMs(b);
+    if (Number.isFinite(ams) && Number.isFinite(bms)) return bms - ams;
+    if (Number.isFinite(ams)) return -1;
+    if (Number.isFinite(bms)) return 1;
+    return 0;
+  });
+  return merged.slice(0, limit);
+}
+
+function buildChronologicalSeries(rows, maxPoints = 120) {
+  const src = Array.isArray(rows) ? rows : [];
+  if (!src.length) return [];
+  const items = src
+    .map((r) => {
+      const ts_ms = rowTsMs(r);
+      const value = Number(r?.value);
+      return {
+        ts_ms,
+        value,
+      };
+    })
+    .filter((r) => Number.isFinite(r.ts_ms) && Number.isFinite(r.value))
+    .sort((a, b) => a.ts_ms - b.ts_ms);
+  if (!items.length) return [];
+
+  const deduped = [];
+  for (const item of items) {
+    const prev = deduped[deduped.length - 1];
+    if (prev && prev.ts_ms === item.ts_ms) {
+      deduped[deduped.length - 1] = item;
+    } else {
+      deduped.push(item);
+    }
+  }
+
+  const tail = deduped.slice(-Math.max(1, Number(maxPoints || 120)));
+  return tail.map((p, idx) => ({
+    idx: idx + 1,
+    ts: new Date(p.ts_ms).toISOString().slice(11, 19),
+    ts_ms: p.ts_ms,
+    value: p.value,
+  }));
+}
+
+function computeSeriesDomain(points) {
+  const vals = (Array.isArray(points) ? points : []).map((p) => Number(p?.value)).filter((v) => Number.isFinite(v));
+  if (!vals.length) return ["auto", "auto"];
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const span = Math.abs(max - min);
+  const ref = Math.max(Math.abs(min), Math.abs(max), 1);
+  const pad = Math.max(span * 0.08, ref * 0.02, 0.25);
+  if (span < 1e-9) return [min - pad, max + pad];
+  return [min - pad, max + pad];
 }
 
 function formatElapsedFromUtc(rawTs) {
   const txt = String(rawTs || "").trim();
   if (!txt) return "-";
-  const ms = Date.parse(txt);
+  const ms = parseTimestampMs(txt);
   if (!Number.isFinite(ms)) return "-";
   const diffSec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
   if (diffSec < 60) return `${diffSec}s ago`;
@@ -2959,7 +3022,7 @@ function AppShell() {
                 const ts = latestByGateway[gid];
                 const cur = next[gid] || { gateway_id: gid };
                 const rawOnline = Boolean(ts) && (() => {
-                  const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                  const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
                   return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
                 })();
                 const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
@@ -2996,7 +3059,7 @@ function AppShell() {
                 const ts = tsFromGw || tsFromIp;
                 const rawOnline = ts
                   ? (() => {
-                      const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                      const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
                       return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
                     })()
                   : false;
@@ -3016,7 +3079,7 @@ function AppShell() {
               (prev || []).map((c) => {
                 const ts = latestByDbName[String(c.name || "").trim()];
                 if (!ts) return c;
-                const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
                 const rawOnline = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
                 const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 5);
                 return {
@@ -3283,7 +3346,7 @@ function AppShell() {
               const ts = latestByGateway[gid];
               const cur = next[gid] || { gateway_id: gid };
               const rawOnline = Boolean(ts) && (() => {
-                const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
                 return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
               })();
               const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
@@ -3320,7 +3383,7 @@ function AppShell() {
                 const ts = tsFromGw || tsFromIp;
                 const rawOnline = ts
                   ? (() => {
-                      const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+                      const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
                       return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
                     })()
                   : false;
@@ -3340,7 +3403,7 @@ function AppShell() {
             (prev || []).map((c) => {
               const ts = latestByDbName[String(c.name || "").trim()];
               if (!ts) return c;
-              const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
+              const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
               const rawOnline = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
               const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 5);
               return {
@@ -3610,8 +3673,9 @@ function AppShell() {
 
   const fmtTs = (value) => {
     if (!value) return "";
-    const d = new Date(value);
-    return Number.isNaN(d.getTime()) ? String(value) : d.toISOString().replace("T", " ").slice(0, 19);
+    const ms = parseTimestampMs(value);
+    if (!Number.isFinite(ms)) return String(value);
+    return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
   };
 
   const inRange = (value, from, to) => {
@@ -3696,7 +3760,7 @@ function AppShell() {
     if (!latest) return { ok: null, label: "No Data", valueText: "-", ageText: "-" };
     const gw = gatewayConfigsRef.current.find((g) => String(g.id) === String(trigger.gateway_id || ""));
     const intervalMs = Math.max(200, Number(gw?.interval_ms || 1000));
-    const ageMs = Date.now() - new Date(latest.ts || "").getTime();
+    const ageMs = Date.now() - parseTimestampMs(latest.ts || "");
     const staleMs = Math.max(5000, intervalMs * 4);
     if (!Number.isFinite(ageMs) || ageMs > staleMs) return { ok: null, label: "Stale", valueText: "-", ageText: "-" };
     const valueNum = Number(latest.value);
@@ -3713,7 +3777,7 @@ function AppShell() {
     if (!latest) return { ok: null, label: "No Data", valueText: "-", ageText: "-" };
     const gw = gatewayConfigsRef.current.find((g) => String(g.id) === String(rule.gateway_id || ""));
     const intervalMs = Math.max(200, Number(gw?.interval_ms || 1000));
-    const ageMs = Date.now() - new Date(latest.ts || "").getTime();
+    const ageMs = Date.now() - parseTimestampMs(latest.ts || "");
     const staleMs = Math.max(5000, intervalMs * 4);
     if (!Number.isFinite(ageMs) || ageMs > staleMs) return { ok: null, label: "Stale", valueText: "-", ageText: "-" };
     const valueNum = Number(latest.value);
@@ -3969,7 +4033,7 @@ function AppShell() {
 
   const isFreshCloudTs = (tsValue, maxAgeMs = 12000) => {
     if (!tsValue) return false;
-    const tsMs = new Date(tsValue).getTime();
+    const tsMs = parseTimestampMs(tsValue);
     if (!Number.isFinite(tsMs)) return false;
     return Math.max(0, Date.now() - tsMs) <= maxAgeMs;
   };
@@ -4070,11 +4134,11 @@ function AppShell() {
 
     return Array.from(groups.values())
       .map((g) => {
-        const ageMs = g.lastLiveUtc ? Date.now() - new Date(g.lastLiveUtc).getTime() : Number.POSITIVE_INFINITY;
+        const ageMs = g.lastLiveUtc ? Date.now() - parseTimestampMs(g.lastLiveUtc) : Number.POSITIVE_INFINITY;
         const liveHealthy = Number.isFinite(ageMs) ? ageMs <= 10000 : false;
         const hasConfigMetadata = g.dbNames.size > 0;
         const liveRecent = Number.isFinite(ageMs) ? ageMs <= 15 * 60 * 1000 : false;
-        const configMs = g.lastConfigUtc ? new Date(g.lastConfigUtc).getTime() : Number.NaN;
+        const configMs = g.lastConfigUtc ? parseTimestampMs(g.lastConfigUtc) : Number.NaN;
         const configRecent = Number.isFinite(configMs) ? Math.max(0, Date.now() - configMs) <= 24 * 60 * 60 * 1000 : false;
         return {
           ...g,
@@ -4362,7 +4426,7 @@ function AppShell() {
       for (const tag of tags) {
         const latest = dataLogView.find(
           (r) =>
-            String(r.tag || "") === String(tag) &&
+            String(r.tag || r.tag_name || "") === String(tag) &&
             (!r.gateway_id || String(r.gateway_id) === String(gw.id))
         );
         const live = liveTagValuesView[`${String(gw.id)}::${normalizeTagName(tag)}`];
@@ -4427,21 +4491,17 @@ function AppShell() {
       const gateway = gatewayConfigsView.find((g) => String(g.id) === String(w.gateway_id)) || null;
       if (!gateway) return null;
       const device = devicesView.find((d) => String(d.id) === String(gateway?.device_id || "")) || null;
-      const points = dataLogView
+      const points = buildChronologicalSeries(
+        dataLogView
         .filter(
           (r) =>
             String(r.gateway_id || "") === String(w.gateway_id || "") &&
-            String(r.tag || "") === String(w.tag_name || "")
+            String(r.tag || r.tag_name || "") === String(w.tag_name || "")
         )
-        .slice(0, Number(w.readings_count || 120))
-        .reverse()
-        .map((r, idx) => ({
-          idx: idx + 1,
-          ts: r.ts ? fmtTs(r.ts).slice(11, 19) : "",
-          ts_ms: rowTsMs(r),
-          value: Number(r.value)
-        }));
-      const series = buildSmoothedSeries(points, renderNowMs, Number(gateway?.interval_ms || 1000));
+      , Number(w.readings_count || 120));
+      const lineSeries = buildSmoothedSeries(points, renderNowMs, Number(gateway?.interval_ms || 1000));
+      const series = String(w?.chart_type || "line") === "bar" ? points : lineSeries;
+      const yDomain = computeSeriesDomain(series);
       const last = points.length ? points[points.length - 1] : null;
       const prev = points.length > 1 ? points[points.length - 2] : null;
       const delta = last && prev ? Number(last.value) - Number(prev.value) : 0;
@@ -4466,6 +4526,7 @@ function AppShell() {
         last_ts: last?.ts || "-",
         delta,
         series,
+        yDomain,
         freshness,
         monitorRow
       };
@@ -4474,28 +4535,26 @@ function AppShell() {
 
   const tagMonitorSeries = useMemo(() => {
     if (!tagMonitorSelection) return [];
-    const base = dataLogView
+    const base = buildChronologicalSeries(
+      dataLogView
       .filter(
         (r) =>
-          String(r.tag || "") === String(tagMonitorSelection.tag_name || "") &&
+          String(r.tag || r.tag_name || "") === String(tagMonitorSelection.tag_name || "") &&
           (!r.gateway_id || String(r.gateway_id) === String(tagMonitorSelection.gateway_id || ""))
       )
-      .slice(0, 120)
-      .reverse()
-      .map((r, idx) => ({
-        idx: idx + 1,
-        ts: r.ts ? fmtTs(r.ts).slice(11, 19) : "",
-        ts_ms: rowTsMs(r),
-        value: Number(r.value)
-      }));
-    return buildSmoothedSeries(base, renderNowMs, Number(tagMonitorSelection?.period_ms || 1000));
-  }, [dataLogView, tagMonitorSelection, renderNowMs]);
+    , 120);
+    return tagMonitorChartType === "bar"
+      ? base
+      : buildSmoothedSeries(base, renderNowMs, Number(tagMonitorSelection?.period_ms || 1000));
+  }, [dataLogView, tagMonitorSelection, tagMonitorChartType, renderNowMs]);
+
+  const tagMonitorDomain = useMemo(() => computeSeriesDomain(tagMonitorSeries), [tagMonitorSeries]);
 
   const tagMonitorLatest = useMemo(() => {
     if (!tagMonitorSelection) return null;
     return dataLogView.find(
       (r) =>
-        String(r.tag || "") === String(tagMonitorSelection.tag_name || "") &&
+        String(r.tag || r.tag_name || "") === String(tagMonitorSelection.tag_name || "") &&
         (!r.gateway_id || String(r.gateway_id) === String(tagMonitorSelection.gateway_id || ""))
     ) || null;
   }, [dataLogView, tagMonitorSelection]);
@@ -7240,7 +7299,7 @@ function AppShell() {
         const tsMs = new Date(r.ts).getTime();
         if (fromMs && Number.isFinite(fromMs) && tsMs < fromMs) return false;
         if (toMs && Number.isFinite(toMs) && tsMs > toMs) return false;
-        if (tagSet.size && !tagSet.has(String(r.tag || ""))) return false;
+        if (tagSet.size && !tagSet.has(String(r.tag || r.tag_name || ""))) return false;
         if (gwSet.size && !gwSet.has(String(r.gateway_id || r.gateway_name || ""))) return false;
         if (batchNeedle && !String(r.source || "").toLowerCase().includes(batchNeedle)) return false;
         return true;
@@ -8088,7 +8147,7 @@ function AppShell() {
                                   tickFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || ""}
                                   domain={[(min) => Number(min) - 1, (max) => Number(max) + 1]}
                                 />
-                                <YAxis width={60} domain={["auto", "auto"]} />
+                                <YAxis width={60} domain={item.yDomain || ["auto", "auto"]} />
                                 <Tooltip labelFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || String(v)} />
                                 <Bar isAnimationActive={false} dataKey="value" fill={item.color || "#16a34a"} maxBarSize={20} />
                               </BarChart>
@@ -8102,7 +8161,7 @@ function AppShell() {
                                   tickFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || ""}
                                   domain={[(min) => Number(min) - 1, (max) => Number(max) + 1]}
                                 />
-                                <YAxis width={52} domain={["auto", "auto"]} />
+                                <YAxis width={52} domain={item.yDomain || ["auto", "auto"]} />
                                 <Tooltip labelFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || String(v)} />
                                 <Line isAnimationActive={false} type="linear" dataKey="value" stroke={item.color || "#16a34a"} strokeWidth={2} dot={false} />
                               </LineChart>
@@ -10376,7 +10435,7 @@ function AppShell() {
                 <ResponsiveContainer width="100%" height={260}>
                   <LineChart data={tagMonitorSeries} margin={{ top: 8, right: 18, left: 24, bottom: 8 }}>
                     <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={[(min) => Number(min) - 1, (max) => Number(max) + 1]} />
-                    <YAxis width={52} domain={["auto", "auto"]} />
+                    <YAxis width={52} domain={tagMonitorDomain} />
                     <Tooltip labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)} />
                     <Line isAnimationActive={false} type="linear" dataKey="value" stroke="#16a34a" strokeWidth={2} dot={false} />
                   </LineChart>
@@ -10385,7 +10444,7 @@ function AppShell() {
                 <ResponsiveContainer width="100%" height={260}>
                   <BarChart data={tagMonitorSeries} margin={{ top: 8, right: 18, left: 30, bottom: 8 }} barCategoryGap="24%">
                     <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={[(min) => Number(min) - 1, (max) => Number(max) + 1]} />
-                    <YAxis width={60} domain={["auto", "auto"]} />
+                    <YAxis width={60} domain={tagMonitorDomain} />
                     <Tooltip labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)} />
                     <Bar isAnimationActive={false} dataKey="value" fill="#0f766e" maxBarSize={22} />
                   </BarChart>
@@ -11581,6 +11640,8 @@ export default function App() {
     </AppErrorBoundary>
   );
 }
+
+
 
 
 
