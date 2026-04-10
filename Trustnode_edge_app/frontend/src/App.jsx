@@ -53,6 +53,10 @@ import {
 import { Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 const THEME_STORAGE_KEY = "trustnode_theme";
+const ACTIVE_PAGE_STORAGE_KEY = "trustnode_active_page";
+const TAG_MONITOR_CHART_TYPE_STORAGE_KEY = "trustnode_tag_monitor_chart_type";
+const TREND_CHART_TYPE_STORAGE_KEY = "trustnode_trend_chart_type";
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "trustnode_sidebar_collapsed";
 const USERS_STORAGE_KEY = "trustnode_users";
 const CURRENT_USER_STORAGE_KEY = "trustnode_current_user";
 const DEVICES_STORAGE_KEY = "trustnode_devices";
@@ -300,6 +304,15 @@ class AppErrorBoundary extends Component {
 
 function tsNow() {
   return new Date().toISOString();
+}
+
+function loadStringSetting(storageKey, fallback = "") {
+  try {
+    const v = localStorage.getItem(storageKey);
+    return typeof v === "string" && v.trim() ? v : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function parseTimestampMs(rawValue) {
@@ -1415,7 +1428,6 @@ function AppShell() {
 
   const buildAppStorePayload = () => ({
     app_settings: {
-      theme,
       remember_user: rememberUser,
       endpoint_mode: endpointMode,
       cloud_url: cloudUrl,
@@ -1426,8 +1438,7 @@ function AppShell() {
       website_env_text: websiteEnvText,
       tenant_web_client_url: tenantWebClientUrl,
       tenant_company_name: tenantCompanyName,
-      tenant_login_realm: tenantLoginRealm,
-      active_page: activePage
+      tenant_login_realm: tenantLoginRealm
     },
     users_access: {
       users,
@@ -1440,11 +1451,6 @@ function AppShell() {
       collection_triggers: collectionTriggers,
       collection_trigger_mode: collectionTriggerMode,
       trigger_rules: triggerRules
-    },
-    dashboard_configurations: {
-      widgets: dashboardWidgets,
-      mode: dashboardMode,
-      per_row: dashboardPerRow
     },
     alarms_setup: {
       alarms
@@ -1481,7 +1487,6 @@ function AppShell() {
     const emailSetup = data.email_notifications || {};
     const metadata = data.metadata && typeof data.metadata === "object" && !Array.isArray(data.metadata) ? data.metadata : {};
 
-    if (appSettings.theme === "light" || appSettings.theme === "dark") setTheme(appSettings.theme);
     if (typeof appSettings.remember_user === "boolean") setRememberUser(appSettings.remember_user);
     if (!isHostedWebClient && typeof appSettings.endpoint_mode === "string") {
       setEndpointMode(appSettings.endpoint_mode);
@@ -1505,10 +1510,6 @@ function AppShell() {
     if (typeof appSettings.tenant_web_client_url === "string") setTenantWebClientUrl(appSettings.tenant_web_client_url);
     if (typeof appSettings.tenant_company_name === "string") setTenantCompanyName(appSettings.tenant_company_name);
     if (typeof appSettings.tenant_login_realm === "string") setTenantLoginRealm(appSettings.tenant_login_realm);
-    if (typeof appSettings.active_page === "string") {
-      const mappedPage = appSettings.active_page === "database_overview" ? "database" : appSettings.active_page;
-      setActivePage(mappedPage);
-    }
 
     if (Array.isArray(usersAccess.users)) {
       const normalizedUsers = usersAccess.users.map((u) => ({
@@ -1525,11 +1526,6 @@ function AppShell() {
       setCollectionTriggerMode(triggers.collection_trigger_mode);
     }
     if (Array.isArray(triggers.trigger_rules)) setTriggerRules(triggers.trigger_rules);
-    if (Array.isArray(dashboard.widgets)) setDashboardWidgets(dashboard.widgets);
-    if (dashboard.mode === "chart" || dashboard.mode === "kpi") setDashboardMode(dashboard.mode);
-    if (dashboard.per_row !== undefined) {
-      setDashboardPerRow(Math.min(4, Math.max(1, Number(dashboard.per_row || 2))));
-    }
     if (Array.isArray(alarmsSetup.alarms)) setAlarms(alarmsSetup.alarms);
     if (reportingSetup.filters && typeof reportingSetup.filters === "object") {
       const incoming = reportingSetup.filters || {};
@@ -1677,6 +1673,24 @@ function AppShell() {
   }, []);
 
   useEffect(() => {
+    const savedPage = loadStringSetting(ACTIVE_PAGE_STORAGE_KEY, "");
+    if (savedPage) {
+      const mappedPage = savedPage === "database_overview" ? "database" : savedPage;
+      setActivePage(mappedPage);
+    }
+    const savedTrend = loadStringSetting(TREND_CHART_TYPE_STORAGE_KEY, "");
+    if (savedTrend === "line" || savedTrend === "bar") setTrendChartType(savedTrend);
+    const savedTagMonitor = loadStringSetting(TAG_MONITOR_CHART_TYPE_STORAGE_KEY, "");
+    if (savedTagMonitor === "line" || savedTagMonitor === "bar") setTagMonitorChartType(savedTagMonitor);
+    try {
+      const rawSidebar = localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY);
+      if (rawSidebar === "true" || rawSidebar === "false") {
+        setSidebarCollapsed(rawSidebar === "true");
+      }
+    } catch {}
+  }, []);
+
+  useEffect(() => {
     let stopped = false;
     if (isHostedWebClient && endpointMode === "cloud") {
       return () => {
@@ -1740,6 +1754,30 @@ function AppShell() {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem(THEME_STORAGE_KEY, theme);
   }, [theme]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, String(activePage || "dashboard"));
+    } catch {}
+  }, [activePage]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TREND_CHART_TYPE_STORAGE_KEY, String(trendChartType || "line"));
+    } catch {}
+  }, [trendChartType]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TAG_MONITOR_CHART_TYPE_STORAGE_KEY, String(tagMonitorChartType || "line"));
+    } catch {}
+  }, [tagMonitorChartType]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(Boolean(sidebarCollapsed)));
+    } catch {}
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     if (isHostedWebClient) {
@@ -1945,12 +1983,6 @@ function AppShell() {
   }, [gatewayConfigs, selectedGatewayId]);
 
   useEffect(() => {
-    if (isHostedWebClient) {
-      setDashboardWidgets([]);
-      setDashboardMode("kpi");
-      setDashboardPerRow(2);
-      return;
-    }
     try {
       const saved = localStorage.getItem(DASHBOARD_WIDGETS_STORAGE_KEY);
       if (saved) {
@@ -1967,7 +1999,7 @@ function AppShell() {
       setDashboardMode(mode);
       setDashboardPerRow(perRow);
     } catch {}
-  }, [isHostedWebClient]);
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(DASHBOARD_WIDGETS_STORAGE_KEY, JSON.stringify(dashboardWidgets));
@@ -2320,7 +2352,6 @@ function AppShell() {
   }, [
     appStoreHydrated,
     isHostedWebClient,
-    theme,
     rememberUser,
     endpointMode,
     cloudUrl,
@@ -2331,7 +2362,6 @@ function AppShell() {
     tenantWebClientUrl,
     tenantCompanyName,
     tenantLoginRealm,
-    activePage,
     users,
     currentUser,
     devices,
@@ -2340,9 +2370,6 @@ function AppShell() {
     collectionTriggers,
     collectionTriggerMode,
     triggerRules,
-    dashboardWidgets,
-    dashboardMode,
-    dashboardPerRow,
     alarms,
     reportFilters,
     reportDocuments,
