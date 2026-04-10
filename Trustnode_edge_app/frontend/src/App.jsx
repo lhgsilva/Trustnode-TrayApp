@@ -905,7 +905,11 @@ function AppShell() {
   const browserProtocol = String(window.location.protocol || "").toLowerCase();
   const browserHost = String(window.location.hostname || "").toLowerCase();
   const isLocalHost = browserHost === "localhost" || browserHost === "127.0.0.1" || browserHost === "::1";
-  const isHostedWebClient = (browserProtocol === "https:" || browserProtocol === "http:") && !isLocalHost;
+  const hasDesktopBackendOverride = Boolean(new URLSearchParams(window.location.search).get("backendUrl"));
+  const isHostedWebClient =
+    !hasDesktopBackendOverride &&
+    (browserProtocol === "https:" || browserProtocol === "http:") &&
+    !isLocalHost;
   const getFullscreenState = () => {
     const doc = document;
     return Boolean(doc.fullscreenElement || doc.webkitFullscreenElement);

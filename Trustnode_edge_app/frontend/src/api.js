@@ -28,6 +28,8 @@ function isHostedWebClientRuntime() {
   const protocol = String(window.location.protocol || "").toLowerCase();
   const host = String(window.location.hostname || "").toLowerCase();
   const isLocalHost = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  const hasDesktopBackendOverride = Boolean(new URLSearchParams(window.location.search).get("backendUrl"));
+  if (hasDesktopBackendOverride) return false;
   return (protocol === "https:" || protocol === "http:") && !isLocalHost;
 }
 
@@ -64,6 +66,8 @@ function getApiBase() {
 
 function getControlApiBase() {
   if (FORCE_CLOUD_URL) return FORCE_CLOUD_URL;
+  const queryBackend = normalizeBaseUrl(new URLSearchParams(window.location.search).get("backendUrl") || "");
+  if (queryBackend) return queryBackend;
   if (!isHostedWebClientRuntime()) return getDefaultLocalApiBase();
   return getApiBase();
 }
