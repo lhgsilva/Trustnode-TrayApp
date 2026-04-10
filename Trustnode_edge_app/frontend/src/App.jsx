@@ -378,7 +378,27 @@ function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000) {
   const incoming = Array.isArray(incomingRows) ? incomingRows : [];
   const prev = Array.isArray(prevRows) ? prevRows : [];
   if (!incoming.length) return prev;
-  const newestIncomingMs = incoming.reduce((max, r) => {
+  const newestPrevByKey = new Map();
+  for (const r of prev) {
+    const k = `${String(r?.gateway_id || "")}::${String(r?.tag || r?.tag_name || "")}`;
+    if (!k.endsWith("::")) {
+      const ms = rowTsMs(r);
+      if (Number.isFinite(ms)) {
+        const old = Number(newestPrevByKey.get(k) || -1);
+        if (ms > old) newestPrevByKey.set(k, ms);
+      }
+    }
+  }
+  const filteredIncoming = incoming.filter((r) => {
+    const k = `${String(r?.gateway_id || "")}::${String(r?.tag || r?.tag_name || "")}`;
+    if (k.endsWith("::")) return true;
+    const ms = rowTsMs(r);
+    if (!Number.isFinite(ms)) return true;
+    const newestPrev = Number(newestPrevByKey.get(k) || -1);
+    return newestPrev < 0 || ms > newestPrev;
+  });
+  if (!filteredIncoming.length) return prev;
+  const newestIncomingMs = filteredIncoming.reduce((max, r) => {
     const ms = rowTsMs(r);
     return Number.isFinite(ms) && ms > max ? ms : max;
   }, -1);
@@ -391,7 +411,7 @@ function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000) {
   }
   const merged = [];
   const seen = new Set();
-  const combined = [...incoming, ...prev];
+  const combined = [...filteredIncoming, ...prev];
   for (const r of combined) {
     const key = `${String(r?.gateway_id || "")}::${String(r?.tag || r?.tag_name || "")}::${String(r?.ts || r?.ts_utc || "")}`;
     if (seen.has(key)) continue;
@@ -1392,6 +1412,7 @@ function AppShell() {
   const liveTagValuesRef = useRef({});
   const cloudNewestLiveTsMsRef = useRef(0);
   const cloudLastApplyMsRef = useRef(0);
+  const cloudLastAcceptedTsByKeyRef = useRef(new Map());
   const tagAlarmPrefsRef = useRef({});
   const emailSettingsRef = useRef({});
   const historianOutboxRef = useRef([]);
@@ -2933,6 +2954,7 @@ function AppShell() {
     if (endpointMode !== "cloud") {
       setCloudStreamConnected(false);
       cloudNewestLiveTsMsRef.current = 0;
+      cloudLastAcceptedTsByKeyRef.current = new Map();
       return;
     }
     if (!currentUser) {
@@ -2953,7 +2975,9 @@ function AppShell() {
           const data = JSON.parse(event.data || "{}");
           if (data.type !== "cloud_snapshot" && data.type !== "cloud_live") return;
           if (Array.isArray(data.live_rows) && data.live_rows.length) {
-            const newestLiveMs = data.live_rows.reduce((max, row) => {
+            const acceptedLiveRows = filterCloudRowsMonotonic(data.live_rows);
+            if (!acceptedLiveRows.length) return;
+            const newestLiveMs = acceptedLiveRows.reduce((max, row) => {
               const ms = rowTsMs(row);
               return Number.isFinite(ms) && ms > max ? ms : max;
             }, -1);
@@ -2995,7 +3019,7 @@ function AppShell() {
             const rowCountByGateway = {};
             const latestByDbName = {};
             const latestByPlcIp = {};
-            for (const row of data.live_rows) {
+            for (const row of acceptedLiveRows) {
               const gatewayId = String(row?.gateway_id || "");
               const rawTag = String(row?.tag || row?.tag_name || "");
               const normTag = normalizeTagName(rawTag);
@@ -3134,7 +3158,7 @@ function AppShell() {
 
             const activeRules = triggerRulesRef.current.filter((rule) => rule.enabled !== false);
             const newAlarms = [];
-            for (const row of data.live_rows) {
+            for (const row of acceptedLiveRows) {
               const gatewayId = String(row?.gateway_id || "").trim();
               const tagName = String(row?.tag || row?.tag_name || "").trim();
               const valueNum = Number(row?.value);
@@ -3284,7 +3308,12 @@ function AppShell() {
         const liveRes = await getAppStoreLive(CLOUD_LIVE_FETCH_LIMIT);
         if (stopped) return;
         if (liveRes?.ok && Array.isArray(liveRes.rows)) {
-          const newestLiveMs = liveRes.rows.reduce((max, row) => {
+          const acceptedLiveRows = filterCloudRowsMonotonic(liveRes.rows);
+          if (!acceptedLiveRows.length) {
+            setWsState("cloud_polling");
+            return;
+          }
+          const newestLiveMs = acceptedLiveRows.reduce((max, row) => {
             const ms = rowTsMs(row);
             return Number.isFinite(ms) && ms > max ? ms : max;
           }, -1);
@@ -3326,7 +3355,7 @@ function AppShell() {
           const rowCountByGateway = {};
           const latestByDbName = {};
           const latestByPlcIp = {};
-          for (const row of liveRes.rows) {
+          for (const row of acceptedLiveRows) {
             const gatewayId = String(row?.gateway_id || "");
             const rawTag = String(row?.tag || row?.tag_name || "");
             const normTag = normalizeTagName(rawTag);
@@ -3520,7 +3549,7 @@ function AppShell() {
       clearInterval(liveTimer);
       clearInterval(auxTimer);
     };
-  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected]);
+  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected, filterCloudRowsMonotonic]);
 
   const canEditPage = (page) => {
     if (isReadonlyCloudMode) return false;
@@ -11698,3 +11727,23 @@ export default function App() {
 
 
 
+  const filterCloudRowsMonotonic = useCallback((rows) => {
+    const src = Array.isArray(rows) ? rows : [];
+    if (!src.length) return [];
+    const out = [];
+    const nextMap = new Map(cloudLastAcceptedTsByKeyRef.current || []);
+    for (const row of src) {
+      const gatewayId = String(row?.gateway_id || "").trim();
+      const tagName = normalizeTagName(String(row?.tag || row?.tag_name || ""));
+      if (!gatewayId || !tagName) continue;
+      const tsMs = rowTsMs(row);
+      if (!Number.isFinite(tsMs)) continue;
+      const key = `${gatewayId}::${tagName}`;
+      const prevMs = Number(nextMap.get(key) || -1);
+      if (tsMs <= prevMs) continue;
+      nextMap.set(key, tsMs);
+      out.push(row);
+    }
+    cloudLastAcceptedTsByKeyRef.current = nextMap;
+    return out;
+  }, []);
