@@ -87,11 +87,11 @@ class AppStore:
         )
         self._live_source_switch_threshold_ms = max(
             500,
-            int(os.environ.get("TRUSTNODE_LIVE_SOURCE_SWITCH_MS", "2500") or "2500"),
+            int(os.environ.get("TRUSTNODE_LIVE_SOURCE_SWITCH_MS", "1500") or "1500"),
         )
         self._live_source_max_stale_ms = max(
-            2000,
-            int(os.environ.get("TRUSTNODE_LIVE_SOURCE_MAX_STALE_MS", "12000") or "12000"),
+            1200,
+            int(os.environ.get("TRUSTNODE_LIVE_SOURCE_MAX_STALE_MS", "2000") or "2000"),
         )
         self._live_data_catchup_interval_seconds = max(
             0.1,
@@ -105,8 +105,8 @@ class AppStore:
             min(5000, int(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_LIMIT", "1200") or "1200")),
         )
         self._cloud_live_cache_interval_seconds = max(
-            0.2,
-            float(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_SECONDS", "0.25") or "0.25"),
+            0.1,
+            float(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_SECONDS", "0.15") or "0.15"),
         )
         self._ensure_schema()
         self._ensure_required_config_domains()
@@ -3386,8 +3386,18 @@ class AppStore:
                         except Exception:
                             prev_payload = []
                     payload_to_store = self._normalize_database_configurations_payload(payload_to_store, prev_payload)
-                new_version = old_version + 1
                 payload_json = json.dumps(payload_to_store)
+                prev_payload_json = str(prev["payload_json"] or "") if prev else ""
+                # No-op write: avoid audit/outbox churn when payload is unchanged.
+                if prev and prev_payload_json == payload_json:
+                    return {
+                        "domain": domain,
+                        "tenant_id": self._current_tenant_id(),
+                        "version": old_version,
+                        "updated_utc": str(prev["updated_utc"] or now),
+                        "unchanged": True,
+                    }
+                new_version = old_version + 1
                 conn.execute(
                     """
                     INSERT INTO config_documents(domain, payload_json, version, updated_utc)
@@ -3622,7 +3632,10 @@ class AppStore:
                     return cached_rows[:lim]
             cloud_live_fast = self._fetch_live_rows_from_cloud_fast(lim)
             if cloud_live_fast:
-                return cloud_live_fast
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                newest_fast_ms = max((_row_ts_ms(r) for r in cloud_live_fast), default=0)
+                if newest_fast_ms > 0 and max(0, now_ms - newest_fast_ms) <= int(self._live_source_max_stale_ms):
+                    return cloud_live_fast
             cloud_live = self._fetch_live_rows_from_cloud(lim)
             cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim * 2, 500), 3000))
             if cloud_live and cloud_hist:
