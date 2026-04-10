@@ -3681,10 +3681,15 @@ function AppShell() {
     if (rt) {
       const rtErr = String(rt.last_error || "").trim();
       const dbErr = String(rt.db_last_error || "").trim();
-      if (rt.running === true && !rtErr && !dbErr) return { ok: true, label: "Running" };
+      const lastWriteMs = new Date(String(rt.db_last_write_utc || "")).getTime();
+      const hasFreshWrite = Number.isFinite(lastWriteMs) && (Date.now() - lastWriteMs) <= 15000;
+      const pending = Number(rt.db_pending_count || 0);
+      if (rt.running === true) {
+        if (rtErr) return { ok: false, label: "Device Fails" };
+        if (dbErr && !hasFreshWrite && pending > 0) return { ok: false, label: "DB Fails" };
+        return { ok: true, label: "Running" };
+      }
       if (rt.running === false && !rtErr && !dbErr) return { ok: false, label: "Stopped" };
-      if (rt.running === true && dbErr) return { ok: false, label: "DB Fails" };
-      if (rt.running === true && rtErr) return { ok: false, label: "Device Fails" };
     }
     const device = devices.find((d) => d.id === gateway.device_id) || null;
     const db = dbConnections.find((c) => c.id === gateway.database_id) || null;
