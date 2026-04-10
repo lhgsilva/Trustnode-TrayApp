@@ -916,7 +916,7 @@ class AppStore:
                                        tag_name, value, quality, quality_label
                                 FROM "{schema}"."{table_name}"
                                 WHERE tenant_id = :tenant
-                                ORDER BY id DESC
+                                ORDER BY ts_utc DESC
                                 LIMIT :lim
                                 """
                             ),
@@ -931,7 +931,7 @@ class AppStore:
                                 SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                        tag_name, value, quality, quality_label
                                 FROM "{schema}"."{table_name}"
-                                ORDER BY id DESC
+                                ORDER BY ts_utc DESC
                                 LIMIT :lim
                                 """
                             ),
@@ -1196,8 +1196,8 @@ class AppStore:
                 # Fetch historian/plc rows and prefer whichever source is freshest.
                 # This prevents stale cloud live widgets when live_latest lags behind.
                 sample_limit = min(max(lim, 2000), 8000)
-                hist_rows = _fetch_rows_with_freshness_fallback(conn, "historian_readings", "id DESC", sample_limit)
-                plc_rows = _fetch_rows_with_freshness_fallback(conn, "plc_readings", "id DESC", sample_limit)
+                hist_rows = _fetch_rows_with_freshness_fallback(conn, "historian_readings", "ts_utc DESC", sample_limit)
+                plc_rows = _fetch_rows_with_freshness_fallback(conn, "plc_readings", "ts_utc DESC", sample_limit)
 
                 live_top = _top_ts_ms(live_rows)
                 hist_top = _top_ts_ms(hist_rows)
