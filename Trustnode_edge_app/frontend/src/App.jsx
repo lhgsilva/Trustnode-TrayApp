@@ -144,7 +144,7 @@ const REPORT_SERIES_COLORS = ["#16a34a", "#2563eb", "#d97706", "#dc2626", "#7c3a
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
-const CLOUD_LIVE_POLL_MS = 500;
+const CLOUD_LIVE_POLL_MS = 1000;
 const CLOUD_AUX_POLL_MS = 1500;
 const CLOUD_LIVE_FETCH_LIMIT = 600;
 const CLOUD_EDGE_ALL_KEY = "__all_edges__";
@@ -429,7 +429,7 @@ function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000) {
   return merged.slice(0, limit);
 }
 
-function buildChronologicalSeries(rows, maxPoints = 120) {
+function buildChronologicalSeries(rows, maxPoints = 120, minStepMs = 0) {
   const src = Array.isArray(rows) ? rows : [];
   if (!src.length) return [];
   const items = src
@@ -446,9 +446,13 @@ function buildChronologicalSeries(rows, maxPoints = 120) {
   if (!items.length) return [];
 
   const deduped = [];
+  const minStep = Math.max(0, Number(minStepMs || 0));
   for (const item of items) {
     const prev = deduped[deduped.length - 1];
     if (prev && prev.ts_ms === item.ts_ms) {
+      deduped[deduped.length - 1] = item;
+    } else if (prev && minStep > 0 && item.ts_ms - prev.ts_ms < Math.floor(minStep * 0.9)) {
+      // Keep only one point per gateway interval bucket to avoid bursty cloud redraws.
       deduped[deduped.length - 1] = item;
     } else {
       deduped.push(item);
@@ -3341,11 +3345,36 @@ function AppShell() {
         const liveRes = await getAppStoreLive(CLOUD_LIVE_FETCH_LIMIT);
         if (stopped) return;
         if (liveRes?.ok && Array.isArray(liveRes.rows)) {
-          const acceptedLiveRows = filterCloudRowsMonotonic(liveRes.rows);
-          if (!acceptedLiveRows.length) {
-            setWsState("cloud_polling");
-            return;
+          const rawRows = liveRes.rows;
+          const latestByGateway = {};
+          const rowCountByGateway = {};
+          const latestByDbName = {};
+          const latestByPlcIp = {};
+          for (const row of rawRows) {
+            const ts = String(row?.ts || row?.ts_utc || "");
+            if (!ts) continue;
+            const tsMs = parseTimestampMs(ts);
+            const gid = String(row?.gateway_id || "");
+            if (gid) {
+              const prevTs = latestByGateway[gid];
+              const prevMs = parseTimestampMs(prevTs || "");
+              if (!prevTs || (Number.isFinite(tsMs) && tsMs > prevMs)) latestByGateway[gid] = ts;
+              rowCountByGateway[gid] = Number(rowCountByGateway[gid] || 0) + 1;
+            }
+            const dbName = String(row?.database_name || "").trim();
+            if (dbName) {
+              const prevTs = latestByDbName[dbName];
+              const prevMs = parseTimestampMs(prevTs || "");
+              if (!prevTs || (Number.isFinite(tsMs) && tsMs > prevMs)) latestByDbName[dbName] = ts;
+            }
+            const plcIp = String(row?.plc_ip || "").trim();
+            if (plcIp) {
+              const prevTs = latestByPlcIp[plcIp];
+              const prevMs = parseTimestampMs(prevTs || "");
+              if (!prevTs || (Number.isFinite(tsMs) && tsMs > prevMs)) latestByPlcIp[plcIp] = ts;
+            }
           }
+          const acceptedLiveRows = filterCloudRowsMonotonic(rawRows);
           const newestLiveMs = acceptedLiveRows.reduce((max, row) => {
             const ms = rowTsMs(row);
             return Number.isFinite(ms) && ms > max ? ms : max;
@@ -3364,10 +3393,7 @@ function AppShell() {
             setWsState("cloud_polling");
             return;
           }
-          if (isDuplicatePollFrame) {
-            return;
-          }
-          if (newestLiveMs > cloudNewestLiveTsMsRef.current) {
+          if (!isDuplicatePollFrame && newestLiveMs > cloudNewestLiveTsMsRef.current) {
             cloudNewestLiveTsMsRef.current = newestLiveMs;
           }
           const dbMetaByName = new Map();
@@ -3384,10 +3410,6 @@ function AppShell() {
           const nextLive = {};
           const nextReadings = [];
           const nextDataRows = [];
-          const latestByGateway = {};
-          const rowCountByGateway = {};
-          const latestByDbName = {};
-          const latestByPlcIp = {};
           for (const row of acceptedLiveRows) {
             const gatewayId = String(row?.gateway_id || "");
             const rawTag = String(row?.tag || row?.tag_name || "");
@@ -3435,14 +3457,11 @@ function AppShell() {
               quality,
               quality_label: qualityLabel
             });
-            if (gatewayId && !latestByGateway[gatewayId]) latestByGateway[gatewayId] = readingTs;
-            if (gatewayId) rowCountByGateway[gatewayId] = Number(rowCountByGateway[gatewayId] || 0) + 1;
-            if (dbName && !latestByDbName[dbName]) latestByDbName[dbName] = readingTs;
-            const plcIp = String(row?.plc_ip || "").trim();
-            if (plcIp && !latestByPlcIp[plcIp]) latestByPlcIp[plcIp] = readingTs;
           }
-          setLiveTagValues(nextLive);
-          setReadings(nextReadings);
+          if (!isDuplicatePollFrame && nextDataRows.length) {
+            setLiveTagValues((prev) => ({ ...(prev || {}), ...nextLive }));
+            setReadings(nextReadings);
+          }
           const nowMs = Date.now();
           setGatewayRuntimeStatuses((prev) => {
             const next = { ...prev };
@@ -3469,6 +3488,13 @@ function AppShell() {
                   db_pending_count: 0,
                   last_check_utc: ts
                 };
+              } else if (cur?.last_check_utc) {
+                const rawOnline = (() => {
+                  const ageMs = Math.max(0, nowMs - parseTimestampMs(cur.last_check_utc));
+                  return Number.isFinite(ageMs) ? ageMs <= 20000 : false;
+                })();
+                const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
+                next[gid] = { ...cur, gateway_id: gid, running: online };
               }
             }
             return next;
@@ -3520,7 +3546,7 @@ function AppShell() {
             })
           );
           // Keep charts/historian visibly live in cloud mode even when historian replay lags.
-          if (nextDataRows.length) {
+          if (!isDuplicatePollFrame && nextDataRows.length) {
             setDataLog((prev) => mergeHistorianRowsStable(nextDataRows, prev, 3000));
           }
           cloudLastApplyMsRef.current = Date.now();
@@ -3549,7 +3575,7 @@ function AppShell() {
           getAppStoreInspector(20)
         ]);
         if (stopped) return;
-        if (histRes?.ok && Array.isArray(histRes.rows)) {
+        if ((activePage === "historian" || activePage === "logs") && histRes?.ok && Array.isArray(histRes.rows)) {
           setDataLog((prev) => mergeHistorianRowsStable(histRes.rows, prev, 5000));
         }
         if (logRes?.ok && Array.isArray(logRes.rows)) {
@@ -3582,7 +3608,7 @@ function AppShell() {
       clearInterval(liveTimer);
       clearInterval(auxTimer);
     };
-  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected, filterCloudRowsMonotonic]);
+  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected, filterCloudRowsMonotonic, activePage]);
 
   const canEditPage = (page) => {
     if (isReadonlyCloudMode) return false;
@@ -4603,12 +4629,12 @@ function AppShell() {
             String(r.gateway_id || "") === String(w.gateway_id || "") &&
             String(r.tag || r.tag_name || "") === String(w.tag_name || "")
         )
-      , Number(w.readings_count || 120));
+      , Number(w.readings_count || 120), Number(gateway?.interval_ms || 1000));
       const lineSeries = buildSmoothedSeries(
         points,
         renderNowMs,
         Number(gateway?.interval_ms || 1000),
-        endpointMode === "cloud"
+        endpointMode !== "cloud"
       );
       const series = String(w?.chart_type || "line") === "bar" ? points : lineSeries;
       const yDomain = computeSeriesDomain(series);
@@ -4652,14 +4678,14 @@ function AppShell() {
           String(r.tag || r.tag_name || "") === String(tagMonitorSelection.tag_name || "") &&
           (!r.gateway_id || String(r.gateway_id) === String(tagMonitorSelection.gateway_id || ""))
       )
-    , 120);
+    , 120, Number(tagMonitorSelection?.period_ms || 1000));
     return tagMonitorChartType === "bar"
       ? base
       : buildSmoothedSeries(
           base,
           renderNowMs,
           Number(tagMonitorSelection?.period_ms || 1000),
-          endpointMode === "cloud"
+          endpointMode !== "cloud"
         );
   }, [dataLogView, tagMonitorSelection, tagMonitorChartType, renderNowMs]);
 
