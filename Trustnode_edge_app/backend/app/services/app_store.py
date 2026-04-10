@@ -85,6 +85,14 @@ class AppStore:
             0.15,
             float(os.environ.get("TRUSTNODE_LIVE_SYNC_SECONDS", "0.2") or "0.2"),
         )
+        self._live_source_switch_threshold_ms = max(
+            500,
+            int(os.environ.get("TRUSTNODE_LIVE_SOURCE_SWITCH_MS", "2500") or "2500"),
+        )
+        self._live_source_max_stale_ms = max(
+            2000,
+            int(os.environ.get("TRUSTNODE_LIVE_SOURCE_MAX_STALE_MS", "12000") or "12000"),
+        )
         self._live_data_catchup_interval_seconds = max(
             0.1,
             float(os.environ.get("TRUSTNODE_LIVE_DATA_CATCHUP_SECONDS", "0.3") or "0.3"),
@@ -1051,7 +1059,21 @@ class AppStore:
 
             live_top = _top_ts_ms(live_rows)
             plc_top = _top_ts_ms(plc_rows)
-            source_rows = plc_rows if plc_top > live_top + 400 else live_rows
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            live_fresh = live_top > 0 and max(0, now_ms - live_top) <= int(self._live_source_max_stale_ms)
+            if live_rows and (live_fresh or not plc_rows):
+                source_rows = live_rows
+            elif plc_rows and not live_rows:
+                source_rows = plc_rows
+            elif live_rows and plc_rows:
+                # Keep live_latest as primary source to minimize perceived lag.
+                # Only switch to plc_readings when live_latest is materially behind.
+                if plc_top > live_top + int(self._live_source_switch_threshold_ms):
+                    source_rows = plc_rows
+                else:
+                    source_rows = live_rows
+            else:
+                source_rows = []
 
             out: list[dict[str, Any]] = []
             seen: set[tuple[str, str]] = set()
