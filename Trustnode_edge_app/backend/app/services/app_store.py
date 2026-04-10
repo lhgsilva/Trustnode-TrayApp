@@ -59,19 +59,19 @@ class AppStore:
         }
         self._data_sync_batch_size = max(
             200,
-            min(20000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "1000") or "1000")),
+            min(20000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "2000") or "2000")),
         )
         self._data_bulk_sync_interval_seconds = max(
-            0.25,
-            float(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "0.25") or "0.25"),
+            0.1,
+            float(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "0.15") or "0.15"),
         )
         self._data_sync_burst_batches = max(
             1,
-            min(12, int(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_BATCHES", "4") or "4")),
+            min(16, int(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_BATCHES", "8") or "8")),
         )
         self._data_sync_burst_seconds = max(
             0.1,
-            float(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_SECONDS", "0.8") or "0.8"),
+            float(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_SECONDS", "1.2") or "1.2"),
         )
         self._live_fast_batch_size = max(
             200,
@@ -84,6 +84,10 @@ class AppStore:
         self._live_sync_interval_seconds = max(
             0.15,
             float(os.environ.get("TRUSTNODE_LIVE_SYNC_SECONDS", "0.2") or "0.2"),
+        )
+        self._live_data_catchup_interval_seconds = max(
+            0.1,
+            float(os.environ.get("TRUSTNODE_LIVE_DATA_CATCHUP_SECONDS", "0.3") or "0.3"),
         )
         self._live_fast_last_local_id = 0
         self._cloud_live_cache_rows: list[dict[str, Any]] = []
@@ -894,10 +898,15 @@ class AppStore:
             self._sync_wakeup_event.clear()
 
     def _live_sync_loop(self) -> None:
+        next_data_catchup_mono = 0.0
         while not self._stop_event.is_set():
             try:
                 if self._is_cloud_auto_sync_enabled():
                     self._flush_live_outbox_once()
+                    now_mono = time.monotonic()
+                    if now_mono >= next_data_catchup_mono:
+                        self._flush_data_outbox_burst()
+                        next_data_catchup_mono = now_mono + float(self._live_data_catchup_interval_seconds)
             except Exception as exc:
                 self._set_data_sync_state(last_data_error=f"Live sync loop error: {exc}")
             self._live_sync_wakeup_event.wait(timeout=self._live_sync_interval_seconds)
@@ -1032,15 +1041,9 @@ class AppStore:
                         ).fetchall()
                     except Exception:
                         unscoped_rows = []
-                    if not scoped_rows:
-                        return unscoped_rows
-                    if not unscoped_rows:
+                    if scoped_rows:
                         return scoped_rows
-                    scoped_top = _top_ts_ms(scoped_rows)
-                    unscoped_top = _top_ts_ms(unscoped_rows)
-                    if unscoped_top > scoped_top + 3000:
-                        return unscoped_rows
-                    return scoped_rows
+                    return unscoped_rows
 
                 live_rows = _fetch_rows_with_freshness_fallback("live_latest", lim)
                 sample_limit = min(max(lim * 4, 500), 4000)
@@ -1048,7 +1051,7 @@ class AppStore:
 
             live_top = _top_ts_ms(live_rows)
             plc_top = _top_ts_ms(plc_rows)
-            source_rows = plc_rows if plc_top > live_top + 1500 else live_rows
+            source_rows = plc_rows if plc_top > live_top + 400 else live_rows
 
             out: list[dict[str, Any]] = []
             seen: set[tuple[str, str]] = set()
@@ -1169,15 +1172,9 @@ class AppStore:
                         ).fetchall()
                     except Exception:
                         unscoped_rows = []
-                    if not scoped_rows:
-                        return unscoped_rows
-                    if not unscoped_rows:
+                    if scoped_rows:
                         return scoped_rows
-                    scoped_top = _top_ts_ms(scoped_rows)
-                    unscoped_top = _top_ts_ms(unscoped_rows)
-                    if unscoped_top > scoped_top + 3000:
-                        return unscoped_rows
-                    return scoped_rows
+                    return unscoped_rows
 
                 hist_rows = _fetch_rows_with_freshness_fallback("historian_readings")
                 plc_rows = _fetch_rows_with_freshness_fallback("plc_readings")
@@ -1407,16 +1404,9 @@ class AppStore:
                     ).fetchall()
                 except Exception:
                     unscoped_rows = []
-                if not scoped_rows:
-                    return unscoped_rows
-                if not unscoped_rows:
+                if scoped_rows:
                     return scoped_rows
-                scoped_top = _top_ts_ms(scoped_rows)
-                unscoped_top = _top_ts_ms(unscoped_rows)
-                # If unscoped rows are materially newer, prefer them to avoid stale tenant pinning.
-                if unscoped_top > scoped_top + 3000:
-                    return unscoped_rows
-                return scoped_rows
+                return unscoped_rows
 
             with engine.begin() as conn:
                 live_rows: list[Any] = []
@@ -1434,7 +1424,7 @@ class AppStore:
                 hist_top = _top_ts_ms(hist_rows)
                 plc_top = _top_ts_ms(plc_rows)
                 freshest = max(hist_top, plc_top)
-                if live_rows and live_top >= freshest - 1500:
+                if live_rows and live_top >= freshest - 400:
                     rows = live_rows
                 elif hist_rows and hist_top >= plc_top:
                     rows = hist_rows

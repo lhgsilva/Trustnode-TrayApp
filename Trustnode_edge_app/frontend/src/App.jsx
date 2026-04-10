@@ -2956,12 +2956,21 @@ function AppShell() {
               const ms = rowTsMs(row);
               return Number.isFinite(ms) && ms > max ? ms : max;
             }, -1);
+            const prevNewestLiveMs = Number(cloudNewestLiveTsMsRef.current || 0);
             const isStalePacket =
               newestLiveMs > 0 &&
-              cloudNewestLiveTsMsRef.current > 0 &&
-              newestLiveMs < cloudNewestLiveTsMsRef.current - 1500;
+              prevNewestLiveMs > 0 &&
+              newestLiveMs < prevNewestLiveMs - 1500;
+            const isDuplicatePacket =
+              newestLiveMs > 0 &&
+              prevNewestLiveMs > 0 &&
+              newestLiveMs <= prevNewestLiveMs;
             if (isStalePacket) {
               // Ignore backward/live-reordered packets but keep stream alive.
+              return;
+            }
+            if (isDuplicatePacket) {
+              // Ignore duplicate cloud snapshots that cause frozen/flicker feeling.
               return;
             }
             if (newestLiveMs > cloudNewestLiveTsMsRef.current) {
@@ -3268,7 +3277,7 @@ function AppShell() {
     let runningLive = false;
     let runningAux = false;
     const pollCloudLive = async () => {
-      if (cloudStreamConnected && Date.now() - cloudLastApplyMsRef.current < 1200) return;
+      if (cloudStreamConnected) return;
       if (stopped || runningLive) return;
       runningLive = true;
       try {
@@ -3279,13 +3288,21 @@ function AppShell() {
             const ms = rowTsMs(row);
             return Number.isFinite(ms) && ms > max ? ms : max;
           }, -1);
+          const prevNewestLiveMs = Number(cloudNewestLiveTsMsRef.current || 0);
           const isStalePollFrame =
             newestLiveMs > 0 &&
-            cloudNewestLiveTsMsRef.current > 0 &&
-            newestLiveMs < cloudNewestLiveTsMsRef.current - 1500;
+            prevNewestLiveMs > 0 &&
+            newestLiveMs < prevNewestLiveMs - 1500;
+          const isDuplicatePollFrame =
+            newestLiveMs > 0 &&
+            prevNewestLiveMs > 0 &&
+            newestLiveMs <= prevNewestLiveMs;
           if (isStalePollFrame) {
             // Do not regress UI timestamps on stale poll frames.
             setWsState("cloud_polling");
+            return;
+          }
+          if (isDuplicatePollFrame) {
             return;
           }
           if (newestLiveMs > cloudNewestLiveTsMsRef.current) {
