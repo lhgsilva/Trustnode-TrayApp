@@ -945,17 +945,45 @@ class AppStore:
                 else:
                     rows = []
             out: list[dict[str, Any]] = []
+            gateway_configs_raw = self.get_config_domain("gateway_configurations")
+            gateway_configs = gateway_configs_raw if isinstance(gateway_configs_raw, list) else []
+
+            def _infer_gateway_id(source: str, tag: str, plc_ip: str) -> str:
+                candidates: list[str] = []
+                for g in gateway_configs:
+                    if not isinstance(g, dict):
+                        continue
+                    gid = str(g.get("id") or "").strip()
+                    if not gid:
+                        continue
+                    g_type = str(g.get("gateway_type") or "").strip()
+                    g_ip = str(g.get("plc_ip") or "").strip()
+                    g_tags_raw = g.get("tags")
+                    g_tags = [str(t or "").strip() for t in g_tags_raw] if isinstance(g_tags_raw, list) else []
+                    if source and g_type and source != g_type:
+                        continue
+                    if plc_ip and g_ip and plc_ip != g_ip:
+                        continue
+                    if tag and g_tags and tag not in g_tags:
+                        continue
+                    candidates.append(gid)
+                if len(candidates) == 1:
+                    return candidates[0]
+                return ""
+
             for r in rows:
                 source = str(r[1] or "")
                 gateway_id_raw = str(r[2] or "").strip()
                 gateway_name_raw = str(r[3] or "").strip()
                 plc_ip_raw = str(r[5] or "").strip()
                 database_name_raw = str(r[6] or "").strip()
+                tag_name = str(r[7] or "")
+                inferred_id = _infer_gateway_id(source, tag_name, plc_ip_raw)
                 fallback_gateway = "|".join(
                     [x for x in [source, plc_ip_raw, database_name_raw] if x]
                 ) or "unknown_gateway"
-                gateway_id = gateway_id_raw or gateway_name_raw or fallback_gateway
-                gateway_name = gateway_name_raw or gateway_id_raw or fallback_gateway
+                gateway_id = gateway_id_raw or gateway_name_raw or inferred_id or fallback_gateway
+                gateway_name = gateway_name_raw or gateway_id_raw or inferred_id or fallback_gateway
                 out.append(
                     {
                         "ts": str(r[0] or ""),
@@ -966,7 +994,7 @@ class AppStore:
                         "device_name": str(r[4] or ""),
                         "plc_ip": plc_ip_raw,
                         "database_name": database_name_raw,
-                        "tag": str(r[7] or ""),
+                        "tag": tag_name,
                         "value": r[8],
                         "quality": r[9],
                         "quality_label": str(r[10] or ""),
@@ -1166,6 +1194,32 @@ class AppStore:
                 else:
                     rows = live_rows
             out: list[dict[str, Any]] = []
+            gateway_configs_raw = self.get_config_domain("gateway_configurations")
+            gateway_configs = gateway_configs_raw if isinstance(gateway_configs_raw, list) else []
+
+            def _infer_gateway_id(source: str, tag: str, plc_ip: str) -> str:
+                candidates: list[str] = []
+                for g in gateway_configs:
+                    if not isinstance(g, dict):
+                        continue
+                    gid = str(g.get("id") or "").strip()
+                    if not gid:
+                        continue
+                    g_type = str(g.get("gateway_type") or "").strip()
+                    g_ip = str(g.get("plc_ip") or "").strip()
+                    g_tags_raw = g.get("tags")
+                    g_tags = [str(t or "").strip() for t in g_tags_raw] if isinstance(g_tags_raw, list) else []
+                    if source and g_type and source != g_type:
+                        continue
+                    if plc_ip and g_ip and plc_ip != g_ip:
+                        continue
+                    if tag and g_tags and tag not in g_tags:
+                        continue
+                    candidates.append(gid)
+                if len(candidates) == 1:
+                    return candidates[0]
+                return ""
+
             seen: set[tuple[str, str]] = set()
             for r in rows:
                 source = str(r[1] or "")
@@ -1173,11 +1227,12 @@ class AppStore:
                 gateway_name_raw = str(r[3] or "").strip()
                 plc_ip_raw = str(r[5] or "").strip()
                 database_name_raw = str(r[6] or "").strip()
+                tag_name = str(r[7] or "")
+                inferred_id = _infer_gateway_id(source, tag_name, plc_ip_raw)
                 fallback_gateway = "|".join(
                     [x for x in [source, plc_ip_raw, database_name_raw] if x]
                 ) or "unknown_gateway"
-                gateway_id = gateway_id_raw or gateway_name_raw or fallback_gateway
-                tag_name = str(r[7] or "")
+                gateway_id = gateway_id_raw or gateway_name_raw or inferred_id or fallback_gateway
                 if not tag_name:
                     continue
                 key = (gateway_id, tag_name)
@@ -1190,7 +1245,7 @@ class AppStore:
                         "tenant_id": tenant_id,
                         "source": source,
                         "gateway_id": gateway_id,
-                        "gateway_name": gateway_name_raw or gateway_id_raw or fallback_gateway,
+                        "gateway_name": gateway_name_raw or gateway_id_raw or inferred_id or fallback_gateway,
                         "device_name": str(r[4] or ""),
                         "plc_ip": plc_ip_raw,
                         "database_name": database_name_raw,
