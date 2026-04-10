@@ -34,7 +34,9 @@ class AppStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._cloud_schema_lock = threading.Lock()
+        self._cloud_engine_lock = threading.Lock()
         self._cloud_schema_ready_keys: set[str] = set()
+        self._cloud_engine_cache: dict[str, Any] = {}
         self._db_path = self._resolve_db_path()
         self._stop_event = threading.Event()
         self._sync_wakeup_event = threading.Event()
@@ -108,6 +110,46 @@ class AppStore:
                 str(schema or "public").strip().lower(),
             ]
         )
+
+    def _get_or_create_cloud_engine(self, cloud: dict[str, Any], schema: str) -> tuple[Any, str]:
+        from sqlalchemy import create_engine  # type: ignore
+
+        key = self._cloud_target_schema_key(cloud, schema)
+        with self._cloud_engine_lock:
+            cached = self._cloud_engine_cache.get(key)
+            if cached is not None:
+                return cached, key
+            url = self._build_pg_sqlalchemy_url(
+                str(cloud.get("host") or ""),
+                int(cloud.get("port") or 5432),
+                str(cloud.get("database") or "postgres"),
+                str(cloud.get("username") or ""),
+                str(cloud.get("password") or ""),
+            )
+            connect_args = {
+                "sslmode": "require" if cloud.get("tls", True) else "disable",
+                "connect_timeout": 5,
+                "prepare_threshold": None,
+            }
+            engine = create_engine(
+                url,
+                pool_pre_ping=True,
+                pool_size=4,
+                max_overflow=4,
+                pool_recycle=300,
+                connect_args=connect_args,
+            )
+            stale_keys = [k for k in self._cloud_engine_cache.keys() if k != key]
+            for stale_key in stale_keys:
+                stale_engine = self._cloud_engine_cache.pop(stale_key, None)
+                if stale_engine is None:
+                    continue
+                try:
+                    stale_engine.dispose()
+                except Exception:
+                    pass
+            self._cloud_engine_cache[key] = engine
+            return engine, key
 
     def _configured_tenant_id(self) -> str:
         forced = normalize_tenant_id(str(os.environ.get("TRUSTNODE_TENANT_ID") or "").strip())
@@ -872,28 +914,23 @@ class AppStore:
             return []
         tenant_id = self._current_tenant_id()
         try:
-            from sqlalchemy import create_engine, text  # type: ignore
+            from sqlalchemy import text  # type: ignore
         except Exception:
             return []
 
         schema = str(cloud.get("schema") or "public")
         lim = max(50, min(int(limit or 1000), 5000))
-        url = self._build_pg_sqlalchemy_url(
-            str(cloud.get("host") or ""),
-            int(cloud.get("port") or 5432),
-            str(cloud.get("database") or "postgres"),
-            str(cloud.get("username") or ""),
-            str(cloud.get("password") or ""),
-        )
-        connect_args = {
-            "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": 5,
-            "prepare_threshold": None,
-            "options": "-c lock_timeout=500ms -c statement_timeout=1500ms",
-        }
-        engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+        try:
+            engine, _ = self._get_or_create_cloud_engine(cloud, schema)
+        except Exception:
+            return []
         try:
             with engine.begin() as conn:
+                try:
+                    conn.execute(text("SET LOCAL lock_timeout = '500ms'"))
+                    conn.execute(text("SET LOCAL statement_timeout = '1500ms'"))
+                except Exception:
+                    pass
                 rows = conn.execute(
                     text(
                         f"""
@@ -941,11 +978,6 @@ class AppStore:
             return out
         except Exception:
             return []
-        finally:
-            try:
-                engine.dispose()
-            except Exception:
-                pass
 
     def _fetch_historian_rows_from_cloud(self, limit: int) -> list[dict[str, Any]]:
         cloud = self._get_cloud_database_target()
@@ -1541,41 +1573,28 @@ class AppStore:
         if not live_rows:
             return
         try:
-            from sqlalchemy import create_engine  # type: ignore
+            from sqlalchemy import text  # type: ignore
         except Exception as exc:
             self._set_data_sync_state(last_data_error=f"Live sync unavailable: {exc}")
             return
 
         schema = str(cloud.get("schema") or "public")
-        url = self._build_pg_sqlalchemy_url(
-            str(cloud.get("host") or ""),
-            int(cloud.get("port") or 5432),
-            str(cloud.get("database") or "postgres"),
-            str(cloud.get("username") or ""),
-            str(cloud.get("password") or ""),
-        )
-        connect_args = {
-            "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": 8,
-            "prepare_threshold": None,
-        }
-        engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
-        target_key = self._cloud_target_schema_key(cloud, schema)
         try:
+            engine, target_key = self._get_or_create_cloud_engine(cloud, schema)
             try:
                 self._ensure_cloud_schema_once(engine, schema, target_key)
             except Exception:
                 pass
             with engine.begin() as conn:
+                try:
+                    conn.execute(text("SET LOCAL lock_timeout = '500ms'"))
+                    conn.execute(text("SET LOCAL statement_timeout = '2500ms'"))
+                except Exception:
+                    pass
                 self._upsert_cloud_live_latest_rows(conn, schema, live_rows)
             self._live_fast_last_local_id = max(self._live_fast_last_local_id, int(max_local_id or 0))
         except Exception as exc:
             self._set_data_sync_state(last_data_error=f"Live sync failed: {exc}")
-        finally:
-            try:
-                engine.dispose()
-            except Exception:
-                pass
 
     def _flush_data_outbox_once(self) -> None:
         cloud = self._get_cloud_database_target()
@@ -1583,26 +1602,17 @@ class AppStore:
             self._set_data_sync_state(last_data_error="No enabled PostgreSQL cloud target configured")
             return
         try:
-            from sqlalchemy import create_engine, text  # type: ignore
+            from sqlalchemy import text  # type: ignore
         except Exception as exc:
             self._set_data_sync_state(last_data_error=f"SQLAlchemy unavailable: {exc}")
             return
 
         schema = str(cloud.get("schema") or "public")
-        url = self._build_pg_sqlalchemy_url(
-            str(cloud.get("host") or ""),
-            int(cloud.get("port") or 5432),
-            str(cloud.get("database") or "postgres"),
-            str(cloud.get("username") or ""),
-            str(cloud.get("password") or ""),
-        )
-        connect_args = {
-            "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": 8,
-            "prepare_threshold": None,
-        }
-        engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
-        target_key = self._cloud_target_schema_key(cloud, schema)
+        try:
+            engine, target_key = self._get_or_create_cloud_engine(cloud, schema)
+        except Exception as exc:
+            self._set_data_sync_state(last_data_error=f"Cloud engine setup failed: {exc}")
+            return
         state = self._get_data_sync_state()
         last_hist_id = int(state.get("last_historian_id", 0))
         last_log_id = int(state.get("last_log_id", 0))
@@ -1764,8 +1774,6 @@ class AppStore:
                 config={"name": cloud.get("name"), "host": cloud.get("host"), "schema": schema},
                 last_error=f"Data sync failed: {exc}",
             )
-        finally:
-            engine.dispose()
 
     def _ensure_schema(self) -> None:
         with self._lock:
@@ -2154,6 +2162,15 @@ class AppStore:
                 self._sync_thread.join(timeout=2.0)
         except Exception:
             pass
+        with self._cloud_engine_lock:
+            for key, engine in list(self._cloud_engine_cache.items()):
+                if engine is None:
+                    continue
+                try:
+                    engine.dispose()
+                except Exception:
+                    pass
+            self._cloud_engine_cache.clear()
 
     def _retention_scheduler_loop(self) -> None:
         while not self._stop_event.is_set():
