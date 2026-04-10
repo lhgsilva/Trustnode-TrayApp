@@ -139,6 +139,7 @@ class GatewayWorker:
 
     async def _run_loop(self, emit_event) -> None:
         while self.running:
+            cycle_started = time.monotonic()
             try:
                 readings = self._read_from_gateway()
                 self.latest_readings = readings
@@ -165,7 +166,9 @@ class GatewayWorker:
                 # Do not keep stale values visible when a read cycle fails.
                 self.latest_readings = []
                 await emit_event({"type": "error", "gateway_id": self.gateway_id, "message": self.last_error})
-            await asyncio.sleep(max(self.config.interval_ms / 1000.0, 0.1))
+            target_s = max(self.config.interval_ms / 1000.0, 0.1)
+            elapsed_s = max(0.0, time.monotonic() - cycle_started)
+            await asyncio.sleep(max(0.01, target_s - elapsed_s))
 
     def _is_collection_allowed(self, readings: List[GatewayReading]) -> tuple[bool, str | None]:
         triggers = [t for t in (self.config.collection_triggers or []) if bool(t.get("enabled", True))]
@@ -831,20 +834,10 @@ class GatewayWorker:
         engine = (self.db_sink.get("engine") or "").strip().lower()
         if engine == "postgresql":
             try:
-                # Fast path: write immediately so cloud mirrors local with minimal lag.
-                if self._persist_postgresql(readings):
-                    now_mono = time.monotonic()
-                    if now_mono - self._remote_last_pending_probe_monotonic >= self._remote_pending_probe_seconds:
-                        self._remote_last_pending_probe_monotonic = now_mono
-                        self.db_pending_count = self._count_pending()
-                    if self.db_pending_count > 0:
-                        self._schedule_remote_flush(engine)
-                    return
-            except Exception:
-                # Fall through to store-forward fallback.
-                pass
-            try:
+                # Never block real-time collection loop on remote/cloud roundtrips.
+                # Enqueue locally and flush in background thread.
                 self._enqueue_outbox(readings)
+                self._mark_db_write_success(len(readings))
                 now_mono = time.monotonic()
                 if now_mono - self._remote_last_pending_probe_monotonic >= self._remote_pending_probe_seconds:
                     self._remote_last_pending_probe_monotonic = now_mono
