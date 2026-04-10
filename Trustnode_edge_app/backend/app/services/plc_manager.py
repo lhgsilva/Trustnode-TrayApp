@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Set
 from urllib.parse import quote_plus
 
 from app.models import GatewayConfig, GatewayReading, GatewayStatus
+from app.tenant import normalize_tenant_id
 
 
 class GatewayWorker:
@@ -962,27 +963,56 @@ class GatewayWorker:
                               tag_name TEXT NOT NULL,
                               value DOUBLE PRECISION NULL,
                               quality INTEGER NULL,
+                              quality_label TEXT NULL,
                               source TEXT NULL,
+                              gateway_id TEXT NULL,
+                              gateway_name TEXT NULL,
+                              device_name TEXT NULL,
+                              plc_ip TEXT NULL,
+                              database_name TEXT NULL,
                               site TEXT NULL,
                               area TEXT NULL,
                               equipment TEXT NULL,
+                              tenant_id TEXT NULL,
                               seq BIGINT NULL,
-                              raw_payload JSONB NULL
+                              raw_payload JSONB NULL,
+                              created_utc TIMESTAMPTZ NULL
                             )
                             """
                         )
                     )
+                    # Keep compatibility with already-provisioned tables that were
+                    # created before cloud mirror columns existed.
+                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS quality_label TEXT'))
+                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS gateway_id TEXT'))
+                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS gateway_name TEXT'))
+                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS device_name TEXT'))
+                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS plc_ip TEXT'))
+                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS database_name TEXT'))
+                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS tenant_id TEXT'))
+                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS created_utc TIMESTAMPTZ'))
                 self._db_schema_ready_key = key
+            tenant_id = normalize_tenant_id(str(self.db_sink.get("tenant_id") or os.environ.get("TRUSTNODE_TENANT_ID") or "default"))
+            db_name = str(self.db_sink.get("name") or database or "").strip()
+            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             rows = [
                 {
                     "ts_utc": r.ts_utc,
                     "tag_name": r.tag_name,
                     "value": r.value,
                     "quality": r.quality,
+                    "quality_label": r.quality_label,
                     "source": r.source,
+                    "gateway_id": self.gateway_id,
+                    "gateway_name": self.gateway_id,
+                    "device_name": "",
+                    "plc_ip": self.config.plc_ip,
+                    "database_name": db_name,
                     "site": r.site,
                     "area": r.area,
                     "equipment": r.equipment,
+                    "tenant_id": tenant_id,
+                    "created_utc": now_utc,
                     "raw_payload": json.dumps(r.model_dump()),
                 }
                 for r in readings
@@ -992,8 +1022,8 @@ class GatewayWorker:
                     text(
                         f"""
                         INSERT INTO "{schema}"."{table}"
-                        (ts_utc, tag_name, value, quality, source, site, area, equipment, raw_payload)
-                        VALUES (CAST(:ts_utc AS timestamptz), :tag_name, :value, :quality, :source, :site, :area, :equipment, CAST(:raw_payload AS jsonb))
+                        (ts_utc, tag_name, value, quality, quality_label, source, gateway_id, gateway_name, device_name, plc_ip, database_name, site, area, equipment, tenant_id, created_utc, raw_payload)
+                        VALUES (CAST(:ts_utc AS timestamptz), :tag_name, :value, :quality, :quality_label, :source, :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :site, :area, :equipment, :tenant_id, CAST(:created_utc AS timestamptz), CAST(:raw_payload AS jsonb))
                         """
                     ),
                     rows,
