@@ -873,71 +873,6 @@ class AppStore:
             with engine.begin() as conn:
                 hist_rows: list[Any] = []
                 plc_rows: list[Any] = []
-                try:
-                    hist_rows = conn.execute(
-                        text(
-                            f"""
-                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                                   tag_name, value, quality, quality_label
-                            FROM "{schema}"."historian_readings"
-                            WHERE tenant_id = :tenant
-                            ORDER BY id DESC
-                            LIMIT :lim
-                            """
-                        ),
-                        {"lim": lim, "tenant": tenant_id},
-                    ).fetchall()
-                except Exception:
-                    hist_rows = []
-                if not hist_rows:
-                    try:
-                        hist_rows = conn.execute(
-                            text(
-                                f"""
-                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                                       tag_name, value, quality, quality_label
-                                FROM "{schema}"."historian_readings"
-                                ORDER BY id DESC
-                                LIMIT :lim
-                                """
-                            ),
-                            {"lim": lim},
-                        ).fetchall()
-                    except Exception:
-                        hist_rows = []
-                try:
-                    plc_rows = conn.execute(
-                        text(
-                            f"""
-                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                                   tag_name, value, quality, quality_label
-                            FROM "{schema}"."plc_readings"
-                            WHERE tenant_id = :tenant
-                            ORDER BY id DESC
-                            LIMIT :lim
-                            """
-                        ),
-                        {"lim": lim, "tenant": tenant_id},
-                    ).fetchall()
-                except Exception:
-                    plc_rows = []
-                if not plc_rows:
-                    try:
-                        plc_rows = conn.execute(
-                            text(
-                                f"""
-                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                                       tag_name, value, quality, quality_label
-                                FROM "{schema}"."plc_readings"
-                                ORDER BY id DESC
-                                LIMIT :lim
-                                """
-                            ),
-                            {"lim": lim},
-                        ).fetchall()
-                    except Exception:
-                        plc_rows = []
-
                 def _top_ts_ms(rows_in: list[Any]) -> int:
                     if not rows_in:
                         return 0
@@ -951,6 +886,53 @@ class AppStore:
                         return int(datetime.fromisoformat(txt).timestamp() * 1000)
                     except Exception:
                         return 0
+
+                def _fetch_rows_with_freshness_fallback(table_name: str) -> list[Any]:
+                    scoped_rows: list[Any] = []
+                    unscoped_rows: list[Any] = []
+                    try:
+                        scoped_rows = conn.execute(
+                            text(
+                                f"""
+                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                       tag_name, value, quality, quality_label
+                                FROM "{schema}"."{table_name}"
+                                WHERE tenant_id = :tenant
+                                ORDER BY id DESC
+                                LIMIT :lim
+                                """
+                            ),
+                            {"lim": lim, "tenant": tenant_id},
+                        ).fetchall()
+                    except Exception:
+                        scoped_rows = []
+                    try:
+                        unscoped_rows = conn.execute(
+                            text(
+                                f"""
+                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                       tag_name, value, quality, quality_label
+                                FROM "{schema}"."{table_name}"
+                                ORDER BY id DESC
+                                LIMIT :lim
+                                """
+                            ),
+                            {"lim": lim},
+                        ).fetchall()
+                    except Exception:
+                        unscoped_rows = []
+                    if not scoped_rows:
+                        return unscoped_rows
+                    if not unscoped_rows:
+                        return scoped_rows
+                    scoped_top = _top_ts_ms(scoped_rows)
+                    unscoped_top = _top_ts_ms(unscoped_rows)
+                    if unscoped_top > scoped_top + 3000:
+                        return unscoped_rows
+                    return scoped_rows
+
+                hist_rows = _fetch_rows_with_freshness_fallback("historian_readings")
+                plc_rows = _fetch_rows_with_freshness_fallback("plc_readings")
 
                 hist_top = _top_ts_ms(hist_rows)
                 plc_top = _top_ts_ms(plc_rows)
