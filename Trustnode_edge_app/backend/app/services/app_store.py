@@ -152,6 +152,24 @@ class AppStore:
             pass
         return False
 
+    def get_config_domain(self, domain: str, default: Any | None = None) -> Any:
+        name = str(domain or "").strip()
+        if not name:
+            return {} if default is None else default
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM config_documents WHERE domain = ?",
+                    (name,),
+                ).fetchone()
+        if not row:
+            return {} if default is None else default
+        try:
+            payload = json.loads(str(row["payload_json"] or "null"))
+        except Exception:
+            return {} if default is None else default
+        return payload if payload is not None else ({} if default is None else default)
+
     def _ensure_cloud_schema_once(self, engine: Any, schema: str, target_key: str) -> None:
         if target_key in self._cloud_schema_ready_keys:
             return
