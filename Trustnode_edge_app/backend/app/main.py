@@ -137,11 +137,69 @@ async def websocket_stream(websocket: WebSocket) -> None:
 
 async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> None:
     live_limit = 300
-    sample_interval_seconds = 0.8
+    sample_interval_seconds = 0.7
+
+    def _ts_ms(raw: str) -> int:
+        text = str(raw or "").strip()
+        if not text:
+            return 0
+        try:
+            iso = text.replace("Z", "+00:00")
+            if " " in iso and "T" not in iso:
+                iso = iso.replace(" ", "T")
+            return int(datetime.fromisoformat(iso).timestamp() * 1000)
+        except Exception:
+            return 0
+
     try:
         while True:
-            live_rows = app_store.get_live_rows(limit=live_limit)
-            gateway_statuses = app_store.build_gateway_statuses_from_live_rows(live_rows)
+            live_rows = app_store.get_live_rows(limit=live_limit, prefer_cloud_reads=True)
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            latest_by_gateway: dict[str, dict[str, str]] = {}
+            write_count_by_gateway: dict[str, int] = {}
+            for row in live_rows:
+                gateway_id = str(row.get("gateway_id") or "").strip()
+                if not gateway_id:
+                    continue
+                write_count_by_gateway[gateway_id] = int(write_count_by_gateway.get(gateway_id, 0)) + 1
+                ts_txt = str(row.get("ts") or row.get("ts_utc") or "")
+                ts_epoch = _ts_ms(ts_txt)
+                prev = latest_by_gateway.get(gateway_id)
+                prev_epoch = _ts_ms(prev.get("ts", "")) if prev else 0
+                if not prev or ts_epoch >= prev_epoch:
+                    latest_by_gateway[gateway_id] = {
+                        "ts": ts_txt,
+                        "gateway_name": str(row.get("gateway_name") or gateway_id),
+                        "gateway_type": str(row.get("source") or ""),
+                        "plc_ip": str(row.get("plc_ip") or ""),
+                    }
+
+            gateway_statuses = []
+            for gateway_id, meta in latest_by_gateway.items():
+                ts_txt = str(meta.get("ts") or "")
+                ts_epoch = _ts_ms(ts_txt)
+                running = ts_epoch > 0 and max(0, now_ms - ts_epoch) <= 12000
+                gateway_statuses.append(
+                    {
+                        "running": bool(running),
+                        "gateway_type": str(meta.get("gateway_type") or ""),
+                        "plc_ip": str(meta.get("plc_ip") or ""),
+                        "interval_ms": 1000,
+                        "tags": [],
+                        "last_error": None,
+                        "db_sink_engine": "",
+                        "db_write_count": int(write_count_by_gateway.get(gateway_id, 0)),
+                        "db_last_write_utc": ts_txt,
+                        "db_last_error": None,
+                        "db_pending_count": 0,
+                        "collection_blocked": False,
+                        "collection_block_reason": None,
+                        "gateway_id": gateway_id,
+                        "gateway_name": str(meta.get("gateway_name") or gateway_id),
+                        "last_check_utc": ts_txt,
+                    }
+                )
+            gateway_statuses.sort(key=lambda g: str(g.get("last_check_utc") or ""), reverse=True)
             running_gateways = [g for g in gateway_statuses if bool(g.get("running"))]
             newest_ts = max((str(g.get("last_check_utc") or "") for g in gateway_statuses), default="")
             payload = {
