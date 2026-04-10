@@ -971,59 +971,54 @@ class AppStore:
                     conn.execute(text("SET LOCAL statement_timeout = '1500ms'"))
                 except Exception:
                     pass
-                live_rows = conn.execute(
-                    text(
-                        f"""
+                def _fetch_rows_with_freshness_fallback(table_name: str, fetch_limit: int) -> list[Any]:
+                    scoped_rows: list[Any] = []
+                    unscoped_rows: list[Any] = []
+                    base_sql = f"""
                         SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                tag_name, value, quality, quality_label
-                        FROM "{schema}"."live_latest"
-                        WHERE tenant_id = :tenant
-                        ORDER BY ts_utc DESC
-                        LIMIT :lim
-                        """
-                    ),
-                    {"tenant": tenant_id, "lim": lim},
-                ).fetchall()
-                if not live_rows and tenant_id == "default":
-                    live_rows = conn.execute(
-                        text(
-                            f"""
-                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                                   tag_name, value, quality, quality_label
-                            FROM "{schema}"."live_latest"
-                            ORDER BY ts_utc DESC
-                            LIMIT :lim
-                            """
-                        ),
-                        {"lim": lim},
-                    ).fetchall()
+                        FROM "{schema}"."{table_name}"
+                    """
+                    try:
+                        scoped_rows = conn.execute(
+                            text(
+                                base_sql
+                                + """
+                                WHERE tenant_id = :tenant
+                                ORDER BY ts_utc DESC
+                                LIMIT :lim
+                                """
+                            ),
+                            {"tenant": tenant_id, "lim": fetch_limit},
+                        ).fetchall()
+                    except Exception:
+                        scoped_rows = []
+                    try:
+                        unscoped_rows = conn.execute(
+                            text(
+                                base_sql
+                                + """
+                                ORDER BY ts_utc DESC
+                                LIMIT :lim
+                                """
+                            ),
+                            {"lim": fetch_limit},
+                        ).fetchall()
+                    except Exception:
+                        unscoped_rows = []
+                    if not scoped_rows:
+                        return unscoped_rows
+                    if not unscoped_rows:
+                        return scoped_rows
+                    scoped_top = _top_ts_ms(scoped_rows)
+                    unscoped_top = _top_ts_ms(unscoped_rows)
+                    if unscoped_top > scoped_top + 3000:
+                        return unscoped_rows
+                    return scoped_rows
+
+                live_rows = _fetch_rows_with_freshness_fallback("live_latest", lim)
                 sample_limit = min(max(lim * 4, 500), 4000)
-                plc_rows = conn.execute(
-                    text(
-                        f"""
-                        SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                               tag_name, value, quality, quality_label
-                        FROM "{schema}"."plc_readings"
-                        WHERE tenant_id = :tenant
-                        ORDER BY ts_utc DESC
-                        LIMIT :lim
-                        """
-                    ),
-                    {"tenant": tenant_id, "lim": sample_limit},
-                ).fetchall()
-                if not plc_rows and tenant_id == "default":
-                    plc_rows = conn.execute(
-                        text(
-                            f"""
-                            SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                                   tag_name, value, quality, quality_label
-                            FROM "{schema}"."plc_readings"
-                            ORDER BY ts_utc DESC
-                            LIMIT :lim
-                            """
-                        ),
-                        {"lim": sample_limit},
-                    ).fetchall()
+                plc_rows = _fetch_rows_with_freshness_fallback("plc_readings", sample_limit)
 
             live_top = _top_ts_ms(live_rows)
             plc_top = _top_ts_ms(plc_rows)
