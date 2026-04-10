@@ -224,12 +224,40 @@ export async function stopGateway() {
 }
 
 export async function startGatewayInstance(payload) {
-  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/gateways/start`, {
+  const request = {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  }, 30000);
-  if (!res.ok) throw new Error("Gateway instance start failed");
+  };
+  let res;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const timeoutMs = 45000 + (attempt - 1) * 15000;
+      res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/gateways/start`, request, timeoutMs);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientFetchError(err) || attempt === 3) break;
+      await sleep(300 * attempt);
+    }
+  }
+  if (!res) throw lastErr || new Error("Gateway instance start failed");
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = body?.detail || body?.message || JSON.stringify(body);
+    } catch {
+      try {
+        detail = await res.text();
+      } catch {
+        detail = "";
+      }
+    }
+    throw new Error(`Gateway instance start failed (HTTP ${res.status})${detail ? `: ${detail}` : ""}`);
+  }
   return res.json();
 }
 
@@ -244,7 +272,20 @@ export async function stopGatewayInstance(gatewayId) {
 }
 
 export async function getGatewayInstanceStatuses() {
-  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/gateways/status`);
+  let res;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/gateways/status`, {}, 20000);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientFetchError(err) || attempt === 2) break;
+      await sleep(200 * attempt);
+    }
+  }
+  if (!res) throw lastErr || new Error("Gateway instance status fetch failed");
   if (!res.ok) throw new Error("Gateway instance status fetch failed");
   return res.json();
 }

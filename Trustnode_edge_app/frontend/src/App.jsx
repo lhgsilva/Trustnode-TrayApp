@@ -1565,7 +1565,7 @@ function AppShell() {
 
   useEffect(() => {
     let stopped = false;
-    if (endpointMode === "cloud") {
+    if (isHostedWebClient && endpointMode === "cloud") {
       return () => {
         stopped = true;
       };
@@ -1580,7 +1580,8 @@ function AppShell() {
         }
         setGatewayRuntimeStatuses(map);
       } catch {
-        if (!stopped) setGatewayRuntimeStatuses({});
+        // Keep last known runtime state to avoid false STOPPED/DB FAILS flicker
+        // when a single status poll hits a transient timeout.
       }
     };
     refresh();
@@ -1590,7 +1591,7 @@ function AppShell() {
       stopped = true;
       clearInterval(timer);
     };
-  }, [endpointMode, endpointVersion, currentUser?.username]);
+  }, [endpointMode, endpointVersion, currentUser?.username, isHostedWebClient]);
 
   useEffect(() => {
     const onFullscreenChange = () => {
@@ -2284,7 +2285,7 @@ function AppShell() {
   }, [config]);
 
   useEffect(() => {
-    if (endpointMode === "cloud") return;
+    if (isHostedWebClient && endpointMode === "cloud") return;
     let stopped = false;
     let running = false;
     const checkDevices = async () => {
@@ -2346,10 +2347,10 @@ function AppShell() {
       stopped = true;
       clearInterval(timer);
     };
-  }, [endpointMode]);
+  }, [endpointMode, isHostedWebClient]);
 
   useEffect(() => {
-    if (endpointMode === "cloud") return;
+    if (isHostedWebClient && endpointMode === "cloud") return;
     let stopped = false;
     let running = false;
     const checkDbConnections = async () => {
@@ -2417,7 +2418,7 @@ function AppShell() {
       stopped = true;
       clearInterval(timer);
     };
-  }, [endpointMode]);
+  }, [endpointMode, isHostedWebClient]);
 
   useEffect(() => {
     if (currentUser?.username && rememberUser) {
@@ -3677,13 +3678,14 @@ function AppShell() {
   const getGatewayHealth = (gateway) => {
     if (!gateway) return { ok: false, label: "Not Ready" };
     const rt = gatewayRuntimeStatusesView[gateway.id] || gatewayRuntimeStatuses[gateway.id] || null;
-    const runtimeStoppedClean =
-      endpointMode === "cloud" &&
-      rt &&
-      rt.running === false &&
-      !String(rt.last_error || "").trim() &&
-      !String(rt.db_last_error || "").trim();
-    if (runtimeStoppedClean) return { ok: false, label: "Stopped" };
+    if (rt) {
+      const rtErr = String(rt.last_error || "").trim();
+      const dbErr = String(rt.db_last_error || "").trim();
+      if (rt.running === true && !rtErr && !dbErr) return { ok: true, label: "Running" };
+      if (rt.running === false && !rtErr && !dbErr) return { ok: false, label: "Stopped" };
+      if (rt.running === true && dbErr) return { ok: false, label: "DB Fails" };
+      if (rt.running === true && rtErr) return { ok: false, label: "Device Fails" };
+    }
     const device = devices.find((d) => d.id === gateway.device_id) || null;
     const db = dbConnections.find((c) => c.id === gateway.database_id) || null;
     const deviceProtocolOk = Boolean(device && (device.protocol_ok ?? device.port_ok));
@@ -4263,6 +4265,7 @@ function AppShell() {
         const relatedRuntime = relatedGateways.map((g) => gatewayRuntimeStatusesView[g.id]).filter(Boolean);
         const hasRelated = relatedRuntime.length > 0;
         const allStoppedClean =
+          isHostedWebClient &&
           endpointMode === "cloud" &&
           hasRelated &&
           relatedRuntime.every(
@@ -4289,7 +4292,7 @@ function AppShell() {
         }
         return { ...d, protocolOk, status, statusKey };
       }),
-    [devicesView, gatewayConfigsView, gatewayRuntimeStatusesView, endpointMode]
+    [devicesView, gatewayConfigsView, gatewayRuntimeStatusesView, endpointMode, isHostedWebClient]
   );
 
   const tagRows = useMemo(() => {
@@ -4695,6 +4698,11 @@ function AppShell() {
       setError("Select a gateway configuration first.");
       return;
     }
+    const gid = String(gateway.id || "");
+    if (gatewayRuntimeStatusesRef.current[gid]?.running) {
+      setError("");
+      return;
+    }
     const db = dbConnections.find((c) => c.id === gateway.database_id);
     const activeGatewayTriggers = collectionTriggers.filter((t) => t.enabled !== false);
     let payload;
@@ -4741,8 +4749,35 @@ function AppShell() {
       setError("");
     } catch (err) {
       const errText = String(err || "");
-      await refreshGatewayRuntimes();
-      const runtime = gatewayRuntimeStatusesRef.current[String(gateway.id || "")];
+      const transientStartErr = /aborterror|signal is aborted|failed to fetch|networkerror|timeout/i.test(
+        errText.toLowerCase()
+      );
+      if (transientStartErr) {
+        markGatewayRunningState([gid], true);
+        for (let i = 0; i < 5; i += 1) {
+          try {
+            await refreshGatewayRuntimes();
+          } catch {
+            // Ignore transient refresh errors; keep probing.
+          }
+          const probe = gatewayRuntimeStatusesRef.current[gid];
+          if (probe?.running) {
+            setError("");
+            addAppLog({
+              level: "warning",
+              category: "gateway",
+              gateway_id: gid,
+              gateway_name: gateway.name || gid,
+              message: "Start acknowledged with delayed response, gateway is running."
+            });
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 700));
+        }
+      } else {
+        await refreshGatewayRuntimes();
+      }
+      const runtime = gatewayRuntimeStatusesRef.current[gid];
       if (runtime?.running) {
         setError("");
         addAppLog({
