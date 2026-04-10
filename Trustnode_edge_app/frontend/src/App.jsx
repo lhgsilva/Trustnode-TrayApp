@@ -2993,7 +2993,7 @@ function AppShell() {
                 const relatedGw = (gatewayConfigsRef.current || []).find((g) => String(g.device_id || "") === String(d.id || ""));
                 const tsFromGw = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
                 const tsFromIp = latestByPlcIp[String(d?.plc_ip || "").trim()] || "";
-                const ts = isCloudEdgeFilterActive ? tsFromGw : (tsFromGw || tsFromIp);
+                const ts = tsFromGw || tsFromIp;
                 const rawOnline = ts
                   ? (() => {
                       const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
@@ -3317,7 +3317,7 @@ function AppShell() {
                 const relatedGw = (gatewayConfigsRef.current || []).find((g) => String(g.device_id || "") === String(d.id || ""));
                 const tsFromGw = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
                 const tsFromIp = latestByPlcIp[String(d?.plc_ip || "").trim()] || "";
-                const ts = isCloudEdgeFilterActive ? tsFromGw : (tsFromGw || tsFromIp);
+                const ts = tsFromGw || tsFromIp;
                 const rawOnline = ts
                   ? (() => {
                       const ageMs = Math.max(0, nowMs - new Date(ts).getTime());
@@ -3738,11 +3738,6 @@ function AppShell() {
       const lastWriteMs = new Date(String(rt.db_last_write_utc || "")).getTime();
       const hasFreshWrite = Number.isFinite(lastWriteMs) && (Date.now() - lastWriteMs) <= 15000;
       const pending = Number(rt.db_pending_count || 0);
-      const intervalMs = Math.max(1000, Number(gateway?.interval_ms || 1000));
-      const fresh = isFreshCloudTs(rt?.last_check_utc || gateway?.last_check_utc || "", Math.max(8000, intervalMs * 6));
-      if (isHostedWebClient && endpointMode === "cloud" && !fresh) {
-        return { ok: false, label: "Stale" };
-      }
       if (rt.running === true) {
         if (rtErr) return { ok: false, label: "Device Fails" };
         if (dbErr && !hasFreshWrite && pending > 0) return { ok: false, label: "DB Fails" };
@@ -3762,14 +3757,14 @@ function AppShell() {
   };
 
   const getDbWritingLabel = (dbId) => {
-    const linkedGatewayIds = gatewayConfigsView
+    const linkedGatewayIds = gatewayConfigs
       .filter((g) => g.database_id === dbId)
       .map((g) => g.id);
     if (!linkedGatewayIds.length) return "W:0 | P:0";
     let writes = 0;
     let pending = 0;
     for (const gid of linkedGatewayIds) {
-      const rt = gatewayRuntimeStatusesView[gid] || gatewayRuntimeStatuses[gid];
+      const rt = gatewayRuntimeStatuses[gid];
       if (!rt) continue;
       writes += Number(rt.db_write_count || 0);
       pending += Number(rt.db_pending_count || 0);
@@ -3981,18 +3976,15 @@ function AppShell() {
 
   const getGatewayFooterDbWriting = (gateway) => {
     if (!gateway?.database_id) return "No DB selected";
-    const db = dbConnectionsView.find((c) => c.id === gateway.database_id) || dbConnections.find((c) => c.id === gateway.database_id);
+    const db = dbConnections.find((c) => c.id === gateway.database_id);
     const dbName = db?.name || "Unknown DB";
-    const rt = gatewayRuntimeStatusesView[gateway.id] || gatewayRuntimeStatuses[gateway.id] || null;
+    const rt = gatewayRuntimeStatuses[gateway.id] || null;
     const writes = Number(rt?.db_write_count || 0);
     const pending = Number(rt?.db_pending_count || 0);
     const lastCheckUtc = String(rt?.last_check_utc || "");
     if (isHostedWebClient && endpointMode === "cloud") {
-      const fresh = isFreshCloudTs(lastCheckUtc, Math.max(8000, Number(gateway?.interval_ms || 1000) * 6));
-      const ageSec = lastCheckUtc ? Math.max(0, Math.floor((Date.now() - new Date(lastCheckUtc).getTime()) / 1000)) : null;
-      const cloudState = fresh ? "LIVE" : "STALE";
-      const ageText = ageSec === null || !Number.isFinite(ageSec) ? "" : ` | ${ageSec}s`;
-      return `${dbName} | Rows ${writes} | Pending ${pending} | ${cloudState}${ageText}`;
+      const cloudState = isFreshCloudTs(lastCheckUtc, 15000) ? "LIVE" : "STALE";
+      return `${dbName} | Rows ${writes} | Pending ${pending} | ${cloudState}`;
     }
     return `${dbName} | Writes ${writes} | Pending ${pending}`;
   };
@@ -4080,7 +4072,6 @@ function AppShell() {
       .map((g) => {
         const ageMs = g.lastLiveUtc ? Date.now() - new Date(g.lastLiveUtc).getTime() : Number.POSITIVE_INFINITY;
         const liveHealthy = Number.isFinite(ageMs) ? ageMs <= 10000 : false;
-        const liveAgeSec = Number.isFinite(ageMs) ? Math.max(0, ageMs / 1000) : Number.POSITIVE_INFINITY;
         const hasConfigMetadata = g.dbNames.size > 0;
         const liveRecent = Number.isFinite(ageMs) ? ageMs <= 15 * 60 * 1000 : false;
         const configMs = g.lastConfigUtc ? new Date(g.lastConfigUtc).getTime() : Number.NaN;
@@ -4091,10 +4082,6 @@ function AppShell() {
           gatewayCount: g.gatewayIds.size,
           liveGatewayIds: Array.from(g.liveGatewayIds || []),
           liveHealthy,
-          liveAgeSec,
-          freshnessLabel: Number.isFinite(liveAgeSec)
-            ? (liveAgeSec <= 2 ? "live" : liveAgeSec <= 10 ? "delay" : "stale")
-            : "stale",
           includeInSelector: liveRecent || (hasConfigMetadata && configRecent),
           dbNamesText: Array.from(g.dbNames).sort().join(", "),
         };
@@ -4102,14 +4089,6 @@ function AppShell() {
       .filter((g) => g.includeInSelector)
       .sort((a, b) => String(b.lastLiveUtc || b.lastConfigUtc || "").localeCompare(String(a.lastLiveUtc || a.lastConfigUtc || "")));
   }, [endpointMode, dbConnections, gatewayConfigs, dataLog]);
-  const freshCloudSourceRows = useMemo(
-    () => cloudSourceRows.filter((r) => Number(r.liveAgeSec || Number.POSITIVE_INFINITY) <= 20),
-    [cloudSourceRows]
-  );
-  const staleCloudSourceRows = useMemo(
-    () => cloudSourceRows.filter((r) => Number(r.liveAgeSec || Number.POSITIVE_INFINITY) > 20),
-    [cloudSourceRows]
-  );
   const selectedCloudEdge = useMemo(() => {
     if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY) return null;
     return cloudSourceRows.find((r) => String(r.key) === String(selectedCloudEdgeKey)) || null;
@@ -4206,7 +4185,7 @@ function AppShell() {
       return;
     }
     if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY && cloudSourceRows.length) {
-      const preferred = freshCloudSourceRows[0] || cloudSourceRows.find((r) => r.liveHealthy) || cloudSourceRows[0];
+      const preferred = cloudSourceRows.find((r) => r.liveHealthy) || cloudSourceRows[0];
       if (preferred?.key) {
         setSelectedCloudEdgeKey(String(preferred.key));
         return;
@@ -4215,7 +4194,7 @@ function AppShell() {
     if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY) return;
     if (cloudSourceRows.some((r) => String(r.key) === String(selectedCloudEdgeKey))) return;
     setSelectedCloudEdgeKey(CLOUD_EDGE_ALL_KEY);
-  }, [isHostedWebClient, endpointMode, selectedCloudEdgeKey, cloudSourceRows, freshCloudSourceRows]);
+  }, [isHostedWebClient, endpointMode, selectedCloudEdgeKey, cloudSourceRows]);
 
   useEffect(() => {
     const preferredId = String(databaseInspector?.cloud_target?.id || "").trim();
@@ -4313,18 +4292,15 @@ function AppShell() {
   const isGatewayRunning = (gateway) => {
     if (!gateway) return false;
     const rt = gatewayRuntimeStatusesView[gateway.id];
-    if (isHostedWebClient && endpointMode === "cloud") {
-      const intervalMs = Math.max(1000, Number(gateway?.interval_ms || 1000));
-      const maxAgeMs = Math.max(8000, intervalMs * 6);
-      const fresh = isFreshCloudTs(rt?.last_check_utc || gateway?.last_check_utc || "", maxAgeMs);
-      return Boolean(rt?.running) && fresh;
-    }
     if (rt && typeof rt.running === "boolean") return Boolean(rt.running);
+    if (isHostedWebClient && endpointMode === "cloud") {
+      return isFreshCloudTs(rt?.last_check_utc || gateway?.last_check_utc || "", 15000);
+    }
     return false;
   };
   const anyGatewayRunning = useMemo(
-    () => gatewayConfigsView.some((g) => isGatewayRunning(g)),
-    [gatewayConfigsView, gatewayRuntimeStatusesView, endpointMode, isHostedWebClient]
+    () => gatewayConfigsView.some((g) => Boolean(gatewayRuntimeStatusesView[g.id]?.running)),
+    [gatewayConfigsView, gatewayRuntimeStatusesView]
   );
   const contentBottomPad = useMemo(
     () => (footerCollapsed ? 16 : Math.max(footerHeight + 18, 140)),
@@ -7852,31 +7828,13 @@ function AppShell() {
                 onChange={(e) => setSelectedCloudEdgeKey(e.target.value)}
                 title="Select which edge source to monitor"
               >
-                {freshCloudSourceRows.length ? (
-                  <optgroup label="Fresh edges">
-                    {freshCloudSourceRows.map((s) => (
-                      <option key={`edge-opt-fresh-${s.key}`} value={s.key}>
-                        {`${s.source} | ${s.site} | ${s.area} | ${s.equipment} | ${Math.round(Number(s.liveAgeSec || 0))}s`}
-                      </option>
-                    ))}
-                  </optgroup>
-                ) : null}
-                {staleCloudSourceRows.length ? (
-                  <optgroup label="Stale edges">
-                    {staleCloudSourceRows.map((s) => (
-                      <option key={`edge-opt-stale-${s.key}`} value={s.key}>
-                        {`${s.source} | ${s.site} | ${s.area} | ${s.equipment} | stale ${Math.round(Number(s.liveAgeSec || 0))}s`}
-                      </option>
-                    ))}
-                  </optgroup>
-                ) : null}
                 <option value={CLOUD_EDGE_ALL_KEY}>All edges</option>
+                {cloudSourceRows.map((s) => (
+                  <option key={`edge-opt-${s.key}`} value={s.key}>
+                    {`${s.source} | ${s.site} | ${s.area} | ${s.equipment}`}
+                  </option>
+                ))}
               </select>
-              {selectedCloudEdge ? (
-                <span className={`status-pill ${selectedCloudEdge.freshnessLabel === "live" ? "status-online" : selectedCloudEdge.freshnessLabel === "delay" ? "status-warning" : "status-offline"}`}>
-                  {`Edge ${Math.round(Number(selectedCloudEdge.liveAgeSec || 0))}s`}
-                </span>
-              ) : null}
               <span className="header-cloud-label">Edge Link</span>
               <span
                 className={`status-pill ${
