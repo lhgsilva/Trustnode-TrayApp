@@ -1251,6 +1251,7 @@ function AppShell() {
   const devicesRef = useRef([]);
   const dbConnectionsRef = useRef([]);
   const gatewayConfigsRef = useRef([]);
+  const gatewayRuntimeStatusesRef = useRef({});
   const collectionTriggersRef = useRef([]);
   const triggerRulesRef = useRef([]);
   const triggerActiveStateRef = useRef({});
@@ -1268,6 +1269,7 @@ function AppShell() {
   const historianOutboxRef = useRef([]);
   const logsOutboxRef = useRef([]);
   const outboxFlushBusyRef = useRef(false);
+  const dbCheckFailuresRef = useRef({});
   const dbRecoveryInFlightRef = useRef(false);
   const dbRecoveryLastSignatureRef = useRef("");
   const configRestartSignatureRef = useRef("");
@@ -1721,6 +1723,10 @@ function AppShell() {
   useEffect(() => {
     dbConnectionsRef.current = dbConnections;
   }, [dbConnections]);
+
+  useEffect(() => {
+    gatewayRuntimeStatusesRef.current = gatewayRuntimeStatuses || {};
+  }, [gatewayRuntimeStatuses]);
 
   useEffect(() => {
     tagAlarmPrefsRef.current = tagAlarmPrefs || {};
@@ -2356,6 +2362,7 @@ function AppShell() {
                 username: c.username || "",
                 password: c.password || "",
                 sqlite_path: c.sqlite_path || "",
+                file_path: c.file_path || "",
                 legacy_url: c.legacy_url || "",
                 legacy_api_token: c.legacy_api_token || "",
                 tls: Boolean(c.tls),
@@ -2363,7 +2370,9 @@ function AppShell() {
               });
               return { id: c.id, connection_ok: Boolean(res.ok), last_test: res.message, last_check_utc: tsNow() };
             } catch (err) {
-              return { id: c.id, connection_ok: false, last_test: String(err), last_check_utc: tsNow() };
+              const msg = String(err || "");
+              const transient = /aborterror|signal is aborted|failed to fetch|networkerror|load failed/i.test(msg);
+              return { id: c.id, connection_ok: false, last_test: msg, last_check_utc: tsNow(), transient };
             }
           })
         );
@@ -2371,7 +2380,25 @@ function AppShell() {
         setDbConnections((prev) =>
           prev.map((c) => {
             const hit = checks.find((x) => x.id === c.id);
-            return hit ? { ...c, connection_ok: hit.connection_ok, last_test: hit.last_test, last_check_utc: hit.last_check_utc } : c;
+            if (!hit) return c;
+            const key = String(c.id || "");
+            if (hit.connection_ok) {
+              dbCheckFailuresRef.current[key] = 0;
+              return { ...c, connection_ok: true, last_test: hit.last_test, last_check_utc: hit.last_check_utc };
+            }
+            const prevFails = Number(dbCheckFailuresRef.current[key] || 0);
+            const nextFails = prevFails + 1;
+            dbCheckFailuresRef.current[key] = nextFails;
+            const keepOnline = Boolean(hit.transient) && Boolean(c.connection_ok) && nextFails < 3;
+            if (keepOnline) {
+              return {
+                ...c,
+                connection_ok: true,
+                last_test: `Transient check issue (retrying): ${hit.last_test}`,
+                last_check_utc: hit.last_check_utc
+              };
+            }
+            return { ...c, connection_ok: false, last_test: hit.last_test, last_check_utc: hit.last_check_utc };
           })
         );
       } finally {
@@ -4695,13 +4722,27 @@ function AppShell() {
       }
       setError("");
     } catch (err) {
-      setError(`Start gateway failed: ${String(err)}`);
+      const errText = String(err || "");
+      await refreshGatewayRuntimes();
+      const runtime = gatewayRuntimeStatusesRef.current[String(gateway.id || "")];
+      if (runtime?.running) {
+        setError("");
+        addAppLog({
+          level: "warning",
+          category: "gateway",
+          gateway_id: gateway.id,
+          gateway_name: gateway.name || gateway.id,
+          message: `Start request completed with delayed response, but gateway is running.`
+        });
+        return;
+      }
+      setError(`Start gateway failed: ${errText}`);
       addAppLog({
         level: "error",
         category: "gateway",
         gateway_id: gateway.id,
         gateway_name: gateway.name || gateway.id,
-        message: `Start failed: ${String(err)}`
+        message: `Start failed: ${errText}`
       });
     }
   };

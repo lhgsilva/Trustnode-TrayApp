@@ -215,7 +215,7 @@ export async function startGatewayInstance(payload) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  });
+  }, 30000);
   if (!res.ok) throw new Error("Gateway instance start failed");
   return res.json();
 }
@@ -225,7 +225,7 @@ export async function stopGatewayInstance(gatewayId) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ gateway_id: gatewayId })
-  });
+  }, 20000);
   if (!res.ok) throw new Error("Gateway instance stop failed");
   return res.json();
 }
@@ -239,7 +239,7 @@ export async function getGatewayInstanceStatuses() {
 export async function stopAllGatewayInstances() {
   const res = await fetchWithTimeout(`${getApiBase()}/api/plc/gateways/stop-all`, {
     method: "POST"
-  });
+  }, 20000);
   if (!res.ok) throw new Error("Stop all gateways failed");
   return res.json();
 }
@@ -352,12 +352,13 @@ export async function browseOpcUaNodes(payload) {
 
 export async function testDatabaseConnection(payload) {
   let res;
+  const networkTimeoutMs = Math.max(15000, Number(payload?.timeout_ms || 0) + 3000);
   try {
     res = await fetchWithTimeout(`${getApiBase()}/api/database/test-connection`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
-    }, 15000);
+    }, networkTimeoutMs);
   } catch (err) {
     if (isTransientFetchError(err)) {
       throw new Error(
