@@ -161,6 +161,11 @@ def get_tenant_context() -> dict:
     }
 
 
+@router.get("/sync/mirror-check")
+def get_sync_mirror_check() -> dict:
+    return {"ok": True, "tenant_id": get_current_tenant(), "mirror": app_store.get_mirror_check()}
+
+
 @router.get("/retention/policy")
 def get_retention_policy() -> dict:
     return {"ok": True, "policy": app_store.get_retention_policy()}

@@ -108,6 +108,11 @@ class AppStore:
             0.1,
             float(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_SECONDS", "0.15") or "0.15"),
         )
+        # Strict mirror mode keeps cloud reads sourced only from canonical mirrored
+        # tables filtered by tenant_id (no unscoped fallback, no mixed-table merge).
+        self._strict_cloud_mirror = str(
+            os.environ.get("TRUSTNODE_STRICT_CLOUD_MIRROR", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._ensure_schema()
         self._ensure_required_config_domains()
         self._ensure_default_database_configuration()
@@ -952,6 +957,8 @@ class AppStore:
             self._stop_event.wait(timeout=self._cloud_live_cache_interval_seconds)
 
     def _fetch_live_rows_from_cloud_fast(self, limit: int) -> list[dict[str, Any]]:
+        if self._strict_cloud_mirror:
+            return self._fetch_live_rows_from_cloud(limit)
         cloud = self._get_cloud_database_target()
         if not cloud:
             return []
@@ -1149,6 +1156,41 @@ class AppStore:
         }
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
+            if self._strict_cloud_mirror:
+                with engine.begin() as conn:
+                    rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT local_id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                   tag_name, value, quality, quality_label
+                            FROM "{schema}"."historian_readings"
+                            WHERE tenant_id = :tenant AND local_id IS NOT NULL
+                            ORDER BY COALESCE(local_id, 0) DESC, id DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": lim, "tenant": tenant_id},
+                    ).fetchall()
+                out: list[dict[str, Any]] = []
+                for r in rows:
+                    out.append(
+                        {
+                            "local_id": int(r[0] or 0),
+                            "ts": str(r[2] or ""),
+                            "tenant_id": str(r[1] or tenant_id),
+                            "source": str(r[3] or ""),
+                            "gateway_id": str(r[4] or ""),
+                            "gateway_name": str(r[5] or ""),
+                            "device_name": str(r[6] or ""),
+                            "plc_ip": str(r[7] or ""),
+                            "database_name": str(r[8] or ""),
+                            "tag": str(r[9] or ""),
+                            "value": r[10],
+                            "quality": r[11],
+                            "quality_label": str(r[12] or ""),
+                        }
+                    )
+                return out
             with engine.begin() as conn:
                 hist_rows: list[Any] = []
                 plc_rows: list[Any] = []
@@ -1309,44 +1351,32 @@ class AppStore:
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
             with engine.begin() as conn:
-                try:
-                    rows = conn.execute(
-                        text(
-                            f"""
-                            SELECT ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
-                            FROM "{schema}"."app_logs"
-                            WHERE tenant_id = :tenant
-                            ORDER BY id DESC
-                            LIMIT :lim
-                            """
-                        ),
-                        {"lim": lim, "tenant": tenant_id},
-                    ).fetchall()
-                except Exception:
-                    rows = conn.execute(
-                        text(
-                            f"""
-                            SELECT ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
-                            FROM "{schema}"."app_logs"
-                            ORDER BY id DESC
-                            LIMIT :lim
-                            """
-                        ),
-                        {"lim": lim},
-                    ).fetchall()
+                rows = conn.execute(
+                    text(
+                        f"""
+                        SELECT local_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
+                        FROM "{schema}"."app_logs"
+                        WHERE tenant_id = :tenant AND local_id IS NOT NULL
+                        ORDER BY COALESCE(local_id, 0) DESC, id DESC
+                        LIMIT :lim
+                        """
+                    ),
+                    {"lim": lim, "tenant": tenant_id},
+                ).fetchall()
             out: list[dict[str, Any]] = []
             for r in rows:
                 out.append(
                     {
-                        "ts": str(r[0] or ""),
+                        "local_id": int(r[0] or 0),
+                        "ts": str(r[1] or ""),
                         "tenant_id": tenant_id,
-                        "level": str(r[1] or "info"),
-                        "category": str(r[2] or "system"),
-                        "message": str(r[3] or ""),
-                        "gateway_id": str(r[4] or ""),
-                        "gateway_name": str(r[5] or ""),
-                        "device_name": str(r[6] or ""),
-                        "database_name": str(r[7] or ""),
+                        "level": str(r[2] or "info"),
+                        "category": str(r[3] or "system"),
+                        "message": str(r[4] or ""),
+                        "gateway_id": str(r[5] or ""),
+                        "gateway_name": str(r[6] or ""),
+                        "device_name": str(r[7] or ""),
+                        "database_name": str(r[8] or ""),
                     }
                 )
             return out
@@ -1383,6 +1413,47 @@ class AppStore:
         }
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
+            if self._strict_cloud_mirror:
+                with engine.begin() as conn:
+                    rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT local_id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                   tag_name, value, quality, quality_label
+                            FROM (
+                              SELECT DISTINCT ON (gateway_id, tag_name)
+                                     local_id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                     tag_name, value, quality, quality_label
+                              FROM "{schema}"."historian_readings"
+                              WHERE tenant_id = :tenant AND local_id IS NOT NULL
+                              ORDER BY gateway_id, tag_name, COALESCE(local_id, 0) DESC, id DESC
+                            ) latest
+                            ORDER BY ts_utc DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": lim, "tenant": tenant_id},
+                    ).fetchall()
+                out: list[dict[str, Any]] = []
+                for r in rows:
+                    out.append(
+                        {
+                            "local_id": int(r[0] or 0),
+                            "tenant_id": str(r[1] or tenant_id),
+                            "ts": str(r[2] or ""),
+                            "source": str(r[3] or ""),
+                            "gateway_id": str(r[4] or ""),
+                            "gateway_name": str(r[5] or ""),
+                            "device_name": str(r[6] or ""),
+                            "plc_ip": str(r[7] or ""),
+                            "database_name": str(r[8] or ""),
+                            "tag": str(r[9] or ""),
+                            "value": r[10],
+                            "quality": r[11],
+                            "quality_label": str(r[12] or ""),
+                        }
+                    )
+                return out
             def _top_ts_ms(rows_in: list[Any]) -> int:
                 if not rows_in:
                     return 0
@@ -3850,6 +3921,149 @@ class AppStore:
             if cloud_rows:
                 return cloud_rows
         return out
+
+    def get_mirror_check(self) -> dict[str, Any]:
+        tenant_id = self._current_tenant_id()
+        now = self._utc_now()
+        result: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "checked_utc": now,
+            "strict_cloud_mirror": bool(self._strict_cloud_mirror),
+            "local": {},
+            "cloud": {},
+            "ok": False,
+            "message": "",
+        }
+
+        with self._lock:
+            with self._connect() as conn:
+                l_hist = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(id),0) AS max_id,
+                           COALESCE(MAX(ts_utc),'') AS max_ts,
+                           COUNT(*) AS c
+                    FROM historian_readings
+                    WHERE tenant_id = ?
+                    """,
+                    (tenant_id,),
+                ).fetchone()
+                l_logs = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(id),0) AS max_id,
+                           COALESCE(MAX(ts_utc),'') AS max_ts,
+                           COUNT(*) AS c
+                    FROM app_logs
+                    WHERE tenant_id = ?
+                    """,
+                    (tenant_id,),
+                ).fetchone()
+        result["local"] = {
+            "historian": {
+                "max_local_id": int(l_hist["max_id"] or 0),
+                "rows": int(l_hist["c"] or 0),
+                "latest_ts": str(l_hist["max_ts"] or ""),
+            },
+            "logs": {
+                "max_local_id": int(l_logs["max_id"] or 0),
+                "rows": int(l_logs["c"] or 0),
+                "latest_ts": str(l_logs["max_ts"] or ""),
+            },
+        }
+
+        cloud = self._get_cloud_database_target()
+        if not cloud:
+            result["message"] = "No cloud target configured."
+            return result
+
+        try:
+            from sqlalchemy import text  # type: ignore
+        except Exception as exc:
+            result["message"] = f"SQLAlchemy unavailable: {exc}"
+            return result
+
+        schema = str(cloud.get("schema") or "public")
+        try:
+            engine, target_key = self._get_or_create_cloud_engine(cloud, schema)
+            try:
+                self._ensure_cloud_schema_once(engine, schema, target_key)
+            except Exception:
+                pass
+            with engine.begin() as c:
+                c_hist = c.execute(
+                    text(
+                        f"""
+                        SELECT COALESCE(MAX(local_id),0) AS max_local_id,
+                               COALESCE(MAX(ts_utc)::text,'') AS max_ts,
+                               COUNT(*) AS c
+                        FROM "{schema}"."historian_readings"
+                        WHERE tenant_id = :tenant
+                        """
+                    ),
+                    {"tenant": tenant_id},
+                ).mappings().first()
+                c_logs = c.execute(
+                    text(
+                        f"""
+                        SELECT COALESCE(MAX(local_id),0) AS max_local_id,
+                               COALESCE(MAX(ts_utc)::text,'') AS max_ts,
+                               COUNT(*) AS c
+                        FROM "{schema}"."app_logs"
+                        WHERE tenant_id = :tenant
+                        """
+                    ),
+                    {"tenant": tenant_id},
+                ).mappings().first()
+                c_plc = c.execute(
+                    text(
+                        f"""
+                        SELECT COALESCE(MAX(local_id),0) AS max_local_id,
+                               COALESCE(MAX(ts_utc)::text,'') AS max_ts,
+                               COUNT(*) AS c
+                        FROM "{schema}"."plc_readings"
+                        WHERE tenant_id = :tenant
+                        """
+                    ),
+                    {"tenant": tenant_id},
+                ).mappings().first()
+        except Exception as exc:
+            result["message"] = f"Cloud mirror check failed: {exc}"
+            return result
+
+        cloud_hist_max = int((c_hist or {}).get("max_local_id") or 0)
+        cloud_logs_max = int((c_logs or {}).get("max_local_id") or 0)
+        local_hist_max = int(result["local"]["historian"]["max_local_id"])
+        local_logs_max = int(result["local"]["logs"]["max_local_id"])
+        hist_gap = max(0, local_hist_max - cloud_hist_max)
+        logs_gap = max(0, local_logs_max - cloud_logs_max)
+
+        result["cloud"] = {
+            "historian": {
+                "max_local_id": cloud_hist_max,
+                "rows": int((c_hist or {}).get("c") or 0),
+                "latest_ts": str((c_hist or {}).get("max_ts") or ""),
+            },
+            "logs": {
+                "max_local_id": cloud_logs_max,
+                "rows": int((c_logs or {}).get("c") or 0),
+                "latest_ts": str((c_logs or {}).get("max_ts") or ""),
+            },
+            "plc_readings": {
+                "max_local_id": int((c_plc or {}).get("max_local_id") or 0),
+                "rows": int((c_plc or {}).get("c") or 0),
+                "latest_ts": str((c_plc or {}).get("max_ts") or ""),
+            },
+        }
+        result["gaps"] = {
+            "historian_local_minus_cloud": hist_gap,
+            "logs_local_minus_cloud": logs_gap,
+        }
+        result["ok"] = hist_gap <= int(self._data_sync_batch_size) and logs_gap <= int(self._data_sync_batch_size)
+        result["message"] = (
+            "Mirror healthy."
+            if result["ok"]
+            else f"Mirror lag detected: historian gap={hist_gap}, logs gap={logs_gap}"
+        )
+        return result
 
     def cleanup_data(self, mode: str, actor: str = "manual") -> Dict[str, Any]:
         tenant_id = self._current_tenant_id()
