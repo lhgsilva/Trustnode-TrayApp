@@ -1060,27 +1060,38 @@ class AppStore:
                 sample_limit = min(max(lim * 4, 500), 4000)
                 plc_rows = _fetch_rows_with_freshness_fallback("plc_readings", sample_limit)
 
-            live_top = _top_ts_ms(live_rows)
-            plc_top = _top_ts_ms(plc_rows)
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            live_fresh = live_top > 0 and max(0, now_ms - live_top) <= int(self._live_source_max_stale_ms)
-            if live_rows and (live_fresh or not plc_rows):
-                source_rows = live_rows
-            elif plc_rows and not live_rows:
-                source_rows = plc_rows
-            elif live_rows and plc_rows:
-                # Keep live_latest as primary source to minimize perceived lag.
-                # Only switch to plc_readings when live_latest is materially behind.
-                if plc_top > live_top + int(self._live_source_switch_threshold_ms):
-                    source_rows = plc_rows
-                else:
-                    source_rows = live_rows
-            else:
-                source_rows = []
+            # Merge sources by (gateway, tag) and keep strictly freshest row.
+            # This avoids backward jumps caused by source switching between
+            # live_latest and plc_readings snapshots.
+            latest_row_by_key: dict[tuple[str, str], tuple[int, Any]] = {}
+            for r in [*(live_rows or []), *(plc_rows or [])]:
+                source = str(r[1] or "")
+                gateway_id_raw = str(r[2] or "").strip()
+                gateway_name_raw = str(r[3] or "").strip()
+                plc_ip_raw = str(r[5] or "").strip()
+                database_name_raw = str(r[6] or "").strip()
+                tag_name = str(r[7] or "")
+                if not tag_name:
+                    continue
+                inferred_id = ""
+                if not gateway_id_raw and not gateway_name_raw:
+                    inferred_id = _infer_gateway_id(source, tag_name, plc_ip_raw)
+                fallback_gateway = "|".join([x for x in [source, plc_ip_raw, database_name_raw] if x]) or "unknown_gateway"
+                gateway_id = gateway_id_raw or gateway_name_raw or inferred_id or fallback_gateway
+                ts_ms = _top_ts_ms([r])
+                if ts_ms > 0 and max(0, now_ms - ts_ms) > int(self._live_source_max_stale_ms * 4):
+                    # Drop very stale rows from either source.
+                    continue
+                key = (gateway_id, tag_name)
+                prev = latest_row_by_key.get(key)
+                if prev and ts_ms <= int(prev[0]):
+                    continue
+                latest_row_by_key[key] = (ts_ms, r)
 
+            merged = sorted(latest_row_by_key.values(), key=lambda x: int(x[0] or 0), reverse=True)
             out: list[dict[str, Any]] = []
-            seen: set[tuple[str, str]] = set()
-            for r in source_rows:
+            for _, r in merged[:lim]:
                 source = str(r[1] or "")
                 gateway_id_raw = str(r[2] or "").strip()
                 gateway_name_raw = str(r[3] or "").strip()
@@ -1092,12 +1103,6 @@ class AppStore:
                     inferred_id = _infer_gateway_id(source, tag_name, plc_ip_raw)
                 fallback_gateway = "|".join([x for x in [source, plc_ip_raw, database_name_raw] if x]) or "unknown_gateway"
                 gateway_id = gateway_id_raw or gateway_name_raw or inferred_id or fallback_gateway
-                if not tag_name:
-                    continue
-                key = (gateway_id, tag_name)
-                if key in seen:
-                    continue
-                seen.add(key)
                 out.append(
                     {
                         "ts": str(r[0] or ""),
@@ -1114,8 +1119,6 @@ class AppStore:
                         "quality_label": str(r[10] or ""),
                     }
                 )
-                if len(out) >= lim:
-                    break
             return out
         except Exception:
             return []
