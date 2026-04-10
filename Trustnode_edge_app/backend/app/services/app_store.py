@@ -3478,7 +3478,10 @@ class AppStore:
                 cache_updated = str(self._cloud_live_cache_updated_utc or "")
             if cached_rows and cache_updated:
                 try:
-                    age_ms = int((datetime.now(timezone.utc) - datetime.fromisoformat(cache_updated.replace("Z", "+00:00"))).total_seconds() * 1000)
+                    cached_dt = datetime.fromisoformat(cache_updated.replace("Z", "+00:00"))
+                    if cached_dt.tzinfo is None:
+                        cached_dt = cached_dt.replace(tzinfo=timezone.utc)
+                    age_ms = int((datetime.now(timezone.utc) - cached_dt).total_seconds() * 1000)
                 except Exception:
                     age_ms = 999999
                 if age_ms <= 12000:
