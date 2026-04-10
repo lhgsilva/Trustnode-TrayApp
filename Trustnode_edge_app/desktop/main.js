@@ -19,6 +19,14 @@ const APP_WINDOW_TITLE = "Trustnode";
 const BACKEND_EXE_NAME = "trustnode-service.exe";
 const LEGACY_USER_DATA_DIR = "trustnode-edge-desktop";
 const PREVIOUS_USER_DATA_DIRS = ["trustnode-desktop"];
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+
+if (!gotSingleInstanceLock) {
+  app.quit();
+  try {
+    process.exit(0);
+  } catch (_) {}
+}
 
 function dirHasFiles(dirPath) {
   try {
@@ -652,6 +660,13 @@ app.whenReady().then(async () => {
   createWindow();
   monitorBackendStartup();
   createTray();
+});
+
+app.on("second-instance", () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
 });
 
 app.on("before-quit", () => {
