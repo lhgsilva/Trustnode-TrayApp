@@ -1441,6 +1441,27 @@ function AppShell() {
     database: {}
   });
 
+  const filterCloudRowsMonotonic = useCallback((rows) => {
+    const src = Array.isArray(rows) ? rows : [];
+    if (!src.length) return [];
+    const out = [];
+    const nextMap = new Map(cloudLastAcceptedTsByKeyRef.current || []);
+    for (const row of src) {
+      const gatewayId = String(row?.gateway_id || "").trim();
+      const tagName = normalizeTagName(String(row?.tag || row?.tag_name || ""));
+      if (!gatewayId || !tagName) continue;
+      const tsMs = rowTsMs(row);
+      if (!Number.isFinite(tsMs)) continue;
+      const key = `${gatewayId}::${tagName}`;
+      const prevMs = Number(nextMap.get(key) || -1);
+      if (tsMs <= prevMs) continue;
+      nextMap.set(key, tsMs);
+      out.push(row);
+    }
+    cloudLastAcceptedTsByKeyRef.current = nextMap;
+    return out;
+  }, []);
+
   useEffect(() => {
     const timer = setInterval(() => setRenderNowMs(Date.now()), UI_RENDER_TICK_MS);
     return () => clearInterval(timer);
@@ -11722,28 +11743,3 @@ export default function App() {
     </AppErrorBoundary>
   );
 }
-
-
-
-
-
-  const filterCloudRowsMonotonic = useCallback((rows) => {
-    const src = Array.isArray(rows) ? rows : [];
-    if (!src.length) return [];
-    const out = [];
-    const nextMap = new Map(cloudLastAcceptedTsByKeyRef.current || []);
-    for (const row of src) {
-      const gatewayId = String(row?.gateway_id || "").trim();
-      const tagName = normalizeTagName(String(row?.tag || row?.tag_name || ""));
-      if (!gatewayId || !tagName) continue;
-      const tsMs = rowTsMs(row);
-      if (!Number.isFinite(tsMs)) continue;
-      const key = `${gatewayId}::${tagName}`;
-      const prevMs = Number(nextMap.get(key) || -1);
-      if (tsMs <= prevMs) continue;
-      nextMap.set(key, tsMs);
-      out.push(row);
-    }
-    cloudLastAcceptedTsByKeyRef.current = nextMap;
-    return out;
-  }, []);
