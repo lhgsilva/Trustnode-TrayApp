@@ -348,10 +348,11 @@ function freshnessBadgeClass(level) {
   return "status-offline";
 }
 
-function buildSmoothedSeries(points, renderNowMs, periodMs = 1000) {
+function buildSmoothedSeries(points, renderNowMs, periodMs = 1000, enableSynthetic = true) {
   const src = Array.isArray(points) ? points : [];
   if (src.length < 2) return src;
   const out = src.map((p) => ({ ...p }));
+  if (!enableSynthetic) return out;
   const last = out[out.length - 1];
   const prev = out[out.length - 2];
   const lastTs = Number(last?.ts_ms || 0);
@@ -3057,12 +3058,12 @@ function AppShell() {
                 if (!gid) continue;
                 const ts = latestByGateway[gid];
                 const cur = next[gid] || { gateway_id: gid };
-                const rawOnline = Boolean(ts) && (() => {
-                  const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
-                  return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
-                })();
-                const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
                 if (ts) {
+                  const rawOnline = (() => {
+                    const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
+                    return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                  })();
+                  const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
                   const sampleRows = Number(rowCountByGateway[gid] || 0);
                   const prevWrites = Number(cur?.db_write_count || 0);
                   next[gid] = {
@@ -3075,8 +3076,6 @@ function AppShell() {
                     db_pending_count: 0,
                     last_check_utc: ts
                   };
-                } else if (cur.running || !online) {
-                  next[gid] = { ...cur, gateway_id: gid, running: online };
                 }
               }
               return next;
@@ -3093,6 +3092,7 @@ function AppShell() {
                 const tsFromGw = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
                 const tsFromIp = latestByPlcIp[String(d?.plc_ip || "").trim()] || "";
                 const ts = tsFromGw || tsFromIp;
+                if (!ts) return d;
                 const rawOnline = ts
                   ? (() => {
                       const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
@@ -3389,12 +3389,12 @@ function AppShell() {
               if (!gid) continue;
               const ts = latestByGateway[gid];
               const cur = next[gid] || { gateway_id: gid };
-              const rawOnline = Boolean(ts) && (() => {
-                const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
-                return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
-              })();
-              const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
               if (ts) {
+                const rawOnline = (() => {
+                  const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
+                  return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                })();
+                const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
                 const sampleRows = Number(rowCountByGateway[gid] || 0);
                 const prevWrites = Number(cur?.db_write_count || 0);
                 next[gid] = {
@@ -3407,8 +3407,6 @@ function AppShell() {
                   db_pending_count: 0,
                   last_check_utc: ts
                 };
-              } else if (cur.running || !online) {
-                next[gid] = { ...cur, gateway_id: gid, running: online };
               }
             }
             return next;
@@ -3425,6 +3423,7 @@ function AppShell() {
                 const tsFromGw = relatedGw ? latestByGateway[String(relatedGw.id || "")] : "";
                 const tsFromIp = latestByPlcIp[String(d?.plc_ip || "").trim()] || "";
                 const ts = tsFromGw || tsFromIp;
+                if (!ts) return d;
                 const rawOnline = ts
                   ? (() => {
                       const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
@@ -4543,7 +4542,12 @@ function AppShell() {
             String(r.tag || r.tag_name || "") === String(w.tag_name || "")
         )
       , Number(w.readings_count || 120));
-      const lineSeries = buildSmoothedSeries(points, renderNowMs, Number(gateway?.interval_ms || 1000));
+      const lineSeries = buildSmoothedSeries(
+        points,
+        renderNowMs,
+        Number(gateway?.interval_ms || 1000),
+        endpointMode === "cloud"
+      );
       const series = String(w?.chart_type || "line") === "bar" ? points : lineSeries;
       const yDomain = computeSeriesDomain(series);
       const last = points.length ? points[points.length - 1] : null;
@@ -4589,7 +4593,12 @@ function AppShell() {
     , 120);
     return tagMonitorChartType === "bar"
       ? base
-      : buildSmoothedSeries(base, renderNowMs, Number(tagMonitorSelection?.period_ms || 1000));
+      : buildSmoothedSeries(
+          base,
+          renderNowMs,
+          Number(tagMonitorSelection?.period_ms || 1000),
+          endpointMode === "cloud"
+        );
   }, [dataLogView, tagMonitorSelection, tagMonitorChartType, renderNowMs]);
 
   const tagMonitorDomain = useMemo(() => computeSeriesDomain(tagMonitorSeries), [tagMonitorSeries]);
