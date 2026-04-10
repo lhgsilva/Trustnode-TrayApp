@@ -142,7 +142,7 @@ const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
 const CLOUD_LIVE_POLL_MS = 2000;
 const CLOUD_AUX_POLL_MS = 5000;
-const CLOUD_LIVE_FETCH_LIMIT = 1200;
+const CLOUD_LIVE_FETCH_LIMIT = 600;
 const CLOUD_EDGE_ALL_KEY = "__all_edges__";
 const RETENTION_PRESETS = {
   day: {
@@ -2944,20 +2944,7 @@ function AppShell() {
             );
             // Keep edge selector/charts/historian responsive in cloud mode from live frames.
             if (nextDataRows.length) {
-              setDataLog((prev) => {
-                const incoming = [...nextDataRows].sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
-                const merged = [...incoming];
-                const seen = new Set(
-                  incoming.map((r) => `${String(r.gateway_id)}::${String(r.tag)}::${String(r.ts)}`)
-                );
-                for (const r of prev || []) {
-                  const key = `${String(r.gateway_id || "")}::${String(r.tag || "")}::${String(r.ts || "")}`;
-                  if (seen.has(key)) continue;
-                  merged.push(r);
-                  if (merged.length >= 5000) break;
-                }
-                return merged;
-              });
+              setDataLog((prev) => mergeHistorianRowsStable(nextDataRows, prev, 3000));
             }
 
             const activeRules = triggerRulesRef.current.filter((rule) => rule.enabled !== false);
@@ -3279,20 +3266,7 @@ function AppShell() {
           );
           // Keep charts/historian visibly live in cloud mode even when historian replay lags.
           if (nextDataRows.length) {
-            setDataLog((prev) => {
-              const incoming = [...nextDataRows].sort((a, b) => String(b.ts).localeCompare(String(a.ts)));
-              const merged = [...incoming];
-              const seen = new Set(
-                incoming.map((r) => `${String(r.gateway_id)}::${String(r.tag)}::${String(r.ts)}`)
-              );
-              for (const r of prev || []) {
-                const key = `${String(r.gateway_id || "")}::${String(r.tag || "")}::${String(r.ts || "")}`;
-                if (seen.has(key)) continue;
-                merged.push(r);
-                if (merged.length >= 5000) break;
-              }
-              return merged;
-            });
+            setDataLog((prev) => mergeHistorianRowsStable(nextDataRows, prev, 3000));
           }
         }
         setWsState("cloud_polling");

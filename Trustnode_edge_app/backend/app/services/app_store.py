@@ -43,10 +43,13 @@ class AppStore:
         self._live_sync_wakeup_event = threading.Event()
         self._cloud_live_cache_lock = threading.Lock()
         # Fast default cadence for cloud/live products; tunable via env.
-        self._sync_interval_seconds = max(1, int(os.environ.get("TRUSTNODE_CONFIG_SYNC_SECONDS", "1") or "1"))
+        self._sync_interval_seconds = max(
+            0.5,
+            float(os.environ.get("TRUSTNODE_CONFIG_SYNC_SECONDS", "0.5") or "0.5"),
+        )
         self._config_pull_interval_seconds = max(
             self._sync_interval_seconds,
-            int(os.environ.get("TRUSTNODE_CONFIG_PULL_SECONDS", "20") or "20"),
+            float(os.environ.get("TRUSTNODE_CONFIG_PULL_SECONDS", "20") or "20"),
         )
         self._disable_config_push = str(os.environ.get("TRUSTNODE_DISABLE_CONFIG_PUSH", "")).strip().lower() in {
             "1",
@@ -59,8 +62,8 @@ class AppStore:
             min(10000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "500") or "500")),
         )
         self._data_bulk_sync_interval_seconds = max(
-            self._sync_interval_seconds,
-            int(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "1") or "1"),
+            0.5,
+            float(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "0.5") or "0.5"),
         )
         self._live_fast_batch_size = max(
             200,
@@ -83,7 +86,7 @@ class AppStore:
         )
         self._cloud_live_cache_interval_seconds = max(
             0.5,
-            float(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_SECONDS", "1.0") or "1.0"),
+            float(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_SECONDS", "0.5") or "0.5"),
         )
         self._ensure_schema()
         self._ensure_required_config_domains()
@@ -939,10 +942,13 @@ class AppStore:
                 except Exception:
                     return 0
 
-            gateway_configs_raw = self.get_config_domain("gateway_configurations")
-            gateway_configs = gateway_configs_raw if isinstance(gateway_configs_raw, list) else []
+            gateway_configs: list[dict[str, Any]] | None = None
 
             def _infer_gateway_id(source: str, tag: str, plc_ip: str) -> str:
+                nonlocal gateway_configs
+                if gateway_configs is None:
+                    gateway_configs_raw = self.get_config_domain("gateway_configurations")
+                    gateway_configs = gateway_configs_raw if isinstance(gateway_configs_raw, list) else []
                 candidates: list[str] = []
                 for g in gateway_configs:
                     if not isinstance(g, dict):
@@ -1033,7 +1039,9 @@ class AppStore:
                 plc_ip_raw = str(r[5] or "").strip()
                 database_name_raw = str(r[6] or "").strip()
                 tag_name = str(r[7] or "")
-                inferred_id = _infer_gateway_id(source, tag_name, plc_ip_raw)
+                inferred_id = ""
+                if not gateway_id_raw and not gateway_name_raw:
+                    inferred_id = _infer_gateway_id(source, tag_name, plc_ip_raw)
                 fallback_gateway = "|".join([x for x in [source, plc_ip_raw, database_name_raw] if x]) or "unknown_gateway"
                 gateway_id = gateway_id_raw or gateway_name_raw or inferred_id or fallback_gateway
                 if not tag_name:
@@ -3558,9 +3566,6 @@ class AppStore:
             return list(out_latest.values())
 
         if prefer_cloud:
-            cloud_live_fast = self._fetch_live_rows_from_cloud_fast(lim)
-            if cloud_live_fast:
-                return cloud_live_fast
             with self._cloud_live_cache_lock:
                 cached_rows = list(self._cloud_live_cache_rows)
                 cache_updated = str(self._cloud_live_cache_updated_utc or "")
@@ -3572,8 +3577,11 @@ class AppStore:
                     age_ms = int((datetime.now(timezone.utc) - cached_dt).total_seconds() * 1000)
                 except Exception:
                     age_ms = 999999
-                if age_ms <= 3000:
+                if age_ms <= int(max(1200, self._cloud_live_cache_interval_seconds * 2500)):
                     return cached_rows[:lim]
+            cloud_live_fast = self._fetch_live_rows_from_cloud_fast(lim)
+            if cloud_live_fast:
+                return cloud_live_fast
             cloud_live = self._fetch_live_rows_from_cloud(lim)
             cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim * 2, 500), 3000))
             if cloud_live and cloud_hist:

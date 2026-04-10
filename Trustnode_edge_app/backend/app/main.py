@@ -137,7 +137,7 @@ async def websocket_stream(websocket: WebSocket) -> None:
 
 async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> None:
     live_limit = 300
-    sample_interval_seconds = 0.7
+    sample_interval_seconds = 0.5
 
     def _ts_ms(raw: str) -> int:
         text = str(raw or "").strip()
