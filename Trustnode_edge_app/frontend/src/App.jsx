@@ -3169,7 +3169,7 @@ function AppShell() {
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       if (ws) ws.close();
     };
-  }, [endpointMode, endpointVersion, currentUser, isHostedWebClient, isCloudEdgeFilterActive]);
+  }, [endpointMode, endpointVersion, currentUser, isHostedWebClient]);
 
   useEffect(() => {
     if (endpointMode !== "cloud") return;
@@ -3414,7 +3414,7 @@ function AppShell() {
       clearInterval(liveTimer);
       clearInterval(auxTimer);
     };
-  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected, isCloudEdgeFilterActive]);
+  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected]);
 
   const canEditPage = (page) => {
     if (isReadonlyCloudMode) return false;
