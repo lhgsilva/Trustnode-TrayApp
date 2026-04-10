@@ -38,6 +38,7 @@ class GatewayRuntimeStartRequest(BaseModel):
     gateway_id: str
     config: GatewayConfig
     db_sink: dict | None = None
+    db_sinks: list[dict] | None = None
 
 
 class GatewayRuntimeStopRequest(BaseModel):
@@ -619,7 +620,12 @@ async def start_gateway_runtime(payload: GatewayRuntimeStartRequest) -> dict[str
     if not gateway_id:
         return {"started": False, "message": "gateway_id is required"}
     try:
-        await plc_manager.start_gateway(gateway_id=gateway_id, config=payload.config, db_sink=payload.db_sink)
+        await plc_manager.start_gateway(
+            gateway_id=gateway_id,
+            config=payload.config,
+            db_sink=payload.db_sink,
+            db_sinks=payload.db_sinks,
+        )
         return {"started": True, "message": f"Gateway '{gateway_id}' started"}
     except ValueError as err:
         return {"started": False, "message": str(err)}

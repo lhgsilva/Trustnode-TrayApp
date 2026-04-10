@@ -62,6 +62,12 @@ function getApiBase() {
   return getDefaultLocalApiBase();
 }
 
+function getControlApiBase() {
+  if (FORCE_CLOUD_URL) return FORCE_CLOUD_URL;
+  if (!isHostedWebClientRuntime()) return getDefaultLocalApiBase();
+  return getApiBase();
+}
+
 function withNoCache(url) {
   const sep = url.includes("?") ? "&" : "?";
   return `${url}${sep}_ts=${Date.now()}`;
@@ -177,13 +183,13 @@ export async function getHealth() {
 }
 
 export async function getConfig() {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/config`);
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/config`);
   if (!res.ok) throw new Error("Config fetch failed");
   return res.json();
 }
 
 export async function updateConfig(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/config`, {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/config`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -193,25 +199,25 @@ export async function updateConfig(payload) {
 }
 
 export async function getStatus() {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/status`);
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/status`);
   if (!res.ok) throw new Error("Status fetch failed");
   return res.json();
 }
 
 export async function startGateway() {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/start`, { method: "POST" });
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/start`, { method: "POST" });
   if (!res.ok) throw new Error("Start failed");
   return res.json();
 }
 
 export async function stopGateway() {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/stop`, { method: "POST" });
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/stop`, { method: "POST" });
   if (!res.ok) throw new Error("Stop failed");
   return res.json();
 }
 
 export async function startGatewayInstance(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/gateways/start`, {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/gateways/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -221,7 +227,7 @@ export async function startGatewayInstance(payload) {
 }
 
 export async function stopGatewayInstance(gatewayId) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/gateways/stop`, {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/gateways/stop`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ gateway_id: gatewayId })
@@ -231,13 +237,13 @@ export async function stopGatewayInstance(gatewayId) {
 }
 
 export async function getGatewayInstanceStatuses() {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/gateways/status`);
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/gateways/status`);
   if (!res.ok) throw new Error("Gateway instance status fetch failed");
   return res.json();
 }
 
 export async function stopAllGatewayInstances() {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/gateways/stop-all`, {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/gateways/stop-all`, {
     method: "POST"
   }, 20000);
   if (!res.ok) throw new Error("Stop all gateways failed");
@@ -255,7 +261,7 @@ export async function testPlcConnection(payload) {
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
       // PLC checks can be slow on first hit (ARP/NIC wakeups/edge startup).
-      res = await fetchWithTimeout(`${getApiBase()}/api/plc/test-connection`, request, 20000);
+      res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/test-connection`, request, 20000);
       lastErr = null;
       break;
     } catch (err) {
@@ -295,7 +301,7 @@ export async function testPlcConnection(payload) {
 }
 
 export async function discoverPlcTags(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/discover-tags`, {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/discover-tags`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -323,7 +329,7 @@ export async function discoverPlcTags(payload) {
 }
 
 export async function browseOpcUaNodes(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/plc/opcua/browse`, {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/opcua/browse`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -354,7 +360,7 @@ export async function testDatabaseConnection(payload) {
   let res;
   const networkTimeoutMs = Math.max(15000, Number(payload?.timeout_ms || 0) + 3000);
   try {
-    res = await fetchWithTimeout(`${getApiBase()}/api/database/test-connection`, {
+    res = await fetchWithTimeout(`${getControlApiBase()}/api/database/test-connection`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
@@ -399,7 +405,7 @@ export async function testDatabaseConnection(payload) {
 }
 
 export async function provisionDatabaseObjects(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/database/provision`, {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/database/provision`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -422,7 +428,7 @@ export async function provisionDatabaseObjects(payload) {
 }
 
 export async function activateDatabaseSink(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/database/activate-sink`, {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/database/activate-sink`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -578,7 +584,7 @@ export async function getAppStoreInspector(previewLimit = 15) {
 }
 
 export async function checkDatabaseRecovery(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/database/recovery/check`, {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/database/recovery/check`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
@@ -588,7 +594,7 @@ export async function checkDatabaseRecovery(payload) {
 }
 
 export async function repairDatabaseRecovery(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/database/recovery/repair`, {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/database/recovery/repair`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)

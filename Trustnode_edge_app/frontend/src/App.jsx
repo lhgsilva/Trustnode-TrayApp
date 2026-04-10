@@ -4625,6 +4625,36 @@ function AppShell() {
     if (!gateway.database_id) throw new Error("Gateway has no database connection selected.");
     const db = dbConnectionsRef.current.find((c) => c.id === gateway.database_id);
     if (!db) throw new Error("Selected database connection was not found.");
+    const toSink = (conn) => ({
+      id: conn.id || "",
+      name: conn.name || "",
+      engine: conn.engine,
+      host: conn.host || "",
+      port: Number(conn.port || 0),
+      database: conn.database || "",
+      username: conn.username || "",
+      password: conn.password || "",
+      sqlite_path: conn.sqlite_path || "",
+      file_path: conn.file_path || "",
+      legacy_url: conn.legacy_url || "",
+      legacy_api_token: conn.legacy_api_token || "",
+      source: conn.source || "",
+      site: conn.site || "",
+      area: conn.area || "",
+      equipment: conn.equipment || "",
+      schema: conn.schema || "public",
+      table: conn.table || "plc_readings",
+      tls: Boolean(conn.tls)
+    });
+    const primarySink = toSink(db);
+    const parallelSinks = dbConnectionsRef.current
+      .filter((conn) => conn && conn.id !== db.id)
+      .filter((conn) => conn.enabled !== false && conn.use_gateway !== false)
+      .filter((conn) => {
+        const engine = String(conn.engine || "").toLowerCase();
+        return engine === "csv_file" || engine === "txt_file" || engine === "sqlite";
+      })
+      .map((conn) => toSink(conn));
     return {
       gateway_id: gateway.id,
       config: {
@@ -4648,26 +4678,8 @@ function AppShell() {
         site: db.site || "",
         area: db.area || ""
       },
-      db_sink: {
-        name: db.name || "",
-        engine: db.engine,
-        host: db.host || "",
-        port: Number(db.port || 0),
-        database: db.database || "",
-        username: db.username || "",
-        password: db.password || "",
-        sqlite_path: db.sqlite_path || "",
-        file_path: db.file_path || "",
-        legacy_url: db.legacy_url || "",
-        legacy_api_token: db.legacy_api_token || "",
-        source: db.source || "",
-        site: db.site || "",
-        area: db.area || "",
-        equipment: db.equipment || "",
-        schema: db.schema || "public",
-        table: db.table || "plc_readings",
-        tls: Boolean(db.tls)
-      }
+      db_sink: primarySink,
+      db_sinks: [primarySink, ...parallelSinks]
     };
   };
 

@@ -17,11 +17,13 @@ class GatewayWorker:
         gateway_id: str,
         config: GatewayConfig,
         db_sink: Dict[str, Any] | None,
+        db_sinks: List[Dict[str, Any]] | None = None,
         collection_gate_cb=None,
     ) -> None:
         self.gateway_id = gateway_id
         self.config = config
         self.db_sink = db_sink or None
+        self.db_sinks = self._normalize_db_sinks(db_sink, db_sinks)
         self._collection_gate_cb = collection_gate_cb
         self.running = False
         self.last_error: str | None = None
@@ -54,8 +56,35 @@ class GatewayWorker:
     def set_config(self, config: GatewayConfig) -> None:
         self.config = config
 
-    def set_db_sink(self, db_sink: Dict[str, Any] | None) -> None:
+    def _normalize_db_sinks(
+        self, db_sink: Dict[str, Any] | None, db_sinks: List[Dict[str, Any]] | None
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for sink in [db_sink, *((db_sinks or []))]:
+            if not isinstance(sink, dict):
+                continue
+            engine = str(sink.get("engine") or "").strip().lower()
+            if not engine:
+                continue
+            key = (
+                f"{engine}|{str(sink.get('id') or '').strip()}|"
+                f"{str(sink.get('host') or '').strip().lower()}|{int(sink.get('port') or 0)}|"
+                f"{str(sink.get('database') or '').strip().lower()}|"
+                f"{str(sink.get('file_path') or '').strip().lower()}|"
+                f"{str(sink.get('sqlite_path') or '').strip().lower()}"
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(dict(sink))
+        return out
+
+    def set_db_sink(
+        self, db_sink: Dict[str, Any] | None, db_sinks: List[Dict[str, Any]] | None = None
+    ) -> None:
         self.db_sink = db_sink or None
+        self.db_sinks = self._normalize_db_sinks(db_sink, db_sinks)
         self.db_write_count = 0
         self.db_last_write_utc = None
         self.db_last_error = None
@@ -840,8 +869,121 @@ class GatewayWorker:
         if engine == "txt_file":
             self._persist_txt_file(readings)
             self.db_pending_count = 0
-            return
-        self.db_pending_count = 0
+        else:
+            self.db_pending_count = 0
+
+        # Fan-out write to additional local/file sinks enabled for this gateway.
+        for sink in (self.db_sinks or []):
+            if not isinstance(sink, dict):
+                continue
+            if sink is self.db_sink:
+                continue
+            sink_engine = str(sink.get("engine") or "").strip().lower()
+            if sink_engine == engine:
+                continue
+            try:
+                if sink_engine == "csv_file":
+                    self._persist_csv_file_for_sink(sink, readings)
+                elif sink_engine == "txt_file":
+                    self._persist_txt_file_for_sink(sink, readings)
+                elif sink_engine == "sqlite":
+                    self._persist_sqlite_for_sink(sink, readings)
+            except Exception:
+                # Parallel sinks are best-effort and should not block primary flow.
+                pass
+
+    def _persist_csv_file_for_sink(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> bool:
+        import csv
+
+        try:
+            file_path = self._resolve_output_file_path((sink or {}).get("file_path") or "", "trustnode_log.csv")
+            write_header = (not os.path.exists(file_path)) or os.path.getsize(file_path) == 0
+            with open(file_path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(["ts_utc", "tag_name", "value", "quality", "quality_label", "source", "site", "area", "equipment"])
+                for r in readings:
+                    writer.writerow([r.ts_utc, r.tag_name, r.value, r.quality, r.quality_label, r.source, r.site, r.area, r.equipment])
+            return True
+        except Exception:
+            return False
+
+    def _persist_txt_file_for_sink(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> bool:
+        try:
+            file_path = self._resolve_output_file_path((sink or {}).get("file_path") or "", "trustnode_log.txt")
+            with open(file_path, "a", encoding="utf-8") as f:
+                for r in readings:
+                    f.write(
+                        f"{r.ts_utc}|{r.tag_name}|{r.value}|{r.quality}|{r.quality_label}|"
+                        f"{r.source}|{r.site}|{r.area}|{r.equipment}\n"
+                    )
+            return True
+        except Exception:
+            return False
+
+    def _persist_sqlite_for_sink(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> bool:
+        try:
+            from sqlalchemy import create_engine, text
+        except Exception:
+            return False
+        sqlite_path = (sink.get("sqlite_path") or "./data/trustnode_edge.db").strip()
+        table = (sink.get("table") or "plc_readings").strip() or "plc_readings"
+        url = self._sqlite_url_from_path(sqlite_path)
+        engine = None
+        try:
+            engine = create_engine(url, pool_pre_ping=True)
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS "{table}" (
+                          id INTEGER PRIMARY KEY AUTOINCREMENT,
+                          ts_utc TEXT NOT NULL DEFAULT (datetime('now')),
+                          tag_name TEXT NOT NULL,
+                          value REAL NULL,
+                          quality INTEGER NULL,
+                          source TEXT NULL,
+                          site TEXT NULL,
+                          area TEXT NULL,
+                          equipment TEXT NULL,
+                          seq INTEGER NULL,
+                          raw_payload TEXT NULL
+                        )
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{table}"
+                        (ts_utc, tag_name, value, quality, source, site, area, equipment, raw_payload)
+                        VALUES (:ts_utc, :tag_name, :value, :quality, :source, :site, :area, :equipment, :raw_payload)
+                        """
+                    ),
+                    [
+                        {
+                            "ts_utc": r.ts_utc,
+                            "tag_name": r.tag_name,
+                            "value": r.value,
+                            "quality": r.quality,
+                            "source": r.source,
+                            "site": r.site,
+                            "area": r.area,
+                            "equipment": r.equipment,
+                            "raw_payload": json.dumps(r.model_dump()),
+                        }
+                        for r in readings
+                    ],
+                )
+            return True
+        except Exception:
+            return False
+        finally:
+            if engine is not None:
+                try:
+                    engine.dispose()
+                except Exception:
+                    pass
 
     def _schedule_remote_flush(self, engine_name: str) -> None:
         now_mono = time.monotonic()
@@ -1381,11 +1523,17 @@ class PLCManager:
         for q in dead:
             self._subscribers.discard(q)
 
-    def _get_or_create_worker(self, gateway_id: str, config: GatewayConfig, db_sink: Dict[str, Any] | None) -> GatewayWorker:
+    def _get_or_create_worker(
+        self,
+        gateway_id: str,
+        config: GatewayConfig,
+        db_sink: Dict[str, Any] | None,
+        db_sinks: List[Dict[str, Any]] | None = None,
+    ) -> GatewayWorker:
         if gateway_id in self.workers:
             w = self.workers[gateway_id]
             w.set_config(config)
-            w.set_db_sink(db_sink)
+            w.set_db_sink(db_sink, db_sinks)
             w.set_collection_gate_cb(self._evaluate_global_collection_gate)
             return w
         if len(self.workers) >= self.max_gateways:
@@ -1394,13 +1542,20 @@ class PLCManager:
             gateway_id=gateway_id,
             config=config,
             db_sink=db_sink,
+            db_sinks=db_sinks,
             collection_gate_cb=self._evaluate_global_collection_gate,
         )
         self.workers[gateway_id] = w
         return w
 
-    async def start_gateway(self, gateway_id: str, config: GatewayConfig, db_sink: Dict[str, Any] | None) -> None:
-        w = self._get_or_create_worker(gateway_id, config, db_sink)
+    async def start_gateway(
+        self,
+        gateway_id: str,
+        config: GatewayConfig,
+        db_sink: Dict[str, Any] | None,
+        db_sinks: List[Dict[str, Any]] | None = None,
+    ) -> None:
+        w = self._get_or_create_worker(gateway_id, config, db_sink, db_sinks)
         self._refresh_global_triggers()
         self.active_gateway_id = gateway_id
         await w.start(self._broadcast)
