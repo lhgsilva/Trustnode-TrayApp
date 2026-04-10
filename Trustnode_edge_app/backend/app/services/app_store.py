@@ -3473,6 +3473,9 @@ class AppStore:
             return list(out_latest.values())
 
         if prefer_cloud:
+            cloud_live_fast = self._fetch_live_rows_from_cloud_fast(lim)
+            if cloud_live_fast:
+                return cloud_live_fast
             with self._cloud_live_cache_lock:
                 cached_rows = list(self._cloud_live_cache_rows)
                 cache_updated = str(self._cloud_live_cache_updated_utc or "")
@@ -3484,7 +3487,7 @@ class AppStore:
                     age_ms = int((datetime.now(timezone.utc) - cached_dt).total_seconds() * 1000)
                 except Exception:
                     age_ms = 999999
-                if age_ms <= 12000:
+                if age_ms <= 3000:
                     return cached_rows[:lim]
             cloud_live = self._fetch_live_rows_from_cloud(lim)
             cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim * 2, 500), 3000))
