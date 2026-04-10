@@ -3061,7 +3061,7 @@ function AppShell() {
                 if (ts) {
                   const rawOnline = (() => {
                     const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
-                    return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                    return Number.isFinite(ageMs) ? ageMs <= 20000 : true;
                   })();
                   const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
                   const sampleRows = Number(rowCountByGateway[gid] || 0);
@@ -3096,7 +3096,7 @@ function AppShell() {
                 const rawOnline = ts
                   ? (() => {
                       const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
-                      return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                      return Number.isFinite(ageMs) ? ageMs <= 20000 : true;
                     })()
                   : false;
                 const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 5);
@@ -3116,7 +3116,7 @@ function AppShell() {
                 const ts = latestByDbName[String(c.name || "").trim()];
                 if (!ts) return c;
                 const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
-                const rawOnline = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
+                const rawOnline = Number.isFinite(ageMs) ? ageMs <= 30000 : true;
                 const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 5);
                 return {
                   ...c,
@@ -3392,7 +3392,7 @@ function AppShell() {
               if (ts) {
                 const rawOnline = (() => {
                   const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
-                  return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                  return Number.isFinite(ageMs) ? ageMs <= 20000 : true;
                 })();
                 const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
                 const sampleRows = Number(rowCountByGateway[gid] || 0);
@@ -3427,7 +3427,7 @@ function AppShell() {
                 const rawOnline = ts
                   ? (() => {
                       const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
-                      return Number.isFinite(ageMs) ? ageMs <= 10000 : true;
+                      return Number.isFinite(ageMs) ? ageMs <= 20000 : true;
                     })()
                   : false;
                 const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 5);
@@ -3447,7 +3447,7 @@ function AppShell() {
               const ts = latestByDbName[String(c.name || "").trim()];
               if (!ts) return c;
               const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
-              const rawOnline = Number.isFinite(ageMs) ? ageMs <= 15000 : true;
+              const rawOnline = Number.isFinite(ageMs) ? ageMs <= 30000 : true;
               const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 5);
               return {
                 ...c,
