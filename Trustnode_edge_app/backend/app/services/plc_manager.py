@@ -52,6 +52,7 @@ class GatewayWorker:
         self._remote_pending_probe_seconds = max(
             0.1, float(os.environ.get("TRUSTNODE_REMOTE_PENDING_PROBE_SECONDS", "0.5") or "0.5")
         )
+        self._ab_preferred_path: str | None = None
 
     def set_config(self, config: GatewayConfig) -> None:
         self.config = config
@@ -265,6 +266,8 @@ class GatewayWorker:
         if not tags:
             raise RuntimeError("Allen-Bradley read failed: no tags configured.")
         candidate_paths = [ip] if "/" in ip else [ip, f"{ip}/1"]
+        if self._ab_preferred_path:
+            candidate_paths = [self._ab_preferred_path] + [p for p in candidate_paths if p != self._ab_preferred_path]
 
         # Primary: pycomm3 LogixDriver (ControlLogix/CompactLogix family).
         try:
@@ -294,7 +297,8 @@ class GatewayWorker:
             try:
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                 out: List[GatewayReading] = []
-                with LogixDriver(path, init_tags=True, init_program_tags=True) as plc:
+                # Keep AB cycle lightweight: do not hydrate full tag dictionaries on every poll.
+                with LogixDriver(path, init_tags=False, init_program_tags=False) as plc:
                     known_tags = set()
                     if isinstance(getattr(plc, "tags", None), dict):
                         known_tags = {str(k).strip() for k in plc.tags.keys() if str(k).strip()}
@@ -338,11 +342,13 @@ class GatewayWorker:
                             )
                         )
                 if out:
+                    self._ab_preferred_path = path
                     return out
                 raise RuntimeError("all tags returned invalid values")
             except Exception as exc:
                 last_error = str(exc)
                 continue
+        self._ab_preferred_path = None
         raise RuntimeError(f"all route attempts failed ({', '.join(candidate_paths)}): {last_error}")
 
     def _read_from_allen_bradley_pylogix(self, candidate_paths: List[str], tags: List[str]) -> List[GatewayReading]:
