@@ -845,8 +845,7 @@ class GatewayWorker:
                 self._schedule_remote_flush(engine)
             except Exception as exc:
                 self._mark_db_write_error(f"Store-forward pipeline error: {exc}")
-            return
-        if engine == "legacy_http":
+        elif engine == "legacy_http":
             try:
                 self._enqueue_outbox(readings)
                 now_mono = time.monotonic()
@@ -856,16 +855,13 @@ class GatewayWorker:
                 self._schedule_remote_flush(engine)
             except Exception as exc:
                 self._mark_db_write_error(f"Store-forward pipeline error: {exc}")
-            return
-        if engine == "sqlite":
+        elif engine == "sqlite":
             self._persist_sqlite(readings)
             self.db_pending_count = 0
-            return
-        if engine == "csv_file":
+        elif engine == "csv_file":
             self._persist_csv_file(readings)
             self.db_pending_count = 0
-            return
-        if engine == "txt_file":
+        elif engine == "txt_file":
             self._persist_txt_file(readings)
             self.db_pending_count = 0
         else:
@@ -1002,10 +998,12 @@ class GatewayWorker:
         thread.start()
 
     def _flush_remote_outbox_once(self, engine_name: str) -> None:
+        schedule_again = False
         try:
             max_batches = max(1, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MAX_BATCHES", "12") or "12"))
+            batch_limit = max(50, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_BATCH_LIMIT", "500") or "500"))
             for _ in range(max_batches):
-                pending = self._load_pending(150)
+                pending = self._load_pending(batch_limit)
                 if not pending:
                     break
                 pending_readings = [
@@ -1030,15 +1028,19 @@ class GatewayWorker:
                     self._mark_failed(ids, self.db_last_error or "remote write failed")
                     break
             self.db_pending_count = self._count_pending()
+            schedule_again = self.db_pending_count > 0
         except Exception as exc:
             self._mark_db_write_error(f"Store-forward flush error: {exc}")
             try:
                 self.db_pending_count = self._count_pending()
+                schedule_again = self.db_pending_count > 0
             except Exception:
                 pass
         finally:
             with self._remote_flush_lock:
                 self._remote_flush_inflight = False
+        if schedule_again and self.running:
+            self._schedule_remote_flush(engine_name)
 
     def _resolve_output_file_path(self, raw_path: str, fallback_name: str) -> str:
         path_in = (raw_path or "").strip()
