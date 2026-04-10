@@ -888,6 +888,8 @@ class AppStore:
                         {"lim": lim, "tenant": tenant_id},
                     ).fetchall()
                 except Exception:
+                    hist_rows = []
+                if not hist_rows:
                     try:
                         hist_rows = conn.execute(
                             text(
@@ -918,6 +920,8 @@ class AppStore:
                         {"lim": lim, "tenant": tenant_id},
                     ).fetchall()
                 except Exception:
+                    plc_rows = []
+                if not plc_rows:
                     try:
                         plc_rows = conn.execute(
                             text(
