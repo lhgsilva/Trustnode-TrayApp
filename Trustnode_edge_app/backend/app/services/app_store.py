@@ -137,6 +137,21 @@ class AppStore:
             return configured_tenant
         return request_tenant or "default"
 
+    def _prefer_cloud_reads(self) -> bool:
+        env_value = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower()
+        if env_value in {"1", "true", "yes", "on"}:
+            return True
+        if env_value in {"0", "false", "no", "off"}:
+            return False
+        try:
+            settings = self.get_config_domain("app_settings")
+            endpoint_mode = str((settings or {}).get("endpoint_mode") or "").strip().lower()
+            if endpoint_mode == "cloud":
+                return True
+        except Exception:
+            pass
+        return False
+
     def _ensure_cloud_schema_once(self, engine: Any, schema: str, target_key: str) -> None:
         if target_key in self._cloud_schema_ready_keys:
             return
@@ -819,12 +834,7 @@ class AppStore:
     def _cloud_live_cache_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                }
+                prefer_cloud = self._prefer_cloud_reads()
                 if prefer_cloud:
                     rows = self._fetch_live_rows_from_cloud(self._cloud_live_cache_limit)
                     if rows:
@@ -2309,12 +2319,7 @@ class AppStore:
     def get_bootstrap(self, prefer_cloud_reads: bool | None = None) -> Dict[str, Any]:
         tenant_id = self._current_tenant_id()
         if prefer_cloud_reads is None:
-            prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
+            prefer_cloud = self._prefer_cloud_reads()
         else:
             prefer_cloud = bool(prefer_cloud_reads)
         if prefer_cloud:
@@ -3205,12 +3210,7 @@ class AppStore:
         tenant_id = self._current_tenant_id()
         # Hosted/web deployments should prefer cloud-backed historian reads so the
         # website mirrors edge-collected data even when no local gateways run on VPS.
-        prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        prefer_cloud = self._prefer_cloud_reads()
         if prefer_cloud:
             cloud_rows = self._fetch_historian_rows_from_cloud(lim)
             if cloud_rows:
@@ -3252,12 +3252,7 @@ class AppStore:
     def get_live_rows(self, limit: int = 5000) -> list[dict[str, Any]]:
         lim = max(100, min(int(limit or 5000), 50000))
         tenant_id = self._current_tenant_id()
-        prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        prefer_cloud = self._prefer_cloud_reads()
         def _row_ts_ms(row: dict[str, Any]) -> int:
             raw = str(row.get("ts") or row.get("ts_utc") or "").strip()
             if not raw:
@@ -3378,12 +3373,7 @@ class AppStore:
         lim = max(1, min(int(limit or 2000), 10000))
         tenant_id = self._current_tenant_id()
         # Hosted/web deployments should prefer cloud-backed log reads.
-        prefer_cloud = str(os.environ.get("TRUSTNODE_PREFER_CLOUD_READS", "")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        prefer_cloud = self._prefer_cloud_reads()
         if prefer_cloud:
             cloud_rows = self._fetch_log_rows_from_cloud(lim)
             if cloud_rows:
