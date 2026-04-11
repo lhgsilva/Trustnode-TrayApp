@@ -198,7 +198,11 @@ class TelemetryService:
         app_settings = data.get("app_settings") if isinstance(data.get("app_settings"), dict) else {}
         endpoint_mode = str(app_settings.get("endpoint_mode") or "").strip().lower()
         cloud_url = str(app_settings.get("cloud_url") or "").strip().rstrip("/")
+        cloud_auto_sync_enabled = bool(app_settings.get("cloud_auto_sync_enabled", True))
         if endpoint_mode == "cloud" and cloud_url:
+            self.vps_ingest_url = cloud_url
+        # Keep ingest enabled for mirror mode even when UI endpoint_mode remains local.
+        if cloud_auto_sync_enabled and cloud_url:
             self.vps_ingest_url = cloud_url
         realm = str(
             app_settings.get("tenant_login_realm")
