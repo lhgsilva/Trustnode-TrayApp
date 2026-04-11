@@ -2763,15 +2763,15 @@ function AppShell() {
             if (gatewayId) {
               setLiveTagValues((prev) => {
                 const next = { ...prev };
-                const ts = tsNow();
                 for (const r of data.readings) {
                   const normTag = normalizeTagName(r.tag_name || "");
                   if (!normTag) continue;
                   const key = `${gatewayId}::${normTag}`;
+                  const readingTs = String(r.ts_utc || tsNow());
                   next[key] = {
                     gateway_id: gatewayId,
                     tag: String(r.tag_name || ""),
-                    ts,
+                    ts: readingTs,
                     value: r.value,
                     quality: r.quality,
                     quality_label: r.quality_label || qualityLabelFromCode(r.quality)
@@ -2782,7 +2782,7 @@ function AppShell() {
             }
             const collectionAllowed = data.collection_allowed !== false;
             const collectionBlockReason = String(data.collection_block_reason || "").trim();
-            const ts = tsNow();
+            const ts = String(first?.ts_utc || tsNow());
             if (!collectionAllowed && activeGatewayTriggers.length) {
               const key = `${gatewayId}::${activeGatewayTriggers.length}`;
               if (connectionLoopRef.current.collectionBlocks[key] !== true) {
@@ -2827,7 +2827,7 @@ function AppShell() {
               }
               setDataLog((prev) => {
                 const rows = data.readings.map((r) => ({
-                  ts,
+                  ts: String(r.ts_utc || ts),
                   source: r.source,
                   gateway_id: gatewayId,
                   gateway_name: gateway?.name || "",
@@ -2857,7 +2857,7 @@ function AppShell() {
                 if (historianOutboxRef.current.length > 12000) {
                   historianOutboxRef.current.splice(0, historianOutboxRef.current.length - 12000);
                 }
-                return [...rows, ...prev].slice(0, 500);
+                return mergeHistorianRowsStable(rows, prev, 5000);
               });
 
               const activeRules = triggerRulesRef.current.filter((rule) => rule.enabled !== false);
