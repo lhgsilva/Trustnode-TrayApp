@@ -157,11 +157,28 @@ export function getAuthToken() {
 }
 
 export async function loginAuth(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/login`, {
+  const request = {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  });
+  };
+  let res;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const timeoutMs = 20000 + (attempt - 1) * 10000;
+      res = await fetchWithTimeout(`${getApiBase()}/api/auth/login`, request, timeoutMs);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientFetchError(err) || attempt === 3) break;
+      await sleep(250 * attempt);
+    }
+  }
+  if (!res) {
+    throw lastErr || new Error("Login failed: network timeout");
+  }
   if (!res.ok) {
     let detail = "";
     try {
@@ -611,7 +628,10 @@ export async function getAppStoreHistorian(limit = 1000) {
           for (const t of tags) {
             rows.push({
               ts: sample.sample_ts_utc,
-              source: sample.plc_driver_type || "",
+              source: sample.customer_id || sample.tenant_id || sample.plc_driver_type || "",
+              site: sample.plant_id || "",
+              area: sample.gateway_id || "",
+              equipment: sample.machine_id || "",
               gateway_id: sample.gateway_id || "",
               gateway_name: sample.gateway_id || "",
               device_name: sample.machine_id || "",
@@ -622,6 +642,9 @@ export async function getAppStoreHistorian(limit = 1000) {
               quality: Number(t?.quality_code ?? sample.quality_code ?? 0),
               quality_label: String(t?.quality_label || ""),
               tenant_id: sample.tenant_id || "default",
+              customer_id: sample.customer_id || "",
+              plant_id: sample.plant_id || "",
+              machine_id: sample.machine_id || "",
               edge_monotonic_seq: Number(sample.edge_monotonic_seq || 0),
               payload_hash_sha256: sample.payload_hash_sha256 || "",
               sample_age_ms: Number.isFinite(Date.parse(String(sample.sample_ts_utc || "")))
@@ -662,17 +685,23 @@ export async function getAppStoreLive(limit = 5000) {
           for (const t of tags) {
             rows.push({
               ts: state.sample_ts_utc,
-              source: "",
+              source: state.customer_id || state.tenant_id || "",
+              site: state.plant_id || "",
+              area: state.gateway_id || "",
+              equipment: state.machine_id || "",
               gateway_id: state.gateway_id || "",
               gateway_name: state.gateway_id || "",
               device_name: state.machine_id || "",
-              plc_ip: "",
+              plc_ip: state.plc_endpoint_id || "",
               database_name: "cloud_v1",
               tag: String(t?.tag_name || ""),
               value: t?.value ?? null,
               quality: Number(t?.quality_code ?? state.quality_code ?? 0),
               quality_label: String(t?.quality_label || ""),
               tenant_id: state.tenant_id || "default",
+              customer_id: state.customer_id || "",
+              plant_id: state.plant_id || "",
+              machine_id: state.machine_id || "",
               edge_monotonic_seq: Number(state.edge_monotonic_seq || 0),
               payload_hash_sha256: "",
               sample_age_ms: Number.isFinite(Date.parse(String(state.sample_ts_utc || "")))
