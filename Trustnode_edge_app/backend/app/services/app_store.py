@@ -320,6 +320,11 @@ class AppStore:
                 conn.execute(text(f'ALTER TABLE "{schema}"."historian_readings" ADD COLUMN IF NOT EXISTS local_id BIGINT'))
                 conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_hist_local_id" ON "{schema}"."historian_readings"(local_id)'))
                 conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_hist_tenant_ts" ON "{schema}"."historian_readings"(tenant_id, ts_utc DESC)'))
+                conn.execute(
+                    text(
+                        f'CREATE INDEX IF NOT EXISTS "ix_hist_tenant_gw_tag_localid" ON "{schema}"."historian_readings"(tenant_id, gateway_id, tag_name, local_id DESC, id DESC)'
+                    )
+                )
 
                 conn.execute(
                     text(
@@ -1136,25 +1141,15 @@ class AppStore:
             return []
         tenant_id = self._current_tenant_id()
         try:
-            from sqlalchemy import create_engine, text  # type: ignore
+            from sqlalchemy import text  # type: ignore
         except Exception:
             return []
         schema = str(cloud.get("schema") or "public")
         lim = max(1, min(int(limit or 1000), 10000))
-        url = self._build_pg_sqlalchemy_url(
-            str(cloud.get("host") or ""),
-            int(cloud.get("port") or 5432),
-            str(cloud.get("database") or "postgres"),
-            str(cloud.get("username") or ""),
-            str(cloud.get("password") or ""),
-        )
-        connect_args = {
-            "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": 8,
-            "prepare_threshold": None,
-            "options": "-c lock_timeout=1000ms -c statement_timeout=5000ms",
-        }
-        engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+        try:
+            engine, _ = self._get_or_create_cloud_engine(cloud, schema)
+        except Exception:
+            return []
         try:
             if self._strict_cloud_mirror:
                 with engine.begin() as conn:
@@ -1318,37 +1313,21 @@ class AppStore:
             return out
         except Exception:
             return []
-        finally:
-            try:
-                engine.dispose()
-            except Exception:
-                pass
-
     def _fetch_log_rows_from_cloud(self, limit: int) -> list[dict[str, Any]]:
         cloud = self._get_cloud_database_target()
         if not cloud:
             return []
         tenant_id = self._current_tenant_id()
         try:
-            from sqlalchemy import create_engine, text  # type: ignore
+            from sqlalchemy import text  # type: ignore
         except Exception:
             return []
         schema = str(cloud.get("schema") or "public")
         lim = max(1, min(int(limit or 2000), 10000))
-        url = self._build_pg_sqlalchemy_url(
-            str(cloud.get("host") or ""),
-            int(cloud.get("port") or 5432),
-            str(cloud.get("database") or "postgres"),
-            str(cloud.get("username") or ""),
-            str(cloud.get("password") or ""),
-        )
-        connect_args = {
-            "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": 8,
-            "prepare_threshold": None,
-            "options": "-c lock_timeout=1000ms -c statement_timeout=5000ms",
-        }
-        engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+        try:
+            engine, _ = self._get_or_create_cloud_engine(cloud, schema)
+        except Exception:
+            return []
         try:
             with engine.begin() as conn:
                 rows = conn.execute(
@@ -1382,11 +1361,6 @@ class AppStore:
             return out
         except Exception:
             return []
-        finally:
-            try:
-                engine.dispose()
-            except Exception:
-                pass
 
     def _fetch_live_rows_from_cloud(self, limit: int) -> list[dict[str, Any]]:
         cloud = self._get_cloud_database_target()
@@ -1394,27 +1368,54 @@ class AppStore:
             return []
         tenant_id = self._current_tenant_id()
         try:
-            from sqlalchemy import create_engine, text  # type: ignore
+            from sqlalchemy import text  # type: ignore
         except Exception:
             return []
         schema = str(cloud.get("schema") or "public")
         lim = max(1, min(int(limit or 1000), 20000))
-        url = self._build_pg_sqlalchemy_url(
-            str(cloud.get("host") or ""),
-            int(cloud.get("port") or 5432),
-            str(cloud.get("database") or "postgres"),
-            str(cloud.get("username") or ""),
-            str(cloud.get("password") or ""),
-        )
-        connect_args = {
-            "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": 8,
-            "prepare_threshold": None,
-        }
-        engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+        try:
+            engine, _ = self._get_or_create_cloud_engine(cloud, schema)
+        except Exception:
+            return []
         try:
             if self._strict_cloud_mirror:
                 with engine.begin() as conn:
+                    # Fast path: use cloud live snapshot table first.
+                    live_rows = conn.execute(
+                        text(
+                            f"""
+                            SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                   tag_name, value, quality, quality_label
+                            FROM "{schema}"."live_latest"
+                            WHERE tenant_id = :tenant
+                            ORDER BY ts_utc DESC
+                            LIMIT :lim
+                            """
+                        ),
+                        {"lim": lim, "tenant": tenant_id},
+                    ).fetchall()
+                    if live_rows:
+                        out_live: list[dict[str, Any]] = []
+                        for r in live_rows:
+                            out_live.append(
+                                {
+                                    "tenant_id": str(r[0] or tenant_id),
+                                    "ts": str(r[1] or ""),
+                                    "source": str(r[2] or ""),
+                                    "gateway_id": str(r[3] or ""),
+                                    "gateway_name": str(r[4] or ""),
+                                    "device_name": str(r[5] or ""),
+                                    "plc_ip": str(r[6] or ""),
+                                    "database_name": str(r[7] or ""),
+                                    "tag": str(r[8] or ""),
+                                    "value": r[9],
+                                    "quality": r[10],
+                                    "quality_label": str(r[11] or ""),
+                                }
+                            )
+                        return out_live
+
+                    # Fallback: derive latest per (gateway, tag) from historian.
                     rows = conn.execute(
                         text(
                             f"""
@@ -1598,11 +1599,6 @@ class AppStore:
             return out
         except Exception:
             return []
-        finally:
-            try:
-                engine.dispose()
-            except Exception:
-                pass
 
     def _get_data_sync_state(self) -> dict[str, Any]:
         with self._lock:
