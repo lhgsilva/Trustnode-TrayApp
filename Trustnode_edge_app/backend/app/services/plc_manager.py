@@ -50,7 +50,7 @@ class GatewayWorker:
             0.05, float(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MIN_SECONDS", "0.1") or "0.1")
         )
         self._remote_pending_probe_seconds = max(
-            0.1, float(os.environ.get("TRUSTNODE_REMOTE_PENDING_PROBE_SECONDS", "0.5") or "0.5")
+            0.25, float(os.environ.get("TRUSTNODE_REMOTE_PENDING_PROBE_SECONDS", "2.0") or "2.0")
         )
         self._ab_preferred_path: str | None = None
 
@@ -737,9 +737,15 @@ class GatewayWorker:
                     )
                 )
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_outbox_unsent ON outbox_readings(sent_remote, id)"))
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_outbox_gateway_unsent "
+                        "ON outbox_readings(gateway_id, sent_remote, id)"
+                    )
+                )
         return self._buffer_engine
 
-    def _enqueue_outbox(self, readings: List[GatewayReading]) -> None:
+    def _enqueue_outbox(self, readings: List[GatewayReading]) -> int:
         from sqlalchemy import text
 
         engine = self._ensure_buffer_engine()
@@ -771,6 +777,7 @@ class GatewayWorker:
                 ),
                 rows,
             )
+        return len(rows)
 
     def _load_pending(self, limit: int = 300) -> List[Dict[str, Any]]:
         from sqlalchemy import text
@@ -836,22 +843,18 @@ class GatewayWorker:
             try:
                 # Never block real-time collection loop on remote/cloud roundtrips.
                 # Enqueue locally and flush in background thread.
-                self._enqueue_outbox(readings)
+                queued = self._enqueue_outbox(readings)
+                if queued:
+                    self.db_pending_count = max(0, int(self.db_pending_count or 0)) + int(queued)
                 self._mark_db_write_success(len(readings))
-                now_mono = time.monotonic()
-                if now_mono - self._remote_last_pending_probe_monotonic >= self._remote_pending_probe_seconds:
-                    self._remote_last_pending_probe_monotonic = now_mono
-                    self.db_pending_count = self._count_pending()
                 self._schedule_remote_flush(engine)
             except Exception as exc:
                 self._mark_db_write_error(f"Store-forward pipeline error: {exc}")
         elif engine == "legacy_http":
             try:
-                self._enqueue_outbox(readings)
-                now_mono = time.monotonic()
-                if now_mono - self._remote_last_pending_probe_monotonic >= self._remote_pending_probe_seconds:
-                    self._remote_last_pending_probe_monotonic = now_mono
-                    self.db_pending_count = self._count_pending()
+                queued = self._enqueue_outbox(readings)
+                if queued:
+                    self.db_pending_count = max(0, int(self.db_pending_count or 0)) + int(queued)
                 self._schedule_remote_flush(engine)
             except Exception as exc:
                 self._mark_db_write_error(f"Store-forward pipeline error: {exc}")

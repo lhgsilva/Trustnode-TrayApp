@@ -2555,6 +2555,8 @@ function AppShell() {
     const checkDbConnections = async () => {
       const current = dbConnectionsRef.current;
       if (running || !current.length) return;
+      const hasRunningGateway = Object.values(gatewayRuntimeStatusesRef.current || {}).some((s) => s?.running === true);
+      if (hasRunningGateway) return;
       running = true;
       try {
         const checks = await Promise.all(
@@ -2572,7 +2574,7 @@ function AppShell() {
                 legacy_url: c.legacy_url || "",
                 legacy_api_token: c.legacy_api_token || "",
                 tls: Boolean(c.tls),
-                timeout_ms: String(c.engine || "").toLowerCase() === "postgresql" ? 12000 : 4000
+                timeout_ms: String(c.engine || "").toLowerCase() === "postgresql" ? 5000 : 3000
               });
               return { id: c.id, connection_ok: Boolean(res.ok), last_test: res.message, last_check_utc: tsNow() };
             } catch (err) {
