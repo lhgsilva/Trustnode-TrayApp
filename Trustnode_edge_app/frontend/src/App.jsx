@@ -24,6 +24,7 @@ import {
   getAppStoreHistorian,
   getAppStoreLogs,
   getAppStoreInspector,
+  getEdgeIngestDiagnostics,
   repairDatabaseRecovery,
   getRetentionPolicy,
   updateRetentionPolicy,
@@ -1230,6 +1231,8 @@ function AppShell() {
   const [databaseInspector, setDatabaseInspector] = useState(null);
   const [databaseInspectorBusy, setDatabaseInspectorBusy] = useState(false);
   const [databaseInspectorError, setDatabaseInspectorError] = useState("");
+  const [edgeIngestDiagnostics, setEdgeIngestDiagnostics] = useState(null);
+  const [edgeIngestDiagnosticsError, setEdgeIngestDiagnosticsError] = useState("");
   const [appMetadata, setAppMetadata] = useState({});
   const [showDefaultLocalDbBadge, setShowDefaultLocalDbBadge] = useState(false);
   const [forceSyncBusy, setForceSyncBusy] = useState(false);
@@ -2258,6 +2261,21 @@ function AppShell() {
       cancelled = true;
     };
   }, [appStoreHydrated, endpointVersion]);
+
+  useEffect(() => {
+    if (!appStoreHydrated || !currentUser) return;
+    let stopped = false;
+    const run = async () => {
+      if (stopped) return;
+      await refreshEdgeIngestDiagnostics();
+    };
+    run();
+    const timer = setInterval(run, 5000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [appStoreHydrated, currentUser, endpointMode]);
 
   useEffect(() => {
     if (!appStoreHydrated) return;
@@ -6638,6 +6656,20 @@ function AppShell() {
     }
   };
 
+  const refreshEdgeIngestDiagnostics = async () => {
+    try {
+      const res = await getEdgeIngestDiagnostics();
+      if (res?.ok && res?.diagnostics) {
+        setEdgeIngestDiagnostics(res.diagnostics);
+        setEdgeIngestDiagnosticsError("");
+      } else {
+        setEdgeIngestDiagnosticsError("Edge ingest diagnostics unavailable.");
+      }
+    } catch (err) {
+      setEdgeIngestDiagnosticsError(String(err));
+    }
+  };
+
   const refreshRetentionData = async () => {
     const [policyRes, runsRes] = await Promise.all([
       getRetentionPolicy(),
@@ -8700,6 +8732,28 @@ function AppShell() {
                   </div>
                 ) : null}
                 {forceSyncResult ? <div className="info-note" style={{ marginTop: 8 }}>{forceSyncResult}</div> : null}
+                {edgeIngestDiagnostics ? (
+                  <div className="info-note" style={{ marginTop: 8 }}>
+                    <b>Edge Ingest:</b>{" "}
+                    {`outbox=${Number(edgeIngestDiagnostics?.outbox_depth || 0)} | `}
+                    {`oldest_unsynced=${String(edgeIngestDiagnostics?.oldest_unsynced_sample_ts_utc || "-")} | `}
+                    {`token_mode=${String(edgeIngestDiagnostics?.device_token_mode || "-")} | `}
+                    {`vps=${String(edgeIngestDiagnostics?.vps_ingest_url || "-")}`}
+                    {edgeIngestDiagnostics?.last_outbox_error?.error ? (
+                      <>
+                        {" | "}
+                        <span style={{ color: "#b91c1c" }}>
+                          {`last_error(${String(edgeIngestDiagnostics.last_outbox_error.gateway_id || "")}): ${String(edgeIngestDiagnostics.last_outbox_error.error || "")}`}
+                        </span>
+                      </>
+                    ) : null}
+                  </div>
+                ) : null}
+                {edgeIngestDiagnosticsError ? (
+                  <div className="error" style={{ marginTop: 8 }}>
+                    {edgeIngestDiagnosticsError}
+                  </div>
+                ) : null}
               </section>
 
               <section className="card db-simple-card">

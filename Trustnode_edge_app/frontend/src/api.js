@@ -567,9 +567,24 @@ export async function sendNotificationEmail(payload) {
 }
 
 export async function getAppStoreBootstrap() {
-  const res = await fetchWithTimeout(withNoCache(`${getApiBase()}/api/app-store/bootstrap`), {
+  let res;
+  let lastErr = null;
+  const request = {
     headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" }
-  });
+  };
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const timeoutMs = 20000 + (attempt - 1) * 10000;
+      res = await fetchWithTimeout(withNoCache(`${getApiBase()}/api/app-store/bootstrap`), request, timeoutMs);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientFetchError(err) || attempt === 3) break;
+      await sleep(250 * attempt);
+    }
+  }
+  if (!res) throw (lastErr || new Error("App store bootstrap fetch failed"));
   if (!res.ok) throw new Error("App store bootstrap fetch failed");
   return res.json();
 }
@@ -741,6 +756,16 @@ export async function getAppStoreInspector(previewLimit = 15) {
     { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
   );
   if (!res.ok) throw new Error("App store inspector fetch failed");
+  return res.json();
+}
+
+export async function getEdgeIngestDiagnostics() {
+  const res = await fetchWithTimeout(
+    withNoCache(`${getApiBase()}/api/v1/edge/diagnostics`),
+    { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } },
+    20000
+  );
+  if (!res.ok) throw new Error("Edge diagnostics fetch failed");
   return res.json();
 }
 

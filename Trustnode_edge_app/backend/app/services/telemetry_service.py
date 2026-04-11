@@ -615,11 +615,60 @@ class TelemetryService:
             oldest = conn.execute(
                 "SELECT sample_ts_utc FROM sync_outbox_v1 WHERE status IN ('pending','retry') ORDER BY sample_ts_utc ASC LIMIT 1"
             ).fetchone()
+            by_gateway_rows = conn.execute(
+                """
+                SELECT gateway_id, status, COUNT(*) AS c
+                FROM sync_outbox_v1
+                GROUP BY gateway_id, status
+                """
+            ).fetchall()
+            by_gateway: Dict[str, Dict[str, int]] = {}
+            for row in by_gateway_rows:
+                gid = str(row["gateway_id"] or "")
+                st = str(row["status"] or "")
+                if gid not in by_gateway:
+                    by_gateway[gid] = {"pending": 0, "retry": 0, "acked": 0, "rejected": 0}
+                if st in by_gateway[gid]:
+                    by_gateway[gid][st] = int(row["c"] or 0)
+            token_rows = conn.execute(
+                "SELECT gateway_id, expires_utc, updated_utc FROM gateway_device_tokens ORDER BY updated_utc DESC"
+            ).fetchall()
+            gateway_tokens = [
+                {
+                    "gateway_id": str(r["gateway_id"] or ""),
+                    "expires_utc": str(r["expires_utc"] or ""),
+                    "updated_utc": str(r["updated_utc"] or ""),
+                }
+                for r in token_rows
+            ]
+            last_error = conn.execute(
+                """
+                SELECT edge_record_id, gateway_id, last_error, updated_utc
+                FROM sync_outbox_v1
+                WHERE status IN ('retry','rejected') AND COALESCE(last_error, '') <> ''
+                ORDER BY updated_utc DESC
+                LIMIT 1
+                """
+            ).fetchone()
             return {
                 "collector_instance_id": self.collector_instance_id,
                 "db_path": str(self.db_path),
+                "tenant_id": self.tenant_id,
+                "customer_id": self.customer_id,
+                "vps_ingest_url": self.vps_ingest_url,
+                "cloud_bootstrap_user": self.cloud_bootstrap_user,
+                "device_token_mode": "static_env" if bool(self.device_token) else "gateway_auto_issue",
+                "cloud_user_token_cached": bool(self._cloud_user_token and self._cloud_user_token_exp > time.time() + 60),
                 "outbox_depth": outbox_depth,
                 "oldest_unsynced_sample_ts_utc": str(oldest["sample_ts_utc"]) if oldest else None,
+                "outbox_by_gateway": by_gateway,
+                "gateway_tokens": gateway_tokens,
+                "last_outbox_error": {
+                    "edge_record_id": str(last_error["edge_record_id"] or ""),
+                    "gateway_id": str(last_error["gateway_id"] or ""),
+                    "error": str(last_error["last_error"] or ""),
+                    "updated_utc": str(last_error["updated_utc"] or ""),
+                } if last_error else None,
             }
 
     def _pull_upload_batch(self, conn: sqlite3.Connection) -> List[sqlite3.Row]:

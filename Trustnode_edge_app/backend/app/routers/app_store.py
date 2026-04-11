@@ -82,8 +82,9 @@ class FullResetRequest(BaseModel):
 
 @router.get("/bootstrap")
 def get_bootstrap(request: Request) -> dict:
-    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
-    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    # Bootstrap configuration must be served from local app-store authority
+    # to keep cloud client UI consistent and avoid stale/slow cloud-read drift.
+    prefer_cloud_reads = False
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
