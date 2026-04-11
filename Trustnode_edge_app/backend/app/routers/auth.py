@@ -35,7 +35,8 @@ class LoginRequest(BaseModel):
 
 
 def _load_users_payload() -> Dict[str, Any]:
-    data = app_store.get_bootstrap() or {}
+    # Auth path must be fast and deterministic; never block login on cloud config pulls.
+    data = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
     users_access = data.get("users_access") or {}
     if isinstance(users_access, dict) and isinstance(users_access.get("users"), list) and users_access.get("users"):
         return users_access
@@ -55,7 +56,8 @@ def _load_users_payload() -> Dict[str, Any]:
 def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
     configured_tenant = "default"
     try:
-        bootstrap = app_store.get_bootstrap()
+        # Auth path must be fast and deterministic; use local cached bootstrap only.
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False)
         app_settings = bootstrap.get("app_settings") if isinstance(bootstrap, dict) else {}
         if isinstance(app_settings, dict):
             configured_tenant = normalize_tenant_id(
