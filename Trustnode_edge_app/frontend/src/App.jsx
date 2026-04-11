@@ -3433,11 +3433,15 @@ function AppShell() {
             };
             nextReadings.push({
               ts_utc: readingTs,
-              source: row?.source || "",
+              source: dbMeta?.source || row?.source || "",
+              site: dbMeta?.site || row?.site || "",
+              area: dbMeta?.area || row?.area || "",
+              equipment: dbMeta?.equipment || row?.equipment || "",
               gateway_id: gatewayId,
               gateway_name: row?.gateway_name || "",
               device_name: row?.device_name || "",
               plc_ip: row?.plc_ip || "",
+              database_name: dbName,
               tag_name: rawTag,
               value: row?.value,
               quality,
@@ -4248,7 +4252,8 @@ function AppShell() {
       g.gatewayIds.add(String(gw.id || ""));
     }
 
-    for (const row of dataLog || []) {
+    const liveOrHistorianRows = (Array.isArray(readings) && readings.length ? readings : dataLog) || [];
+    for (const row of liveOrHistorianRows) {
       const dbName = String(row?.database_name || "").trim();
       const directGroup = ensureGroup(row?.source, row?.site, row?.area, row?.equipment);
       const mappedGroupKey = dbName ? dbGroupKeyByName.get(dbName.toLowerCase()) : "";
@@ -4285,7 +4290,7 @@ function AppShell() {
       })
       .filter((g) => g.includeInSelector)
       .sort((a, b) => String(b.lastLiveUtc || b.lastConfigUtc || "").localeCompare(String(a.lastLiveUtc || a.lastConfigUtc || "")));
-  }, [endpointMode, dbConnections, gatewayConfigs, dataLog]);
+  }, [endpointMode, dbConnections, gatewayConfigs, dataLog, readings]);
   const selectedCloudEdge = useMemo(() => {
     if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY) return null;
     return cloudSourceRows.find((r) => String(r.key) === String(selectedCloudEdgeKey)) || null;
