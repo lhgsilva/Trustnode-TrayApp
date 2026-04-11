@@ -53,6 +53,7 @@ class GatewayWorker:
             0.25, float(os.environ.get("TRUSTNODE_REMOTE_PENDING_PROBE_SECONDS", "2.0") or "2.0")
         )
         self._ab_preferred_path: str | None = None
+        self._telemetry_runtime_refresh_monotonic = 0.0
 
     def set_config(self, config: GatewayConfig) -> None:
         self.config = config
@@ -155,7 +156,16 @@ class GatewayWorker:
                     # Durable local commit is the definition of successful collection.
                     # If this fails, we keep runtime alive but we do not mark this cycle as collected.
                     try:
-                        from app.state import telemetry_service  # local import avoids circular import timing
+                        from app.state import telemetry_service, app_store  # local import avoids circular import timing
+
+                        now_mono = time.monotonic()
+                        if now_mono - self._telemetry_runtime_refresh_monotonic >= 10.0:
+                            try:
+                                bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+                                telemetry_service.configure_from_bootstrap(bootstrap)
+                            except Exception:
+                                pass
+                            self._telemetry_runtime_refresh_monotonic = now_mono
 
                         ok, err, edge_record_id = telemetry_service.record_collection_cycle(
                             gateway_id=self.gateway_id,

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import random
+import base64
 import sqlite3
 import threading
 import time
@@ -35,6 +36,10 @@ class TelemetryService:
         self.customer_id = str(os.environ.get("TRUSTNODE_CUSTOMER_ID", "default") or "default")
         self.vps_ingest_url = str(os.environ.get("TRUSTNODE_VPS_INGEST_URL", "")).strip().rstrip("/")
         self.device_token = str(os.environ.get("TRUSTNODE_DEVICE_TOKEN", "")).strip()
+        self.cloud_bootstrap_user = str(os.environ.get("TRUSTNODE_CLOUD_BOOTSTRAP_USER", "admin") or "admin").strip()
+        self.cloud_bootstrap_password = str(os.environ.get("TRUSTNODE_CLOUD_BOOTSTRAP_PASSWORD", "admin") or "admin").strip()
+        self._cloud_user_token = ""
+        self._cloud_user_token_exp = 0.0
         self.max_batch = max(50, min(2000, int(os.environ.get("TRUSTNODE_OUTBOX_BATCH_SIZE", "500") or "500")))
         self.max_request_bytes = max(256_000, int(os.environ.get("TRUSTNODE_OUTBOX_MAX_REQUEST_BYTES", "2000000") or "2000000"))
         self.base_backoff_seconds = max(0.25, float(os.environ.get("TRUSTNODE_OUTBOX_BACKOFF_BASE_SECONDS", "0.5") or "0.5"))
@@ -172,12 +177,140 @@ class TelemetryService:
                   updated_utc TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS gateway_device_tokens (
+                  gateway_id TEXT PRIMARY KEY,
+                  token TEXT NOT NULL,
+                  expires_utc TEXT NOT NULL,
+                  updated_utc TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS ix_raw_gateway_ts ON telemetry_samples_raw(gateway_id, sample_ts_utc DESC);
                 CREATE INDEX IF NOT EXISTS ix_raw_tenant_plant_machine_ts ON telemetry_samples_raw(tenant_id, plant_id, machine_id, sample_ts_utc DESC);
                 CREATE INDEX IF NOT EXISTS ix_raw_gateway_seq ON telemetry_samples_raw(gateway_id, edge_monotonic_seq DESC);
                 CREATE INDEX IF NOT EXISTS ix_outbox_v1_status_seq ON sync_outbox_v1(status, sample_ts_utc, edge_monotonic_seq);
                 """
             )
+
+    def configure_from_bootstrap(self, bootstrap: Dict[str, Any]) -> None:
+        data = (bootstrap or {}).get("data") if isinstance(bootstrap, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
+        app_settings = data.get("app_settings") if isinstance(data.get("app_settings"), dict) else {}
+        endpoint_mode = str(app_settings.get("endpoint_mode") or "").strip().lower()
+        cloud_url = str(app_settings.get("cloud_url") or "").strip().rstrip("/")
+        if endpoint_mode == "cloud" and cloud_url:
+            self.vps_ingest_url = cloud_url
+        realm = str(
+            app_settings.get("tenant_login_realm")
+            or app_settings.get("tenant_id")
+            or self.tenant_id
+        ).strip()
+        if realm:
+            self.tenant_id = realm
+
+    @staticmethod
+    def _decode_jwt_exp(token: str) -> float:
+        try:
+            parts = str(token or "").split(".")
+            if len(parts) < 2:
+                return 0.0
+            payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
+            return float(payload.get("exp") or 0.0)
+        except Exception:
+            return 0.0
+
+    def _ensure_cloud_user_token(self) -> Tuple[bool, str]:
+        now = time.time()
+        if self._cloud_user_token and self._cloud_user_token_exp > now + 60:
+            return True, self._cloud_user_token
+        if not self.vps_ingest_url:
+            return False, "missing_vps_ingest_url"
+        try:
+            res = requests.post(
+                f"{self.vps_ingest_url}/api/auth/login",
+                json={"username": self.cloud_bootstrap_user, "password": self.cloud_bootstrap_password},
+                timeout=10,
+            )
+            if res.status_code // 100 != 2:
+                return False, f"cloud_login_http_{res.status_code}"
+            payload = res.json()
+            token = str(payload.get("token") or "").strip()
+            if not token:
+                return False, "cloud_login_missing_token"
+            self._cloud_user_token = token
+            self._cloud_user_token_exp = self._decode_jwt_exp(token)
+            return True, token
+        except Exception as exc:
+            return False, str(exc)
+
+    def _gateway_token_from_db(self, conn: sqlite3.Connection, gateway_id: str) -> str:
+        row = conn.execute(
+            "SELECT token, expires_utc FROM gateway_device_tokens WHERE gateway_id = ?",
+            (gateway_id,),
+        ).fetchone()
+        if not row:
+            return ""
+        expires_text = str(row["expires_utc"] or "")
+        try:
+            exp = datetime.fromisoformat(expires_text.replace("Z", "+00:00")).timestamp()
+            if exp <= time.time() + 60:
+                return ""
+        except Exception:
+            return ""
+        return str(row["token"] or "")
+
+    def _issue_gateway_device_token(self, conn: sqlite3.Connection, gateway_id: str) -> Tuple[bool, str]:
+        if self.device_token:
+            return True, self.device_token
+        ok, token_or_err = self._ensure_cloud_user_token()
+        if not ok:
+            return False, token_or_err
+        try:
+            res = requests.post(
+                f"{self.vps_ingest_url}/api/v1/devices/token",
+                json={
+                    "tenant_id": self.tenant_id,
+                    "gateway_id": gateway_id,
+                    "expires_seconds": 3600,
+                },
+                headers={"Authorization": f"Bearer {token_or_err}"},
+                timeout=10,
+            )
+            if res.status_code // 100 != 2:
+                return False, f"issue_device_token_http_{res.status_code}"
+            payload = res.json()
+            device_token = str(payload.get("token") or "").strip()
+            if not device_token:
+                return False, "issue_device_token_missing_token"
+            exp_epoch = self._decode_jwt_exp(device_token)
+            if exp_epoch > 0:
+                expires_utc = datetime.fromtimestamp(exp_epoch, tz=timezone.utc).isoformat()
+            else:
+                expires_utc = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc).isoformat()
+            now_utc = self._utc_now_text()
+            conn.execute(
+                """
+                INSERT INTO gateway_device_tokens(gateway_id, token, expires_utc, updated_utc)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(gateway_id) DO UPDATE SET
+                  token=excluded.token,
+                  expires_utc=excluded.expires_utc,
+                  updated_utc=excluded.updated_utc
+                """,
+                (gateway_id, device_token, expires_utc, now_utc),
+            )
+            return True, device_token
+        except Exception as exc:
+            return False, str(exc)
+
+    def _token_for_gateway(self, conn: sqlite3.Connection, gateway_id: str) -> Tuple[bool, str]:
+        if self.device_token:
+            return True, self.device_token
+        cached = self._gateway_token_from_db(conn, gateway_id)
+        if cached:
+            return True, cached
+        return self._issue_gateway_device_token(conn, gateway_id)
 
     def _gateway_next_seq(self, conn: sqlite3.Connection, gateway_id: str) -> int:
         row = conn.execute("SELECT last_seq FROM gateway_runtime_state WHERE gateway_id = ?", (gateway_id,)).fetchone()
@@ -491,7 +624,7 @@ class TelemetryService:
 
     def _pull_upload_batch(self, conn: sqlite3.Connection) -> List[sqlite3.Row]:
         now = self._utc_now_text()
-        return conn.execute(
+        rows = conn.execute(
             """
             SELECT * FROM sync_outbox_v1
             WHERE status IN ('pending','retry')
@@ -499,20 +632,31 @@ class TelemetryService:
             ORDER BY sample_ts_utc ASC, edge_monotonic_seq ASC
             LIMIT ?
             """,
-            (now, self.max_batch),
+            (now, max(self.max_batch * 4, self.max_batch)),
         ).fetchall()
+        if not rows:
+            return []
+        first_gateway = str(rows[0]["gateway_id"] or "")
+        selected: List[sqlite3.Row] = []
+        for row in rows:
+            if str(row["gateway_id"] or "") != first_gateway:
+                continue
+            selected.append(row)
+            if len(selected) >= self.max_batch:
+                break
+        return selected
 
     def _next_backoff(self, retries: int) -> float:
         base = self.base_backoff_seconds * (2 ** max(0, retries - 1))
         jitter = random.uniform(0.0, 0.25 * base)
         return min(self.max_backoff_seconds, base + jitter)
 
-    def _post_ingest_batch(self, records: List[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
-        if not self.vps_ingest_url or not self.device_token:
+    def _post_ingest_batch(self, records: List[Dict[str, Any]], *, gateway_id: str, bearer_token: str) -> Tuple[bool, Dict[str, Any]]:
+        if not self.vps_ingest_url or not bearer_token:
             return False, {"error": "VPS ingest URL/device token not configured"}
         payload = {
             "tenant_id": self.tenant_id,
-            "gateway_id": str(records[0].get("gateway_id") or "") if records else "",
+            "gateway_id": str(gateway_id or ""),
             "records": records,
         }
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -521,7 +665,7 @@ class TelemetryService:
             return False, {"error": f"compressed batch too large: {len(compressed)} bytes"}
 
         headers = {
-            "Authorization": f"Bearer {self.device_token}",
+            "Authorization": f"Bearer {bearer_token}",
             "Content-Type": "application/json",
             "Content-Encoding": "gzip",
         }
@@ -555,12 +699,37 @@ class TelemetryService:
                         if batch:
                             any_work = True
                             rows = [dict(r) for r in batch]
+                            gateway_id = str(rows[0].get("gateway_id") or "") if rows else ""
+                            ok_token, token_or_err = self._token_for_gateway(conn, gateway_id)
+                            if not ok_token:
+                                now = self._utc_now_text()
+                                err = f"device_token_unavailable:{token_or_err}"
+                                for row in rows:
+                                    retries = int(row.get("retries") or 0) + 1
+                                    delay = self._next_backoff(retries)
+                                    next_retry = datetime.fromtimestamp(time.time() + delay, tz=timezone.utc).isoformat()
+                                    conn.execute(
+                                        "UPDATE sync_outbox_v1 SET status='retry', retries=?, updated_utc=?, next_retry_utc=?, last_error=? WHERE edge_record_id=?",
+                                        (retries, now, next_retry, err[:1000], str(row["edge_record_id"])),
+                                    )
+                                self._audit(
+                                    conn,
+                                    actor_type="system",
+                                    actor_id="outbox_sync",
+                                    tenant_id=self.tenant_id,
+                                    action="device_token_issue",
+                                    outcome="failure",
+                                    correlation_id=str(uuid.uuid4()),
+                                    details={"gateway_id": gateway_id, "batch_size": len(rows), "error": str(token_or_err)},
+                                )
+                                self._metric_upsert(conn, "outbox_depth", self._outbox_depth(conn), None)
+                                continue
                             records: List[Dict[str, Any]] = []
                             for row in rows:
                                 rec = json.loads(row["payload_json"])
                                 records.append(rec)
 
-                            ok, result = self._post_ingest_batch(records)
+                            ok, result = self._post_ingest_batch(records, gateway_id=gateway_id, bearer_token=token_or_err)
                             corr = str(result.get("correlation_id") or str(uuid.uuid4()))
 
                             if ok:
