@@ -67,6 +67,7 @@ const TRIGGER_RULES_STORAGE_KEY = "trustnode_trigger_rules";
 const COLLECTION_TRIGGERS_STORAGE_KEY = "trustnode_collection_triggers";
 const DASHBOARD_WIDGETS_STORAGE_KEY = "trustnode_dashboard_widgets";
 const DASHBOARD_LAYOUT_STORAGE_KEY = "trustnode_dashboard_layout";
+const DASHBOARD_TAG_COLORS_STORAGE_KEY = "trustnode_dashboard_tag_colors";
 const EMAIL_SETTINGS_STORAGE_KEY = "trustnode_email_settings";
 const DEFAULT_LOCAL_DB_BADGE_DISMISS_KEY = "trustnode_default_local_db_badge_dismissed";
 const LOCAL_DB_ENGINES = new Set(["sqlite", "csv_file", "txt_file"]);
@@ -469,7 +470,7 @@ function buildChronologicalSeries(rows, maxPoints = 120, minStepMs = 0) {
   }));
 }
 
-function computeSeriesDomain(points) {
+function computeSeriesDomain(points, previousDomain = null) {
   const vals = (Array.isArray(points) ? points : []).map((p) => Number(p?.value)).filter((v) => Number.isFinite(v));
   if (!vals.length) return ["auto", "auto"];
   const min = Math.min(...vals);
@@ -477,8 +478,25 @@ function computeSeriesDomain(points) {
   const span = Math.abs(max - min);
   const ref = Math.max(Math.abs(min), Math.abs(max), 1);
   const pad = Math.max(span * 0.08, ref * 0.02, 0.25);
-  if (span < 1e-9) return [min - pad, max + pad];
-  return [min - pad, max + pad];
+  const nextMin = span < 1e-9 ? min - pad : min - pad;
+  const nextMax = span < 1e-9 ? max + pad : max + pad;
+  if (!Array.isArray(previousDomain) || previousDomain.length !== 2) return [nextMin, nextMax];
+  const prevMin = Number(previousDomain[0]);
+  const prevMax = Number(previousDomain[1]);
+  if (!Number.isFinite(prevMin) || !Number.isFinite(prevMax) || prevMax <= prevMin) return [nextMin, nextMax];
+  // Expand fast for new excursions; shrink slowly to avoid chart jitter.
+  const expand = Math.max((prevMax - prevMin) * 0.03, 0.1);
+  const expandedMin = Math.min(nextMin, prevMin - expand);
+  const expandedMax = Math.max(nextMax, prevMax + expand);
+  if (expandedMin < prevMin || expandedMax > prevMax) return [expandedMin, expandedMax];
+  const shrinkThreshold = Math.max((prevMax - prevMin) * 0.2, 0.5);
+  const canShrinkMin = nextMin - prevMin > shrinkThreshold;
+  const canShrinkMax = prevMax - nextMax > shrinkThreshold;
+  if (!canShrinkMin && !canShrinkMax) return [prevMin, prevMax];
+  const shrinkFactor = 0.35;
+  const shrunkMin = canShrinkMin ? prevMin + (nextMin - prevMin) * shrinkFactor : prevMin;
+  const shrunkMax = canShrinkMax ? prevMax - (prevMax - nextMax) * shrinkFactor : prevMax;
+  return [shrunkMin, shrunkMax];
 }
 
 function formatElapsedFromUtc(rawTs) {
@@ -1145,6 +1163,7 @@ function AppShell() {
   const [showTagMonitorModal, setShowTagMonitorModal] = useState(false);
   const [tagMonitorSelection, setTagMonitorSelection] = useState(null);
   const [dashboardWidgets, setDashboardWidgets] = useState([]);
+  const [dashboardTagColors, setDashboardTagColors] = useState({});
   const [dashboardMode, setDashboardMode] = useState("kpi");
   const [dashboardPerRow, setDashboardPerRow] = useState(2);
   const [showDashboardWidgetModal, setShowDashboardWidgetModal] = useState(false);
@@ -1248,6 +1267,8 @@ function AppShell() {
     max_delete_rows_per_run: 50000
   });
   const [retentionPresetKey, setRetentionPresetKey] = useState("week");
+  const dashboardDomainByKeyRef = useRef({});
+  const tagMonitorDomainRef = useRef(null);
   const [cloudProviderDbId, setCloudProviderDbId] = useState("");
   const [currentTenantId, setCurrentTenantId] = useState("default");
   const [cloudAutoSyncEnabled, setCloudAutoSyncEnabled] = useState(true);
@@ -2055,6 +2076,19 @@ function AppShell() {
       }
     } catch {}
     try {
+      const savedColors = localStorage.getItem(DASHBOARD_TAG_COLORS_STORAGE_KEY);
+      if (savedColors) {
+        const parsedColors = JSON.parse(savedColors);
+        if (parsedColors && typeof parsedColors === "object" && !Array.isArray(parsedColors)) {
+          const normalized = {};
+          for (const [k, v] of Object.entries(parsedColors)) {
+            normalized[String(k)] = normalizeHexColor(v, "#16a34a");
+          }
+          setDashboardTagColors(normalized);
+        }
+      }
+    } catch {}
+    try {
       const savedLayout = JSON.parse(localStorage.getItem(DASHBOARD_LAYOUT_STORAGE_KEY) || "{}");
       const mode = savedLayout?.mode === "chart" ? "chart" : "kpi";
       const perRow = Math.min(4, Math.max(1, Number(savedLayout?.per_row || 2)));
@@ -2066,6 +2100,10 @@ function AppShell() {
   useEffect(() => {
     localStorage.setItem(DASHBOARD_WIDGETS_STORAGE_KEY, JSON.stringify(dashboardWidgets));
   }, [dashboardWidgets]);
+
+  useEffect(() => {
+    localStorage.setItem(DASHBOARD_TAG_COLORS_STORAGE_KEY, JSON.stringify(dashboardTagColors || {}));
+  }, [dashboardTagColors]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -4614,6 +4652,38 @@ function AppShell() {
     });
   }, [tagRows, tagFilters]);
 
+  const dashboardColorKeyFor = useCallback((gatewayId, tagName) => {
+    return `${String(gatewayId || "").trim()}::${normalizeTagName(tagName)}`;
+  }, []);
+
+  const getDashboardTagColor = useCallback(
+    (gatewayId, tagName, fallback = "#16a34a") => {
+      const byGatewayKey = dashboardColorKeyFor(gatewayId, tagName);
+      const byTagKey = dashboardColorKeyFor("*", tagName);
+      const gatewayColor = dashboardTagColors?.[byGatewayKey];
+      if (gatewayColor) return normalizeHexColor(gatewayColor, fallback);
+      const tagColor = dashboardTagColors?.[byTagKey];
+      if (tagColor) return normalizeHexColor(tagColor, fallback);
+      return normalizeHexColor(fallback, "#16a34a");
+    },
+    [dashboardColorKeyFor, dashboardTagColors]
+  );
+
+  const rememberDashboardTagColor = useCallback(
+    (gatewayId, tagName, colorValue) => {
+      const color = normalizeHexColor(colorValue, "#16a34a");
+      const keyGateway = dashboardColorKeyFor(gatewayId, tagName);
+      const keyTag = dashboardColorKeyFor("*", tagName);
+      setDashboardTagColors((prev) => {
+        const next = { ...(prev || {}) };
+        next[keyGateway] = color;
+        next[keyTag] = color;
+        return next;
+      });
+    },
+    [dashboardColorKeyFor]
+  );
+
   const dashboardWidgetsView = useMemo(() => {
     if (!isCloudEdgeFilterActive) return dashboardWidgets;
     const allowedGatewayIds = new Set((gatewayConfigsView || []).map((g) => String(g.id || "")));
@@ -4630,7 +4700,7 @@ function AppShell() {
       seen.add(key);
       fallback.push({
         id: `auto-${key}`,
-        color: "#16a34a",
+        color: getDashboardTagColor(gid, tag, "#16a34a"),
         title: tag,
         tag_name: tag,
         chart_type: "line",
@@ -4640,13 +4710,18 @@ function AppShell() {
       if (fallback.length >= 8) break;
     }
     return fallback;
-  }, [dashboardWidgets, gatewayConfigsView, tagRows, isCloudEdgeFilterActive]);
+  }, [dashboardWidgets, gatewayConfigsView, tagRows, isCloudEdgeFilterActive, getDashboardTagColor]);
 
   const dashboardItems = useMemo(() => {
-    return dashboardWidgetsView.map((w) => {
+    const nextSeenKeys = new Set();
+    const items = dashboardWidgetsView.map((w) => {
       const gateway = gatewayConfigsView.find((g) => String(g.id) === String(w.gateway_id)) || null;
       if (!gateway) return null;
       const device = devicesView.find((d) => String(d.id) === String(gateway?.device_id || "")) || null;
+      const itemColor = normalizeHexColor(
+        w.color || getDashboardTagColor(w.gateway_id, w.tag_name, "#16a34a"),
+        "#16a34a"
+      );
       const points = buildChronologicalSeries(
         dataLogView
         .filter(
@@ -4662,7 +4737,12 @@ function AppShell() {
         endpointMode !== "cloud"
       );
       const series = String(w?.chart_type || "line") === "bar" ? points : lineSeries;
-      const yDomain = computeSeriesDomain(series);
+      const domainKey = `${String(w.gateway_id || "")}::${normalizeTagName(w.tag_name)}::${String(w.id || "")}`;
+      nextSeenKeys.add(domainKey);
+      const prevDomain = dashboardDomainByKeyRef.current?.[domainKey] || null;
+      const yDomain = computeSeriesDomain(series, prevDomain);
+      dashboardDomainByKeyRef.current[domainKey] = yDomain;
+      const xDomain = [1, Math.max(20, Number(w.readings_count || 120)) + 1];
       const last = points.length ? points[points.length - 1] : null;
       const prev = points.length > 1 ? points[points.length - 2] : null;
       const delta = last && prev ? Number(last.value) - Number(prev.value) : 0;
@@ -4680,6 +4760,7 @@ function AppShell() {
       };
       return {
         ...w,
+        color: itemColor,
         title: w.title || w.tag_name,
         gateway_name: gateway?.name || "-",
         device_name: device?.name || "-",
@@ -4688,11 +4769,17 @@ function AppShell() {
         delta,
         series,
         yDomain,
+        xDomain,
         freshness,
         monitorRow
       };
     }).filter(Boolean);
-  }, [dashboardWidgetsView, gatewayConfigsView, devicesView, dataLogView, renderNowMs]);
+    const domainState = dashboardDomainByKeyRef.current || {};
+    for (const key of Object.keys(domainState)) {
+      if (!nextSeenKeys.has(key)) delete domainState[key];
+    }
+    return items;
+  }, [dashboardWidgetsView, gatewayConfigsView, devicesView, dataLogView, renderNowMs, endpointMode, getDashboardTagColor]);
 
   const tagMonitorSeries = useMemo(() => {
     if (!tagMonitorSelection) return [];
@@ -4714,7 +4801,22 @@ function AppShell() {
         );
   }, [dataLogView, tagMonitorSelection, tagMonitorChartType, renderNowMs]);
 
-  const tagMonitorDomain = useMemo(() => computeSeriesDomain(tagMonitorSeries), [tagMonitorSeries]);
+  const tagMonitorDomain = useMemo(() => {
+    const prev = tagMonitorDomainRef.current;
+    const next = computeSeriesDomain(tagMonitorSeries, prev);
+    tagMonitorDomainRef.current = next;
+    return next;
+  }, [tagMonitorSeries]);
+  const tagMonitorColor = useMemo(
+    () =>
+      getDashboardTagColor(
+        tagMonitorSelection?.gateway_id || "",
+        tagMonitorSelection?.tag_name || "",
+        "#16a34a"
+      ),
+    [tagMonitorSelection, getDashboardTagColor]
+  );
+  const tagMonitorXDomain = useMemo(() => [1, Math.max(20, Number(tagMonitorSelection?.readings_count || 120)) + 1], [tagMonitorSelection]);
 
   const tagMonitorLatest = useMemo(() => {
     if (!tagMonitorSelection) return null;
@@ -4825,7 +4927,7 @@ function AppShell() {
       gateway_id: gatewayId,
       tag_name: tag,
       readings_count: 120,
-      color: "#16a34a",
+      color: getDashboardTagColor(gatewayId, tag, "#16a34a"),
       chart_type: "line"
     });
     setShowDashboardWidgetModal(true);
@@ -4840,7 +4942,7 @@ function AppShell() {
       gateway_id: item.gateway_id || "",
       tag_name: item.tag_name || "",
       readings_count: Number(item.readings_count || 120),
-      color: item.color || "#16a34a",
+      color: normalizeHexColor(item.color || getDashboardTagColor(item.gateway_id, item.tag_name, "#16a34a"), "#16a34a"),
       chart_type: item.chart_type === "bar" ? "bar" : "line"
     });
     setShowDashboardWidgetModal(true);
@@ -4861,9 +4963,13 @@ function AppShell() {
       gateway_id: gatewayId,
       tag_name: tagName,
       readings_count: count,
-      color: dashboardWidgetForm.color || "#16a34a",
+      color: normalizeHexColor(
+        dashboardWidgetForm.color || getDashboardTagColor(gatewayId, tagName, "#16a34a"),
+        "#16a34a"
+      ),
       chart_type: dashboardWidgetForm.chart_type === "bar" ? "bar" : "line"
     };
+    rememberDashboardTagColor(gatewayId, tagName, payload.color);
     setDashboardWidgets((prev) => {
       if (editingDashboardWidgetId) return prev.map((w) => (w.id === editingDashboardWidgetId ? payload : w));
       return [...prev, payload];
@@ -8325,7 +8431,8 @@ function AppShell() {
                                   dataKey="idx"
                                   type="number"
                                   tickFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || ""}
-                                  domain={[(min) => Number(min) - 1, (max) => Number(max) + 1]}
+                                  domain={item.xDomain || [1, 121]}
+                                  allowDataOverflow
                                 />
                                 <YAxis width={60} domain={item.yDomain || ["auto", "auto"]} />
                                 <Tooltip labelFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || String(v)} />
@@ -8339,7 +8446,8 @@ function AppShell() {
                                   dataKey="idx"
                                   type="number"
                                   tickFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || ""}
-                                  domain={[(min) => Number(min) - 1, (max) => Number(max) + 1]}
+                                  domain={item.xDomain || [1, 121]}
+                                  allowDataOverflow
                                 />
                                 <YAxis width={52} domain={item.yDomain || ["auto", "auto"]} />
                                 <Tooltip labelFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || String(v)} />
@@ -10636,19 +10744,19 @@ function AppShell() {
               {tagMonitorChartType === "line" ? (
                 <ResponsiveContainer width="100%" height={260}>
                   <LineChart data={tagMonitorSeries} margin={{ top: 8, right: 18, left: 24, bottom: 8 }}>
-                    <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={[(min) => Number(min) - 1, (max) => Number(max) + 1]} />
+                    <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={tagMonitorXDomain} allowDataOverflow />
                     <YAxis width={52} domain={tagMonitorDomain} />
                     <Tooltip labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)} />
-                    <Line isAnimationActive={false} type="linear" dataKey="value" stroke="#16a34a" strokeWidth={2} dot={false} />
+                    <Line isAnimationActive={false} type="linear" dataKey="value" stroke={tagMonitorColor} strokeWidth={2} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>
               ) : (
                 <ResponsiveContainer width="100%" height={260}>
                   <BarChart data={tagMonitorSeries} margin={{ top: 8, right: 18, left: 30, bottom: 8 }} barCategoryGap="24%">
-                    <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={[(min) => Number(min) - 1, (max) => Number(max) + 1]} />
+                    <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={tagMonitorXDomain} allowDataOverflow />
                     <YAxis width={60} domain={tagMonitorDomain} />
                     <Tooltip labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)} />
-                    <Bar isAnimationActive={false} dataKey="value" fill="#0f766e" maxBarSize={22} />
+                    <Bar isAnimationActive={false} dataKey="value" fill={tagMonitorColor} maxBarSize={22} />
                   </BarChart>
                 </ResponsiveContainer>
               )}
@@ -11506,7 +11614,12 @@ function AppShell() {
                     const nextGateway = e.target.value;
                     const nextTags = triggerTagsByGateway[nextGateway] || [];
                     const nextTag = nextTags.includes(dashboardWidgetForm.tag_name) ? dashboardWidgetForm.tag_name : (nextTags[0] || "");
-                    setDashboardWidgetForm({ ...dashboardWidgetForm, gateway_id: nextGateway, tag_name: nextTag });
+                    setDashboardWidgetForm({
+                      ...dashboardWidgetForm,
+                      gateway_id: nextGateway,
+                      tag_name: nextTag,
+                      color: getDashboardTagColor(nextGateway, nextTag, dashboardWidgetForm.color || "#16a34a"),
+                    });
                   }}
                 >
                   <option value="">Select gateway</option>
@@ -11519,7 +11632,14 @@ function AppShell() {
                 Tag
                 <select
                   value={dashboardWidgetForm.tag_name}
-                  onChange={(e) => setDashboardWidgetForm({ ...dashboardWidgetForm, tag_name: e.target.value })}
+                  onChange={(e) => {
+                    const nextTag = e.target.value;
+                    setDashboardWidgetForm({
+                      ...dashboardWidgetForm,
+                      tag_name: nextTag,
+                      color: getDashboardTagColor(dashboardWidgetForm.gateway_id, nextTag, dashboardWidgetForm.color || "#16a34a"),
+                    });
+                  }}
                 >
                   <option value="">Select tag</option>
                   {(triggerTagsByGateway[dashboardWidgetForm.gateway_id] || []).map((tag) => (
@@ -11542,7 +11662,13 @@ function AppShell() {
                 <input
                   type="color"
                   value={dashboardWidgetForm.color}
-                  onChange={(e) => setDashboardWidgetForm({ ...dashboardWidgetForm, color: e.target.value })}
+                  onChange={(e) => {
+                    const nextColor = normalizeHexColor(e.target.value, "#16a34a");
+                    setDashboardWidgetForm({ ...dashboardWidgetForm, color: nextColor });
+                    if (dashboardWidgetForm.tag_name) {
+                      rememberDashboardTagColor(dashboardWidgetForm.gateway_id, dashboardWidgetForm.tag_name, nextColor);
+                    }
+                  }}
                 />
               </label>
             </div>
