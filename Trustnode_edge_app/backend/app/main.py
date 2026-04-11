@@ -16,7 +16,8 @@ from app.routers.health import router as health_router
 from app.routers.plc import router as plc_router
 from app.routers.ui_source import router as ui_source_router
 from app.routers.notifications import router as notifications_router
-from app.state import plc_manager, app_store
+from app.routers.telemetry_v1 import router as telemetry_v1_router
+from app.state import plc_manager, app_store, telemetry_service, ingest_store
 from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
 
 app = FastAPI(title="Trustnode Edge API", version="0.1.0")
@@ -37,12 +38,15 @@ app.include_router(database_router)
 app.include_router(app_store_router)
 app.include_router(ui_source_router)
 app.include_router(notifications_router)
+app.include_router(telemetry_v1_router)
 
 
 PUBLIC_PATHS = {
     "/api/health",
     "/api/auth/login",
     "/api/auth/me",
+    "/api/v1/healthz",
+    "/api/v1/readyz",
 }
 
 
@@ -67,6 +71,10 @@ async def auth_middleware(request: Request, call_next):
         return _apply_no_cache_headers(await call_next(request))
     if not path.startswith("/api/"):
         return await call_next(request)
+    # v1 telemetry endpoints use explicit auth inside router handlers
+    # (device tokens for ingest, user tokens for query/admin).
+    if path.startswith("/api/v1/"):
+        return _apply_no_cache_headers(await call_next(request))
     if request.url.path in PUBLIC_PATHS:
         return _apply_no_cache_headers(await call_next(request))
     auth = request.headers.get("Authorization", "")
@@ -139,21 +147,34 @@ async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> No
     live_limit = 300
     sample_interval_seconds = 0.15
 
-    def _ts_ms(raw: str) -> int:
-        text = str(raw or "").strip()
-        if not text:
-            return 0
-        try:
-            iso = text.replace("Z", "+00:00")
-            if " " in iso and "T" not in iso:
-                iso = iso.replace(" ", "T")
-            return int(datetime.fromisoformat(iso).timestamp() * 1000)
-        except Exception:
-            return 0
+    def _flatten_latest(rows: list[dict]) -> list[dict]:
+        flat: list[dict] = []
+        for state in rows:
+            tags = state.get("tags_json") if isinstance(state.get("tags_json"), list) else []
+            for t in tags:
+                flat.append(
+                    {
+                        "ts": state.get("sample_ts_utc"),
+                        "source": "",
+                        "gateway_id": state.get("gateway_id") or "",
+                        "gateway_name": state.get("gateway_id") or "",
+                        "device_name": state.get("machine_id") or "",
+                        "plc_ip": "",
+                        "database_name": "cloud_v1",
+                        "tag": str((t or {}).get("tag_name") or ""),
+                        "value": (t or {}).get("value"),
+                        "quality": int((t or {}).get("quality_code") or state.get("quality_code") or 0),
+                        "quality_label": str((t or {}).get("quality_label") or ""),
+                        "edge_monotonic_seq": int(state.get("edge_monotonic_seq") or 0),
+                        "tenant_id": state.get("tenant_id") or tenant_id,
+                    }
+                )
+        return flat
 
     try:
         while True:
-            live_rows = app_store.get_live_rows(limit=live_limit, prefer_cloud_reads=True)
+            latest_rows = ingest_store.query_latest(tenant_id=tenant_id, limit=live_limit)
+            live_rows = _flatten_latest(latest_rows)
             gateway_statuses = app_store.build_gateway_statuses_from_live_rows(live_rows, freshness_ms=20000)
             running_gateways = [g for g in gateway_statuses if bool(g.get("running"))]
             newest_ts = max((str(g.get("last_check_utc") or "") for g in gateway_statuses), default="")
@@ -209,4 +230,5 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    telemetry_service.shutdown()
     app_store.shutdown()

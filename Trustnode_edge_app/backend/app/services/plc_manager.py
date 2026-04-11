@@ -143,18 +143,46 @@ class GatewayWorker:
             try:
                 readings = self._read_from_gateway()
                 self.latest_readings = readings
+                persisted_local = False
+                persisted_edge_record_id: str | None = None
                 if self._collection_gate_cb:
                     collection_allowed, block_reason = self._collection_gate_cb(self.gateway_id, readings)
                 else:
                     collection_allowed, block_reason = self._is_collection_allowed(readings)
                 self.collection_blocked = not collection_allowed
                 self.collection_block_reason = block_reason
+                if collection_allowed:
+                    # Durable local commit is the definition of successful collection.
+                    # If this fails, we keep runtime alive but we do not mark this cycle as collected.
+                    try:
+                        from app.state import telemetry_service  # local import avoids circular import timing
+
+                        ok, err, edge_record_id = telemetry_service.record_collection_cycle(
+                            gateway_id=self.gateway_id,
+                            config=self.config,
+                            readings=readings,
+                            collection_status="ok",
+                        )
+                        persisted_local = bool(ok)
+                        persisted_edge_record_id = edge_record_id
+                        if not ok:
+                            collection_allowed = False
+                            self.collection_blocked = True
+                            self.collection_block_reason = f"Local persistence failed: {err}"
+                            self.last_error = self.collection_block_reason
+                    except Exception as exc:
+                        collection_allowed = False
+                        self.collection_blocked = True
+                        self.collection_block_reason = f"Local persistence failed: {exc}"
+                        self.last_error = self.collection_block_reason
                 await emit_event(
                     {
                         "type": "reading",
                         "gateway_id": self.gateway_id,
                         "collection_allowed": collection_allowed,
-                        "collection_block_reason": block_reason,
+                        "persisted_local": persisted_local,
+                        "edge_record_id": persisted_edge_record_id,
+                        "collection_block_reason": self.collection_block_reason,
                         "status": self.get_status().model_dump(),
                         "readings": [r.model_dump() for r in readings],
                     }
@@ -1559,6 +1587,7 @@ class PLCManager:
                 isinstance(message, dict)
                 and message.get("type") == "reading"
                 and message.get("collection_allowed") is not False
+                and bool(message.get("persisted_local"))
                 and isinstance(message.get("readings"), list)
             ):
                 from app.state import app_store  # local import to avoid circular import timing

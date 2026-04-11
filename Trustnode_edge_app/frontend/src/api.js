@@ -596,6 +596,46 @@ export async function appendAppStoreLogs(rows) {
 }
 
 export async function getAppStoreHistorian(limit = 1000) {
+  const useV1Cloud = getBackendTarget().mode === "cloud";
+  if (useV1Cloud) {
+    try {
+      const resV1 = await fetchWithTimeout(
+        withNoCache(`${getApiBase()}/api/v1/history?limit=${encodeURIComponent(String(limit))}`),
+        { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
+      );
+      if (resV1.ok) {
+        const data = await resV1.json();
+        const rows = [];
+        for (const sample of Array.isArray(data?.rows) ? data.rows : []) {
+          const tags = Array.isArray(sample?.tags_json) ? sample.tags_json : [];
+          for (const t of tags) {
+            rows.push({
+              ts: sample.sample_ts_utc,
+              source: sample.plc_driver_type || "",
+              gateway_id: sample.gateway_id || "",
+              gateway_name: sample.gateway_id || "",
+              device_name: sample.machine_id || "",
+              plc_ip: sample.plc_endpoint_id || "",
+              database_name: "cloud_v1",
+              tag: String(t?.tag_name || ""),
+              value: t?.value ?? null,
+              quality: Number(t?.quality_code ?? sample.quality_code ?? 0),
+              quality_label: String(t?.quality_label || ""),
+              tenant_id: sample.tenant_id || "default",
+              edge_monotonic_seq: Number(sample.edge_monotonic_seq || 0),
+              payload_hash_sha256: sample.payload_hash_sha256 || "",
+              sample_age_ms: Number.isFinite(Date.parse(String(sample.sample_ts_utc || "")))
+                ? Math.max(0, Date.now() - Date.parse(String(sample.sample_ts_utc || "")))
+                : Number.POSITIVE_INFINITY,
+            });
+          }
+        }
+        return { ok: true, rows };
+      }
+    } catch {
+      // Fallback to legacy app-store route below.
+    }
+  }
   const res = await fetchWithTimeout(
     withNoCache(`${getApiBase()}/api/app-store/historian?limit=${encodeURIComponent(String(limit))}`),
     { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
@@ -605,6 +645,46 @@ export async function getAppStoreHistorian(limit = 1000) {
 }
 
 export async function getAppStoreLive(limit = 5000) {
+  const useV1Cloud = getBackendTarget().mode === "cloud";
+  if (useV1Cloud) {
+    try {
+      const resV1 = await fetchWithTimeout(
+        withNoCache(`${getApiBase()}/api/v1/latest?limit=${encodeURIComponent(String(limit))}`),
+        { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
+      );
+      if (resV1.ok) {
+        const data = await resV1.json();
+        const rows = [];
+        for (const state of Array.isArray(data?.rows) ? data.rows : []) {
+          const tags = Array.isArray(state?.tags_json) ? state.tags_json : [];
+          for (const t of tags) {
+            rows.push({
+              ts: state.sample_ts_utc,
+              source: "",
+              gateway_id: state.gateway_id || "",
+              gateway_name: state.gateway_id || "",
+              device_name: state.machine_id || "",
+              plc_ip: "",
+              database_name: "cloud_v1",
+              tag: String(t?.tag_name || ""),
+              value: t?.value ?? null,
+              quality: Number(t?.quality_code ?? state.quality_code ?? 0),
+              quality_label: String(t?.quality_label || ""),
+              tenant_id: state.tenant_id || "default",
+              edge_monotonic_seq: Number(state.edge_monotonic_seq || 0),
+              payload_hash_sha256: "",
+              sample_age_ms: Number.isFinite(Date.parse(String(state.sample_ts_utc || "")))
+                ? Math.max(0, Date.now() - Date.parse(String(state.sample_ts_utc || "")))
+                : Number.POSITIVE_INFINITY,
+            });
+          }
+        }
+        return { ok: true, rows };
+      }
+    } catch {
+      // Fallback to legacy app-store route below.
+    }
+  }
   const res = await fetchWithTimeout(
     withNoCache(`${getApiBase()}/api/app-store/live?limit=${encodeURIComponent(String(limit))}`),
     { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
