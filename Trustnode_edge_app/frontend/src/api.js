@@ -630,7 +630,9 @@ export async function getAppStoreHistorian(limit = 1000) {
             });
           }
         }
-        return { ok: true, rows };
+        // If v1 endpoint is healthy but currently empty, fall back to legacy mirror
+        // so cloud UI remains populated during migration/cutover.
+        if (rows.length > 0) return { ok: true, rows };
       }
     } catch {
       // Fallback to legacy app-store route below.
@@ -679,7 +681,9 @@ export async function getAppStoreLive(limit = 5000) {
             });
           }
         }
-        return { ok: true, rows };
+        // If v1 endpoint is healthy but currently empty, fall back to legacy mirror
+        // so cloud UI remains populated during migration/cutover.
+        if (rows.length > 0) return { ok: true, rows };
       }
     } catch {
       // Fallback to legacy app-store route below.

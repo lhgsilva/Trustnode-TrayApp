@@ -175,6 +175,10 @@ async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> No
         while True:
             latest_rows = ingest_store.query_latest(tenant_id=tenant_id, limit=live_limit)
             live_rows = _flatten_latest(latest_rows)
+            # Migration-safe fallback: if v1 latest is empty, keep legacy cloud
+            # mirror rows flowing so edge selection and dashboards remain usable.
+            if not live_rows:
+                live_rows = app_store.get_live_rows(limit=live_limit, prefer_cloud_reads=True)
             gateway_statuses = app_store.build_gateway_statuses_from_live_rows(live_rows, freshness_ms=20000)
             running_gateways = [g for g in gateway_statuses if bool(g.get("running"))]
             newest_ts = max((str(g.get("last_check_utc") or "") for g in gateway_statuses), default="")
