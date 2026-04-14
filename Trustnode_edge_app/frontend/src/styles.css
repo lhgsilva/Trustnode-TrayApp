@@ -1,22 +1,22 @@
 :root {
   --bg: #f3f3f3;
-  --header: #ffffff;
-  --header-text: #1f2328;
-  --header-border: #e1e4e8;
-  --header-surface: #f7f7f7;
-  --header-surface-border: #d0d7de;
-  --sidebar: #ffffff;
-  --sidebar-text: #1f2328;
-  --sidebar-soft: #f3f4f6;
-  --sidebar-border: #d8dee4;
-  --sidebar-title: #6b7280;
-  --nav-active-bg: #e8e8e8;
-  --nav-active-text: #1f2328;
-  --card: #ffffff;
-  --stroke: #d0d7de;
+  --header: #2d2d30;
+  --header-text: #d4d4d4;
+  --header-border: #3c3c3c;
+  --header-surface: #333337;
+  --header-surface-border: #454545;
+  --sidebar: #252526;
+  --sidebar-text: #d4d4d4;
+  --sidebar-soft: #2a2d2e;
+  --sidebar-border: #333333;
+  --sidebar-title: #9da0a6;
+  --nav-active-bg: #094771;
+  --nav-active-text: #ffffff;
+  --card: #eceff3;
+  --stroke: #c5ccd6;
   --text: #1f2328;
-  --muted: #6b7280;
-  --table-row: #f8fafc;
+  --muted: #5f6b7a;
+  --table-row: #e5eaf0;
   --error-bg: #fee2e2;
   --error-text: #7f1d1d;
   --error-border: #fecaca;
@@ -2600,14 +2600,21 @@ input[type="checkbox"] {
 .power-main-chart-card,
 .power-side-chart-card {
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .power-main-chart-card .chart-wrap,
 .power-side-chart-card .chart-wrap {
   width: 100%;
-  overflow: hidden;
-  padding-bottom: 6px;
+  overflow: visible;
+  padding-bottom: 18px;
+}
+
+.power-main-chart-card .recharts-wrapper,
+.power-side-chart-card .recharts-wrapper,
+.power-main-chart-card .recharts-surface,
+.power-side-chart-card .recharts-surface {
+  overflow: visible;
 }
 
 .power-main-chart-card .meta,

@@ -9754,16 +9754,16 @@ function AppShell() {
                     <span>Selected meters: {selectedPowerChartMeters.length || (powerConfig?.devices || []).length}</span>
                   </div>
                   <div className="chart-wrap">
-                    <ResponsiveContainer width="100%" height={310}>
-                      <ComposedChart data={powerMainChartData.rows} margin={{ top: 10, right: 22, left: 8, bottom: 28 }}>
+                    <ResponsiveContainer width="100%" height={332}>
+                      <ComposedChart data={powerMainChartData.rows} margin={{ top: 10, right: 22, left: 8, bottom: 36 }}>
                         <XAxis
                           dataKey="ts"
                           ticks={powerMainXAxisTicks}
                           minTickGap={22}
                           interval="preserveStartEnd"
                           allowDuplicatedCategory={false}
-                          height={42}
-                          tickMargin={10}
+                          height={56}
+                          tickMargin={12}
                           tickFormatter={formatPowerMainXAxisTick}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
                           axisLine={{ stroke: powerChartAxisColor }}
@@ -9826,17 +9826,17 @@ function AppShell() {
                     </div>
                   </div>
                   <div className="chart-wrap">
-                    <ResponsiveContainer width="100%" height={310}>
+                    <ResponsiveContainer width="100%" height={332}>
                       {powerSideChartType === "bar" ? (
-                        <BarChart data={powerSideChartData.rows} margin={{ top: 10, right: 12, left: 6, bottom: 28 }}>
+                        <BarChart data={powerSideChartData.rows} margin={{ top: 10, right: 12, left: 6, bottom: 36 }}>
                           <XAxis
                             dataKey="ts"
                             ticks={powerSideXAxisTicks}
                             minTickGap={22}
                             interval="preserveStartEnd"
                             allowDuplicatedCategory={false}
-                            height={42}
-                            tickMargin={10}
+                            height={56}
+                            tickMargin={12}
                             tickFormatter={formatPowerSideXAxisTick}
                             tick={{ fontSize: 11, fill: powerChartAxisColor }}
                             axisLine={{ stroke: powerChartAxisColor }}
@@ -9853,15 +9853,15 @@ function AppShell() {
                           />
                         </BarChart>
                       ) : (
-                        <LineChart data={powerSideChartData.rows} margin={{ top: 10, right: 12, left: 6, bottom: 28 }}>
+                        <LineChart data={powerSideChartData.rows} margin={{ top: 10, right: 12, left: 6, bottom: 36 }}>
                           <XAxis
                             dataKey="ts"
                             ticks={powerSideXAxisTicks}
                             minTickGap={22}
                             interval="preserveStartEnd"
                             allowDuplicatedCategory={false}
-                            height={42}
-                            tickMargin={10}
+                            height={56}
+                            tickMargin={12}
                             tickFormatter={formatPowerSideXAxisTick}
                             tick={{ fontSize: 11, fill: powerChartAxisColor }}
                             axisLine={{ stroke: powerChartAxisColor }}
