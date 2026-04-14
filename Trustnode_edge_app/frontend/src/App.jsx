@@ -63,6 +63,8 @@ import {
 import { Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 const THEME_STORAGE_KEY = "trustnode_theme";
+const INTERFACE_THEME_PREFS_STORAGE_KEY = "trustnode_interface_theme_prefs";
+const CHART_PALETTE_STORAGE_KEY = "trustnode_chart_palette";
 const ACTIVE_PAGE_STORAGE_KEY = "trustnode_active_page";
 const TAG_MONITOR_CHART_TYPE_STORAGE_KEY = "trustnode_tag_monitor_chart_type";
 const TREND_CHART_TYPE_STORAGE_KEY = "trustnode_trend_chart_type";
@@ -118,7 +120,7 @@ const NAV_SECTIONS = [
   {
     id: "administration",
     title: "Settings",
-    items: ["Users and Access Control", "Email and Notifications", "Scheduled Reports"]
+    items: ["Interface", "Users and Access Control", "Email and Notifications", "Scheduled Reports"]
   }
 ];
 
@@ -148,6 +150,7 @@ function pageTitle(page) {
   if (page === "scheduled_reports") return "Scheduled Reports";
   if (page === "power_overview") return "Power Overview";
   if (page === "power_configuration") return "Power Configuration";
+  if (page === "interface") return "Interface";
   return page.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
@@ -158,7 +161,56 @@ function buildOpcUrlFromIp(ip) {
 }
 
 const DEFAULT_OPC_NODE_ID = "";
-const REPORT_SERIES_COLORS = ["#16a34a", "#2563eb", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#0ea5e9", "#f59e0b"];
+const DEFAULT_REPORT_SERIES_COLORS = ["#16a34a", "#2563eb", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#0ea5e9", "#f59e0b"];
+const DEFAULT_INTERFACE_THEME_PREFS = {
+  light: {
+    bg: "#f3f3f3",
+    card: "#eceff3",
+    stroke: "#c5ccd6",
+    text: "#1f2328",
+    muted: "#5f6b7a",
+    table_row: "#e5eaf0",
+    brand: "#007acc",
+    ok: "#2ea043",
+    danger: "#d1242f",
+    header: "#2d2d30",
+    header_text: "#d4d4d4",
+    sidebar: "#252526",
+    sidebar_text: "#d4d4d4",
+    nav_active_bg: "#094771"
+  },
+  dark: {
+    bg: "#1e1e1e",
+    card: "#252526",
+    stroke: "#3c3c3c",
+    text: "#d4d4d4",
+    muted: "#9da0a6",
+    table_row: "#2a2d2e",
+    brand: "#007acc",
+    ok: "#2ea043",
+    danger: "#d1242f",
+    header: "#2d2d30",
+    header_text: "#d4d4d4",
+    sidebar: "#252526",
+    sidebar_text: "#d4d4d4",
+    nav_active_bg: "#094771"
+  }
+};
+const INTERFACE_THEME_TOKEN_FIELDS = [
+  { key: "bg", label: "Background" },
+  { key: "card", label: "Card" },
+  { key: "stroke", label: "Border" },
+  { key: "text", label: "Text" },
+  { key: "muted", label: "Muted Text" },
+  { key: "brand", label: "Primary" },
+  { key: "ok", label: "Success" },
+  { key: "danger", label: "Danger" },
+  { key: "header", label: "Header Background" },
+  { key: "header_text", label: "Header Text" },
+  { key: "sidebar", label: "Sidebar Background" },
+  { key: "sidebar_text", label: "Sidebar Text" },
+  { key: "nav_active_bg", label: "Nav Active" }
+];
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
@@ -780,6 +832,8 @@ function MenuIcon({ page }) {
       return <svg {...common}><path d="M4 6h16v12H4z" /><path d="M4 8l8 6 8-6" /></svg>;
     case "scheduled_reports":
       return <svg {...common}><circle cx="12" cy="12" r="8" /><path d="M12 8v5l3 2" /></svg>;
+    case "interface":
+      return <svg {...common}><circle cx="12" cy="12" r="3" /><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.7-1L14.5 3h-5L9 6a7 7 0 0 0-1.7 1l-2.4-1-2 3.5L5 11a7 7 0 0 0 0 2l-2.1 1.5 2 3.5 2.4-1a7 7 0 0 0 1.7 1l.5 3h5l.5-3a7 7 0 0 0 1.7-1l2.4 1 2-3.5L18.9 13c.1-.3.1-.7.1-1z" /></svg>;
     case "frontend_source":
       return <svg {...common}><path d="M3 12h6l3-8 3 16 3-8h3" /></svg>;
     case "users_and_access_control":
@@ -1025,6 +1079,7 @@ function getInitialTheme() {
 }
 
 const PERMISSION_LABELS = {
+  interface: "Interface",
   devices: "Devices",
   tags: "Tags",
   triggers_and_limits: "Triggers and Limits",
@@ -1045,7 +1100,7 @@ const PERMISSION_LABELS = {
 const PERMISSION_GROUPS = [
   { title: "Collection and Monitoring", items: ["devices", "tags", "triggers_and_limits", "gateway_configuration"] },
   { title: "Operations", items: ["gateway_runtime_control", "alarms", "reporting", "data_log"] },
-  { title: "Administration", items: ["database", "backup_and_retention", "email_and_notifications", "scheduled_reports", "users_and_access_control"] }
+  { title: "Administration", items: ["interface", "database", "backup_and_retention", "email_and_notifications", "scheduled_reports", "users_and_access_control"] }
 ];
 
 function compareByOperator(value, operator, threshold) {
@@ -1067,6 +1122,7 @@ function buildRolePermissions(role) {
       data_log: true,
       gateway_configuration: true,
       gateway_runtime_control: true,
+      interface: true,
       database: true,
       database_overview: true,
       database_inspector: true,
@@ -1088,6 +1144,7 @@ function buildRolePermissions(role) {
       data_log: true,
       gateway_configuration: true,
       gateway_runtime_control: true,
+      interface: true,
       database: false,
       database_overview: false,
       database_inspector: false,
@@ -1109,6 +1166,7 @@ function buildRolePermissions(role) {
       data_log: true,
       gateway_configuration: false,
       gateway_runtime_control: true,
+      interface: true,
       database: false,
       database_overview: false,
       database_inspector: false,
@@ -1129,6 +1187,7 @@ function buildRolePermissions(role) {
     data_log: true,
     gateway_configuration: false,
     gateway_runtime_control: false,
+    interface: false,
     database: false,
     database_overview: false,
     database_inspector: false,
@@ -1209,6 +1268,19 @@ function AppShell() {
     administration: false
   });
   const [theme, setTheme] = useState("light");
+  const [interfaceThemePrefs, setInterfaceThemePrefs] = useState(() => loadInterfaceThemePrefs());
+  const [chartPalette, setChartPalette] = useState(() => loadChartPalette());
+  const seriesColors = useMemo(
+    () => (Array.isArray(chartPalette) && chartPalette.length ? chartPalette.map((c, idx) => normalizeHexColor(c, DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length])) : [...DEFAULT_REPORT_SERIES_COLORS]),
+    [chartPalette]
+  );
+  const getSeriesColor = useCallback(
+    (idx) => {
+      const base = seriesColors[idx % seriesColors.length] || DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length];
+      return normalizeHexColor(base, DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length]);
+    },
+    [seriesColors]
+  );
 
   const [alarms, setAlarms] = useState([]);
   const [selectedAlarmIds, setSelectedAlarmIds] = useState([]);
@@ -1729,7 +1801,9 @@ function AppShell() {
       website_env_text: websiteEnvText,
       tenant_web_client_url: tenantWebClientUrl,
       tenant_company_name: tenantCompanyName,
-      tenant_login_realm: tenantLoginRealm
+      tenant_login_realm: tenantLoginRealm,
+      interface_theme_prefs: interfaceThemePrefs,
+      chart_palette: chartPalette
     },
     users_access: {
       users,
@@ -1802,6 +1876,28 @@ function AppShell() {
     if (typeof appSettings.tenant_web_client_url === "string") setTenantWebClientUrl(appSettings.tenant_web_client_url);
     if (typeof appSettings.tenant_company_name === "string") setTenantCompanyName(appSettings.tenant_company_name);
     if (typeof appSettings.tenant_login_realm === "string") setTenantLoginRealm(appSettings.tenant_login_realm);
+    if (appSettings.interface_theme_prefs && typeof appSettings.interface_theme_prefs === "object") {
+      const merged = {
+        light: { ...DEFAULT_INTERFACE_THEME_PREFS.light },
+        dark: { ...DEFAULT_INTERFACE_THEME_PREFS.dark }
+      };
+      for (const mode of ["light", "dark"]) {
+        const incomingMode = appSettings.interface_theme_prefs?.[mode];
+        if (incomingMode && typeof incomingMode === "object") {
+          for (const [k, v] of Object.entries(incomingMode)) {
+            if (k in merged[mode]) merged[mode][k] = normalizeHexColor(v, merged[mode][k]);
+          }
+        }
+      }
+      setInterfaceThemePrefs(merged);
+    }
+    if (Array.isArray(appSettings.chart_palette) && appSettings.chart_palette.length) {
+      setChartPalette(
+        appSettings.chart_palette.map((c, idx) =>
+          normalizeHexColor(c, DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length])
+        )
+      );
+    }
 
     if (Array.isArray(usersAccess.users)) {
       const normalizedUsers = usersAccess.users.map((u) => ({
@@ -2048,7 +2144,25 @@ function AppShell() {
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
     localStorage.setItem(THEME_STORAGE_KEY, theme);
-  }, [theme]);
+    const activeMode = theme === "dark" ? "dark" : "light";
+    const modePrefs = interfaceThemePrefs?.[activeMode] || {};
+    for (const [token, fallback] of Object.entries(DEFAULT_INTERFACE_THEME_PREFS[activeMode])) {
+      const value = normalizeHexColor(modePrefs?.[token], fallback);
+      document.documentElement.style.setProperty(`--${token}`, value);
+    }
+  }, [theme, interfaceThemePrefs]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(INTERFACE_THEME_PREFS_STORAGE_KEY, JSON.stringify(interfaceThemePrefs || DEFAULT_INTERFACE_THEME_PREFS));
+    } catch {}
+  }, [interfaceThemePrefs]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(CHART_PALETTE_STORAGE_KEY, JSON.stringify(chartPalette || DEFAULT_REPORT_SERIES_COLORS));
+    } catch {}
+  }, [chartPalette]);
 
   useEffect(() => {
     try {
@@ -2695,6 +2809,8 @@ function AppShell() {
     tenantWebClientUrl,
     tenantCompanyName,
     tenantLoginRealm,
+    interfaceThemePrefs,
+    chartPalette,
     users,
     currentUser,
     devices,
@@ -6066,6 +6182,55 @@ function AppShell() {
   }, [appLogsView, logFilters]);
 
   const toggleTheme = () => setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+  const updateInterfaceThemeToken = (mode, token, value) => {
+    if (!canEditPage("interface")) return;
+    const safeMode = mode === "dark" ? "dark" : "light";
+    if (!(token in (DEFAULT_INTERFACE_THEME_PREFS[safeMode] || {}))) return;
+    const fallback = DEFAULT_INTERFACE_THEME_PREFS[safeMode][token];
+    const normalized = normalizeHexColor(value, fallback);
+    setInterfaceThemePrefs((prev) => ({
+      light: { ...DEFAULT_INTERFACE_THEME_PREFS.light, ...(prev?.light || {}) },
+      dark: { ...DEFAULT_INTERFACE_THEME_PREFS.dark, ...(prev?.dark || {}) },
+      [safeMode]: {
+        ...DEFAULT_INTERFACE_THEME_PREFS[safeMode],
+        ...(prev?.[safeMode] || {}),
+        [token]: normalized,
+      },
+    }));
+  };
+  const resetInterfaceThemeMode = (mode) => {
+    if (!canEditPage("interface")) return;
+    const safeMode = mode === "dark" ? "dark" : "light";
+    setInterfaceThemePrefs((prev) => ({
+      light: { ...DEFAULT_INTERFACE_THEME_PREFS.light, ...(prev?.light || {}) },
+      dark: { ...DEFAULT_INTERFACE_THEME_PREFS.dark, ...(prev?.dark || {}) },
+      [safeMode]: { ...DEFAULT_INTERFACE_THEME_PREFS[safeMode] },
+    }));
+  };
+  const setChartPaletteColor = (idx, value) => {
+    if (!canEditPage("interface")) return;
+    setChartPalette((prev) => {
+      const current = Array.isArray(prev) && prev.length ? [...prev] : [...DEFAULT_REPORT_SERIES_COLORS];
+      const next = Math.max(current.length, DEFAULT_REPORT_SERIES_COLORS.length, idx + 1);
+      while (current.length < next) {
+        current.push(DEFAULT_REPORT_SERIES_COLORS[current.length % DEFAULT_REPORT_SERIES_COLORS.length]);
+      }
+      current[idx] = normalizeHexColor(value, DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length]);
+      return current;
+    });
+  };
+  const resetChartPalette = () => {
+    if (!canEditPage("interface")) return;
+    setChartPalette([...DEFAULT_REPORT_SERIES_COLORS]);
+  };
+  const resetAllInterfaceSettings = () => {
+    if (!canEditPage("interface")) return;
+    setInterfaceThemePrefs({
+      light: { ...DEFAULT_INTERFACE_THEME_PREFS.light },
+      dark: { ...DEFAULT_INTERFACE_THEME_PREFS.dark },
+    });
+    setChartPalette([...DEFAULT_REPORT_SERIES_COLORS]);
+  };
   const toggleFullscreen = async () => {
     try {
       const doc = document;
@@ -8710,7 +8875,7 @@ function AppShell() {
       }
       for (const [k, v] of Object.entries(colors)) {
         if (validTags.has(String(k))) {
-          const fallback = REPORT_SERIES_COLORS[Math.abs(String(k).split("").reduce((a, c) => a + c.charCodeAt(0), 0)) % REPORT_SERIES_COLORS.length];
+          const fallback = getSeriesColor(Math.abs(String(k).split("").reduce((a, c) => a + c.charCodeAt(0), 0)));
           nextColors[k] = normalizeHexColor(v, fallback);
         }
       }
@@ -8746,14 +8911,14 @@ function AppShell() {
   };
   const getReportTagColor = (tag, idx = 0) => {
     const v = reportFilters?.tag_colors?.[tag];
-    return normalizeHexColor(v, REPORT_SERIES_COLORS[idx % REPORT_SERIES_COLORS.length]);
+    return normalizeHexColor(v, getSeriesColor(idx));
   };
   const setReportTagColor = (tag, color) => {
     setReportFilters((prev) => ({
       ...prev,
       tag_colors: {
         ...(prev.tag_colors || {}),
-        [tag]: normalizeHexColor(color, REPORT_SERIES_COLORS[0])
+        [tag]: normalizeHexColor(color, getSeriesColor(0))
       }
     }));
   };
@@ -8976,7 +9141,7 @@ function AppShell() {
       chart_series: tags.map((tag, idx) => ({
         tag,
         axis: (f.tag_axes && f.tag_axes[tag] === "right") ? "right" : "left",
-        color: normalizeHexColor((f.tag_colors && f.tag_colors[tag]), REPORT_SERIES_COLORS[idx % REPORT_SERIES_COLORS.length]),
+        color: normalizeHexColor((f.tag_colors && f.tag_colors[tag]), getSeriesColor(idx)),
         chart_type: (f.report_chart_type === "bar") ? "bar" : "line"
       })),
       summary,
@@ -9754,8 +9919,8 @@ function AppShell() {
                     <span>Selected meters: {selectedPowerChartMeters.length || (powerConfig?.devices || []).length}</span>
                   </div>
                   <div className="chart-wrap">
-                    <ResponsiveContainer width="100%" height={332}>
-                      <ComposedChart data={powerMainChartData.rows} margin={{ top: 10, right: 22, left: 8, bottom: 36 }}>
+                    <ResponsiveContainer width="100%" height={320}>
+                      <ComposedChart data={powerMainChartData.rows} margin={{ top: 10, right: 20, left: 10, bottom: 44 }}>
                         <XAxis
                           dataKey="ts"
                           ticks={powerMainXAxisTicks}
@@ -9763,7 +9928,7 @@ function AppShell() {
                           interval="preserveStartEnd"
                           allowDuplicatedCategory={false}
                           height={56}
-                          tickMargin={12}
+                          tickMargin={14}
                           tickFormatter={formatPowerMainXAxisTick}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
                           axisLine={{ stroke: powerChartAxisColor }}
@@ -9781,7 +9946,7 @@ function AppShell() {
                                   key={`pwr-bar-${d.id}`}
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
-                                  fill={REPORT_SERIES_COLORS[idx % REPORT_SERIES_COLORS.length]}
+                                  fill={getSeriesColor(idx)}
                                   isAnimationActive={false}
                                 />
                               ))}
@@ -9797,7 +9962,7 @@ function AppShell() {
                                   type="monotone"
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
-                                  stroke={REPORT_SERIES_COLORS[idx % REPORT_SERIES_COLORS.length]}
+                                  stroke={getSeriesColor(idx)}
                                   strokeWidth={1.6}
                                   dot={false}
                                   isAnimationActive={false}
@@ -9826,9 +9991,9 @@ function AppShell() {
                     </div>
                   </div>
                   <div className="chart-wrap">
-                    <ResponsiveContainer width="100%" height={332}>
+                    <ResponsiveContainer width="100%" height={320}>
                       {powerSideChartType === "bar" ? (
-                        <BarChart data={powerSideChartData.rows} margin={{ top: 10, right: 12, left: 6, bottom: 36 }}>
+                        <BarChart data={powerSideChartData.rows} margin={{ top: 10, right: 14, left: 8, bottom: 44 }}>
                           <XAxis
                             dataKey="ts"
                             ticks={powerSideXAxisTicks}
@@ -9836,7 +10001,7 @@ function AppShell() {
                             interval="preserveStartEnd"
                             allowDuplicatedCategory={false}
                             height={56}
-                            tickMargin={12}
+                            tickMargin={14}
                             tickFormatter={formatPowerSideXAxisTick}
                             tick={{ fontSize: 11, fill: powerChartAxisColor }}
                             axisLine={{ stroke: powerChartAxisColor }}
@@ -9848,12 +10013,12 @@ function AppShell() {
                             key="pwr-side-bar-total-kwh"
                             dataKey="total_kwh"
                             name="Total kWh"
-                            fill={REPORT_SERIES_COLORS[0]}
+                            fill={getSeriesColor(0)}
                             isAnimationActive={false}
                           />
                         </BarChart>
                       ) : (
-                        <LineChart data={powerSideChartData.rows} margin={{ top: 10, right: 12, left: 6, bottom: 36 }}>
+                        <LineChart data={powerSideChartData.rows} margin={{ top: 10, right: 14, left: 8, bottom: 44 }}>
                           <XAxis
                             dataKey="ts"
                             ticks={powerSideXAxisTicks}
@@ -9861,7 +10026,7 @@ function AppShell() {
                             interval="preserveStartEnd"
                             allowDuplicatedCategory={false}
                             height={56}
-                            tickMargin={12}
+                            tickMargin={14}
                             tickFormatter={formatPowerSideXAxisTick}
                             tick={{ fontSize: 11, fill: powerChartAxisColor }}
                             axisLine={{ stroke: powerChartAxisColor }}
@@ -9874,7 +10039,7 @@ function AppShell() {
                             type="monotone"
                             dataKey="total_kwh"
                             name="Total kWh"
-                            stroke={REPORT_SERIES_COLORS[0]}
+                            stroke={getSeriesColor(0)}
                             strokeWidth={2}
                             dot={false}
                             isAnimationActive={false}
@@ -11144,6 +11309,101 @@ function AppShell() {
                 </div>
                 <div className="lock-note">
                   Saved env values are part of app configuration and can be used for hosted website deployment reference.
+                </div>
+              </section>
+            </>
+          ) : null}
+
+          {activePage === "interface" ? (
+            <>
+              <section className="card">
+                <div className="row interface-header-row">
+                  <h3 className="card-title" style={{ margin: 0 }}>Interface Theme</h3>
+                  <button
+                    className="btn btn-danger btn-sm"
+                    onClick={resetAllInterfaceSettings}
+                    disabled={!canEditPage("interface")}
+                  >
+                    Reset All
+                  </button>
+                </div>
+                <div className="interface-theme-grid">
+                  {["light", "dark"].map((mode) => (
+                    <article key={`theme-mode-${mode}`} className="interface-theme-card">
+                      <div className="row interface-theme-card-head">
+                        <h4>{mode === "dark" ? "Dark Mode" : "Light Mode"}</h4>
+                        <button
+                          className="btn btn-primary btn-sm"
+                          onClick={() => resetInterfaceThemeMode(mode)}
+                          disabled={!canEditPage("interface")}
+                        >
+                          Reset
+                        </button>
+                      </div>
+                      <div className="interface-color-grid">
+                        {INTERFACE_THEME_TOKEN_FIELDS.map((field) => {
+                          const fallback = DEFAULT_INTERFACE_THEME_PREFS[mode][field.key];
+                          const color = normalizeHexColor(interfaceThemePrefs?.[mode]?.[field.key], fallback);
+                          return (
+                            <label key={`${mode}-${field.key}`} className="interface-color-field">
+                              <span>{field.label}</span>
+                              <div className="interface-color-inputs">
+                                <input
+                                  type="color"
+                                  value={color}
+                                  onChange={(e) => updateInterfaceThemeToken(mode, field.key, e.target.value)}
+                                  disabled={!canEditPage("interface")}
+                                />
+                                <input
+                                  type="text"
+                                  value={color}
+                                  onChange={(e) => updateInterfaceThemeToken(mode, field.key, e.target.value)}
+                                  disabled={!canEditPage("interface")}
+                                />
+                              </div>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </section>
+
+              <section className="card">
+                <div className="row interface-header-row">
+                  <h3 className="card-title" style={{ margin: 0 }}>Chart Palette</h3>
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={resetChartPalette}
+                    disabled={!canEditPage("interface")}
+                  >
+                    Reset Palette
+                  </button>
+                </div>
+                <div className="interface-palette-grid">
+                  {seriesColors.map((color, idx) => (
+                    <label key={`palette-${idx}`} className="interface-palette-item">
+                      <span>{`Series ${idx + 1}`}</span>
+                      <div className="interface-color-inputs">
+                        <input
+                          type="color"
+                          value={normalizeHexColor(color, DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length])}
+                          onChange={(e) => setChartPaletteColor(idx, e.target.value)}
+                          disabled={!canEditPage("interface")}
+                        />
+                        <input
+                          type="text"
+                          value={normalizeHexColor(color, DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length])}
+                          onChange={(e) => setChartPaletteColor(idx, e.target.value)}
+                          disabled={!canEditPage("interface")}
+                        />
+                      </div>
+                    </label>
+                  ))}
+                </div>
+                <div className="lock-note">
+                  Saved interface and palette settings are independent per UI environment (local edge UI and cloud web client).
                 </div>
               </section>
             </>
@@ -13702,4 +13962,43 @@ export default function App() {
       <AppShell />
     </AppErrorBoundary>
   );
+}
+
+function loadInterfaceThemePrefs() {
+  try {
+    const raw = localStorage.getItem(INTERFACE_THEME_PREFS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    const next = {
+      light: { ...DEFAULT_INTERFACE_THEME_PREFS.light },
+      dark: { ...DEFAULT_INTERFACE_THEME_PREFS.dark }
+    };
+    if (parsed && typeof parsed === "object") {
+      for (const mode of ["light", "dark"]) {
+        if (parsed[mode] && typeof parsed[mode] === "object") {
+          for (const [k, v] of Object.entries(parsed[mode])) {
+            if (k in next[mode]) {
+              next[mode][k] = normalizeHexColor(v, next[mode][k]);
+            }
+          }
+        }
+      }
+    }
+    return next;
+  } catch {
+    return {
+      light: { ...DEFAULT_INTERFACE_THEME_PREFS.light },
+      dark: { ...DEFAULT_INTERFACE_THEME_PREFS.dark }
+    };
+  }
+}
+
+function loadChartPalette() {
+  try {
+    const raw = localStorage.getItem(CHART_PALETTE_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (!Array.isArray(parsed) || !parsed.length) return [...DEFAULT_REPORT_SERIES_COLORS];
+    return parsed.map((c, idx) => normalizeHexColor(c, DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length]));
+  } catch {
+    return [...DEFAULT_REPORT_SERIES_COLORS];
+  }
 }
