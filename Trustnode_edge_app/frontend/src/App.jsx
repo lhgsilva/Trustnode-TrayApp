@@ -50,6 +50,15 @@ import {
   startGatewayInstance,
   stopAllGatewayInstances,
   stopGatewayInstance,
+  getPowerConfig,
+  getPowerProfiles,
+  updatePowerConfig,
+  testPowerConnection,
+  getPowerStatus,
+  getPowerLatest,
+  getPowerHistory,
+  startPowerDevice,
+  stopPowerDevice,
 } from "./api";
 import { Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
@@ -89,6 +98,11 @@ const KNOWN_SUPABASE_POOLER_HOST = "aws-1-eu-west-1.pooler.supabase.com";
 
 const NAV_SECTIONS = [
   { id: "overview", title: "Overview", items: ["Dashboard"] },
+  {
+    id: "power_management",
+    title: "Power Management",
+    items: ["Power Overview", "Power Configuration"]
+  },
   {
     id: "collection_monitoring",
     title: "Collection and Monitoring",
@@ -132,6 +146,8 @@ function pageTitle(page) {
   if (page === "website_and_env") return "Website and Environment";
   if (page === "email_and_notifications") return "Email and Notifications";
   if (page === "scheduled_reports") return "Scheduled Reports";
+  if (page === "power_overview") return "Power Overview";
+  if (page === "power_configuration") return "Power Configuration";
   return page.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
@@ -240,6 +256,80 @@ function normalizeSupabaseDirectUsername(engine, host, port, username) {
   if (!isSupabaseDirect) return userText;
   return "postgres";
 }
+
+function formatMetricValue(value, digits = 2) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "-";
+  return num.toFixed(digits);
+}
+
+function computeMultiSeriesDomain(rows, keys, floorZero = true) {
+  const vals = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    for (const k of Array.isArray(keys) ? keys : []) {
+      const v = Number(row?.[k]);
+      if (Number.isFinite(v)) vals.push(v);
+    }
+  }
+  if (!vals.length) return floorZero ? [0, "auto"] : ["auto", "auto"];
+  let min = Math.min(...vals);
+  let max = Math.max(...vals);
+  if (vals.length >= 10) {
+    const sorted = [...vals].sort((a, b) => a - b);
+    const q = (p) => {
+      const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
+      return sorted[idx];
+    };
+    const p10 = q(0.1);
+    const p90 = q(0.9);
+    const coreSpan = Math.max(1e-6, p90 - p10);
+    if (max - p90 > coreSpan * 8) max = p90 + coreSpan * 2;
+    if (p10 - min > coreSpan * 8) min = p10 - coreSpan * 2;
+  }
+  if (min === max) {
+    const pad = Math.max(0.25, Math.abs(max) * 0.1);
+    min -= pad;
+    max += pad;
+  } else {
+    const span = max - min;
+    const pad = span * 0.08;
+    min -= pad;
+    max += pad;
+  }
+  if (floorZero) min = Math.max(0, min);
+  return [Number(min.toFixed(4)), Number(max.toFixed(4))];
+}
+
+const POWER_REGISTER_HINTS = {
+  voltage_v: "Voltage L1-N",
+  current_a: "Current I L1",
+  active_power_w: "Real power P1 L1N",
+  power_factor: "CosPhi UL1 IL1",
+  frequency_hz: "Measured frequency",
+  energy_wh: "Real energy L1",
+  active_power_total_w: "Total active power",
+  energy_total_wh: "Total real energy",
+  energy_consumed_total_wh: "Consumed energy",
+  energy_delivered_total_wh: "Delivered energy",
+};
+
+const POWER_PROFILE_DEFAULTS = {
+  single_phase: "weidmuller_em525_single_phase_basic",
+  three_phase: "weidmuller_em525_three_phase_basic",
+};
+const POWER_PERIOD_OPTIONS = [
+  { value: "1h", label: "Last 1 hour", ms: 60 * 60 * 1000 },
+  { value: "24h", label: "Last 24 hours", ms: 24 * 60 * 60 * 1000 },
+  { value: "7d", label: "Last 7 days", ms: 7 * 24 * 60 * 60 * 1000 },
+  { value: "30d", label: "Last 30 days", ms: 30 * 24 * 60 * 60 * 1000 },
+];
+const POWER_AGG_OPTIONS = ["avg", "max", "min", "sum"];
+const POWER_INTERVAL_OPTIONS = [
+  { value: "minute", label: "Minute" },
+  { value: "hour", label: "Hour" },
+  { value: "day", label: "Day" },
+];
+const DEFAULT_ENERGY_COST_PER_KWH = 0.25;
 
 class AppErrorBoundary extends Component {
   constructor(props) {
@@ -473,30 +563,42 @@ function buildChronologicalSeries(rows, maxPoints = 120, minStepMs = 0) {
 function computeSeriesDomain(points, previousDomain = null) {
   const vals = (Array.isArray(points) ? points : []).map((p) => Number(p?.value)).filter((v) => Number.isFinite(v));
   if (!vals.length) return ["auto", "auto"];
-  const min = Math.min(...vals);
-  const max = Math.max(...vals);
+  let min = Math.min(...vals);
+  let max = Math.max(...vals);
+  if (vals.length >= 10) {
+    const sorted = [...vals].sort((a, b) => a - b);
+    const q = (p) => {
+      const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
+      return sorted[idx];
+    };
+    const p10 = q(0.1);
+    const p90 = q(0.9);
+    const coreSpan = Math.max(1e-6, p90 - p10);
+    if (max - p90 > coreSpan * 8) max = p90 + coreSpan * 2;
+    if (p10 - min > coreSpan * 8) min = p10 - coreSpan * 2;
+  }
   const span = Math.abs(max - min);
   const ref = Math.max(Math.abs(min), Math.abs(max), 1);
   const pad = Math.max(span * 0.08, ref * 0.02, 0.25);
   const nextMin = span < 1e-9 ? min - pad : min - pad;
   const nextMax = span < 1e-9 ? max + pad : max + pad;
-  if (!Array.isArray(previousDomain) || previousDomain.length !== 2) return [nextMin, nextMax];
+  if (!Array.isArray(previousDomain) || previousDomain.length !== 2) return [Number(nextMin.toFixed(6)), Number(nextMax.toFixed(6))];
   const prevMin = Number(previousDomain[0]);
   const prevMax = Number(previousDomain[1]);
   if (!Number.isFinite(prevMin) || !Number.isFinite(prevMax) || prevMax <= prevMin) return [nextMin, nextMax];
-  // Expand fast for new excursions; shrink slowly to avoid chart jitter.
-  const expand = Math.max((prevMax - prevMin) * 0.03, 0.1);
-  const expandedMin = Math.min(nextMin, prevMin - expand);
-  const expandedMax = Math.max(nextMax, prevMax + expand);
-  if (expandedMin < prevMin || expandedMax > prevMax) return [expandedMin, expandedMax];
-  const shrinkThreshold = Math.max((prevMax - prevMin) * 0.2, 0.5);
-  const canShrinkMin = nextMin - prevMin > shrinkThreshold;
-  const canShrinkMax = prevMax - nextMax > shrinkThreshold;
-  if (!canShrinkMin && !canShrinkMax) return [prevMin, prevMax];
-  const shrinkFactor = 0.35;
-  const shrunkMin = canShrinkMin ? prevMin + (nextMin - prevMin) * shrinkFactor : prevMin;
-  const shrunkMax = canShrinkMax ? prevMax - (prevMax - nextMax) * shrinkFactor : prevMax;
-  return [shrunkMin, shrunkMax];
+  // Auto-fit without ratcheting: expand to real bounds immediately, then
+  // shrink toward new bounds smoothly so the chart remains stable.
+  const prevSpan = Math.max(prevMax - prevMin, 1e-9);
+  const driftEpsilon = Math.max(prevSpan * 0.005, 0.02);
+  const lowerOut = nextMin < prevMin - driftEpsilon;
+  const upperOut = nextMax > prevMax + driftEpsilon;
+  if (lowerOut || upperOut) {
+    return [lowerOut ? nextMin : prevMin, upperOut ? nextMax : prevMax];
+  }
+  const shrinkFactor = 0.45;
+  const shrunkMin = prevMin + (nextMin - prevMin) * shrinkFactor;
+  const shrunkMax = prevMax + (nextMax - prevMax) * shrinkFactor;
+  return [Number(shrunkMin.toFixed(6)), Number(shrunkMax.toFixed(6))];
 }
 
 function formatElapsedFromUtc(rawTs) {
@@ -1099,6 +1201,7 @@ function AppShell() {
   const [activePage, setActivePage] = useState("dashboard");
   const [expandedSections, setExpandedSections] = useState({
     overview: false,
+    power_management: false,
     collection_monitoring: false,
     notifications: false,
     data_log: false,
@@ -1267,7 +1370,6 @@ function AppShell() {
     max_delete_rows_per_run: 50000
   });
   const [retentionPresetKey, setRetentionPresetKey] = useState("week");
-  const dashboardDomainByKeyRef = useRef({});
   const tagMonitorDomainRef = useRef(null);
   const [cloudProviderDbId, setCloudProviderDbId] = useState("");
   const [currentTenantId, setCurrentTenantId] = useState("default");
@@ -1298,6 +1400,111 @@ function AppShell() {
   const [otherDbPickerType, setOtherDbPickerType] = useState("sqlite");
   const [retentionRuns, setRetentionRuns] = useState([]);
   const [retentionBusy, setRetentionBusy] = useState(false);
+  const [powerConfig, setPowerConfig] = useState({
+    enabled: true,
+    energy_price_eur_kwh: DEFAULT_ENERGY_COST_PER_KWH,
+    selected_device_id: "power_meter_01",
+    devices: [
+      {
+        id: "power_meter_01",
+        name: "Power Meter 01",
+        description: "Weidmuller meter",
+        enabled: true,
+        type: "modbus_tcp",
+        protocol: "modbus_tcp",
+        ip: "192.168.10.117",
+        port: 502,
+        unit_id: 1,
+        poll_interval_ms: 1000,
+        electrical_mode: "single_phase",
+        register_profile: POWER_PROFILE_DEFAULTS.single_phase,
+        use_custom_registers: true,
+        wiring_type: "single_phase",
+        voltage_connected: true,
+        ct_connected: true,
+        ct_primary: 80,
+        ct_secondary: 5,
+        vt_primary: 230,
+        vt_secondary: 230,
+        registers: {
+          voltage_v: 19000,
+          current_a: 19012,
+          active_power_w: 19020,
+          power_factor: 19044,
+          frequency_hz: 19050,
+          energy_wh: 19054,
+          active_power_total_w: 19026,
+          energy_total_wh: 19060,
+          energy_consumed_total_wh: 19068,
+          energy_delivered_total_wh: 19076,
+        },
+      },
+    ],
+  });
+  const [powerProfiles, setPowerProfiles] = useState({
+    profiles: {},
+    mode_defaults: POWER_PROFILE_DEFAULTS,
+  });
+  const [powerStatus, setPowerStatus] = useState({
+    connected: false,
+    last_error: "",
+    last_poll_utc: "",
+    last_success_utc: "",
+  });
+  const [powerSample, setPowerSample] = useState(null);
+  const [powerHistoryRows, setPowerHistoryRows] = useState([]);
+  const [powerRegisterTests, setPowerRegisterTests] = useState({});
+  const [powerBusy, setPowerBusy] = useState(false);
+  const [powerResult, setPowerResult] = useState("");
+  const [powerViewMode, setPowerViewMode] = useState("realtime");
+  const [powerPeriod, setPowerPeriod] = useState("24h");
+  const [powerInterval, setPowerInterval] = useState("hour");
+  const [powerAggregation, setPowerAggregation] = useState("avg");
+  const [powerFilterMeterId, setPowerFilterMeterId] = useState("all");
+  const [powerMainMetric, setPowerMainMetric] = useState("power_kw");
+  const [powerMainChartType, setPowerMainChartType] = useState("line");
+  const [powerCostChartRange, setPowerCostChartRange] = useState("12h");
+  const [powerSideMetric, setPowerSideMetric] = useState("power_kw");
+  const [powerSideChartType, setPowerSideChartType] = useState("line");
+  const [selectedPowerChartMeters, setSelectedPowerChartMeters] = useState([]);
+  const [showPowerDeviceModal, setShowPowerDeviceModal] = useState(false);
+  const [editingPowerDeviceId, setEditingPowerDeviceId] = useState(null);
+  const [powerDeviceForm, setPowerDeviceForm] = useState({
+    id: "",
+    name: "",
+    description: "",
+    enabled: true,
+    type: "modbus_tcp",
+    protocol: "modbus_tcp",
+    ip: "",
+    port: 502,
+    unit_id: 1,
+    poll_interval_ms: 1000,
+    electrical_mode: "single_phase",
+    register_profile: POWER_PROFILE_DEFAULTS.single_phase,
+    use_custom_registers: true,
+    wiring_type: "single_phase",
+    voltage_connected: true,
+    ct_connected: true,
+    ct_primary: 80,
+    ct_secondary: 5,
+    vt_primary: 230,
+    vt_secondary: 230,
+    registers: {
+      voltage_v: 19000,
+      current_a: 19012,
+      active_power_w: 19020,
+      power_factor: 19044,
+      frequency_hz: 19050,
+      energy_wh: 19054,
+      active_power_total_w: 19026,
+      energy_total_wh: 19060,
+      energy_consumed_total_wh: 19068,
+      energy_delivered_total_wh: 19076,
+    },
+  });
+  const [newPowerRegisterKey, setNewPowerRegisterKey] = useState("");
+  const [newPowerRegisterAddress, setNewPowerRegisterAddress] = useState("");
   const [retentionResult, setRetentionResult] = useState("");
   const [backupRows, setBackupRows] = useState([]);
   const [backupBusy, setBackupBusy] = useState(false);
@@ -1438,6 +1645,7 @@ function AppShell() {
   const appStorePersistInFlightRef = useRef(false);
   const appStoreLastPersistSignatureRef = useRef("");
   const liveTagValuesRef = useRef({});
+  const powerConfigRef = useRef({});
   const cloudNewestLiveTsMsRef = useRef(0);
   const cloudLastApplyMsRef = useRef(0);
   const cloudLastAcceptedTsByKeyRef = useRef(new Map());
@@ -1551,6 +1759,7 @@ function AppShell() {
       profiles: emailProfiles,
       active_profile_id: activeEmailProfileId
     },
+    power_management_config: powerConfig,
     metadata: {
       ...appMetadata,
       saved_utc: tsNow(),
@@ -1629,6 +1838,9 @@ function AppShell() {
       if (typeof emailSetup.active_profile_id === "string") {
         setActiveEmailProfileId(emailSetup.active_profile_id);
       }
+    }
+    if (data.power_management_config && typeof data.power_management_config === "object") {
+      setPowerConfig(data.power_management_config);
     }
     setAppMetadata(metadata);
   };
@@ -2020,6 +2232,10 @@ function AppShell() {
   }, [liveTagValues]);
 
   useEffect(() => {
+    powerConfigRef.current = powerConfig || {};
+  }, [powerConfig]);
+
+  useEffect(() => {
     if (!gatewayOpcValidatedFor) return;
     const plcIp = (gatewayForm.plc_ip || "").trim();
     const opcUrl = (gatewayForm.opc_url || "").trim();
@@ -2056,14 +2272,16 @@ function AppShell() {
 
   useEffect(() => {
     gatewayConfigsRef.current = gatewayConfigs;
-    if (!gatewayConfigs.length) {
-      setSelectedGatewayId("");
-      return;
-    }
-    if (!gatewayConfigs.some((g) => g.id === selectedGatewayId)) {
-      setSelectedGatewayId(gatewayConfigs[0].id);
-    }
-  }, [gatewayConfigs, selectedGatewayId]);
+    const hasGateway = gatewayConfigs.some((g) => String(g.id || "") === String(selectedGatewayId || ""));
+    const powerDevices = Array.isArray(powerConfig?.devices) ? powerConfig.devices : [];
+    const hasPowerGateway = powerDevices.some((d) => String(d?.id || "") === String(selectedGatewayId || ""));
+    if (hasGateway || hasPowerGateway) return;
+    const nextGatewayId =
+      String(gatewayConfigs[0]?.id || "") ||
+      String(powerConfig?.selected_device_id || "") ||
+      String(powerDevices[0]?.id || "");
+    setSelectedGatewayId(nextGatewayId);
+  }, [gatewayConfigs, powerConfig, selectedGatewayId]);
 
   useEffect(() => {
     try {
@@ -3172,8 +3390,11 @@ function AppShell() {
             const nowMs = Date.now();
             setGatewayRuntimeStatuses((prev) => {
               const next = { ...prev };
-              for (const g of gatewayConfigsRef.current || []) {
-                const gid = String(g?.id || "");
+              const knownGatewayIds = new Set([
+                ...(gatewayConfigsRef.current || []).map((g) => String(g?.id || "")),
+                ...((powerConfigRef.current?.devices || []).map((d) => String(d?.id || ""))),
+              ]);
+              for (const gid of knownGatewayIds) {
                 if (!gid) continue;
                 const ts = latestByGateway[gid];
                 const cur = next[gid] || { gateway_id: gid };
@@ -3527,8 +3748,11 @@ function AppShell() {
           const nowMs = Date.now();
           setGatewayRuntimeStatuses((prev) => {
             const next = { ...prev };
-            for (const g of gatewayConfigsRef.current || []) {
-              const gid = String(g?.id || "");
+            const knownGatewayIds = new Set([
+              ...(gatewayConfigsRef.current || []).map((g) => String(g?.id || "")),
+              ...((powerConfigRef.current?.devices || []).map((d) => String(d?.id || ""))),
+            ]);
+            for (const gid of knownGatewayIds) {
               if (!gid) continue;
               const ts = latestByGateway[gid];
               const cur = next[gid] || { gateway_id: gid };
@@ -3672,6 +3896,880 @@ function AppShell() {
     };
   }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected, filterCloudRowsMonotonic, activePage]);
 
+  useEffect(() => {
+    if (!currentUser) return undefined;
+    let stopped = false;
+    let running = false;
+
+    const pollPower = async () => {
+      if (running || stopped) return;
+      running = true;
+      try {
+        const [cfgRes, statusRes] = await Promise.all([
+          getPowerConfig(),
+          getPowerStatus(),
+        ]);
+        const cfgDevices = Array.isArray(cfgRes?.config?.devices) ? cfgRes.config.devices : [];
+        const enabledDeviceIds = cfgDevices
+          .filter((d) => d?.enabled !== false)
+          .map((d) => String(d?.id || "").trim())
+          .filter(Boolean);
+        const latestByDevice = await Promise.all(
+          (enabledDeviceIds.length ? enabledDeviceIds : [String(cfgRes?.config?.selected_device_id || "").trim()].filter(Boolean)).map(async (deviceId) => {
+            try {
+              const res = await getPowerLatest(deviceId);
+              return { deviceId, sample: res?.ok ? (res?.sample || null) : null };
+            } catch {
+              return { deviceId, sample: null };
+            }
+          })
+        );
+        if (!stopped) {
+          if (cfgRes?.ok && cfgRes?.config) setPowerConfig(cfgRes.config);
+          if (statusRes?.ok && statusRes?.status) setPowerStatus(statusRes.status);
+          const selectedDeviceId = String(cfgRes?.config?.selected_device_id || "");
+          const selectedSample =
+            latestByDevice.find((s) => String(s.deviceId) === selectedDeviceId)?.sample ||
+            latestByDevice[0]?.sample ||
+            null;
+          setPowerSample(selectedSample);
+
+          const byId = new Map((cfgDevices || []).map((d) => [String(d?.id || ""), d]));
+          const mergedLive = {};
+          const mergedRows = [];
+          const nowTs = tsNow();
+          for (const entry of latestByDevice) {
+            const sample = entry?.sample;
+            if (!sample || !sample.values || typeof sample.values !== "object") continue;
+            const deviceId = String(sample.device || entry.deviceId || "").trim();
+            if (!deviceId) continue;
+            const deviceCfg = byId.get(deviceId) || {};
+            const sampleTs = String(sample.ts || nowTs);
+            for (const [tagName, rawValue] of Object.entries(sample.values || {})) {
+              const normTag = normalizeTagName(tagName);
+              if (!normTag) continue;
+              const valueNum = Number(rawValue);
+              if (!Number.isFinite(valueNum)) continue;
+              const liveKey = `${deviceId}::${normTag}`;
+              mergedLive[liveKey] = {
+                gateway_id: deviceId,
+                tag: String(tagName),
+                ts: sampleTs,
+                value: valueNum,
+                quality: 192,
+                quality_label: "GOOD",
+              };
+              mergedRows.push({
+                ts: sampleTs,
+                source: "power_modbus",
+                gateway_id: deviceId,
+                gateway_name: String(deviceCfg?.name || deviceId),
+                device_name: String(deviceCfg?.name || deviceId),
+                plc_ip: String(deviceCfg?.ip || ""),
+                database_name: "Power Management",
+                tag: String(tagName),
+                value: valueNum,
+                quality: 192,
+                quality_label: "GOOD",
+              });
+            }
+          }
+          if (Object.keys(mergedLive).length) {
+            setLiveTagValues((prev) => ({ ...(prev || {}), ...mergedLive }));
+          }
+          if (mergedRows.length) {
+            setDataLog((prev) => mergeHistorianRowsStable(mergedRows, prev, 5000));
+            setGatewayRuntimeStatuses((prev) => {
+              const next = { ...(prev || {}) };
+              for (const row of mergedRows) {
+                const gid = String(row.gateway_id || "");
+                if (!gid) continue;
+                const cur = next[gid] || { gateway_id: gid };
+                next[gid] = {
+                  ...cur,
+                  gateway_id: gid,
+                  running: true,
+                  last_error: null,
+                  db_last_error: null,
+                  db_pending_count: 0,
+                  db_write_count: Number(cur?.db_write_count || 0) + 1,
+                  last_check_utc: String(row.ts || cur?.last_check_utc || ""),
+                };
+              }
+              return next;
+            });
+
+            const activeRules = triggerRulesRef.current.filter((rule) => rule.enabled !== false);
+            const newAlarms = [];
+            for (const row of mergedRows) {
+              const gatewayId = String(row.gateway_id || "").trim();
+              const tagName = String(row.tag || row.tag_name || "").trim();
+              const valueNum = Number(row.value);
+              if (!gatewayId || !tagName || Number.isNaN(valueNum)) continue;
+              const tagAlarmEnabled = isTagAlarmEnabled(gatewayId, tagName);
+              const matchedRules = activeRules.filter(
+                (rule) => String(rule.gateway_id) === gatewayId && String(rule.tag_name || "").trim() === tagName
+              );
+              for (const rule of matchedRules) {
+                const lowerHit = Boolean(rule.lower_enabled) &&
+                  compareByOperator(valueNum, String(rule.lower_operator || "<"), Number(rule.lower_value));
+                const upperHit = Boolean(rule.upper_enabled) &&
+                  compareByOperator(valueNum, String(rule.upper_operator || ">="), Number(rule.upper_value));
+                const violated = lowerHit || upperHit;
+                const ruleKey = `${gatewayId}:${tagName}:${rule.id}`;
+                const wasActive = Boolean(triggerActiveStateRef.current[ruleKey]);
+                const gatewayName = String(row.gateway_name || gatewayNameById[gatewayId] || gatewayId);
+                const lowerText = rule.lower_enabled ? `${rule.lower_operator} ${rule.lower_value}` : "-";
+                const upperText = rule.upper_enabled ? `${rule.upper_operator} ${rule.upper_value}` : "-";
+                if (violated && !wasActive) {
+                  newAlarms.push({
+                    id: `${rule.id}-${tagName}-${Date.now()}-power`,
+                    ts: String(row.ts || nowTs),
+                    severity: tagAlarmEnabled ? "Critical" : "Info",
+                    message: tagAlarmEnabled
+                      ? `[${gatewayName}] ${tagName} violated limits (L: ${lowerText}, U: ${upperText})`
+                      : `[${gatewayName}] ${tagName} violated limits but alarm is PAUSED (L: ${lowerText}, U: ${upperText})`,
+                    value: row.value,
+                    tag: tagName,
+                    alert_key: ruleKey,
+                    event_type: "active",
+                    gateway_id: gatewayId,
+                    gateway_name: gatewayName,
+                    acknowledged: !tagAlarmEnabled,
+                    notification_paused: !tagAlarmEnabled,
+                    paused_by_tag: !tagAlarmEnabled,
+                  });
+                } else if (!violated && wasActive) {
+                  newAlarms.push({
+                    id: `${rule.id}-${tagName}-${Date.now()}-power-clear`,
+                    ts: String(row.ts || nowTs),
+                    severity: "Info",
+                    message: tagAlarmEnabled
+                      ? `[${gatewayName}] ${tagName} back within limits`
+                      : `[${gatewayName}] ${tagName} back within limits but alarm is PAUSED`,
+                    value: row.value,
+                    tag: tagName,
+                    alert_key: ruleKey,
+                    event_type: "clear",
+                    gateway_id: gatewayId,
+                    gateway_name: gatewayName,
+                    acknowledged: !tagAlarmEnabled,
+                    notification_paused: !tagAlarmEnabled,
+                    paused_by_tag: !tagAlarmEnabled,
+                  });
+                }
+                triggerActiveStateRef.current[ruleKey] = violated;
+              }
+            }
+            if (newAlarms.length) {
+              setAlarms((prev) => [...newAlarms, ...(prev || [])].slice(0, 300));
+              newAlarms.forEach((alarm) => {
+                if (!alarm.acknowledged && !alarm.notification_paused) sendAlarmEmailNotification(alarm);
+              });
+            }
+          }
+        }
+        if (!stopped && activePage === "power_overview") {
+          const histRes = await getPowerHistory(5000, "");
+          if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
+        }
+      } catch (err) {
+        if (!stopped) {
+          setPowerStatus((prev) => ({
+            ...(prev || {}),
+            connected: false,
+            last_error: String(err?.message || err || "Power poll failed"),
+          }));
+        }
+      } finally {
+        running = false;
+      }
+    };
+
+    pollPower();
+    const timer = setInterval(pollPower, 1000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [currentUser, activePage, endpointVersion]);
+
+  useEffect(() => {
+    if (!currentUser) return undefined;
+    let stopped = false;
+    (async () => {
+      try {
+        const res = await getPowerProfiles();
+        if (!stopped && res?.ok) {
+          setPowerProfiles({
+            profiles: res?.profiles || {},
+            mode_defaults: res?.mode_defaults || POWER_PROFILE_DEFAULTS,
+          });
+        }
+      } catch {
+        if (!stopped) {
+          setPowerProfiles((prev) => ({
+            profiles: prev?.profiles || {},
+            mode_defaults: prev?.mode_defaults || POWER_PROFILE_DEFAULTS,
+          }));
+        }
+      }
+    })();
+    return () => {
+      stopped = true;
+    };
+  }, [currentUser]);
+
+  const savePowerConfig = async () => {
+    setPowerBusy(true);
+    try {
+      const res = await updatePowerConfig(powerConfig);
+      if (res?.ok && res?.config) setPowerConfig(res.config);
+      setPowerResult("Power configuration saved.");
+    } catch (err) {
+      setPowerResult(`Save failed: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
+  };
+
+  const selectedPowerDevice = useMemo(() => {
+    const selectedId = String(powerConfig?.selected_device_id || "");
+    const devices = Array.isArray(powerConfig?.devices) ? powerConfig.devices : [];
+    return devices.find((d) => String(d?.id || "") === selectedId) || devices[0] || null;
+  }, [powerConfig]);
+
+  const selectedPowerRegisterMap = useMemo(() => {
+    const device = selectedPowerDevice || {};
+    const profileName = String(device?.register_profile || "");
+    const profileMap = powerProfiles?.profiles?.[profileName] || {};
+    const customMap = (device?.use_custom_registers ? (device?.registers || {}) : {});
+    return { ...profileMap, ...customMap };
+  }, [selectedPowerDevice, powerProfiles]);
+
+  const selectedPowerLatestByTag = useMemo(() => {
+    const did = String(powerConfig?.selected_device_id || "");
+    if (!did) return { values: {}, ts: "" };
+    let latestTsMs = -1;
+    let latestTs = "";
+    const values = {};
+    for (const row of powerHistoryRows || []) {
+      if (String(row?.gateway_id || "") !== did) continue;
+      const rowTs = String(row?.ts || row?.ts_utc || "");
+      const tsMs = parseTimestampMs(rowTs);
+      if (!Number.isFinite(tsMs)) continue;
+      const tag = String(row?.tag || row?.tag_name || "");
+      if (!tag) continue;
+      if (tsMs > latestTsMs) {
+        latestTsMs = tsMs;
+        latestTs = rowTs;
+        for (const k of Object.keys(values)) delete values[k];
+      }
+      if (tsMs === latestTsMs) values[tag] = Number(row?.value || 0);
+    }
+    return { values, ts: latestTs };
+  }, [powerHistoryRows, powerConfig]);
+
+  const selectedPowerRegisterTestResult = useMemo(() => {
+    const did = String(powerConfig?.selected_device_id || "");
+    return (powerRegisterTests?.[did] || { tested_at_utc: "", register_results: {} });
+  }, [powerRegisterTests, powerConfig]);
+
+  const powerDeviceStatuses = useMemo(() => {
+    const byId = {};
+    for (const row of powerStatus?.devices || []) byId[String(row?.device_id || "")] = row;
+    return byId;
+  }, [powerStatus]);
+
+  useEffect(() => {
+    const deviceIds = (powerConfig?.devices || []).map((d) => String(d?.id || "")).filter(Boolean);
+    setSelectedPowerChartMeters((prev) => {
+      const prevSet = new Set((prev || []).map(String));
+      const kept = deviceIds.filter((id) => prevSet.has(id));
+      if (kept.length) return kept;
+      return deviceIds;
+    });
+  }, [powerConfig]);
+
+  const periodMs = useMemo(() => {
+    const realtimePeriods = new Set(["1h", "6h", "24h"]);
+    const available = powerViewMode === "realtime"
+      ? POWER_PERIOD_OPTIONS.filter((p) => realtimePeriods.has(p.value))
+      : POWER_PERIOD_OPTIONS;
+    const match = available.find((p) => p.value === powerPeriod) || available[0];
+    return match?.ms || 24 * 60 * 60 * 1000;
+  }, [powerPeriod, powerViewMode]);
+
+  useEffect(() => {
+    if (powerViewMode !== "realtime") return;
+    if (["1h", "6h", "24h"].includes(String(powerPeriod || ""))) return;
+    setPowerPeriod("24h");
+  }, [powerViewMode, powerPeriod]);
+
+  const powerCostPerKwh = useMemo(() => {
+    const v = Number(powerConfig?.energy_price_eur_kwh);
+    return Number.isFinite(v) && v > 0 ? v : DEFAULT_ENERGY_COST_PER_KWH;
+  }, [powerConfig]);
+
+  const powerRowsFiltered = useMemo(() => {
+    const nowMs = Date.now();
+    const fromMs = nowMs - periodMs;
+    const meterSet = new Set((selectedPowerChartMeters || []).map(String));
+    const scopedMeterId = String(powerFilterMeterId || "all");
+    const rows = (powerHistoryRows || []).filter((r) => {
+      const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
+      if (!Number.isFinite(ts) || ts < fromMs || ts > nowMs + 60000) return false;
+      const gid = String(r?.gateway_id || "");
+      if (scopedMeterId && scopedMeterId !== "all" && gid !== scopedMeterId) return false;
+      if (meterSet.size && !meterSet.has(gid)) return false;
+      return true;
+    });
+    return rows;
+  }, [powerHistoryRows, periodMs, selectedPowerChartMeters, powerFilterMeterId]);
+
+  const powerTrendData = useMemo(() => {
+    const meterIds = (powerConfig?.devices || []).map((d) => String(d?.id || "")).filter(Boolean);
+    const bucketKey = (tsMs) => {
+      const d = new Date(tsMs);
+      if (powerInterval === "day") return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+      if (powerInterval === "hour") return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${String(d.getUTCHours()).padStart(2, "0")}:00`;
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+    };
+    const powerTags = new Set(["active_power_total_w", "active_power_w"]);
+    const buckets = new Map();
+    for (const row of powerRowsFiltered) {
+      const tag = String(row?.tag || row?.tag_name || "");
+      if (!powerTags.has(tag)) continue;
+      const gid = String(row?.gateway_id || "");
+      const valueKw = Number(row?.value || 0) / 1000.0;
+      if (!Number.isFinite(valueKw)) continue;
+      const tsMs = parseTimestampMs(row?.ts || row?.ts_utc || "");
+      const key = bucketKey(tsMs);
+      if (!buckets.has(key)) buckets.set(key, { ts: key, total: 0, meterValues: {}, meterBuckets: {} });
+      const b = buckets.get(key);
+      if (!b.meterBuckets[gid]) b.meterBuckets[gid] = [];
+      b.meterBuckets[gid].push(valueKw);
+    }
+    const aggFn = (arr) => {
+      if (!arr?.length) return 0;
+      if (powerAggregation === "max") return Math.max(...arr);
+      if (powerAggregation === "min") return Math.min(...arr);
+      if (powerAggregation === "sum") return arr.reduce((a, n) => a + n, 0);
+      return arr.reduce((a, n) => a + n, 0) / arr.length;
+    };
+    const out = Array.from(buckets.values()).map((b) => {
+      const row = { ts: b.ts, total_kw: 0 };
+      for (const gid of meterIds) {
+        const kw = aggFn(b.meterBuckets[gid] || []);
+        row[gid] = kw;
+        row.total_kw += kw;
+      }
+      row.energy_cost = row.total_kw * powerCostPerKwh;
+      return row;
+    });
+    out.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+    return out;
+  }, [powerRowsFiltered, powerInterval, powerAggregation, powerConfig, powerCostPerKwh]);
+
+  const powerMainChartData = useMemo(() => {
+    const meterIds = (powerConfig?.devices || [])
+      .map((d) => String(d?.id || ""))
+      .filter((id) => !selectedPowerChartMeters.length || selectedPowerChartMeters.includes(id));
+    const bucketKey = (tsMs) => {
+      const d = new Date(tsMs);
+      if (powerInterval === "day") return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+      if (powerInterval === "hour") return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${String(d.getUTCHours()).padStart(2, "0")}:00`;
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+    };
+    const metricTagPriority =
+      powerMainMetric === "voltage_v"
+        ? ["voltage_v", "voltage_l1_v"]
+        : powerMainMetric === "current_a"
+          ? ["current_a", "current_l1_a"]
+          : powerMainMetric === "energy_kwh"
+            ? ["energy_total_wh", "energy_wh"]
+            : ["active_power_total_w", "active_power_w"];
+    const scale = powerMainMetric === "power_kw" || powerMainMetric === "energy_kwh" ? 1 / 1000.0 : 1;
+    const buckets = new Map();
+    for (const row of powerRowsFiltered || []) {
+      const gid = String(row?.gateway_id || "");
+      if (meterIds.length && !meterIds.includes(gid)) continue;
+      const tag = String(row?.tag || row?.tag_name || "");
+      if (!metricTagPriority.includes(tag)) continue;
+      const tsMs = parseTimestampMs(row?.ts || row?.ts_utc || "");
+      if (!Number.isFinite(tsMs)) continue;
+      const raw = Number(row?.value || 0);
+      if (!Number.isFinite(raw)) continue;
+      const key = bucketKey(tsMs);
+      if (!buckets.has(key)) buckets.set(key, { ts: key, meterBuckets: {} });
+      const b = buckets.get(key);
+      if (!b.meterBuckets[gid]) b.meterBuckets[gid] = [];
+      b.meterBuckets[gid].push(raw * scale);
+    }
+    const aggFn = (arr) => {
+      if (!arr?.length) return 0;
+      if (powerAggregation === "max") return Math.max(...arr);
+      if (powerAggregation === "min") return Math.min(...arr);
+      if (powerAggregation === "sum") return arr.reduce((a, n) => a + n, 0);
+      return arr.reduce((a, n) => a + n, 0) / arr.length;
+    };
+    const rows = Array.from(buckets.values()).map((b) => {
+      const row = { ts: b.ts, total: 0 };
+      for (const gid of meterIds) {
+        const v = aggFn(b.meterBuckets[gid] || []);
+        row[gid] = v;
+        row.total += v;
+      }
+      return row;
+    });
+    rows.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+    return { rows, meterIds };
+  }, [powerConfig, powerRowsFiltered, powerInterval, powerMainMetric, powerAggregation, selectedPowerChartMeters]);
+
+  const powerMainYDomain = useMemo(() => {
+    const keys = ["total", ...powerMainChartData.meterIds];
+    return computeMultiSeriesDomain(powerMainChartData.rows, keys, true);
+  }, [powerMainChartData]);
+  const powerMainXAxisTicks = useMemo(() => {
+    const labels = Array.from(
+      new Set((powerMainChartData?.rows || []).map((r) => String(r?.ts || "").trim()).filter(Boolean))
+    );
+    if (!labels.length) return [];
+    const maxTicks = powerInterval === "minute" ? 10 : powerInterval === "hour" ? 12 : 14;
+    if (labels.length <= maxTicks) return labels;
+    const step = Math.max(1, Math.ceil((labels.length - 1) / (maxTicks - 1)));
+    const out = [];
+    for (let i = 0; i < labels.length; i += step) out.push(labels[i]);
+    if (out[out.length - 1] !== labels[labels.length - 1]) out.push(labels[labels.length - 1]);
+    return out;
+  }, [powerMainChartData, powerInterval]);
+  const powerSideChartData = useMemo(() => {
+    const nowMs = Date.now();
+    const isLast12h = String(powerCostChartRange || "12h") === "12h";
+    const fromMs = nowMs - (isLast12h ? 12 * 60 * 60 * 1000 : 30 * 24 * 60 * 60 * 1000);
+    const meterSet = new Set((selectedPowerChartMeters || []).map(String));
+    const scopedMeterId = String(powerFilterMeterId || "all");
+    const intervalByGateway = Object.fromEntries(
+      (powerConfig?.devices || []).map((d) => [String(d?.id || ""), Number(d?.poll_interval_ms || 1000)])
+    );
+    const bucketKey = (tsMs) => {
+      const d = new Date(tsMs);
+      if (isLast12h) {
+        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${String(d.getUTCHours()).padStart(2, "0")}:00`;
+      }
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    };
+    const buckets = new Map();
+    for (const row of powerHistoryRows || []) {
+      const gid = String(row?.gateway_id || "");
+      if (scopedMeterId && scopedMeterId !== "all" && gid !== scopedMeterId) continue;
+      if (meterSet.size && !meterSet.has(gid)) continue;
+      const tsMs = parseTimestampMs(row?.ts || row?.ts_utc || "");
+      if (!Number.isFinite(tsMs) || tsMs < fromMs || tsMs > nowMs + 60000) continue;
+      const tag = String(row?.tag || row?.tag_name || "");
+      if (!(tag === "active_power_total_w" || tag === "active_power_w")) continue;
+      const raw = Number(row?.value || 0);
+      if (!Number.isFinite(raw)) continue;
+      const kw = raw / 1000.0;
+      const intervalMs = Math.max(100, Number(intervalByGateway[gid] || 1000));
+      const kwh = kw * (intervalMs / 3600000.0);
+      const key = bucketKey(tsMs);
+      const prev = buckets.get(key) || { ts: key, total_kwh: 0 };
+      prev.total_kwh += kwh;
+      buckets.set(key, prev);
+    }
+    const rows = Array.from(buckets.values())
+      .sort((a, b) => String(a.ts).localeCompare(String(b.ts)))
+      .map((r) => ({
+        ...r,
+        total_cost: Number(r.total_kwh || 0) * powerCostPerKwh,
+      }));
+    return { rows, keys: ["total_kwh", "total_cost"], showPhases: false };
+  }, [powerHistoryRows, powerConfig, powerFilterMeterId, selectedPowerChartMeters, powerCostChartRange, powerCostPerKwh]);
+
+  const powerSideYDomain = useMemo(() => {
+    return computeMultiSeriesDomain(powerSideChartData.rows, ["total_kwh"], true);
+  }, [powerSideChartData]);
+  const powerSideXAxisTicks = useMemo(() => {
+    const labels = Array.from(
+      new Set((powerSideChartData?.rows || []).map((r) => String(r?.ts || "").trim()).filter(Boolean))
+    );
+    if (!labels.length) return [];
+    const maxTicks = String(powerCostChartRange || "12h") === "30d" ? 10 : 12;
+    if (labels.length <= maxTicks) return labels;
+    const step = Math.max(1, Math.ceil((labels.length - 1) / (maxTicks - 1)));
+    const out = [];
+    for (let i = 0; i < labels.length; i += step) out.push(labels[i]);
+    if (out[out.length - 1] !== labels[labels.length - 1]) out.push(labels[labels.length - 1]);
+    return out;
+  }, [powerSideChartData, powerCostChartRange]);
+
+  const powerKpis = useMemo(() => {
+    const latest = powerTrendData[powerTrendData.length - 1] || null;
+    const totalEnergyKwh = powerTrendData.reduce((acc, r) => acc + Number(r.total_kw || 0), 0) * (powerInterval === "day" ? 24 : powerInterval === "hour" ? 1 : 1 / 60);
+    const totalCost = totalEnergyKwh * powerCostPerKwh;
+    const liveKw = Number(latest?.total_kw || 0);
+    const peakKw = powerTrendData.reduce((m, r) => Math.max(m, Number(r.total_kw || 0)), 0);
+    const peakLabel = peakKw >= 100 ? "High" : peakKw >= 50 ? "Medium" : "Normal";
+    const avgKw = powerTrendData.length ? powerTrendData.reduce((a, r) => a + Number(r.total_kw || 0), 0) / powerTrendData.length : 0;
+    const efficiency = peakKw > 0 ? Math.max(0, Math.min(100, (avgKw / peakKw) * 100)) : 0;
+    const downtimeCost = powerTrendData
+      .filter((r) => Number(r.total_kw || 0) < Math.max(1, peakKw * 0.1))
+      .reduce((a, r) => a + Number(r.energy_cost || 0), 0);
+    return {
+      efficiency,
+      totalCost,
+      totalEnergyKwh,
+      liveKw,
+      peakKw,
+      peakLabel,
+      downtimeCost,
+    };
+  }, [powerTrendData, powerInterval, powerCostPerKwh]);
+  const powerChartAxisColor = useMemo(() => (theme === "dark" ? "#9da0a6" : "#6b7280"), [theme]);
+  const formatPowerMainXAxisTick = useCallback(
+    (value) => {
+      const text = String(value || "");
+      if (!text) return "";
+      if (powerInterval === "day") {
+        return text.length >= 10 ? text.slice(5, 10) : text;
+      }
+      const parts = text.split(" ");
+      if (parts.length >= 2) return parts[1].slice(0, 5);
+      return text.length >= 5 ? text.slice(-5) : text;
+    },
+    [powerInterval]
+  );
+  const formatPowerSideXAxisTick = useCallback(
+    (value) => {
+      const text = String(value || "");
+      if (!text) return "";
+      if (String(powerCostChartRange || "12h") === "30d") {
+        return text.length >= 10 ? text.slice(5, 10) : text;
+      }
+      const parts = text.split(" ");
+      if (parts.length >= 2) return parts[1].slice(0, 5);
+      return text.length >= 5 ? text.slice(-5) : text;
+    },
+    [powerCostChartRange]
+  );
+
+  const powerMeterRows = useMemo(() => {
+    const meterIds = (powerConfig?.devices || []).map((d) => String(d?.id || ""));
+    const latestByMeter = {};
+    for (const row of powerRowsFiltered) {
+      const gid = String(row?.gateway_id || "");
+      const tag = String(row?.tag || row?.tag_name || "");
+      const ts = parseTimestampMs(row?.ts || row?.ts_utc || "");
+      if (!Number.isFinite(ts)) continue;
+      if (!latestByMeter[gid]) latestByMeter[gid] = { ts, tags: {} };
+      if (ts >= latestByMeter[gid].ts) {
+        latestByMeter[gid].ts = ts;
+        latestByMeter[gid].tags[tag] = Number(row?.value || 0);
+      }
+    }
+    return meterIds.map((id) => {
+      const d = (powerConfig?.devices || []).find((x) => String(x?.id || "") === id) || {};
+      const st = powerDeviceStatuses[id] || {};
+      const tags = latestByMeter[id]?.tags || {};
+      const powerKw = Number(tags.active_power_total_w ?? tags.active_power_w ?? 0) / 1000.0;
+      const energyKwh = Number(tags.energy_total_wh ?? tags.energy_wh ?? 0) / 1000.0;
+      const voltageV = Number(tags.voltage_v ?? tags.voltage_l1_v ?? 0);
+      const currentA = Number(tags.current_a ?? tags.current_l1_a ?? 0);
+      const powerFactor = Number(tags.power_factor_total ?? tags.power_factor ?? 0);
+      const location = [String(d?.site || "").trim(), String(d?.area || "").trim(), String(d?.equipment || "").trim()]
+        .filter(Boolean)
+        .join(" | ");
+      const minKw = Number(d?.min_active_power_kw);
+      const maxKw = Number(d?.max_active_power_kw);
+      const limits =
+        Number.isFinite(minKw) && Number.isFinite(maxKw)
+          ? `${formatMetricValue(minKw, 2)} - ${formatMetricValue(maxKw, 2)} kW`
+          : Number.isFinite(maxKw)
+            ? `Max ${formatMetricValue(maxKw, 2)} kW`
+            : Number.isFinite(minKw)
+              ? `Min ${formatMetricValue(minKw, 2)} kW`
+              : "-";
+      return {
+        id,
+        name: String(d?.name || id),
+        machine: String(d?.description || d?.machine_description || "-"),
+        location: location || "-",
+        limits,
+        mode: String(d?.electrical_mode || "single_phase"),
+        endpoint: `${String(d?.ip || "-")}:${Number(d?.port || 502)}`,
+        interval: Number(d?.poll_interval_ms || 1000),
+        connected: Boolean(st?.connected),
+        voltageV: Number.isFinite(voltageV) ? voltageV : 0,
+        currentA: Number.isFinite(currentA) ? currentA : 0,
+        powerFactor: Number.isFinite(powerFactor) ? powerFactor : 0,
+        powerKw,
+        energyKwh,
+        lastTs: latestByMeter[id]?.ts || 0,
+      };
+    });
+  }, [powerConfig, powerRowsFiltered, powerDeviceStatuses]);
+
+  const openAddPowerDevice = () => {
+    setEditingPowerDeviceId(null);
+    setPowerDeviceForm({
+      id: "",
+      name: "",
+      description: "",
+      machine_description: "",
+      site: "",
+      area: "",
+      equipment: "",
+      enabled: true,
+      type: "modbus_tcp",
+      protocol: "modbus_tcp",
+      ip: "",
+      port: 502,
+      unit_id: 1,
+      poll_interval_ms: 1000,
+      electrical_mode: "single_phase",
+      register_profile: powerProfiles?.mode_defaults?.single_phase || POWER_PROFILE_DEFAULTS.single_phase,
+      use_custom_registers: true,
+      wiring_type: "single_phase",
+      voltage_connected: true,
+      ct_connected: true,
+      ct_primary: 80,
+      ct_secondary: 5,
+      vt_primary: 230,
+      vt_secondary: 230,
+      min_active_power_kw: "",
+      max_active_power_kw: "",
+      registers: {
+        voltage_v: 19000,
+        current_a: 19012,
+        active_power_w: 19020,
+        power_factor: 19044,
+        frequency_hz: 19050,
+        energy_wh: 19054,
+        ...(powerProfiles?.profiles?.[powerProfiles?.mode_defaults?.single_phase || POWER_PROFILE_DEFAULTS.single_phase] || {}),
+      },
+    });
+    setShowPowerDeviceModal(true);
+  };
+
+  const openEditPowerDevice = (device) => {
+    if (!device) return;
+    setEditingPowerDeviceId(String(device.id || ""));
+    const mode = String(device?.electrical_mode || device?.wiring_type || "single_phase");
+    const profileName = String(device?.register_profile || powerProfiles?.mode_defaults?.[mode] || POWER_PROFILE_DEFAULTS[mode] || POWER_PROFILE_DEFAULTS.single_phase);
+    const profileRegs = powerProfiles?.profiles?.[profileName] || {};
+    setPowerDeviceForm({
+      ...device,
+      electrical_mode: mode,
+      register_profile: profileName,
+      use_custom_registers: Boolean(device?.use_custom_registers),
+      registers: {
+        ...profileRegs,
+        ...(device.registers || {}),
+      },
+    });
+    setShowPowerDeviceModal(true);
+  };
+
+  const savePowerDevice = () => {
+    const nextId = String(powerDeviceForm.id || "").trim();
+    if (!nextId) {
+      setPowerResult("Device ID is required.");
+      return;
+    }
+    setPowerConfig((prev) => {
+      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+      const existingIndex = prevDevices.findIndex((d) => String(d?.id || "") === String(editingPowerDeviceId || nextId));
+      const nextDevice = {
+        ...powerDeviceForm,
+        id: nextId,
+        name: String(powerDeviceForm.name || nextId),
+        description: String(powerDeviceForm.description || powerDeviceForm.machine_description || ""),
+        machine_description: String(powerDeviceForm.machine_description || powerDeviceForm.description || ""),
+        site: String(powerDeviceForm.site || ""),
+        area: String(powerDeviceForm.area || ""),
+        equipment: String(powerDeviceForm.equipment || ""),
+        type: "modbus_tcp",
+        protocol: "modbus_tcp",
+        electrical_mode: String(powerDeviceForm.electrical_mode || "single_phase"),
+        wiring_type: String(powerDeviceForm.electrical_mode || "single_phase"),
+        register_profile: String(powerDeviceForm.register_profile || POWER_PROFILE_DEFAULTS.single_phase),
+        use_custom_registers: Boolean(powerDeviceForm.use_custom_registers),
+        min_active_power_kw: powerDeviceForm.min_active_power_kw === "" ? "" : Number(powerDeviceForm.min_active_power_kw || 0),
+        max_active_power_kw: powerDeviceForm.max_active_power_kw === "" ? "" : Number(powerDeviceForm.max_active_power_kw || 0),
+      };
+      const devices = [...prevDevices];
+      if (existingIndex >= 0) devices[existingIndex] = nextDevice;
+      else devices.push(nextDevice);
+      const selected = String(prev?.selected_device_id || "");
+      return {
+        ...(prev || {}),
+        devices,
+        selected_device_id: selected || nextId,
+      };
+    });
+    setShowPowerDeviceModal(false);
+  };
+
+  const removePowerDevice = (deviceId) => {
+    const did = String(deviceId || "");
+    setPowerConfig((prev) => {
+      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+      const devices = prevDevices.filter((d) => String(d?.id || "") !== did);
+      const selected = String(prev?.selected_device_id || "");
+      const nextSelected =
+        selected === did ? String(devices[0]?.id || "") : selected;
+      return { ...(prev || {}), devices, selected_device_id: nextSelected };
+    });
+  };
+
+  const setPowerDeviceField = (field, value) => {
+    const selectedId = String(powerConfig?.selected_device_id || "");
+    setPowerConfig((prev) => {
+      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+      const devices = prevDevices.map((d) => {
+        if (String(d?.id || "") !== selectedId) return d;
+        const next = { ...d, [field]: value };
+        if (field === "use_custom_registers" && value === false) {
+          const profileName = String(next.register_profile || "");
+          next.registers = { ...(powerProfiles?.profiles?.[profileName] || {}) };
+        }
+        return next;
+      });
+      return { ...(prev || {}), devices };
+    });
+  };
+
+  const setPowerDeviceMode = (modeRaw) => {
+    const mode = String(modeRaw || "single_phase");
+    const selectedId = String(powerConfig?.selected_device_id || "");
+    const profile = String(powerProfiles?.mode_defaults?.[mode] || POWER_PROFILE_DEFAULTS[mode] || POWER_PROFILE_DEFAULTS.single_phase);
+    const profileRegs = { ...(powerProfiles?.profiles?.[profile] || {}) };
+    setPowerConfig((prev) => {
+      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+      const devices = prevDevices.map((d) => {
+        if (String(d?.id || "") !== selectedId) return d;
+        const next = {
+          ...d,
+          electrical_mode: mode,
+          wiring_type: mode,
+          register_profile: profile,
+        };
+        if (!Boolean(next.use_custom_registers)) next.registers = profileRegs;
+        return next;
+      });
+      return { ...(prev || {}), devices };
+    });
+  };
+
+  const setPowerDeviceRegisterProfile = (profileNameRaw) => {
+    const profileName = String(profileNameRaw || "").trim();
+    if (!profileName) return;
+    const selectedId = String(powerConfig?.selected_device_id || "");
+    const profileRegs = { ...(powerProfiles?.profiles?.[profileName] || {}) };
+    setPowerConfig((prev) => {
+      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+      const devices = prevDevices.map((d) => {
+        if (String(d?.id || "") !== selectedId) return d;
+        const next = {
+          ...d,
+          register_profile: profileName,
+        };
+        if (!Boolean(next.use_custom_registers)) next.registers = profileRegs;
+        return next;
+      });
+      return { ...(prev || {}), devices };
+    });
+  };
+
+  const setPowerDeviceRegisterField = (key, value) => {
+    const selectedId = String(powerConfig?.selected_device_id || "");
+    setPowerConfig((prev) => {
+      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+      const devices = prevDevices.map((d) => {
+        if (String(d?.id || "") !== selectedId) return d;
+        return {
+          ...d,
+          use_custom_registers: true,
+          registers: { ...(d.registers || {}), [key]: Number(value || 0) },
+        };
+      });
+      return { ...(prev || {}), devices };
+    });
+  };
+
+  const addPowerRegisterRow = () => {
+    const key = String(newPowerRegisterKey || "").trim();
+    if (!key) {
+      setPowerResult("Register key is required.");
+      return;
+    }
+    const addr = Number(newPowerRegisterAddress || 0);
+    if (!Number.isFinite(addr) || addr < 0) {
+      setPowerResult("Register address must be zero or greater.");
+      return;
+    }
+    setPowerDeviceRegisterField(key, Math.floor(addr));
+    setNewPowerRegisterKey("");
+    setNewPowerRegisterAddress("");
+  };
+
+  const removePowerRegisterRow = (key) => {
+    const selectedId = String(powerConfig?.selected_device_id || "");
+    const regKey = String(key || "").trim();
+    if (!selectedId || !regKey) return;
+    setPowerConfig((prev) => {
+      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+      const devices = prevDevices.map((d) => {
+        if (String(d?.id || "") !== selectedId) return d;
+        const nextRegs = { ...(d.registers || {}) };
+        delete nextRegs[regKey];
+        return { ...d, use_custom_registers: true, registers: nextRegs };
+      });
+      return { ...(prev || {}), devices };
+    });
+  };
+
+  const setPowerDeviceRunning = async (deviceId, shouldRun) => {
+    const did = String(deviceId || "").trim();
+    if (!did) return;
+    setPowerBusy(true);
+    try {
+      const res = shouldRun ? await startPowerDevice(did) : await stopPowerDevice(did);
+      if (res?.ok && res?.config) setPowerConfig(res.config);
+      setPowerResult(shouldRun ? `Power meter ${did} started.` : `Power meter ${did} stopped.`);
+    } catch (err) {
+      setPowerResult(`Power meter control failed: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
+  };
+
+  const runPowerConnectionTest = async () => {
+    setPowerBusy(true);
+    try {
+      const did = String(powerConfig?.selected_device_id || "");
+      const res = await testPowerConnection({
+        device_id: did,
+        timeout_ms: 3000,
+      });
+      if (did) {
+        setPowerRegisterTests((prev) => ({
+          ...(prev || {}),
+          [did]: {
+            tested_at_utc: String(res?.tested_at_utc || ""),
+            register_results: { ...(res?.register_results || {}) },
+          },
+        }));
+      }
+      setPowerResult(res?.message || (res?.ok ? "Connection test successful." : "Connection test failed."));
+    } catch (err) {
+      setPowerResult(`Connection test failed: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
+  };
+
   const canEditPage = (page) => {
     if (isReadonlyCloudMode) return false;
     if (!currentUser) return false;
@@ -3681,6 +4779,8 @@ function AppShell() {
         ? "data_log"
         : page === "historian" || page === "logs"
           ? "data_log"
+          : page === "power_overview" || page === "power_configuration"
+            ? "database"
           : page === "database_overview"
             ? "database"
             : page === "database_inspector"
@@ -3784,10 +4884,10 @@ function AppShell() {
 
     const gwStates = {};
     for (const g of gatewayConfigs) {
-      const rt = gatewayRuntimeStatuses[g.id] || null;
-      const running = Boolean(rt?.running);
-      const dbErr = String(rt?.db_last_error || "").trim();
-      const connErr = String(rt?.last_error || "").trim();
+      const runtimeStatus = gatewayRuntimeStatuses[g.id] || null;
+      const running = Boolean(runtimeStatus?.running);
+      const dbErr = String(runtimeStatus?.db_last_error || "").trim();
+      const connErr = String(runtimeStatus?.last_error || "").trim();
       const label = running ? (dbErr || connErr ? "RUNNING_WITH_ERRORS" : "RUNNING") : "STOPPED";
       gwStates[g.id] = label;
       if (state.gateways[g.id] !== label) {
@@ -3939,20 +5039,79 @@ function AppShell() {
     () => gatewayConfigs.find((g) => g.id === selectedGatewayId) || null,
     [gatewayConfigs, selectedGatewayId]
   );
+  const powerGatewayDescriptors = useMemo(() => {
+    const devices = Array.isArray(powerConfig?.devices) ? powerConfig.devices : [];
+    return devices
+      .map((d) => {
+        const profileName = String(d?.register_profile || "");
+        const profileMap = powerProfiles?.profiles?.[profileName] || {};
+        const customMap = d?.registers && typeof d.registers === "object" ? d.registers : {};
+        const mergedMap = d?.use_custom_registers ? { ...profileMap, ...customMap } : (Object.keys(customMap).length ? customMap : profileMap);
+        return {
+          id: String(d?.id || ""),
+          name: String(d?.name || d?.id || "Power Meter"),
+          interval_ms: Number(d?.poll_interval_ms || 1000),
+          gateway_type: "modbus_tcp_meter",
+          tags: Object.keys(mergedMap || {}),
+          power_meter: true,
+          enabled: d?.enabled !== false,
+        };
+      })
+      .filter((d) => d.id);
+  }, [powerConfig, powerProfiles]);
+  const allGatewayOptions = useMemo(() => {
+    const base = (gatewayConfigs || []).map((g) => ({
+      id: String(g.id || ""),
+      name: String(g.name || g.id || ""),
+      power_meter: false,
+    }));
+    const extra = (powerGatewayDescriptors || [])
+      .filter((g) => !base.some((b) => String(b.id) === String(g.id)))
+      .map((g) => ({
+        id: String(g.id || ""),
+        name: String(g.name || g.id || ""),
+        power_meter: true,
+      }));
+    return [...base, ...extra];
+  }, [gatewayConfigs, powerGatewayDescriptors]);
+  const gatewayNameById = useMemo(
+    () => Object.fromEntries((allGatewayOptions || []).map((g) => [String(g.id || ""), String(g.name || g.id || "")])),
+    [allGatewayOptions]
+  );
   const triggerTagsByGateway = useMemo(() => {
     const byGateway = {};
     for (const g of gatewayConfigs) {
       byGateway[g.id] = Array.from(new Set((g.tags || []).map((t) => String(t).trim()).filter(Boolean)));
     }
+    for (const g of powerGatewayDescriptors) {
+      const existing = Array.isArray(byGateway[g.id]) ? byGateway[g.id] : [];
+      byGateway[g.id] = Array.from(new Set([...existing, ...(g.tags || [])].map((t) => String(t).trim()).filter(Boolean)));
+    }
     return byGateway;
-  }, [gatewayConfigs]);
+  }, [gatewayConfigs, powerGatewayDescriptors]);
+  const dashboardGatewayOptions = useMemo(() => {
+    const base = (gatewayConfigs || []).map((g) => ({ id: g.id, name: g.name || g.id }));
+    const extras = (powerGatewayDescriptors || [])
+      .filter((g) => !base.some((b) => String(b.id) === String(g.id)))
+      .map((g) => ({ id: g.id, name: `${g.name} (Power Meter)` }));
+    return [...base, ...extras];
+  }, [gatewayConfigs, powerGatewayDescriptors]);
+  const getGatewayIntervalMs = useCallback(
+    (gatewayId) => {
+      const gid = String(gatewayId || "");
+      const gw = (gatewayConfigsRef.current || []).find((g) => String(g.id || "") === gid);
+      if (gw) return Math.max(200, Number(gw.interval_ms || 1000));
+      const pd = (powerConfig?.devices || []).find((d) => String(d?.id || "") === gid);
+      return Math.max(200, Number(pd?.poll_interval_ms || 1000));
+    },
+    [powerConfig]
+  );
   const getTriggerLiveStatus = (trigger) => {
     if (!trigger?.gateway_id || !trigger?.tag_name) return { ok: null, label: "No Data", valueText: "-", ageText: "-" };
     const key = `${String(trigger.gateway_id || "")}::${normalizeTagName(trigger.tag_name || "")}`;
     const latest = liveTagValuesRef.current[key] || null;
     if (!latest) return { ok: null, label: "No Data", valueText: "-", ageText: "-" };
-    const gw = gatewayConfigsRef.current.find((g) => String(g.id) === String(trigger.gateway_id || ""));
-    const intervalMs = Math.max(200, Number(gw?.interval_ms || 1000));
+    const intervalMs = getGatewayIntervalMs(trigger.gateway_id);
     const ageMs = Date.now() - parseTimestampMs(latest.ts || "");
     const staleMs = Math.max(5000, intervalMs * 4);
     if (!Number.isFinite(ageMs) || ageMs > staleMs) return { ok: null, label: "Stale", valueText: "-", ageText: "-" };
@@ -3968,8 +5127,7 @@ function AppShell() {
     const key = `${String(rule.gateway_id || "")}::${normalizeTagName(rule.tag_name || "")}`;
     const latest = liveTagValuesRef.current[key] || null;
     if (!latest) return { ok: null, label: "No Data", valueText: "-", ageText: "-" };
-    const gw = gatewayConfigsRef.current.find((g) => String(g.id) === String(rule.gateway_id || ""));
-    const intervalMs = Math.max(200, Number(gw?.interval_ms || 1000));
+    const intervalMs = getGatewayIntervalMs(rule.gateway_id);
     const ageMs = Date.now() - parseTimestampMs(latest.ts || "");
     const staleMs = Math.max(5000, intervalMs * 4);
     if (!Number.isFinite(ageMs) || ageMs > staleMs) return { ok: null, label: "Stale", valueText: "-", ageText: "-" };
@@ -3988,19 +5146,19 @@ function AppShell() {
   };
   const getGatewayHealth = (gateway) => {
     if (!gateway) return { ok: false, label: "Not Ready" };
-    const rt = gatewayRuntimeStatusesView[gateway.id] || gatewayRuntimeStatuses[gateway.id] || null;
-    if (rt) {
-      const rtErr = String(rt.last_error || "").trim();
-      const dbErr = String(rt.db_last_error || "").trim();
-      const lastWriteMs = new Date(String(rt.db_last_write_utc || "")).getTime();
+    const runtimeStatus = gatewayRuntimeStatusesView[gateway.id] || gatewayRuntimeStatuses[gateway.id] || null;
+    if (runtimeStatus) {
+      const rtErr = String(runtimeStatus.last_error || "").trim();
+      const dbErr = String(runtimeStatus.db_last_error || "").trim();
+      const lastWriteMs = new Date(String(runtimeStatus.db_last_write_utc || "")).getTime();
       const hasFreshWrite = Number.isFinite(lastWriteMs) && (Date.now() - lastWriteMs) <= 15000;
-      const pending = Number(rt.db_pending_count || 0);
-      if (rt.running === true) {
+      const pending = Number(runtimeStatus.db_pending_count || 0);
+      if (runtimeStatus.running === true) {
         if (rtErr) return { ok: false, label: "Device Fails" };
         if (dbErr && !hasFreshWrite && pending > 0) return { ok: false, label: "DB Fails" };
         return { ok: true, label: "Running" };
       }
-      if (rt.running === false && !rtErr && !dbErr) return { ok: false, label: "Stopped" };
+      if (runtimeStatus.running === false && !rtErr && !dbErr) return { ok: false, label: "Stopped" };
     }
     const device = devices.find((d) => d.id === gateway.device_id) || null;
     const db = dbConnections.find((c) => c.id === gateway.database_id) || null;
@@ -4021,10 +5179,10 @@ function AppShell() {
     let writes = 0;
     let pending = 0;
     for (const gid of linkedGatewayIds) {
-      const rt = gatewayRuntimeStatuses[gid];
-      if (!rt) continue;
-      writes += Number(rt.db_write_count || 0);
-      pending += Number(rt.db_pending_count || 0);
+      const runtimeStatus = gatewayRuntimeStatuses[gid];
+      if (!runtimeStatus) continue;
+      writes += Number(runtimeStatus.db_write_count || 0);
+      pending += Number(runtimeStatus.db_pending_count || 0);
     }
     return `W:${writes} | P:${pending}`;
   };
@@ -4235,10 +5393,10 @@ function AppShell() {
     if (!gateway?.database_id) return "No DB selected";
     const db = dbConnections.find((c) => c.id === gateway.database_id);
     const dbName = db?.name || "Unknown DB";
-    const rt = gatewayRuntimeStatuses[gateway.id] || null;
-    const writes = Number(rt?.db_write_count || 0);
-    const pending = Number(rt?.db_pending_count || 0);
-    const lastCheckUtc = String(rt?.last_check_utc || "");
+    const runtimeStatus = gatewayRuntimeStatuses[gateway.id] || null;
+    const writes = Number(runtimeStatus?.db_write_count || 0);
+    const pending = Number(runtimeStatus?.db_pending_count || 0);
+    const lastCheckUtc = String(runtimeStatus?.last_check_utc || "");
     if (isHostedWebClient && endpointMode === "cloud") {
       const cloudState = isFreshCloudTs(lastCheckUtc, 15000) ? "LIVE" : "STALE";
       return `${dbName} | Rows ${writes} | Pending ${pending} | ${cloudState}`;
@@ -4384,8 +5542,12 @@ function AppShell() {
     });
   }, [gatewayConfigs, dbConnections, isCloudEdgeFilterActive, selectedCloudEdgeKey, selectedCloudEdge]);
   const visibleGatewayIdSet = useMemo(
-    () => new Set((gatewayConfigsView || []).map((g) => String(g.id || ""))),
-    [gatewayConfigsView]
+    () =>
+      new Set([
+        ...(gatewayConfigsView || []).map((g) => String(g.id || "")),
+        ...(powerGatewayDescriptors || []).map((g) => String(g.id || "")),
+      ]),
+    [gatewayConfigsView, powerGatewayDescriptors]
   );
   const devicesView = useMemo(() => {
     if (!isCloudEdgeFilterActive) return devices;
@@ -4549,10 +5711,11 @@ function AppShell() {
 
   const isGatewayRunning = (gateway) => {
     if (!gateway) return false;
-    const rt = gatewayRuntimeStatusesView[gateway.id];
-    if (rt && typeof rt.running === "boolean") return Boolean(rt.running);
+    const runtimeStatus = gatewayRuntimeStatusesView[gateway.id];
+    if (runtimeStatus && typeof runtimeStatus.running === "boolean") return Boolean(runtimeStatus.running);
     if (isHostedWebClient && endpointMode === "cloud") {
-      return isFreshCloudTs(rt?.last_check_utc || gateway?.last_check_utc || "", 15000);
+      const lastCheckUtc = runtimeStatus?.last_check_utc || gateway?.last_check_utc || "";
+      return isFreshCloudTs(lastCheckUtc, 15000);
     }
     return false;
   };
@@ -4586,10 +5749,10 @@ function AppShell() {
           endpointMode === "cloud" &&
           hasRelated &&
           relatedRuntime.every(
-            (rt) =>
-              rt?.running === false &&
-              !String(rt?.last_error || "").trim() &&
-              !String(rt?.db_last_error || "").trim()
+            (runtimeStatus) =>
+              runtimeStatus?.running === false &&
+              !String(runtimeStatus?.last_error || "").trim() &&
+              !String(runtimeStatus?.db_last_error || "").trim()
           );
         const protocolOk = d.protocol_ok ?? d.port_ok;
         let status = "Offline";
@@ -4636,8 +5799,33 @@ function AppShell() {
         });
       }
     }
+    for (const gw of powerGatewayDescriptors) {
+      const observedTags = (dataLogView || [])
+        .filter((r) => String(r?.gateway_id || "") === String(gw.id || ""))
+        .map((r) => String(r?.tag || r?.tag_name || "").trim())
+        .filter(Boolean);
+      const tags = Array.from(new Set([...(Array.isArray(gw.tags) ? gw.tags : []), ...observedTags]));
+      for (const tag of tags) {
+        const latest = dataLogView.find(
+          (r) =>
+            String(r.tag || r.tag_name || "") === String(tag) &&
+            String(r.gateway_id || "") === String(gw.id || "")
+        );
+        const live = liveTagValuesView[`${String(gw.id)}::${normalizeTagName(tag)}`];
+        rows.push({
+          key: `${gw.id}::${tag}`,
+          tag_name: tag,
+          device_name: gw.name || gw.id,
+          gateway_id: gw.id,
+          gateway_name: gw.name || gw.id,
+          period_ms: Number(gw.interval_ms || 1000),
+          last_value: latest?.value ?? live?.value ?? "-",
+          last_ts: latest?.ts ? fmtTs(latest.ts) : live?.ts ? fmtTs(live.ts) : "-"
+        });
+      }
+    }
     return rows;
-  }, [gatewayConfigsView, devicesView, dataLogView, liveTagValuesView]);
+  }, [gatewayConfigsView, powerGatewayDescriptors, devicesView, dataLogView, liveTagValuesView]);
 
   const filteredTagRows = useMemo(() => {
     const deviceNeedle = String(tagFilters.device || "").trim().toLowerCase();
@@ -4686,7 +5874,10 @@ function AppShell() {
 
   const dashboardWidgetsView = useMemo(() => {
     if (!isCloudEdgeFilterActive) return dashboardWidgets;
-    const allowedGatewayIds = new Set((gatewayConfigsView || []).map((g) => String(g.id || "")));
+    const allowedGatewayIds = new Set([
+      ...(gatewayConfigsView || []).map((g) => String(g.id || "")),
+      ...(powerGatewayDescriptors || []).map((g) => String(g.id || "")),
+    ]);
     const filtered = (dashboardWidgets || []).filter((w) => allowedGatewayIds.has(String(w.gateway_id || "")));
     if (filtered.length) return filtered;
     const fallback = [];
@@ -4710,14 +5901,18 @@ function AppShell() {
       if (fallback.length >= 8) break;
     }
     return fallback;
-  }, [dashboardWidgets, gatewayConfigsView, tagRows, isCloudEdgeFilterActive, getDashboardTagColor]);
+  }, [dashboardWidgets, gatewayConfigsView, powerGatewayDescriptors, tagRows, isCloudEdgeFilterActive, getDashboardTagColor]);
 
   const dashboardItems = useMemo(() => {
-    const nextSeenKeys = new Set();
     const items = dashboardWidgetsView.map((w) => {
-      const gateway = gatewayConfigsView.find((g) => String(g.id) === String(w.gateway_id)) || null;
+      const gateway =
+        gatewayConfigsView.find((g) => String(g.id) === String(w.gateway_id)) ||
+        powerGatewayDescriptors.find((g) => String(g.id) === String(w.gateway_id)) ||
+        null;
       if (!gateway) return null;
-      const device = devicesView.find((d) => String(d.id) === String(gateway?.device_id || "")) || null;
+      const device =
+        devicesView.find((d) => String(d.id) === String(gateway?.device_id || "")) ||
+        (gateway?.power_meter ? { name: gateway.name } : null);
       const itemColor = normalizeHexColor(
         w.color || getDashboardTagColor(w.gateway_id, w.tag_name, "#16a34a"),
         "#16a34a"
@@ -4734,14 +5929,10 @@ function AppShell() {
         points,
         renderNowMs,
         Number(gateway?.interval_ms || 1000),
-        endpointMode !== "cloud"
+        false
       );
       const series = String(w?.chart_type || "line") === "bar" ? points : lineSeries;
-      const domainKey = `${String(w.gateway_id || "")}::${normalizeTagName(w.tag_name)}::${String(w.id || "")}`;
-      nextSeenKeys.add(domainKey);
-      const prevDomain = dashboardDomainByKeyRef.current?.[domainKey] || null;
-      const yDomain = computeSeriesDomain(series, prevDomain);
-      dashboardDomainByKeyRef.current[domainKey] = yDomain;
+      const yDomain = computeSeriesDomain(series, null);
       const xDomain = [1, Math.max(20, Number(w.readings_count || 120)) + 1];
       const last = points.length ? points[points.length - 1] : null;
       const prev = points.length > 1 ? points[points.length - 2] : null;
@@ -4774,12 +5965,8 @@ function AppShell() {
         monitorRow
       };
     }).filter(Boolean);
-    const domainState = dashboardDomainByKeyRef.current || {};
-    for (const key of Object.keys(domainState)) {
-      if (!nextSeenKeys.has(key)) delete domainState[key];
-    }
     return items;
-  }, [dashboardWidgetsView, gatewayConfigsView, devicesView, dataLogView, renderNowMs, endpointMode, getDashboardTagColor]);
+  }, [dashboardWidgetsView, gatewayConfigsView, powerGatewayDescriptors, devicesView, dataLogView, renderNowMs, getDashboardTagColor]);
 
   const tagMonitorSeries = useMemo(() => {
     if (!tagMonitorSelection) return [];
@@ -4850,7 +6037,6 @@ function AppShell() {
   }, [tagMonitorSeries, tagMonitorSelection, tagMonitorLatest, renderNowMs]);
 
   const historianRows = useMemo(() => {
-    const gatewayNameById = Object.fromEntries(gatewayConfigsView.map((g) => [g.id, g.name]));
     return dataLogView.filter((row) => {
       if (!inRange(row.ts, historianFilters.from, historianFilters.to)) return false;
       if (historianFilters.tag && !String(row.tag || "").toLowerCase().includes(historianFilters.tag.toLowerCase())) return false;
@@ -4862,7 +6048,7 @@ function AppShell() {
       ...row,
       gateway_name: row.gateway_name || gatewayNameById[row.gateway_id] || row.gateway_id || "-"
     }));
-  }, [dataLogView, historianFilters, gatewayConfigsView]);
+  }, [dataLogView, historianFilters, gatewayNameById]);
 
   const filteredLogs = useMemo(() => {
     return appLogsView.filter((row) => {
@@ -4919,7 +6105,7 @@ function AppShell() {
 
   const openAddDashboardWidget = () => {
     if (!canEditPage("dashboard")) return;
-    const gatewayId = gatewayConfigs[0]?.id || "";
+    const gatewayId = dashboardGatewayOptions[0]?.id || "";
     const tag = (triggerTagsByGateway[gatewayId] || [])[0] || "";
     setEditingDashboardWidgetId(null);
     setDashboardWidgetForm({
@@ -5570,7 +6756,7 @@ function AppShell() {
 
   const openAddTriggerRule = () => {
     if (!canEditPage("triggers_and_limits")) return;
-    const defaultGatewayId = gatewayConfigs[0]?.id || "";
+    const defaultGatewayId = allGatewayOptions[0]?.id || "";
     const defaultTag = (triggerTagsByGateway[defaultGatewayId] || [])[0] || "";
     setEditingTriggerId(null);
     setTriggerForm({
@@ -5589,7 +6775,7 @@ function AppShell() {
 
   const openAddCollectionTrigger = () => {
     if (!canEditPage("triggers_and_limits")) return;
-    const defaultGatewayId = gatewayConfigs[0]?.id || "";
+    const defaultGatewayId = allGatewayOptions[0]?.id || "";
     const defaultTag = (triggerTagsByGateway[defaultGatewayId] || [])[0] || "";
     setEditingCollectionTriggerId(null);
     setCollectionTriggerForm({
@@ -7478,23 +8664,29 @@ function AppShell() {
 
   const reportFilterOptions = useMemo(() => {
     const gatewayMap = new Map();
-    for (const g of gatewayConfigs || []) {
-      gatewayMap.set(String(g.id), { id: String(g.id), name: String(g.name || g.id), tags: Array.isArray(g.tags) ? g.tags : [] });
+    for (const g of allGatewayOptions || []) {
+      const gwId = String(g.id || "");
+      gatewayMap.set(gwId, {
+        id: gwId,
+        name: String(g.name || gwId),
+        tags: Array.isArray(triggerTagsByGateway?.[gwId]) ? triggerTagsByGateway[gwId] : [],
+      });
     }
-    for (const r of dataLog || []) {
+    for (const r of dataLogView || []) {
       const id = String(r.gateway_id || "");
       if (!id) continue;
       if (!gatewayMap.has(id)) {
         gatewayMap.set(id, { id, name: String(r.gateway_name || id), tags: [] });
       }
       const gw = gatewayMap.get(id);
-      if (r?.tag && !gw.tags.includes(String(r.tag))) gw.tags.push(String(r.tag));
+      const rowTag = String(r?.tag || r?.tag_name || "");
+      if (rowTag && !gw.tags.includes(rowTag)) gw.tags.push(rowTag);
     }
     const gateways = Array.from(gatewayMap.values()).sort((a, b) => a.name.localeCompare(b.name));
     const selected = new Set(toStringArray(reportFilters.selected_gateway_ids).map(String));
     const tagsSet = new Set();
     for (const g of gateways) {
-      if (selected.size && selected.has(g.id)) {
+      if (!selected.size || selected.has(g.id)) {
         for (const t of g.tags || []) tagsSet.add(String(t));
       }
     }
@@ -7502,7 +8694,7 @@ function AppShell() {
       gateways,
       tags: Array.from(tagsSet).sort((a, b) => a.localeCompare(b)),
     };
-  }, [gatewayConfigs, dataLog, reportFilters.selected_gateway_ids]);
+  }, [allGatewayOptions, triggerTagsByGateway, dataLogView, reportFilters.selected_gateway_ids]);
 
   useEffect(() => {
     const validTags = new Set((reportFilterOptions.tags || []).map(String));
@@ -7580,7 +8772,7 @@ function AppShell() {
     const tagSet = new Set((filters?.selected_tags || []).map((x) => String(x)));
     const gwSet = new Set((filters?.selected_gateway_ids || []).map((x) => String(x)));
     const maxRows = Math.max(200, Number(filters?.max_rows || 3000));
-    return (dataLog || [])
+    return (dataLogView || [])
       .filter((r) => {
         const tsMs = new Date(r.ts).getTime();
         if (fromMs && Number.isFinite(fromMs) && tsMs < fromMs) return false;
@@ -7616,7 +8808,7 @@ function AppShell() {
         map.set(ts, base);
       }
       const target = map.get(ts);
-      const t = String(row.tag || "");
+      const t = String(row.tag || row.tag_name || "");
       if (tags.includes(t)) target[t] = row.value ?? "";
     }
     return Array.from(map.values()).sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
@@ -8469,6 +9661,476 @@ function AppShell() {
             </>
           ) : null}
 
+          {activePage === "power_overview" ? (
+            <>
+              <section className="card">
+                <div className="power-top-tabs" role="tablist" aria-label="Power view mode">
+                  <button
+                    type="button"
+                    className={`power-top-tab ${powerViewMode === "realtime" ? "active" : ""}`}
+                    onClick={() => setPowerViewMode("realtime")}
+                    aria-selected={powerViewMode === "realtime"}
+                  >
+                    Realtime
+                  </button>
+                  <button
+                    type="button"
+                    className={`power-top-tab ${powerViewMode === "historical" ? "active" : ""}`}
+                    onClick={() => setPowerViewMode("historical")}
+                    aria-selected={powerViewMode === "historical"}
+                  >
+                    Historical
+                  </button>
+                </div>
+                <div className="power-toolbar-grid">
+                  <label className="field">
+                    <span>Meter</span>
+                    <select value={powerFilterMeterId} onChange={(e) => setPowerFilterMeterId(e.target.value)}>
+                      <option value="all">All meters</option>
+                      {(powerConfig?.devices || []).map((d) => (
+                        <option key={`p-meter-${d.id}`} value={String(d.id || "")}>{String(d.name || d.id)}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>Period</span>
+                    <select value={powerPeriod} onChange={(e) => setPowerPeriod(e.target.value)}>
+                      {(powerViewMode === "realtime"
+                        ? POWER_PERIOD_OPTIONS.filter((p) => ["1h", "6h", "24h"].includes(p.value))
+                        : POWER_PERIOD_OPTIONS
+                      ).map((p) => (
+                        <option key={p.value} value={p.value}>{p.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>Interval</span>
+                    <select value={powerInterval} onChange={(e) => setPowerInterval(e.target.value)}>
+                      {POWER_INTERVAL_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>{o.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>Aggregation</span>
+                    <select value={powerAggregation} onChange={(e) => setPowerAggregation(e.target.value)}>
+                      {POWER_AGG_OPTIONS.map((o) => (
+                        <option key={o} value={o}>{o.toUpperCase()}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+              </section>
+              <section className="power-kpi-grid">
+                <div className="stat-card power-insight-card power-insight-eff"><div className="stat-title">Energy Efficiency</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.efficiency, 1)}</span><span className="power-insight-unit">%</span></div></div>
+                <div className="stat-card power-insight-card power-insight-cost"><div className="stat-title">Energy Costs</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.totalCost, 2)}</span><span className="power-insight-unit">EUR</span></div></div>
+                <div className="stat-card power-insight-card power-insight-energy"><div className="stat-title">Total kWh Consumption</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.totalEnergyKwh, 2)}</span><span className="power-insight-unit">kWh</span></div></div>
+                <div className="stat-card power-insight-card power-insight-live"><div className="stat-title">Live kW Consumption</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.liveKw, 2)}</span><span className="power-insight-unit">kW</span></div></div>
+                <div className="stat-card power-insight-card power-insight-peak"><div className="stat-title">Peak Demand Indicator</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.peakKw, 2)}</span><span className="power-insight-unit">kW</span></div><div className="meta"><span>{powerKpis.peakLabel}</span></div></div>
+                <div className="stat-card power-insight-card power-insight-down"><div className="stat-title">Downtime Energy Cost</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.downtimeCost, 2)}</span><span className="power-insight-unit">EUR</span></div></div>
+              </section>
+              <section className="power-main-grid">
+                <article className="card power-main-chart-card">
+                  <div className="row trend-header-row">
+                    <h3 style={{ marginTop: 0, marginBottom: 0 }}>
+                      {powerMainMetric === "voltage_v" ? "Voltage (V)" : powerMainMetric === "current_a" ? "Current (A)" : powerMainMetric === "energy_kwh" ? "Consumption (kWh)" : "Energy Consumption (kW)"} by {powerInterval}
+                    </h3>
+                    <div className="row power-side-controls">
+                      <select value={powerMainMetric} onChange={(e) => setPowerMainMetric(e.target.value)}>
+                        <option value="power_kw">Power (kW)</option>
+                        <option value="voltage_v">Voltage (V)</option>
+                        <option value="current_a">Current (A)</option>
+                        <option value="energy_kwh">Consumption (kWh)</option>
+                      </select>
+                      <div className="power-chart-type-toggle" role="group" aria-label="Main chart type">
+                        <button type="button" className={powerMainChartType === "line" ? "active" : ""} onClick={() => setPowerMainChartType("line")}>Line</button>
+                        <button type="button" className={powerMainChartType === "bar" ? "active" : ""} onClick={() => setPowerMainChartType("bar")}>Bar</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="meta">
+                    <span>Mode: {powerViewMode}</span>
+                    <span>Aggregation: {powerAggregation.toUpperCase()}</span>
+                    <span>Selected meters: {selectedPowerChartMeters.length || (powerConfig?.devices || []).length}</span>
+                  </div>
+                  <div className="chart-wrap">
+                    <ResponsiveContainer width="100%" height={310}>
+                      <ComposedChart data={powerMainChartData.rows} margin={{ top: 10, right: 22, left: 8, bottom: 28 }}>
+                        <XAxis
+                          dataKey="ts"
+                          ticks={powerMainXAxisTicks}
+                          minTickGap={22}
+                          interval="preserveStartEnd"
+                          allowDuplicatedCategory={false}
+                          height={42}
+                          tickMargin={10}
+                          tickFormatter={formatPowerMainXAxisTick}
+                          tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                          axisLine={{ stroke: powerChartAxisColor }}
+                          tickLine={{ stroke: powerChartAxisColor }}
+                        />
+                        <YAxis width={62} domain={powerMainYDomain} tick={{ fontSize: 11, fill: powerChartAxisColor }} axisLine={{ stroke: powerChartAxisColor }} tickLine={{ stroke: powerChartAxisColor }} />
+                        <Tooltip />
+                        {powerMainChartType === "bar" ? (
+                          <>
+                            <Bar dataKey="total" name="Total" fill="#16a34a" isAnimationActive={false} />
+                            {(powerConfig?.devices || [])
+                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")))
+                              .map((d, idx) => (
+                                <Bar
+                                  key={`pwr-bar-${d.id}`}
+                                  dataKey={String(d.id)}
+                                  name={String(d.name || d.id)}
+                                  fill={REPORT_SERIES_COLORS[idx % REPORT_SERIES_COLORS.length]}
+                                  isAnimationActive={false}
+                                />
+                              ))}
+                          </>
+                        ) : (
+                          <>
+                            <Line type="monotone" dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={false} isAnimationActive={false} />
+                            {(powerConfig?.devices || [])
+                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")))
+                              .map((d, idx) => (
+                                <Line
+                                  key={`pwr-line-${d.id}`}
+                                  type="monotone"
+                                  dataKey={String(d.id)}
+                                  name={String(d.name || d.id)}
+                                  stroke={REPORT_SERIES_COLORS[idx % REPORT_SERIES_COLORS.length]}
+                                  strokeWidth={1.6}
+                                  dot={false}
+                                  isAnimationActive={false}
+                                />
+                              ))}
+                          </>
+                        )}
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                  </div>
+                </article>
+                <article className="card power-side-chart-card">
+                  <div className="row trend-header-row">
+                    <h3 style={{ marginTop: 0, marginBottom: 0 }}>
+                      Total Consumption (kWh) {powerCostChartRange === "12h" ? "by Hour (Last 12h)" : "by Day (Last 30d)"}
+                    </h3>
+                    <div className="row power-side-controls">
+                      <select value={powerCostChartRange} onChange={(e) => setPowerCostChartRange(e.target.value)}>
+                        <option value="12h">Last 12 hours</option>
+                        <option value="30d">Last 30 days</option>
+                      </select>
+                      <div className="power-chart-type-toggle" role="group" aria-label="Side chart type">
+                        <button type="button" className={powerSideChartType === "line" ? "active" : ""} onClick={() => setPowerSideChartType("line")}>Line</button>
+                        <button type="button" className={powerSideChartType === "bar" ? "active" : ""} onClick={() => setPowerSideChartType("bar")}>Bar</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="chart-wrap">
+                    <ResponsiveContainer width="100%" height={310}>
+                      {powerSideChartType === "bar" ? (
+                        <BarChart data={powerSideChartData.rows} margin={{ top: 10, right: 12, left: 6, bottom: 28 }}>
+                          <XAxis
+                            dataKey="ts"
+                            ticks={powerSideXAxisTicks}
+                            minTickGap={22}
+                            interval="preserveStartEnd"
+                            allowDuplicatedCategory={false}
+                            height={42}
+                            tickMargin={10}
+                            tickFormatter={formatPowerSideXAxisTick}
+                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                            axisLine={{ stroke: powerChartAxisColor }}
+                            tickLine={{ stroke: powerChartAxisColor }}
+                          />
+                          <YAxis width={64} domain={powerSideYDomain} tick={{ fontSize: 11, fill: powerChartAxisColor }} axisLine={{ stroke: powerChartAxisColor }} tickLine={{ stroke: powerChartAxisColor }} />
+                          <Tooltip />
+                          <Bar
+                            key="pwr-side-bar-total-kwh"
+                            dataKey="total_kwh"
+                            name="Total kWh"
+                            fill={REPORT_SERIES_COLORS[0]}
+                            isAnimationActive={false}
+                          />
+                        </BarChart>
+                      ) : (
+                        <LineChart data={powerSideChartData.rows} margin={{ top: 10, right: 12, left: 6, bottom: 28 }}>
+                          <XAxis
+                            dataKey="ts"
+                            ticks={powerSideXAxisTicks}
+                            minTickGap={22}
+                            interval="preserveStartEnd"
+                            allowDuplicatedCategory={false}
+                            height={42}
+                            tickMargin={10}
+                            tickFormatter={formatPowerSideXAxisTick}
+                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                            axisLine={{ stroke: powerChartAxisColor }}
+                            tickLine={{ stroke: powerChartAxisColor }}
+                          />
+                          <YAxis width={64} domain={powerSideYDomain} tick={{ fontSize: 11, fill: powerChartAxisColor }} axisLine={{ stroke: powerChartAxisColor }} tickLine={{ stroke: powerChartAxisColor }} />
+                          <Tooltip />
+                          <Line
+                            key="pwr-side-line-total-kwh"
+                            type="monotone"
+                            dataKey="total_kwh"
+                            name="Total kWh"
+                            stroke={REPORT_SERIES_COLORS[0]}
+                            strokeWidth={2}
+                            dot={false}
+                            isAnimationActive={false}
+                          />
+                        </LineChart>
+                      )}
+                    </ResponsiveContainer>
+                  </div>
+                </article>
+              </section>
+              <section className="card">
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                  <h3 style={{ marginTop: 0 }}>Meters and Main Lines</h3>
+                  <div className="meta">
+                    <span>Total meters: {(powerConfig?.devices || []).length}</span>
+                    <span>Connected: {powerMeterRows.filter((m) => m.connected).length}</span>
+                  </div>
+                </div>
+                <div className="table db-table power-meter-table">
+                  <div className="thead">
+                    <span>Meter</span>
+                    <span>Machine Description</span>
+                    <span>Endpoint</span>
+                    <span>Power Factor</span>
+                    <span>Voltage (V)</span>
+                    <span>Current (A)</span>
+                    <span>Active Power (kW)</span>
+                    <span>Energy (kWh)</span>
+                    <span>Include in Charts</span>
+                    <span>Status</span>
+                  </div>
+                  {powerMeterRows.map((m) => (
+                    <div key={`pwr-meter-row-${m.id}`} className="trow">
+                      <span>{m.name}</span>
+                      <span>{m.machine}</span>
+                      <span>{m.endpoint}</span>
+                      <span>{formatMetricValue(m.powerFactor, 3)}</span>
+                      <span>{formatMetricValue(m.voltageV, 2)}</span>
+                      <span>{formatMetricValue(m.currentA, 3)}</span>
+                      <span>{formatMetricValue(m.powerKw, 3)}</span>
+                      <span>{formatMetricValue(m.energyKwh, 3)}</span>
+                      <span>
+                        <input
+                          type="checkbox"
+                          checked={selectedPowerChartMeters.includes(m.id)}
+                          onChange={(e) => {
+                            setSelectedPowerChartMeters((prev) => {
+                              const set = new Set((prev || []).map(String));
+                              if (e.target.checked) set.add(m.id);
+                              else set.delete(m.id);
+                              return Array.from(set);
+                            });
+                          }}
+                        />
+                      </span>
+                      <span>
+                        <span className={`status-pill ${m.connected ? "status-online" : "status-offline"}`}>
+                          {m.connected ? "Connected" : "Disconnected"}
+                        </span>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </>
+          ) : null}
+
+          {activePage === "power_configuration" ? (
+            <>
+              <section className="card">
+                <div className="db-simple-head">
+                  <div className="db-head-title-wrap">
+                    <h3 style={{ margin: 0 }}>Power Meters</h3>
+                    <label className="remember-row db-inline-toggle">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(powerConfig.enabled)}
+                        onChange={(e) => setPowerConfig((prev) => ({ ...(prev || {}), enabled: e.target.checked }))}
+                      />
+                      <span className="remember-label">Enabled</span>
+                    </label>
+                  </div>
+                  <div className="db-card-top-actions">
+                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddPowerDevice} disabled={!canEditPage("database")}>
+                      <AddIcon />
+                      <span>Add</span>
+                    </button>
+                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("database")}>Save</button>
+                    <button className="btn btn-primary btn-sm" onClick={runPowerConnectionTest} disabled={powerBusy}>Test Connection</button>
+                  </div>
+                </div>
+                <div className="form-grid three" style={{ marginTop: 10 }}>
+                  <label className="field">
+                    <span>Energy Price (EUR/kWh)</span>
+                    <input
+                      type="number"
+                      step="0.001"
+                      min="0"
+                      value={Number(powerConfig?.energy_price_eur_kwh ?? DEFAULT_ENERGY_COST_PER_KWH)}
+                      onChange={(e) =>
+                        setPowerConfig((prev) => ({
+                          ...(prev || {}),
+                          energy_price_eur_kwh: Number(e.target.value || DEFAULT_ENERGY_COST_PER_KWH),
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+                <div className="table db-table">
+                  <div className="thead"><span>Name</span><span>ID</span><span>Type</span><span>Endpoint</span><span>Wiring</span><span>Interval</span><span>Status</span><span>Actions</span></div>
+                  {(Array.isArray(powerConfig.devices) ? powerConfig.devices : []).map((d) => {
+                    const st = (powerStatus?.devices || []).find((x) => String(x.device_id || "") === String(d.id || "")) || {};
+                    const selected = String(powerConfig?.selected_device_id || "") === String(d.id || "");
+                    return (
+                      <div
+                        key={`pwr-dev-${d.id}`}
+                        className={`trow ${selected ? "selected-row" : ""}`}
+                        onClick={() => setPowerConfig((prev) => ({ ...(prev || {}), selected_device_id: String(d.id || "") }))}
+                      >
+                        <span>{d.name || d.id}</span>
+                        <span>{d.id}</span>
+                        <span>{String(d.type || "modbus_tcp").toUpperCase()}</span>
+                        <span>{`${d.ip || "-"}:${d.port || 502}`}</span>
+                        <span>{String(d.electrical_mode || d.wiring_type || "single_phase")}</span>
+                        <span>{`${Number(d.poll_interval_ms || 1000)} ms`}</span>
+                        <span>
+                          <span className={`status-pill ${st.connected ? "status-online" : "status-offline"}`}>
+                            {st.connected ? "Connected" : "Disconnected"}
+                          </span>
+                        </span>
+                        <span className="row-actions">
+                          <button
+                            className="icon-btn table-action-btn"
+                            title={d.enabled !== false ? "Stop Collection" : "Start Collection"}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setPowerDeviceRunning(d.id, d.enabled === false);
+                            }}
+                          >
+                            {d.enabled !== false ? <StopIcon /> : <StartIcon />}
+                          </button>
+                          <button className="icon-btn table-action-btn" onClick={(e) => { e.stopPropagation(); openEditPowerDevice(d); }}><EditIcon /></button>
+                          <button className="icon-btn table-action-btn danger" onClick={(e) => { e.stopPropagation(); removePowerDevice(d.id); }}><DeleteIcon /></button>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+              <section className="card">
+                <h3 style={{ marginTop: 0 }}>Selected Meter Wiring & Registers</h3>
+                {!selectedPowerDevice ? (
+                  <div className="info-note">Select a power meter to configure wiring and registers.</div>
+                ) : (
+                  <>
+                    <div className="form-grid three">
+                      <label className="field"><span>Meter Mode</span>
+                        <select value={selectedPowerDevice.electrical_mode || selectedPowerDevice.wiring_type || "single_phase"} onChange={(e) => setPowerDeviceMode(e.target.value)}>
+                          <option value="single_phase">Single Phase</option>
+                          <option value="three_phase">Three Phase</option>
+                        </select>
+                      </label>
+                      <label className="field"><span>Register Profile</span>
+                        <select value={selectedPowerDevice.register_profile || ""} onChange={(e) => setPowerDeviceRegisterProfile(e.target.value)}>
+                          {Object.keys(powerProfiles?.profiles || {}).map((k) => (
+                            <option key={k} value={k}>{k}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="remember-row">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(selectedPowerDevice.use_custom_registers)}
+                          onChange={(e) => setPowerDeviceField("use_custom_registers", e.target.checked)}
+                        />
+                        <span className="remember-label">Use custom register mapping</span>
+                      </label>
+                      <label className="remember-row"><input type="checkbox" checked={Boolean(selectedPowerDevice.voltage_connected)} onChange={(e) => setPowerDeviceField("voltage_connected", e.target.checked)} /><span className="remember-label">Voltage connected</span></label>
+                      <label className="remember-row"><input type="checkbox" checked={Boolean(selectedPowerDevice.ct_connected)} onChange={(e) => setPowerDeviceField("ct_connected", e.target.checked)} /><span className="remember-label">CT connected</span></label>
+                      <label className="field"><span>CT Primary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.ct_primary || 80)} onChange={(e) => setPowerDeviceField("ct_primary", Number(e.target.value || 80))} /></label>
+                      <label className="field"><span>CT Secondary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.ct_secondary || 5)} onChange={(e) => setPowerDeviceField("ct_secondary", Number(e.target.value || 5))} /></label>
+                      <label className="field"><span>VT Primary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.vt_primary || 230)} onChange={(e) => setPowerDeviceField("vt_primary", Number(e.target.value || 230))} /></label>
+                      <label className="field"><span>VT Secondary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.vt_secondary || 230)} onChange={(e) => setPowerDeviceField("vt_secondary", Number(e.target.value || 230))} /></label>
+                    </div>
+                    <div className="table db-table" style={{ marginTop: 12 }}>
+                      <div className="thead"><span>Tag Key</span><span>Register Address</span><span>Description</span><span>Last</span><span>Tested</span><span>Actions</span></div>
+                      {Object.entries(selectedPowerRegisterMap || {}).map(([regKey, regVal]) => (
+                        <div key={`pwr-reg-${regKey}`} className="trow">
+                          <span>{regKey}</span>
+                          <span><input type="number" value={Number(regVal || 0)} onChange={(e) => setPowerDeviceRegisterField(regKey, Number(e.target.value || 0))} /></span>
+                          <span>{POWER_REGISTER_HINTS[regKey] || regKey.replaceAll("_", " ")}</span>
+                          <span>
+                            {Number.isFinite(Number(selectedPowerLatestByTag?.values?.[regKey]))
+                              ? formatMetricValue(Number(selectedPowerLatestByTag?.values?.[regKey]), 3)
+                              : "-"}
+                          </span>
+                          <span>
+                            {(() => {
+                              const t = selectedPowerRegisterTestResult?.register_results?.[regKey];
+                              if (!t) return "-";
+                              const testedAt = selectedPowerRegisterTestResult?.tested_at_utc
+                                ? fmtTs(selectedPowerRegisterTestResult.tested_at_utc)
+                                : "";
+                              if (t.ok) {
+                                const v = Number(t.value);
+                                const label = Number.isFinite(v) ? formatMetricValue(v, 3) : "PASS";
+                                return testedAt ? `${label} @ ${testedAt}` : label;
+                              }
+                              const err = String(t.error || "FAIL");
+                              return testedAt ? `FAIL @ ${testedAt}` : err.slice(0, 28);
+                            })()}
+                          </span>
+                          <span className="row-actions">
+                            <button className="icon-btn table-action-btn danger" title="Remove register" onClick={() => removePowerRegisterRow(regKey)}>
+                              <DeleteIcon />
+                            </button>
+                          </span>
+                        </div>
+                      ))}
+                      <div className="trow">
+                        <span>
+                          <input
+                            placeholder="e.g. voltage_v"
+                            value={newPowerRegisterKey}
+                            onChange={(e) => setNewPowerRegisterKey(e.target.value)}
+                          />
+                        </span>
+                        <span>
+                          <input
+                            type="number"
+                            placeholder="Address"
+                            value={newPowerRegisterAddress}
+                            onChange={(e) => setNewPowerRegisterAddress(e.target.value)}
+                          />
+                        </span>
+                        <span>Add custom or manual register from supplier map</span>
+                        <span>-</span>
+                        <span>-</span>
+                        <span className="row-actions">
+                          <button className="icon-btn table-action-btn" title="Add register" onClick={addPowerRegisterRow}>
+                            <AddIcon />
+                          </button>
+                        </span>
+                      </div>
+                    </div>
+                  </>
+                )}
+                <div className="row" style={{ marginTop: 16, gap: 8 }}>
+                  <button className="btn btn-success" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("database")}>Save Configuration</button>
+                  <button className="btn btn-primary" onClick={runPowerConnectionTest} disabled={powerBusy}>Test Selected Meter</button>
+                </div>
+                {powerResult ? <div className="info-note" style={{ marginTop: 10 }}>{powerResult}</div> : null}
+              </section>
+            </>
+          ) : null}
+
           {activePage === "devices" ? (
             <>
               <section className="page-tools">
@@ -8535,11 +10197,11 @@ function AppShell() {
                   {gatewayConfigsView.map((g) => {
                     const dbName = dbConnections.find((db) => db.id === g.database_id)?.name || "-";
                     const deviceName = devices.find((d) => d.id === g.device_id)?.name || "-";
-                    const rt = gatewayRuntimeStatuses[g.id] || null;
-                    const running = Boolean(rt?.running);
-                    const pending = Number(rt?.db_pending_count || 0);
-                    const writes = Number(rt?.db_write_count || 0);
-                    const statusKey = rt?.db_last_error ? "offline" : running ? "online" : "warning";
+                    const runtimeStatus = gatewayRuntimeStatuses[g.id] || null;
+                    const running = Boolean(runtimeStatus?.running);
+                    const pending = Number(runtimeStatus?.db_pending_count || 0);
+                    const writes = Number(runtimeStatus?.db_write_count || 0);
+                    const statusKey = runtimeStatus?.db_last_error ? "offline" : running ? "online" : "warning";
                     const statusText = running ? "RUNNING" : "STOPPED";
                     return (
                       <div
@@ -9935,8 +11597,8 @@ function AppShell() {
                       onChange={(e) => setHistorianFilters((p) => ({ ...p, gatewayId: e.target.value }))}
                     >
                       <option value="">All gateways</option>
-                      {gatewayConfigsView.map((g) => (
-                        <option key={g.id} value={g.id}>{g.name}</option>
+                      {allGatewayOptions.map((g) => (
+                        <option key={g.id} value={g.id}>{g.power_meter ? `${g.name} (Power Meter)` : g.name}</option>
                       ))}
                     </select>
                   </label>
@@ -10069,8 +11731,8 @@ function AppShell() {
                     Gateway
                     <select value={logFilters.gatewayId} onChange={(e) => setLogFilters((p) => ({ ...p, gatewayId: e.target.value }))}>
                       <option value="">All gateways</option>
-                      {gatewayConfigsView.map((g) => (
-                        <option key={g.id} value={g.id}>{g.name}</option>
+                      {allGatewayOptions.map((g) => (
+                        <option key={g.id} value={g.id}>{g.power_meter ? `${g.name} (Power Meter)` : g.name}</option>
                       ))}
                     </select>
                   </label>
@@ -10239,8 +11901,8 @@ function AppShell() {
                       onChange={(e) => setTagFilters((p) => ({ ...p, gatewayId: e.target.value }))}
                     >
                       <option value="">All gateways</option>
-                      {gatewayConfigsView.map((g) => (
-                        <option key={g.id} value={g.id}>{g.name}</option>
+                      {allGatewayOptions.map((g) => (
+                        <option key={g.id} value={g.id}>{g.power_meter ? `${g.name} (Power Meter)` : g.name}</option>
                       ))}
                     </select>
                   </label>
@@ -10344,7 +12006,7 @@ function AppShell() {
                     <span>Gateway</span><span>Tag</span><span>Type</span><span>Condition</span><span>Status</span><span>Live Status</span><span>Actions</span>
                   </div>
                   {collectionTriggers.map((trigger) => {
-                    const gatewayName = gatewayConfigs.find((g) => g.id === trigger.gateway_id)?.name || trigger.gateway_id || "-";
+                    const gatewayName = gatewayNameById[String(trigger.gateway_id || "")] || trigger.gateway_id || "-";
                     const live = trigger.enabled === false ? { ok: null, label: "DISABLED", valueText: "-", ageText: "-" } : getTriggerLiveStatus(trigger);
                     return (
                       <div key={trigger.id} className="trow">
@@ -10398,7 +12060,7 @@ function AppShell() {
                     <span>Gateway</span><span>Tag</span><span>Lower Limit</span><span>Upper Limit</span><span>Status</span><span>Live Reading</span><span>Actions</span>
                   </div>
                   {triggerRules.map((rule) => {
-                    const gatewayName = gatewayConfigs.find((g) => g.id === rule.gateway_id)?.name || rule.gateway_id || "-";
+                    const gatewayName = gatewayNameById[String(rule.gateway_id || "")] || rule.gateway_id || "-";
                     const live = getLimitRuleLiveStatus(rule);
                     return (
                       <div key={rule.id} className="trow">
@@ -10447,107 +12109,94 @@ function AppShell() {
           ) : null}
 
           {activePage === "reporting" ? (
-            <div className="reporting-workspace">
-              <div className="reporting-left">
-                <section className="card">
-                <h4 className="card-title">Report Filters</h4>
-                <div className="reporting-filter-grid">
-                  <label>
-                    From
-                    <input type="datetime-local" value={reportFilters.from} onChange={(e) => setReportFilters((p) => ({ ...p, from: e.target.value }))} />
-                  </label>
-                  <label>
-                    To
-                    <input type="datetime-local" value={reportFilters.to} onChange={(e) => setReportFilters((p) => ({ ...p, to: e.target.value }))} />
-                  </label>
-                  <label className="reporting-max-rows">
-                    Max Rows
-                    <input
-                      type="number"
-                      min="200"
-                      step="200"
-                      value={reportFilters.max_rows}
-                      onChange={(e) => setReportFilters((p) => ({ ...p, max_rows: Number(e.target.value || 3000) }))}
-                    />
-                  </label>
-                  <label>
-                    Batch/Source
-                    <input value={reportFilters.batch} onChange={(e) => setReportFilters((p) => ({ ...p, batch: e.target.value }))} placeholder="Filter by batch/source" />
-                  </label>
-                </div>
-                <div className="reporting-select-row">
-                  <div className="report-check-group gateway-col">
-                    <div className="report-check-title">Gateways</div>
-                    <div className="report-check-list">
-                      {reportFilterOptions.gateways.map((g) => (
-                        <label key={`gw-${g.id}`} className="report-check-item gateway-check-item">
-                          <input type="checkbox" checked={isSelected(reportFilters.selected_gateway_ids, g.id)} onChange={() => toggleFilterSelection("selected_gateway_ids", g.id)} />
-                          <span>{g.name}</span>
-                        </label>
-                      ))}
+            <div className="page-fill single reporting-page-flat">
+              <div className="reporting-workspace reporting-workspace-40-60">
+                <div className="reporting-left">
+                  <section className="card">
+                    <h4 className="card-title">Report Filters</h4>
+                    <div className="reporting-filter-grid">
+                      <label>
+                        From
+                        <input type="datetime-local" value={reportFilters.from} onChange={(e) => setReportFilters((p) => ({ ...p, from: e.target.value }))} />
+                      </label>
+                      <label>
+                        To
+                        <input type="datetime-local" value={reportFilters.to} onChange={(e) => setReportFilters((p) => ({ ...p, to: e.target.value }))} />
+                      </label>
+                      <label className="reporting-max-rows">
+                        Max Rows
+                        <input type="number" min="200" step="200" value={reportFilters.max_rows} onChange={(e) => setReportFilters((p) => ({ ...p, max_rows: Number(e.target.value || 3000) }))} />
+                      </label>
+                      <label>
+                        Batch/Source
+                        <input value={reportFilters.batch} onChange={(e) => setReportFilters((p) => ({ ...p, batch: e.target.value }))} placeholder="Filter by batch/source" />
+                      </label>
                     </div>
-                  </div>
-                  <div className="report-check-group tags-col">
-                    <div className="report-check-title">Tags (columns) + Y Axis</div>
-                    <div className="report-check-list">
-                      {reportFilterOptions.tags.map((v) => (
-                        <div key={`tag-${v}`} className="report-check-item tag-check-item">
-                          <input type="checkbox" checked={isSelected(reportFilters.selected_tags, v)} onChange={() => toggleFilterSelection("selected_tags", v)} />
-                          <span>{v}</span>
-                          <select
-                            value={getReportTagAxis(v)}
-                            onChange={(e) => setReportTagAxis(v, e.target.value)}
-                            title="Chart Y axis"
-                          >
-                            <option value="left">Y-Left</option>
-                            <option value="right">Y-Right</option>
-                          </select>
-                          <input
-                            type="color"
-                            value={getReportTagColor(v, reportFilterOptions.tags.indexOf(v))}
-                            onChange={(e) => setReportTagColor(v, e.target.value)}
-                            title="Series color"
-                          />
+                    <div className="reporting-select-row reporting-select-row-flat">
+                      <div className="report-check-group gateway-col">
+                        <div className="report-check-title">Gateways</div>
+                        <div className="report-check-list">
+                          {reportFilterOptions.gateways.map((g) => (
+                            <label key={`gw-${g.id}`} className="report-check-item gateway-check-item">
+                              <input type="checkbox" checked={isSelected(reportFilters.selected_gateway_ids, g.id)} onChange={() => toggleFilterSelection("selected_gateway_ids", g.id)} />
+                              <span>{g.name}</span>
+                            </label>
+                          ))}
                         </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-                <div className="reporting-actions-wide-row">
-                  <button className="btn btn-primary" onClick={() => loadReportingData()}>Load Data</button>
-                  <button className="btn btn-danger" onClick={() => createReportDocument("pdf")}>Generate PDF</button>
-                  <button className="btn btn-success" onClick={() => createReportDocument("csv")}>Generate CSV</button>
-                </div>
-              </section>
-              <section className="card card-fill">
-                <h4 className="card-title">Generated Reports</h4>
-                <div className="table-scroll fill-scroll">
-                  <div className="table reporting-docs-table">
-                    <div className="thead">
-                      <span>Created</span><span>By</span><span>Summary</span><span>Actions</span>
-                    </div>
-                    {safeReportDocuments.map((doc) => (
-                      <div key={doc.id} className="trow">
-                        <span>{doc.created_utc}</span>
-                        <span>{doc.generated_by || "-"}</span>
-                        <span className="db-cell" title={doc.summary}>{doc.summary}</span>
-                        <span className="row-actions">
-                          <button className="icon-btn table-action-btn" onClick={() => openReportPreview(doc)} title="Preview"><PreviewIcon /></button>
-                          <button className="icon-btn table-action-btn" onClick={() => downloadReportPdf(doc)} title="Download PDF"><PdfIcon /></button>
-                          <button className="icon-btn table-action-btn" onClick={() => downloadReportCsv(doc)} title="Download CSV"><CsvIcon /></button>
-                          <button className="icon-btn table-action-btn danger" onClick={() => removeReportDocument(doc.id)} title="Delete"><DeleteIcon /></button>
-                        </span>
                       </div>
-                    ))}
-                  </div>
+                      <div className="report-check-group tags-col">
+                        <div className="report-check-title">Tags + Axis + Color</div>
+                        <div className="report-check-list">
+                          {reportFilterOptions.tags.map((v) => (
+                            <div key={`tag-${v}`} className="report-check-item tag-check-item">
+                              <input type="checkbox" checked={isSelected(reportFilters.selected_tags, v)} onChange={() => toggleFilterSelection("selected_tags", v)} />
+                              <span>{v}</span>
+                              <select value={getReportTagAxis(v)} onChange={(e) => setReportTagAxis(v, e.target.value)} title="Chart Y axis">
+                                <option value="left">Y-Left</option>
+                                <option value="right">Y-Right</option>
+                              </select>
+                              <input type="color" value={getReportTagColor(v, reportFilterOptions.tags.indexOf(v))} onChange={(e) => setReportTagColor(v, e.target.value)} title="Series color" />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="reporting-actions-wide-row">
+                      <button className="btn btn-primary" onClick={() => loadReportingData()}>Load Data</button>
+                      <button className="btn btn-danger" onClick={() => createReportDocument("pdf")}>Generate PDF</button>
+                      <button className="btn btn-success" onClick={() => createReportDocument("csv")}>Generate CSV</button>
+                    </div>
+                  </section>
+
+                  <section className="card card-fill">
+                    <h4 className="card-title">Generated Reports</h4>
+                    <div className="table-scroll fill-scroll">
+                      <div className="table reporting-docs-table">
+                        <div className="thead">
+                          <span>Created</span><span>By</span><span>Summary</span><span>Actions</span>
+                        </div>
+                        {safeReportDocuments.map((doc) => (
+                          <div key={doc.id} className="trow">
+                            <span>{doc.created_utc}</span>
+                            <span>{doc.generated_by || "-"}</span>
+                            <span className="db-cell" title={doc.summary}>{doc.summary}</span>
+                            <span className="row-actions">
+                              <button className="icon-btn table-action-btn" onClick={() => openReportPreview(doc)} title="Preview"><PreviewIcon /></button>
+                              <button className="icon-btn table-action-btn" onClick={() => downloadReportPdf(doc)} title="Download PDF"><PdfIcon /></button>
+                              <button className="icon-btn table-action-btn" onClick={() => downloadReportCsv(doc)} title="Download CSV"><CsvIcon /></button>
+                              <button className="icon-btn table-action-btn danger" onClick={() => removeReportDocument(doc.id)} title="Delete"><DeleteIcon /></button>
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </section>
                 </div>
-              </section>
-              </div>
-              <div className="reporting-right">
-                {!reportPreviewDoc ? (
-                  <section className="card card-fill reporting-main-card">
+
+                <div className="reporting-right">
+                  <section className="card reporting-main-card reporting-chart-card">
                     <div className="row trend-header-row">
-                      <h4 className="card-title">Chart and Table</h4>
+                      <h4 className="card-title">Chart</h4>
                       <button className="btn btn-primary btn-sm" type="button" onClick={toggleReportChartType}>
                         {reportChartType === "bar" ? "Line" : "Bar"}
                       </button>
@@ -10555,44 +12204,31 @@ function AppShell() {
                     <div className="muted report-summary">{reportSummaryText || "No data loaded yet. Apply filters and click Load Data."}</div>
                     <div className="muted report-summary">{reportLoadedAt ? `Loaded UTC: ${reportLoadedAt}` : "-"}</div>
                     <div className="chart-wrap reporting-chart-wrap">
-                      <ResponsiveContainer width="100%" height={180}>
-                        <ComposedChart data={reportingChartData} margin={{ top: 6, right: 14, left: 18, bottom: 6 }}>
+                      <ResponsiveContainer width="100%" height={300}>
+                        <ComposedChart data={reportingChartData} margin={{ top: 8, right: 14, left: 18, bottom: 8 }}>
                           <XAxis dataKey="ts" />
-                          <YAxis yAxisId="left" width={52} domain={["auto", "auto"]} />
-                          <YAxis yAxisId="right" orientation="right" width={52} domain={["auto", "auto"]} />
+                          <YAxis yAxisId="left" width={56} domain={["auto", "auto"]} />
+                          <YAxis yAxisId="right" orientation="right" width={56} domain={["auto", "auto"]} />
                           <Tooltip />
-                          {reportSelectedTags.slice(0, 6).map((tag, idx) => {
+                          {reportSelectedTags.slice(0, 12).map((tag, idx) => {
                             const color = getReportTagColor(tag, idx);
                             if (reportChartType === "bar") {
                               return (
-                                <Bar
-                                  key={`rt-bar-${tag}`}
-                                  isAnimationActive={false}
-                                  yAxisId={getReportTagAxis(tag)}
-                                  dataKey={tag}
-                                  fill={color}
-                                  fillOpacity={0.8}
-                                  maxBarSize={18}
-                                />
+                                <Bar key={`rt-bar-${tag}`} isAnimationActive={false} yAxisId={getReportTagAxis(tag)} dataKey={tag} fill={color} fillOpacity={0.8} maxBarSize={18} />
                               );
                             }
                             return (
-                              <Line
-                                key={`rt-line-${tag}`}
-                                isAnimationActive={false}
-                                type="linear"
-                                yAxisId={getReportTagAxis(tag)}
-                                dataKey={tag}
-                                stroke={color}
-                                strokeWidth={2}
-                                dot={false}
-                              />
+                              <Line key={`rt-line-${tag}`} isAnimationActive={false} type="linear" yAxisId={getReportTagAxis(tag)} dataKey={tag} stroke={color} strokeWidth={2} dot={false} />
                             );
                           })}
                         </ComposedChart>
                       </ResponsiveContainer>
                     </div>
-                    <div className="table-scroll fill-scroll">
+                  </section>
+
+                  <section className="card card-fill reporting-series-card">
+                    <h4 className="card-title">Data Series</h4>
+                    <div className="table-scroll fill-scroll reporting-table-side">
                       <div className="table historian-table reporting-pivot-table">
                         <div className="thead" style={{ gridTemplateColumns: `1.4fr repeat(${Math.max(1, reportSelectedTags.length)}, minmax(120px, 1fr))` }}>
                           <span>Timestamp (UTC)</span>
@@ -10607,30 +12243,18 @@ function AppShell() {
                       </div>
                     </div>
                   </section>
-                ) : (
-                  <section className="card card-fill reporting-preview-card">
-                    <div className="row trend-header-row">
-                      <h4 className="card-title">Report Preview</h4>
-                      <button className="btn btn-primary btn-sm" onClick={() => setReportPreviewDoc(null)}>Back to Chart/Table</button>
-                    </div>
-                    <iframe
-                      title="report-preview"
-                      className="report-preview-frame"
-                      srcDoc={reportPreviewDoc.html_content || ""}
-                    />
-                  </section>
-                )}
+                </div>
               </div>
             </div>
           ) : null}
           </div>
           <footer ref={footerRef} className={`gateway-footer ${footerCollapsed ? "collapsed" : ""}`}>
             <div className="gateway-footer-title">Enabled Gateways</div>
-            <div className="gateway-footer-table">
-              <div className="gateway-footer-head">
-                <span>Gateway Name</span><span>IP Address</span><span>Status</span><span>Interval</span><span>Database Writing Status</span><span>Actions</span>
-              </div>
-              {gatewayConfigsView.map((g) => {
+              <div className="gateway-footer-table">
+                <div className="gateway-footer-head">
+                  <span>Gateway Name</span><span>IP Address</span><span>Status</span><span>Interval</span><span>Database Writing Status</span><span>Actions</span>
+                </div>
+                {gatewayConfigsView.map((g) => {
                 const health = getGatewayHealth(g);
                 const running = isGatewayRunning(g);
                 return (
@@ -10666,6 +12290,46 @@ function AppShell() {
                   </div>
                 );
               })}
+              {(powerConfig?.devices || []).map((d) => {
+                const did = String(d?.id || "");
+                const st = powerDeviceStatuses[did] || {};
+                const running = d?.enabled !== false;
+                const connected = Boolean(st?.connected);
+                const powerText = formatMetricValue(Number(st?.active_power_w || st?.active_power_total_w || 0) / 1000.0, 3);
+                const pending = Number(st?.pending_count || st?.outbox_pending || 0);
+                return (
+                  <div key={`footer-power-${did}`} className="gateway-footer-row">
+                    <span className="gateway-footer-cell" title={String(d?.name || did)}>{String(d?.name || did)}</span>
+                    <span className="gateway-footer-cell" title={`${String(d?.ip || "-")}:${Number(d?.port || 502)}`}>{`${String(d?.ip || "-")}:${Number(d?.port || 502)}`}</span>
+                    <span className="gateway-footer-cell">
+                      <span className={`status-pill ${connected ? "status-online" : "status-warning"}`}>{connected ? "Connected" : "Device Fails"}</span>
+                      <span className={`status-pill ${running ? "status-online" : "status-offline"}`} style={{ marginLeft: 6 }}>
+                        {running ? "RUNNING" : "STOPPED"}
+                      </span>
+                    </span>
+                    <span className="gateway-footer-cell">{Number(d?.poll_interval_ms || 1000)} ms</span>
+                    <span className="gateway-footer-cell" title={`Power ${powerText} kW | Pending ${pending}`}>{`Power ${powerText} kW | Pending ${pending}`}</span>
+                    <span className="row-actions gateway-footer-actions">
+                      <button
+                        className={`icon-btn table-action-btn footer-action-btn ${running ? "" : "icon-btn-start"}`}
+                        onClick={() => setPowerDeviceRunning(did, true)}
+                        disabled={!canControlGateways || running}
+                        title={running ? "Gateway already running" : "Start gateway"}
+                      >
+                        <StartIcon />
+                      </button>
+                      <button
+                        className={`icon-btn table-action-btn footer-action-btn ${running ? "icon-btn-stop" : ""}`}
+                        onClick={() => setPowerDeviceRunning(did, false)}
+                        disabled={!canControlGateways || !running}
+                        title={!running ? "Gateway is stopped" : "Stop gateway"}
+                      >
+                        <StopIcon />
+                      </button>
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           </footer>
           <button
@@ -10679,6 +12343,23 @@ function AppShell() {
           </button>
         </main>
       </div>
+      {reportPreviewDoc ? (
+        <div className="modal-backdrop">
+          <div className="modal-card reporting-preview-modal">
+            <div className="row trend-header-row">
+              <h3>Report Preview</h3>
+              <button className="btn btn-primary btn-sm" onClick={() => setReportPreviewDoc(null)} type="button">
+                Close
+              </button>
+            </div>
+            <iframe
+              title="report-preview"
+              className="report-preview-frame"
+              srcDoc={reportPreviewDoc.html_content || ""}
+            />
+          </div>
+        </div>
+      ) : null}
       {showTagMonitorModal && tagMonitorSelection ? (
         <div className="modal-backdrop">
           <div className="modal-card tag-monitor-modal">
@@ -11593,6 +13274,60 @@ function AppShell() {
           </div>
         </div>
       ) : null}
+      {showPowerDeviceModal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card trigger-modal-card">
+            <h3>{editingPowerDeviceId ? "Edit Power Meter" : "Add Power Meter"}</h3>
+            <div className="trigger-form-grid">
+              <label><span>Device ID</span><input value={powerDeviceForm.id} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, id: e.target.value })} /></label>
+              <label><span>Name</span><input value={powerDeviceForm.name} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, name: e.target.value })} /></label>
+              <label><span>Description</span><input value={powerDeviceForm.description} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, description: e.target.value })} /></label>
+              <label><span>Type</span><select value={powerDeviceForm.type || "modbus_tcp"} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, type: e.target.value })}><option value="modbus_tcp">Modbus TCP</option></select></label>
+              <label><span>IP Address</span><input value={powerDeviceForm.ip} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ip: e.target.value })} /></label>
+              <label><span>Port</span><input type="number" value={powerDeviceForm.port} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, port: Number(e.target.value || 502) })} /></label>
+              <label><span>Unit ID</span><input type="number" value={powerDeviceForm.unit_id} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, unit_id: Number(e.target.value || 1) })} /></label>
+              <label><span>Polling Interval (ms)</span><input type="number" value={powerDeviceForm.poll_interval_ms} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, poll_interval_ms: Number(e.target.value || 1000) })} /></label>
+              <label><span>Meter Mode</span><select value={powerDeviceForm.electrical_mode || "single_phase"} onChange={(e) => {
+                const nextMode = e.target.value;
+                const nextProfile = powerProfiles?.mode_defaults?.[nextMode] || POWER_PROFILE_DEFAULTS[nextMode] || POWER_PROFILE_DEFAULTS.single_phase;
+                const nextRegisters = powerProfiles?.profiles?.[nextProfile] || powerDeviceForm.registers || {};
+                setPowerDeviceForm({
+                  ...powerDeviceForm,
+                  electrical_mode: nextMode,
+                  wiring_type: nextMode,
+                  register_profile: nextProfile,
+                  registers: powerDeviceForm.use_custom_registers ? powerDeviceForm.registers : nextRegisters,
+                });
+              }}><option value="single_phase">Single Phase</option><option value="three_phase">Three Phase</option></select></label>
+              <label><span>Register Profile</span><select value={powerDeviceForm.register_profile || ""} onChange={(e) => {
+                const nextProfile = e.target.value;
+                const nextRegisters = powerProfiles?.profiles?.[nextProfile] || powerDeviceForm.registers || {};
+                setPowerDeviceForm({
+                  ...powerDeviceForm,
+                  register_profile: nextProfile,
+                  registers: powerDeviceForm.use_custom_registers ? powerDeviceForm.registers : nextRegisters,
+                });
+              }}>
+                {Object.keys(powerProfiles?.profiles || {}).map((k) => <option key={k} value={k}>{k}</option>)}
+              </select></label>
+              <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.use_custom_registers)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, use_custom_registers: e.target.checked })} /><span className="remember-label">Use custom register mapping</span></label>
+              <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.voltage_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, voltage_connected: e.target.checked })} /><span className="remember-label">Voltage connected</span></label>
+              <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.ct_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_connected: e.target.checked })} /><span className="remember-label">CT connected</span></label>
+                    <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.enabled)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, enabled: e.target.checked })} /><span className="remember-label">Enabled</span></label>
+                    <label><span>Machine Description</span><input value={powerDeviceForm.machine_description || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, machine_description: e.target.value })} /></label>
+                    <label><span>Site</span><input value={powerDeviceForm.site || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, site: e.target.value })} /></label>
+                    <label><span>Area</span><input value={powerDeviceForm.area || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, area: e.target.value })} /></label>
+                    <label><span>Equipment</span><input value={powerDeviceForm.equipment || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, equipment: e.target.value })} /></label>
+                    <label><span>Min Active Power (kW)</span><input type="number" step="0.01" value={powerDeviceForm.min_active_power_kw ?? ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, min_active_power_kw: e.target.value })} /></label>
+                    <label><span>Max Active Power (kW)</span><input type="number" step="0.01" value={powerDeviceForm.max_active_power_kw ?? ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, max_active_power_kw: e.target.value })} /></label>
+                  </div>
+            <div className="row modal-actions">
+              <button className="btn btn-primary" onClick={savePowerDevice}>OK</button>
+              <button className="btn btn-danger" onClick={() => setShowPowerDeviceModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {showDashboardWidgetModal ? (
         <div className="modal-backdrop">
           <div className="modal-card">
@@ -11623,7 +13358,7 @@ function AppShell() {
                   }}
                 >
                   <option value="">Select gateway</option>
-                  {gatewayConfigsView.map((g) => (
+                  {dashboardGatewayOptions.map((g) => (
                     <option key={g.id} value={g.id}>{g.name}</option>
                   ))}
                 </select>
@@ -11697,8 +13432,8 @@ function AppShell() {
                   disabled={!canEditPage("triggers_and_limits")}
                 >
                   <option value="">Select gateway</option>
-                  {gatewayConfigsView.map((g) => (
-                    <option key={g.id} value={g.id}>{g.name}</option>
+                  {allGatewayOptions.map((g) => (
+                    <option key={g.id} value={g.id}>{g.power_meter ? `${g.name} (Power Meter)` : g.name}</option>
                   ))}
                 </select>
               </label>
@@ -11790,8 +13525,8 @@ function AppShell() {
                   disabled={!canEditPage("triggers_and_limits")}
                 >
                   <option value="">Select gateway</option>
-                  {gatewayConfigsView.map((g) => (
-                    <option key={g.id} value={g.id}>{g.name}</option>
+                  {allGatewayOptions.map((g) => (
+                    <option key={g.id} value={g.id}>{g.power_meter ? `${g.name} (Power Meter)` : g.name}</option>
                   ))}
                 </select>
               </label>
