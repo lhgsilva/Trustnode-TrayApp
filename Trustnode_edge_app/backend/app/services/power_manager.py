@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import threading
 import time
@@ -326,7 +327,11 @@ class PowerManager:
         register_scales = dict(device.get("register_scales") or {})
         client = self._get_client(device)
         now = self._utc_now()
-        if not client.connect():
+        try:
+            is_connected = bool(getattr(client, "connected", False))
+        except Exception:
+            is_connected = False
+        if not is_connected and not client.connect():
             raise RuntimeError("Unable to connect")
         raw_values: dict[str, float] = {}
         addr_to_keys: dict[int, list[str]] = {}
@@ -340,12 +345,14 @@ class PowerManager:
             addr_to_keys.setdefault(addr_int, []).append(str(key))
         sorted_addrs = sorted(addr_to_keys.keys())
         blocks: list[tuple[int, int]] = []
+        max_gap = max(1, int(float(os.environ.get("TRUSTNODE_POWER_BLOCK_MERGE_GAP", "16") or "16")))
+        max_span = max(8, int(float(os.environ.get("TRUSTNODE_POWER_BLOCK_MAX_SPAN", "120") or "120")))
         if sorted_addrs:
             start = sorted_addrs[0]
             end = start + 1
             for addr in sorted_addrs[1:]:
                 # Merge near/contiguous ranges to reduce Modbus round-trips.
-                if addr <= end + 2 and (addr - start) <= 120:
+                if addr <= end + max_gap and (addr - start) <= max_span:
                     end = max(end, addr + 1)
                     continue
                 blocks.append((start, end))
