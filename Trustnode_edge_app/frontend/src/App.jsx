@@ -127,7 +127,7 @@ const NAV_SECTIONS = [
   {
     id: "administration",
     title: "Settings",
-    items: ["Interface", "Users and Access Control", "Email and Notifications", "Scheduled Reports"]
+    items: ["Edge", "Interface", "Users and Access Control", "Email and Notifications", "Scheduled Reports"]
   }
 ];
 
@@ -157,6 +157,7 @@ function pageTitle(page) {
   if (page === "scheduled_reports") return "Scheduled Reports";
   if (page === "power_overview") return "Power Overview";
   if (page === "power_configuration") return "Power Configuration";
+  if (page === "edge") return "Edge";
   if (page === "interface") return "Interface";
   return page.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
 }
@@ -229,7 +230,7 @@ const INTERFACE_THEME_TOKEN_FIELDS = [
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
-const CLOUD_LIVE_POLL_MS = 1500;
+const CLOUD_LIVE_POLL_MS = 1000;
 const CLOUD_AUX_POLL_MS = 10000;
 const CLOUD_LIVE_FETCH_LIMIT = 180;
 const CLOUD_HIST_FETCH_LIMIT = 600;
@@ -1593,6 +1594,13 @@ function AppShell() {
   const [tenantWebClientUrl, setTenantWebClientUrl] = useState("https://trustnode.lsapps.app");
   const [tenantCompanyName, setTenantCompanyName] = useState("");
   const [tenantLoginRealm, setTenantLoginRealm] = useState("");
+  const [edgeProfile, setEdgeProfile] = useState({
+    edge_id: "edge-01",
+    edge_name: "Primary Edge",
+    description: "",
+    location: "",
+    machine_group: "",
+  });
   const [cloudSupabaseMode, setCloudSupabaseMode] = useState("auto");
   const [cloudSupabaseHasIpv4AddOn, setCloudSupabaseHasIpv4AddOn] = useState(true);
   const [cloudSupabaseApplyResult, setCloudSupabaseApplyResult] = useState("");
@@ -1811,6 +1819,8 @@ function AppShell() {
     tag_axes: {},
     tag_colors: {},
     report_chart_type: "line",
+    aggregation_interval: "raw",
+    aggregation_method: "avg",
     batch: "",
     max_rows: 3000
   });
@@ -1828,7 +1838,16 @@ function AppShell() {
     day_of_month: "1",
     format: "csv",
     recipients: "",
-    filters: { from: "", to: "", selected_gateway_ids: [], selected_tags: [], batch: "", max_rows: 3000 },
+    filters: {
+      from: "",
+      to: "",
+      selected_gateway_ids: [],
+      selected_tags: [],
+      batch: "",
+      max_rows: 3000,
+      aggregation_interval: "raw",
+      aggregation_method: "avg",
+    },
     last_run_utc: "",
     next_run_utc: ""
   });
@@ -1978,6 +1997,7 @@ function AppShell() {
       tenant_web_client_url: tenantWebClientUrl,
       tenant_company_name: tenantCompanyName,
       tenant_login_realm: tenantLoginRealm,
+      edge_profile: edgeProfile,
       interface_theme_prefs: interfaceThemePrefs,
       chart_palette: chartPalette
     },
@@ -2062,6 +2082,16 @@ function AppShell() {
     if (typeof appSettings.tenant_web_client_url === "string") setTenantWebClientUrl(appSettings.tenant_web_client_url);
     if (typeof appSettings.tenant_company_name === "string") setTenantCompanyName(appSettings.tenant_company_name);
     if (typeof appSettings.tenant_login_realm === "string") setTenantLoginRealm(appSettings.tenant_login_realm);
+    if (appSettings.edge_profile && typeof appSettings.edge_profile === "object" && !Array.isArray(appSettings.edge_profile)) {
+      setEdgeProfile((prev) => ({
+        ...prev,
+        edge_id: String(appSettings.edge_profile.edge_id || prev.edge_id || "edge-01"),
+        edge_name: String(appSettings.edge_profile.edge_name || prev.edge_name || "Primary Edge"),
+        description: String(appSettings.edge_profile.description || ""),
+        location: String(appSettings.edge_profile.location || ""),
+        machine_group: String(appSettings.edge_profile.machine_group || ""),
+      }));
+    }
     if (appSettings.interface_theme_prefs && typeof appSettings.interface_theme_prefs === "object") {
       const merged = {
         light: { ...DEFAULT_INTERFACE_THEME_PREFS.light },
@@ -3007,6 +3037,7 @@ function AppShell() {
     tenantWebClientUrl,
     tenantCompanyName,
     tenantLoginRealm,
+    edgeProfile,
     displayTimeZone,
     displayTimestampFormat,
     interfaceThemePrefs,
@@ -3754,7 +3785,7 @@ function AppShell() {
                     const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
                     return Number.isFinite(ageMs) ? ageMs <= 20000 : true;
                   })();
-                  const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
+                  const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 2);
                   const sampleRows = Number(rowCountByGateway[gid] || 0);
                   const prevWrites = Number(cur?.db_write_count || 0);
                   next[gid] = {
@@ -3790,7 +3821,7 @@ function AppShell() {
                       return Number.isFinite(ageMs) ? ageMs <= 20000 : true;
                     })()
                   : false;
-                const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 5);
+                const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 2);
                 return {
                   ...d,
                   connection_ok: online,
@@ -3808,7 +3839,7 @@ function AppShell() {
                 if (!ts) return c;
                 const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
                 const rawOnline = Number.isFinite(ageMs) ? ageMs <= 30000 : true;
-                const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 5);
+                const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 2);
                 return {
                   ...c,
                   connection_ok: online,
@@ -4112,7 +4143,7 @@ function AppShell() {
                   const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
                   return Number.isFinite(ageMs) ? ageMs <= 20000 : true;
                 })();
-                const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
+                const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 2);
                 const sampleRows = Number(rowCountByGateway[gid] || 0);
                 const prevWrites = Number(cur?.db_write_count || 0);
                 next[gid] = {
@@ -4130,7 +4161,7 @@ function AppShell() {
                   const ageMs = Math.max(0, nowMs - parseTimestampMs(cur.last_check_utc));
                   return Number.isFinite(ageMs) ? ageMs <= 20000 : false;
                 })();
-                const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 5);
+                const online = getStableCloudOnline("gateway", gid, rawOnline, 1, 2);
                 next[gid] = { ...cur, gateway_id: gid, running: online };
               }
             }
@@ -4155,7 +4186,7 @@ function AppShell() {
                       return Number.isFinite(ageMs) ? ageMs <= 20000 : true;
                     })()
                   : false;
-                const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 5);
+                const online = getStableCloudOnline("device", String(d.id || d.name || d.plc_ip || ""), rawOnline, 1, 2);
                 return {
                   ...d,
                   connection_ok: online,
@@ -4173,7 +4204,7 @@ function AppShell() {
               if (!ts) return c;
               const ageMs = Math.max(0, nowMs - parseTimestampMs(ts));
               const rawOnline = Number.isFinite(ageMs) ? ageMs <= 30000 : true;
-              const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 5);
+              const online = getStableCloudOnline("database", String(c.id || c.name || ""), rawOnline, 1, 2);
               return {
                 ...c,
                 connection_ok: online,
@@ -5238,6 +5269,8 @@ function AppShell() {
               ? "database"
             : page === "website_and_env"
               ? "users_and_access_control"
+              : page === "edge"
+                ? "users_and_access_control"
               : page === "email_and_notifications" || page === "scheduled_reports"
                 ? "users_and_access_control"
           : page;
@@ -6354,29 +6387,8 @@ function AppShell() {
       ...(powerGatewayDescriptors || []).map((g) => String(g.id || "")),
     ]);
     const filtered = (dashboardWidgets || []).filter((w) => allowedGatewayIds.has(String(w.gateway_id || "")));
-    if (filtered.length) return filtered;
-    const fallback = [];
-    const seen = new Set();
-    for (const row of tagRows) {
-      const gid = String(row.gateway_id || "");
-      const tag = String(row.tag_name || "");
-      if (!gid || !tag || !allowedGatewayIds.has(gid)) continue;
-      const key = `${gid}::${tag}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      fallback.push({
-        id: `auto-${key}`,
-        color: getDashboardTagColor(gid, tag, "#16a34a"),
-        title: tag,
-        tag_name: tag,
-        chart_type: "line",
-        gateway_id: gid,
-        readings_count: 120,
-      });
-      if (fallback.length >= 8) break;
-    }
-    return fallback;
-  }, [dashboardWidgets, gatewayConfigsView, powerGatewayDescriptors, tagRows, isCloudEdgeFilterActive, getDashboardTagColor]);
+    return filtered;
+  }, [dashboardWidgets, gatewayConfigsView, powerGatewayDescriptors, isCloudEdgeFilterActive]);
 
   const dashboardItems = useMemo(() => {
     const items = dashboardWidgetsView.map((w) => {
@@ -9289,6 +9301,69 @@ function AppShell() {
     }));
   };
 
+  const inferTagUnit = (tag) => {
+    const t = String(tag || "").toLowerCase();
+    if (t.includes("kwh") || t.includes("energy")) return "kWh";
+    if (t.includes("kw") || t.includes("power")) return "kW";
+    if (t.includes("voltage") || t.endsWith("_v")) return "V";
+    if (t.includes("current") || t.endsWith("_a")) return "A";
+    if (t.includes("frequency") || t.endsWith("_hz")) return "Hz";
+    if (t.includes("factor") || t.includes("pf")) return "PF";
+    return "Value";
+  };
+
+  const aggregateReportingRows = (rows, filters) => {
+    const interval = String(filters?.aggregation_interval || "raw");
+    const method = String(filters?.aggregation_method || "avg");
+    if (interval === "raw") return rows;
+    const grouped = new Map();
+    for (const r of rows || []) {
+      const tsMs = parseTimestampMs(r?.ts);
+      if (!Number.isFinite(tsMs)) continue;
+      const bucket = bucketKeyForInterval(tsMs, interval, displayTimeZone);
+      const gw = String(r?.gateway_id || r?.gateway_name || "");
+      const tag = String(r?.tag || r?.tag_name || "");
+      const key = `${bucket}||${gw}||${tag}`;
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          ts: new Date(tsMs).toISOString(),
+          gateway_id: gw,
+          gateway_name: String(r?.gateway_name || gw),
+          tag,
+          values: [],
+          lastRow: r,
+        });
+      }
+      const g = grouped.get(key);
+      const v = Number(r?.value);
+      if (Number.isFinite(v)) g.values.push(v);
+      if (parseTimestampMs(g.ts) <= tsMs) {
+        g.ts = new Date(tsMs).toISOString();
+        g.lastRow = r;
+      }
+    }
+    const out = [];
+    for (const g of grouped.values()) {
+      const vals = g.values;
+      if (!vals.length) continue;
+      let value = vals[vals.length - 1];
+      if (method === "sum") value = vals.reduce((a, n) => a + n, 0);
+      else if (method === "min") value = Math.min(...vals);
+      else if (method === "max") value = Math.max(...vals);
+      else if (method === "avg") value = vals.reduce((a, n) => a + n, 0) / vals.length;
+      out.push({
+        ...(g.lastRow || {}),
+        ts: g.ts,
+        gateway_id: g.gateway_id,
+        gateway_name: g.gateway_name,
+        tag: g.tag,
+        value,
+      });
+    }
+    out.sort((a, b) => parseTimestampMs(a.ts) - parseTimestampMs(b.ts));
+    return out;
+  };
+
   const getReportingRowsForFilters = (filters) => {
     const fromMs = filters?.from ? new Date(filters.from).getTime() : null;
     const toMs = filters?.to ? new Date(filters.to).getTime() : null;
@@ -9296,7 +9371,7 @@ function AppShell() {
     const tagSet = new Set((filters?.selected_tags || []).map((x) => String(x)));
     const gwSet = new Set((filters?.selected_gateway_ids || []).map((x) => String(x)));
     const maxRows = Math.max(200, Number(filters?.max_rows || 3000));
-    return (dataLogView || [])
+    const filtered = (dataLogView || [])
       .filter((r) => {
         const tsMs = new Date(r.ts).getTime();
         if (fromMs && Number.isFinite(fromMs) && tsMs < fromMs) return false;
@@ -9307,6 +9382,7 @@ function AppShell() {
         return true;
       })
       .slice(0, maxRows);
+    return aggregateReportingRows(filtered, filters);
   };
 
   const reportSelectedTags = useMemo(() => {
@@ -9349,6 +9425,14 @@ function AppShell() {
       return entry;
     });
   }, [reportPivotRows, reportSelectedTags, fmtTsShort]);
+  const reportingAxisUnits = useMemo(() => {
+    const leftTag = reportSelectedTags.find((tag) => getReportTagAxis(tag) === "left") || reportSelectedTags[0] || "";
+    const rightTag = reportSelectedTags.find((tag) => getReportTagAxis(tag) === "right") || "";
+    return {
+      left: inferTagUnit(leftTag),
+      right: rightTag ? inferTagUnit(rightTag) : "",
+    };
+  }, [reportSelectedTags, reportFilters.tag_axes]);
 
   const buildReportCsv = (pivotRows, tags) => {
     const header = ["timestamp_local", ...tags];
@@ -9440,7 +9524,9 @@ function AppShell() {
       .map((id) => gatewayConfigs.find((x) => String(x.id) === String(id))?.name || id)
       .join("; ") || "ALL";
     const t = (tags || []).join("; ") || "AUTO";
-    return `GW: ${g} | TAGS: ${t} | ROWS: ${rows.length}`;
+    const interval = String(filters?.aggregation_interval || "raw").toUpperCase();
+    const agg = String(filters?.aggregation_method || "avg").toUpperCase();
+    return `GW: ${g} | TAGS: ${t} | AGG: ${agg}/${interval} | ROWS: ${rows.length}`;
   };
 
   const loadReportingData = (customFilters = null) => {
@@ -9892,7 +9978,7 @@ function AppShell() {
                 <option value={CLOUD_EDGE_ALL_KEY}>All edges</option>
                 {cloudSourceRows.map((s) => (
                   <option key={`edge-opt-${s.key}`} value={s.key}>
-                    {`${s.source} | ${s.site} | ${s.area} | ${s.equipment}`}
+                    {`${s.source} | ${s.site} | ${s.area} | ${s.equipment} | GW:${s.gatewayCount || 0}`}
                   </option>
                 ))}
               </select>
@@ -11767,6 +11853,67 @@ function AppShell() {
             </>
           ) : null}
 
+          {activePage === "edge" ? (
+            <>
+              <section className="card">
+                <div className="row interface-header-row">
+                  <h3 className="card-title" style={{ margin: 0 }}>Edge Identity</h3>
+                </div>
+                <div className="form-grid">
+                  <label>
+                    Edge ID
+                    <input
+                      value={edgeProfile.edge_id}
+                      onChange={(e) => setEdgeProfile((p) => ({ ...p, edge_id: String(e.target.value || "").trim() }))}
+                      placeholder="edge-01"
+                      disabled={!canEditPage("edge")}
+                    />
+                  </label>
+                  <label>
+                    Edge Name
+                    <input
+                      value={edgeProfile.edge_name}
+                      onChange={(e) => setEdgeProfile((p) => ({ ...p, edge_name: e.target.value }))}
+                      placeholder="Primary Edge"
+                      disabled={!canEditPage("edge")}
+                    />
+                  </label>
+                  <label>
+                    Location
+                    <input
+                      value={edgeProfile.location}
+                      onChange={(e) => setEdgeProfile((p) => ({ ...p, location: e.target.value }))}
+                      placeholder="Plant A / Line 1"
+                      disabled={!canEditPage("edge")}
+                    />
+                  </label>
+                  <label>
+                    Machine Group
+                    <input
+                      value={edgeProfile.machine_group}
+                      onChange={(e) => setEdgeProfile((p) => ({ ...p, machine_group: e.target.value }))}
+                      placeholder="Packaging"
+                      disabled={!canEditPage("edge")}
+                    />
+                  </label>
+                </div>
+                <label>
+                  Description
+                  <textarea
+                    rows={3}
+                    value={edgeProfile.description}
+                    onChange={(e) => setEdgeProfile((p) => ({ ...p, description: e.target.value }))}
+                    placeholder="Describe this edge and what gateways it owns."
+                    disabled={!canEditPage("edge")}
+                  />
+                </label>
+                <div className="lock-note">
+                  This identity is persisted with the app configuration and used by cloud UI selection/filtering context.
+                </div>
+              </section>
+            </>
+          ) : null}
+
           {activePage === "interface" ? (
             <>
               <section className="card">
@@ -12949,6 +13096,26 @@ function AppShell() {
                         Batch/Source
                         <input value={reportFilters.batch} onChange={(e) => setReportFilters((p) => ({ ...p, batch: e.target.value }))} placeholder="Filter by batch/source" />
                       </label>
+                      <label>
+                        Interval
+                        <select value={reportFilters.aggregation_interval || "raw"} onChange={(e) => setReportFilters((p) => ({ ...p, aggregation_interval: e.target.value }))}>
+                          <option value="raw">Raw</option>
+                          <option value="second">Second</option>
+                          <option value="minute">Minute</option>
+                          <option value="hour">Hour</option>
+                          <option value="day">Day</option>
+                        </select>
+                      </label>
+                      <label>
+                        Aggregation
+                        <select value={reportFilters.aggregation_method || "avg"} onChange={(e) => setReportFilters((p) => ({ ...p, aggregation_method: e.target.value }))}>
+                          <option value="avg">AVG</option>
+                          <option value="sum">SUM</option>
+                          <option value="min">MIN</option>
+                          <option value="max">MAX</option>
+                          <option value="last">LAST</option>
+                        </select>
+                      </label>
                     </div>
                     <div className="reporting-select-row reporting-select-row-flat">
                       <div className="report-check-group gateway-col">
@@ -13023,10 +13190,10 @@ function AppShell() {
                     <div className="muted report-summary">{reportLoadedAt ? `Loaded: ${fmtTs(reportLoadedAt)} (${displayTimeZone})` : "-"}</div>
                     <div className="chart-wrap reporting-chart-wrap">
                       <ResponsiveContainer width="100%" height={300}>
-                        <ComposedChart data={reportingChartData} margin={{ top: 8, right: 14, left: 18, bottom: 8 }}>
+                        <ComposedChart data={reportingChartData} margin={{ top: 16, right: 26, left: 22, bottom: 26 }}>
                           <XAxis dataKey="ts" />
-                          <YAxis yAxisId="left" width={56} domain={["auto", "auto"]} />
-                          <YAxis yAxisId="right" orientation="right" width={56} domain={["auto", "auto"]} />
+                          <YAxis yAxisId="left" width={64} domain={["auto", "auto"]} label={{ value: reportingAxisUnits.left || "Value", angle: -90, position: "insideLeft", offset: -4 }} />
+                          <YAxis yAxisId="right" orientation="right" width={64} domain={["auto", "auto"]} label={{ value: reportingAxisUnits.right || "", angle: 90, position: "insideRight", offset: -4 }} />
                           <Tooltip />
                           {reportSelectedTags.slice(0, 12).map((tag, idx) => {
                             const color = getReportTagColor(tag, idx);
