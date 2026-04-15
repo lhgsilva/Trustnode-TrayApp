@@ -1,56 +1,36 @@
 ﻿<?php
 session_start();
-
 const TRUSTNODE_API_BASE_DEFAULT = 'https://trustnode.lsapps.app';
-
 if (isset($_GET['proxy'])) {
-  $base = trim((string)($_SESSION['trustnode_api_base'] ?? TRUSTNODE_API_BASE_DEFAULT));
-  if (isset($_GET['base'])) {
-    $candidate = trim((string)$_GET['base']);
-    if ($candidate !== '') {
-      $base = rtrim($candidate, '/');
-      $_SESSION['trustnode_api_base'] = $base;
-    }
-  }
-
+  $base = trim((string)($_GET['base'] ?? ($_SESSION['trustnode_api_base'] ?? TRUSTNODE_API_BASE_DEFAULT)));
+  if ($base === '') $base = TRUSTNODE_API_BASE_DEFAULT;
+  $_SESSION['trustnode_api_base'] = $base;
   $path = ltrim((string)$_GET['proxy'], '/');
   $url = rtrim($base, '/') . '/' . $path;
   $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
   $body = file_get_contents('php://input');
-
   $headers = ['Accept: application/json', 'Cache-Control: no-store'];
   if ($method !== 'GET') $headers[] = 'Content-Type: application/json';
-
   $token = $_SESSION['trustnode_token'] ?? '';
   if ($token !== '') $headers[] = 'Authorization: Bearer ' . $token;
-
   $ch = curl_init($url);
   curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
   curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
   curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
-  curl_setopt($ch, CURLOPT_TIMEOUT, 25);
+  curl_setopt($ch, CURLOPT_TIMEOUT, 30);
   curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
   if ($method !== 'GET' && $body !== false && $body !== '') curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
-
   $response = curl_exec($ch);
   $http = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
   $err = curl_error($ch);
   curl_close($ch);
-
   header('Content-Type: application/json; charset=utf-8');
   header('Cache-Control: no-store, no-cache, must-revalidate');
-
-  if ($err) {
-    http_response_code(502);
-    echo json_encode(['ok' => false, 'error' => 'proxy_error', 'detail' => $err]);
-    exit;
-  }
-
+  if ($err) { http_response_code(502); echo json_encode(['ok'=>false,'error'=>'proxy_error','detail'=>$err]); exit; }
   if ($path === 'api/auth/login' && $http >= 200 && $http < 300) {
     $json = json_decode((string)$response, true);
     if (is_array($json) && !empty($json['token'])) $_SESSION['trustnode_token'] = (string)$json['token'];
   }
-
   http_response_code($http > 0 ? $http : 500);
   echo (string)$response;
   exit;
@@ -61,125 +41,169 @@ if (isset($_GET['proxy'])) {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>TrustNode Hosted Client (Single File PHP)</title>
+  <title>Trustnode Client Single Page (PHP Proxy)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    :root { --bg:#1e1e1e; --header:#000; --header-text:#d4d4d4; --card:#252526; --stroke:#3c3c3c; --text:#d4d4d4; --muted:#9da0a6; --brand:#007acc; --ok:#2ea043; --danger:#d1242f; --sidebar:#252526; --sidebar-text:#d4d4d4; --nav-active:#094771; --row:#2a2d2e; }
-    [data-theme="light"] { --bg:#f3f3f3; --header:#2d2d30; --header-text:#d4d4d4; --card:#eceff3; --stroke:#c5ccd6; --text:#1f2328; --muted:#5f6b7a; --brand:#007acc; --ok:#2ea043; --danger:#d1242f; --sidebar:#252526; --sidebar-text:#d4d4d4; --nav-active:#094771; --row:#e5eaf0; }
-    *{box-sizing:border-box} html,body{height:100%} body{margin:0;background:var(--bg);color:var(--text);font-family:"Segoe UI","Trebuchet MS",sans-serif}
-    .shell{display:grid;grid-template-rows:58px 1fr;height:100%}.header{background:var(--header);color:var(--header-text);border-bottom:1px solid #1f1f1f;display:flex;align-items:center;justify-content:space-between;padding:8px 12px;gap:10px}
-    .brand{font-weight:700}.header .row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-    .status{border:1px solid var(--stroke);border-radius:999px;padding:4px 10px;font-size:12px}.status.ok{color:#b6f3bf;background:rgba(46,160,67,.2)}.status.bad{color:#ffd7d9;background:rgba(209,36,47,.2)}
-    .main{display:grid;grid-template-columns:230px 1fr;min-height:0}.sidebar{background:var(--sidebar);color:var(--sidebar-text);border-right:1px solid #333;padding:10px;overflow:auto}
-    .nav-btn{width:100%;text-align:left;padding:10px;border:1px solid transparent;background:transparent;color:inherit;border-radius:8px;cursor:pointer;margin-bottom:4px}.nav-btn.active{background:var(--nav-active);color:#fff}
-    .content{overflow:auto;padding:12px}.card{background:var(--card);border:1px solid var(--stroke);border-radius:12px;padding:12px;margin-bottom:12px}.card-title{margin:0 0 10px 0;font-size:18px}
-    .form-grid{display:grid;gap:10px;grid-template-columns:repeat(6,minmax(120px,1fr))}.form-grid-4{display:grid;gap:10px;grid-template-columns:repeat(4,minmax(120px,1fr))}.form-grid-3{display:grid;gap:10px;grid-template-columns:repeat(3,minmax(120px,1fr))}
-    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.grow{flex:1 1 220px}
-    label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)} input,select,button,textarea{background:transparent;color:var(--text);border:1px solid var(--stroke);border-radius:8px;padding:8px 10px} button{cursor:pointer}
-    .btn{background:var(--brand);color:#fff;border-color:var(--brand)}.btn-ok{background:var(--ok);color:#fff;border-color:var(--ok)}.btn-danger{background:var(--danger);color:#fff;border-color:var(--danger)}
-    .kpis{display:grid;gap:10px;grid-template-columns:repeat(6,minmax(120px,1fr))}.kpi{background:color-mix(in srgb,var(--card) 88%, #000 12%);border:1px solid var(--stroke);border-radius:10px;padding:10px}.kpi .t{font-size:12px;color:var(--muted)}.kpi .v{font-size:22px;font-weight:700;margin-top:4px}
-    .split{display:grid;gap:10px;grid-template-columns:2fr 1fr}.split-eq{display:grid;gap:10px;grid-template-columns:1fr 1fr}.chart-wrap{height:320px}.table-wrap{max-height:420px;overflow:auto}
-    table{width:100%;border-collapse:collapse} th,td{padding:7px 6px;border-bottom:1px solid var(--stroke);font-size:13px;text-align:left;white-space:nowrap} tbody tr:nth-child(odd){background:var(--row)}
-    .auth{max-width:520px;margin:50px auto}.hidden{display:none !important}.muted{color:var(--muted);font-size:12px}
-    @media (max-width:1200px){.kpis{grid-template-columns:repeat(3,minmax(120px,1fr))}.form-grid{grid-template-columns:repeat(3,minmax(120px,1fr))}}
-    @media (max-width:900px){.main{grid-template-columns:1fr}.sidebar{display:flex;overflow:auto;gap:6px}.nav-btn{min-width:170px}.split,.split-eq{grid-template-columns:1fr}.form-grid,.form-grid-4,.form-grid-3,.kpis{grid-template-columns:1fr}}
+    :root{--bg:#1f1f1f;--panel:#252526;--stroke:#3f3f46;--text:#d4d4d4;--muted:#9ca3af;--blue:#0e8af0;--green:#22c55e;--red:#ef4444;--purple:#a78bfa}
+    *{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,Roboto,Arial,sans-serif}
+    .hidden{display:none!important}.mb{margin-bottom:12px}.tiny{font-size:12px;color:var(--muted)}
+    .app{display:grid;grid-template-rows:52px 1fr;height:100%}.top{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;border-bottom:1px solid #111;background:#1a1a1a}
+    .top .brand{font-size:18px;font-weight:700}.top .right{display:flex;gap:8px;align-items:center}
+    .pill{padding:4px 10px;border-radius:999px;border:1px solid var(--stroke);font-size:12px}.pill.ok{background:rgba(34,197,94,.16);color:#bbf7d0}.pill.bad{background:rgba(239,68,68,.16);color:#fecaca}
+    .main{display:grid;grid-template-columns:240px 1fr;min-height:0}.side{background:#202124;border-right:1px solid #111;padding:10px;overflow:auto}
+    .logo{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding:6px}.logo .dot{width:24px;height:24px;border-radius:4px;background:linear-gradient(135deg,#0ea5e9,#22d3ee)}.logo .txt b{display:block;font-size:16px}.logo .txt span{font-size:11px;color:var(--muted)}
+    .group{font-size:12px;color:#cbd5e1;margin:12px 6px 6px}.nav{display:flex;flex-direction:column;gap:5px}.nav button{background:transparent;border:1px solid transparent;color:#e5e7eb;text-align:left;padding:9px 10px;border-radius:8px;cursor:pointer}.nav button.active{background:#0b3f69;border-color:#1d4ed8}
+    .content{overflow:auto;padding:14px}.card{background:var(--panel);border:1px solid var(--stroke);border-radius:12px;padding:12px}.page-title{font-size:40px;font-weight:700;margin:4px 0 12px}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.grow{flex:1}
+    input,select,button{background:#232326;color:var(--text);border:1px solid var(--stroke);border-radius:10px;padding:9px 10px}button{cursor:pointer}.btn-blue{background:var(--blue);border-color:var(--blue);color:#fff}.btn-green{background:#16a34a;border-color:#16a34a;color:#fff}.btn-red{background:#dc2626;border-color:#dc2626;color:#fff}
+    .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}.grid-6{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:10px}
+    .widget-grid{display:grid;gap:10px}.widget{background:var(--panel);border:1px solid var(--stroke);border-radius:12px;padding:10px;min-height:210px}.widget-head{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px}.widget-name{font-weight:700}.widget-meta{font-size:12px;color:var(--muted)}.widget-controls{display:flex;gap:6px}.widget canvas{width:100%;height:130px!important}
+    .toolbar{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:10px}.field{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--muted)}
+    .tabs{display:inline-flex;border:1px solid var(--stroke);border-radius:10px;overflow:hidden}.tabs button{border:0;border-right:1px solid var(--stroke);border-radius:0;background:transparent;padding:8px 14px}.tabs button:last-child{border-right:0}.tabs button.active{background:#0b8f8f;color:#fff}
+    .kpi-card{background:var(--panel);border:1px solid var(--stroke);border-radius:12px;padding:10px}.kpi-t{font-size:13px;color:var(--muted)}.kpi-v{font-size:38px;font-weight:700;margin-top:7px}
+    .split-60{display:grid;grid-template-columns:3fr 2fr;gap:12px}.chart-card{position:relative;min-height:360px}.chart-card canvas{width:100%;height:290px!important}
+    .table-wrap{overflow:auto;max-height:480px}table{width:100%;border-collapse:collapse}th,td{padding:8px 8px;border-bottom:1px solid #313338;white-space:nowrap;text-align:left;font-size:14px}tbody tr:nth-child(odd){background:#26282d}
+    .report-layout{display:grid;grid-template-columns:40% 60%;gap:12px}.left-stack,.right-stack{display:flex;flex-direction:column;gap:12px;min-height:0}
+    .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:30}.modal.open{display:flex}.modal .box{width:min(1100px,95vw);max-height:90vh;overflow:auto;background:#1f2328;border:1px solid var(--stroke);border-radius:12px;padding:12px}
+    @media (max-width:1280px){.grid-6{grid-template-columns:repeat(3,minmax(120px,1fr))}.toolbar{grid-template-columns:repeat(3,minmax(120px,1fr))}}
+    @media (max-width:980px){.main{grid-template-columns:1fr}.side{display:none}.grid-2,.split-60,.report-layout{grid-template-columns:1fr}.toolbar,.grid-6{grid-template-columns:1fr}.page-title{font-size:30px}}
   </style>
 </head>
 <body>
-<div id="authRoot" class="auth card">
-  <h2 class="card-title">Sign In</h2>
-  <div class="form-grid-3">
-    <label>Cloud URL<input id="authUrl" value="<?= htmlspecialchars((string)($_SESSION['trustnode_api_base'] ?? TRUSTNODE_API_BASE_DEFAULT), ENT_QUOTES) ?>" /></label>
-    <label>Username<input id="authUser" value="admin" /></label>
-    <label>Password<input id="authPass" value="admin" type="password" /></label>
+  <div id="login" class="card" style="max-width:560px;margin:60px auto;">
+    <div style="font-size:30px;font-weight:700;margin-bottom:10px">Trustnode Client</div>
+    <div class="row mb">
+      <input id="apiBase" class="grow" value="https://trustnode.lsapps.app" />
+      <input id="user" value="admin" />
+      <input id="pass" type="password" value="admin" />
+      <button id="loginBtn" class="btn-blue">Sign In</button>
+    </div>
+    <div id="loginMsg" class="tiny"></div>
   </div>
-  <div class="row" style="margin-top:10px"><button id="authLogin" class="btn">Sign In</button><button id="authTheme" type="button">Toggle Theme</button><span id="authMsg" class="muted"></span></div>
-</div>
 
-<div id="appRoot" class="shell hidden">
-  <div class="header"><div class="row"><div class="brand">Trustnode Edge - Hosted Single File (PHP)</div><span id="connBadge" class="status bad">DISCONNECTED</span></div><div class="row"><span id="lastUpdate" class="muted">-</span><button id="themeToggle">Theme</button><button id="logoutBtn" class="btn-danger">Logout</button></div></div>
-  <div class="main">
-    <aside class="sidebar"><button class="nav-btn active" data-page="dashboard">Dashboard</button><button class="nav-btn" data-page="reporting">Reporting</button><button class="nav-btn" data-page="historian">Historian</button><button class="nav-btn" data-page="power">Power Overview</button></aside>
-    <section class="content">
-      <div id="page-dashboard"><div class="card"><h3 class="card-title">Dashboard</h3><div class="form-grid-4"><label>Gateway<select id="dashGateway"></select></label><label>Device<select id="dashDevice"></select></label><label>Tag<select id="dashTag"></select></label><label>Window<select id="dashWindow"><option value="60">Last 60</option><option value="120">Last 120</option><option value="240">Last 240</option></select></label></div></div><div class="card kpis"><div class="kpi"><div class="t">Live Rows</div><div class="v" id="kLiveRows">-</div></div><div class="kpi"><div class="t">Gateways</div><div class="v" id="kGateways">-</div></div><div class="kpi"><div class="t">Devices</div><div class="v" id="kDevices">-</div></div><div class="kpi"><div class="t">Tags</div><div class="v" id="kTags">-</div></div><div class="kpi"><div class="t">Avg Sample Age (s)</div><div class="v" id="kAge">-</div></div><div class="kpi"><div class="t">Current Value</div><div class="v" id="kCurrent">-</div></div></div><div class="card"><div class="chart-wrap"><canvas id="dashChart"></canvas></div></div></div>
-      <div id="page-reporting" class="hidden"><div class="card"><h3 class="card-title">Reporting</h3><div class="form-grid"><label>From<input id="repFrom" type="datetime-local" /></label><label>To<input id="repTo" type="datetime-local" /></label><label>Gateway<select id="repGateway"></select></label><label>Tag contains<input id="repTagLike" placeholder="power / temp / ..." /></label><label>Aggregation<select id="repAgg"><option value="raw">RAW</option><option value="minute">Minute</option><option value="hour">Hour</option><option value="day">Day</option></select></label><label>Method<select id="repMethod"><option value="avg">AVG</option><option value="sum">SUM</option><option value="min">MIN</option><option value="max">MAX</option></select></label></div><div class="row" style="margin-top:10px"><button id="repLoad" class="btn-ok">Load Data</button><button id="repCsv" class="btn">Export CSV</button></div></div><div class="split"><div class="card"><div class="chart-wrap"><canvas id="repChart"></canvas></div></div><div class="card table-wrap"><table><thead><tr><th>Timestamp</th><th>Value</th></tr></thead><tbody id="repTableBody"></tbody></table></div></div></div>
-      <div id="page-historian" class="hidden"><div class="card"><h3 class="card-title">Historian</h3><div class="form-grid"><label>From<input id="hisFrom" type="datetime-local" /></label><label>To<input id="hisTo" type="datetime-local" /></label><label>Gateway<select id="hisGateway"></select></label><label>Device<input id="hisDevice" placeholder="device contains..." /></label><label>Tag<input id="hisTag" placeholder="tag contains..." /></label><label>Quality<select id="hisQuality"><option value="all">All</option><option value="GOOD">GOOD</option><option value="UNCERTAIN">UNCERTAIN</option><option value="BAD">BAD</option></select></label></div><div class="row" style="margin-top:10px"><button id="hisRefresh" class="btn-ok">Refresh</button><button id="hisCsv" class="btn">Export CSV</button><button id="hisJson" class="btn">Export JSON</button></div></div><div class="card table-wrap"><table><thead><tr><th>Timestamp</th><th>Tag</th><th>Value</th><th>Quality</th><th>Device</th><th>Gateway</th></tr></thead><tbody id="hisTableBody"></tbody></table></div></div>
-      <div id="page-power" class="hidden"><div class="card"><h3 class="card-title">Power Management Overview</h3><div class="form-grid-4"><label>Device<select id="powDevice"></select></label><label>History Limit<select id="powLimit"><option value="120">120</option><option value="240">240</option><option value="480">480</option></select></label><label>Primary Metric<select id="powMetric"><option value="active_power_w">Active Power</option><option value="voltage_v">Voltage</option><option value="current_a">Current</option><option value="energy_wh">Energy</option></select></label><label>Chart Type<select id="powType"><option value="line">Line</option><option value="bar">Bar</option></select></label></div></div><div class="kpis card"><div class="kpi"><div class="t">Voltage (V)</div><div class="v" id="pV">-</div></div><div class="kpi"><div class="t">Current (A)</div><div class="v" id="pA">-</div></div><div class="kpi"><div class="t">Active Power (kW)</div><div class="v" id="pKW">-</div></div><div class="kpi"><div class="t">Energy (kWh)</div><div class="v" id="pKWH">-</div></div><div class="kpi"><div class="t">Power Factor</div><div class="v" id="pPF">-</div></div><div class="kpi"><div class="t">Frequency (Hz)</div><div class="v" id="pHZ">-</div></div></div><div class="split-eq"><div class="card"><div class="chart-wrap"><canvas id="powChart1"></canvas></div></div><div class="card"><div class="chart-wrap"><canvas id="powChart2"></canvas></div></div></div></div>
-    </section>
+  <div id="app" class="app hidden">
+    <div class="top">
+      <div class="row"><div class="brand">Trustnode Edge</div><span id="conn" class="pill bad">UNREACHABLE</span></div>
+      <div class="right"><span id="last" class="tiny">-</span><button id="refreshBtn">Refresh</button><button id="logoutBtn" class="btn-red">Logout</button></div>
+    </div>
+    <div class="main">
+      <aside class="side">
+        <div class="logo"><div class="dot"></div><div class="txt"><b>Trustnode Edge</b><span>Industrial Data Gateway</span></div></div>
+        <div class="group">OVERVIEW</div>
+        <div class="nav">
+          <button data-page="dashboard" class="active">Dashboard</button>
+          <button data-page="power">Power Overview</button>
+          <button data-page="historian">Historian</button>
+          <button data-page="reporting">Reporting</button>
+        </div>
+      </aside>
+
+      <section class="content">
+        <div id="page-dashboard">
+          <div class="page-title">Dashboard</div>
+          <div class="card mb"><div class="row" style="justify-content:flex-end;"><button id="addWidget" class="btn-blue">+ Add Item</button><label class="tiny">Per Row<select id="perRow"><option>1</option><option selected>2</option><option>3</option><option>4</option></select></label></div></div>
+          <div id="widgetGrid" class="widget-grid"></div>
+        </div>
+
+        <div id="page-power" class="hidden">
+          <div class="page-title">Power Overview</div>
+          <div class="card mb">
+            <div class="tabs" id="powModeTabs"><button data-mode="realtime" class="active">Realtime</button><button data-mode="historical">Historical</button></div>
+            <div class="toolbar" style="margin-top:10px">
+              <div class="field">Meter<select id="powMeter"></select></div>
+              <div class="field">Period<select id="powPeriod"><option value="1h">Last 1 hour</option><option value="24h" selected>Last 24 hours</option><option value="7d">Last 7 days</option></select></div>
+              <div class="field">Interval<select id="powInterval"><option value="second">Second</option><option value="minute">Minute</option><option value="hour" selected>Hour</option></select></div>
+              <div class="field">Aggregation<select id="powAgg"><option value="avg" selected>AVG</option><option value="sum">SUM</option><option value="min">MIN</option><option value="max">MAX</option></select></div>
+              <div class="field">Status<div id="powStatus" class="pill bad">Disconnected</div></div>
+            </div>
+          </div>
+          <div id="powKpis" class="grid-6 mb"></div>
+          <div class="split-60 mb">
+            <div class="card chart-card">
+              <div class="row" style="justify-content:space-between"><h3 style="margin:0">Energy Consumption</h3><div class="row"><select id="powMainMetric"><option value="active_power_w">Power (W)</option><option value="active_power_total_w">Power Total (W)</option><option value="voltage_v">Voltage (V)</option><option value="current_a">Current (A)</option><option value="energy_wh">Energy (Wh)</option></select><div class="tabs" id="powMainType"><button data-type="line" class="active">Line</button><button data-type="bar">Bar</button></div></div></div>
+              <canvas id="powMainChart"></canvas>
+            </div>
+            <div class="card chart-card">
+              <div class="row" style="justify-content:space-between"><h3 style="margin:0">Total Consumption by Hour</h3><div class="row"><select id="powTotalWindow"><option value="12" selected>Last 12 hours</option><option value="24">Last 24 hours</option><option value="168">Last 7 days</option></select><div class="tabs" id="powTotalType"><button data-type="line">Line</button><button data-type="bar" class="active">Bar</button></div></div></div>
+              <canvas id="powTotalChart"></canvas>
+            </div>
+          </div>
+          <div class="card">
+            <div class="row" style="justify-content:space-between"><h3 style="margin:0">Meters and Main Lines</h3><span id="powCounts" class="tiny"></span></div>
+            <div class="table-wrap"><table><thead><tr><th>Meter</th><th>Machine Description</th><th>Endpoint</th><th>Power Factor</th><th>Voltage (V)</th><th>Current (A)</th><th>Active Power (kW)</th><th>Energy (kWh)</th><th>Include in Charts</th><th>Status</th></tr></thead><tbody id="powTable"></tbody></table></div>
+          </div>
+        </div>
+
+        <div id="page-historian" class="hidden">
+          <div class="page-title">Historian</div>
+          <div class="card mb">
+            <div class="toolbar"><div class="field">From<input id="hisFrom" type="datetime-local"></div><div class="field">To<input id="hisTo" type="datetime-local"></div><div class="field">Tag<input id="hisTag" placeholder="Filter by tag"></div><div class="field">Gateway<select id="hisGateway"></select></div><div class="field">Device<input id="hisDevice" placeholder="Filter by device"></div></div>
+            <div class="row" style="margin-top:10px"><button id="hisRefresh" class="btn-green">Refresh</button><button id="hisCsv" class="btn-blue">Export CSV</button><button id="hisJson" class="btn-blue">Export JSON</button></div>
+          </div>
+          <div class="card"><div class="table-wrap"><table><thead><tr><th>Timestamp</th><th>Tag</th><th>Value</th><th>Quality</th><th>Device</th><th>Gateway</th><th>Database</th><th>PLC</th></tr></thead><tbody id="hisBody"></tbody></table></div></div>
+        </div>
+
+        <div id="page-reporting" class="hidden">
+          <div class="page-title">Reporting</div>
+          <div class="report-layout">
+            <div class="left-stack">
+              <div class="card">
+                <h3 style="margin-top:0">Report Filters</h3>
+                <div class="grid-2 mb">
+                  <div class="field">From<input id="repFrom" type="datetime-local"></div><div class="field">To<input id="repTo" type="datetime-local"></div><div class="field">Max Rows<input id="repRows" value="10000"></div><div class="field">Batch/Source<input id="repBatch" placeholder="Filter by batch/source"></div><div class="field">Interval<select id="repInterval"><option value="second">Second</option><option value="minute">Minute</option><option value="hour">Hour</option><option value="day">Day</option></select></div><div class="field">Aggregation<select id="repAgg"><option value="avg">AVG</option><option value="sum">SUM</option><option value="min">MIN</option><option value="max">MAX</option></select></div>
+                </div>
+                <div class="field mb">Gateways<div id="repGateways" class="card" style="padding:8px;max-height:100px;overflow:auto"></div></div>
+                <div class="field">Tags + Axis + Color<div id="repTags" class="card" style="padding:8px;max-height:220px;overflow:auto"></div></div>
+                <div class="row" style="margin-top:10px"><button id="repLoad" class="btn-blue grow">Load Data</button><button id="repPdf" class="btn-red grow">Generate PDF</button><button id="repCsv" class="btn-green grow">Generate CSV</button></div>
+              </div>
+              <div class="card"><h3 style="margin-top:0">Generated Reports</h3><div class="table-wrap" style="max-height:220px"><table><thead><tr><th>Created</th><th>By</th><th>Summary</th><th>Actions</th></tr></thead><tbody id="repSaved"></tbody></table></div></div>
+            </div>
+            <div class="right-stack">
+              <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Chart</h3><div class="tabs" id="repType"><button data-type="line">Line</button><button data-type="bar" class="active">Bar</button></div></div><canvas id="repChart"></canvas></div>
+              <div class="card"><h3 style="margin-top:0">Data Series</h3><div class="table-wrap"><table><thead><tr><th>Timestamp</th><th id="repValHead">value</th></tr></thead><tbody id="repBody"></tbody></table></div></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
   </div>
-</div>
 
+  <div id="widgetModal" class="modal"><div class="box"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Add Dashboard Item</h3><button id="closeWidgetModal">Close</button></div><div class="grid-2" style="margin-top:10px"><div class="field">Gateway<select id="wGateway"></select></div><div class="field">Device<select id="wDevice"></select></div><div class="field">Tag<select id="wTag"></select></div><div class="field">Type<select id="wType"><option value="line">Line</option><option value="bar">Bar</option><option value="kpi">KPI</option></select></div></div><div class="row" style="margin-top:10px"><button id="saveWidget" class="btn-green">Add</button></div></div></div>
+  <div id="monitorModal" class="modal"><div class="box"><div class="row" style="justify-content:space-between"><h3 id="monitorTitle" style="margin:0">Tag Monitor</h3><button id="closeMonitorModal">Close</button></div><canvas id="monitorChart"></canvas><div class="table-wrap" style="max-height:280px;margin-top:10px"><table><thead><tr><th>Timestamp</th><th>Value</th></tr></thead><tbody id="monitorBody"></tbody></table></div></div></div>
+
+<script>window.__TRUSTNODE_PROXY=true;</script>
 <script>
-(() => {
-  const S = { baseUrl:'', token:'', timers:[], liveRows:[], historianRows:[], logsRows:[], powerLatest:null, powerHistory:[], reportRows:[] };
-  const E = (id) => document.getElementById(id);
-  const fmtNum = (v,d=3) => Number.isFinite(Number(v)) ? Number(v).toFixed(d) : '-';
-  const tsMs = (v) => { const m = Date.parse(String(v||'')); return Number.isFinite(m) ? m : NaN; };
-  const fmtTs = (v) => { const d = new Date(tsMs(v)); if (Number.isNaN(d.getTime())) return String(v||''); const p=(x)=>String(x).padStart(2,'0'); return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; };
-  const toCsv = (rows) => { if (!rows.length) return ''; const cols = Object.keys(rows[0]); const esc=(x)=>`"${String(x??'').replaceAll('"','""')}"`; return [cols.join(','), ...rows.map(r=>cols.map(c=>esc(r[c])).join(','))].join('\n'); };
-  const download = (name, content, type='text/plain;charset=utf-8') => { const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([content],{type})); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000); };
-
-  async function req(path, opts={}) {
-    const baseParam = encodeURIComponent(E('authUrl').value.trim());
-    const headers = Object.assign({ 'Content-Type':'application/json', 'Cache-Control':'no-store' }, opts.headers || {});
-    const r = await fetch(`?proxy=${encodeURIComponent(path.replace(/^\//,''))}&base=${baseParam}`, Object.assign({}, opts, { headers, cache:'no-store' }));
-    if (!r.ok) throw new Error(`HTTP ${r.status} ${path}`);
-    return r.json();
-  }
-
-  async function login() {
-    S.baseUrl = E('authUrl').value.trim().replace(/\/+$/, '');
-    const data = await req('/api/auth/login', { method:'POST', body: JSON.stringify({ username:E('authUser').value, password:E('authPass').value }) });
-    S.token = data.token || 'proxy-session';
-    E('authMsg').textContent = 'Connected'; E('connBadge').className='status ok'; E('connBadge').textContent='CONNECTED';
-    E('authRoot').classList.add('hidden'); E('appRoot').classList.remove('hidden');
-    startTimers(); await refreshAll();
-  }
-
-  function uniq(rows){ const m=new Map(); for(const r of rows||[]){ const k=`${r.ts}|${r.gateway_id||r.gateway_name||''}|${r.device_name||''}|${r.tag||''}`; if(!m.has(k)) m.set(k,r);} return [...m.values()].sort((a,b)=>tsMs(a.ts)-tsMs(b.ts)); }
-  function gatewayList(){ const s=new Set(); [...S.liveRows,...S.historianRows].forEach(r=>s.add(String(r.gateway_id||r.gateway_name||''))); return ['all',...[...s].filter(Boolean).sort((a,b)=>a.localeCompare(b))]; }
-  function deviceList(){ const s=new Set(); [...S.liveRows,...S.historianRows].forEach(r=>s.add(String(r.device_name||''))); return ['all',...[...s].filter(Boolean).sort((a,b)=>a.localeCompare(b))]; }
-  function tagList(){ const s=new Set(); [...S.liveRows,...S.historianRows].forEach(r=>s.add(String(r.tag||''))); return ['all',...[...s].filter(Boolean).sort((a,b)=>a.localeCompare(b))]; }
-  function fillSelect(id, values, keep=true){ const el=E(id); const prev=el.value; el.innerHTML=values.map(v=>`<option value="${v}">${v}</option>`).join(''); if(keep && values.includes(prev)) el.value=prev; }
-
-  async function refreshLive(){ const [live, logs] = await Promise.all([req('/api/app-store/live?limit=3000'), req('/api/app-store/logs?limit=1000').catch(()=>({rows:[]}))]); S.liveRows=uniq(live.rows||[]); S.logsRows=logs.rows||[]; E('lastUpdate').textContent=`Last update ${fmtTs(new Date().toISOString())}`; fillFilters(); renderDashboard(); }
-  async function refreshHistorian(){ const hist = await req('/api/app-store/historian?limit=4000'); S.historianRows=uniq(hist.rows||[]).reverse(); fillFilters(); renderHistorian(); if(!S.reportRows.length) renderReporting(); }
-  async function refreshPower(){ const [latest, history] = await Promise.all([req('/api/power/latest').catch(()=>({row:null})), req(`/api/power/history?limit=${encodeURIComponent(E('powLimit')?.value||240)}`).catch(()=>({rows:[]}))]); S.powerLatest=latest.row||latest.latest||null; S.powerHistory=uniq((history.rows||[]).map(r=>{ const vals=r.values||r.values_scaled||r.values_raw||{}; return { ts:r.ts, device_id:r.device_id||r.device_name||'', voltage_v:Number(vals.voltage_v??vals.voltage_l1_v), current_a:Number(vals.current_a??vals.current_l1_a), active_power_w:Number(vals.active_power_total_w??vals.active_power_w), energy_wh:Number(vals.energy_total_wh??vals.energy_wh), power_factor:Number(vals.power_factor_total??vals.power_factor), frequency_hz:Number(vals.frequency_hz) }; })); renderPower(); }
-  async function refreshAll(){ await Promise.all([refreshLive(), refreshHistorian(), refreshPower()]); }
-
-  function fillFilters(){ const g=gatewayList(), d=deviceList(), t=tagList(); ['dashGateway','repGateway','hisGateway'].forEach(id=>fillSelect(id,g)); fillSelect('dashDevice',d); fillSelect('dashTag',t); fillSelect('powDevice',['all', ...new Set(S.powerHistory.map(r=>String(r.device_id||''))).values()].filter(Boolean)); }
-  function filterRows(rows,{gateway='all',device='all',tag='all',from='',to='',quality='all'}){ const fromMs=from?Date.parse(from):NaN; const toMs=to?Date.parse(to):NaN; return (rows||[]).filter(r=>{ if(gateway!=='all'&&String(r.gateway_id||r.gateway_name||'')!==gateway) return false; if(device!=='all'&&String(r.device_name||'')!==device) return false; if(tag!=='all'&&String(r.tag||'')!==tag) return false; const t=tsMs(r.ts); if(Number.isFinite(fromMs)&&t<fromMs) return false; if(Number.isFinite(toMs)&&t>toMs) return false; if(quality!=='all'&&String(r.quality_label||'').toUpperCase()!==quality) return false; return true; }); }
-  function agg(rows,interval='raw',method='avg'){ if(interval==='raw') return rows.map(r=>({ts:fmtTs(r.ts),value:Number(r.value)})).filter(x=>Number.isFinite(x.value)); const b=new Map(); rows.forEach(r=>{ const d=new Date(tsMs(r.ts)); const v=Number(r.value); if(Number.isNaN(d.getTime())||!Number.isFinite(v)) return; let k=''; if(interval==='minute') k=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()} ${d.getHours()}:${d.getMinutes()}`; if(interval==='hour') k=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()} ${d.getHours()}:00`; if(interval==='day') k=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`; const a=b.get(k)||[]; a.push(v); b.set(k,a); }); return [...b.entries()].map(([k,a])=>{ let v=a[a.length-1]; if(method==='sum') v=a.reduce((x,y)=>x+y,0); else if(method==='min') v=Math.min(...a); else if(method==='max') v=Math.max(...a); else v=a.reduce((x,y)=>x+y,0)/a.length; return {ts:k,value:v}; }); }
-
-  function renderDashboard(){ const rows=filterRows(S.liveRows,{gateway:E('dashGateway').value||'all',device:E('dashDevice').value||'all',tag:E('dashTag').value||'all'}); E('kLiveRows').textContent=String(rows.length); E('kGateways').textContent=String(new Set(rows.map(r=>String(r.gateway_id||r.gateway_name||''))).size); E('kDevices').textContent=String(new Set(rows.map(r=>String(r.device_name||''))).size); E('kTags').textContent=String(new Set(rows.map(r=>String(r.tag||''))).size); const age=rows.length?rows.map(r=>Math.max(0,(Date.now()-tsMs(r.ts))/1000)).reduce((a,b)=>a+b,0)/rows.length:NaN; E('kAge').textContent=Number.isFinite(age)?age.toFixed(2):'-'; E('kCurrent').textContent=rows.length?fmtNum(rows[rows.length-1].value):'-'; const win=Number(E('dashWindow').value||120); const byTs=new Map(); rows.forEach(r=>{const k=fmtTs(r.ts),v=Number(r.value); if(!Number.isFinite(v)) return; const a=byTs.get(k)||[]; a.push(v); byTs.set(k,a);}); const labels=[...byTs.keys()].slice(-win); const vals=labels.map(k=>{const a=byTs.get(k)||[]; return a.length?a.reduce((x,y)=>x+y,0)/a.length:null;}); charts.dash.data.labels=labels; charts.dash.data.datasets[0].data=vals; charts.dash.update('none'); }
-  function renderReporting(){ const rows=filterRows(S.historianRows,{gateway:E('repGateway').value||'all',from:E('repFrom').value||'',to:E('repTo').value||''}).filter(r=>{const n=(E('repTagLike').value||'').trim().toLowerCase(); return !n || String(r.tag||'').toLowerCase().includes(n);}); const series=agg(rows,E('repAgg').value||'raw',E('repMethod').value||'avg').slice(-300); S.reportRows=series; charts.rep.data.labels=series.map(x=>x.ts); charts.rep.data.datasets[0].data=series.map(x=>x.value); charts.rep.update('none'); E('repTableBody').innerHTML=series.slice(-150).map(r=>`<tr><td>${r.ts}</td><td>${fmtNum(r.value)}</td></tr>`).join(''); }
-  function renderHistorian(){ const rows=filterRows(S.historianRows,{gateway:E('hisGateway').value||'all',from:E('hisFrom').value||'',to:E('hisTo').value||'',quality:E('hisQuality').value||'all'}).filter(r=>{const d=(E('hisDevice').value||'').trim().toLowerCase(); const t=(E('hisTag').value||'').trim().toLowerCase(); if(d&&!String(r.device_name||'').toLowerCase().includes(d)) return false; if(t&&!String(r.tag||'').toLowerCase().includes(t)) return false; return true;}); E('hisTableBody').innerHTML=rows.slice(0,1800).map(r=>`<tr><td>${fmtTs(r.ts)}</td><td>${r.tag||'-'}</td><td>${fmtNum(r.value)}</td><td>${r.quality_label||r.quality||'-'}</td><td>${r.device_name||'-'}</td><td>${r.gateway_name||r.gateway_id||'-'}</td></tr>`).join(''); }
-  function renderPower(){ const device=E('powDevice').value||'all'; const data=S.powerHistory.filter(r=>device==='all'||String(r.device_id||'')===device); const metric=E('powMetric').value||'active_power_w'; const type=E('powType').value||'line'; const last=data[data.length-1]||(S.powerLatest&&S.powerLatest.values?{ voltage_v:Number(S.powerLatest.values.voltage_v??S.powerLatest.values.voltage_l1_v), current_a:Number(S.powerLatest.values.current_a??S.powerLatest.values.current_l1_a), active_power_w:Number(S.powerLatest.values.active_power_total_w??S.powerLatest.values.active_power_w), energy_wh:Number(S.powerLatest.values.energy_total_wh??S.powerLatest.values.energy_wh), power_factor:Number(S.powerLatest.values.power_factor_total??S.powerLatest.values.power_factor), frequency_hz:Number(S.powerLatest.values.frequency_hz)}:{}); E('pV').textContent=fmtNum(last.voltage_v,3); E('pA').textContent=fmtNum(last.current_a,3); E('pKW').textContent=Number.isFinite(last.active_power_w)?fmtNum(last.active_power_w/1000,3):'-'; E('pKWH').textContent=Number.isFinite(last.energy_wh)?fmtNum(last.energy_wh/1000,3):'-'; E('pPF').textContent=fmtNum(last.power_factor,3); E('pHZ').textContent=fmtNum(last.frequency_hz,3); const lim=Number(E('powLimit').value||240); const labels=data.slice(-lim).map(r=>fmtTs(r.ts)); const vals=data.slice(-lim).map(r=>Number(r[metric])); const vals2=data.slice(-lim).map(r=>Number(r.energy_wh)); charts.pow1.config.type=type; charts.pow1.data.labels=labels; charts.pow1.data.datasets[0].label=metric; charts.pow1.data.datasets[0].data=vals; charts.pow1.update('none'); charts.pow2.data.labels=labels; charts.pow2.data.datasets[0].data=vals2.map(v=>Number.isFinite(v)?v/1000:null); charts.pow2.update('none'); }
-
-  function startTimers(){ S.timers.forEach(clearInterval); S.timers=[]; const vis=()=>document.visibilityState==='visible'; S.timers.push(setInterval(()=>vis()&&refreshLive().catch(()=>{}),2000)); S.timers.push(setInterval(()=>vis()&&refreshHistorian().catch(()=>{}),4500)); S.timers.push(setInterval(()=>vis()&&refreshPower().catch(()=>{}),2500)); }
-  function setPage(page){ ['dashboard','reporting','historian','power'].forEach(p=>E(`page-${p}`).classList.toggle('hidden',p!==page)); document.querySelectorAll('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); }
-
-  const charts = {
-    dash:new Chart(E('dashChart'),{type:'line',data:{labels:[],datasets:[{label:'Live Trend',data:[],borderColor:'#16a34a',tension:.25,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,animation:false,parsing:false}}),
-    rep:new Chart(E('repChart'),{type:'line',data:{labels:[],datasets:[{label:'Report Series',data:[],borderColor:'#0ea5e9',tension:.2,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,animation:false,parsing:false}}),
-    pow1:new Chart(E('powChart1'),{type:'line',data:{labels:[],datasets:[{label:'Power',data:[],borderColor:'#22c55e',backgroundColor:'rgba(34,197,94,.35)'}]},options:{responsive:true,maintainAspectRatio:false,animation:false,parsing:false}}),
-    pow2:new Chart(E('powChart2'),{type:'bar',data:{labels:[],datasets:[{label:'Energy (kWh)',data:[],backgroundColor:'#0ea5e9'}]},options:{responsive:true,maintainAspectRatio:false,animation:false,parsing:false}})
-  };
-
-  E('authLogin').onclick = () => login().catch(err => E('authMsg').textContent = err.message);
-  E('authTheme').onclick = E('themeToggle').onclick = () => { document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light'; };
-  E('logoutBtn').onclick = () => location.reload();
-  document.querySelectorAll('.nav-btn').forEach(btn => btn.onclick = () => setPage(btn.dataset.page));
-  ['dashGateway','dashDevice','dashTag','dashWindow'].forEach(id => E(id).onchange = renderDashboard);
-  ['repGateway','repFrom','repTo','repTagLike','repAgg','repMethod'].forEach(id => E(id).onchange = renderReporting);
-  ['hisGateway','hisFrom','hisTo','hisDevice','hisTag','hisQuality'].forEach(id => E(id).onchange = renderHistorian);
-  ['powDevice','powLimit','powMetric','powType'].forEach(id => E(id).onchange = () => { if (id==='powLimit') refreshPower().catch(()=>{}); else renderPower(); });
-  E('repLoad').onclick = renderReporting;
-  E('hisRefresh').onclick = () => refreshHistorian().catch(()=>{});
-  E('repCsv').onclick = () => download(`report_${Date.now()}.csv`, toCsv(S.reportRows), 'text/csv;charset=utf-8');
-  E('hisCsv').onclick = () => { const rows=[...E('hisTableBody').querySelectorAll('tr')].map(tr=>{ const t=tr.querySelectorAll('td'); return {timestamp:t[0]?.textContent||'',tag:t[1]?.textContent||'',value:t[2]?.textContent||'',quality:t[3]?.textContent||'',device:t[4]?.textContent||'',gateway:t[5]?.textContent||''}; }); download(`historian_${Date.now()}.csv`, toCsv(rows), 'text/csv;charset=utf-8'); };
-  E('hisJson').onclick = () => download(`historian_${Date.now()}.json`, JSON.stringify(S.historianRows, null, 2), 'application/json;charset=utf-8');
+(()=>{
+  const state={base:'',token:'',live:[],hist:[],widgets:[],charts:new Map(),timer:null,savedReports:[],powInclude:new Map(),repType:'bar',powMainType:'line',powTotalType:'bar'};
+  const $=(id)=>document.getElementById(id);
+  const fmt=(v,d=3)=>Number.isFinite(+v)?(+v).toFixed(d):'-';
+  const ts=(v)=>{const x=new Date(v);return isNaN(x)?null:x};
+  const tsText=(v)=>{const d=ts(v);if(!d)return String(v||'');const p=(n)=>String(n).padStart(2,'0');return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`};
+  const csv=(rows)=>{if(!rows.length)return'';const cols=Object.keys(rows[0]);const esc=(x)=>`"${String(x??'').replace(/"/g,'""')}"`;return [cols.join(','),...rows.map(r=>cols.map(c=>esc(r[c])).join(','))].join('\n')};
+  const dl=(n,c,t='text/plain;charset=utf-8')=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([c],{type:t}));a.download=n;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500)};
+  async function api(path,opt={}){const h=Object.assign({'Content-Type':'application/json','Cache-Control':'no-store'},opt.headers||{});if(state.token)h.Authorization=`Bearer ${state.token}`;const useProxy=!!window.__TRUSTNODE_PROXY;const url=useProxy?`?proxy=${encodeURIComponent(path.replace(/^\//,''))}&base=${encodeURIComponent(state.base)}`:`${state.base}${path}`;const r=await fetch(url,Object.assign({},opt,{headers:h,cache:'no-store'}));if(!r.ok)throw new Error(`HTTP ${r.status} ${path}`);return await r.json();}
+  function setConnected(ok){const c=$('conn');c.className=`pill ${ok?'ok':'bad'}`;c.textContent=ok?'CONNECTED':'UNREACHABLE'}
+  async function login(){try{state.base=$('apiBase').value.trim().replace(/\/+$/,'');const res=await api('/api/auth/login',{method:'POST',body:JSON.stringify({username:$('user').value,password:$('pass').value})});state.token=res.token||'';$('login').classList.add('hidden');$('app').classList.remove('hidden');setConnected(true);await refreshAll();if(state.timer)clearInterval(state.timer);state.timer=setInterval(refreshAll,2000);}catch(e){$('loginMsg').textContent=`Login failed: ${e.message}`;setConnected(false)}}
+  function gateways(rows){return ['All gateways',...new Set(rows.map(r=>r.gateway_name||r.gateway_id).filter(Boolean))]}
+  function tags(rows){return [...new Set(rows.map(r=>r.tag).filter(Boolean))].sort((a,b)=>a.localeCompare(b))}
+  function chartFor(canvasId,type,labels,data,color='#22c55e'){const c=$(canvasId);if(!c)return;if(state.charts.has(canvasId))state.charts.get(canvasId).destroy();const ch=new Chart(c.getContext('2d'),{type,data:{labels,datasets:[{data,label:'value',borderColor:color,backgroundColor:type==='bar'?`${color}99`:'transparent',pointRadius:2,borderWidth:2,tension:.2}]},options:{responsive:true,maintainAspectRatio:false,animation:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#94a3b8',maxRotation:0,minRotation:0,autoSkip:true,maxTicksLimit:10},grid:{color:'#334155'}},y:{ticks:{color:'#94a3b8',stepSize:.5},grid:{color:'#334155'}}}}});state.charts.set(canvasId,ch)}
+  function setOptions(id,arr){const el=$(id);if(!el)return;const cur=el.value;el.innerHTML=arr.map(x=>`<option>${x}</option>`).join('');if(arr.includes(cur))el.value=cur}
+  function updateWidgetModalOptions(){const g=$('wGateway').value||'All gateways';const dRows=state.live.filter(r=>g==='All gateways'||(r.gateway_name||r.gateway_id)===g);setOptions('wDevice',['All devices',...new Set(dRows.map(r=>r.device_name||'').filter(Boolean))]);const d=$('wDevice').value||'All devices';setOptions('wTag',[...new Set(dRows.filter(r=>d==='All devices'||(r.device_name||'')===d).map(r=>r.tag).filter(Boolean))].sort())}
+  function rebuildFilters(){const rows=state.hist.length?state.hist:state.live;const gws=gateways(rows);setOptions('hisGateway',gws);setOptions('powMeter',['All meters',...new Set((state.live.concat(state.hist)).map(r=>r.device_name||r.gateway_name).filter(Boolean))]);setOptions('wGateway',gws);setOptions('repGateway',gws);const rg=$('repGateways');rg.innerHTML=gws.filter(x=>x!=='All gateways').map(x=>`<label style="display:block;margin:4px 0"><input type="checkbox" checked value="${x}"> ${x}</label>`).join('');const rt=$('repTags');const tgs=tags(rows);rt.innerHTML=tgs.map((t,i)=>`<div style="display:grid;grid-template-columns:18px 1fr 92px 54px;gap:8px;align-items:center;margin:4px 0"><input type="checkbox" ${i===0?'checked':''} value="${t}"><span>${t}</span><select><option>Y-Left</option><option>Y-Right</option></select><input type="color" value="${['#22c55e','#3b82f6','#f59e0b','#ef4444','#a855f7','#06b6d4'][i%6]}"></div>`).join('');updateWidgetModalOptions()}
+  function filterRows(rows,{gateway,device,tag}){return rows.filter(r=>{const g=r.gateway_name||r.gateway_id||'';const d=r.device_name||'';const t=r.tag||'';if(gateway&&gateway!=='All gateways'&&g!==gateway)return false;if(device&&device!=='All devices'&&d!==device)return false;if(tag&&t!==tag)return false;return true;})}
+  function rowSeries(rows,tag){return rows.filter(r=>r.tag===tag).sort((a,b)=>new Date(a.ts)-new Date(b.ts)).map(r=>({x:tsText(r.ts),y:+r.value||0,raw:r}))}
+  function renderDashboard(){const grid=$('widgetGrid');const per=Math.max(1,parseInt($('perRow').value||'2',10));grid.style.gridTemplateColumns=`repeat(${per}, minmax(320px, 1fr))`;if(!state.widgets.length){grid.innerHTML='<div class="card tiny">No dashboard items configured. Use Add Item to select gateway tags and build your KPI/chart view.</div>';return;}grid.innerHTML='';for(const w of state.widgets){const rows=filterRows(state.live,{gateway:w.gateway,device:w.device,tag:w.tag});const points=rowSeries(rows,w.tag).slice(-90);const last=points.at(-1)?.y??0;const box=document.createElement('div');box.className='widget';box.innerHTML=`<div class="widget-head"><div><div class="widget-name">${w.tag} <span style="color:var(--purple)">| ${fmt(last)}</span></div><div class="widget-meta">Value: ${fmt(last)} Last: ${points.at(-1)?.x||'-'} Device: ${w.device||'-'} Gateway: ${w.gateway||'-'}</div></div><div class="widget-controls"><button data-act="type" data-id="${w.id}" class="btn-blue">${w.type.toUpperCase()}</button><button data-act="monitor" data-id="${w.id}">Monitor</button><button data-act="remove" data-id="${w.id}" class="btn-red">Delete</button></div></div>${w.type==='kpi'?`<div style="font-size:38px;font-weight:700">${fmt(last)}</div><div class="tiny">${w.tag}</div>`:`<canvas id="w_${w.id}"></canvas>`}`;grid.appendChild(box);if(w.type!=='kpi')chartFor(`w_${w.id}`,w.type.toLowerCase(),points.map(p=>p.x),points.map(p=>p.y),'#8b5cf6');}}
+  function meterRows(){const rows=state.live.filter(r=>/power|energy|voltage|current|factor|hz/i.test(r.tag||'')||/power/i.test((r.device_name||'')+(r.gateway_name||'')));const keyRows=new Map();for(const r of rows){const k=(r.device_name||r.gateway_name||'meter');if(!keyRows.has(k))keyRows.set(k,[]);keyRows.get(k).push(r);}return [...keyRows.entries()].map(([meter,arr])=>{const newest=(tag)=>arr.filter(x=>x.tag===tag).sort((a,b)=>new Date(b.ts)-new Date(a.ts))[0];return{meter,desc:'Weidmuller meter',endpoint:`${newest('voltage_v')?.plc_ip||'-'}`,pf:+(newest('power_factor')?.value||0),v:+(newest('voltage_v')?.value||0),a:+(newest('current_a')?.value||0),kw:+(newest('active_power_w')?.value||0)/1000,kwh:+(newest('energy_wh')?.value||0)/1000,connected:!!arr.length};});}
+  function renderPower(){const meterSel=$('powMeter').value||'All meters';const rows=state.hist.length?state.hist:state.live;const meterFiltered=rows.filter(r=>meterSel==='All meters'?true:((r.device_name||r.gateway_name)===meterSel));const getLast=(tag)=>meterFiltered.filter(r=>r.tag===tag).sort((a,b)=>new Date(b.ts)-new Date(a.ts))[0]?.value;const kpis=[['Energy Efficiency',fmt(((+getLast('power_factor')||0)*100),1)+' %','#60a5fa'],['Energy Costs',fmt(((+getLast('energy_wh')||0)/1000*0.35),2)+' EUR','#67e8f9'],['Total kWh Consumption',fmt((+getLast('energy_total_wh')||+getLast('energy_wh')||0)/1000,2)+' kWh','#c4b5fd'],['Live kW Consumption',fmt((+getLast('active_power_total_w')||+getLast('active_power_w')||0)/1000,2)+' kW','#4ade80'],['Peak Demand Indicator',fmt((+getLast('active_power_total_w')||+getLast('active_power_w')||0)/1000,2)+' kW','#fbbf24'],['Downtime Energy Cost',fmt(((+getLast('energy_delivered_total_wh')||0)/1000*0.35),2)+' EUR','#fb7185']];$('powKpis').innerHTML=kpis.map(k=>`<div class="kpi-card"><div class="kpi-t">${k[0]}</div><div class="kpi-v" style="color:${k[2]}">${k[1]}</div></div>`).join('');$('powStatus').className='pill '+(meterFiltered.length?'ok':'bad');$('powStatus').textContent=meterFiltered.length?'Connected':'Disconnected';const metric=$('powMainMetric').value;const metricRows=meterFiltered.filter(r=>r.tag===metric).sort((a,b)=>new Date(a.ts)-new Date(b.ts));chartFor('powMainChart',state.powMainType,metricRows.slice(-240).map(r=>tsText(r.ts)),metricRows.slice(-240).map(r=>+r.value||0),'#22c55e');const hours=+($('powTotalWindow').value||12);const now=Date.now();const hourRows=meterFiltered.filter(r=>/energy_total_wh|energy_wh/.test(r.tag||'')).filter(r=>now-new Date(r.ts).getTime()<=hours*3600000);const bucket=new Map();for(const r of hourRows){const d=new Date(r.ts);const h=`${String(d.getHours()).padStart(2,'0')}:00`;bucket.set(h,(bucket.get(h)||0)+(+r.value||0));}chartFor('powTotalChart',state.powTotalType,[...bucket.keys()],[...bucket.values()].map(v=>v/1000),'#22c55e');const meters=meterRows();$('powCounts').textContent=`Total meters: ${meters.length}  Connected: ${meters.filter(m=>m.connected).length}`;$('powTable').innerHTML=meters.map(m=>`<tr><td>${m.meter}</td><td>${m.desc}</td><td>${m.endpoint}</td><td>${fmt(m.pf)}</td><td>${fmt(m.v)}</td><td>${fmt(m.a)}</td><td>${fmt(m.kw)}</td><td>${fmt(m.kwh)}</td><td><input type="checkbox" ${state.powInclude.get(m.meter)!==false?'checked':''} data-meter="${m.meter}" class="pow-inc"></td><td><span class="pill ${m.connected?'ok':'bad'}">${m.connected?'Connected':'Offline'}</span></td></tr>`).join('');document.querySelectorAll('.pow-inc').forEach(el=>el.onchange=()=>state.powInclude.set(el.dataset.meter,el.checked));}
+  function renderHistorian(){const g=$('hisGateway').value||'All gateways';const tag=$('hisTag').value.trim().toLowerCase();const dev=$('hisDevice').value.trim().toLowerCase();const from=$('hisFrom').value?new Date($('hisFrom').value).getTime():-Infinity;const to=$('hisTo').value?new Date($('hisTo').value).getTime():Infinity;const rows=state.hist.filter(r=>{const t=new Date(r.ts).getTime();if(g!=='All gateways'&&(r.gateway_name||r.gateway_id)!==g)return false;if(tag&&!(r.tag||'').toLowerCase().includes(tag))return false;if(dev&&!(r.device_name||'').toLowerCase().includes(dev))return false;return t>=from&&t<=to;}).sort((a,b)=>new Date(b.ts)-new Date(a.ts));$('hisBody').innerHTML=rows.slice(0,2000).map(r=>`<tr><td>${tsText(r.ts)}</td><td>${r.tag||''}</td><td>${fmt(r.value)}</td><td>${r.quality_label||r.quality||''}</td><td>${r.device_name||''}</td><td>${r.gateway_name||r.gateway_id||''}</td><td>${r.database_name||''}</td><td>${r.plc_ip||''}</td></tr>`).join('');$('hisCsv').onclick=()=>dl('historian.csv',csv(rows));$('hisJson').onclick=()=>dl('historian.json',JSON.stringify(rows,null,2),'application/json;charset=utf-8');}
+  function renderSavedReports(){$('repSaved').innerHTML=state.savedReports.slice(0,40).map((r,i)=>`<tr><td>${tsText(r.created)}</td><td>${r.by}</td><td>${r.summary}</td><td><button data-i="${i}" class="btn-red rep-del">Delete</button></td></tr>`).join('');document.querySelectorAll('.rep-del').forEach(b=>b.onclick=()=>{state.savedReports.splice(+b.dataset.i,1);renderSavedReports()});}
+  function renderReporting(){const checkedG=[...$('repGateways').querySelectorAll('input[type=checkbox]:checked')].map(x=>x.value);const checkedT=[...$('repTags').querySelectorAll('input[type=checkbox]:checked')].map(x=>x.value);const from=$('repFrom').value?new Date($('repFrom').value).getTime():-Infinity;const to=$('repTo').value?new Date($('repTo').value).getTime():Infinity;const rows=state.hist.filter(r=>{const t=new Date(r.ts).getTime();if(checkedG.length&&!checkedG.includes(r.gateway_name||r.gateway_id))return false;if(checkedT.length&&!checkedT.includes(r.tag))return false;return t>=from&&t<=to;}).sort((a,b)=>new Date(a.ts)-new Date(b.ts));const firstTag=checkedT[0]||rows[0]?.tag;const tagRows=rows.filter(r=>r.tag===firstTag).slice(-800);$('repValHead').textContent=firstTag||'value';$('repBody').innerHTML=tagRows.map(r=>`<tr><td>${tsText(r.ts)}</td><td>${fmt(r.value)}</td></tr>`).join('');chartFor('repChart',state.repType,tagRows.map(r=>tsText(r.ts)),tagRows.map(r=>+r.value||0),'#3b82f6');$('repLoad').onclick=()=>renderReporting();$('repCsv').onclick=()=>dl('report.csv',csv(rows));$('repPdf').onclick=()=>{state.savedReports.unshift({created:new Date(),by:'admin',summary:`${new Date().toLocaleString()} | tags=${checkedT.join('|')} | rows=${rows.length}`});renderSavedReports();};}
+  async function refreshAll(){try{const [live,hist]=await Promise.all([api('/api/app-store/live?limit=5000'),api('/api/app-store/historian?limit=2000')]);state.live=(live.rows||[]).slice().sort((a,b)=>new Date(a.ts)-new Date(b.ts));state.hist=(hist.rows||[]).slice().sort((a,b)=>new Date(a.ts)-new Date(b.ts));$('last').textContent=`Updated ${new Date().toLocaleTimeString()}`;setConnected(true);rebuildFilters();renderDashboard();renderPower();renderHistorian();renderReporting();}catch(e){setConnected(false);console.error(e)}}
+  function wire(){$('loginBtn').onclick=login;$('logoutBtn').onclick=()=>location.reload();$('refreshBtn').onclick=refreshAll;document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));b.classList.add('active');['dashboard','power','historian','reporting'].forEach(p=>$('page-'+p).classList.toggle('hidden',p!==b.dataset.page));});$('perRow').onchange=renderDashboard;$('addWidget').onclick=()=>{updateWidgetModalOptions();$('widgetModal').classList.add('open')};$('closeWidgetModal').onclick=()=>$('widgetModal').classList.remove('open');$('wGateway').onchange=updateWidgetModalOptions;$('wDevice').onchange=updateWidgetModalOptions;$('saveWidget').onclick=()=>{const w={id:crypto.randomUUID(),gateway:$('wGateway').value,device:$('wDevice').value,tag:$('wTag').value,type:$('wType').value};if(!w.tag)return;state.widgets.push(w);$('widgetModal').classList.remove('open');renderDashboard();};$('closeMonitorModal').onclick=()=>$('monitorModal').classList.remove('open');$('powMainType').querySelectorAll('button').forEach(b=>b.onclick=()=>{$('powMainType').querySelectorAll('button').forEach(x=>x.classList.remove('active'));b.classList.add('active');state.powMainType=b.dataset.type;renderPower();});$('powTotalType').querySelectorAll('button').forEach(b=>b.onclick=()=>{$('powTotalType').querySelectorAll('button').forEach(x=>x.classList.remove('active'));b.classList.add('active');state.powTotalType=b.dataset.type;renderPower();});$('powMeter').onchange=renderPower;$('powMainMetric').onchange=renderPower;$('powTotalWindow').onchange=renderPower;$('hisRefresh').onclick=renderHistorian;$('repType').querySelectorAll('button').forEach(b=>b.onclick=()=>{$('repType').querySelectorAll('button').forEach(x=>x.classList.remove('active'));b.classList.add('active');state.repType=b.dataset.type;renderReporting();});document.addEventListener('click',(ev)=>{const el=ev.target.closest('button[data-act]');if(!el)return;const id=el.dataset.id;const w=state.widgets.find(x=>x.id===id);if(!w)return;if(el.dataset.act==='remove'){state.widgets=state.widgets.filter(x=>x.id!==id);renderDashboard();}if(el.dataset.act==='type'){w.type=w.type==='line'?'bar':w.type==='bar'?'kpi':'line';renderDashboard();}if(el.dataset.act==='monitor'){const rows=filterRows(state.live,{gateway:w.gateway,device:w.device,tag:w.tag});const points=rowSeries(rows,w.tag).slice(-240);$('monitorTitle').textContent=`Tag Monitor - ${w.tag}`;$('monitorModal').classList.add('open');chartFor('monitorChart','line',points.map(p=>p.x),points.map(p=>p.y),'#22d3ee');$('monitorBody').innerHTML=points.slice().reverse().map(p=>`<tr><td>${p.x}</td><td>${fmt(p.y)}</td></tr>`).join('');}});}
+  wire();
 })();
 </script>
 </body>
 </html>
+
+
