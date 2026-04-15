@@ -2,137 +2,104 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>TrustNode DB Direct-ish Client (HTML + PostgREST)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TrustNode Hosted Client (DB REST Single File)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    :root { --bg:#1e1e1e; --card:#252526; --stroke:#3c3c3c; --text:#d4d4d4; --muted:#9da0a6; --brand:#007acc; --ok:#2ea043; --danger:#d1242f; --header:#000; --header-text:#d4d4d4; }
-    [data-theme="light"] { --bg:#f3f3f3; --card:#eceff3; --stroke:#c5ccd6; --text:#1f2328; --muted:#5f6b7a; --brand:#007acc; --ok:#2ea043; --danger:#d1242f; --header:#2d2d30; --header-text:#d4d4d4; }
-    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,sans-serif}
-    .top{background:var(--header);color:var(--header-text);padding:10px 14px;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center;gap:10px}
-    .wrap{padding:12px;max-width:1500px;margin:0 auto}.card{background:var(--card);border:1px solid var(--stroke);border-radius:12px;padding:12px;margin-bottom:12px}
-    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.grow{flex:1 1 240px}
-    input,select,button{background:transparent;color:var(--text);border:1px solid var(--stroke);border-radius:8px;padding:8px 10px}button{cursor:pointer}
-    .btn{background:var(--brand);border-color:var(--brand);color:#fff}.btn-ok{background:var(--ok);border-color:var(--ok);color:#fff}
-    .tabs{display:flex;gap:8px;flex-wrap:wrap}.tab{padding:8px 12px;border:1px solid var(--stroke);border-radius:999px;cursor:pointer}.tab.active{background:var(--brand);border-color:var(--brand);color:#fff}
-    .grid-4{display:grid;grid-template-columns:repeat(4,minmax(180px,1fr));gap:10px}.kpi{border:1px solid var(--stroke);border-radius:10px;padding:10px}.kpi .label{color:var(--muted);font-size:12px}.kpi .value{font-size:22px;font-weight:700}
-    .views>section{display:none}.views>section.active{display:block}.split{display:grid;grid-template-columns:2fr 1fr;gap:10px}
-    .table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--stroke);padding:6px;font-size:13px;text-align:left}
-    .status{padding:4px 8px;border-radius:999px;font-size:12px;border:1px solid var(--stroke)}.ok{color:#b6f3bf;background:rgba(46,160,67,.2)}.bad{color:#ffd7d9;background:rgba(209,36,47,.2)}
-    canvas{width:100%!important;height:280px!important}
-    .warn{font-size:12px;color:#ffd7d9}
-    @media(max-width:900px){.split,.grid-4{grid-template-columns:1fr}}
+    :root { --bg:#1e1e1e; --header:#000; --header-text:#d4d4d4; --card:#252526; --stroke:#3c3c3c; --text:#d4d4d4; --muted:#9da0a6; --brand:#007acc; --ok:#2ea043; --danger:#d1242f; --sidebar:#252526; --sidebar-text:#d4d4d4; --nav-active:#094771; --row:#2a2d2e; }
+    [data-theme="light"] { --bg:#f3f3f3; --header:#2d2d30; --header-text:#d4d4d4; --card:#eceff3; --stroke:#c5ccd6; --text:#1f2328; --muted:#5f6b7a; --brand:#007acc; --ok:#2ea043; --danger:#d1242f; --sidebar:#252526; --sidebar-text:#d4d4d4; --nav-active:#094771; --row:#e5eaf0; }
+    *{box-sizing:border-box} html,body{height:100%} body{margin:0;background:var(--bg);color:var(--text);font-family:"Segoe UI","Trebuchet MS",sans-serif}
+    .shell{display:grid;grid-template-rows:58px 1fr;height:100%}.header{background:var(--header);color:var(--header-text);border-bottom:1px solid #1f1f1f;display:flex;align-items:center;justify-content:space-between;padding:8px 12px;gap:10px}
+    .main{display:grid;grid-template-columns:230px 1fr;min-height:0}.sidebar{background:var(--sidebar);color:var(--sidebar-text);border-right:1px solid #333;padding:10px;overflow:auto}.content{overflow:auto;padding:12px}
+    .nav-btn{width:100%;text-align:left;padding:10px;border:1px solid transparent;background:transparent;color:inherit;border-radius:8px;cursor:pointer;margin-bottom:4px}.nav-btn.active{background:var(--nav-active);color:#fff}
+    .card{background:var(--card);border:1px solid var(--stroke);border-radius:12px;padding:12px;margin-bottom:12px}.card-title{margin:0 0 10px 0;font-size:18px}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.form-grid{display:grid;gap:10px;grid-template-columns:repeat(4,minmax(140px,1fr))}
+    label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)} input,select,button{background:transparent;color:var(--text);border:1px solid var(--stroke);border-radius:8px;padding:8px 10px}
+    .btn{background:var(--brand);color:#fff;border-color:var(--brand)} .kpis{display:grid;gap:10px;grid-template-columns:repeat(6,minmax(120px,1fr))}.kpi{border:1px solid var(--stroke);border-radius:10px;padding:10px}.kpi .t{font-size:12px;color:var(--muted)}.kpi .v{font-size:22px;font-weight:700}
+    .split{display:grid;grid-template-columns:2fr 1fr;gap:10px}.chart-wrap{height:300px}.table-wrap{max-height:420px;overflow:auto} table{width:100%;border-collapse:collapse} th,td{padding:7px 6px;border-bottom:1px solid var(--stroke);font-size:13px;text-align:left;white-space:nowrap} tbody tr:nth-child(odd){background:var(--row)}
+    .hidden{display:none!important}.status{border:1px solid var(--stroke);border-radius:999px;padding:4px 10px;font-size:12px}.status.ok{color:#b6f3bf;background:rgba(46,160,67,.2)}.status.bad{color:#ffd7d9;background:rgba(209,36,47,.2)}
+    @media (max-width:1000px){.main{grid-template-columns:1fr}.sidebar{display:flex;overflow:auto;gap:6px}.nav-btn{min-width:170px}.split,.kpis,.form-grid{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
-<div class="top">
-  <div><strong>TrustNode Client (HTML Direct via PostgREST)</strong></div>
-  <div class="row"><span id="connState" class="status bad">Not configured</span><button id="themeBtn">Toggle Theme</button></div>
-</div>
-<div class="wrap">
-  <div class="card">
-    <div class="row">
-      <input id="restUrl" class="grow" placeholder="PostgREST URL (e.g. https://<project>.supabase.co/rest/v1)" />
-      <input id="restKey" class="grow" placeholder="Anon readonly key (never service role)" />
-      <button id="connectBtn" class="btn">Connect</button>
-    </div>
-    <div class="warn">Use readonly views only. For production, API middleware is still the safer/faster strategy.</div>
+<div id="auth" class="card" style="max-width:900px;margin:40px auto">
+  <h2 class="card-title">Connect to DB REST (Supabase/PostgREST)</h2>
+  <div class="form-grid">
+    <label>REST Base URL<input id="restUrl" placeholder="https://<project>.supabase.co/rest/v1" /></label>
+    <label>Readonly Key<input id="restKey" /></label>
+    <label>Live View<input id="viewLive" value="latest_machine_state" /></label>
+    <label>Raw View<input id="viewRaw" value="telemetry_samples_raw" /></label>
   </div>
-  <div class="card"><div class="tabs" id="tabs"><div class="tab active" data-view="dashboard">Dashboard</div><div class="tab" data-view="reporting">Reporting</div><div class="tab" data-view="historian">Historian</div><div class="tab" data-view="power">Power Overview</div></div></div>
+  <div class="row" style="margin-top:10px"><button id="connect" class="btn">Connect</button><button id="toggleTheme">Theme</button><span id="authMsg"></span></div>
+</div>
 
-  <div class="views">
-    <section id="view-dashboard" class="active"><div class="card grid-4"><div class="kpi"><div class="label">Live Rows</div><div class="value" id="kpiLiveRows">-</div></div><div class="kpi"><div class="label">Gateways</div><div class="value" id="kpiGateways">-</div></div><div class="kpi"><div class="label">Avg Sample Age (s)</div><div class="value" id="kpiAge">-</div></div><div class="kpi"><div class="label">Last Update</div><div class="value" id="kpiLast">-</div></div></div><div class="card"><canvas id="liveChart"></canvas></div></section>
-    <section id="view-reporting"><div class="card row"><select id="repAgg"><option value="raw">RAW</option><option value="minute">MINUTE</option><option value="hour">HOUR</option><option value="day">DAY</option></select><input id="repTag" placeholder="tag contains..." /><button id="repLoad" class="btn-ok">Load</button></div><div class="split"><div class="card"><canvas id="repChart"></canvas></div><div class="card" style="max-height:320px;overflow:auto"><table class="table" id="repTable"><thead><tr><th>Time</th><th>Value</th></tr></thead><tbody></tbody></table></div></div></section>
-    <section id="view-historian"><div class="card row"><input id="histTag" placeholder="Filter by tag" /><select id="histLimit"><option>200</option><option>500</option><option>1000</option></select><button id="histLoad" class="btn-ok">Refresh</button></div><div class="card" style="max-height:420px;overflow:auto"><table class="table" id="histTable"><thead><tr><th>Timestamp</th><th>Gateway</th><th>Tag</th><th>Value</th><th>Quality</th></tr></thead><tbody></tbody></table></div></section>
-    <section id="view-power"><div class="card grid-4"><div class="kpi"><div class="label">Voltage (V)</div><div class="value" id="pVoltage">-</div></div><div class="kpi"><div class="label">Current (A)</div><div class="value" id="pCurrent">-</div></div><div class="kpi"><div class="label">Active Power (kW)</div><div class="value" id="pPower">-</div></div><div class="kpi"><div class="label">Energy (kWh)</div><div class="value" id="pEnergy">-</div></div><div class="kpi"><div class="label">Power Factor</div><div class="value" id="pPf">-</div></div><div class="kpi"><div class="label">Frequency (Hz)</div><div class="value" id="pFreq">-</div></div></div><div class="split"><div class="card"><canvas id="powerChart"></canvas></div><div class="card"><canvas id="energyChart"></canvas></div></div></section>
+<div id="app" class="shell hidden">
+  <div class="header"><div>Trustnode Hosted Single File (DB REST)</div><div class="row"><span id="conn" class="status bad">DISCONNECTED</span><button id="theme2">Theme</button></div></div>
+  <div class="main">
+    <aside class="sidebar"><button class="nav-btn active" data-page="dashboard">Dashboard</button><button class="nav-btn" data-page="reporting">Reporting</button><button class="nav-btn" data-page="historian">Historian</button><button class="nav-btn" data-page="power">Power</button></aside>
+    <section class="content">
+      <div id="page-dashboard"><div class="card kpis"><div class="kpi"><div class="t">Rows</div><div class="v" id="dRows">-</div></div><div class="kpi"><div class="t">Gateways</div><div class="v" id="dGw">-</div></div><div class="kpi"><div class="t">Devices</div><div class="v" id="dDev">-</div></div><div class="kpi"><div class="t">Avg Age(s)</div><div class="v" id="dAge">-</div></div><div class="kpi"><div class="t">Last Value</div><div class="v" id="dVal">-</div></div><div class="kpi"><div class="t">Last Ts</div><div class="v" id="dTs">-</div></div></div><div class="card"><div class="chart-wrap"><canvas id="cDash"></canvas></div></div></div>
+      <div id="page-reporting" class="hidden"><div class="card row"><input id="rTag" placeholder="tag contains" /><select id="rAgg"><option value="raw">RAW</option><option value="minute">MIN</option><option value="hour">HOUR</option><option value="day">DAY</option></select><select id="rMethod"><option value="avg">AVG</option><option value="sum">SUM</option><option value="min">MIN</option><option value="max">MAX</option></select><button id="rLoad" class="btn">Load</button></div><div class="split"><div class="card"><div class="chart-wrap"><canvas id="cRep"></canvas></div></div><div class="card table-wrap"><table><thead><tr><th>Ts</th><th>Value</th></tr></thead><tbody id="rBody"></tbody></table></div></div></div>
+      <div id="page-historian" class="hidden"><div class="card row"><input id="hTag" placeholder="tag filter" /><button id="hLoad" class="btn">Refresh</button></div><div class="card table-wrap"><table><thead><tr><th>Timestamp</th><th>Gateway</th><th>Tag</th><th>Value</th></tr></thead><tbody id="hBody"></tbody></table></div></div>
+      <div id="page-power" class="hidden"><div class="card row"><select id="pMetric"><option value="active_power_w">Active Power</option><option value="energy_wh">Energy</option><option value="voltage_v">Voltage</option><option value="current_a">Current</option></select><select id="pType"><option value="line">Line</option><option value="bar">Bar</option></select></div><div class="split"><div class="card"><div class="chart-wrap"><canvas id="cPow"></canvas></div></div><div class="card"><div class="chart-wrap"><canvas id="cPow2"></canvas></div></div></div></div>
+    </section>
   </div>
 </div>
+
 <script>
 (() => {
-  const state={timers:[],histRows:[],ready:false};
-  const fmtN=(v)=>Number.isFinite(Number(v))?Number(v).toFixed(3):'-';
-  const fmtTs=(s)=>{const d=new Date(s);if(Number.isNaN(d.getTime()))return String(s||'');const p=(x)=>String(x).padStart(2,'0');return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;};
-  const h=()=>({apikey:document.getElementById('restKey').value.trim(),Authorization:`Bearer ${document.getElementById('restKey').value.trim()}`});
-  const base=()=>document.getElementById('restUrl').value.trim().replace(/\/+$/,'');
-  const req=async(path)=>{const r=await fetch(`${base()}/${path}`,{headers:h(),cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json();};
-
-  const chartCfg={responsive:true,maintainAspectRatio:false,animation:false,parsing:false};
-  const liveChart=new Chart(document.getElementById('liveChart'),{type:'line',data:{labels:[],datasets:[{label:'Live Avg',data:[],borderColor:'#16a34a',tension:.2}]},options:chartCfg});
-  const repChart=new Chart(document.getElementById('repChart'),{type:'line',data:{labels:[],datasets:[{label:'Report',data:[],borderColor:'#007acc'}]},options:chartCfg});
-  const powerChart=new Chart(document.getElementById('powerChart'),{type:'line',data:{labels:[],datasets:[{label:'kW',data:[],borderColor:'#22c55e'}]},options:chartCfg});
-  const energyChart=new Chart(document.getElementById('energyChart'),{type:'bar',data:{labels:[],datasets:[{label:'kWh',data:[],backgroundColor:'#0ea5e9'}]},options:chartCfg});
-
-  const normalize=(rows)=>{const m=new Map();(rows||[]).forEach(r=>{const k=`${r.ts}|${r.gateway_id||r.gateway_name}|${r.tag}`;if(!m.has(k))m.set(k,r);});return [...m.values()].sort((a,b)=>new Date(a.ts)-new Date(b.ts));};
+  const S={rows:[],hist:[],rep:[],timers:[]};
+  const E=id=>document.getElementById(id);
+  const ts=v=>{const d=new Date(v);if(Number.isNaN(d.getTime()))return String(v||'');const p=x=>String(x).padStart(2,'0');return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;};
+  const n=v=>Number.isFinite(Number(v))?Number(v).toFixed(3):'-';
+  const headers=()=>({apikey:E('restKey').value.trim(),Authorization:`Bearer ${E('restKey').value.trim()}`});
+  const base=()=>E('restUrl').value.trim().replace(/\/+$/,'');
+  const uniq=(rows)=>{const m=new Map();(rows||[]).forEach(r=>{const k=`${r.ts}|${r.gateway_id||''}|${r.tag||''}`; if(!m.has(k))m.set(k,r);}); return [...m.values()].sort((a,b)=>new Date(a.ts)-new Date(b.ts));};
 
   async function loadLive(){
-    const latest = await req('latest_machine_state?select=sample_ts_utc,gateway_id,machine_id,tags_json,quality_code&order=sample_ts_utc.desc&limit=120');
+    const liveView=E('viewLive').value.trim()||'latest_machine_state';
+    const r=await fetch(`${base()}/${liveView}?select=sample_ts_utc,gateway_id,machine_id,tags_json,quality_code&order=sample_ts_utc.desc&limit=150`,{headers:headers(),cache:'no-store'});
+    if(!r.ok) throw new Error(`live ${r.status}`);
+    const data=await r.json();
     const rows=[];
-    for(const l of (latest||[])){
-      const tags = Array.isArray(l.tags_json)?l.tags_json:[];
-      for(const t of tags){
-        rows.push({ts:l.sample_ts_utc,gateway_id:l.gateway_id,gateway_name:l.gateway_id,device_name:l.machine_id,tag:String(t.tag_name||''),value:t.value,quality:t.quality_code??l.quality_code??0,quality_label:'GOOD'});
-      }
-    }
-    const n=normalize(rows);
-    const byTs=new Map(); n.forEach(r=>{const t=fmtTs(r.ts),v=Number(r.value);if(!Number.isFinite(v))return;const a=byTs.get(t)||[];a.push(v);byTs.set(t,a);});
-    const labels=[...byTs.keys()].slice(-100),vals=labels.map(k=>{const a=byTs.get(k)||[];return a.length?a.reduce((x,y)=>x+y,0)/a.length:null;});
-    liveChart.data.labels=labels; liveChart.data.datasets[0].data=vals; liveChart.update('none');
-    const gateways=new Set(n.map(r=>String(r.gateway_id||''))).size; const now=Date.now(); const ages=n.map(r=>{const t=Date.parse(r.ts); return Number.isFinite(t)?Math.max(0,(now-t)/1000):0;});
-    document.getElementById('kpiLiveRows').textContent=String(n.length); document.getElementById('kpiGateways').textContent=String(gateways); document.getElementById('kpiAge').textContent=ages.length?(ages.reduce((a,b)=>a+b,0)/ages.length).toFixed(2):'-'; document.getElementById('kpiLast').textContent=n.length?fmtTs(n[n.length-1].ts):'-';
+    for(const s of data||[]){const tags=Array.isArray(s.tags_json)?s.tags_json:[];for(const t of tags){rows.push({ts:s.sample_ts_utc,gateway_id:s.gateway_id,gateway_name:s.gateway_id,device_name:s.machine_id,tag:String(t.tag_name||''),value:t.value,quality:t.quality_code??s.quality_code??0});}}
+    S.rows=uniq(rows);
+    renderDashboard();
   }
 
-  async function loadHistorian(){
-    const lim=document.getElementById('histLimit').value||'500';
-    const needle=(document.getElementById('histTag').value||'').toLowerCase();
-    const raw = await req(`telemetry_samples_raw?select=sample_ts_utc,gateway_id,machine_id,quality_code,tags_json&order=sample_ts_utc.desc&limit=${encodeURIComponent(lim)}`);
+  async function loadHist(){
+    const rawView=E('viewRaw').value.trim()||'telemetry_samples_raw';
+    const r=await fetch(`${base()}/${rawView}?select=sample_ts_utc,gateway_id,machine_id,tags_json,quality_code&order=sample_ts_utc.desc&limit=600`,{headers:headers(),cache:'no-store'});
+    if(!r.ok) throw new Error(`hist ${r.status}`);
+    const data=await r.json();
     const rows=[];
-    for(const r of (raw||[])){
-      const tags=Array.isArray(r.tags_json)?r.tags_json:[];
-      for(const t of tags){
-        const tag=String(t.tag_name||''); if(needle && !tag.toLowerCase().includes(needle)) continue;
-        rows.push({ts:r.sample_ts_utc,gateway_id:r.gateway_id,gateway_name:r.gateway_id,device_name:r.machine_id,tag,value:t.value,quality:t.quality_code??r.quality_code??0,quality_label:'GOOD'});
-      }
-    }
-    state.histRows=normalize(rows).reverse();
-    const tb=document.querySelector('#histTable tbody'); tb.innerHTML='';
-    state.histRows.forEach(r=>{const tr=document.createElement('tr'); tr.innerHTML=`<td>${fmtTs(r.ts)}</td><td>${r.gateway_name||'-'}</td><td>${r.tag||'-'}</td><td>${fmtN(r.value)}</td><td>${r.quality}</td>`; tb.appendChild(tr);});
+    for(const s of data||[]){const tags=Array.isArray(s.tags_json)?s.tags_json:[];for(const t of tags){rows.push({ts:s.sample_ts_utc,gateway_id:s.gateway_id,gateway_name:s.gateway_id,device_name:s.machine_id,tag:String(t.tag_name||''),value:t.value,quality:t.quality_code??s.quality_code??0});}}
+    S.hist=uniq(rows).reverse();
+    renderHistorian();
   }
 
-  function aggregate(rows,mode){ if(mode==='raw')return rows.map(r=>({k:fmtTs(r.ts),v:Number(r.value)})).filter(x=>Number.isFinite(x.v)); const b=new Map(); rows.forEach(r=>{const d=new Date(r.ts),v=Number(r.value); if(Number.isNaN(d.getTime())||!Number.isFinite(v))return; let key=''; if(mode==='minute')key=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()} ${d.getHours()}:${d.getMinutes()}`; if(mode==='hour')key=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()} ${d.getHours()}:00`; if(mode==='day')key=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`; const a=b.get(key)||[]; a.push(v); b.set(key,a);}); return [...b.entries()].map(([k,a])=>({k,v:a.reduce((x,y)=>x+y,0)/a.length})); }
+  function aggregate(rows,interval,method){ if(interval==='raw') return rows.map(r=>({ts:ts(r.ts),value:Number(r.value)})).filter(x=>Number.isFinite(x.value)); const b=new Map(); rows.forEach(r=>{const d=new Date(r.ts),v=Number(r.value);if(Number.isNaN(d.getTime())||!Number.isFinite(v))return; let k=''; if(interval==='minute')k=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()} ${d.getHours()}:${d.getMinutes()}`; if(interval==='hour')k=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()} ${d.getHours()}:00`; if(interval==='day')k=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`; const a=b.get(k)||[]; a.push(v); b.set(k,a);}); return [...b.entries()].map(([k,a])=>{let v=a[a.length-1]; if(method==='sum')v=a.reduce((x,y)=>x+y,0); else if(method==='min')v=Math.min(...a); else if(method==='max')v=Math.max(...a); else v=a.reduce((x,y)=>x+y,0)/a.length; return {ts:k,value:v};}); }
 
-  async function loadReporting(){
-    const needle=(document.getElementById('repTag').value||'').toLowerCase();
-    const mode=document.getElementById('repAgg').value;
-    const rows=(state.histRows||[]).filter(r=>!needle||String(r.tag||'').toLowerCase().includes(needle));
-    const data=aggregate(rows,mode).slice(-220);
-    repChart.data.labels=data.map(x=>x.k); repChart.data.datasets[0].data=data.map(x=>x.v); repChart.update('none');
-    const tb=document.querySelector('#repTable tbody'); tb.innerHTML=''; data.slice(-120).forEach(x=>{const tr=document.createElement('tr'); tr.innerHTML=`<td>${x.k}</td><td>${fmtN(x.v)}</td>`; tb.appendChild(tr);});
-  }
+  function renderDashboard(){ const rows=S.rows; E('dRows').textContent=String(rows.length); E('dGw').textContent=String(new Set(rows.map(r=>r.gateway_id||'')).size); E('dDev').textContent=String(new Set(rows.map(r=>r.device_name||'')).size); const age=rows.length?rows.map(r=>Math.max(0,(Date.now()-Date.parse(r.ts))/1000)).reduce((a,b)=>a+b,0)/rows.length:NaN; E('dAge').textContent=Number.isFinite(age)?age.toFixed(2):'-'; E('dVal').textContent=rows.length?n(rows[rows.length-1].value):'-'; E('dTs').textContent=rows.length?ts(rows[rows.length-1].ts):'-'; const byTs=new Map(); rows.forEach(r=>{const k=ts(r.ts),v=Number(r.value); if(!Number.isFinite(v)) return; const a=byTs.get(k)||[];a.push(v);byTs.set(k,a);}); const labels=[...byTs.keys()].slice(-140), vals=labels.map(k=>{const a=byTs.get(k)||[];return a.length?a.reduce((x,y)=>x+y,0)/a.length:null;}); charts.dash.data.labels=labels; charts.dash.data.datasets[0].data=vals; charts.dash.update('none'); }
+  function renderHistorian(){ const needle=(E('hTag').value||'').toLowerCase(); const rows=S.hist.filter(r=>!needle||String(r.tag||'').toLowerCase().includes(needle)); E('hBody').innerHTML=rows.slice(0,1500).map(r=>`<tr><td>${ts(r.ts)}</td><td>${r.gateway_name||r.gateway_id||'-'}</td><td>${r.tag||'-'}</td><td>${n(r.value)}</td></tr>`).join(''); }
+  function renderReporting(){ const needle=(E('rTag').value||'').toLowerCase(); const rows=S.hist.filter(r=>!needle||String(r.tag||'').toLowerCase().includes(needle)); const series=aggregate(rows,E('rAgg').value,E('rMethod').value).slice(-260); S.rep=series; charts.rep.data.labels=series.map(x=>x.ts); charts.rep.data.datasets[0].data=series.map(x=>x.value); charts.rep.update('none'); E('rBody').innerHTML=series.slice(-150).map(x=>`<tr><td>${x.ts}</td><td>${n(x.value)}</td></tr>`).join(''); }
+  function renderPower(){ const metric=E('pMetric').value; const type=E('pType').value; const rows=S.hist.filter(r=>String(r.tag||'').includes('power')||String(r.tag||'').includes('energy')||String(r.tag||'').includes('voltage')||String(r.tag||'').includes('current')); const byTs=new Map(); rows.forEach(r=>{const k=ts(r.ts); const obj=byTs.get(k)||{ts:k}; obj[r.tag]=Number(r.value); byTs.set(k,obj);}); const data=[...byTs.values()].slice(-160); charts.pow.config.type=type; charts.pow.data.labels=data.map(x=>x.ts); charts.pow.data.datasets[0].label=metric; charts.pow.data.datasets[0].data=data.map(x=>x[metric]??null); charts.pow.update('none'); charts.pow2.data.labels=data.map(x=>x.ts); charts.pow2.data.datasets[0].data=data.map(x=>x.energy_wh?Number(x.energy_wh)/1000:null); charts.pow2.update('none'); }
 
-  async function loadPower(){
-    const rows=(state.histRows||[]).filter(r=>String(r.tag||'').includes('power')||String(r.tag||'').includes('energy')||String(r.tag||'').includes('voltage')||String(r.tag||'').includes('current')||String(r.tag||'').includes('frequency'));
-    const last=rows[0]||{};
-    const pick=(name)=>{const hit=rows.find(r=>String(r.tag||'')===name); return Number(hit?.value);};
-    const voltage=pick('voltage_v'), current=pick('current_a'), powerW=pick('active_power_total_w')||pick('active_power_w'), energyWh=pick('energy_total_wh')||pick('energy_wh'), pf=pick('power_factor_total')||pick('power_factor'), freq=pick('frequency_hz');
-    document.getElementById('pVoltage').textContent=fmtN(voltage); document.getElementById('pCurrent').textContent=fmtN(current); document.getElementById('pPower').textContent=Number.isFinite(powerW)?fmtN(powerW/1000):'-'; document.getElementById('pEnergy').textContent=Number.isFinite(energyWh)?fmtN(energyWh/1000):'-'; document.getElementById('pPf').textContent=fmtN(pf); document.getElementById('pFreq').textContent=fmtN(freq);
-    const pRows=rows.filter(r=>String(r.tag||'').includes('active_power')); const eRows=rows.filter(r=>String(r.tag||'').includes('energy_'));
-    powerChart.data.labels=pRows.slice(-120).map(r=>fmtTs(r.ts)); powerChart.data.datasets[0].data=pRows.slice(-120).map(r=>Number(r.value)/1000); powerChart.update('none');
-    energyChart.data.labels=eRows.slice(-120).map(r=>fmtTs(r.ts)); energyChart.data.datasets[0].data=eRows.slice(-120).map(r=>Number(r.value)/1000); energyChart.update('none');
-  }
+  async function refresh(){ await Promise.all([loadLive(),loadHist()]); renderReporting(); renderPower(); E('conn').className='status ok'; E('conn').textContent='CONNECTED'; }
+  function timers(){ S.timers.forEach(clearInterval); S.timers=[]; const vis=()=>document.visibilityState==='visible'; S.timers.push(setInterval(()=>vis()&&loadLive().catch(()=>{}),2200)); S.timers.push(setInterval(()=>vis()&&loadHist().catch(()=>{}),5000)); }
+  function page(p){ ['dashboard','reporting','historian','power'].forEach(x=>E(`page-${x}`).classList.toggle('hidden',x!==p)); document.querySelectorAll('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.page===p)); }
 
-  function start(){
-    state.timers.forEach(clearInterval); state.timers=[];
-    const visible=()=>document.visibilityState==='visible';
-    state.timers.push(setInterval(()=>visible()&&loadLive(),2000));
-    state.timers.push(setInterval(()=>visible()&&loadHistorian(),4500));
-    state.timers.push(setInterval(()=>visible()&&loadPower(),2500));
-  }
+  const charts={
+    dash:new Chart(E('cDash'),{type:'line',data:{labels:[],datasets:[{label:'Live',data:[],borderColor:'#22c55e',pointRadius:0,tension:.25}]},options:{responsive:true,maintainAspectRatio:false,animation:false,parsing:false}}),
+    rep:new Chart(E('cRep'),{type:'line',data:{labels:[],datasets:[{label:'Report',data:[],borderColor:'#0ea5e9',pointRadius:0,tension:.2}]},options:{responsive:true,maintainAspectRatio:false,animation:false,parsing:false}}),
+    pow:new Chart(E('cPow'),{type:'line',data:{labels:[],datasets:[{label:'Power',data:[],borderColor:'#16a34a',backgroundColor:'rgba(22,163,74,.3)'}]},options:{responsive:true,maintainAspectRatio:false,animation:false,parsing:false}}),
+    pow2:new Chart(E('cPow2'),{type:'bar',data:{labels:[],datasets:[{label:'Energy kWh',data:[],backgroundColor:'#0284c7'}]},options:{responsive:true,maintainAspectRatio:false,animation:false,parsing:false}})
+  };
 
-  document.getElementById('connectBtn').onclick=async()=>{ try{ await loadLive(); await loadHistorian(); await loadReporting(); await loadPower(); start(); state.ready=true; const c=document.getElementById('connState'); c.className='status ok'; c.textContent='Connected'; } catch(e){ alert(e.message); }};
-  document.getElementById('histLoad').onclick=()=>loadHistorian().catch(e=>alert(e.message));
-  document.getElementById('repLoad').onclick=()=>loadReporting().catch(e=>alert(e.message));
-  document.getElementById('tabs').addEventListener('click',(e)=>{const t=e.target.closest('.tab');if(!t)return; document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active')); t.classList.add('active'); document.querySelectorAll('.views>section').forEach(s=>s.classList.remove('active')); document.getElementById(`view-${t.dataset.view}`).classList.add('active');});
-  document.getElementById('themeBtn').onclick=()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='light'?'dark':'light';};
+  E('connect').onclick=()=>refresh().then(timers).catch(e=>E('authMsg').textContent=e.message);
+  E('toggleTheme').onclick=E('theme2').onclick=()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='light'?'dark':'light';};
+  document.querySelectorAll('.nav-btn').forEach(b=>b.onclick=()=>page(b.dataset.page));
+  E('hLoad').onclick=renderHistorian; E('rLoad').onclick=renderReporting; E('pMetric').onchange=renderPower; E('pType').onchange=renderPower;
 })();
 </script>
 </body>
