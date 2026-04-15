@@ -236,7 +236,7 @@ const CLOUD_LIVE_FETCH_LIMIT = 180;
 const CLOUD_HIST_FETCH_LIMIT = 600;
 const CLOUD_LOG_FETCH_LIMIT = 800;
 const CLOUD_EDGE_ALL_KEY = "__all_edges__";
-const UI_RENDER_TICK_MS = 250;
+const UI_RENDER_TICK_MS = 500;
 const RETENTION_PRESETS = {
   day: {
     key: "day",
@@ -1914,6 +1914,7 @@ function AppShell() {
   const cloudLastApplyMsRef = useRef(0);
   const cloudLastAcceptedTsByKeyRef = useRef(new Map());
   const cloudPollLogThrottleRef = useRef({ live: 0, aux: 0 });
+  const powerHistoryLastFetchMsRef = useRef(0);
   const tagAlarmPrefsRef = useRef({});
   const emailSettingsRef = useRef({});
   const historianOutboxRef = useRef([]);
@@ -1976,9 +1977,14 @@ function AppShell() {
   }, []);
 
   useEffect(() => {
-    const timer = setInterval(() => setRenderNowMs(Date.now()), UI_RENDER_TICK_MS);
+    const needsFastUiTick =
+      activePage === "dashboard" ||
+      activePage === "power_overview" ||
+      showTagMonitorModal;
+    const tickMs = needsFastUiTick ? UI_RENDER_TICK_MS : 1500;
+    const timer = setInterval(() => setRenderNowMs(Date.now()), tickMs);
     return () => clearInterval(timer);
-  }, []);
+  }, [activePage, showTagMonitorModal]);
   const [devicesSeeded, setDevicesSeeded] = useState(false);
   const [startupWarningsReady, setStartupWarningsReady] = useState(false);
 
@@ -4479,8 +4485,12 @@ function AppShell() {
           }
         }
         if (!stopped && activePage === "power_overview") {
-          const histRes = await getPowerHistory(5000, "");
-          if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
+          const nowMs = Date.now();
+          if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= 2000) {
+            powerHistoryLastFetchMsRef.current = nowMs;
+            const histRes = await getPowerHistory(1500, "");
+            if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
+          }
         }
       } catch (err) {
         if (!stopped) {
@@ -4495,8 +4505,12 @@ function AppShell() {
       }
     };
 
+    const pollMs =
+      activePage === "power_overview" || activePage === "dashboard" || activePage === "tags"
+        ? 1000
+        : 2500;
     pollPower();
-    const timer = setInterval(pollPower, 1000);
+    const timer = setInterval(pollPower, pollMs);
     return () => {
       stopped = true;
       clearInterval(timer);

@@ -103,6 +103,7 @@ class PowerManager:
         self._last_samples: dict[str, dict[str, Any]] = {}
         self._status_by_device: dict[str, dict[str, Any]] = {}
         self._next_poll_at: dict[str, float] = {}
+        self._register_backoff_until: dict[str, dict[int, float]] = {}
         self._thread.start()
 
     @staticmethod
@@ -296,18 +297,26 @@ class PowerManager:
         client = self._clients.get(device_id)
         host = str(device.get("ip") or "")
         port = int(device.get("port") or 502)
+        poll_interval_ms = max(250, int(device.get("poll_interval_ms") or 1000))
+        target_timeout = max(0.2, min(0.9, (poll_interval_ms / 1000.0) * 0.6))
         if client is None:
-            client = ModbusTcpClient(host=host, port=port, timeout=1.5)
+            client = ModbusTcpClient(host=host, port=port, timeout=target_timeout)
             self._clients[device_id] = client
             return client
         same_target = str(getattr(client, "host", "") or "") == host and int(getattr(client, "port", 0) or 0) == port
+        timeout_changed = abs(float(getattr(client, "timeout", target_timeout) or target_timeout) - target_timeout) > 0.05
         if not same_target:
             try:
                 client.close()
             except Exception:
                 pass
-            client = ModbusTcpClient(host=host, port=port, timeout=1.5)
+            client = ModbusTcpClient(host=host, port=port, timeout=target_timeout)
             self._clients[device_id] = client
+        elif timeout_changed:
+            try:
+                client.timeout = target_timeout
+            except Exception:
+                pass
         return client
 
     def _poll_device(self, device: dict[str, Any]) -> None:
@@ -321,8 +330,13 @@ class PowerManager:
             raise RuntimeError("Unable to connect")
         raw_values: dict[str, float] = {}
         addr_to_keys: dict[int, list[str]] = {}
+        now_mono = time.monotonic()
+        device_backoff = self._register_backoff_until.setdefault(device_id, {})
         for key, addr in registers.items():
             addr_int = int(addr)
+            fail_until = float(device_backoff.get(addr_int, 0.0) or 0.0)
+            if fail_until > now_mono:
+                continue
             addr_to_keys.setdefault(addr_int, []).append(str(key))
         sorted_addrs = sorted(addr_to_keys.keys())
         blocks: list[tuple[int, int]] = []
@@ -360,17 +374,21 @@ class PowerManager:
                 for addr, keys in addr_to_keys.items():
                     if addr < block_start or addr > block_end:
                         continue
-                    res = client.read_input_registers(address=int(addr), count=2, slave=unit_id)
-                    if getattr(res, "isError", lambda: True)():
-                        raise RuntimeError(f"Read failed for register {addr}")
-                    pair = list(getattr(res, "registers", []) or [0, 0])
-                    val = self._decode_float32_be(pair)
-                    for key in keys:
-                        raw_values[key] = val
-        if raw_values:
-            missing = [str(k) for k in registers.keys() if str(k) not in raw_values]
-            if missing:
-                raise RuntimeError(f"Read incomplete; missing registers for: {', '.join(missing)}")
+                    try:
+                        res = client.read_input_registers(address=int(addr), count=2, slave=unit_id)
+                        if getattr(res, "isError", lambda: True)():
+                            device_backoff[int(addr)] = now_mono + 15.0
+                            continue
+                        pair = list(getattr(res, "registers", []) or [0, 0])
+                        val = self._decode_float32_be(pair)
+                        for key in keys:
+                            raw_values[key] = val
+                        device_backoff.pop(int(addr), None)
+                    except Exception:
+                        device_backoff[int(addr)] = now_mono + 15.0
+                        continue
+        if not raw_values:
+            raise RuntimeError("Read failed for all configured registers")
 
         ct_ratio = 1.0
         vt_ratio = 1.0
@@ -517,7 +535,7 @@ class PowerManager:
                 # Keep cadence stable and avoid bursty catch-up that makes charts look erratic.
                 next_due = max(due_at + interval_s, finished + 0.02)
                 self._next_poll_at[device_id] = next_due
-            time.sleep(0.08)
+            time.sleep(0.02)
 
     def get_status(self) -> dict[str, Any]:
         cfg = self.get_config()
