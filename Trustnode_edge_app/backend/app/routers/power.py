@@ -103,14 +103,17 @@ def get_power_status(request: Request) -> dict:
             except Exception:
                 age_s = None
         poll_ms = int(d.get("poll_interval_ms") or 1000)
-        connected = bool(latest) and (age_s is not None and age_s <= max(5.0, poll_ms / 1000.0 * 4.0))
+        # Cloud reads can lag edge writes because of sync batching and network jitter.
+        # Keep status stable for operators while still marking truly stale streams offline.
+        freshness_window_s = max(20.0, (poll_ms / 1000.0) * 20.0)
+        connected = bool(latest) and (age_s is not None and age_s <= freshness_window_s)
         any_connected = any_connected or connected
         row = {
             "device_id": did,
             "name": str(d.get("name") or did),
             "connected": connected,
             "enabled": bool(d.get("enabled", True)),
-            "last_error": "" if connected else "No fresh cloud power rows",
+            "last_error": "" if connected else f"No fresh cloud power rows (>{int(freshness_window_s)}s)",
             "last_poll_utc": last_ts,
             "last_success_utc": last_ts,
             "ip": str(d.get("ip") or ""),

@@ -5933,12 +5933,12 @@ function AppShell() {
       }
     }
 
-    return Array.from(groups.values())
-      .map((g) => {
+    const mapped = Array.from(groups.values()).map((g) => {
         const ageMs = g.lastLiveUtc ? Date.now() - parseTimestampMs(g.lastLiveUtc) : Number.POSITIVE_INFINITY;
         const liveHealthy = Number.isFinite(ageMs) ? ageMs <= 10000 : false;
         const hasConfigMetadata = g.dbNames.size > 0;
-        const liveRecent = Number.isFinite(ageMs) ? ageMs <= 15 * 60 * 1000 : false;
+        // Edge selector in cloud mode should primarily show active feeds.
+        const liveRecent = Number.isFinite(ageMs) ? ageMs <= 3 * 60 * 1000 : false;
         const configMs = g.lastConfigUtc ? parseTimestampMs(g.lastConfigUtc) : Number.NaN;
         const configRecent = Number.isFinite(configMs) ? Math.max(0, Date.now() - configMs) <= 24 * 60 * 60 * 1000 : false;
         return {
@@ -5947,12 +5947,16 @@ function AppShell() {
           gatewayCount: g.gatewayIds.size,
           liveGatewayIds: Array.from(g.liveGatewayIds || []),
           liveHealthy,
-          includeInSelector: liveRecent || (hasConfigMetadata && configRecent),
+          liveRecent,
+          hasConfigMetadata,
+          configRecent,
           dbNamesText: Array.from(g.dbNames).sort().join(", "),
         };
-      })
-      .filter((g) => g.includeInSelector)
-      .sort((a, b) => String(b.lastLiveUtc || b.lastConfigUtc || "").localeCompare(String(a.lastLiveUtc || a.lastConfigUtc || "")));
+      });
+    const liveOnly = mapped.filter((g) => g.liveRecent);
+    const fallback = mapped.filter((g) => g.hasConfigMetadata && g.configRecent);
+    const source = liveOnly.length ? liveOnly : fallback;
+    return source.sort((a, b) => String(b.lastLiveUtc || b.lastConfigUtc || "").localeCompare(String(a.lastLiveUtc || a.lastConfigUtc || "")));
   }, [endpointMode, dbConnections, gatewayConfigs, dataLog, readings]);
   const selectedCloudEdge = useMemo(() => {
     if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY) return null;
