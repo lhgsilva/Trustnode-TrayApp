@@ -315,6 +315,46 @@ function formatMetricValue(value, digits = 2) {
   return num.toFixed(digits);
 }
 
+function formatChartValue(value, maxDigits = 3) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "-";
+  const fixed = num.toFixed(Math.max(0, Math.min(6, Number(maxDigits) || 3)));
+  return String(Number(fixed));
+}
+
+function quantizeDomain(domain, step = 0.5, floorZero = false) {
+  if (!Array.isArray(domain) || domain.length !== 2) return domain;
+  let min = Number(domain[0]);
+  let max = Number(domain[1]);
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return domain;
+  if (max < min) [min, max] = [max, min];
+  const s = Math.max(0.000001, Number(step) || 0.5);
+  min = Math.floor(min / s) * s;
+  max = Math.ceil(max / s) * s;
+  if (floorZero) min = Math.max(0, min);
+  if (min === max) max = min + s;
+  return [Number(min.toFixed(6)), Number(max.toFixed(6))];
+}
+
+function buildYAxisTicks(domain, step = 0.5, maxTicks = 14) {
+  if (!Array.isArray(domain) || domain.length !== 2) return undefined;
+  const min = Number(domain[0]);
+  const max = Number(domain[1]);
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return undefined;
+  const safeMaxTicks = Math.max(2, Number(maxTicks) || 14);
+  let tickStep = Math.max(0.000001, Number(step) || 0.5);
+  let count = Math.round((max - min) / tickStep) + 1;
+  if (count > safeMaxTicks) {
+    const mult = Math.ceil(count / safeMaxTicks);
+    tickStep *= mult;
+  }
+  const start = Math.floor(min / tickStep) * tickStep;
+  const end = Math.ceil(max / tickStep) * tickStep;
+  const ticks = [];
+  for (let v = start; v <= end + tickStep * 0.5; v += tickStep) ticks.push(Number(v.toFixed(6)));
+  return ticks;
+}
+
 function computeMultiSeriesDomain(rows, keys, floorZero = true) {
   const vals = [];
   for (const row of Array.isArray(rows) ? rows : []) {
@@ -349,7 +389,7 @@ function computeMultiSeriesDomain(rows, keys, floorZero = true) {
     max += pad;
   }
   if (floorZero) min = Math.max(0, min);
-  return [Number(min.toFixed(4)), Number(max.toFixed(4))];
+  return quantizeDomain([Number(min.toFixed(4)), Number(max.toFixed(4))], 0.5, floorZero);
 }
 
 const POWER_REGISTER_HINTS = {
@@ -369,14 +409,28 @@ const POWER_PROFILE_DEFAULTS = {
   single_phase: "weidmuller_em525_single_phase_basic",
   three_phase: "weidmuller_em525_three_phase_basic",
 };
+const DEFAULT_POWER_REGISTER_SCALE = 1;
+
+function buildRegisterScaleMap(registers, existing = {}) {
+  const out = {};
+  const regMap = registers && typeof registers === "object" ? registers : {};
+  const scaleMap = existing && typeof existing === "object" ? existing : {};
+  for (const key of Object.keys(regMap)) {
+    const parsed = Number(scaleMap[key]);
+    out[key] = Number.isFinite(parsed) && parsed !== 0 ? parsed : DEFAULT_POWER_REGISTER_SCALE;
+  }
+  return out;
+}
 const POWER_PERIOD_OPTIONS = [
   { value: "1h", label: "Last 1 hour", ms: 60 * 60 * 1000 },
+  { value: "6h", label: "Last 6 hours", ms: 6 * 60 * 60 * 1000 },
   { value: "24h", label: "Last 24 hours", ms: 24 * 60 * 60 * 1000 },
   { value: "7d", label: "Last 7 days", ms: 7 * 24 * 60 * 60 * 1000 },
   { value: "30d", label: "Last 30 days", ms: 30 * 24 * 60 * 60 * 1000 },
 ];
 const POWER_AGG_OPTIONS = ["avg", "max", "min", "sum"];
 const POWER_INTERVAL_OPTIONS = [
+  { value: "second", label: "Second" },
   { value: "minute", label: "Minute" },
   { value: "hour", label: "Hour" },
   { value: "day", label: "Day" },
@@ -478,7 +532,7 @@ function rowTsMs(row) {
 function computeFreshness(tsRaw, nowMs = Date.now()) {
   const ms = parseTimestampMs(tsRaw);
   if (!Number.isFinite(ms)) {
-    return { ageMs: Number.POSITIVE_INFINITY, label: "No data", level: "stale" };
+    return { ageMs: Number.POSITIVE_INFINITY, label: "Offline", level: "stale" };
   }
   const ageMs = Math.max(0, nowMs - ms);
   if (ageMs <= 2000) return { ageMs, label: `Live ${(ageMs / 1000).toFixed(1)}s`, level: "live" };
@@ -634,10 +688,14 @@ function computeSeriesDomain(points, previousDomain = null) {
   const pad = Math.max(span * 0.08, ref * 0.02, 0.25);
   const nextMin = span < 1e-9 ? min - pad : min - pad;
   const nextMax = span < 1e-9 ? max + pad : max + pad;
-  if (!Array.isArray(previousDomain) || previousDomain.length !== 2) return [Number(nextMin.toFixed(6)), Number(nextMax.toFixed(6))];
+  if (!Array.isArray(previousDomain) || previousDomain.length !== 2) {
+    return quantizeDomain([Number(nextMin.toFixed(6)), Number(nextMax.toFixed(6))], 0.5, false);
+  }
   const prevMin = Number(previousDomain[0]);
   const prevMax = Number(previousDomain[1]);
-  if (!Number.isFinite(prevMin) || !Number.isFinite(prevMax) || prevMax <= prevMin) return [nextMin, nextMax];
+  if (!Number.isFinite(prevMin) || !Number.isFinite(prevMax) || prevMax <= prevMin) {
+    return quantizeDomain([nextMin, nextMax], 0.5, false);
+  }
   // Auto-fit without ratcheting: expand to real bounds immediately, then
   // shrink toward new bounds smoothly so the chart remains stable.
   const prevSpan = Math.max(prevMax - prevMin, 1e-9);
@@ -645,12 +703,12 @@ function computeSeriesDomain(points, previousDomain = null) {
   const lowerOut = nextMin < prevMin - driftEpsilon;
   const upperOut = nextMax > prevMax + driftEpsilon;
   if (lowerOut || upperOut) {
-    return [lowerOut ? nextMin : prevMin, upperOut ? nextMax : prevMax];
+    return quantizeDomain([lowerOut ? nextMin : prevMin, upperOut ? nextMax : prevMax], 0.5, false);
   }
   const shrinkFactor = 0.45;
   const shrunkMin = prevMin + (nextMin - prevMin) * shrinkFactor;
   const shrunkMax = prevMax + (nextMax - prevMax) * shrinkFactor;
-  return [Number(shrunkMin.toFixed(6)), Number(shrunkMax.toFixed(6))];
+  return quantizeDomain([Number(shrunkMin.toFixed(6)), Number(shrunkMax.toFixed(6))], 0.5, false);
 }
 
 function formatElapsedFromUtc(rawTs) {
@@ -1510,6 +1568,18 @@ function AppShell() {
           energy_consumed_total_wh: 19068,
           energy_delivered_total_wh: 19076,
         },
+        register_scales: {
+          voltage_v: 1,
+          current_a: 1,
+          active_power_w: 1,
+          power_factor: 1,
+          frequency_hz: 1,
+          energy_wh: 1,
+          active_power_total_w: 1,
+          energy_total_wh: 1,
+          energy_consumed_total_wh: 1,
+          energy_delivered_total_wh: 1,
+        },
       },
     ],
   });
@@ -1573,6 +1643,18 @@ function AppShell() {
       energy_total_wh: 19060,
       energy_consumed_total_wh: 19068,
       energy_delivered_total_wh: 19076,
+    },
+    register_scales: {
+      voltage_v: 1,
+      current_a: 1,
+      active_power_w: 1,
+      power_factor: 1,
+      frequency_hz: 1,
+      energy_wh: 1,
+      active_power_total_w: 1,
+      energy_total_wh: 1,
+      energy_consumed_total_wh: 1,
+      energy_delivered_total_wh: 1,
     },
   });
   const [newPowerRegisterKey, setNewPowerRegisterKey] = useState("");
@@ -1699,6 +1781,7 @@ function AppShell() {
   const [deviceTestResult, setDeviceTestResult] = useState(null);
   const [appStoreHydrated, setAppStoreHydrated] = useState(false);
   const reconnectTimerRef = useRef(null);
+  const fileSinkPickerRef = useRef(null);
   const footerRef = useRef(null);
   const historySeqRef = useRef(0);
   const userMenuRef = useRef(null);
@@ -1936,7 +2019,19 @@ function AppShell() {
       }
     }
     if (data.power_management_config && typeof data.power_management_config === "object") {
-      setPowerConfig(data.power_management_config);
+      const incomingPower = data.power_management_config;
+      const devices = Array.isArray(incomingPower?.devices) ? incomingPower.devices : [];
+      setPowerConfig({
+        ...incomingPower,
+        devices: devices.map((d) => {
+          const registers = d?.registers && typeof d.registers === "object" ? d.registers : {};
+          return {
+            ...(d || {}),
+            registers,
+            register_scales: buildRegisterScaleMap(registers, d?.register_scales || {}),
+          };
+        }),
+      });
     }
     setAppMetadata(metadata);
   };
@@ -4041,7 +4136,21 @@ function AppShell() {
           })
         );
         if (!stopped) {
-          if (cfgRes?.ok && cfgRes?.config) setPowerConfig(cfgRes.config);
+          if (cfgRes?.ok && cfgRes?.config) {
+            const cfg = cfgRes.config || {};
+            const cfgDevices = Array.isArray(cfg.devices) ? cfg.devices : [];
+            setPowerConfig({
+              ...cfg,
+              devices: cfgDevices.map((d) => {
+                const registers = d?.registers && typeof d.registers === "object" ? d.registers : {};
+                return {
+                  ...(d || {}),
+                  registers,
+                  register_scales: buildRegisterScaleMap(registers, d?.register_scales || {}),
+                };
+              }),
+            });
+          }
           if (statusRes?.ok && statusRes?.status) setPowerStatus(statusRes.status);
           const selectedDeviceId = String(cfgRes?.config?.selected_device_id || "");
           const selectedSample =
@@ -4240,7 +4349,21 @@ function AppShell() {
     setPowerBusy(true);
     try {
       const res = await updatePowerConfig(powerConfig);
-      if (res?.ok && res?.config) setPowerConfig(res.config);
+      if (res?.ok && res?.config) {
+        const cfg = res.config || {};
+        const cfgDevices = Array.isArray(cfg.devices) ? cfg.devices : [];
+        setPowerConfig({
+          ...cfg,
+          devices: cfgDevices.map((d) => {
+            const registers = d?.registers && typeof d.registers === "object" ? d.registers : {};
+            return {
+              ...(d || {}),
+              registers,
+              register_scales: buildRegisterScaleMap(registers, d?.register_scales || {}),
+            };
+          }),
+        });
+      }
       setPowerResult("Power configuration saved.");
     } catch (err) {
       setPowerResult(`Save failed: ${String(err?.message || err)}`);
@@ -4265,10 +4388,11 @@ function AppShell() {
 
   const selectedPowerLatestByTag = useMemo(() => {
     const did = String(powerConfig?.selected_device_id || "");
-    if (!did) return { values: {}, ts: "" };
+    if (!did) return { values: {}, values_raw: {}, ts: "" };
     let latestTsMs = -1;
     let latestTs = "";
     const values = {};
+    const valuesRaw = {};
     for (const row of powerHistoryRows || []) {
       if (String(row?.gateway_id || "") !== did) continue;
       const rowTs = String(row?.ts || row?.ts_utc || "");
@@ -4280,10 +4404,15 @@ function AppShell() {
         latestTsMs = tsMs;
         latestTs = rowTs;
         for (const k of Object.keys(values)) delete values[k];
+        for (const k of Object.keys(valuesRaw)) delete valuesRaw[k];
       }
-      if (tsMs === latestTsMs) values[tag] = Number(row?.value || 0);
+      if (tsMs === latestTsMs) {
+        const num = Number(row?.value || 0);
+        if (tag.endsWith("_raw")) valuesRaw[tag.slice(0, -4)] = num;
+        else values[tag] = num;
+      }
     }
-    return { values, ts: latestTs };
+    return { values, values_raw: valuesRaw, ts: latestTs };
   }, [powerHistoryRows, powerConfig]);
 
   const selectedPowerRegisterTestResult = useMemo(() => {
@@ -4347,9 +4476,16 @@ function AppShell() {
     const meterIds = (powerConfig?.devices || []).map((d) => String(d?.id || "")).filter(Boolean);
     const bucketKey = (tsMs) => {
       const d = new Date(tsMs);
-      if (powerInterval === "day") return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
-      if (powerInterval === "hour") return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${String(d.getUTCHours()).padStart(2, "0")}:00`;
-      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      const ss = String(d.getSeconds()).padStart(2, "0");
+      if (powerInterval === "day") return `${y}-${m}-${day}`;
+      if (powerInterval === "hour") return `${y}-${m}-${day} ${hh}:00`;
+      if (powerInterval === "minute") return `${y}-${m}-${day} ${hh}:${mm}`;
+      return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
     };
     const powerTags = new Set(["active_power_total_w", "active_power_w"]);
     const buckets = new Map();
@@ -4393,9 +4529,16 @@ function AppShell() {
       .filter((id) => !selectedPowerChartMeters.length || selectedPowerChartMeters.includes(id));
     const bucketKey = (tsMs) => {
       const d = new Date(tsMs);
-      if (powerInterval === "day") return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
-      if (powerInterval === "hour") return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${String(d.getUTCHours()).padStart(2, "0")}:00`;
-      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      const ss = String(d.getSeconds()).padStart(2, "0");
+      if (powerInterval === "day") return `${y}-${m}-${day}`;
+      if (powerInterval === "hour") return `${y}-${m}-${day} ${hh}:00`;
+      if (powerInterval === "minute") return `${y}-${m}-${day} ${hh}:${mm}`;
+      return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
     };
     const metricTagPriority =
       powerMainMetric === "voltage_v"
@@ -4451,7 +4594,7 @@ function AppShell() {
       new Set((powerMainChartData?.rows || []).map((r) => String(r?.ts || "").trim()).filter(Boolean))
     );
     if (!labels.length) return [];
-    const maxTicks = powerInterval === "minute" ? 10 : powerInterval === "hour" ? 12 : 14;
+    const maxTicks = powerInterval === "second" ? 8 : powerInterval === "minute" ? 10 : powerInterval === "hour" ? 12 : 14;
     if (labels.length <= maxTicks) return labels;
     const step = Math.max(1, Math.ceil((labels.length - 1) / (maxTicks - 1)));
     const out = [];
@@ -4471,9 +4614,9 @@ function AppShell() {
     const bucketKey = (tsMs) => {
       const d = new Date(tsMs);
       if (isLast12h) {
-        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")} ${String(d.getUTCHours()).padStart(2, "0")}:00`;
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:00`;
       }
-      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
     };
     const buckets = new Map();
     for (const row of powerHistoryRows || []) {
@@ -4522,7 +4665,15 @@ function AppShell() {
 
   const powerKpis = useMemo(() => {
     const latest = powerTrendData[powerTrendData.length - 1] || null;
-    const totalEnergyKwh = powerTrendData.reduce((acc, r) => acc + Number(r.total_kw || 0), 0) * (powerInterval === "day" ? 24 : powerInterval === "hour" ? 1 : 1 / 60);
+    const intervalHours =
+      powerInterval === "day"
+        ? 24
+        : powerInterval === "hour"
+          ? 1
+          : powerInterval === "minute"
+            ? 1 / 60
+            : 1 / 3600;
+    const totalEnergyKwh = powerTrendData.reduce((acc, r) => acc + Number(r.total_kw || 0), 0) * intervalHours;
     const totalCost = totalEnergyKwh * powerCostPerKwh;
     const liveKw = Number(latest?.total_kw || 0);
     const peakKw = powerTrendData.reduce((m, r) => Math.max(m, Number(r.total_kw || 0)), 0);
@@ -4551,7 +4702,11 @@ function AppShell() {
         return text.length >= 10 ? text.slice(5, 10) : text;
       }
       const parts = text.split(" ");
-      if (parts.length >= 2) return parts[1].slice(0, 5);
+      if (parts.length >= 2) {
+        if (powerInterval === "second") return parts[1].slice(0, 8);
+        return parts[1].slice(0, 5);
+      }
+      if (powerInterval === "second") return text.length >= 8 ? text.slice(-8) : text;
       return text.length >= 5 ? text.slice(-5) : text;
     },
     [powerInterval]
@@ -4664,6 +4819,18 @@ function AppShell() {
         energy_wh: 19054,
         ...(powerProfiles?.profiles?.[powerProfiles?.mode_defaults?.single_phase || POWER_PROFILE_DEFAULTS.single_phase] || {}),
       },
+      register_scales: {
+        voltage_v: 1,
+        current_a: 1,
+        active_power_w: 1,
+        power_factor: 1,
+        frequency_hz: 1,
+        energy_wh: 1,
+        active_power_total_w: 1,
+        energy_total_wh: 1,
+        energy_consumed_total_wh: 1,
+        energy_delivered_total_wh: 1,
+      },
     });
     setShowPowerDeviceModal(true);
   };
@@ -4679,10 +4846,14 @@ function AppShell() {
       electrical_mode: mode,
       register_profile: profileName,
       use_custom_registers: Boolean(device?.use_custom_registers),
-      registers: {
-        ...profileRegs,
-        ...(device.registers || {}),
-      },
+      registers: (() => {
+        const merged = { ...profileRegs, ...(device.registers || {}) };
+        return merged;
+      })(),
+      register_scales: buildRegisterScaleMap(
+        { ...profileRegs, ...(device.registers || {}) },
+        device.register_scales || {}
+      ),
     });
     setShowPowerDeviceModal(true);
   };
@@ -4711,6 +4882,7 @@ function AppShell() {
         wiring_type: String(powerDeviceForm.electrical_mode || "single_phase"),
         register_profile: String(powerDeviceForm.register_profile || POWER_PROFILE_DEFAULTS.single_phase),
         use_custom_registers: Boolean(powerDeviceForm.use_custom_registers),
+        register_scales: buildRegisterScaleMap(powerDeviceForm.registers || {}, powerDeviceForm.register_scales || {}),
         min_active_power_kw: powerDeviceForm.min_active_power_kw === "" ? "" : Number(powerDeviceForm.min_active_power_kw || 0),
         max_active_power_kw: powerDeviceForm.max_active_power_kw === "" ? "" : Number(powerDeviceForm.max_active_power_kw || 0),
       };
@@ -4749,6 +4921,7 @@ function AppShell() {
         if (field === "use_custom_registers" && value === false) {
           const profileName = String(next.register_profile || "");
           next.registers = { ...(powerProfiles?.profiles?.[profileName] || {}) };
+          next.register_scales = buildRegisterScaleMap(next.registers || {}, next.register_scales || {});
         }
         return next;
       });
@@ -4772,6 +4945,7 @@ function AppShell() {
           register_profile: profile,
         };
         if (!Boolean(next.use_custom_registers)) next.registers = profileRegs;
+        next.register_scales = buildRegisterScaleMap(next.registers || {}, next.register_scales || {});
         return next;
       });
       return { ...(prev || {}), devices };
@@ -4792,6 +4966,7 @@ function AppShell() {
           register_profile: profileName,
         };
         if (!Boolean(next.use_custom_registers)) next.registers = profileRegs;
+        next.register_scales = buildRegisterScaleMap(next.registers || {}, next.register_scales || {});
         return next;
       });
       return { ...(prev || {}), devices };
@@ -4808,6 +4983,25 @@ function AppShell() {
           ...d,
           use_custom_registers: true,
           registers: { ...(d.registers || {}), [key]: Number(value || 0) },
+          register_scales: { ...(d.register_scales || {}), [key]: Number(d?.register_scales?.[key] || 1) || 1 },
+        };
+      });
+      return { ...(prev || {}), devices };
+    });
+  };
+
+  const setPowerDeviceRegisterScaleField = (key, value) => {
+    const selectedId = String(powerConfig?.selected_device_id || "");
+    const parsed = Number(value);
+    const scale = Number.isFinite(parsed) && parsed !== 0 ? parsed : 1;
+    setPowerConfig((prev) => {
+      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+      const devices = prevDevices.map((d) => {
+        if (String(d?.id || "") !== selectedId) return d;
+        return {
+          ...d,
+          use_custom_registers: true,
+          register_scales: { ...(d.register_scales || {}), [key]: scale },
         };
       });
       return { ...(prev || {}), devices };
@@ -4839,8 +5033,10 @@ function AppShell() {
       const devices = prevDevices.map((d) => {
         if (String(d?.id || "") !== selectedId) return d;
         const nextRegs = { ...(d.registers || {}) };
+        const nextScales = { ...(d.register_scales || {}) };
         delete nextRegs[regKey];
-        return { ...d, use_custom_registers: true, registers: nextRegs };
+        delete nextScales[regKey];
+        return { ...d, use_custom_registers: true, registers: nextRegs, register_scales: nextScales };
       });
       return { ...(prev || {}), devices };
     });
@@ -4852,7 +5048,21 @@ function AppShell() {
     setPowerBusy(true);
     try {
       const res = shouldRun ? await startPowerDevice(did) : await stopPowerDevice(did);
-      if (res?.ok && res?.config) setPowerConfig(res.config);
+      if (res?.ok && res?.config) {
+        const cfg = res.config || {};
+        const cfgDevices = Array.isArray(cfg.devices) ? cfg.devices : [];
+        setPowerConfig({
+          ...cfg,
+          devices: cfgDevices.map((d) => {
+            const registers = d?.registers && typeof d.registers === "object" ? d.registers : {};
+            return {
+              ...(d || {}),
+              registers,
+              register_scales: buildRegisterScaleMap(registers, d?.register_scales || {}),
+            };
+          }),
+        });
+      }
       setPowerResult(shouldRun ? `Power meter ${did} started.` : `Power meter ${did} stopped.`);
     } catch (err) {
       setPowerResult(`Power meter control failed: ${String(err?.message || err)}`);
@@ -5084,7 +5294,14 @@ function AppShell() {
     if (!value) return "";
     const ms = parseTimestampMs(value);
     if (!Number.isFinite(ms)) return String(value);
-    return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
+    const d = new Date(ms);
+    const dd = String(d.getDate()).padStart(2, "0");
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const yyyy = String(d.getFullYear());
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mi = String(d.getMinutes()).padStart(2, "0");
+    const ss = String(d.getSeconds()).padStart(2, "0");
+    return `${dd}/${mm}/${yyyy} ${hh}:${mi}:${ss}`;
   };
 
   const inRange = (value, from, to) => {
@@ -5819,11 +6036,14 @@ function AppShell() {
     return { all: rows, local, remote };
   };
   const unknownRunningGateways = useMemo(() => {
-    const known = new Set(gatewayConfigsView.map((g) => g.id));
+    const known = new Set([
+      ...gatewayConfigsView.map((g) => String(g.id || "")),
+      ...powerGatewayDescriptors.map((g) => String(g.id || "")),
+    ]);
     return Object.values(gatewayRuntimeStatusesView).filter(
       (s) => Boolean(s?.running) && !known.has(String(s?.gateway_id || ""))
     );
-  }, [gatewayRuntimeStatusesView, gatewayConfigsView]);
+  }, [gatewayRuntimeStatusesView, gatewayConfigsView, powerGatewayDescriptors]);
 
   const isGatewayRunning = (gateway) => {
     if (!gateway) return false;
@@ -5855,8 +6075,8 @@ function AppShell() {
   }, [footerCollapsed, gatewayConfigsView.length, gatewayRuntimeStatusesView]);
 
   const deviceRows = useMemo(
-    () =>
-      devicesView.map((d) => {
+    () => {
+      const plcRows = devicesView.map((d) => {
         const relatedGateways = gatewayConfigsView.filter((g) => String(g.device_id || "") === String(d.id || ""));
         const relatedRuntime = relatedGateways.map((g) => gatewayRuntimeStatusesView[g.id]).filter(Boolean);
         const hasRelated = relatedRuntime.length > 0;
@@ -5887,8 +6107,27 @@ function AppShell() {
           statusKey = "warning";
         }
         return { ...d, protocolOk, status, statusKey };
-      }),
-    [devicesView, gatewayConfigsView, gatewayRuntimeStatusesView, endpointMode, isHostedWebClient]
+      });
+      const meterRows = (powerConfig?.devices || []).map((m) => {
+        const did = String(m?.id || "");
+        const st = powerDeviceStatuses?.[did] || {};
+        return {
+          is_power_meter: true,
+          id: did,
+          name: String(m?.name || did),
+          gateway_type: "modbus_tcp",
+          plc_ip: String(m?.ip || ""),
+          ping_ok: Boolean(st?.connected),
+          protocol_ok: Boolean(st?.connected),
+          protocolOk: Boolean(st?.connected),
+          status: Boolean(st?.connected) ? "Online" : "Offline",
+          statusKey: Boolean(st?.connected) ? "online" : "offline",
+          last_test: String(st?.last_error || ""),
+        };
+      });
+      return [...plcRows, ...meterRows];
+    },
+    [devicesView, gatewayConfigsView, gatewayRuntimeStatusesView, endpointMode, isHostedWebClient, powerConfig, powerDeviceStatuses]
   );
 
   const tagRows = useMemo(() => {
@@ -9068,7 +9307,7 @@ function AppShell() {
     const tags = doc.columns || [];
     const rows = doc.preview_rows || [];
     const chartSvg = buildReportSvgChart(doc);
-    const headerCells = ["Timestamp (UTC)", ...tags].map((x) => `<th>${String(x).replaceAll("<", "&lt;")}</th>`).join("");
+    const headerCells = ["Timestamp", ...tags].map((x) => `<th>${String(x).replaceAll("<", "&lt;")}</th>`).join("");
     const bodyRows = rows.map((r) => {
       const cells = [r.ts, ...tags.map((t) => r[t])].map((v) => `<td>${String(v ?? "").replaceAll("<", "&lt;")}</td>`).join("");
       return `<tr>${cells}</tr>`;
@@ -9712,7 +9951,7 @@ function AppShell() {
                           <div>Device: {item.device_name}</div>
                           <div>
                             <span className={`status-pill ${freshnessBadgeClass(item.freshness?.level)}`}>
-                              {item.freshness?.label || "No data"}
+                              {item.freshness?.label || "-"}
                             </span>
                           </div>
                         </div>
@@ -9774,7 +10013,7 @@ function AppShell() {
                           <span>Last: {item.last_ts}</span>
                           <span>
                             <span className={`status-pill ${freshnessBadgeClass(item.freshness?.level)}`}>
-                              {item.freshness?.label || "No data"}
+                              {item.freshness?.label || "-"}
                             </span>
                           </span>
                           <span>Device: {item.device_name}</span>
@@ -9791,8 +10030,16 @@ function AppShell() {
                                   domain={item.xDomain || [1, 121]}
                                   allowDataOverflow
                                 />
-                                <YAxis width={60} domain={item.yDomain || ["auto", "auto"]} />
-                                <Tooltip labelFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || String(v)} />
+                                <YAxis
+                                  width={60}
+                                  domain={item.yDomain || ["auto", "auto"]}
+                                  ticks={buildYAxisTicks(item.yDomain || ["auto", "auto"], 0.5, 12)}
+                                  tickFormatter={(v) => formatChartValue(v, 3)}
+                                />
+                                <Tooltip
+                                  labelFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || String(v)}
+                                  formatter={(v) => formatChartValue(v, 3)}
+                                />
                                 <Bar isAnimationActive={false} dataKey="value" fill={item.color || "#16a34a"} maxBarSize={20} />
                               </BarChart>
                             </ResponsiveContainer>
@@ -9806,8 +10053,16 @@ function AppShell() {
                                   domain={item.xDomain || [1, 121]}
                                   allowDataOverflow
                                 />
-                                <YAxis width={52} domain={item.yDomain || ["auto", "auto"]} />
-                                <Tooltip labelFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || String(v)} />
+                                <YAxis
+                                  width={52}
+                                  domain={item.yDomain || ["auto", "auto"]}
+                                  ticks={buildYAxisTicks(item.yDomain || ["auto", "auto"], 0.5, 12)}
+                                  tickFormatter={(v) => formatChartValue(v, 3)}
+                                />
+                                <Tooltip
+                                  labelFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || String(v)}
+                                  formatter={(v) => formatChartValue(v, 3)}
+                                />
                                 <Line isAnimationActive={false} type="linear" dataKey="value" stroke={item.color || "#16a34a"} strokeWidth={2} dot={false} />
                               </LineChart>
                             </ResponsiveContainer>
@@ -9934,8 +10189,16 @@ function AppShell() {
                           axisLine={{ stroke: powerChartAxisColor }}
                           tickLine={{ stroke: powerChartAxisColor }}
                         />
-                        <YAxis width={62} domain={powerMainYDomain} tick={{ fontSize: 11, fill: powerChartAxisColor }} axisLine={{ stroke: powerChartAxisColor }} tickLine={{ stroke: powerChartAxisColor }} />
-                        <Tooltip />
+                        <YAxis
+                          width={62}
+                          domain={powerMainYDomain}
+                          ticks={buildYAxisTicks(powerMainYDomain, 0.5, 12)}
+                          tickFormatter={(v) => formatChartValue(v, 3)}
+                          tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                          axisLine={{ stroke: powerChartAxisColor }}
+                          tickLine={{ stroke: powerChartAxisColor }}
+                        />
+                        <Tooltip formatter={(v) => formatChartValue(v, 3)} />
                         {powerMainChartType === "bar" ? (
                           <>
                             <Bar dataKey="total" name="Total" fill="#16a34a" isAnimationActive={false} />
@@ -10007,8 +10270,16 @@ function AppShell() {
                             axisLine={{ stroke: powerChartAxisColor }}
                             tickLine={{ stroke: powerChartAxisColor }}
                           />
-                          <YAxis width={64} domain={powerSideYDomain} tick={{ fontSize: 11, fill: powerChartAxisColor }} axisLine={{ stroke: powerChartAxisColor }} tickLine={{ stroke: powerChartAxisColor }} />
-                          <Tooltip />
+                          <YAxis
+                            width={64}
+                            domain={powerSideYDomain}
+                            ticks={buildYAxisTicks(powerSideYDomain, 0.5, 12)}
+                            tickFormatter={(v) => formatChartValue(v, 3)}
+                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                            axisLine={{ stroke: powerChartAxisColor }}
+                            tickLine={{ stroke: powerChartAxisColor }}
+                          />
+                          <Tooltip formatter={(v) => formatChartValue(v, 3)} />
                           <Bar
                             key="pwr-side-bar-total-kwh"
                             dataKey="total_kwh"
@@ -10032,8 +10303,16 @@ function AppShell() {
                             axisLine={{ stroke: powerChartAxisColor }}
                             tickLine={{ stroke: powerChartAxisColor }}
                           />
-                          <YAxis width={64} domain={powerSideYDomain} tick={{ fontSize: 11, fill: powerChartAxisColor }} axisLine={{ stroke: powerChartAxisColor }} tickLine={{ stroke: powerChartAxisColor }} />
-                          <Tooltip />
+                          <YAxis
+                            width={64}
+                            domain={powerSideYDomain}
+                            ticks={buildYAxisTicks(powerSideYDomain, 0.5, 12)}
+                            tickFormatter={(v) => formatChartValue(v, 3)}
+                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                            axisLine={{ stroke: powerChartAxisColor }}
+                            tickLine={{ stroke: powerChartAxisColor }}
+                          />
+                          <Tooltip formatter={(v) => formatChartValue(v, 3)} />
                           <Line
                             key="pwr-side-line-total-kwh"
                             type="monotone"
@@ -10225,12 +10504,25 @@ function AppShell() {
                       <label className="field"><span>VT Secondary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.vt_secondary || 230)} onChange={(e) => setPowerDeviceField("vt_secondary", Number(e.target.value || 230))} /></label>
                     </div>
                     <div className="table db-table" style={{ marginTop: 12 }}>
-                      <div className="thead"><span>Tag Key</span><span>Register Address</span><span>Description</span><span>Last</span><span>Tested</span><span>Actions</span></div>
+                      <div className="thead"><span>Tag Key</span><span>Register Address</span><span>Scale</span><span>Description</span><span>Last Raw</span><span>Last Scaled</span><span>Tested</span><span>Actions</span></div>
                       {Object.entries(selectedPowerRegisterMap || {}).map(([regKey, regVal]) => (
                         <div key={`pwr-reg-${regKey}`} className="trow">
                           <span>{regKey}</span>
                           <span><input type="number" value={Number(regVal || 0)} onChange={(e) => setPowerDeviceRegisterField(regKey, Number(e.target.value || 0))} /></span>
+                          <span>
+                            <input
+                              type="number"
+                              step="0.0001"
+                              value={Number(selectedPowerDevice?.register_scales?.[regKey] || 1)}
+                              onChange={(e) => setPowerDeviceRegisterScaleField(regKey, Number(e.target.value || 1))}
+                            />
+                          </span>
                           <span>{POWER_REGISTER_HINTS[regKey] || regKey.replaceAll("_", " ")}</span>
+                          <span>
+                            {Number.isFinite(Number(selectedPowerLatestByTag?.values_raw?.[regKey]))
+                              ? formatMetricValue(Number(selectedPowerLatestByTag?.values_raw?.[regKey]), 3)
+                              : "-"}
+                          </span>
                           <span>
                             {Number.isFinite(Number(selectedPowerLatestByTag?.values?.[regKey]))
                               ? formatMetricValue(Number(selectedPowerLatestByTag?.values?.[regKey]), 3)
@@ -10244,8 +10536,11 @@ function AppShell() {
                                 ? fmtTs(selectedPowerRegisterTestResult.tested_at_utc)
                                 : "";
                               if (t.ok) {
-                                const v = Number(t.value);
-                                const label = Number.isFinite(v) ? formatMetricValue(v, 3) : "PASS";
+                                const raw = Number(t.value_raw);
+                                const scaled = Number(t.value_scaled ?? t.value);
+                                const rawTxt = Number.isFinite(raw) ? `raw ${formatMetricValue(raw, 3)}` : "raw -";
+                                const scaledTxt = Number.isFinite(scaled) ? `scaled ${formatMetricValue(scaled, 3)}` : "scaled -";
+                                const label = `${rawTxt} / ${scaledTxt}`;
                                 return testedAt ? `${label} @ ${testedAt}` : label;
                               }
                               const err = String(t.error || "FAIL");
@@ -10275,7 +10570,9 @@ function AppShell() {
                             onChange={(e) => setNewPowerRegisterAddress(e.target.value)}
                           />
                         </span>
+                        <span>1</span>
                         <span>Add custom or manual register from supplier map</span>
+                        <span>-</span>
                         <span>-</span>
                         <span>-</span>
                         <span className="row-actions">
@@ -10326,10 +10623,20 @@ function AppShell() {
                         ) : null}
                       </span>
                       <span className="row-actions">
-                        <button className="icon-btn table-action-btn" onClick={() => openEditDevice(d)} disabled={!canEditPage("devices")} title="Edit device">
+                        <button
+                          className="icon-btn table-action-btn"
+                          onClick={() => (d?.is_power_meter ? openEditPowerDevice(d) : openEditDevice(d))}
+                          disabled={!canEditPage("devices")}
+                          title="Edit device"
+                        >
                           <EditIcon />
                         </button>
-                        <button className="icon-btn table-action-btn danger" onClick={() => removeDevice(d.id)} disabled={!canDeleteRecords} title="Delete device">
+                        <button
+                          className="icon-btn table-action-btn danger"
+                          onClick={() => (d?.is_power_meter ? removePowerDevice(d.id) : removeDevice(d.id))}
+                          disabled={!canDeleteRecords}
+                          title="Delete device"
+                        >
                           <DeleteIcon />
                         </button>
                       </span>
@@ -10943,7 +11250,7 @@ function AppShell() {
                   </div>
                 </div>
                 <div className="table backup-files-table">
-                  <div className="thead"><span>Select</span><span>Created (UTC)</span><span>File</span><span>Size</span><span>Actions</span></div>
+                  <div className="thead"><span>Select</span><span>Created</span><span>File</span><span>Size</span><span>Actions</span></div>
                   {backupRows.map((b) => (
                     <div key={`bk-${b.filename}`} className="trow">
                       <span className="db-cell">
@@ -11404,6 +11711,70 @@ function AppShell() {
                 </div>
                 <div className="lock-note">
                   Saved interface and palette settings are independent per UI environment (local edge UI and cloud web client).
+                </div>
+              </section>
+              <section className="card">
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                  <h3 style={{ marginTop: 0, marginBottom: 8 }}>Power Meter Gateways</h3>
+                  <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddPowerDevice} disabled={!canEditPage("database")}>
+                    <AddIcon />
+                    <span>Add Meter Gateway</span>
+                  </button>
+                </div>
+                <div className="table gateway-table">
+                  <div className="thead">
+                    <span>Name</span><span>Meter</span><span>Protocol</span><span>Address</span><span>Interval</span><span>Status</span><span>Tags</span><span>Actions</span>
+                  </div>
+                  {(powerConfig?.devices || []).map((d) => {
+                    const did = String(d?.id || "");
+                    const st = powerDeviceStatuses?.[did] || {};
+                    const running = d?.enabled !== false;
+                    const tags = Object.keys(d?.registers || {}).filter((k) => !String(k).endsWith("_raw"));
+                    return (
+                      <div key={`gw-pwr-${did}`} className="trow">
+                        <span>{String(d?.name || did)}</span>
+                        <span>{did}</span>
+                        <span>modbus_tcp</span>
+                        <span>{`${String(d?.ip || "-")}:${Number(d?.port || 502)}`}</span>
+                        <span>{`${Number(d?.poll_interval_ms || 1000)} ms`}</span>
+                        <span>
+                          <div className={`status-pill ${st.connected ? "status-online" : "status-offline"}`}>
+                            {st.connected ? "RUNNING" : running ? "STARTING" : "STOPPED"}
+                          </div>
+                          <div className="muted status-sub">
+                            {String(st?.last_error || "").trim() || "-"}
+                          </div>
+                        </span>
+                        <span className="tags-stack">
+                          {tags.length ? tags.map((tag) => <div key={`gw-pwr-tag-${did}-${tag}`}>{tag}</div>) : <div>-</div>}
+                        </span>
+                        <span className="row-actions">
+                          <button
+                            className="icon-btn table-action-btn"
+                            onClick={() => {
+                              setPowerConfig((prev) => ({ ...(prev || {}), selected_device_id: did }));
+                              openEditPowerDevice(d);
+                            }}
+                            disabled={!canEditPage("database")}
+                            title="Edit meter gateway"
+                          >
+                            <EditIcon />
+                          </button>
+                          <button
+                            className={`icon-btn table-action-btn ${running ? "icon-btn-stop" : "icon-btn-start"}`}
+                            onClick={() => setPowerDeviceRunning(did, !running)}
+                            disabled={!canControlGateways}
+                            title={running ? "Stop meter gateway" : "Start meter gateway"}
+                          >
+                            {running ? <StopIcon /> : <StartIcon />}
+                          </button>
+                          <button className="icon-btn table-action-btn danger" onClick={() => removePowerDevice(did)} disabled={!canDeleteRecords} title="Delete meter gateway">
+                            <DeleteIcon />
+                          </button>
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               </section>
             </>
@@ -11927,7 +12298,7 @@ function AppShell() {
                 <div className="table-scroll fill-scroll">
                   <div className="table historian-table">
                     <div className="thead">
-                      <span>Timestamp (UTC)</span><span>Tag</span><span>Value</span><span>Quality</span><span>Device</span><span>Gateway</span><span>Database</span><span>PLC</span>
+                      <span>Timestamp</span><span>Tag</span><span>Value</span><span>Quality</span><span>Device</span><span>Gateway</span><span>Database</span><span>PLC</span>
                     </div>
                     {historianRows.map((row, idx) => (
                       <div key={`${row.ts}-${row.tag}-${idx}`} className="trow">
@@ -12036,7 +12407,7 @@ function AppShell() {
                 <div className="table-scroll fill-scroll">
                   <div className="table logs-table">
                     <div className="thead">
-                      <span>Timestamp (UTC)</span><span>Level</span><span>Category</span><span>Message</span><span>Gateway</span><span>Device</span><span>Database</span>
+                      <span>Timestamp</span><span>Level</span><span>Category</span><span>Message</span><span>Gateway</span><span>Device</span><span>Database</span>
                     </div>
                     {filteredLogs.map((row, idx) => (
                       <div key={`${row.ts}-${idx}`} className="trow">
@@ -12491,7 +12862,7 @@ function AppShell() {
                     <div className="table-scroll fill-scroll reporting-table-side">
                       <div className="table historian-table reporting-pivot-table">
                         <div className="thead" style={{ gridTemplateColumns: `1.4fr repeat(${Math.max(1, reportSelectedTags.length)}, minmax(120px, 1fr))` }}>
-                          <span>Timestamp (UTC)</span>
+                          <span>Timestamp</span>
                           {reportSelectedTags.map((t) => <span key={`rh-${t}`}>{t}</span>)}
                         </div>
                         {reportPivotRows.map((row, idx) => (
@@ -12677,7 +13048,7 @@ function AppShell() {
               <span>Points: {tagMonitorSeries.length}</span>
               <span>
                 <span className={`status-pill ${freshnessBadgeClass(tagMonitorKpi.freshness?.level)}`}>
-                  {tagMonitorKpi.freshness?.label || "No data"}
+                  {tagMonitorKpi.freshness?.label || "-"}
                 </span>
               </span>
             </div>
@@ -12686,8 +13057,16 @@ function AppShell() {
                 <ResponsiveContainer width="100%" height={260}>
                   <LineChart data={tagMonitorSeries} margin={{ top: 8, right: 18, left: 24, bottom: 8 }}>
                     <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={tagMonitorXDomain} allowDataOverflow />
-                    <YAxis width={52} domain={tagMonitorDomain} />
-                    <Tooltip labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)} />
+                    <YAxis
+                      width={52}
+                      domain={tagMonitorDomain}
+                      ticks={buildYAxisTicks(tagMonitorDomain, 0.5, 12)}
+                      tickFormatter={(v) => formatChartValue(v, 3)}
+                    />
+                    <Tooltip
+                      labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)}
+                      formatter={(v) => formatChartValue(v, 3)}
+                    />
                     <Line isAnimationActive={false} type="linear" dataKey="value" stroke={tagMonitorColor} strokeWidth={2} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>
@@ -12695,8 +13074,16 @@ function AppShell() {
                 <ResponsiveContainer width="100%" height={260}>
                   <BarChart data={tagMonitorSeries} margin={{ top: 8, right: 18, left: 30, bottom: 8 }} barCategoryGap="24%">
                     <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={tagMonitorXDomain} allowDataOverflow />
-                    <YAxis width={60} domain={tagMonitorDomain} />
-                    <Tooltip labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)} />
+                    <YAxis
+                      width={60}
+                      domain={tagMonitorDomain}
+                      ticks={buildYAxisTicks(tagMonitorDomain, 0.5, 12)}
+                      tickFormatter={(v) => formatChartValue(v, 3)}
+                    />
+                    <Tooltip
+                      labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)}
+                      formatter={(v) => formatChartValue(v, 3)}
+                    />
                     <Bar isAnimationActive={false} dataKey="value" fill={tagMonitorColor} maxBarSize={22} />
                   </BarChart>
                 </ResponsiveContainer>
@@ -13115,7 +13502,7 @@ function AppShell() {
             <h3>Manual Cloud Sync</h3>
             <div className="trigger-form-grid">
               <label>
-                From (UTC)
+                From
                 <input
                   type="datetime-local"
                   value={cloudSyncForm.from_utc}
@@ -13124,7 +13511,7 @@ function AppShell() {
                 />
               </label>
               <label>
-                To (UTC)
+                To
                 <input
                   type="datetime-local"
                   value={cloudSyncForm.to_utc}
@@ -13362,12 +13749,38 @@ function AppShell() {
                     <div className="db-grid-2">
                       <label className="db-span-2">
                         Output File Path
-                        <input
-                          value={dbForm.file_path}
-                          onChange={(e) => setDbForm({ ...dbForm, file_path: e.target.value })}
-                          placeholder={dbForm.engine === "csv_file" ? "./data/trustnode_log.csv" : "./data/trustnode_log.txt"}
-                          disabled={!canEditPage("database")}
-                        />
+                        <div className="row" style={{ gap: 8 }}>
+                          <input
+                            value={dbForm.file_path}
+                            onChange={(e) => setDbForm({ ...dbForm, file_path: e.target.value })}
+                            placeholder={dbForm.engine === "csv_file" ? "./data/trustnode_log.csv" : "./data/trustnode_log.txt"}
+                            disabled={!canEditPage("database")}
+                          />
+                          <button
+                            type="button"
+                            className="icon-btn table-action-btn"
+                            title="Pick file destination"
+                            onClick={() => fileSinkPickerRef.current?.click()}
+                            disabled={!canEditPage("database")}
+                          >
+                            <FolderIcon />
+                          </button>
+                          <input
+                            ref={fileSinkPickerRef}
+                            type="file"
+                            style={{ display: "none" }}
+                            accept={dbForm.engine === "csv_file" ? ".csv,text/csv" : ".txt,text/plain"}
+                            onChange={(e) => {
+                              const f = e?.target?.files?.[0];
+                              if (!f) return;
+                              const chosen = String(f?.path || f?.name || "").trim();
+                              if (chosen) setDbForm((prev) => ({ ...(prev || {}), file_path: chosen }));
+                              try {
+                                e.target.value = "";
+                              } catch {}
+                            }}
+                          />
+                        </div>
                       </label>
                     </div>
                   </section>
@@ -13551,26 +13964,40 @@ function AppShell() {
                 const nextMode = e.target.value;
                 const nextProfile = powerProfiles?.mode_defaults?.[nextMode] || POWER_PROFILE_DEFAULTS[nextMode] || POWER_PROFILE_DEFAULTS.single_phase;
                 const nextRegisters = powerProfiles?.profiles?.[nextProfile] || powerDeviceForm.registers || {};
+                const effectiveRegisters = powerDeviceForm.use_custom_registers ? (powerDeviceForm.registers || {}) : nextRegisters;
                 setPowerDeviceForm({
                   ...powerDeviceForm,
                   electrical_mode: nextMode,
                   wiring_type: nextMode,
                   register_profile: nextProfile,
-                  registers: powerDeviceForm.use_custom_registers ? powerDeviceForm.registers : nextRegisters,
+                  registers: effectiveRegisters,
+                  register_scales: buildRegisterScaleMap(effectiveRegisters, powerDeviceForm.register_scales || {}),
                 });
               }}><option value="single_phase">Single Phase</option><option value="three_phase">Three Phase</option></select></label>
               <label><span>Register Profile</span><select value={powerDeviceForm.register_profile || ""} onChange={(e) => {
                 const nextProfile = e.target.value;
                 const nextRegisters = powerProfiles?.profiles?.[nextProfile] || powerDeviceForm.registers || {};
+                const effectiveRegisters = powerDeviceForm.use_custom_registers ? (powerDeviceForm.registers || {}) : nextRegisters;
                 setPowerDeviceForm({
                   ...powerDeviceForm,
                   register_profile: nextProfile,
-                  registers: powerDeviceForm.use_custom_registers ? powerDeviceForm.registers : nextRegisters,
+                  registers: effectiveRegisters,
+                  register_scales: buildRegisterScaleMap(effectiveRegisters, powerDeviceForm.register_scales || {}),
                 });
               }}>
                 {Object.keys(powerProfiles?.profiles || {}).map((k) => <option key={k} value={k}>{k}</option>)}
               </select></label>
-              <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.use_custom_registers)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, use_custom_registers: e.target.checked })} /><span className="remember-label">Use custom register mapping</span></label>
+              <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.use_custom_registers)} onChange={(e) => {
+                const checked = e.target.checked;
+                const profileRegs = powerProfiles?.profiles?.[powerDeviceForm.register_profile || ""] || {};
+                const effectiveRegisters = checked ? (powerDeviceForm.registers || profileRegs) : profileRegs;
+                setPowerDeviceForm({
+                  ...powerDeviceForm,
+                  use_custom_registers: checked,
+                  registers: effectiveRegisters,
+                  register_scales: buildRegisterScaleMap(effectiveRegisters, powerDeviceForm.register_scales || {}),
+                });
+              }} /><span className="remember-label">Use custom register mapping</span></label>
               <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.voltage_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, voltage_connected: e.target.checked })} /><span className="remember-label">Voltage connected</span></label>
               <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.ct_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_connected: e.target.checked })} /><span className="remember-label">CT connected</span></label>
                     <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.enabled)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, enabled: e.target.checked })} /><span className="remember-label">Enabled</span></label>
@@ -13961,6 +14388,14 @@ export default function App() {
     <AppErrorBoundary>
       <AppShell />
     </AppErrorBoundary>
+  );
+}
+
+function FolderIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+    </svg>
   );
 }
 
