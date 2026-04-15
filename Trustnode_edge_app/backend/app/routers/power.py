@@ -190,6 +190,11 @@ def get_power_history(request: Request, limit: int = 300, device_id: str = "") -
     return {"ok": True, "rows": filtered[:lim]}
 
 
+@router.get("/diagnostics")
+def get_power_diagnostics() -> dict:
+    return {"ok": True, "diagnostics": power_manager.get_diagnostics()}
+
+
 @router.post("/devices/{device_id}/start")
 def start_power_device(device_id: str) -> dict:
     cfg = power_manager.set_device_enabled(device_id, True, actor="admin")

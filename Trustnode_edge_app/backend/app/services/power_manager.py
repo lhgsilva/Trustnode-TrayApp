@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import struct
 import threading
 import time
@@ -99,13 +100,23 @@ class PowerManager:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="tn-power-manager")
+        self._writer_stop = threading.Event()
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True, name="tn-power-writer")
         self._config: dict[str, Any] = self._load_config()
         self._clients: dict[str, ModbusTcpClient] = {}
         self._last_samples: dict[str, dict[str, Any]] = {}
         self._status_by_device: dict[str, dict[str, Any]] = {}
-        self._next_poll_at: dict[str, float] = {}
         self._register_backoff_until: dict[str, dict[int, float]] = {}
+        self._rows_queue: queue.Queue[list[dict[str, Any]]] = queue.Queue(
+            maxsize=max(50, int(os.environ.get("TRUSTNODE_POWER_ROWS_QUEUE_MAX", "1000") or "1000"))
+        )
+        self._worker_threads: dict[str, threading.Thread] = {}
+        self._worker_stops: dict[str, threading.Event] = {}
+        self._metrics_by_device: dict[str, dict[str, Any]] = {}
+        self._dropped_rows = 0
+        self._writer_batches = 0
         self._thread.start()
+        self._writer_thread.start()
 
     @staticmethod
     def _utc_now() -> str:
@@ -117,8 +128,19 @@ class PowerManager:
 
     def shutdown(self) -> None:
         self._stop.set()
+        self._writer_stop.set()
+        with self._lock:
+            for ev in self._worker_stops.values():
+                ev.set()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        if self._writer_thread.is_alive():
+            self._writer_thread.join(timeout=2.0)
+        with self._lock:
+            workers = list(self._worker_threads.values())
+        for t in workers:
+            if t.is_alive():
+                t.join(timeout=1.5)
         with self._lock:
             for client in self._clients.values():
                 try:
@@ -261,7 +283,6 @@ class PowerManager:
                     except Exception:
                         pass
                     self._clients.pop(device_id, None)
-            self._next_poll_at = {}
         self._app_store.upsert_domain("power_management_config", cfg, actor=actor)
         return self.get_config()
 
@@ -320,7 +341,7 @@ class PowerManager:
                 pass
         return client
 
-    def _poll_device(self, device: dict[str, Any]) -> None:
+    def _poll_device(self, device: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         device_id = str(device.get("id") or "")
         unit_id = int(device.get("unit_id") or 1)
         registers = dict(device.get("registers") or {})
@@ -463,23 +484,20 @@ class PowerManager:
                         "source": "power_modbus",
                     }
                 )
-        self._app_store.append_historian_rows(rows)
-
-        with self._lock:
-            self._last_samples[device_id] = sample
-            self._status_by_device[device_id] = {
-                "device_id": device_id,
-                "name": str(device.get("name") or device_id),
-                "connected": True,
-                "enabled": bool(device.get("enabled", True)),
-                "last_error": "",
-                "last_poll_utc": now,
-                "last_success_utc": now,
-                "ip": str(device.get("ip") or ""),
-                "port": int(device.get("port") or 502),
-                "unit_id": int(device.get("unit_id") or 1),
-                "poll_interval_ms": int(device.get("poll_interval_ms") or 1000),
-            }
+        status = {
+            "device_id": device_id,
+            "name": str(device.get("name") or device_id),
+            "connected": True,
+            "enabled": bool(device.get("enabled", True)),
+            "last_error": "",
+            "last_poll_utc": now,
+            "last_success_utc": now,
+            "ip": str(device.get("ip") or ""),
+            "port": int(device.get("port") or 502),
+            "unit_id": int(device.get("unit_id") or 1),
+            "poll_interval_ms": int(device.get("poll_interval_ms") or 1000),
+        }
+        return sample, rows, status
 
     def _mark_device_error(self, device: dict[str, Any], err: str) -> None:
         device_id = str(device.get("id") or "")
@@ -500,49 +518,159 @@ class PowerManager:
                 "poll_interval_ms": int(device.get("poll_interval_ms") or 1000),
             }
 
+    def _enqueue_rows(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        try:
+            self._rows_queue.put_nowait(rows)
+        except queue.Full:
+            try:
+                dropped = self._rows_queue.get_nowait()
+                self._dropped_rows += len(dropped or [])
+            except Exception:
+                pass
+            try:
+                self._rows_queue.put_nowait(rows)
+            except Exception:
+                self._dropped_rows += len(rows or [])
+
+    def _writer_loop(self) -> None:
+        max_batch_rows = max(100, int(os.environ.get("TRUSTNODE_POWER_WRITER_MAX_ROWS", "4000") or "4000"))
+        flush_wait_s = max(0.02, float(os.environ.get("TRUSTNODE_POWER_WRITER_FLUSH_WAIT_SECONDS", "0.08") or "0.08"))
+        while not self._writer_stop.is_set():
+            batch: list[dict[str, Any]] = []
+            try:
+                first = self._rows_queue.get(timeout=0.1)
+                if first:
+                    batch.extend(first)
+            except queue.Empty:
+                continue
+            deadline = time.monotonic() + flush_wait_s
+            while len(batch) < max_batch_rows:
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining <= 0:
+                    break
+                try:
+                    more = self._rows_queue.get(timeout=remaining)
+                    if more:
+                        batch.extend(more)
+                except queue.Empty:
+                    break
+            if not batch:
+                continue
+            try:
+                self._app_store.append_historian_rows(batch)
+                self._writer_batches += 1
+            except Exception:
+                # Keep runtime resilient; failed write gets retried by requeueing once.
+                try:
+                    self._rows_queue.put_nowait(batch)
+                except Exception:
+                    self._dropped_rows += len(batch)
+                time.sleep(0.05)
+
+    def _run_device_loop(self, device_id: str, stop_evt: threading.Event) -> None:
+        next_due = time.monotonic()
+        prev_start = 0.0
+        while not self._stop.is_set() and not stop_evt.is_set():
+            cfg = self.get_config()
+            device = next((dict(d) for d in (cfg.get("devices") or []) if str(d.get("id") or "") == device_id), None)
+            if not device or not bool(cfg.get("enabled", True)) or not bool(device.get("enabled", True)):
+                time.sleep(0.2)
+                next_due = time.monotonic()
+                continue
+
+            interval_s = max(0.25, float(device.get("poll_interval_ms") or 1000) / 1000.0)
+            wait_s = max(0.0, next_due - time.monotonic())
+            if stop_evt.wait(wait_s):
+                break
+
+            scheduled_at = next_due
+            started = time.monotonic()
+            lag_ms = max(0.0, (started - scheduled_at) * 1000.0)
+            skipped_cycles = 0
+            try:
+                sample, rows, status = self._poll_device(device)
+                self._enqueue_rows(rows)
+                with self._lock:
+                    self._last_samples[device_id] = sample
+                    self._status_by_device[device_id] = status
+            except Exception as exc:
+                self._mark_device_error(device, str(exc))
+                try:
+                    self._app_store.append_log_rows(
+                        [
+                            {
+                                "ts_utc": self._utc_now(),
+                                "level": "warning",
+                                "category": "power_management",
+                                "message": f"Power meter {device_id} read failed: {str(exc)}",
+                                "gateway_id": device_id,
+                                "gateway_name": str(device.get("name") or device_id),
+                                "device_name": str(device.get("name") or device_id),
+                                "database_name": "Power Management",
+                            }
+                        ]
+                    )
+                except Exception:
+                    pass
+            finished = time.monotonic()
+            duration_ms = max(0.0, (finished - started) * 1000.0)
+            effective_interval_ms = None
+            if prev_start > 0.0:
+                effective_interval_ms = max(0.0, (started - prev_start) * 1000.0)
+            prev_start = started
+
+            next_due = scheduled_at + interval_s
+            while next_due <= finished:
+                next_due += interval_s
+                skipped_cycles += 1
+            with self._lock:
+                self._metrics_by_device[device_id] = {
+                    "poll_duration_ms": round(duration_ms, 2),
+                    "schedule_lag_ms": round(lag_ms, 2),
+                    "effective_interval_ms": round(float(effective_interval_ms), 2) if effective_interval_ms is not None else None,
+                    "skipped_cycles": int(skipped_cycles),
+                    "writer_queue_depth": int(self._rows_queue.qsize()),
+                    "writer_dropped_rows": int(self._dropped_rows),
+                    "writer_batches": int(self._writer_batches),
+                    "updated_utc": self._utc_now(),
+                }
+
+    def _reconcile_workers(self) -> None:
+        cfg = self.get_config()
+        desired_ids = {
+            str(d.get("id") or "")
+            for d in (cfg.get("devices") or [])
+            if str(d.get("id") or "").strip() and bool(d.get("enabled", True)) and bool(cfg.get("enabled", True))
+        }
+        with self._lock:
+            current_ids = set(self._worker_threads.keys())
+
+        for gid in sorted(current_ids - desired_ids):
+            with self._lock:
+                ev = self._worker_stops.pop(gid, None)
+                th = self._worker_threads.pop(gid, None)
+            if ev:
+                ev.set()
+            if th and th.is_alive():
+                th.join(timeout=0.8)
+
+        for gid in sorted(desired_ids - current_ids):
+            ev = threading.Event()
+            th = threading.Thread(target=self._run_device_loop, args=(gid, ev), daemon=True, name=f"tn-power-{gid}")
+            with self._lock:
+                self._worker_stops[gid] = ev
+                self._worker_threads[gid] = th
+            th.start()
+
     def _run_loop(self) -> None:
         while not self._stop.is_set():
-            now_mono = time.monotonic()
-            cfg = self.get_config()
-            if not bool(cfg.get("enabled", True)):
-                time.sleep(0.2)
-                continue
-            devices = list(cfg.get("devices") or [])
-            for device in devices:
-                if not bool(device.get("enabled", True)):
-                    continue
-                device_id = str(device.get("id") or "")
-                interval_s = max(0.25, float(device.get("poll_interval_ms") or 1000) / 1000.0)
-                due_at = float(self._next_poll_at.get(device_id, now_mono))
-                if now_mono < due_at:
-                    continue
-                started = time.monotonic()
-                try:
-                    self._poll_device(device)
-                except Exception as exc:
-                    self._mark_device_error(device, str(exc))
-                    try:
-                        self._app_store.append_log_rows(
-                            [
-                                {
-                                    "ts_utc": self._utc_now(),
-                                    "level": "warning",
-                                    "category": "power_management",
-                                    "message": f"Power meter {device_id} read failed: {str(exc)}",
-                                    "gateway_id": device_id,
-                                    "gateway_name": str(device.get("name") or device_id),
-                                    "device_name": str(device.get("name") or device_id),
-                                    "database_name": "Power Management",
-                                }
-                            ]
-                        )
-                    except Exception:
-                        pass
-                finished = time.monotonic()
-                # Keep cadence stable and avoid bursty catch-up that makes charts look erratic.
-                next_due = max(due_at + interval_s, finished + 0.02)
-                self._next_poll_at[device_id] = next_due
-            time.sleep(0.02)
+            try:
+                self._reconcile_workers()
+            except Exception:
+                pass
+            time.sleep(0.2)
 
     def get_status(self) -> dict[str, Any]:
         cfg = self.get_config()
@@ -552,6 +680,7 @@ class PowerManager:
             for d in cfg.get("devices") or []:
                 did = str(d.get("id") or "")
                 st = dict(self._status_by_device.get(did) or {})
+                metrics = dict(self._metrics_by_device.get(did) or {})
                 if not st:
                     st = {
                         "device_id": did,
@@ -566,6 +695,16 @@ class PowerManager:
                         "unit_id": int(d.get("unit_id") or 1),
                         "poll_interval_ms": int(d.get("poll_interval_ms") or 1000),
                     }
+                st.update(
+                    {
+                        "poll_duration_ms": metrics.get("poll_duration_ms"),
+                        "effective_interval_ms": metrics.get("effective_interval_ms"),
+                        "schedule_lag_ms": metrics.get("schedule_lag_ms"),
+                        "skipped_cycles": int(metrics.get("skipped_cycles") or 0),
+                        "writer_queue_depth": int(metrics.get("writer_queue_depth") or self._rows_queue.qsize()),
+                        "writer_dropped_rows": int(metrics.get("writer_dropped_rows") or self._dropped_rows),
+                    }
+                )
                 devices_out.append(st)
             selected_status = next((x for x in devices_out if str(x.get("device_id")) == selected_id), None)
             any_connected = any(bool(x.get("connected")) for x in devices_out)
@@ -587,6 +726,24 @@ class PowerManager:
                 return {}
             latest = max(self._last_samples.values(), key=lambda x: str(x.get("ts") or ""))
             return self._deep_copy(latest)
+
+    def get_diagnostics(self) -> dict[str, Any]:
+        cfg = self.get_config()
+        with self._lock:
+            metrics = self._deep_copy(self._metrics_by_device)
+            statuses = self._deep_copy(self._status_by_device)
+            worker_ids = list(self._worker_threads.keys())
+        return {
+            "enabled": bool(cfg.get("enabled", True)),
+            "selected_device_id": str(cfg.get("selected_device_id") or ""),
+            "worker_count": len(worker_ids),
+            "worker_ids": worker_ids,
+            "writer_queue_depth": int(self._rows_queue.qsize()),
+            "writer_dropped_rows": int(self._dropped_rows),
+            "writer_batches": int(self._writer_batches),
+            "devices_metrics": metrics,
+            "devices_status": statuses,
+        }
 
     def test_connection(self, payload: dict[str, Any] | None = None, timeout_s: float = 3.0) -> dict[str, Any]:
         target = self._normalize_device(payload or self._deep_copy(DEFAULT_DEVICE))
