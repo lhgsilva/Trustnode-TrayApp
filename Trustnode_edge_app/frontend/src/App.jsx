@@ -162,6 +162,14 @@ function buildOpcUrlFromIp(ip) {
 
 const DEFAULT_OPC_NODE_ID = "";
 const DEFAULT_REPORT_SERIES_COLORS = ["#16a34a", "#2563eb", "#d97706", "#dc2626", "#7c3aed", "#0891b2", "#0ea5e9", "#f59e0b"];
+const DEFAULT_DISPLAY_TIMEZONE = (() => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+})();
+const DEFAULT_DISPLAY_TIMESTAMP_FORMAT = "dd/MM/yyyy HH:mm:ss";
 const DEFAULT_INTERFACE_THEME_PREFS = {
   light: {
     bg: "#f3f3f3",
@@ -504,6 +512,73 @@ function tsNow() {
   return new Date().toISOString();
 }
 
+function safeTimeZone(value, fallback = DEFAULT_DISPLAY_TIMEZONE) {
+  const tz = String(value || "").trim();
+  if (!tz) return fallback;
+  try {
+    // Validate timezone by constructing a formatter.
+    // eslint-disable-next-line no-new
+    new Intl.DateTimeFormat("en-GB", { timeZone: tz });
+    return tz;
+  } catch {
+    return fallback;
+  }
+}
+
+function getDatePartsInTimeZone(ms, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
+  if (!Number.isFinite(ms)) return null;
+  const tz = safeTimeZone(timeZone, DEFAULT_DISPLAY_TIMEZONE);
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(ms));
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  return {
+    year: map.year || "0000",
+    month: map.month || "00",
+    day: map.day || "00",
+    hour: map.hour || "00",
+    minute: map.minute || "00",
+    second: map.second || "00",
+  };
+}
+
+function formatTimestampDisplay(rawValue, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
+  const raw = String(rawValue || "").trim();
+  if (!raw) return "";
+  const ms = parseTimestampMs(raw);
+  if (!Number.isFinite(ms)) return raw;
+  const p = getDatePartsInTimeZone(ms, timeZone);
+  if (!p) return raw;
+  return `${p.day}/${p.month}/${p.year} ${p.hour}:${p.minute}:${p.second}`;
+}
+
+function formatTimeDisplay(rawValue, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
+  const raw = String(rawValue || "").trim();
+  if (!raw) return "";
+  const ms = parseTimestampMs(raw);
+  if (!Number.isFinite(ms)) return raw;
+  const p = getDatePartsInTimeZone(ms, timeZone);
+  if (!p) return raw;
+  return `${p.hour}:${p.minute}:${p.second}`;
+}
+
+function bucketKeyForInterval(tsMs, interval, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
+  const p = getDatePartsInTimeZone(tsMs, timeZone);
+  if (!p) return "";
+  if (interval === "day") return `${p.year}-${p.month}-${p.day}`;
+  if (interval === "hour") return `${p.year}-${p.month}-${p.day} ${p.hour}:00`;
+  if (interval === "minute") return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
+}
+
 function loadStringSetting(storageKey, fallback = "") {
   try {
     const v = localStorage.getItem(storageKey);
@@ -564,7 +639,7 @@ function buildSmoothedSeries(points, renderNowMs, periodMs = 1000, enableSynthet
   const projected = Number(last.value || 0) + slope * Math.min(elapsed, dt) * 0.6;
   out.push({
     idx: Number(last.idx || out.length) + 0.5,
-    ts: new Date(renderNowMs).toISOString().slice(11, 19),
+    ts: formatTimeDisplay(new Date(renderNowMs).toISOString(), DEFAULT_DISPLAY_TIMEZONE),
     ts_ms: renderNowMs,
     value: projected,
     synthetic: true,
@@ -660,7 +735,7 @@ function buildChronologicalSeries(rows, maxPoints = 120, minStepMs = 0) {
   const tail = deduped.slice(-Math.max(1, Number(maxPoints || 120)));
   return tail.map((p, idx) => ({
     idx: idx + 1,
-    ts: new Date(p.ts_ms).toISOString().slice(11, 19),
+    ts: formatTimeDisplay(new Date(p.ts_ms).toISOString(), DEFAULT_DISPLAY_TIMEZONE),
     ts_ms: p.ts_ms,
     value: p.value,
   }));
@@ -1478,6 +1553,8 @@ function AppShell() {
   const [uiSourceSavedMessage, setUiSourceSavedMessage] = useState("");
   const [uiSourceTestResult, setUiSourceTestResult] = useState("");
   const [websiteEnvText, setWebsiteEnvText] = useState("");
+  const [displayTimeZone, setDisplayTimeZone] = useState(DEFAULT_DISPLAY_TIMEZONE);
+  const [displayTimestampFormat, setDisplayTimestampFormat] = useState(DEFAULT_DISPLAY_TIMESTAMP_FORMAT);
   const [websiteStatusResult, setWebsiteStatusResult] = useState("");
   const [databaseOverviewResult, setDatabaseOverviewResult] = useState("");
   const [databaseInspector, setDatabaseInspector] = useState(null);
@@ -1882,6 +1959,8 @@ function AppShell() {
       ui_source_remote_url: uiSourceRemoteUrl,
       ui_source_local_path: uiSourceLocalPath,
       website_env_text: websiteEnvText,
+      display_timezone: displayTimeZone,
+      display_timestamp_format: displayTimestampFormat,
       tenant_web_client_url: tenantWebClientUrl,
       tenant_company_name: tenantCompanyName,
       tenant_login_realm: tenantLoginRealm,
@@ -1956,6 +2035,16 @@ function AppShell() {
     if (typeof appSettings.ui_source_remote_url === "string") setUiSourceRemoteUrl(appSettings.ui_source_remote_url);
     if (typeof appSettings.ui_source_local_path === "string") setUiSourceLocalPath(appSettings.ui_source_local_path);
     if (typeof appSettings.website_env_text === "string") setWebsiteEnvText(appSettings.website_env_text);
+    if (typeof appSettings.display_timezone === "string" && appSettings.display_timezone.trim()) {
+      setDisplayTimeZone(safeTimeZone(appSettings.display_timezone, DEFAULT_DISPLAY_TIMEZONE));
+    } else {
+      setDisplayTimeZone(DEFAULT_DISPLAY_TIMEZONE);
+    }
+    if (typeof appSettings.display_timestamp_format === "string" && appSettings.display_timestamp_format.trim()) {
+      setDisplayTimestampFormat(String(appSettings.display_timestamp_format).trim());
+    } else {
+      setDisplayTimestampFormat(DEFAULT_DISPLAY_TIMESTAMP_FORMAT);
+    }
     if (typeof appSettings.tenant_web_client_url === "string") setTenantWebClientUrl(appSettings.tenant_web_client_url);
     if (typeof appSettings.tenant_company_name === "string") setTenantCompanyName(appSettings.tenant_company_name);
     if (typeof appSettings.tenant_login_realm === "string") setTenantLoginRealm(appSettings.tenant_login_realm);
@@ -2904,6 +2993,8 @@ function AppShell() {
     tenantWebClientUrl,
     tenantCompanyName,
     tenantLoginRealm,
+    displayTimeZone,
+    displayTimestampFormat,
     interfaceThemePrefs,
     chartPalette,
     users,
@@ -4474,19 +4565,7 @@ function AppShell() {
 
   const powerTrendData = useMemo(() => {
     const meterIds = (powerConfig?.devices || []).map((d) => String(d?.id || "")).filter(Boolean);
-    const bucketKey = (tsMs) => {
-      const d = new Date(tsMs);
-      const y = d.getFullYear();
-      const m = String(d.getMonth() + 1).padStart(2, "0");
-      const day = String(d.getDate()).padStart(2, "0");
-      const hh = String(d.getHours()).padStart(2, "0");
-      const mm = String(d.getMinutes()).padStart(2, "0");
-      const ss = String(d.getSeconds()).padStart(2, "0");
-      if (powerInterval === "day") return `${y}-${m}-${day}`;
-      if (powerInterval === "hour") return `${y}-${m}-${day} ${hh}:00`;
-      if (powerInterval === "minute") return `${y}-${m}-${day} ${hh}:${mm}`;
-      return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
-    };
+    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, powerInterval, displayTimeZone);
     const powerTags = new Set(["active_power_total_w", "active_power_w"]);
     const buckets = new Map();
     for (const row of powerRowsFiltered) {
@@ -4521,25 +4600,13 @@ function AppShell() {
     });
     out.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
     return out;
-  }, [powerRowsFiltered, powerInterval, powerAggregation, powerConfig, powerCostPerKwh]);
+  }, [powerRowsFiltered, powerInterval, powerAggregation, powerConfig, powerCostPerKwh, displayTimeZone]);
 
   const powerMainChartData = useMemo(() => {
     const meterIds = (powerConfig?.devices || [])
       .map((d) => String(d?.id || ""))
       .filter((id) => !selectedPowerChartMeters.length || selectedPowerChartMeters.includes(id));
-    const bucketKey = (tsMs) => {
-      const d = new Date(tsMs);
-      const y = d.getFullYear();
-      const m = String(d.getMonth() + 1).padStart(2, "0");
-      const day = String(d.getDate()).padStart(2, "0");
-      const hh = String(d.getHours()).padStart(2, "0");
-      const mm = String(d.getMinutes()).padStart(2, "0");
-      const ss = String(d.getSeconds()).padStart(2, "0");
-      if (powerInterval === "day") return `${y}-${m}-${day}`;
-      if (powerInterval === "hour") return `${y}-${m}-${day} ${hh}:00`;
-      if (powerInterval === "minute") return `${y}-${m}-${day} ${hh}:${mm}`;
-      return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
-    };
+    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, powerInterval, displayTimeZone);
     const metricTagPriority =
       powerMainMetric === "voltage_v"
         ? ["voltage_v", "voltage_l1_v"]
@@ -4583,7 +4650,7 @@ function AppShell() {
     });
     rows.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
     return { rows, meterIds };
-  }, [powerConfig, powerRowsFiltered, powerInterval, powerMainMetric, powerAggregation, selectedPowerChartMeters]);
+  }, [powerConfig, powerRowsFiltered, powerInterval, powerMainMetric, powerAggregation, selectedPowerChartMeters, displayTimeZone]);
 
   const powerMainYDomain = useMemo(() => {
     const keys = ["total", ...powerMainChartData.meterIds];
@@ -4611,13 +4678,7 @@ function AppShell() {
     const intervalByGateway = Object.fromEntries(
       (powerConfig?.devices || []).map((d) => [String(d?.id || ""), Number(d?.poll_interval_ms || 1000)])
     );
-    const bucketKey = (tsMs) => {
-      const d = new Date(tsMs);
-      if (isLast12h) {
-        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:00`;
-      }
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-    };
+    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, isLast12h ? "hour" : "day", displayTimeZone);
     const buckets = new Map();
     for (const row of powerHistoryRows || []) {
       const gid = String(row?.gateway_id || "");
@@ -4644,7 +4705,7 @@ function AppShell() {
         total_cost: Number(r.total_kwh || 0) * powerCostPerKwh,
       }));
     return { rows, keys: ["total_kwh", "total_cost"], showPhases: false };
-  }, [powerHistoryRows, powerConfig, powerFilterMeterId, selectedPowerChartMeters, powerCostChartRange, powerCostPerKwh]);
+  }, [powerHistoryRows, powerConfig, powerFilterMeterId, selectedPowerChartMeters, powerCostChartRange, powerCostPerKwh, displayTimeZone]);
 
   const powerSideYDomain = useMemo(() => {
     return computeMultiSeriesDomain(powerSideChartData.rows, ["total_kwh"], true);
@@ -5290,19 +5351,12 @@ function AppShell() {
     }
   }, [devices, dbConnections, gatewayConfigs, gatewayRuntimeStatuses, wsState, bootState]);
 
-  const fmtTs = (value) => {
-    if (!value) return "";
-    const ms = parseTimestampMs(value);
-    if (!Number.isFinite(ms)) return String(value);
-    const d = new Date(ms);
-    const dd = String(d.getDate()).padStart(2, "0");
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
-    const yyyy = String(d.getFullYear());
-    const hh = String(d.getHours()).padStart(2, "0");
-    const mi = String(d.getMinutes()).padStart(2, "0");
-    const ss = String(d.getSeconds()).padStart(2, "0");
-    return `${dd}/${mm}/${yyyy} ${hh}:${mi}:${ss}`;
-  };
+  const fmtTs = useCallback((value) => {
+    return formatTimestampDisplay(value, displayTimeZone);
+  }, [displayTimeZone]);
+  const fmtTsShort = useCallback((value) => {
+    return formatTimeDisplay(value, displayTimeZone);
+  }, [displayTimeZone]);
 
   const inRange = (value, from, to) => {
     if (!from && !to) return true;
@@ -9221,20 +9275,20 @@ function AppShell() {
   const reportingChartData = useMemo(() => {
     const rows = reportPivotRows.slice(-240);
     return rows.map((r) => {
-      const entry = { ts: String(r.ts || "").slice(11, 19) };
+      const entry = { ts: fmtTsShort(String(r.ts || "")) };
       for (const tag of reportSelectedTags.slice(0, 6)) {
         const v = Number(r[tag]);
         entry[tag] = Number.isNaN(v) ? null : v;
       }
       return entry;
     });
-  }, [reportPivotRows, reportSelectedTags]);
+  }, [reportPivotRows, reportSelectedTags, fmtTsShort]);
 
   const buildReportCsv = (pivotRows, tags) => {
-    const header = ["timestamp_utc", ...tags];
+    const header = ["timestamp_local", ...tags];
     const lines = [header.join(",")];
     for (const r of pivotRows) {
-      const vals = [r.ts, ...tags.map((t) => r[t])].map((v) => `"${String(v ?? "").replaceAll("\"", "\"\"")}"`);
+      const vals = [fmtTs(r.ts), ...tags.map((t) => r[t])].map((v) => `"${String(v ?? "").replaceAll("\"", "\"\"")}"`);
       lines.push(vals.join(","));
     }
     return lines.join("\n");
@@ -9309,10 +9363,10 @@ function AppShell() {
     const chartSvg = buildReportSvgChart(doc);
     const headerCells = ["Timestamp", ...tags].map((x) => `<th>${String(x).replaceAll("<", "&lt;")}</th>`).join("");
     const bodyRows = rows.map((r) => {
-      const cells = [r.ts, ...tags.map((t) => r[t])].map((v) => `<td>${String(v ?? "").replaceAll("<", "&lt;")}</td>`).join("");
+      const cells = [fmtTs(r.ts), ...tags.map((t) => r[t])].map((v) => `<td>${String(v ?? "").replaceAll("<", "&lt;")}</td>`).join("");
       return `<tr>${cells}</tr>`;
     }).join("");
-    return `<!doctype html><html><head><meta charset="utf-8"/><title>Trustnode Report</title><style>body{font-family:Segoe UI,Arial,sans-serif;padding:16px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #d1d5db;padding:6px 8px;font-size:12px}th{background:#f3f4f6;text-align:left}.meta{margin-bottom:10px;color:#374151;font-size:13px}.chart-box{margin:12px 0;border:1px solid #d1d5db;border-radius:10px;padding:8px;background:#fff;display:flex;justify-content:center}</style></head><body><h2>Trustnode Report</h2><div class="meta"><div><b>Created:</b> ${doc.created_utc}</div><div><b>Generated By:</b> ${doc.generated_by}</div><div><b>Summary:</b> ${String(doc.summary || "").replaceAll("<", "&lt;")}</div></div>${chartSvg ? `<div class="chart-box">${chartSvg}</div>` : ""}<table><thead><tr>${headerCells}</tr></thead><tbody>${bodyRows}</tbody></table></body></html>`;
+    return `<!doctype html><html><head><meta charset="utf-8"/><title>Trustnode Report</title><style>body{font-family:Segoe UI,Arial,sans-serif;padding:16px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #d1d5db;padding:6px 8px;font-size:12px}th{background:#f3f4f6;text-align:left}.meta{margin-bottom:10px;color:#374151;font-size:13px}.chart-box{margin:12px 0;border:1px solid #d1d5db;border-radius:10px;padding:8px;background:#fff;display:flex;justify-content:center}</style></head><body><h2>Trustnode Report</h2><div class="meta"><div><b>Created:</b> ${fmtTs(doc.created_utc)}</div><div><b>Timezone:</b> ${String(displayTimeZone || "UTC")}</div><div><b>Generated By:</b> ${doc.generated_by}</div><div><b>Summary:</b> ${String(doc.summary || "").replaceAll("<", "&lt;")}</div></div>${chartSvg ? `<div class="chart-box">${chartSvg}</div>` : ""}<table><thead><tr>${headerCells}</tr></thead><tbody>${bodyRows}</tbody></table></body></html>`;
   };
 
   const buildReportSummary = (filters, rows, tags) => {
@@ -11261,7 +11315,7 @@ function AppShell() {
                           onChange={() => setSelectedBackupFilename(b.filename)}
                         />
                       </span>
-                      <span className="db-cell">{b.modified_utc || "-"}</span>
+                      <span className="db-cell">{b.modified_utc ? fmtTs(b.modified_utc) : "-"}</span>
                       <span className="db-cell" title={b.path || b.filename}>{b.filename}</span>
                       <span className="db-cell">{Number(b.size_bytes || 0).toLocaleString()} bytes</span>
                       <span className="row-actions db-actions-cell">
@@ -11314,13 +11368,13 @@ function AppShell() {
                 </div>
                 {retentionResult && retentionResultScope === "global" ? <div className={retentionResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 10 }}>{retentionResult}</div> : null}
                 <div className="table retention-runs-table" style={{ marginTop: 12 }}>
-                  <div className="thead"><span>Run UTC</span><span>Mode</span><span>Status</span><span>Delete Candidates</span><span>Backup</span></div>
+                  <div className="thead"><span>Run Time</span><span>Mode</span><span>Status</span><span>Delete Candidates</span><span>Backup</span></div>
                   {retentionRuns.map((r) => {
                     const d = r?.details?.deletes || {};
                     const backupText = r?.details?.backup_path ? "YES" : (r?.details?.backup_error ? "ERROR" : "-");
                     return (
                       <div key={`retention-run-backup-page-${r.id}`} className="trow">
-                        <span className="db-cell">{r.run_utc || "-"}</span>
+                        <span className="db-cell">{r.run_utc ? fmtTs(r.run_utc) : "-"}</span>
                         <span className="db-cell">{r.dry_run ? "DRY" : "EXECUTE"}</span>
                         <span className="db-cell">{String(r.status || "").toUpperCase()}</span>
                         <span className="db-cell">{`raw:${d.raw_candidates ?? 0} min:${d.minute_candidates ?? 0} hr:${d.hour_candidates ?? 0} day:${d.day_candidates ?? 0}`}</span>
@@ -11410,7 +11464,7 @@ function AppShell() {
                     <span className="db-cell">{databaseInspector?.sync_outbox_status?.sent ?? 0}</span>
                     <span className="db-cell">
                       {databaseInspector?.sync_target?.last_sync_utc
-                        ? `Last sync: ${databaseInspector.sync_target.last_sync_utc}`
+                        ? `Last sync: ${fmtTs(databaseInspector.sync_target.last_sync_utc)}`
                         : (databaseInspector?.sync_target?.last_error || "-")}
                     </span>
                   </div>
@@ -11437,12 +11491,12 @@ function AppShell() {
               <section className="card">
                 <h3>Config Domains (Latest)</h3>
                 <div className="table db-table">
-                  <div className="thead"><span>Domain</span><span>Version</span><span>Updated UTC</span></div>
+                  <div className="thead"><span>Domain</span><span>Version</span><span>Updated</span></div>
                   {(databaseInspector?.config_domains_preview || []).map((d) => (
                     <div key={`dom-${d.domain}`} className="trow">
                       <span className="db-cell">{d.domain}</span>
                       <span className="db-cell">{d.version}</span>
-                      <span className="db-cell">{d.updated_utc}</span>
+                      <span className="db-cell">{d.updated_utc ? fmtTs(d.updated_utc) : "-"}</span>
                     </div>
                   ))}
                   {!databaseInspector?.config_domains_preview?.length ? (
@@ -11623,6 +11677,42 @@ function AppShell() {
 
           {activePage === "interface" ? (
             <>
+              <section className="card">
+                <div className="row interface-header-row">
+                  <h3 className="card-title" style={{ margin: 0 }}>Time and Timestamp Display</h3>
+                </div>
+                <div className="form-grid">
+                  <label>
+                    Display Timezone
+                    <input
+                      value={displayTimeZone}
+                      onChange={(e) => setDisplayTimeZone(safeTimeZone(e.target.value, DEFAULT_DISPLAY_TIMEZONE))}
+                      placeholder="Europe/Dublin"
+                      disabled={!canEditPage("interface")}
+                    />
+                  </label>
+                  <label>
+                    Display Format
+                    <input
+                      value={displayTimestampFormat}
+                      onChange={(e) => setDisplayTimestampFormat(String(e.target.value || DEFAULT_DISPLAY_TIMESTAMP_FORMAT))}
+                      placeholder={DEFAULT_DISPLAY_TIMESTAMP_FORMAT}
+                      disabled={!canEditPage("interface")}
+                    />
+                  </label>
+                </div>
+                <div className="row" style={{ gap: 8 }}>
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={() => setDisplayTimeZone(DEFAULT_DISPLAY_TIMEZONE)}
+                    disabled={!canEditPage("interface")}
+                  >
+                    Use Browser Timezone
+                  </button>
+                  <span className="lock-note">Preview: {fmtTs(tsNow())}</span>
+                </div>
+              </section>
+
               <section className="card">
                 <div className="row interface-header-row">
                   <h3 className="card-title" style={{ margin: 0 }}>Interface Theme</h3>
@@ -12173,7 +12263,7 @@ function AppShell() {
                             onChange={(e) => toggleAlarmSelected(a.id, e.target.checked)}
                           />
                         </span>
-                        <span>{a.ts}</span><span>{a.message}</span><span>{a.value}</span>
+                        <span>{fmtTs(a.ts)}</span><span>{a.message}</span><span>{a.value}</span>
                         <span>
                           {a.paused_by_tag ? (
                             <span className="status-pill status-warning">PAUSED BY TAG</span>
@@ -12262,7 +12352,7 @@ function AppShell() {
                         `historian_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`,
                         toCsv(
                           historianRows.map((r) => ({
-                            timestamp_utc: fmtTs(r.ts),
+                            timestamp_local: fmtTs(r.ts),
                             gateway: r.gateway_name || "",
                             device: r.device_name || "",
                             plc_ip: r.plc_ip || "",
@@ -12382,7 +12472,12 @@ function AppShell() {
                     onClick={() =>
                       downloadText(
                         `logs_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`,
-                        toCsv(filteredLogs),
+                        toCsv(
+                          filteredLogs.map((r) => ({
+                            ...r,
+                            timestamp_local: fmtTs(r.ts),
+                          }))
+                        ),
                         "text/csv;charset=utf-8"
                       )
                     }
@@ -12808,7 +12903,7 @@ function AppShell() {
                         </div>
                         {safeReportDocuments.map((doc) => (
                           <div key={doc.id} className="trow">
-                            <span>{doc.created_utc}</span>
+                            <span>{doc.created_utc ? fmtTs(doc.created_utc) : "-"}</span>
                             <span>{doc.generated_by || "-"}</span>
                             <span className="db-cell" title={doc.summary}>{doc.summary}</span>
                             <span className="row-actions">
@@ -12833,7 +12928,7 @@ function AppShell() {
                       </button>
                     </div>
                     <div className="muted report-summary">{reportSummaryText || "No data loaded yet. Apply filters and click Load Data."}</div>
-                    <div className="muted report-summary">{reportLoadedAt ? `Loaded UTC: ${reportLoadedAt}` : "-"}</div>
+                    <div className="muted report-summary">{reportLoadedAt ? `Loaded: ${fmtTs(reportLoadedAt)} (${displayTimeZone})` : "-"}</div>
                     <div className="chart-wrap reporting-chart-wrap">
                       <ResponsiveContainer width="100%" height={300}>
                         <ComposedChart data={reportingChartData} margin={{ top: 8, right: 14, left: 18, bottom: 8 }}>

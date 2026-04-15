@@ -17,7 +17,8 @@ from app.routers.plc import router as plc_router
 from app.routers.ui_source import router as ui_source_router
 from app.routers.notifications import router as notifications_router
 from app.routers.telemetry_v1 import router as telemetry_v1_router
-from app.state import plc_manager, app_store, telemetry_service, ingest_store
+from app.routers.power import router as power_router
+from app.state import plc_manager, app_store, telemetry_service, ingest_store, power_manager
 from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
 
 app = FastAPI(title="Trustnode Edge API", version="0.1.0")
@@ -39,6 +40,7 @@ app.include_router(app_store_router)
 app.include_router(ui_source_router)
 app.include_router(notifications_router)
 app.include_router(telemetry_v1_router)
+app.include_router(power_router)
 
 
 PUBLIC_PATHS = {
@@ -235,4 +237,5 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     telemetry_service.shutdown()
+    power_manager.shutdown()
     app_store.shutdown()

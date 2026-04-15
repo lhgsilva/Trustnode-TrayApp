@@ -918,3 +918,74 @@ export async function resetAppStoreFull(payload = {}) {
   if (!res.ok) throw new Error("Full reset failed");
   return res.json();
 }
+
+export async function getPowerConfig() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/power/config`);
+  if (!res.ok) throw new Error("Power config fetch failed");
+  return res.json();
+}
+
+export async function getPowerProfiles() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/power/profiles`);
+  if (!res.ok) throw new Error("Power profiles fetch failed");
+  return res.json();
+}
+
+export async function updatePowerConfig(payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/power/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) throw new Error("Power config update failed");
+  return res.json();
+}
+
+export async function testPowerConnection(payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/power/test-connection`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }, 15000);
+  if (!res.ok) throw new Error("Power meter connection test failed");
+  return res.json();
+}
+
+export async function getPowerStatus() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/power/status`);
+  if (!res.ok) throw new Error("Power status fetch failed");
+  return res.json();
+}
+
+export async function getPowerLatest(deviceId = "") {
+  const params = new URLSearchParams();
+  if (deviceId) params.set("device_id", String(deviceId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/power/latest${suffix}`);
+  if (!res.ok) throw new Error("Power latest fetch failed");
+  return res.json();
+}
+
+export async function getPowerHistory(limit = 300, deviceId = "") {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (deviceId) params.set("device_id", String(deviceId));
+  const res = await fetchWithTimeout(`${getApiBase()}/api/power/history?${params.toString()}`);
+  if (!res.ok) throw new Error("Power history fetch failed");
+  return res.json();
+}
+
+export async function startPowerDevice(deviceId) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/power/devices/${encodeURIComponent(String(deviceId || ""))}/start`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error("Power device start failed");
+  return res.json();
+}
+
+export async function stopPowerDevice(deviceId) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/power/devices/${encodeURIComponent(String(deviceId || ""))}/stop`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error("Power device stop failed");
+  return res.json();
+}
