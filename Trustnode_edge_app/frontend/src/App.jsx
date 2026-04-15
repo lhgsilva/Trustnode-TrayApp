@@ -1677,6 +1677,10 @@ function AppShell() {
   const [powerRegisterTests, setPowerRegisterTests] = useState({});
   const [powerBusy, setPowerBusy] = useState(false);
   const [powerResult, setPowerResult] = useState("");
+  const [powerCardsCollapsed, setPowerCardsCollapsed] = useState({
+    meters: false,
+    registers: false,
+  });
   const [powerViewMode, setPowerViewMode] = useState("realtime");
   const [powerPeriod, setPowerPeriod] = useState("24h");
   const [powerInterval, setPowerInterval] = useState("hour");
@@ -10462,6 +10466,15 @@ function AppShell() {
                 <div className="db-simple-head">
                   <div className="db-head-title-wrap">
                     <h3 style={{ margin: 0 }}>Power Meters</h3>
+                    <button
+                      className="btn btn-sm card-collapse-btn"
+                      onClick={() =>
+                        setPowerCardsCollapsed((prev) => ({ ...prev, meters: !prev.meters }))
+                      }
+                      title={powerCardsCollapsed.meters ? "Expand card" : "Collapse card"}
+                    >
+                      {powerCardsCollapsed.meters ? "+" : "-"}
+                    </button>
                     <label className="remember-row db-inline-toggle">
                       <input
                         type="checkbox"
@@ -10480,67 +10493,84 @@ function AppShell() {
                     <button className="btn btn-primary btn-sm" onClick={runPowerConnectionTest} disabled={powerBusy}>Test Connection</button>
                   </div>
                 </div>
-                <div className="form-grid three" style={{ marginTop: 10 }}>
-                  <label className="field">
-                    <span>Energy Price (EUR/kWh)</span>
-                    <input
-                      type="number"
-                      step="0.001"
-                      min="0"
-                      value={Number(powerConfig?.energy_price_eur_kwh ?? DEFAULT_ENERGY_COST_PER_KWH)}
-                      onChange={(e) =>
-                        setPowerConfig((prev) => ({
-                          ...(prev || {}),
-                          energy_price_eur_kwh: Number(e.target.value || DEFAULT_ENERGY_COST_PER_KWH),
-                        }))
-                      }
-                    />
-                  </label>
-                </div>
-                <div className="table db-table">
-                  <div className="thead"><span>Name</span><span>ID</span><span>Type</span><span>Endpoint</span><span>Wiring</span><span>Interval</span><span>Status</span><span>Actions</span></div>
-                  {(Array.isArray(powerConfig.devices) ? powerConfig.devices : []).map((d) => {
-                    const st = (powerStatus?.devices || []).find((x) => String(x.device_id || "") === String(d.id || "")) || {};
-                    const selected = String(powerConfig?.selected_device_id || "") === String(d.id || "");
-                    return (
-                      <div
-                        key={`pwr-dev-${d.id}`}
-                        className={`trow ${selected ? "selected-row" : ""}`}
-                        onClick={() => setPowerConfig((prev) => ({ ...(prev || {}), selected_device_id: String(d.id || "") }))}
-                      >
-                        <span>{d.name || d.id}</span>
-                        <span>{d.id}</span>
-                        <span>{String(d.type || "modbus_tcp").toUpperCase()}</span>
-                        <span>{`${d.ip || "-"}:${d.port || 502}`}</span>
-                        <span>{String(d.electrical_mode || d.wiring_type || "single_phase")}</span>
-                        <span>{`${Number(d.poll_interval_ms || 1000)} ms`}</span>
-                        <span>
-                          <span className={`status-pill ${st.connected ? "status-online" : "status-offline"}`}>
-                            {st.connected ? "Connected" : "Disconnected"}
-                          </span>
-                        </span>
-                        <span className="row-actions">
-                          <button
-                            className="icon-btn table-action-btn"
-                            title={d.enabled !== false ? "Stop Collection" : "Start Collection"}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setPowerDeviceRunning(d.id, d.enabled === false);
-                            }}
+                {!powerCardsCollapsed.meters ? (
+                  <>
+                    <div className="form-grid three" style={{ marginTop: 10 }}>
+                      <label className="field">
+                        <span>Energy Price (EUR/kWh)</span>
+                        <input
+                          type="number"
+                          step="0.001"
+                          min="0"
+                          value={Number(powerConfig?.energy_price_eur_kwh ?? DEFAULT_ENERGY_COST_PER_KWH)}
+                          onChange={(e) =>
+                            setPowerConfig((prev) => ({
+                              ...(prev || {}),
+                              energy_price_eur_kwh: Number(e.target.value || DEFAULT_ENERGY_COST_PER_KWH),
+                            }))
+                          }
+                        />
+                      </label>
+                    </div>
+                    <div className="table db-table">
+                      <div className="thead"><span>Name</span><span>ID</span><span>Type</span><span>Endpoint</span><span>Wiring</span><span>Interval</span><span>Status</span><span>Actions</span></div>
+                      {(Array.isArray(powerConfig.devices) ? powerConfig.devices : []).map((d) => {
+                        const st = (powerStatus?.devices || []).find((x) => String(x.device_id || "") === String(d.id || "")) || {};
+                        const selected = String(powerConfig?.selected_device_id || "") === String(d.id || "");
+                        return (
+                          <div
+                            key={`pwr-dev-${d.id}`}
+                            className={`trow ${selected ? "selected-row" : ""}`}
+                            onClick={() => setPowerConfig((prev) => ({ ...(prev || {}), selected_device_id: String(d.id || "") }))}
                           >
-                            {d.enabled !== false ? <StopIcon /> : <StartIcon />}
-                          </button>
-                          <button className="icon-btn table-action-btn" onClick={(e) => { e.stopPropagation(); openEditPowerDevice(d); }}><EditIcon /></button>
-                          <button className="icon-btn table-action-btn danger" onClick={(e) => { e.stopPropagation(); removePowerDevice(d.id); }}><DeleteIcon /></button>
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
+                            <span>{d.name || d.id}</span>
+                            <span>{d.id}</span>
+                            <span>{String(d.type || "modbus_tcp").toUpperCase()}</span>
+                            <span>{`${d.ip || "-"}:${d.port || 502}`}</span>
+                            <span>{String(d.electrical_mode || d.wiring_type || "single_phase")}</span>
+                            <span>{`${Number(d.poll_interval_ms || 1000)} ms`}</span>
+                            <span>
+                              <span className={`status-pill ${st.connected ? "status-online" : "status-offline"}`}>
+                                {st.connected ? "Connected" : "Disconnected"}
+                              </span>
+                            </span>
+                            <span className="row-actions">
+                              <button
+                                className="icon-btn table-action-btn"
+                                title={d.enabled !== false ? "Stop Collection" : "Start Collection"}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setPowerDeviceRunning(d.id, d.enabled === false);
+                                }}
+                              >
+                                {d.enabled !== false ? <StopIcon /> : <StartIcon />}
+                              </button>
+                              <button className="icon-btn table-action-btn" onClick={(e) => { e.stopPropagation(); openEditPowerDevice(d); }}><EditIcon /></button>
+                              <button className="icon-btn table-action-btn danger" onClick={(e) => { e.stopPropagation(); removePowerDevice(d.id); }}><DeleteIcon /></button>
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : null}
               </section>
               <section className="card">
-                <h3 style={{ marginTop: 0 }}>Selected Meter Wiring & Registers</h3>
-                {!selectedPowerDevice ? (
+                <div className="db-simple-head">
+                  <div className="db-head-title-wrap">
+                    <h3 style={{ margin: 0 }}>Selected Meter Wiring & Registers</h3>
+                    <button
+                      className="btn btn-sm card-collapse-btn"
+                      onClick={() =>
+                        setPowerCardsCollapsed((prev) => ({ ...prev, registers: !prev.registers }))
+                      }
+                      title={powerCardsCollapsed.registers ? "Expand card" : "Collapse card"}
+                    >
+                      {powerCardsCollapsed.registers ? "+" : "-"}
+                    </button>
+                  </div>
+                </div>
+                {powerCardsCollapsed.registers ? null : !selectedPowerDevice ? (
                   <div className="info-note">Select a power meter to configure wiring and registers.</div>
                 ) : (
                   <>
@@ -10573,7 +10603,7 @@ function AppShell() {
                       <label className="field"><span>VT Primary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.vt_primary || 230)} onChange={(e) => setPowerDeviceField("vt_primary", Number(e.target.value || 230))} /></label>
                       <label className="field"><span>VT Secondary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.vt_secondary || 230)} onChange={(e) => setPowerDeviceField("vt_secondary", Number(e.target.value || 230))} /></label>
                     </div>
-                    <div className="table db-table" style={{ marginTop: 12 }}>
+                    <div className="table db-table power-register-table power-register-compact" style={{ marginTop: 12 }}>
                       <div className="thead"><span>Tag Key</span><span>Register Address</span><span>Scale</span><span>Description</span><span>Last Raw</span><span>Last Scaled</span><span>Tested</span><span>Actions</span></div>
                       {Object.entries(selectedPowerRegisterMap || {}).map(([regKey, regVal]) => (
                         <div key={`pwr-reg-${regKey}`} className="trow">

@@ -2815,6 +2815,55 @@ input[type="checkbox"] {
   grid-template-columns: minmax(120px, 1.1fr) minmax(180px, 1.4fr) minmax(170px, 1.3fr) minmax(100px, 0.8fr) minmax(100px, 0.8fr) minmax(100px, 0.8fr) minmax(130px, 1fr) minmax(130px, 1fr) minmax(130px, 0.9fr) minmax(120px, 0.9fr);
 }
 
+.card-collapse-btn {
+  min-width: 32px;
+  height: 28px;
+  padding: 0 10px;
+  line-height: 1;
+  border: 1px solid var(--stroke);
+  background: color-mix(in srgb, var(--card) 80%, var(--bg) 20%);
+}
+
+.power-register-table .thead,
+.power-register-table .trow {
+  min-width: 1240px;
+  grid-template-columns:
+    minmax(150px, 1.25fr)
+    minmax(110px, 0.9fr)
+    minmax(90px, 0.75fr)
+    minmax(220px, 1.5fr)
+    minmax(110px, 0.9fr)
+    minmax(110px, 0.9fr)
+    minmax(220px, 1.5fr)
+    72px;
+}
+
+.power-register-table.power-register-compact .thead {
+  font-size: 12px;
+  padding-bottom: 5px;
+}
+
+.power-register-table.power-register-compact .trow {
+  padding: 4px 6px;
+  font-size: 12px;
+  gap: 6px;
+  border-radius: 6px;
+}
+
+.power-register-table.power-register-compact .trow > span {
+  min-height: 26px;
+  display: flex;
+  align-items: center;
+}
+
+.power-register-table.power-register-compact input,
+.power-register-table.power-register-compact select {
+  height: 26px;
+  min-height: 26px;
+  padding: 2px 6px;
+  font-size: 12px;
+}
+
 @media (max-width: 1400px) {
   .power-kpi-grid {
     grid-template-columns: repeat(3, minmax(150px, 1fr));
