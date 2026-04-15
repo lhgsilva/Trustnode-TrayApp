@@ -54,9 +54,22 @@ jobs:
           if (-not $cloudApi) { $cloudApi = "https://trustnode.lsapps.app" }
           pwsh -NoProfile -ExecutionPolicy Bypass -File "./Trustnode_edge_app/scripts/build-web-cloud-readonly.ps1" -CloudApiUrl $cloudApi -BasePath "/"
 
+      - name: Add client test pages
+        run: |
+          mkdir -p Trustnode_edge_app/web_cloud_readonly/client
+          cp Trustnode_edge_app/client_page_tests/client_test.html Trustnode_edge_app/web_cloud_readonly/client/client_test.html
+          cp Trustnode_edge_app/client_page_tests/client_test.php Trustnode_edge_app/web_cloud_readonly/client/client_test.php
+          cp Trustnode_edge_app/client_page_tests/client_test_db_rest.html Trustnode_edge_app/web_cloud_readonly/client/client_test_db_rest.html
+          cp Trustnode_edge_app/client_page_tests/client_test_db_php.html Trustnode_edge_app/web_cloud_readonly/client/client_test_db_php.html
+          cp Trustnode_edge_app/client_page_tests/client_test_db.php Trustnode_edge_app/web_cloud_readonly/client/client_test_db.php
+
       - name: Validate web bundle wiring
         run: |
           test -f Trustnode_edge_app/web_cloud_readonly/index.html
+          test -f Trustnode_edge_app/web_cloud_readonly/client/client_test.html
+          test -f Trustnode_edge_app/web_cloud_readonly/client/client_test.php
+          test -f Trustnode_edge_app/web_cloud_readonly/client/client_test_db_rest.html
+          test -f Trustnode_edge_app/web_cloud_readonly/client/client_test_db_php.html
           js_file="$(grep -o 'assets/index-[^"]*\.js' Trustnode_edge_app/web_cloud_readonly/index.html | head -n1)"
           test -n "$js_file"
           test -f "Trustnode_edge_app/web_cloud_readonly/$js_file"

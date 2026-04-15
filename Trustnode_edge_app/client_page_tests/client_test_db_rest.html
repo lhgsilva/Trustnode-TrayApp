@@ -1,0 +1,139 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>TrustNode DB Direct-ish Client (HTML + PostgREST)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root { --bg:#1e1e1e; --card:#252526; --stroke:#3c3c3c; --text:#d4d4d4; --muted:#9da0a6; --brand:#007acc; --ok:#2ea043; --danger:#d1242f; --header:#000; --header-text:#d4d4d4; }
+    [data-theme="light"] { --bg:#f3f3f3; --card:#eceff3; --stroke:#c5ccd6; --text:#1f2328; --muted:#5f6b7a; --brand:#007acc; --ok:#2ea043; --danger:#d1242f; --header:#2d2d30; --header-text:#d4d4d4; }
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:Segoe UI,sans-serif}
+    .top{background:var(--header);color:var(--header-text);padding:10px 14px;border-bottom:1px solid #222;display:flex;justify-content:space-between;align-items:center;gap:10px}
+    .wrap{padding:12px;max-width:1500px;margin:0 auto}.card{background:var(--card);border:1px solid var(--stroke);border-radius:12px;padding:12px;margin-bottom:12px}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.grow{flex:1 1 240px}
+    input,select,button{background:transparent;color:var(--text);border:1px solid var(--stroke);border-radius:8px;padding:8px 10px}button{cursor:pointer}
+    .btn{background:var(--brand);border-color:var(--brand);color:#fff}.btn-ok{background:var(--ok);border-color:var(--ok);color:#fff}
+    .tabs{display:flex;gap:8px;flex-wrap:wrap}.tab{padding:8px 12px;border:1px solid var(--stroke);border-radius:999px;cursor:pointer}.tab.active{background:var(--brand);border-color:var(--brand);color:#fff}
+    .grid-4{display:grid;grid-template-columns:repeat(4,minmax(180px,1fr));gap:10px}.kpi{border:1px solid var(--stroke);border-radius:10px;padding:10px}.kpi .label{color:var(--muted);font-size:12px}.kpi .value{font-size:22px;font-weight:700}
+    .views>section{display:none}.views>section.active{display:block}.split{display:grid;grid-template-columns:2fr 1fr;gap:10px}
+    .table{width:100%;border-collapse:collapse}.table th,.table td{border-bottom:1px solid var(--stroke);padding:6px;font-size:13px;text-align:left}
+    .status{padding:4px 8px;border-radius:999px;font-size:12px;border:1px solid var(--stroke)}.ok{color:#b6f3bf;background:rgba(46,160,67,.2)}.bad{color:#ffd7d9;background:rgba(209,36,47,.2)}
+    canvas{width:100%!important;height:280px!important}
+    .warn{font-size:12px;color:#ffd7d9}
+    @media(max-width:900px){.split,.grid-4{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<div class="top">
+  <div><strong>TrustNode Client (HTML Direct via PostgREST)</strong></div>
+  <div class="row"><span id="connState" class="status bad">Not configured</span><button id="themeBtn">Toggle Theme</button></div>
+</div>
+<div class="wrap">
+  <div class="card">
+    <div class="row">
+      <input id="restUrl" class="grow" placeholder="PostgREST URL (e.g. https://<project>.supabase.co/rest/v1)" />
+      <input id="restKey" class="grow" placeholder="Anon readonly key (never service role)" />
+      <button id="connectBtn" class="btn">Connect</button>
+    </div>
+    <div class="warn">Use readonly views only. For production, API middleware is still the safer/faster strategy.</div>
+  </div>
+  <div class="card"><div class="tabs" id="tabs"><div class="tab active" data-view="dashboard">Dashboard</div><div class="tab" data-view="reporting">Reporting</div><div class="tab" data-view="historian">Historian</div><div class="tab" data-view="power">Power Overview</div></div></div>
+
+  <div class="views">
+    <section id="view-dashboard" class="active"><div class="card grid-4"><div class="kpi"><div class="label">Live Rows</div><div class="value" id="kpiLiveRows">-</div></div><div class="kpi"><div class="label">Gateways</div><div class="value" id="kpiGateways">-</div></div><div class="kpi"><div class="label">Avg Sample Age (s)</div><div class="value" id="kpiAge">-</div></div><div class="kpi"><div class="label">Last Update</div><div class="value" id="kpiLast">-</div></div></div><div class="card"><canvas id="liveChart"></canvas></div></section>
+    <section id="view-reporting"><div class="card row"><select id="repAgg"><option value="raw">RAW</option><option value="minute">MINUTE</option><option value="hour">HOUR</option><option value="day">DAY</option></select><input id="repTag" placeholder="tag contains..." /><button id="repLoad" class="btn-ok">Load</button></div><div class="split"><div class="card"><canvas id="repChart"></canvas></div><div class="card" style="max-height:320px;overflow:auto"><table class="table" id="repTable"><thead><tr><th>Time</th><th>Value</th></tr></thead><tbody></tbody></table></div></div></section>
+    <section id="view-historian"><div class="card row"><input id="histTag" placeholder="Filter by tag" /><select id="histLimit"><option>200</option><option>500</option><option>1000</option></select><button id="histLoad" class="btn-ok">Refresh</button></div><div class="card" style="max-height:420px;overflow:auto"><table class="table" id="histTable"><thead><tr><th>Timestamp</th><th>Gateway</th><th>Tag</th><th>Value</th><th>Quality</th></tr></thead><tbody></tbody></table></div></section>
+    <section id="view-power"><div class="card grid-4"><div class="kpi"><div class="label">Voltage (V)</div><div class="value" id="pVoltage">-</div></div><div class="kpi"><div class="label">Current (A)</div><div class="value" id="pCurrent">-</div></div><div class="kpi"><div class="label">Active Power (kW)</div><div class="value" id="pPower">-</div></div><div class="kpi"><div class="label">Energy (kWh)</div><div class="value" id="pEnergy">-</div></div><div class="kpi"><div class="label">Power Factor</div><div class="value" id="pPf">-</div></div><div class="kpi"><div class="label">Frequency (Hz)</div><div class="value" id="pFreq">-</div></div></div><div class="split"><div class="card"><canvas id="powerChart"></canvas></div><div class="card"><canvas id="energyChart"></canvas></div></div></section>
+  </div>
+</div>
+<script>
+(() => {
+  const state={timers:[],histRows:[],ready:false};
+  const fmtN=(v)=>Number.isFinite(Number(v))?Number(v).toFixed(3):'-';
+  const fmtTs=(s)=>{const d=new Date(s);if(Number.isNaN(d.getTime()))return String(s||'');const p=(x)=>String(x).padStart(2,'0');return `${p(d.getDate())}/${p(d.getMonth()+1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;};
+  const h=()=>({apikey:document.getElementById('restKey').value.trim(),Authorization:`Bearer ${document.getElementById('restKey').value.trim()}`});
+  const base=()=>document.getElementById('restUrl').value.trim().replace(/\/+$/,'');
+  const req=async(path)=>{const r=await fetch(`${base()}/${path}`,{headers:h(),cache:'no-store'});if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json();};
+
+  const chartCfg={responsive:true,maintainAspectRatio:false,animation:false,parsing:false};
+  const liveChart=new Chart(document.getElementById('liveChart'),{type:'line',data:{labels:[],datasets:[{label:'Live Avg',data:[],borderColor:'#16a34a',tension:.2}]},options:chartCfg});
+  const repChart=new Chart(document.getElementById('repChart'),{type:'line',data:{labels:[],datasets:[{label:'Report',data:[],borderColor:'#007acc'}]},options:chartCfg});
+  const powerChart=new Chart(document.getElementById('powerChart'),{type:'line',data:{labels:[],datasets:[{label:'kW',data:[],borderColor:'#22c55e'}]},options:chartCfg});
+  const energyChart=new Chart(document.getElementById('energyChart'),{type:'bar',data:{labels:[],datasets:[{label:'kWh',data:[],backgroundColor:'#0ea5e9'}]},options:chartCfg});
+
+  const normalize=(rows)=>{const m=new Map();(rows||[]).forEach(r=>{const k=`${r.ts}|${r.gateway_id||r.gateway_name}|${r.tag}`;if(!m.has(k))m.set(k,r);});return [...m.values()].sort((a,b)=>new Date(a.ts)-new Date(b.ts));};
+
+  async function loadLive(){
+    const latest = await req('latest_machine_state?select=sample_ts_utc,gateway_id,machine_id,tags_json,quality_code&order=sample_ts_utc.desc&limit=120');
+    const rows=[];
+    for(const l of (latest||[])){
+      const tags = Array.isArray(l.tags_json)?l.tags_json:[];
+      for(const t of tags){
+        rows.push({ts:l.sample_ts_utc,gateway_id:l.gateway_id,gateway_name:l.gateway_id,device_name:l.machine_id,tag:String(t.tag_name||''),value:t.value,quality:t.quality_code??l.quality_code??0,quality_label:'GOOD'});
+      }
+    }
+    const n=normalize(rows);
+    const byTs=new Map(); n.forEach(r=>{const t=fmtTs(r.ts),v=Number(r.value);if(!Number.isFinite(v))return;const a=byTs.get(t)||[];a.push(v);byTs.set(t,a);});
+    const labels=[...byTs.keys()].slice(-100),vals=labels.map(k=>{const a=byTs.get(k)||[];return a.length?a.reduce((x,y)=>x+y,0)/a.length:null;});
+    liveChart.data.labels=labels; liveChart.data.datasets[0].data=vals; liveChart.update('none');
+    const gateways=new Set(n.map(r=>String(r.gateway_id||''))).size; const now=Date.now(); const ages=n.map(r=>{const t=Date.parse(r.ts); return Number.isFinite(t)?Math.max(0,(now-t)/1000):0;});
+    document.getElementById('kpiLiveRows').textContent=String(n.length); document.getElementById('kpiGateways').textContent=String(gateways); document.getElementById('kpiAge').textContent=ages.length?(ages.reduce((a,b)=>a+b,0)/ages.length).toFixed(2):'-'; document.getElementById('kpiLast').textContent=n.length?fmtTs(n[n.length-1].ts):'-';
+  }
+
+  async function loadHistorian(){
+    const lim=document.getElementById('histLimit').value||'500';
+    const needle=(document.getElementById('histTag').value||'').toLowerCase();
+    const raw = await req(`telemetry_samples_raw?select=sample_ts_utc,gateway_id,machine_id,quality_code,tags_json&order=sample_ts_utc.desc&limit=${encodeURIComponent(lim)}`);
+    const rows=[];
+    for(const r of (raw||[])){
+      const tags=Array.isArray(r.tags_json)?r.tags_json:[];
+      for(const t of tags){
+        const tag=String(t.tag_name||''); if(needle && !tag.toLowerCase().includes(needle)) continue;
+        rows.push({ts:r.sample_ts_utc,gateway_id:r.gateway_id,gateway_name:r.gateway_id,device_name:r.machine_id,tag,value:t.value,quality:t.quality_code??r.quality_code??0,quality_label:'GOOD'});
+      }
+    }
+    state.histRows=normalize(rows).reverse();
+    const tb=document.querySelector('#histTable tbody'); tb.innerHTML='';
+    state.histRows.forEach(r=>{const tr=document.createElement('tr'); tr.innerHTML=`<td>${fmtTs(r.ts)}</td><td>${r.gateway_name||'-'}</td><td>${r.tag||'-'}</td><td>${fmtN(r.value)}</td><td>${r.quality}</td>`; tb.appendChild(tr);});
+  }
+
+  function aggregate(rows,mode){ if(mode==='raw')return rows.map(r=>({k:fmtTs(r.ts),v:Number(r.value)})).filter(x=>Number.isFinite(x.v)); const b=new Map(); rows.forEach(r=>{const d=new Date(r.ts),v=Number(r.value); if(Number.isNaN(d.getTime())||!Number.isFinite(v))return; let key=''; if(mode==='minute')key=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()} ${d.getHours()}:${d.getMinutes()}`; if(mode==='hour')key=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()} ${d.getHours()}:00`; if(mode==='day')key=`${d.getFullYear()}-${d.getMonth()+1}-${d.getDate()}`; const a=b.get(key)||[]; a.push(v); b.set(key,a);}); return [...b.entries()].map(([k,a])=>({k,v:a.reduce((x,y)=>x+y,0)/a.length})); }
+
+  async function loadReporting(){
+    const needle=(document.getElementById('repTag').value||'').toLowerCase();
+    const mode=document.getElementById('repAgg').value;
+    const rows=(state.histRows||[]).filter(r=>!needle||String(r.tag||'').toLowerCase().includes(needle));
+    const data=aggregate(rows,mode).slice(-220);
+    repChart.data.labels=data.map(x=>x.k); repChart.data.datasets[0].data=data.map(x=>x.v); repChart.update('none');
+    const tb=document.querySelector('#repTable tbody'); tb.innerHTML=''; data.slice(-120).forEach(x=>{const tr=document.createElement('tr'); tr.innerHTML=`<td>${x.k}</td><td>${fmtN(x.v)}</td>`; tb.appendChild(tr);});
+  }
+
+  async function loadPower(){
+    const rows=(state.histRows||[]).filter(r=>String(r.tag||'').includes('power')||String(r.tag||'').includes('energy')||String(r.tag||'').includes('voltage')||String(r.tag||'').includes('current')||String(r.tag||'').includes('frequency'));
+    const last=rows[0]||{};
+    const pick=(name)=>{const hit=rows.find(r=>String(r.tag||'')===name); return Number(hit?.value);};
+    const voltage=pick('voltage_v'), current=pick('current_a'), powerW=pick('active_power_total_w')||pick('active_power_w'), energyWh=pick('energy_total_wh')||pick('energy_wh'), pf=pick('power_factor_total')||pick('power_factor'), freq=pick('frequency_hz');
+    document.getElementById('pVoltage').textContent=fmtN(voltage); document.getElementById('pCurrent').textContent=fmtN(current); document.getElementById('pPower').textContent=Number.isFinite(powerW)?fmtN(powerW/1000):'-'; document.getElementById('pEnergy').textContent=Number.isFinite(energyWh)?fmtN(energyWh/1000):'-'; document.getElementById('pPf').textContent=fmtN(pf); document.getElementById('pFreq').textContent=fmtN(freq);
+    const pRows=rows.filter(r=>String(r.tag||'').includes('active_power')); const eRows=rows.filter(r=>String(r.tag||'').includes('energy_'));
+    powerChart.data.labels=pRows.slice(-120).map(r=>fmtTs(r.ts)); powerChart.data.datasets[0].data=pRows.slice(-120).map(r=>Number(r.value)/1000); powerChart.update('none');
+    energyChart.data.labels=eRows.slice(-120).map(r=>fmtTs(r.ts)); energyChart.data.datasets[0].data=eRows.slice(-120).map(r=>Number(r.value)/1000); energyChart.update('none');
+  }
+
+  function start(){
+    state.timers.forEach(clearInterval); state.timers=[];
+    const visible=()=>document.visibilityState==='visible';
+    state.timers.push(setInterval(()=>visible()&&loadLive(),2000));
+    state.timers.push(setInterval(()=>visible()&&loadHistorian(),4500));
+    state.timers.push(setInterval(()=>visible()&&loadPower(),2500));
+  }
+
+  document.getElementById('connectBtn').onclick=async()=>{ try{ await loadLive(); await loadHistorian(); await loadReporting(); await loadPower(); start(); state.ready=true; const c=document.getElementById('connState'); c.className='status ok'; c.textContent='Connected'; } catch(e){ alert(e.message); }};
+  document.getElementById('histLoad').onclick=()=>loadHistorian().catch(e=>alert(e.message));
+  document.getElementById('repLoad').onclick=()=>loadReporting().catch(e=>alert(e.message));
+  document.getElementById('tabs').addEventListener('click',(e)=>{const t=e.target.closest('.tab');if(!t)return; document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active')); t.classList.add('active'); document.querySelectorAll('.views>section').forEach(s=>s.classList.remove('active')); document.getElementById(`view-${t.dataset.view}`).classList.add('active');});
+  document.getElementById('themeBtn').onclick=()=>{document.documentElement.dataset.theme=document.documentElement.dataset.theme==='light'?'dark':'light';};
+})();
+</script>
+</body>
+</html>
