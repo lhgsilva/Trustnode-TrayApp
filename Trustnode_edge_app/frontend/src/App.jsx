@@ -222,9 +222,11 @@ const INTERFACE_THEME_TOKEN_FIELDS = [
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
 const GATEWAY_STATUS_POLL_MS_CLOUD = 1000;
-const CLOUD_LIVE_POLL_MS = 1000;
-const CLOUD_AUX_POLL_MS = 1500;
-const CLOUD_LIVE_FETCH_LIMIT = 600;
+const CLOUD_LIVE_POLL_MS = 1500;
+const CLOUD_AUX_POLL_MS = 10000;
+const CLOUD_LIVE_FETCH_LIMIT = 180;
+const CLOUD_HIST_FETCH_LIMIT = 600;
+const CLOUD_LOG_FETCH_LIMIT = 800;
 const CLOUD_EDGE_ALL_KEY = "__all_edges__";
 const UI_RENDER_TICK_MS = 250;
 const RETENTION_PRESETS = {
@@ -1881,6 +1883,7 @@ function AppShell() {
   const cloudNewestLiveTsMsRef = useRef(0);
   const cloudLastApplyMsRef = useRef(0);
   const cloudLastAcceptedTsByKeyRef = useRef(new Map());
+  const cloudPollLogThrottleRef = useRef({ live: 0, aux: 0 });
   const tagAlarmPrefsRef = useRef({});
   const emailSettingsRef = useRef({});
   const historianOutboxRef = useRef([]);
@@ -2780,7 +2783,7 @@ function AppShell() {
     let cancelled = false;
     const loadOperationalHistory = async () => {
       try {
-        const [histRes, logRes] = await Promise.all([getAppStoreHistorian(1500), getAppStoreLogs(2500)]);
+        const [histRes, logRes] = await Promise.all([getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT), getAppStoreLogs(CLOUD_LOG_FETCH_LIMIT)]);
         if (cancelled) return;
         if (histRes?.ok && Array.isArray(histRes.rows)) {
           setDataLog(histRes.rows);
@@ -4143,11 +4146,15 @@ function AppShell() {
       } catch (err) {
         if (!stopped) {
           setWsState("reconnecting");
-          addAppLog({
-            level: "warning",
-            category: "connectivity",
-            message: `Cloud live polling failed: ${String(err)}`
-          });
+          const now = Date.now();
+          if (now - Number(cloudPollLogThrottleRef.current.live || 0) > 15000) {
+            cloudPollLogThrottleRef.current.live = now;
+            addAppLog({
+              level: "warning",
+              category: "connectivity",
+              message: `Cloud live polling failed: ${String(err)}`
+            });
+          }
         }
       } finally {
         runningLive = false;
@@ -4155,18 +4162,23 @@ function AppShell() {
     };
     const pollCloudAux = async () => {
       if (stopped || runningAux) return;
+      const inspectorPages = new Set(["database", "database_overview", "database_inspector", "backup_and_retention"]);
+      const wantsHistorian = activePage === "historian";
+      const wantsLogs = activePage === "logs";
+      const wantsInspector = inspectorPages.has(String(activePage || ""));
+      if (cloudStreamConnected && !wantsHistorian && !wantsLogs && !wantsInspector) return;
       runningAux = true;
       try {
         const [histRes, logRes, inspectorRes] = await Promise.all([
-          getAppStoreHistorian(1500),
-          getAppStoreLogs(2500),
-          getAppStoreInspector(20)
+          (wantsHistorian || !cloudStreamConnected) ? getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT) : Promise.resolve(null),
+          (wantsLogs || !cloudStreamConnected) ? getAppStoreLogs(CLOUD_LOG_FETCH_LIMIT) : Promise.resolve(null),
+          (wantsInspector || !cloudStreamConnected) ? getAppStoreInspector(20) : Promise.resolve(null)
         ]);
         if (stopped) return;
-        if ((activePage === "historian" || activePage === "logs") && histRes?.ok && Array.isArray(histRes.rows)) {
+        if (wantsHistorian && histRes?.ok && Array.isArray(histRes.rows)) {
           setDataLog((prev) => mergeHistorianRowsStable(histRes.rows, prev, 5000));
         }
-        if (logRes?.ok && Array.isArray(logRes.rows)) {
+        if (wantsLogs && logRes?.ok && Array.isArray(logRes.rows)) {
           setAppLogs(logRes.rows);
         }
         if (inspectorRes?.ok && inspectorRes?.inspector) {
@@ -4176,11 +4188,15 @@ function AppShell() {
       } catch (err) {
         if (!stopped) {
           setWsState("reconnecting");
-          addAppLog({
-            level: "warning",
-            category: "connectivity",
-            message: `Cloud aux polling failed: ${String(err)}`
-          });
+          const now = Date.now();
+          if (now - Number(cloudPollLogThrottleRef.current.aux || 0) > 20000) {
+            cloudPollLogThrottleRef.current.aux = now;
+            addAppLog({
+              level: "warning",
+              category: "connectivity",
+              message: `Cloud aux polling failed: ${String(err)}`
+            });
+          }
         }
       } finally {
         runningAux = false;

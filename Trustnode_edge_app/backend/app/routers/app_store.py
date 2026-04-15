@@ -120,10 +120,12 @@ def append_logs(payload: AppendRowsRequest) -> dict:
 def get_historian(request: Request, limit: int = 1000) -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
     prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    # Protect cloud API from expensive oversized scans under high fan-out clients.
+    safe_limit = max(50, min(int(limit or 1000), 1000 if prefer_cloud_reads else 5000))
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
-        "rows": app_store.get_historian_rows(limit=limit, prefer_cloud_reads=prefer_cloud_reads),
+        "rows": app_store.get_historian_rows(limit=safe_limit, prefer_cloud_reads=prefer_cloud_reads),
     }
 
 
@@ -131,10 +133,11 @@ def get_historian(request: Request, limit: int = 1000) -> dict:
 def get_live(request: Request, limit: int = 5000) -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
     prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    safe_limit = max(50, min(int(limit or 5000), 800 if prefer_cloud_reads else 5000))
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
-        "rows": app_store.get_live_rows(limit=limit, prefer_cloud_reads=prefer_cloud_reads),
+        "rows": app_store.get_live_rows(limit=safe_limit, prefer_cloud_reads=prefer_cloud_reads),
     }
 
 
@@ -142,10 +145,11 @@ def get_live(request: Request, limit: int = 5000) -> dict:
 def get_logs(request: Request, limit: int = 2000) -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
     prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    safe_limit = max(50, min(int(limit or 2000), 1000 if prefer_cloud_reads else 5000))
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
-        "rows": app_store.get_log_rows(limit=limit, prefer_cloud_reads=prefer_cloud_reads),
+        "rows": app_store.get_log_rows(limit=safe_limit, prefer_cloud_reads=prefer_cloud_reads),
     }
 
 
