@@ -97,6 +97,13 @@ const KNOWN_SUPABASE_DEFAULTS = {
   equipment: "MACHINE-01",
 };
 const KNOWN_SUPABASE_POOLER_HOST = "aws-1-eu-west-1.pooler.supabase.com";
+const FALLBACK_PLC_CONFIG = {
+  gateway_type: "allen_bradley",
+  plc_ip: "",
+  opc_url: "",
+  interval_ms: 1000,
+  tags: [],
+};
 
 const NAV_SECTIONS = [
   { id: "overview", title: "Overview", items: ["Dashboard"] },
@@ -3273,14 +3280,49 @@ function AppShell() {
   useEffect(() => {
     let cancelled = false;
     const initWithRetry = async () => {
+      if (!currentUser) return;
       while (!cancelled) {
         try {
-          const [cfg, st] = await Promise.all([getConfig(), getStatus()]);
+          let cfg = null;
+          let st = null;
+          try {
+            cfg = await getConfig();
+          } catch (cfgErr) {
+            // Cloud UX must stay available even if PLC config endpoint is temporarily unhealthy.
+            // Try deriving a safe fallback from bootstrap before showing blocking loader.
+            try {
+              const boot = await getAppStoreBootstrap();
+              const gwCfgs = Array.isArray(boot?.data?.gateway_configurations)
+                ? boot.data.gateway_configurations
+                : [];
+              const first = gwCfgs.length ? gwCfgs[0] : null;
+              cfg = {
+                ...FALLBACK_PLC_CONFIG,
+                gateway_type: String(first?.gateway_type || FALLBACK_PLC_CONFIG.gateway_type),
+                plc_ip: String(first?.plc_ip || ""),
+                opc_url: String(first?.opc_url || ""),
+                interval_ms: Number(first?.interval_ms || FALLBACK_PLC_CONFIG.interval_ms),
+                tags: Array.isArray(first?.tags) ? first.tags : [],
+              };
+              setError(
+                `Config endpoint unavailable, using bootstrap fallback. Details: ${String(
+                  cfgErr?.message || cfgErr || ""
+                )}`
+              );
+            } catch {
+              throw cfgErr;
+            }
+          }
+          try {
+            st = await getStatus();
+          } catch {
+            st = {};
+          }
           if (cancelled) return;
-          setConfig(cfg);
-          setStatus(st);
+          setConfig(cfg || { ...FALLBACK_PLC_CONFIG });
+          setStatus(st || {});
           setBootState("ready");
-          setError("");
+          setError((prev) => (String(prev || "").includes("bootstrap fallback") ? prev : ""));
           return;
         } catch (e) {
           if (cancelled) return;
@@ -3294,7 +3336,7 @@ function AppShell() {
     return () => {
       cancelled = true;
     };
-  }, [endpointVersion]);
+  }, [endpointVersion, currentUser]);
 
   useEffect(() => {
     let stopped = false;
