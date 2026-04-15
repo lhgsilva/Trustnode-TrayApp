@@ -3716,17 +3716,24 @@ class AppStore:
                 if newest_fast_ms > 0 and max(0, now_ms - newest_fast_ms) <= int(self._live_source_max_stale_ms):
                     return cloud_live_fast
             cloud_live = self._fetch_live_rows_from_cloud(lim)
-            cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim * 2, 500), 3000))
-            if cloud_live and cloud_hist:
+            if cloud_live:
+                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 latest_live_ms = max((_row_ts_ms(r) for r in cloud_live), default=0)
-                latest_hist_ms = max((_row_ts_ms(r) for r in cloud_hist), default=0)
-                # If live_latest lags materially behind historian, serve latest rows
-                # derived from historian so web charts remain visibly live.
-                if latest_hist_ms > 0 and latest_hist_ms > latest_live_ms + 1500:
-                    hist_live = _latest_per_gateway_tag(cloud_hist, lim)
-                    if hist_live:
-                        return hist_live
+                live_age_ms = max(0, now_ms - latest_live_ms) if latest_live_ms > 0 else 999999
+                # Fast path: avoid expensive historian reads on every live request.
+                if live_age_ms <= int(max(1500, self._live_source_max_stale_ms)):
+                    return cloud_live
+                cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim * 2, 500), 1500))
+                if cloud_hist:
+                    latest_hist_ms = max((_row_ts_ms(r) for r in cloud_hist), default=0)
+                    # If live_latest lags materially behind historian, serve latest rows
+                    # derived from historian so web charts remain visibly live.
+                    if latest_hist_ms > 0 and latest_hist_ms > latest_live_ms + 1500:
+                        hist_live = _latest_per_gateway_tag(cloud_hist, lim)
+                        if hist_live:
+                            return hist_live
                 return cloud_live
+            cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim * 2, 500), 1500))
             if cloud_live:
                 return cloud_live
             if cloud_hist:

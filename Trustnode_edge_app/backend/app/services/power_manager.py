@@ -320,11 +320,57 @@ class PowerManager:
         if not client.connect():
             raise RuntimeError("Unable to connect")
         raw_values: dict[str, float] = {}
+        addr_to_keys: dict[int, list[str]] = {}
         for key, addr in registers.items():
-            res = client.read_input_registers(address=int(addr), count=2, slave=unit_id)
-            if getattr(res, "isError", lambda: True)():
-                raise RuntimeError(f"Read failed for {key} at register {addr}")
-            raw_values[key] = self._decode_float32_be(list(getattr(res, "registers", []) or [0, 0]))
+            addr_int = int(addr)
+            addr_to_keys.setdefault(addr_int, []).append(str(key))
+        sorted_addrs = sorted(addr_to_keys.keys())
+        blocks: list[tuple[int, int]] = []
+        if sorted_addrs:
+            start = sorted_addrs[0]
+            end = start + 1
+            for addr in sorted_addrs[1:]:
+                # Merge near/contiguous ranges to reduce Modbus round-trips.
+                if addr <= end + 2 and (addr - start) <= 120:
+                    end = max(end, addr + 1)
+                    continue
+                blocks.append((start, end))
+                start = addr
+                end = addr + 1
+            blocks.append((start, end))
+        for block_start, block_end in blocks:
+            count = max(2, int(block_end - block_start + 1))
+            try:
+                res = client.read_input_registers(address=int(block_start), count=count, slave=unit_id)
+                if getattr(res, "isError", lambda: True)():
+                    raise RuntimeError(f"Read failed for block {block_start}:{block_end}")
+                regs = list(getattr(res, "registers", []) or [])
+                for addr, keys in addr_to_keys.items():
+                    if addr < block_start or addr > block_end:
+                        continue
+                    off = int(addr - block_start)
+                    pair = regs[off : off + 2]
+                    if len(pair) < 2:
+                        continue
+                    val = self._decode_float32_be(pair)
+                    for key in keys:
+                        raw_values[key] = val
+            except Exception:
+                # Fallback: isolate bad points without failing whole cycle.
+                for addr, keys in addr_to_keys.items():
+                    if addr < block_start or addr > block_end:
+                        continue
+                    res = client.read_input_registers(address=int(addr), count=2, slave=unit_id)
+                    if getattr(res, "isError", lambda: True)():
+                        raise RuntimeError(f"Read failed for register {addr}")
+                    pair = list(getattr(res, "registers", []) or [0, 0])
+                    val = self._decode_float32_be(pair)
+                    for key in keys:
+                        raw_values[key] = val
+        if raw_values:
+            missing = [str(k) for k in registers.keys() if str(k) not in raw_values]
+            if missing:
+                raise RuntimeError(f"Read incomplete; missing registers for: {', '.join(missing)}")
 
         ct_ratio = 1.0
         vt_ratio = 1.0
@@ -442,10 +488,10 @@ class PowerManager:
                     continue
                 device_id = str(device.get("id") or "")
                 interval_s = max(0.25, float(device.get("poll_interval_ms") or 1000) / 1000.0)
-                due_at = float(self._next_poll_at.get(device_id, 0.0))
+                due_at = float(self._next_poll_at.get(device_id, now_mono))
                 if now_mono < due_at:
                     continue
-                self._next_poll_at[device_id] = now_mono + interval_s
+                started = time.monotonic()
                 try:
                     self._poll_device(device)
                 except Exception as exc:
@@ -467,6 +513,10 @@ class PowerManager:
                         )
                     except Exception:
                         pass
+                finished = time.monotonic()
+                # Keep cadence stable and avoid bursty catch-up that makes charts look erratic.
+                next_due = max(due_at + interval_s, finished + 0.02)
+                self._next_poll_at[device_id] = next_due
             time.sleep(0.08)
 
     def get_status(self) -> dict[str, Any]:
