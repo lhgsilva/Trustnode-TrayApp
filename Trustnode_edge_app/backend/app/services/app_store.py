@@ -1156,7 +1156,13 @@ class AppStore:
         except Exception:
             return []
 
-    def _fetch_historian_rows_from_cloud(self, limit: int) -> list[dict[str, Any]]:
+    def _fetch_historian_rows_from_cloud(
+        self,
+        limit: int,
+        gateway: str = "",
+        device: str = "",
+        tag: str = "",
+    ) -> list[dict[str, Any]]:
         cloud = self._get_cloud_database_target()
         if not cloud:
             return []
@@ -1167,6 +1173,24 @@ class AppStore:
             return []
         schema = str(cloud.get("schema") or "public")
         lim = max(1, min(int(limit or 1000), 10000))
+        gateway_txt = str(gateway or "").strip()
+        device_txt = str(device or "").strip()
+        tag_txt = str(tag or "").strip()
+        filters_sql = ""
+        filters_sql_unscoped = ""
+        params: dict[str, Any] = {"lim": lim, "tenant": tenant_id}
+        if gateway_txt:
+            filters_sql += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+            filters_sql_unscoped += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+            params["gateway"] = gateway_txt
+        if device_txt:
+            filters_sql += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
+            filters_sql_unscoped += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
+            params["device_like"] = f"%{device_txt}%"
+        if tag_txt:
+            filters_sql += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+            filters_sql_unscoped += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+            params["tag_like"] = f"%{tag_txt}%"
         try:
             engine, _ = self._get_or_create_cloud_engine(cloud, schema)
         except Exception:
@@ -1180,12 +1204,12 @@ class AppStore:
                             SELECT local_id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                    tag_name, value, quality, quality_label
                             FROM "{schema}"."historian_readings"
-                            WHERE tenant_id = :tenant AND local_id IS NOT NULL
+                            WHERE tenant_id = :tenant AND local_id IS NOT NULL{filters_sql}
                             ORDER BY ts_utc DESC, COALESCE(local_id, 0) DESC, id DESC
                             LIMIT :lim
                             """
                         ),
-                        {"lim": lim, "tenant": tenant_id},
+                        params,
                     ).fetchall()
                 out: list[dict[str, Any]] = []
                 for r in rows:
@@ -1234,12 +1258,12 @@ class AppStore:
                                 SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                        tag_name, value, quality, quality_label
                                 FROM "{schema}"."{table_name}"
-                                WHERE tenant_id = :tenant
+                                WHERE tenant_id = :tenant{filters_sql}
                                 ORDER BY ts_utc DESC
                                 LIMIT :lim
                                 """
                             ),
-                            {"lim": lim, "tenant": tenant_id},
+                            params,
                         ).fetchall()
                     except Exception:
                         scoped_rows = []
@@ -1250,11 +1274,12 @@ class AppStore:
                                 SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                        tag_name, value, quality, quality_label
                                 FROM "{schema}"."{table_name}"
+                                WHERE 1=1{filters_sql_unscoped}
                                 ORDER BY ts_utc DESC
                                 LIMIT :lim
                                 """
                             ),
-                            {"lim": lim},
+                            {k: v for k, v in params.items() if k != "tenant"},
                         ).fetchall()
                     except Exception:
                         unscoped_rows = []
@@ -3629,29 +3654,55 @@ class AppStore:
         self._sync_wakeup_event.set()
         return len(safe_rows)
 
-    def get_historian_rows(self, limit: int = 1000, prefer_cloud_reads: bool | None = None) -> list[dict[str, Any]]:
+    def get_historian_rows(
+        self,
+        limit: int = 1000,
+        prefer_cloud_reads: bool | None = None,
+        gateway: str = "",
+        device: str = "",
+        tag: str = "",
+    ) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 1000), 10000))
         tenant_id = self._current_tenant_id()
+        gateway_txt = str(gateway or "").strip()
+        device_txt = str(device or "").strip()
+        tag_txt = str(tag or "").strip()
         # Hosted/web deployments should prefer cloud-backed historian reads so the
         # website mirrors edge-collected data even when no local gateways run on VPS.
         prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
         if prefer_cloud:
-            cloud_rows = self._fetch_historian_rows_from_cloud(lim)
+            cloud_rows = self._fetch_historian_rows_from_cloud(
+                lim,
+                gateway=gateway_txt,
+                device=device_txt,
+                tag=tag_txt,
+            )
             if cloud_rows:
                 return cloud_rows
 
+        where = "WHERE tenant_id = :tenant"
+        params: dict[str, Any] = {"tenant": tenant_id, "lim": lim}
+        if gateway_txt:
+            where += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+            params["gateway"] = gateway_txt
+        if device_txt:
+            where += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
+            params["device_like"] = f"%{device_txt}%"
+        if tag_txt:
+            where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+            params["tag_like"] = f"%{tag_txt}%"
         with self._lock:
             with self._connect() as conn:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                            tag_name, value, quality, quality_label
                     FROM historian_readings
-                    WHERE tenant_id = ?
+                    {where}
                     ORDER BY id DESC
-                    LIMIT ?
+                    LIMIT :lim
                     """,
-                    (tenant_id, lim),
+                    params,
                 ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:

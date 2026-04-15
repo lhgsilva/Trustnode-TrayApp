@@ -117,7 +117,13 @@ def append_logs(payload: AppendRowsRequest) -> dict:
 
 
 @router.get("/historian")
-def get_historian(request: Request, limit: int = 1000) -> dict:
+def get_historian(
+    request: Request,
+    limit: int = 1000,
+    gateway: str = "",
+    device: str = "",
+    tag: str = "",
+) -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
     prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
     # Protect cloud API from expensive oversized scans under high fan-out clients.
@@ -125,7 +131,13 @@ def get_historian(request: Request, limit: int = 1000) -> dict:
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
-        "rows": app_store.get_historian_rows(limit=safe_limit, prefer_cloud_reads=prefer_cloud_reads),
+        "rows": app_store.get_historian_rows(
+            limit=safe_limit,
+            prefer_cloud_reads=prefer_cloud_reads,
+            gateway=gateway,
+            device=device,
+            tag=tag,
+        ),
     }
 
 
