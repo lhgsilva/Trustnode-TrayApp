@@ -1715,10 +1715,11 @@ body {
 }
 
 .reporting-preview-modal {
-  width: min(50vw, 900px);
-  max-width: calc(94vh / 1.414);
-  min-width: 360px;
+  width: min(86vw, 1400px);
+  max-width: calc(100vw - 32px);
+  min-width: min(640px, 96vw);
   height: 94vh;
+  max-height: calc(100vh - 24px);
   display: grid;
   grid-template-rows: auto 1fr;
   gap: 10px;

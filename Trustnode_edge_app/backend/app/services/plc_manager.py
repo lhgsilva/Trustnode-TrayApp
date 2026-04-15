@@ -53,9 +53,20 @@ class GatewayWorker:
             0.25, float(os.environ.get("TRUSTNODE_REMOTE_PENDING_PROBE_SECONDS", "2.0") or "2.0")
         )
         self._ab_preferred_path: str | None = None
+        self._ab_pycomm3_client = None
+        self._ab_pycomm3_path: str | None = None
+        self._ab_pylogix_client = None
+        self._ab_pylogix_ip: str | None = None
+        self._ab_pylogix_slot: int | None = None
         self._telemetry_runtime_refresh_monotonic = 0.0
 
     def set_config(self, config: GatewayConfig) -> None:
+        if (
+            str(getattr(self.config, "plc_ip", "") or "").strip() != str(getattr(config, "plc_ip", "") or "").strip()
+            or str(getattr(self.config, "gateway_type", "") or "").strip().lower()
+            != str(getattr(config, "gateway_type", "") or "").strip().lower()
+        ):
+            self._dispose_gateway_clients()
         self.config = config
 
     def _normalize_db_sinks(
@@ -120,6 +131,7 @@ class GatewayWorker:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        self._dispose_gateway_clients()
 
     def get_status(self) -> GatewayStatus:
         return GatewayStatus(
@@ -338,55 +350,64 @@ class GatewayWorker:
             try:
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                 out: List[GatewayReading] = []
-                # Keep AB cycle lightweight: do not hydrate full tag dictionaries on every poll.
-                with LogixDriver(path, init_tags=False, init_program_tags=False) as plc:
-                    known_tags = set()
-                    if isinstance(getattr(plc, "tags", None), dict):
-                        known_tags = {str(k).strip() for k in plc.tags.keys() if str(k).strip()}
-                    if known_tags:
-                        missing = [t for t in tags if t not in known_tags]
-                        if missing:
-                            raise RuntimeError(
-                                f"Configured AB tags not found in controller ({len(missing)}): {', '.join(missing[:8])}"
-                            )
-
-                    results = plc.read(*tags)
-                    if not isinstance(results, list):
-                        results = [results]
-                    if not results:
-                        raise RuntimeError("no responses")
-                    if len(results) != len(tags):
-                        raise RuntimeError(f"requested {len(tags)} tags but got {len(results)} results")
-                    for idx, res in enumerate(results):
-                        requested_tag = tags[idx]
-                        reported_tag = str(getattr(res, "tag", "") or "")
-                        if reported_tag and _norm_tag(reported_tag) != _norm_tag(requested_tag):
-                            raise RuntimeError(
-                                f"read mismatch on route {path}: requested '{requested_tag}' but got '{reported_tag}'"
-                            )
-                        status = str(getattr(res, "error", None) or getattr(res, "status", "") or "")
-                        if status:
-                            raise RuntimeError(f"read failed for '{requested_tag}': {status}")
-                        value = self._coerce_value_to_float(getattr(res, "value", None), requested_tag or "<unknown>")
-                        quality, quality_label = self._normalize_quality(self.config.gateway_type, raw_quality=192)
-                        out.append(
-                            GatewayReading(
-                                ts_utc=ts,
-                                tag_name=requested_tag,
-                                value=value,
-                                quality=quality,
-                                quality_label=quality_label,
-                                source=self.config.gateway_type,
-                                site=self.config.site,
-                                area=self.config.area,
-                                equipment=self.config.equipment,
-                            )
+                # Keep AB cycle lightweight: reuse session between polls.
+                plc = self._ensure_ab_pycomm3_client(path, LogixDriver)
+                known_tags = set()
+                if isinstance(getattr(plc, "tags", None), dict):
+                    known_tags = {str(k).strip() for k in plc.tags.keys() if str(k).strip()}
+                if known_tags:
+                    missing = [t for t in tags if t not in known_tags]
+                    if missing:
+                        raise RuntimeError(
+                            f"Configured AB tags not found in controller ({len(missing)}): {', '.join(missing[:8])}"
                         )
+
+                try:
+                    results = plc.read(*tags)
+                except Exception:
+                    # One reconnect attempt on broken/stale session.
+                    self._close_ab_pycomm3_client()
+                    plc = self._ensure_ab_pycomm3_client(path, LogixDriver)
+                    results = plc.read(*tags)
+
+                if not isinstance(results, list):
+                    results = [results]
+                if not results:
+                    raise RuntimeError("no responses")
+                if len(results) != len(tags):
+                    raise RuntimeError(f"requested {len(tags)} tags but got {len(results)} results")
+                for idx, res in enumerate(results):
+                    requested_tag = tags[idx]
+                    reported_tag = str(getattr(res, "tag", "") or "")
+                    if reported_tag and _norm_tag(reported_tag) != _norm_tag(requested_tag):
+                        raise RuntimeError(
+                            f"read mismatch on route {path}: requested '{requested_tag}' but got '{reported_tag}'"
+                        )
+                    status = str(getattr(res, "error", None) or getattr(res, "status", "") or "")
+                    if status:
+                        raise RuntimeError(f"read failed for '{requested_tag}': {status}")
+                    value = self._coerce_value_to_float(getattr(res, "value", None), requested_tag or "<unknown>")
+                    quality, quality_label = self._normalize_quality(self.config.gateway_type, raw_quality=192)
+                    out.append(
+                        GatewayReading(
+                            ts_utc=ts,
+                            tag_name=requested_tag,
+                            value=value,
+                            quality=quality,
+                            quality_label=quality_label,
+                            source=self.config.gateway_type,
+                            site=self.config.site,
+                            area=self.config.area,
+                            equipment=self.config.equipment,
+                        )
+                    )
                 if out:
                     self._ab_preferred_path = path
                     return out
                 raise RuntimeError("all tags returned invalid values")
             except Exception as exc:
+                if self._ab_pycomm3_path == path:
+                    self._close_ab_pycomm3_client()
                 last_error = str(exc)
                 continue
         self._ab_preferred_path = None
@@ -414,14 +435,18 @@ class GatewayWorker:
             slots.append(0)
 
         for slot in slots:
-            comm = PLC()
+            comm = None
             try:
-                comm.IPAddress = base_ip
-                comm.ProcessorSlot = slot
+                comm = self._ensure_ab_pylogix_client(base_ip, slot, PLC)
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                 out: List[GatewayReading] = []
-                for tag in tags:
-                    res = comm.Read(tag)
+                results = comm.Read(tags)
+                if not isinstance(results, list):
+                    results = [results]
+                if len(results) != len(tags):
+                    raise RuntimeError(f"requested {len(tags)} tags but got {len(results)} results")
+                for idx, res in enumerate(results):
+                    tag = tags[idx]
                     status = str(getattr(res, "Status", "") or "")
                     status_ok = status.strip().lower() in ("success", "ok", "0")
                     if not status_ok:
@@ -445,13 +470,10 @@ class GatewayWorker:
                     return out
                 raise RuntimeError("all tags returned invalid values")
             except Exception as exc:
+                if self._ab_pylogix_ip == base_ip and self._ab_pylogix_slot == slot:
+                    self._close_ab_pylogix_client()
                 last_error = str(exc)
                 continue
-            finally:
-                try:
-                    comm.Close()
-                except Exception:
-                    pass
         raise RuntimeError(f"all slot attempts failed ({', '.join(str(s) for s in slots)}): {last_error}")
 
     def _parse_snap7_tag(self, raw_tag: str) -> tuple[str, int, int, str, int]:
@@ -698,6 +720,51 @@ class GatewayWorker:
         self._db_engine = None
         self._db_engine_key = ""
         self._db_schema_ready_key = ""
+
+    def _ensure_ab_pycomm3_client(self, path: str, logix_driver_cls):
+        if self._ab_pycomm3_client is not None and self._ab_pycomm3_path == path:
+            return self._ab_pycomm3_client
+        self._close_ab_pycomm3_client()
+        plc = logix_driver_cls(path, init_tags=False, init_program_tags=False)
+        plc.open()
+        self._ab_pycomm3_client = plc
+        self._ab_pycomm3_path = path
+        return plc
+
+    def _close_ab_pycomm3_client(self) -> None:
+        if self._ab_pycomm3_client is not None:
+            try:
+                self._ab_pycomm3_client.close()
+            except Exception:
+                pass
+        self._ab_pycomm3_client = None
+        self._ab_pycomm3_path = None
+
+    def _ensure_ab_pylogix_client(self, ip: str, slot: int, plc_cls):
+        if self._ab_pylogix_client is not None and self._ab_pylogix_ip == ip and self._ab_pylogix_slot == slot:
+            return self._ab_pylogix_client
+        self._close_ab_pylogix_client()
+        comm = plc_cls()
+        comm.IPAddress = ip
+        comm.ProcessorSlot = int(slot)
+        self._ab_pylogix_client = comm
+        self._ab_pylogix_ip = ip
+        self._ab_pylogix_slot = int(slot)
+        return comm
+
+    def _close_ab_pylogix_client(self) -> None:
+        if self._ab_pylogix_client is not None:
+            try:
+                self._ab_pylogix_client.Close()
+            except Exception:
+                pass
+        self._ab_pylogix_client = None
+        self._ab_pylogix_ip = None
+        self._ab_pylogix_slot = None
+
+    def _dispose_gateway_clients(self) -> None:
+        self._close_ab_pycomm3_client()
+        self._close_ab_pylogix_client()
 
     def _sqlite_url_from_path(self, sqlite_path: str) -> str:
         path_norm = (sqlite_path or "").strip()
