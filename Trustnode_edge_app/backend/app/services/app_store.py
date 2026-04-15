@@ -259,7 +259,7 @@ class AppStore:
                         f"""
                         CREATE TABLE IF NOT EXISTS "{schema}"."historian_readings" (
                           id BIGSERIAL PRIMARY KEY,
-                          local_id BIGINT UNIQUE NOT NULL,
+                          local_id BIGINT NOT NULL,
                           tenant_id TEXT NOT NULL DEFAULT 'default',
                           ts_utc TIMESTAMPTZ NOT NULL,
                           gateway_id TEXT NULL,
@@ -282,7 +282,7 @@ class AppStore:
                         f"""
                         CREATE TABLE IF NOT EXISTS "{schema}"."plc_readings" (
                           id BIGSERIAL PRIMARY KEY,
-                          local_id BIGINT UNIQUE NOT NULL,
+                          local_id BIGINT NOT NULL,
                           tenant_id TEXT NOT NULL DEFAULT 'default',
                           ts_utc TIMESTAMPTZ NOT NULL,
                           gateway_id TEXT NULL,
@@ -312,13 +312,27 @@ class AppStore:
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS quality_label TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS source TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS created_utc TIMESTAMPTZ'))
-                conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_plc_local_id" ON "{schema}"."plc_readings"(local_id)'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."historian_readings" DROP CONSTRAINT IF EXISTS "historian_readings_local_id_key"'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" DROP CONSTRAINT IF EXISTS "plc_readings_local_id_key"'))
+                conn.execute(text(f'ALTER TABLE "{schema}"."app_logs" DROP CONSTRAINT IF EXISTS "app_logs_local_id_key"'))
+                conn.execute(text(f'DROP INDEX IF EXISTS "{schema}"."ux_plc_local_id"'))
+                conn.execute(text(f'DROP INDEX IF EXISTS "{schema}"."ux_hist_local_id"'))
+                conn.execute(text(f'DROP INDEX IF EXISTS "{schema}"."ux_logs_local_id"'))
+                conn.execute(
+                    text(
+                        f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_plc_tenant_gateway_local_id" ON "{schema}"."plc_readings"(tenant_id, gateway_id, local_id)'
+                    )
+                )
                 conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_plc_tenant_ts" ON "{schema}"."plc_readings"(tenant_id, ts_utc DESC)'))
 
                 # Compatibility migration for pre-local_id deployments.
                 conn.execute(text(f'ALTER TABLE "{schema}"."historian_readings" ADD COLUMN IF NOT EXISTS tenant_id TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."historian_readings" ADD COLUMN IF NOT EXISTS local_id BIGINT'))
-                conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_hist_local_id" ON "{schema}"."historian_readings"(local_id)'))
+                conn.execute(
+                    text(
+                        f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_hist_tenant_gateway_local_id" ON "{schema}"."historian_readings"(tenant_id, gateway_id, local_id)'
+                    )
+                )
                 conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_hist_tenant_ts" ON "{schema}"."historian_readings"(tenant_id, ts_utc DESC)'))
                 conn.execute(
                     text(
@@ -331,7 +345,7 @@ class AppStore:
                         f"""
                         CREATE TABLE IF NOT EXISTS "{schema}"."app_logs" (
                           id BIGSERIAL PRIMARY KEY,
-                          local_id BIGINT UNIQUE NOT NULL,
+                          local_id BIGINT NOT NULL,
                           tenant_id TEXT NOT NULL DEFAULT 'default',
                           ts_utc TIMESTAMPTZ NOT NULL,
                           level TEXT NOT NULL,
@@ -348,7 +362,11 @@ class AppStore:
                 )
                 conn.execute(text(f'ALTER TABLE "{schema}"."app_logs" ADD COLUMN IF NOT EXISTS local_id BIGINT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."app_logs" ADD COLUMN IF NOT EXISTS tenant_id TEXT'))
-                conn.execute(text(f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_logs_local_id" ON "{schema}"."app_logs"(local_id)'))
+                conn.execute(
+                    text(
+                        f'CREATE UNIQUE INDEX IF NOT EXISTS "ux_logs_tenant_gateway_local_id" ON "{schema}"."app_logs"(tenant_id, gateway_id, local_id)'
+                    )
+                )
                 conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_logs_tenant_ts" ON "{schema}"."app_logs"(tenant_id, ts_utc DESC)'))
 
                 conn.execute(
@@ -1160,7 +1178,7 @@ class AppStore:
                                    tag_name, value, quality, quality_label
                             FROM "{schema}"."historian_readings"
                             WHERE tenant_id = :tenant AND local_id IS NOT NULL
-                            ORDER BY COALESCE(local_id, 0) DESC, id DESC
+                            ORDER BY ts_utc DESC, COALESCE(local_id, 0) DESC, id DESC
                             LIMIT :lim
                             """
                         ),
@@ -1887,7 +1905,7 @@ class AppStore:
                             (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
                             VALUES
                             (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
-                            ON CONFLICT(local_id) DO NOTHING
+                            ON CONFLICT(tenant_id, gateway_id, local_id) DO NOTHING
                             """
                         ),
                         hist_payload_rows,
@@ -1900,7 +1918,7 @@ class AppStore:
                             (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
                             VALUES
                             (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
-                            ON CONFLICT(local_id) DO NOTHING
+                            ON CONFLICT(tenant_id, gateway_id, local_id) DO NOTHING
                             """
                         ),
                         hist_payload_rows,
@@ -1934,7 +1952,7 @@ class AppStore:
                             (local_id, tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc)
                             VALUES
                             (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :level, :category, :message, :gateway_id, :gateway_name, :device_name, :database_name, CAST(:created_utc AS timestamptz))
-                            ON CONFLICT(local_id) DO NOTHING
+                            ON CONFLICT(tenant_id, gateway_id, local_id) DO NOTHING
                             """
                         ),
                         [
@@ -3143,7 +3161,7 @@ class AppStore:
                             (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
                             VALUES
                             (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
-                            ON CONFLICT(local_id) DO NOTHING
+                            ON CONFLICT(tenant_id, gateway_id, local_id) DO NOTHING
                             """
                         ),
                         hist_payload,
@@ -3155,7 +3173,7 @@ class AppStore:
                             (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
                             VALUES
                             (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
-                            ON CONFLICT(local_id) DO NOTHING
+                            ON CONFLICT(tenant_id, gateway_id, local_id) DO NOTHING
                             """
                         ),
                         hist_payload,
@@ -3168,7 +3186,7 @@ class AppStore:
                             (local_id, tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc)
                             VALUES
                             (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :level, :category, :message, :gateway_id, :gateway_name, :device_name, :database_name, CAST(:created_utc AS timestamptz))
-                            ON CONFLICT(local_id) DO NOTHING
+                            ON CONFLICT(tenant_id, gateway_id, local_id) DO NOTHING
                             """
                         ),
                         logs_payload,
