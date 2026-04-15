@@ -200,12 +200,62 @@ jobs:
               journalctl -u ${{ env.BACKEND_SERVICE }} -n 120 --no-pager || true
               exit 1
             fi
+            # Ensure /client/*.php executes via php-fpm (never served as source)
+            systemctl enable --now php-fpm || true
+            PHP_FPM_PASS=""
+            if [ -S /run/php-fpm/www.sock ]; then
+              PHP_FPM_PASS="unix:/run/php-fpm/www.sock"
+            else
+              PHP_SOCK="$(find /run -maxdepth 4 -type s \( -name '*php*fpm*.sock' -o -name 'php*.sock' \) 2>/dev/null | head -n1 || true)"
+              if [ -n "$PHP_SOCK" ]; then
+                PHP_FPM_PASS="unix:$PHP_SOCK"
+              else
+                PHP_FPM_PASS="127.0.0.1:9000"
+              fi
+            fi
+            TARGET_CONF="$(grep -Rsl 'server_name .*trustnode.lsapps.app' /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
+            if [ -z "$TARGET_CONF" ]; then
+              TARGET_CONF="$(grep -Rsl '${{ env.VPS_WEB_ROOT }}' /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
+            fi
+            if [ -z "$TARGET_CONF" ]; then
+              echo "Could not locate nginx vhost config for trustnode.lsapps.app"
+              exit 1
+            fi
+            if ! grep -q 'TRUSTNODE_CLIENT_PHP_BEGIN' "$TARGET_CONF"; then
+              awk -v pass="$PHP_FPM_PASS" '
+                BEGIN{in_server=0;inserted=0}
+                {
+                  print $0
+                  if ($0 ~ /^[[:space:]]*server[[:space:]]*\{/) in_server=1
+                  else if (in_server && $0 ~ /^[[:space:]]*}$/ && inserted==0) {
+                    print "    # TRUSTNODE_CLIENT_PHP_BEGIN"
+                    print "    location ^~ /client/ {"
+                    print "        try_files $uri $uri/ /client/client_test.html;"
+                    print "    }"
+                    print "    location ~ ^/client/.*\\.php$ {"
+                    print "        root /var/www/trustnode;"
+                    print "        include fastcgi_params;"
+                    print "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;"
+                    print "        fastcgi_index client_test.php;"
+                    print "        fastcgi_pass " pass ";"
+                    print "    }"
+                    print "    # TRUSTNODE_CLIENT_PHP_END"
+                    inserted=1
+                  }
+                }
+              ' "$TARGET_CONF" > "${TARGET_CONF}.tmp" && mv "${TARGET_CONF}.tmp" "$TARGET_CONF"
+            fi
             chown -R nginx:nginx "${{ env.VPS_WEB_ROOT }}"
             restorecon -Rv "${{ env.VPS_WEB_ROOT }}" || true
             nginx -t
             systemctl reload nginx
             curl -fsS https://trustnode.lsapps.app/api/health >/dev/null
             curl -fsS https://trustnode.lsapps.app/ >/dev/null
+            php_probe="$(curl -fsS https://trustnode.lsapps.app/client/client_test.php | head -c 240 || true)"
+            if echo "$php_probe" | grep -q '<?php'; then
+              echo "PHP source leak detected at /client/client_test.php"
+              exit 1
+            fi
 
       - name: Remote deploy (ssh key)
         if: ${{ steps.gate.outputs.deploy == 'true' && env.VPS_SSH_KEY != '' }}
@@ -256,9 +306,59 @@ jobs:
               journalctl -u ${{ env.BACKEND_SERVICE }} -n 120 --no-pager || true
               exit 1
             fi
+            # Ensure /client/*.php executes via php-fpm (never served as source)
+            systemctl enable --now php-fpm || true
+            PHP_FPM_PASS=""
+            if [ -S /run/php-fpm/www.sock ]; then
+              PHP_FPM_PASS="unix:/run/php-fpm/www.sock"
+            else
+              PHP_SOCK="$(find /run -maxdepth 4 -type s \( -name '*php*fpm*.sock' -o -name 'php*.sock' \) 2>/dev/null | head -n1 || true)"
+              if [ -n "$PHP_SOCK" ]; then
+                PHP_FPM_PASS="unix:$PHP_SOCK"
+              else
+                PHP_FPM_PASS="127.0.0.1:9000"
+              fi
+            fi
+            TARGET_CONF="$(grep -Rsl 'server_name .*trustnode.lsapps.app' /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
+            if [ -z "$TARGET_CONF" ]; then
+              TARGET_CONF="$(grep -Rsl '${{ env.VPS_WEB_ROOT }}' /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
+            fi
+            if [ -z "$TARGET_CONF" ]; then
+              echo "Could not locate nginx vhost config for trustnode.lsapps.app"
+              exit 1
+            fi
+            if ! grep -q 'TRUSTNODE_CLIENT_PHP_BEGIN' "$TARGET_CONF"; then
+              awk -v pass="$PHP_FPM_PASS" '
+                BEGIN{in_server=0;inserted=0}
+                {
+                  print $0
+                  if ($0 ~ /^[[:space:]]*server[[:space:]]*\{/) in_server=1
+                  else if (in_server && $0 ~ /^[[:space:]]*}$/ && inserted==0) {
+                    print "    # TRUSTNODE_CLIENT_PHP_BEGIN"
+                    print "    location ^~ /client/ {"
+                    print "        try_files $uri $uri/ /client/client_test.html;"
+                    print "    }"
+                    print "    location ~ ^/client/.*\\.php$ {"
+                    print "        root /var/www/trustnode;"
+                    print "        include fastcgi_params;"
+                    print "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;"
+                    print "        fastcgi_index client_test.php;"
+                    print "        fastcgi_pass " pass ";"
+                    print "    }"
+                    print "    # TRUSTNODE_CLIENT_PHP_END"
+                    inserted=1
+                  }
+                }
+              ' "$TARGET_CONF" > "${TARGET_CONF}.tmp" && mv "${TARGET_CONF}.tmp" "$TARGET_CONF"
+            fi
             chown -R nginx:nginx "${{ env.VPS_WEB_ROOT }}"
             restorecon -Rv "${{ env.VPS_WEB_ROOT }}" || true
             nginx -t
             systemctl reload nginx
             curl -fsS https://trustnode.lsapps.app/api/health >/dev/null
             curl -fsS https://trustnode.lsapps.app/ >/dev/null
+            php_probe="$(curl -fsS https://trustnode.lsapps.app/client/client_test.php | head -c 240 || true)"
+            if echo "$php_probe" | grep -q '<?php'; then
+              echo "PHP source leak detected at /client/client_test.php"
+              exit 1
+            fi
