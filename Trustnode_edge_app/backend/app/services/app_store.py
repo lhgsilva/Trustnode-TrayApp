@@ -44,8 +44,8 @@ class AppStore:
         self._cloud_live_cache_lock = threading.Lock()
         # Fast default cadence for cloud/live products; tunable via env.
         self._sync_interval_seconds = max(
-            0.5,
-            float(os.environ.get("TRUSTNODE_CONFIG_SYNC_SECONDS", "0.5") or "0.5"),
+            0.2,
+            float(os.environ.get("TRUSTNODE_CONFIG_SYNC_SECONDS", "0.2") or "0.2"),
         )
         self._config_pull_interval_seconds = max(
             self._sync_interval_seconds,
@@ -62,16 +62,16 @@ class AppStore:
             min(20000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "2000") or "2000")),
         )
         self._data_bulk_sync_interval_seconds = max(
-            0.1,
-            float(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "0.15") or "0.15"),
+            0.05,
+            float(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "0.08") or "0.08"),
         )
         self._data_sync_burst_batches = max(
             1,
-            min(16, int(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_BATCHES", "8") or "8")),
+            min(24, int(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_BATCHES", "12") or "12")),
         )
         self._data_sync_burst_seconds = max(
             0.1,
-            float(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_SECONDS", "1.2") or "1.2"),
+            float(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_SECONDS", "1.8") or "1.8"),
         )
         self._live_fast_batch_size = max(
             200,
@@ -95,7 +95,7 @@ class AppStore:
         )
         self._live_data_catchup_interval_seconds = max(
             0.1,
-            float(os.environ.get("TRUSTNODE_LIVE_DATA_CATCHUP_SECONDS", "0.3") or "0.3"),
+            float(os.environ.get("TRUSTNODE_LIVE_DATA_CATCHUP_SECONDS", "0.15") or "0.15"),
         )
         self._live_fast_last_local_id = 0
         self._cloud_live_cache_rows: list[dict[str, Any]] = []
@@ -942,6 +942,9 @@ class AppStore:
             try:
                 if self._is_cloud_auto_sync_enabled():
                     self._flush_live_outbox_once()
+                    # Keep cloud historian close to real-time by flushing at least
+                    # one data batch on every live tick.
+                    self._flush_data_outbox_once()
                     now_mono = time.monotonic()
                     if now_mono >= next_data_catchup_mono:
                         self._flush_data_outbox_burst()
