@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 $root = 'Trustnode_edge_app'
 $bundleDir = Join-Path $root 'web_cloud_readonly'
@@ -63,14 +63,14 @@ $apiDirectShim = @'
           '/api/plc/gateways/status': 120
         };
         const GET_CACHE_MS = {
-          '/api/app-store/live': 250,
-          '/api/power/latest': 250,
-          '/api/power/status': 400,
-          '/api/plc/gateways/status': 500,
-          '/api/v1/latest': 500,
-          '/api/app-store/historian': 1200,
-          '/api/app-store/logs': 1200,
-          '/api/v1/history': 1200
+          '/api/app-store/live': 900,
+          '/api/power/latest': 900,
+          '/api/power/status': 1000,
+          '/api/plc/gateways/status': 1000,
+          '/api/v1/latest': 900,
+          '/api/app-store/historian': 1500,
+          '/api/app-store/logs': 1500,
+          '/api/v1/history': 1500
         };
         const inflight = new Map();
         const responseCache = new Map();
@@ -181,14 +181,14 @@ $dbRestShim = @'
           '/api/plc/gateways/status': 120
         };
         const GET_CACHE_MS = {
-          '/api/app-store/live': 250,
-          '/api/power/latest': 250,
-          '/api/power/status': 400,
-          '/api/plc/gateways/status': 500,
-          '/api/v1/latest': 500,
-          '/api/app-store/historian': 1200,
-          '/api/app-store/logs': 1200,
-          '/api/v1/history': 1200
+          '/api/app-store/live': 900,
+          '/api/power/latest': 900,
+          '/api/power/status': 1000,
+          '/api/plc/gateways/status': 1000,
+          '/api/v1/latest': 900,
+          '/api/app-store/historian': 1500,
+          '/api/app-store/logs': 1500,
+          '/api/v1/history': 1500
         };
         const inflight = new Map();
         const responseCache = new Map();
@@ -460,14 +460,14 @@ $phpShim = @'
           '/api/plc/gateways/status': 120
         };
         const GET_CACHE_MS = {
-          '/api/app-store/live': 250,
-          '/api/power/latest': 250,
-          '/api/power/status': 400,
-          '/api/plc/gateways/status': 500,
-          '/api/v1/latest': 500,
-          '/api/app-store/historian': 1200,
-          '/api/app-store/logs': 1200,
-          '/api/v1/history': 1200
+          '/api/app-store/live': 900,
+          '/api/power/latest': 900,
+          '/api/power/status': 1000,
+          '/api/plc/gateways/status': 1000,
+          '/api/v1/latest': 900,
+          '/api/app-store/historian': 1500,
+          '/api/app-store/logs': 1500,
+          '/api/v1/history': 1500
         };
         const inflight = new Map();
         const responseCache = new Map();
@@ -710,14 +710,14 @@ $phpDbShim = @'
           '/api/plc/gateways/status': 120
         };
         const GET_CACHE_MS = {
-          '/api/app-store/live': 250,
-          '/api/power/latest': 250,
-          '/api/power/status': 400,
-          '/api/plc/gateways/status': 500,
-          '/api/v1/latest': 500,
-          '/api/app-store/historian': 1200,
-          '/api/app-store/logs': 1200,
-          '/api/v1/history': 1200
+          '/api/app-store/live': 900,
+          '/api/power/latest': 900,
+          '/api/power/status': 1000,
+          '/api/plc/gateways/status': 1000,
+          '/api/v1/latest': 900,
+          '/api/app-store/historian': 1500,
+          '/api/app-store/logs': 1500,
+          '/api/v1/history': 1500
         };
         const inflight = new Map();
         const responseCache = new Map();
@@ -817,3 +817,4 @@ Set-Content -NoNewline -Encoding UTF8 (Join-Path $outDir 'client_test_db.php') (
 Set-Content -NoNewline -Encoding UTF8 (Join-Path $outDir 'client_test_db_php.html') $directDbHtml
 
 Write-Host 'OK: regenerated 4 single-file variants (HTML API, HTML direct DB, PHP API, PHP direct DB).'
+

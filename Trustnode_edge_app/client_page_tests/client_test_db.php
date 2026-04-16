@@ -178,14 +178,14 @@ if (isset($_GET['proxy'])) {
           '/api/plc/gateways/status': 120
         };
         const GET_CACHE_MS = {
-          '/api/app-store/live': 250,
-          '/api/power/latest': 250,
-          '/api/power/status': 400,
-          '/api/plc/gateways/status': 500,
-          '/api/v1/latest': 500,
-          '/api/app-store/historian': 1200,
-          '/api/app-store/logs': 1200,
-          '/api/v1/history': 1200
+          '/api/app-store/live': 900,
+          '/api/power/latest': 900,
+          '/api/power/status': 1000,
+          '/api/plc/gateways/status': 1000,
+          '/api/v1/latest': 900,
+          '/api/app-store/historian': 1500,
+          '/api/app-store/logs': 1500,
+          '/api/v1/history': 1500
         };
         const inflight = new Map();
         const responseCache = new Map();
