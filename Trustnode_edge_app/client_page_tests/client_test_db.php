@@ -60,7 +60,7 @@ if (isset($_GET['dbproxy'])) {
     if ($kind === 'live') {
       $rows = tn_try_queries($pdo, [
         [
-          'sql' => 'SELECT ts_utc AS ts, source, gateway_id, gateway_name, device_name, plc_ip, database_name, COALESCE(tag_name, tag) AS tag, value, quality, quality_label FROM live_latest ORDER BY ts_utc DESC LIMIT :lim',
+          'sql' => 'SELECT ts_utc AS ts, source, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name AS tag, value, quality, quality_label FROM live_latest ORDER BY ts_utc DESC LIMIT :lim',
           'params' => [':lim' => $limit],
         ],
       ]);
@@ -71,7 +71,7 @@ if (isset($_GET['dbproxy'])) {
       $needle = trim((string)($_GET['tag'] ?? ''));
       $rows = tn_try_queries($pdo, [
         [
-          'sql' => 'SELECT ts, source, gateway_id, gateway_name, device_name, plc_ip, database_name, COALESCE(tag, tag_name) AS tag, value, quality, quality_label FROM historian_readings WHERE (:tag = \'\' OR COALESCE(tag,tag_name) ILIKE :tag_like) ORDER BY ts DESC LIMIT :lim',
+          'sql' => 'SELECT ts_utc AS ts, source, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name AS tag, value, quality, quality_label FROM historian_readings WHERE (:tag = \'\' OR tag_name ILIKE :tag_like) ORDER BY ts_utc DESC LIMIT :lim',
           'params' => [':lim' => $limit, ':tag' => $needle, ':tag_like' => '%'.$needle.'%'],
         ],
       ]);
@@ -81,7 +81,7 @@ if (isset($_GET['dbproxy'])) {
     if ($kind === 'logs') {
       $rows = tn_try_queries($pdo, [
         [
-          'sql' => 'SELECT ts, level, category, message, gateway, device, database_name FROM app_logs ORDER BY ts DESC LIMIT :lim',
+          'sql' => 'SELECT ts_utc AS ts, level, category, message, gateway_name AS gateway, device_name AS device, database_name FROM app_logs ORDER BY ts_utc DESC LIMIT :lim',
           'params' => [':lim' => max(1, min(2500, $limit))],
         ],
       ]);
