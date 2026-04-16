@@ -10001,7 +10001,11 @@ function AppShell() {
     });
   };
 
-  const canManageUsers = currentUser?.username === "admin" && currentUser?.password === "admin";
+  const canManageUsers = Boolean(
+    currentUser &&
+    currentUser.role === "admin" &&
+    currentUser.permissions?.users_and_access_control
+  );
 
   const openEditUser = (user) => {
     if (!canManageUsers || !user) return;
