@@ -1097,8 +1097,8 @@ class AppStore:
 
             with engine.begin() as conn:
                 try:
-                    conn.execute(text("SET LOCAL lock_timeout = '500ms'"))
-                    conn.execute(text("SET LOCAL statement_timeout = '1500ms'"))
+                    conn.execute(text("SET LOCAL lock_timeout = '1200ms'"))
+                    conn.execute(text("SET LOCAL statement_timeout = '3000ms'"))
                 except Exception:
                     pass
                 def _fetch_rows_with_freshness_fallback(table_name: str, fetch_limit: int) -> list[Any]:
@@ -1805,6 +1805,14 @@ class AppStore:
         if not rows:
             return
         from sqlalchemy import text  # type: ignore
+        ordered_rows = sorted(
+            rows,
+            key=lambda r: (
+                str(r.get("tenant_id") or ""),
+                str(r.get("gateway_id") or ""),
+                str(r.get("tag_name") or ""),
+            ),
+        )
 
         conn.execute(
             text(
@@ -1827,7 +1835,7 @@ class AppStore:
                   updated_utc = excluded.updated_utc
                 """
             ),
-            rows,
+            ordered_rows,
         )
 
     def _enqueue_live_fast_pending(self, rows: list[dict[str, Any]], max_local_id: int | None = None) -> None:
@@ -1987,8 +1995,8 @@ class AppStore:
                 pass
             with engine.begin() as conn:
                 try:
-                    conn.execute(text("SET LOCAL lock_timeout = '500ms'"))
-                    conn.execute(text("SET LOCAL statement_timeout = '2500ms'"))
+                    conn.execute(text("SET LOCAL lock_timeout = '1800ms'"))
+                    conn.execute(text("SET LOCAL statement_timeout = '4000ms'"))
                 except Exception:
                     pass
                 self._upsert_cloud_live_latest_rows(conn, schema, live_rows)
