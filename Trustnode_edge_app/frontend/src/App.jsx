@@ -2146,7 +2146,6 @@ function AppShell() {
     power_management_config: powerConfig,
     metadata: {
       ...appMetadata,
-      saved_utc: tsNow(),
       app_version: "edge-2026-02-21-db-primary-1"
     }
   });
@@ -3131,7 +3130,7 @@ function AppShell() {
       } finally {
         appStorePersistInFlightRef.current = false;
       }
-    }, 800);
+    }, 2500);
     return () => {
       if (appStoreSaveTimerRef.current) {
         clearTimeout(appStoreSaveTimerRef.current);

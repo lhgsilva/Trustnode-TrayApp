@@ -84,6 +84,7 @@ DEFAULT_DEVICE: dict[str, Any] = {
     "vt_secondary": 230.0,
     "registers": DEFAULT_REGISTERS,
     "register_scales": {k: 1.0 for k in DEFAULT_REGISTERS.keys()},
+    "include_raw_tags": False,
 }
 
 
@@ -205,6 +206,7 @@ class PowerManager:
                 parsed = float(raw_scales.get(k) or 1.0)
                 scale_map[k] = parsed if parsed != 0 else 1.0
         base["register_scales"] = scale_map
+        base["include_raw_tags"] = bool(raw.get("include_raw_tags", base.get("include_raw_tags", False)))
         return base
 
     def _normalize_config(self, raw: Any) -> dict[str, Any]:
@@ -320,7 +322,8 @@ class PowerManager:
         host = str(device.get("ip") or "")
         port = int(device.get("port") or 502)
         poll_interval_ms = max(250, int(device.get("poll_interval_ms") or 1000))
-        target_timeout = max(0.2, min(0.9, (poll_interval_ms / 1000.0) * 0.6))
+        # Keep request timeout bounded so 1s intervals are not dominated by network timeouts.
+        target_timeout = max(0.15, min(0.45, (poll_interval_ms / 1000.0) * 0.45))
         if client is None:
             client = ModbusTcpClient(host=host, port=port, timeout=target_timeout)
             self._clients[device_id] = client
@@ -340,6 +343,83 @@ class PowerManager:
             except Exception:
                 pass
         return client
+
+    def _read_block_pairs(
+        self,
+        client: ModbusTcpClient,
+        unit_id: int,
+        block_start: int,
+        block_end: int,
+        addr_to_keys: dict[int, list[str]],
+        raw_values: dict[str, float],
+        now_mono: float,
+        device_backoff: dict[int, float],
+        min_span: int = 8,
+    ) -> None:
+        count = max(2, int(block_end - block_start + 1))
+        try:
+            res = client.read_input_registers(address=int(block_start), count=count, slave=unit_id)
+            if getattr(res, "isError", lambda: True)():
+                raise RuntimeError(f"Read failed for block {block_start}:{block_end}")
+            regs = list(getattr(res, "registers", []) or [])
+            for addr, keys in addr_to_keys.items():
+                if addr < block_start or addr > block_end:
+                    continue
+                off = int(addr - block_start)
+                pair = regs[off : off + 2]
+                if len(pair) < 2:
+                    continue
+                val = self._decode_float32_be(pair)
+                for key in keys:
+                    raw_values[key] = val
+                device_backoff.pop(int(addr), None)
+            return
+        except Exception:
+            pass
+
+        # Fallback strategy: split failed blocks into smaller ranges.
+        span = int(block_end - block_start)
+        if span <= min_span:
+            for addr in range(int(block_start), int(block_end) + 1):
+                keys = addr_to_keys.get(addr) or []
+                if not keys:
+                    continue
+                try:
+                    res = client.read_input_registers(address=int(addr), count=2, slave=unit_id)
+                    if getattr(res, "isError", lambda: True)():
+                        raise RuntimeError("single read failed")
+                    pair = list(getattr(res, "registers", []) or [0, 0])
+                    val = self._decode_float32_be(pair)
+                    for key in keys:
+                        raw_values[key] = val
+                    device_backoff.pop(int(addr), None)
+                except Exception:
+                    device_backoff[int(addr)] = now_mono + 12.0
+            return
+
+        mid = int((block_start + block_end) // 2)
+        self._read_block_pairs(
+            client,
+            unit_id,
+            block_start,
+            mid,
+            addr_to_keys,
+            raw_values,
+            now_mono,
+            device_backoff,
+            min_span=min_span,
+        )
+        self._read_block_pairs(
+            client,
+            unit_id,
+            mid + 1,
+            block_end,
+            addr_to_keys,
+            raw_values,
+            now_mono,
+            device_backoff,
+            min_span=min_span,
+        )
 
     def _poll_device(self, device: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         device_id = str(device.get("id") or "")
@@ -381,40 +461,17 @@ class PowerManager:
                 end = addr + 1
             blocks.append((start, end))
         for block_start, block_end in blocks:
-            count = max(2, int(block_end - block_start + 1))
-            try:
-                res = client.read_input_registers(address=int(block_start), count=count, slave=unit_id)
-                if getattr(res, "isError", lambda: True)():
-                    raise RuntimeError(f"Read failed for block {block_start}:{block_end}")
-                regs = list(getattr(res, "registers", []) or [])
-                for addr, keys in addr_to_keys.items():
-                    if addr < block_start or addr > block_end:
-                        continue
-                    off = int(addr - block_start)
-                    pair = regs[off : off + 2]
-                    if len(pair) < 2:
-                        continue
-                    val = self._decode_float32_be(pair)
-                    for key in keys:
-                        raw_values[key] = val
-            except Exception:
-                # Fallback: isolate bad points without failing whole cycle.
-                for addr, keys in addr_to_keys.items():
-                    if addr < block_start or addr > block_end:
-                        continue
-                    try:
-                        res = client.read_input_registers(address=int(addr), count=2, slave=unit_id)
-                        if getattr(res, "isError", lambda: True)():
-                            device_backoff[int(addr)] = now_mono + 15.0
-                            continue
-                        pair = list(getattr(res, "registers", []) or [0, 0])
-                        val = self._decode_float32_be(pair)
-                        for key in keys:
-                            raw_values[key] = val
-                        device_backoff.pop(int(addr), None)
-                    except Exception:
-                        device_backoff[int(addr)] = now_mono + 15.0
-                        continue
+            self._read_block_pairs(
+                client=client,
+                unit_id=unit_id,
+                block_start=block_start,
+                block_end=block_end,
+                addr_to_keys=addr_to_keys,
+                raw_values=raw_values,
+                now_mono=now_mono,
+                device_backoff=device_backoff,
+                min_span=max(4, int(float(os.environ.get("TRUSTNODE_POWER_BLOCK_MIN_SPAN", "8") or "8"))),
+            )
         if not raw_values:
             raise RuntimeError("Read failed for all configured registers")
 
@@ -468,7 +525,7 @@ class PowerManager:
                 }
             )
             raw_val = raw_values.get(key)
-            if raw_val is not None:
+            if bool(device.get("include_raw_tags", False)) and raw_val is not None:
                 rows.append(
                     {
                         "ts_utc": now,

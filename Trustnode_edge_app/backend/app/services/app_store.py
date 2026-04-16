@@ -143,6 +143,37 @@ class AppStore:
     def _canonical_json(self, payload: Any) -> str:
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
+    def _strip_runtime_fields_for_config_sync(self, payload: Any) -> Any:
+        transient_keys = {
+            "saved_utc",
+            "connection_ok",
+            "ping_ok",
+            "port_ok",
+            "protocol_ok",
+            "last_test",
+            "last_check_utc",
+            "db_write_count",
+            "db_pending_count",
+            "db_last_write_utc",
+            "db_last_error",
+            "last_error",
+            "running",
+            "transient",
+            "collection_blocked",
+            "collection_block_reason",
+        }
+        if isinstance(payload, dict):
+            out: Dict[str, Any] = {}
+            for k, v in payload.items():
+                key = str(k)
+                if key in transient_keys:
+                    continue
+                out[key] = self._strip_runtime_fields_for_config_sync(v)
+            return out
+        if isinstance(payload, list):
+            return [self._strip_runtime_fields_for_config_sync(v) for v in payload]
+        return payload
+
     def _get_or_create_cloud_engine(self, cloud: dict[str, Any], schema: str) -> tuple[Any, str]:
         from sqlalchemy import create_engine  # type: ignore
 
@@ -3554,8 +3585,9 @@ class AppStore:
 
     def upsert_domain(self, domain: str, payload: Any, actor: str = "system") -> Dict[str, Any]:
         now = self._utc_now()
+        domain_name = str(domain or "").strip()
         payload_to_store = payload
-        if str(domain or "").strip() == "users_access":
+        if domain_name == "users_access":
             payload_to_store = self._normalize_users_access_payload(payload)
         with self._lock:
             with self._connect() as conn:
@@ -3564,7 +3596,7 @@ class AppStore:
                     (domain,),
                 ).fetchone()
                 old_version = int(prev["version"]) if prev else 0
-                if str(domain or "").strip() == "database_configurations":
+                if domain_name == "database_configurations":
                     prev_payload: Any = []
                     if prev and prev["payload_json"] is not None:
                         try:
@@ -3572,6 +3604,14 @@ class AppStore:
                         except Exception:
                             prev_payload = []
                     payload_to_store = self._normalize_database_configurations_payload(payload_to_store, prev_payload)
+                elif domain_name in {
+                    "metadata",
+                    "devices",
+                    "gateway_configurations",
+                    "database_configurations",
+                    "power_management_config",
+                }:
+                    payload_to_store = self._strip_runtime_fields_for_config_sync(payload_to_store)
                 payload_json = self._canonical_json(payload_to_store)
                 prev_payload_json = ""
                 if prev:
