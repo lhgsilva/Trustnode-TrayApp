@@ -85,6 +85,14 @@ class AppStore:
             0.08,
             float(os.environ.get("TRUSTNODE_LIVE_SYNC_SECONDS", "0.1") or "0.1"),
         )
+        self._live_sync_burst_batches = max(
+            1,
+            min(24, int(os.environ.get("TRUSTNODE_LIVE_SYNC_BURST_BATCHES", "8") or "8")),
+        )
+        self._live_sync_burst_seconds = max(
+            0.05,
+            float(os.environ.get("TRUSTNODE_LIVE_SYNC_BURST_SECONDS", "0.25") or "0.25"),
+        )
         self._live_source_switch_threshold_ms = max(
             500,
             int(os.environ.get("TRUSTNODE_LIVE_SOURCE_SWITCH_MS", "1500") or "1500"),
@@ -975,7 +983,11 @@ class AppStore:
                     # Keep this loop focused on low-latency live snapshots only.
                     # Full historian/log batch sync runs in the config/bulk loop;
                     # mixing both paths here causes multi-second stalls.
-                    self._flush_live_outbox_once()
+                    started = time.monotonic()
+                    for _ in range(int(self._live_sync_burst_batches)):
+                        self._flush_live_outbox_once()
+                        if (time.monotonic() - started) >= float(self._live_sync_burst_seconds):
+                            break
                     # Nudge bulk/config sync worker after every live flush so
                     # historian catch-up can run immediately without blocking live.
                     self._sync_wakeup_event.set()
@@ -2049,27 +2061,33 @@ class AppStore:
                         ),
                         hist_payload_rows,
                     )
-                    # Fallback: keep live_latest current even when fast-lane local
-                    # delta source is unavailable on some edge runtimes.
-                    live_latest_rows = {}
-                    for row in hist_payload_rows:
-                        key = (
-                            str(row.get("tenant_id") or "default"),
-                            str(row.get("gateway_id") or ""),
-                            str(row.get("tag_name") or ""),
-                        )
-                        if not key[1] or not key[2]:
-                            continue
-                        prev = live_latest_rows.get(key)
-                        if not prev:
-                            live_latest_rows[key] = row
-                            continue
-                        prev_id = int(prev.get("local_id") or 0)
-                        curr_id = int(row.get("local_id") or 0)
-                        if curr_id >= prev_id:
-                            live_latest_rows[key] = row
-                    if live_latest_rows:
-                        self._upsert_cloud_live_latest_rows(conn, schema, list(live_latest_rows.values()))
+                    # Optional compatibility path: keep this disabled by default
+                    # to avoid lock contention with the dedicated fast live lane.
+                    if str(os.environ.get("TRUSTNODE_DATA_SYNC_UPSERT_LIVE_LATEST", "")).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }:
+                        live_latest_rows = {}
+                        for row in hist_payload_rows:
+                            key = (
+                                str(row.get("tenant_id") or "default"),
+                                str(row.get("gateway_id") or ""),
+                                str(row.get("tag_name") or ""),
+                            )
+                            if not key[1] or not key[2]:
+                                continue
+                            prev = live_latest_rows.get(key)
+                            if not prev:
+                                live_latest_rows[key] = row
+                                continue
+                            prev_id = int(prev.get("local_id") or 0)
+                            curr_id = int(row.get("local_id") or 0)
+                            if curr_id >= prev_id:
+                                live_latest_rows[key] = row
+                        if live_latest_rows:
+                            self._upsert_cloud_live_latest_rows(conn, schema, list(live_latest_rows.values()))
                 if log_rows:
                     conn.execute(
                         text(
