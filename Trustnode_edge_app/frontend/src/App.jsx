@@ -1228,6 +1228,12 @@ function getInitialTheme() {
 }
 
 const PERMISSION_LABELS = {
+  dashboard: "Dashboard",
+  power_overview: "Power Management Overview",
+  historian: "Historian",
+  client_module_alarms: "Alarms Module",
+  client_module_reporting: "Reporting Module",
+  client_module_interface: "Interface Module",
   interface: "Interface",
   devices: "Devices",
   tags: "Tags",
@@ -1243,14 +1249,57 @@ const PERMISSION_LABELS = {
   backup_and_retention: "Backup and Retention",
   email_and_notifications: "Email and Notifications",
   scheduled_reports: "Scheduled Reports",
-  users_and_access_control: "Users and Access"
+  users_and_access_control: "Users and Access",
 };
 
 const PERMISSION_GROUPS = [
+  { title: "Client Test Modules", items: ["dashboard", "power_overview", "historian", "client_module_alarms", "client_module_reporting", "client_module_interface"] },
   { title: "Collection and Monitoring", items: ["devices", "tags", "triggers_and_limits", "gateway_configuration"] },
   { title: "Operations", items: ["gateway_runtime_control", "alarms", "reporting", "data_log"] },
-  { title: "Administration", items: ["interface", "database", "backup_and_retention", "email_and_notifications", "scheduled_reports", "users_and_access_control"] }
+  { title: "Administration", items: ["interface", "database", "backup_and_retention", "email_and_notifications", "scheduled_reports", "users_and_access_control"] },
 ];
+
+const CLIENT_MODULE_DEFS = [
+  { page: "dashboard", key: "dashboard", label: "Dashboard" },
+  { page: "power_overview", key: "power_overview", label: "Power Management Overview" },
+  { page: "alarms", key: "client_module_alarms", label: "Alarms" },
+  { page: "reporting", key: "client_module_reporting", label: "Reporting" },
+  { page: "historian", key: "historian", label: "Historian" },
+  { page: "interface", key: "client_module_interface", label: "Interface" },
+];
+
+const CLIENT_MODULE_PAGE_SET = new Set(CLIENT_MODULE_DEFS.map((m) => m.page));
+const CLIENT_MODULE_PERMISSION_BY_PAGE = CLIENT_MODULE_DEFS.reduce((acc, item) => {
+  acc[item.page] = item.key;
+  return acc;
+}, {});
+
+function parseForcedClientModules() {
+  try {
+    const search = new URLSearchParams(window.location.search);
+    const raw =
+      String(window.__TN_CLIENT_MODULES || "").trim() ||
+      String(search.get("modules") || "").trim();
+    if (!raw) return new Set();
+    const mapAlias = {
+      power: "power_overview",
+      power_management: "power_overview",
+      power_management_overview: "power_overview",
+    };
+    const set = new Set();
+    raw
+      .split(",")
+      .map((x) => String(x || "").trim().toLowerCase())
+      .filter(Boolean)
+      .forEach((item) => {
+        const normalized = mapAlias[item] || item;
+        if (CLIENT_MODULE_PAGE_SET.has(normalized)) set.add(normalized);
+      });
+    return set;
+  } catch {
+    return new Set();
+  }
+}
 
 function compareByOperator(value, operator, threshold) {
   if (operator === "<") return value < threshold;
@@ -1263,6 +1312,12 @@ function compareByOperator(value, operator, threshold) {
 function buildRolePermissions(role) {
   if (role === "admin") {
     return {
+      dashboard: true,
+      power_overview: true,
+      historian: true,
+      client_module_alarms: true,
+      client_module_reporting: true,
+      client_module_interface: true,
       devices: true,
       tags: true,
       triggers_and_limits: true,
@@ -1285,6 +1340,12 @@ function buildRolePermissions(role) {
   }
   if (role === "engineer") {
     return {
+      dashboard: true,
+      power_overview: true,
+      historian: true,
+      client_module_alarms: true,
+      client_module_reporting: true,
+      client_module_interface: true,
       devices: true,
       tags: true,
       triggers_and_limits: true,
@@ -1307,6 +1368,12 @@ function buildRolePermissions(role) {
   }
   if (role === "operator") {
     return {
+      dashboard: true,
+      power_overview: true,
+      historian: true,
+      client_module_alarms: true,
+      client_module_reporting: false,
+      client_module_interface: true,
       devices: true,
       tags: true,
       triggers_and_limits: true,
@@ -1327,7 +1394,41 @@ function buildRolePermissions(role) {
       users_and_access_control: false
     };
   }
+  if (role === "client") {
+    return {
+      dashboard: true,
+      power_overview: true,
+      historian: true,
+      client_module_alarms: true,
+      client_module_reporting: true,
+      client_module_interface: true,
+      devices: false,
+      tags: false,
+      triggers_and_limits: false,
+      alarms: true,
+      reporting: true,
+      data_log: true,
+      gateway_configuration: false,
+      gateway_runtime_control: false,
+      interface: true,
+      database: false,
+      database_overview: false,
+      database_inspector: false,
+      backup_and_retention: false,
+      website_and_env: false,
+      email_and_notifications: false,
+      scheduled_reports: false,
+      frontend_source: false,
+      users_and_access_control: false
+    };
+  }
   return {
+    dashboard: true,
+    power_overview: false,
+    historian: true,
+    client_module_alarms: false,
+    client_module_reporting: false,
+    client_module_interface: false,
     devices: false,
     tags: false,
     triggers_and_limits: false,
@@ -5270,17 +5371,36 @@ function AppShell() {
     }
   };
 
+  const forcedClientModules = useMemo(() => parseForcedClientModules(), []);
+  const forcedClientMode = forcedClientModules.size > 0;
+
+  const hasClientModuleAccess = useCallback(
+    (page) => {
+      const perms = currentUser?.permissions || {};
+      if (page === "dashboard") return Boolean(perms.dashboard ?? perms.data_log ?? true);
+      if (page === "power_overview") return Boolean(perms.power_overview ?? perms.database ?? false);
+      if (page === "historian") return Boolean(perms.historian ?? perms.data_log ?? true);
+      if (page === "alarms") return Boolean(perms.client_module_alarms ?? perms.alarms ?? false);
+      if (page === "reporting") return Boolean(perms.client_module_reporting ?? perms.reporting ?? false);
+      if (page === "interface") return Boolean(perms.client_module_interface ?? perms.interface ?? false);
+      return false;
+    },
+    [currentUser]
+  );
+
   const canEditPage = (page) => {
     if (isReadonlyCloudMode) return false;
     if (!currentUser) return false;
     if (currentUser.role === "admin") return true;
     const mapped =
       page === "dashboard"
-        ? "data_log"
+        ? "dashboard"
         : page === "historian" || page === "logs"
-          ? "data_log"
-          : page === "power_overview" || page === "power_configuration"
-            ? "database"
+          ? "historian"
+          : page === "power_overview"
+            ? "power_overview"
+            : page === "power_configuration"
+              ? "database"
           : page === "database_overview"
             ? "database"
             : page === "database_inspector"
@@ -5294,10 +5414,22 @@ function AppShell() {
               : page === "email_and_notifications" || page === "scheduled_reports"
                 ? "users_and_access_control"
           : page;
+    if (mapped === "historian") {
+      return Boolean(currentUser.permissions?.historian ?? currentUser.permissions?.data_log);
+    }
     return Boolean(currentUser.permissions?.[mapped]);
   };
 
   const canOpenPage = (page) => {
+    if (forcedClientMode) {
+      if (!CLIENT_MODULE_PAGE_SET.has(page)) return false;
+      if (!forcedClientModules.has(page)) return false;
+      return hasClientModuleAccess(page);
+    }
+    if (currentUser?.role === "client") {
+      if (!CLIENT_MODULE_PAGE_SET.has(page)) return false;
+      return hasClientModuleAccess(page);
+    }
     if (isReadonlyCloudMode) {
       return [
         "dashboard",
@@ -5308,12 +5440,41 @@ function AppShell() {
         "logs"
       ].includes(page);
     }
-    if (page === "dashboard") return true;
+    if (page === "dashboard") return hasClientModuleAccess("dashboard");
+    if (page === "power_overview") return hasClientModuleAccess("power_overview");
+    if (page === "historian") return hasClientModuleAccess("historian");
+    if (page === "alarms") return hasClientModuleAccess("alarms");
+    if (page === "reporting") return hasClientModuleAccess("reporting");
+    if (page === "interface") return hasClientModuleAccess("interface");
     return canEditPage(page);
   };
 
+  const visibleClientModuleLabels = useCallback(
+    (user) => {
+      const perms = user?.permissions || {};
+      return CLIENT_MODULE_DEFS.filter((m) => {
+        const key = CLIENT_MODULE_PERMISSION_BY_PAGE[m.page];
+        if (!key) return false;
+        if (m.page === "alarms") return Boolean(perms.client_module_alarms ?? perms.alarms);
+        if (m.page === "reporting") return Boolean(perms.client_module_reporting ?? perms.reporting);
+        if (m.page === "interface") return Boolean(perms.client_module_interface ?? perms.interface);
+        if (m.page === "historian") return Boolean(perms.historian ?? perms.data_log);
+        return Boolean(perms[key]);
+      }).map((m) => m.label);
+    },
+    []
+  );
+
   const canDeleteRecords = Boolean(!isReadonlyCloudMode && currentUser && currentUser.role === "admin");
   const canControlGateways = Boolean(!isReadonlyCloudMode && currentUser && (currentUser.role === "admin" || currentUser.permissions?.gateway_runtime_control));
+
+  useEffect(() => {
+    if (!currentUser) return;
+    if (canOpenPage(activePage)) return;
+    const fallbackCandidates = ["dashboard", "power_overview", "alarms", "reporting", "historian", "interface", "logs"];
+    const fallback = fallbackCandidates.find((p) => canOpenPage(p));
+    if (fallback) setActivePage(fallback);
+  }, [activePage, canOpenPage, currentUser]);
 
   const addAppLog = (entry) => {
     const key = `${String(entry.level || "info")}|${String(entry.category || "system")}|${String(entry.gateway_id || "")}|${String(entry.database_name || "")}|${String(entry.message || "")}`;
@@ -10019,7 +10180,7 @@ function AppShell() {
           ) : null}
         </div>
         <div className="header-right">
-          <button className="icon-btn" title="Notifications" onClick={() => handleNavClick("alarms")}>
+          <button className="icon-btn" title="Notifications" onClick={() => handleNavClick("alarms")} disabled={!canOpenPage("alarms")}>
             <BellIcon />
             {criticalAlarmCount > 0 ? <span className="notif-dot">{criticalAlarmCount}</span> : null}
           </button>
@@ -10035,52 +10196,61 @@ function AppShell() {
       <div className={`body ${sidebarCollapsed ? "sidebar-hidden" : ""}`}>
         <aside className={`sidebar ${sidebarCollapsed ? "hidden" : ""}`}>
           <div className="sidebar-scroll">
-            {NAV_SECTIONS.map((section) => (
-              <div key={section.id} className="nav-section">
-                <button className="nav-group-btn" onClick={() => toggleSection(section.id)}>
-                  {sidebarCollapsed ? section.title.slice(0, 2).toUpperCase() : section.title}
-                  {!sidebarCollapsed ? <span>{expandedSections[section.id] ? "-" : "+"}</span> : null}
-                </button>
-                {!sidebarCollapsed && expandedSections[section.id]
-                  ? section.items.map((item) => {
-                      const id = pageId(item);
-                      const active = activePage === id;
-                      const locked = !canOpenPage(id);
-                      return (
-                        <button
-                          key={item}
-                          className={`nav-item nav-subitem ${active ? "active" : ""}`}
-                          onClick={() => handleNavClick(id)}
-                          title={item}
-                          disabled={locked}
-                        >
-                          <span className="nav-icon"><MenuIcon page={id} /></span>
-                          <span>{item}</span>
-                          {locked ? <span className="lock-tag">LOCK</span> : null}
-                        </button>
-                      );
-                    })
-                  : null}
-                {sidebarCollapsed
-                  ? section.items.map((item) => {
-                      const id = pageId(item);
-                      const active = activePage === id;
-                      const locked = !canOpenPage(id);
-                      return (
-                        <button
-                          key={item}
-                          className={`nav-item nav-icon-only ${active ? "active" : ""}`}
-                          onClick={() => handleNavClick(id)}
-                          title={`${item}${locked ? " (locked)" : ""}`}
-                          disabled={locked}
-                        >
-                          <span className="nav-icon-center"><MenuIcon page={id} /></span>
-                        </button>
-                      );
-                    })
-                  : null}
-              </div>
-            ))}
+            {NAV_SECTIONS.map((section) => {
+              const hideLockedNavItems = forcedClientMode || currentUser?.role === "client";
+              const sectionItems = section.items.filter((item) => {
+                const id = pageId(item);
+                if (!hideLockedNavItems) return true;
+                return canOpenPage(id);
+              });
+              if (!sectionItems.length) return null;
+              return (
+                <div key={section.id} className="nav-section">
+                  <button className="nav-group-btn" onClick={() => toggleSection(section.id)}>
+                    {sidebarCollapsed ? section.title.slice(0, 2).toUpperCase() : section.title}
+                    {!sidebarCollapsed ? <span>{expandedSections[section.id] ? "-" : "+"}</span> : null}
+                  </button>
+                  {!sidebarCollapsed && expandedSections[section.id]
+                    ? sectionItems.map((item) => {
+                        const id = pageId(item);
+                        const active = activePage === id;
+                        const locked = !canOpenPage(id);
+                        return (
+                          <button
+                            key={item}
+                            className={`nav-item nav-subitem ${active ? "active" : ""}`}
+                            onClick={() => handleNavClick(id)}
+                            title={item}
+                            disabled={locked}
+                          >
+                            <span className="nav-icon"><MenuIcon page={id} /></span>
+                            <span>{item}</span>
+                            {locked ? <span className="lock-tag">LOCK</span> : null}
+                          </button>
+                        );
+                      })
+                    : null}
+                  {sidebarCollapsed
+                    ? sectionItems.map((item) => {
+                        const id = pageId(item);
+                        const active = activePage === id;
+                        const locked = !canOpenPage(id);
+                        return (
+                          <button
+                            key={item}
+                            className={`nav-item nav-icon-only ${active ? "active" : ""}`}
+                            onClick={() => handleNavClick(id)}
+                            title={`${item}${locked ? " (locked)" : ""}`}
+                            disabled={locked}
+                          >
+                            <span className="nav-icon-center"><MenuIcon page={id} /></span>
+                          </button>
+                        );
+                      })
+                    : null}
+                </div>
+              );
+            })}
           </div>
 
           <div className="sidebar-footer">
@@ -12786,12 +12956,13 @@ function AppShell() {
                 <div className="table-scroll users-table-scroll">
                   <div className="table users-table">
                     <div className="thead">
-                      <span>User</span><span>Role</span><span>Gateway Config</span><span>Gateway Start/Stop</span><span>Database</span><span>User Admin</span><span>Actions</span>
+                      <span>User</span><span>Role</span><span>Client Modules</span><span>Gateway Config</span><span>Gateway Start/Stop</span><span>Database</span><span>User Admin</span><span>Actions</span>
                     </div>
                     {users.map((u) => (
                       <div key={u.username} className="trow">
                         <span>{u.username}</span>
                         <span>{u.role}</span>
+                        <span>{visibleClientModuleLabels(u).join(", ") || "-"}</span>
                         <span>{u.permissions?.gateway_configuration ? "Yes" : "No"}</span>
                         <span>{u.permissions?.gateway_runtime_control ? "Yes" : "No"}</span>
                         <span>{u.permissions?.database ? "Yes" : "No"}</span>
@@ -12838,6 +13009,7 @@ function AppShell() {
                         <option value="viewer">viewer</option>
                         <option value="operator">operator</option>
                         <option value="engineer">engineer</option>
+                        <option value="client">client</option>
                       </select>
                     </label>
                   </div>
@@ -14285,6 +14457,7 @@ function AppShell() {
                   <option value="viewer">viewer</option>
                   <option value="operator">operator</option>
                   <option value="engineer">engineer</option>
+                  <option value="client">client</option>
                   <option value="admin">admin</option>
                 </select>
               </label>
