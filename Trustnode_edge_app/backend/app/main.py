@@ -146,8 +146,9 @@ async def websocket_stream(websocket: WebSocket) -> None:
 
 
 async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> None:
-    live_limit = 300
+    live_limit = 220
     sample_interval_seconds = 0.15
+    heartbeat_interval_seconds = 2.0
 
     def _flatten_latest(rows: list[dict]) -> list[dict]:
         flat: list[dict] = []
@@ -173,7 +174,32 @@ async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> No
                 )
         return flat
 
+    def _fingerprint(live_rows: list[dict], gateway_statuses: list[dict]) -> str:
+        # Lightweight deterministic fingerprint for change detection.
+        # Include only fields needed for chart/status refresh.
+        live_head = [
+            (
+                str(r.get("gateway_id") or ""),
+                str(r.get("tag") or ""),
+                str(r.get("ts") or ""),
+                str(r.get("value")),
+                str(r.get("quality") or ""),
+            )
+            for r in live_rows[:180]
+        ]
+        status_head = [
+            (
+                str(g.get("gateway_id") or ""),
+                bool(g.get("running")),
+                str(g.get("last_check_utc") or ""),
+            )
+            for g in gateway_statuses
+        ]
+        return json.dumps([live_head, status_head], separators=(",", ":"), ensure_ascii=False)
+
     try:
+        last_fp = ""
+        last_sent_mono = 0.0
         while True:
             latest_rows = ingest_store.query_latest(tenant_id=tenant_id, limit=live_limit)
             live_rows = _flatten_latest(latest_rows)
@@ -184,6 +210,12 @@ async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> No
             gateway_statuses = app_store.build_gateway_statuses_from_live_rows(live_rows, freshness_ms=20000)
             running_gateways = [g for g in gateway_statuses if bool(g.get("running"))]
             newest_ts = max((str(g.get("last_check_utc") or "") for g in gateway_statuses), default="")
+            fp = _fingerprint(live_rows, gateway_statuses)
+            now_mono = asyncio.get_running_loop().time()
+            should_send = fp != last_fp or (now_mono - last_sent_mono) >= heartbeat_interval_seconds
+            if not should_send:
+                await asyncio.sleep(sample_interval_seconds)
+                continue
             payload = {
                 # Keep legacy type for older web clients.
                 "type": "cloud_snapshot",
@@ -203,6 +235,8 @@ async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> No
                 },
             }
             await websocket.send_text(json.dumps(payload))
+            last_fp = fp
+            last_sent_mono = now_mono
             await asyncio.sleep(sample_interval_seconds)
     except WebSocketDisconnect:
         pass

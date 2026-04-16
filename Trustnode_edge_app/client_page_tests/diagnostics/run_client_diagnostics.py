@@ -186,16 +186,46 @@ def collect_sync_diagnostics(local_api: str, cloud_api: str, username: str, pass
         out["cloud_live_1"] = auth_get(cloud_api, cloud_token, "/api/app-store/live?limit=1", timeout)
         out["cloud_hist_1"] = auth_get(cloud_api, cloud_token, "/api/app-store/historian?limit=1", timeout)
 
+    def _rows(doc: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows = (doc or {}).get("rows")
+        return rows if isinstance(rows, list) else []
+
+    def _key(row: Dict[str, Any]) -> str:
+        return f"{row.get('gateway_id') or row.get('gateway_name') or ''}::{row.get('tag') or ''}"
+
     lags = []
+    selected_key = ""
     if local_token and cloud_token:
+        local_seed = auth_get(local_api, local_token, "/api/app-store/live?limit=400", timeout)
+        cloud_seed = auth_get(cloud_api, cloud_token, "/api/app-store/live?limit=400", timeout)
+        local_keys = {_key(r) for r in _rows(local_seed) if _key(r)}
+        cloud_keys = {_key(r) for r in _rows(cloud_seed) if _key(r)}
+        common = sorted(local_keys & cloud_keys)
+        # Prefer a high-signal PLC/meter stream when possible.
+        preferred = [
+            k
+            for k in common
+            if ("simdint" in k.lower() or "simreal" in k.lower() or "power_meter" in k.lower() or "energy" in k.lower())
+        ]
+        selected_key = preferred[0] if preferred else (common[0] if common else "")
+        out["live_lag_stream_key"] = selected_key
         for _ in range(10):
-            l = auth_get(local_api, local_token, "/api/app-store/live?limit=1", timeout)
-            c = auth_get(cloud_api, cloud_token, "/api/app-store/live?limit=1", timeout)
+            probe_limit = 400 if selected_key else 1
+            l = auth_get(local_api, local_token, f"/api/app-store/live?limit={probe_limit}", timeout)
+            c = auth_get(cloud_api, cloud_token, f"/api/app-store/live?limit={probe_limit}", timeout)
             lts = None
             cts = None
             try:
-                lts = parse_ts((l or {}).get("rows", [{}])[0].get("ts"))
-                cts = parse_ts((c or {}).get("rows", [{}])[0].get("ts"))
+                l_rows = _rows(l)
+                c_rows = _rows(c)
+                if selected_key:
+                    l_match = next((r for r in l_rows if _key(r) == selected_key), None)
+                    c_match = next((r for r in c_rows if _key(r) == selected_key), None)
+                else:
+                    l_match = l_rows[0] if l_rows else None
+                    c_match = c_rows[0] if c_rows else None
+                lts = parse_ts((l_match or {}).get("ts"))
+                cts = parse_ts((c_match or {}).get("ts"))
             except Exception:
                 pass
             if lts and cts:
@@ -267,6 +297,23 @@ def _value_consistency(local_rows: List[Dict[str, Any]], cloud_rows: List[Dict[s
             continue
         cloud_by_ts[k] = r.get("value")
     overlap = sorted(set(local_by_ts.keys()) & set(cloud_by_ts.keys()))
+    # Retry with second-bucket normalized timestamps because cloud/local often
+    # use different sub-second precision.
+    if not overlap:
+        local_sec = {}
+        cloud_sec = {}
+        for k, v in local_by_ts.items():
+            dt = parse_ts(k)
+            if dt:
+                local_sec[dt.strftime("%Y-%m-%dT%H:%M:%S")] = v
+        for k, v in cloud_by_ts.items():
+            dt = parse_ts(k)
+            if dt:
+                cloud_sec[dt.strftime("%Y-%m-%dT%H:%M:%S")] = v
+        overlap = sorted(set(local_sec.keys()) & set(cloud_sec.keys()))
+        if overlap:
+            local_by_ts = local_sec
+            cloud_by_ts = cloud_sec
     if not overlap:
         return {"overlap_rows": 0, "equal_rows": 0, "mismatch_rows": 0, "equal_ratio": None}
     equal = 0
