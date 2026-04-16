@@ -18,6 +18,7 @@ import {
   getAppStoreBootstrap,
   getAppStoreTenantContext,
   saveAppStoreBootstrap,
+  saveAppStoreDomain,
   appendAppStoreHistorian,
   appendAppStoreLogs,
   getAppStoreLive,
@@ -9992,13 +9993,31 @@ function AppShell() {
       role: newUserForm.role,
       permissions: normalizePermissions(newUserForm.permissions, newUserForm.role)
     };
-    setUsers((prev) => [...prev, newUser]);
-    setNewUserForm({
-      username: "",
-      password: "",
-      role: "viewer",
-      permissions: buildRolePermissions("viewer")
-    });
+    const nextUsers = [...users, newUser];
+    const actor = currentUser?.username || "system";
+    saveAppStoreDomain(
+      "users_access",
+      { users: nextUsers, current_user: currentUser?.username || "" },
+      actor
+    )
+      .then(async () => {
+        setUsers(nextUsers);
+        setError("");
+        setNewUserForm({
+          username: "",
+          password: "",
+          role: "viewer",
+          permissions: buildRolePermissions("viewer")
+        });
+        try {
+          await forceAppStoreSyncNow(actor);
+        } catch {
+          // Best-effort immediate propagation. Background sync still runs.
+        }
+      })
+      .catch((err) => {
+        setError(`Failed to create user: ${String(err?.message || err)}`);
+      });
   };
 
   const canManageUsers = Boolean(
@@ -10020,30 +10039,46 @@ function AppShell() {
 
   const saveEditedUser = () => {
     if (!canManageUsers || !editingUsername) return;
-    setUsers((prev) =>
-      prev.map((u) => {
-        if (u.username !== editingUsername) return u;
-        return {
-          ...u,
-          role: String(editUserForm.role || "viewer"),
-          password: String(editUserForm.password || ""),
-          permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")
-        };
+    const nextUsers = users.map((u) => {
+      if (u.username !== editingUsername) return u;
+      return {
+        ...u,
+        role: String(editUserForm.role || "viewer"),
+        password: String(editUserForm.password || ""),
+        permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")
+      };
+    });
+    const actor = currentUser?.username || "system";
+    saveAppStoreDomain(
+      "users_access",
+      { users: nextUsers, current_user: currentUser?.username || "" },
+      actor
+    )
+      .then(async () => {
+        setUsers(nextUsers);
+        if (currentUser?.username === editingUsername) {
+          setCurrentUser((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              role: String(editUserForm.role || "viewer"),
+              password: String(editUserForm.password || ""),
+              permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")
+            };
+          });
+        }
+        setShowEditUserModal(false);
+        setEditingUsername("");
+        setError("");
+        try {
+          await forceAppStoreSyncNow(actor);
+        } catch {
+          // Best-effort immediate propagation. Background sync still runs.
+        }
       })
-    );
-    if (currentUser?.username === editingUsername) {
-      setCurrentUser((prev) => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          role: String(editUserForm.role || "viewer"),
-          password: String(editUserForm.password || ""),
-          permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")
-        };
+      .catch((err) => {
+        setError(`Failed to save user: ${String(err?.message || err)}`);
       });
-    }
-    setShowEditUserModal(false);
-    setEditingUsername("");
   };
 
   const deleteUser = (username) => {
@@ -10055,8 +10090,26 @@ function AppShell() {
       return;
     }
     withConfirm("Delete User", `Delete user '${target}'?`, () => {
-      setUsers((prev) => prev.filter((u) => String(u.username) !== target));
-      if (currentUser?.username === target) logout();
+      const nextUsers = users.filter((u) => String(u.username) !== target);
+      const actor = currentUser?.username || "system";
+      saveAppStoreDomain(
+        "users_access",
+        { users: nextUsers, current_user: currentUser?.username || "" },
+        actor
+      )
+        .then(async () => {
+          setUsers(nextUsers);
+          setError("");
+          if (currentUser?.username === target) logout();
+          try {
+            await forceAppStoreSyncNow(actor);
+          } catch {
+            // Best-effort immediate propagation. Background sync still runs.
+          }
+        })
+        .catch((err) => {
+          setError(`Failed to delete user: ${String(err?.message || err)}`);
+        });
     });
   };
 

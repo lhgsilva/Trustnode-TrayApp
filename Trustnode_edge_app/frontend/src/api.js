@@ -599,6 +599,29 @@ export async function saveAppStoreBootstrap(data, actor = "system") {
   return res.json();
 }
 
+export async function saveAppStoreDomain(domain, payload, actor = "system") {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/domain`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ domain, payload, actor })
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = body?.detail || JSON.stringify(body);
+    } catch {
+      try {
+        detail = await res.text();
+      } catch {
+        detail = "";
+      }
+    }
+    throw new Error(`App store domain save failed (HTTP ${res.status})${detail ? `: ${detail}` : ""}`);
+  }
+  return res.json();
+}
+
 export async function getAppStoreTenantContext() {
   const res = await fetchWithTimeout(withNoCache(`${getApiBase()}/api/app-store/tenant/context`), {
     headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" }
