@@ -98,6 +98,7 @@ class AppStore:
             float(os.environ.get("TRUSTNODE_LIVE_DATA_CATCHUP_SECONDS", "0.15") or "0.15"),
         )
         self._live_fast_last_local_id = 0
+        self._live_fast_pending_latest: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._cloud_live_cache_rows: list[dict[str, Any]] = []
         self._cloud_live_cache_updated_utc = ""
         self._cloud_live_cache_limit = max(
@@ -1746,11 +1747,78 @@ class AppStore:
             rows,
         )
 
+    def _enqueue_live_fast_pending(self, rows: list[dict[str, Any]], max_local_id: int | None = None) -> None:
+        if not rows:
+            return
+        with self._lock:
+            for row in rows:
+                tenant_id = normalize_tenant_id(str(row.get("tenant_id") or "default"))
+                gateway_id = str(row.get("gateway_id") or "")
+                tag_name = str(row.get("tag_name") or "")
+                if not gateway_id or not tag_name:
+                    continue
+                self._live_fast_pending_latest[(tenant_id, gateway_id, tag_name)] = {
+                    "tenant_id": tenant_id,
+                    "gateway_id": gateway_id,
+                    "tag_name": tag_name,
+                    "ts_utc": str(row.get("ts_utc") or ""),
+                    "source": str(row.get("source") or ""),
+                    "gateway_name": str(row.get("gateway_name") or ""),
+                    "device_name": str(row.get("device_name") or ""),
+                    "plc_ip": str(row.get("plc_ip") or ""),
+                    "database_name": str(row.get("database_name") or ""),
+                    "value": row.get("value"),
+                    "quality": row.get("quality"),
+                    "quality_label": str(row.get("quality_label") or ""),
+                    "updated_utc": str(row.get("updated_utc") or self._utc_now()),
+                }
+            if max_local_id and int(max_local_id) > 0:
+                self._live_fast_last_local_id = max(self._live_fast_last_local_id, int(max_local_id))
+
+    def _drain_live_fast_pending(self) -> list[dict[str, Any]]:
+        with self._lock:
+            if not self._live_fast_pending_latest:
+                return []
+            rows = list(self._live_fast_pending_latest.values())
+            self._live_fast_pending_latest.clear()
+            return rows
+
     def _collect_live_latest_incremental_rows(self) -> tuple[list[dict[str, Any]], int]:
         now = self._utc_now()
         latest_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
         latest_id_by_key: dict[tuple[str, str, str], int] = {}
         max_id = int(self._live_fast_last_local_id or 0)
+        pending_rows = self._drain_live_fast_pending()
+        if pending_rows:
+            for row in pending_rows:
+                key = (
+                    normalize_tenant_id(str(row.get("tenant_id") or "default")),
+                    str(row.get("gateway_id") or ""),
+                    str(row.get("tag_name") or ""),
+                )
+                if not key[1] or not key[2]:
+                    continue
+                latest_by_key[key] = {
+                    "tenant_id": key[0],
+                    "gateway_id": key[1],
+                    "tag_name": key[2],
+                    "ts_utc": str(row.get("ts_utc") or ""),
+                    "source": str(row.get("source") or ""),
+                    "gateway_name": str(row.get("gateway_name") or ""),
+                    "device_name": str(row.get("device_name") or ""),
+                    "plc_ip": str(row.get("plc_ip") or ""),
+                    "database_name": str(row.get("database_name") or ""),
+                    "value": row.get("value"),
+                    "quality": row.get("quality"),
+                    "quality_label": str(row.get("quality_label") or ""),
+                    "updated_utc": now,
+                }
+
+        # When we already have fresh per-tag deltas from append_historian_rows,
+        # skip extra local DB scans in the hot path.
+        if latest_by_key:
+            return list(latest_by_key.values()), max_id
+
         with self._lock:
             with self._connect() as conn:
                 if max_id <= 0:
@@ -1843,6 +1911,7 @@ class AppStore:
                 self._upsert_cloud_live_latest_rows(conn, schema, live_rows)
             self._live_fast_last_local_id = max(self._live_fast_last_local_id, int(max_local_id or 0))
         except Exception as exc:
+            self._enqueue_live_fast_pending(live_rows, max_local_id=max_local_id)
             self._set_data_sync_state(last_data_error=f"Live sync failed: {exc}")
 
     def _flush_data_outbox_once(self) -> int:
@@ -3582,27 +3651,58 @@ class AppStore:
         now = self._utc_now()
         tenant_id = self._current_tenant_id()
         safe_rows = []
+        pending_live_rows: list[dict[str, Any]] = []
         for r in rows or []:
             row_tenant = normalize_tenant_id(str(r.get("tenant_id") or tenant_id))
+            ts_utc = str(r.get("ts_utc") or r.get("ts") or now)
+            gateway_id = str(r.get("gateway_id") or "")
+            gateway_name = str(r.get("gateway_name") or "")
+            device_name = str(r.get("device_name") or "")
+            plc_ip = str(r.get("plc_ip") or "")
+            database_name = str(r.get("database_name") or "")
+            tag_name = str(r.get("tag_name") or r.get("tag") or "")
+            value = float(r.get("value")) if r.get("value") is not None else None
+            quality = int(r.get("quality")) if r.get("quality") is not None else None
+            quality_label = str(r.get("quality_label") or "")
+            source = str(r.get("source") or "")
             safe_rows.append(
                 (
                     row_tenant,
-                    str(r.get("ts_utc") or r.get("ts") or now),
-                    str(r.get("gateway_id") or ""),
-                    str(r.get("gateway_name") or ""),
-                    str(r.get("device_name") or ""),
-                    str(r.get("plc_ip") or ""),
-                    str(r.get("database_name") or ""),
-                    str(r.get("tag_name") or r.get("tag") or ""),
-                    float(r.get("value")) if r.get("value") is not None else None,
-                    int(r.get("quality")) if r.get("quality") is not None else None,
-                    str(r.get("quality_label") or ""),
-                    str(r.get("source") or ""),
+                    ts_utc,
+                    gateway_id,
+                    gateway_name,
+                    device_name,
+                    plc_ip,
+                    database_name,
+                    tag_name,
+                    value,
+                    quality,
+                    quality_label,
+                    source,
                     now,
                 )
             )
+            if gateway_id and tag_name:
+                pending_live_rows.append(
+                    {
+                        "tenant_id": row_tenant,
+                        "gateway_id": gateway_id,
+                        "tag_name": tag_name,
+                        "ts_utc": ts_utc,
+                        "source": source,
+                        "gateway_name": gateway_name,
+                        "device_name": device_name,
+                        "plc_ip": plc_ip,
+                        "database_name": database_name,
+                        "value": value,
+                        "quality": quality,
+                        "quality_label": quality_label,
+                        "updated_utc": now,
+                    }
+                )
         if not safe_rows:
             return 0
+        max_local_id = 0
         with self._lock:
             with self._connect() as conn:
                 conn.executemany(
@@ -3613,6 +3713,13 @@ class AppStore:
                     """,
                     safe_rows,
                 )
+                try:
+                    row = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
+                    max_local_id = int(row["id"] or 0) if row else 0
+                except Exception:
+                    max_local_id = 0
+        if pending_live_rows:
+            self._enqueue_live_fast_pending(pending_live_rows, max_local_id=max_local_id)
         self._sync_wakeup_event.set()
         self._live_sync_wakeup_event.set()
         return len(safe_rows)
