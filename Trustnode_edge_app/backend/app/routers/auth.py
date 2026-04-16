@@ -1,7 +1,7 @@
 import logging
 import time
 from collections import defaultdict
-from typing import Any, Dict
+from typing import Any, Dict, Iterable
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -34,9 +34,9 @@ class LoginRequest(BaseModel):
     password: str
 
 
-def _load_users_payload() -> Dict[str, Any]:
-    # Auth path must be fast and deterministic; never block login on cloud config pulls.
-    data = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+def _load_users_payload(prefer_cloud_reads: bool = False) -> Dict[str, Any]:
+    # Local-first for speed; caller can request cloud-refreshed bootstrap when needed.
+    data = app_store.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads) or {}
     users_access = data.get("users_access") or {}
     if isinstance(users_access, dict) and isinstance(users_access.get("users"), list) and users_access.get("users"):
         return users_access
@@ -51,6 +51,22 @@ def _load_users_payload() -> Dict[str, Any]:
             }
         ]
     }
+
+
+def _iter_users(users_access: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    users = users_access.get("users") if isinstance(users_access.get("users"), list) else []
+    for row in users or []:
+        if isinstance(row, dict):
+            yield row
+
+
+def _match_user(users_access: Dict[str, Any], username: str, password: str) -> Dict[str, Any] | None:
+    for u in _iter_users(users_access):
+        if str(u.get("username") or "").strip() != username:
+            continue
+        if verify_password(password, str(u.get("password") or "")):
+            return u
+    return None
 
 
 def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
@@ -78,21 +94,23 @@ def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
 def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
     client_host = str(getattr(request.client, "host", "") or "unknown")
     _check_rate_limit(client_host)
-    users_access = _load_users_payload()
-    users = users_access.get("users") if isinstance(users_access.get("users"), list) else []
-    if not users:
+    users_access = _load_users_payload(prefer_cloud_reads=False)
+    local_users = list(_iter_users(users_access))
+    if not local_users:
         raise HTTPException(status_code=503, detail="No users configured. Complete first-run setup.")
     username = str(payload.username or "").strip()
     password = str(payload.password or "")
-    hit = None
-    for u in users:
-        if not isinstance(u, dict):
-            continue
-        if str(u.get("username") or "").strip() != username:
-            continue
-        if verify_password(password, str(u.get("password") or "")):
-            hit = u
-            break
+    hit = _match_user(users_access, username, password)
+    if not hit:
+        # Retry once with cloud-refreshed bootstrap so newly created users on cloud/local
+        # become valid for login immediately after sync propagation.
+        try:
+            cloud_users_access = _load_users_payload(prefer_cloud_reads=True)
+            hit = _match_user(cloud_users_access, username, password)
+            if hit:
+                users_access = cloud_users_access
+        except Exception:
+            hit = None
     if not hit:
         logger.warning("Failed login attempt: user=%s ip=%s", username, client_host)
         raise HTTPException(status_code=401, detail="Invalid username or password")
