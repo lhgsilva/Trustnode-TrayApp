@@ -74,16 +74,16 @@ class AppStore:
             float(os.environ.get("TRUSTNODE_DATA_SYNC_BURST_SECONDS", "1.8") or "1.8"),
         )
         self._live_fast_batch_size = max(
-            200,
-            min(10000, int(os.environ.get("TRUSTNODE_LIVE_FAST_BATCH_SIZE", "2000") or "2000")),
+            500,
+            min(20000, int(os.environ.get("TRUSTNODE_LIVE_FAST_BATCH_SIZE", "6000") or "6000")),
         )
         self._live_fast_initial_rows = max(
             self._live_fast_batch_size,
-            min(20000, int(os.environ.get("TRUSTNODE_LIVE_FAST_INITIAL_ROWS", "4000") or "4000")),
+            min(40000, int(os.environ.get("TRUSTNODE_LIVE_FAST_INITIAL_ROWS", "12000") or "12000")),
         )
         self._live_sync_interval_seconds = max(
-            0.15,
-            float(os.environ.get("TRUSTNODE_LIVE_SYNC_SECONDS", "0.2") or "0.2"),
+            0.08,
+            float(os.environ.get("TRUSTNODE_LIVE_SYNC_SECONDS", "0.1") or "0.1"),
         )
         self._live_source_switch_threshold_ms = max(
             500,
@@ -105,8 +105,8 @@ class AppStore:
             min(5000, int(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_LIMIT", "1200") or "1200")),
         )
         self._cloud_live_cache_interval_seconds = max(
-            0.1,
-            float(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_SECONDS", "0.15") or "0.15"),
+            0.05,
+            float(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_SECONDS", "0.1") or "0.1"),
         )
         # Strict mirror mode keeps cloud reads sourced only from canonical mirrored
         # tables filtered by tenant_id (no unscoped fallback, no mixed-table merge).
