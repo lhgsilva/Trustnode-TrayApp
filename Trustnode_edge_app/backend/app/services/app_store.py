@@ -61,6 +61,14 @@ class AppStore:
             200,
             min(20000, int(os.environ.get("TRUSTNODE_DATA_SYNC_BATCH_SIZE", "2000") or "2000")),
         )
+        self._data_sync_log_batch_size = max(
+            50,
+            min(5000, int(os.environ.get("TRUSTNODE_LOG_SYNC_BATCH_SIZE", "400") or "400")),
+        )
+        self._data_sync_log_every_n = max(
+            1,
+            min(20, int(os.environ.get("TRUSTNODE_LOG_SYNC_EVERY_N", "4") or "4")),
+        )
         self._data_bulk_sync_interval_seconds = max(
             0.05,
             float(os.environ.get("TRUSTNODE_DATA_BULK_SYNC_SECONDS", "0.08") or "0.08"),
@@ -107,6 +115,7 @@ class AppStore:
         )
         self._live_fast_last_local_id = 0
         self._live_fast_pending_latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._data_sync_tick = 0
         self._cloud_live_cache_rows: list[dict[str, Any]] = []
         self._cloud_live_cache_updated_utc = ""
         self._cloud_live_cache_limit = max(
@@ -1468,6 +1477,18 @@ class AppStore:
         try:
             if self._strict_cloud_mirror:
                 with engine.begin() as conn:
+                    def _row_ts_ms(raw_ts: str) -> int:
+                        txt = str(raw_ts or "").strip()
+                        if not txt:
+                            return 0
+                        try:
+                            txt = txt.replace("Z", "+00:00")
+                            if " " in txt and "T" not in txt:
+                                txt = txt.replace(" ", "T")
+                            return int(datetime.fromisoformat(txt).timestamp() * 1000)
+                        except Exception:
+                            return 0
+
                     # Fast path: use cloud live snapshot table first.
                     live_rows = conn.execute(
                         text(
@@ -1482,7 +1503,26 @@ class AppStore:
                         ),
                         {"lim": lim, "tenant": tenant_id},
                     ).fetchall()
-                    if live_rows:
+                    live_top_ms = _row_ts_ms(str(live_rows[0][1] if live_rows else ""))
+                    hist_top_row = conn.execute(
+                        text(
+                            f"""
+                            SELECT ts_utc
+                            FROM "{schema}"."historian_readings"
+                            WHERE tenant_id = :tenant AND local_id IS NOT NULL
+                            ORDER BY COALESCE(local_id, 0) DESC, id DESC
+                            LIMIT 1
+                            """
+                        ),
+                        {"tenant": tenant_id},
+                    ).fetchone()
+                    hist_top_ms = _row_ts_ms(str(hist_top_row[0] if hist_top_row else ""))
+                    # Keep strict mirror, but avoid serving stale live_latest when
+                    # historian has newer mirrored rows already available.
+                    prefer_live_rows = bool(live_rows) and (
+                        hist_top_ms <= 0 or live_top_ms >= (hist_top_ms - 1200)
+                    )
+                    if prefer_live_rows:
                         out_live: list[dict[str, Any]] = []
                         for r in live_rows:
                             out_live.append(
@@ -1978,6 +2018,9 @@ class AppStore:
         last_hist_id = int(state.get("last_historian_id", 0))
         last_log_id = int(state.get("last_log_id", 0))
         batch_size = int(self._data_sync_batch_size)
+        log_batch_size = int(self._data_sync_log_batch_size)
+        self._data_sync_tick = int(self._data_sync_tick) + 1
+        sync_logs_this_tick = (self._data_sync_tick % int(self._data_sync_log_every_n)) == 0
 
         try:
             with self._lock:
@@ -1993,16 +2036,18 @@ class AppStore:
                         """,
                         (last_hist_id, batch_size),
                     ).fetchall()
-                    log_rows = conn.execute(
-                        """
-                        SELECT id, tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc
-                        FROM app_logs
-                        WHERE id > ?
-                        ORDER BY id ASC
-                        LIMIT ?
-                        """,
-                        (last_log_id, batch_size),
-                    ).fetchall()
+                    log_rows = []
+                    if sync_logs_this_tick or not hist_rows:
+                        log_rows = conn.execute(
+                            """
+                            SELECT id, tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name, created_utc
+                            FROM app_logs
+                            WHERE id > ?
+                            ORDER BY id ASC
+                            LIMIT ?
+                            """,
+                            (last_log_id, log_batch_size),
+                        ).fetchall()
             if not hist_rows and not log_rows:
                 self._set_data_sync_state(last_data_sync_utc=self._utc_now(), last_data_error="")
                 return 0
