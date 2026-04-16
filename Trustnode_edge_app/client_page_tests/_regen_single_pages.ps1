@@ -52,6 +52,63 @@ $apiDirectShim = @'
         const fromStorage = (function(){ try { return (localStorage.getItem('tn_api_base') || '').trim(); } catch (_) { return ''; }})();
         const apiBase = fromQuery || fromStorage || 'https://trustnode.lsapps.app';
         window.__TN_API_BASE = apiBase;
+        const LIMIT_CAPS = {
+          '/api/app-store/live': 240,
+          '/api/app-store/historian': 800,
+          '/api/app-store/logs': 1000,
+          '/api/v1/history': 800,
+          '/api/v1/latest': 400,
+          '/api/power/latest': 240,
+          '/api/power/status': 200,
+          '/api/plc/gateways/status': 120
+        };
+        const GET_CACHE_MS = {
+          '/api/app-store/live': 250,
+          '/api/power/latest': 250,
+          '/api/power/status': 400,
+          '/api/plc/gateways/status': 500,
+          '/api/v1/latest': 500,
+          '/api/app-store/historian': 1200,
+          '/api/app-store/logs': 1200,
+          '/api/v1/history': 1200
+        };
+        const inflight = new Map();
+        const responseCache = new Map();
+
+        function mapApiUrl(u){
+          const out = new URL(u.pathname + u.search, window.__TN_API_BASE);
+          const cap = LIMIT_CAPS[out.pathname];
+          if (cap && out.searchParams.has('limit')) {
+            const raw = Number(out.searchParams.get('limit') || cap);
+            out.searchParams.set('limit', String(Math.max(1, Math.min(cap, Number.isFinite(raw) ? raw : cap))));
+          }
+          return out.toString();
+        }
+
+        async function fetchWithCache(mapped, init){
+          const method = String((init && init.method) || 'GET').toUpperCase();
+          if (method !== 'GET') return origFetch(mapped, init);
+          const path = (() => { try { return new URL(mapped).pathname; } catch (_) { return ''; } })();
+          const ttl = Number(GET_CACHE_MS[path] || 0);
+          const now = Date.now();
+          if (ttl > 0) {
+            const cached = responseCache.get(mapped);
+            if (cached && now - cached.ts <= ttl) {
+              return cached.response.clone();
+            }
+          }
+          if (inflight.has(mapped)) {
+            return inflight.get(mapped).then((r) => r.clone());
+          }
+          const req = origFetch(mapped, init).then((res) => {
+            if (ttl > 0 && res.ok) {
+              responseCache.set(mapped, { ts: Date.now(), response: res.clone() });
+            }
+            return res;
+          }).finally(() => inflight.delete(mapped));
+          inflight.set(mapped, req);
+          return req.then((r) => r.clone());
+        }
 
         const origFetch = window.fetch.bind(window);
         window.fetch = function(input, init){
@@ -59,9 +116,8 @@ $apiDirectShim = @'
             const raw = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
             const u = new URL(raw, window.location.origin);
             if (u.pathname.startsWith('/api/')) {
-              const base = new URL(window.__TN_API_BASE);
-              const mapped = `${base.origin}${u.pathname}${u.search}`;
-              return origFetch(mapped, init);
+              const mapped = mapApiUrl(u);
+              return fetchWithCache(mapped, init);
             }
           } catch (_) {}
           return origFetch(input, init);
@@ -114,6 +170,28 @@ $dbRestShim = @'
         window.__TN_API_BASE = API_BASE;
         window.__TN_DB_URL = DB_URL;
         window.__TN_DB_KEY = DB_KEY;
+        const LIMIT_CAPS = {
+          '/api/app-store/live': 240,
+          '/api/app-store/historian': 800,
+          '/api/app-store/logs': 1000,
+          '/api/v1/history': 800,
+          '/api/v1/latest': 400,
+          '/api/power/latest': 240,
+          '/api/power/status': 200,
+          '/api/plc/gateways/status': 120
+        };
+        const GET_CACHE_MS = {
+          '/api/app-store/live': 250,
+          '/api/power/latest': 250,
+          '/api/power/status': 400,
+          '/api/plc/gateways/status': 500,
+          '/api/v1/latest': 500,
+          '/api/app-store/historian': 1200,
+          '/api/app-store/logs': 1200,
+          '/api/v1/history': 1200
+        };
+        const inflight = new Map();
+        const responseCache = new Map();
 
         function jsonResponse(payload, status){
           return new Response(JSON.stringify(payload), {
@@ -164,7 +242,8 @@ $dbRestShim = @'
 
         async function mapDbData(pathname, search){
           const sp = new URLSearchParams(search || '');
-          const limit = Math.max(1, Math.min(5000, Number(sp.get('limit') || '500')));
+          const limitCap = Number(LIMIT_CAPS[pathname] || 1000);
+          const limit = Math.max(1, Math.min(limitCap, Number(sp.get('limit') || '500')));
           if (pathname === '/api/app-store/live') {
             const rows = await queryWithFallback([
               `live_latest?select=ts_utc,source,gateway_id,gateway_name,device_name,plc_ip,database_name,tag_name,value,quality,quality_label&order=ts_utc.desc&limit=${limit}`,
@@ -226,6 +305,41 @@ $dbRestShim = @'
           return null;
         }
 
+        function mapApiUrl(u){
+          const out = new URL(u.pathname + u.search, window.__TN_API_BASE);
+          const cap = LIMIT_CAPS[out.pathname];
+          if (cap && out.searchParams.has('limit')) {
+            const raw = Number(out.searchParams.get('limit') || cap);
+            out.searchParams.set('limit', String(Math.max(1, Math.min(cap, Number.isFinite(raw) ? raw : cap))));
+          }
+          return out.toString();
+        }
+
+        async function fetchWithCache(mapped, init){
+          const method = String((init && init.method) || 'GET').toUpperCase();
+          if (method !== 'GET') return origFetch(mapped, init);
+          const path = (() => { try { return new URL(mapped, window.location.origin).pathname; } catch (_) { return ''; } })();
+          const ttl = Number(GET_CACHE_MS[path] || 0);
+          const now = Date.now();
+          if (ttl > 0) {
+            const cached = responseCache.get(mapped);
+            if (cached && now - cached.ts <= ttl) {
+              return cached.response.clone();
+            }
+          }
+          if (inflight.has(mapped)) {
+            return inflight.get(mapped).then((r) => r.clone());
+          }
+          const req = origFetch(mapped, init).then((res) => {
+            if (ttl > 0 && res.ok) {
+              responseCache.set(mapped, { ts: Date.now(), response: res.clone() });
+            }
+            return res;
+          }).finally(() => inflight.delete(mapped));
+          inflight.set(mapped, req);
+          return req.then((r) => r.clone());
+        }
+
         const origFetch = window.fetch.bind(window);
         window.fetch = async function(input, init){
           try {
@@ -237,9 +351,8 @@ $dbRestShim = @'
               if (dbMapped) {
                 return jsonResponse(dbMapped, 200);
               }
-              const base = new URL(window.__TN_API_BASE);
-              const mapped = `${base.origin}${u.pathname}${u.search}`;
-              return origFetch(mapped, init);
+              const mapped = mapApiUrl(u);
+              return fetchWithCache(mapped, init);
             }
           } catch (_) {}
           return origFetch(input, init);
@@ -336,14 +449,67 @@ $phpShim = @'
         }
         const fromStorage = (function(){ try { return (localStorage.getItem('tn_api_base') || '').trim(); } catch (_) { return ''; }})();
         window.__TN_PROXY_BASE = fromQuery || fromStorage || 'https://trustnode.lsapps.app';
+        const LIMIT_CAPS = {
+          '/api/app-store/live': 240,
+          '/api/app-store/historian': 800,
+          '/api/app-store/logs': 1000,
+          '/api/v1/history': 800,
+          '/api/v1/latest': 400,
+          '/api/power/latest': 240,
+          '/api/power/status': 200,
+          '/api/plc/gateways/status': 120
+        };
+        const GET_CACHE_MS = {
+          '/api/app-store/live': 250,
+          '/api/power/latest': 250,
+          '/api/power/status': 400,
+          '/api/plc/gateways/status': 500,
+          '/api/v1/latest': 500,
+          '/api/app-store/historian': 1200,
+          '/api/app-store/logs': 1200,
+          '/api/v1/history': 1200
+        };
+        const inflight = new Map();
+        const responseCache = new Map();
+
+        function mapProxyPath(u){
+          const cap = LIMIT_CAPS[u.pathname];
+          if (cap && u.searchParams.has('limit')) {
+            const raw = Number(u.searchParams.get('limit') || cap);
+            u.searchParams.set('limit', String(Math.max(1, Math.min(cap, Number.isFinite(raw) ? raw : cap))));
+          }
+          return u.pathname.replace(/^\\//, '') + u.search;
+        }
+
+        async function fetchWithCache(mapped, init, cacheKey, path){
+          const method = String((init && init.method) || 'GET').toUpperCase();
+          if (method !== 'GET') return origFetch(mapped, init);
+          const ttl = Number(GET_CACHE_MS[path] || 0);
+          const now = Date.now();
+          if (ttl > 0) {
+            const cached = responseCache.get(cacheKey);
+            if (cached && now - cached.ts <= ttl) return cached.response.clone();
+          }
+          if (inflight.has(cacheKey)) {
+            return inflight.get(cacheKey).then((r) => r.clone());
+          }
+          const req = origFetch(mapped, init).then((res) => {
+            if (ttl > 0 && res.ok) responseCache.set(cacheKey, { ts: Date.now(), response: res.clone() });
+            return res;
+          }).finally(() => inflight.delete(cacheKey));
+          inflight.set(cacheKey, req);
+          return req.then((r) => r.clone());
+        }
         const origFetch = window.fetch.bind(window);
         window.fetch = function(input, init){
           try {
             const raw = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
             const u = new URL(raw, window.location.origin);
             if (u.pathname.startsWith('/api/')) {
-              const proxy = `?proxy=${encodeURIComponent(u.pathname.replace(/^\\//, '') + u.search)}&base=${encodeURIComponent(window.__TN_PROXY_BASE)}`;
-              return origFetch(proxy, init);
+              const proxyPath = mapProxyPath(u);
+              const proxy = `?proxy=${encodeURIComponent(proxyPath)}&base=${encodeURIComponent(window.__TN_PROXY_BASE)}`;
+              const cacheKey = `${window.__TN_PROXY_BASE}|${proxyPath}`;
+              return fetchWithCache(proxy, init, cacheKey, u.pathname);
             }
           } catch (_) {}
           return origFetch(input, init);
@@ -432,7 +598,7 @@ if (isset($_GET['dbproxy'])) {
   try {
     $pdo = tn_db();
     $kind = (string)$_GET['dbproxy'];
-    $limit = max(1, min(5000, (int)($_GET['limit'] ?? 500)));
+    $limit = max(1, min(1200, (int)($_GET['limit'] ?? 500)));
 
     if ($kind === 'live') {
       $rows = tn_try_queries($pdo, [
@@ -533,6 +699,63 @@ $phpDbShim = @'
         }
         const fromStorage = (function(){ try { return (localStorage.getItem('tn_api_base') || '').trim(); } catch (_) { return ''; }})();
         window.__TN_PROXY_BASE = fromQuery || fromStorage || 'https://trustnode.lsapps.app';
+        const LIMIT_CAPS = {
+          '/api/app-store/live': 240,
+          '/api/app-store/historian': 800,
+          '/api/app-store/logs': 1000,
+          '/api/v1/history': 800,
+          '/api/v1/latest': 400,
+          '/api/power/latest': 240,
+          '/api/power/status': 200,
+          '/api/plc/gateways/status': 120
+        };
+        const GET_CACHE_MS = {
+          '/api/app-store/live': 250,
+          '/api/power/latest': 250,
+          '/api/power/status': 400,
+          '/api/plc/gateways/status': 500,
+          '/api/v1/latest': 500,
+          '/api/app-store/historian': 1200,
+          '/api/app-store/logs': 1200,
+          '/api/v1/history': 1200
+        };
+        const inflight = new Map();
+        const responseCache = new Map();
+
+        function capLimit(rawLimit, path){
+          const cap = Number(LIMIT_CAPS[path] || 1000);
+          const parsed = Number(rawLimit || cap);
+          return Math.max(1, Math.min(cap, Number.isFinite(parsed) ? parsed : cap));
+        }
+
+        function mapProxyPath(u){
+          const cap = LIMIT_CAPS[u.pathname];
+          if (cap && u.searchParams.has('limit')) {
+            const raw = Number(u.searchParams.get('limit') || cap);
+            u.searchParams.set('limit', String(Math.max(1, Math.min(cap, Number.isFinite(raw) ? raw : cap))));
+          }
+          return u.pathname.replace(/^\\//, '') + u.search;
+        }
+
+        async function fetchWithCache(mapped, init, cacheKey, path){
+          const method = String((init && init.method) || 'GET').toUpperCase();
+          if (method !== 'GET') return origFetch(mapped, init);
+          const ttl = Number(GET_CACHE_MS[path] || 0);
+          const now = Date.now();
+          if (ttl > 0) {
+            const cached = responseCache.get(cacheKey);
+            if (cached && now - cached.ts <= ttl) return cached.response.clone();
+          }
+          if (inflight.has(cacheKey)) {
+            return inflight.get(cacheKey).then((r) => r.clone());
+          }
+          const req = origFetch(mapped, init).then((res) => {
+            if (ttl > 0 && res.ok) responseCache.set(cacheKey, { ts: Date.now(), response: res.clone() });
+            return res;
+          }).finally(() => inflight.delete(cacheKey));
+          inflight.set(cacheKey, req);
+          return req.then((r) => r.clone());
+        }
 
         const origFetch = window.fetch.bind(window);
         window.fetch = function(input, init){
@@ -540,21 +763,26 @@ $phpDbShim = @'
             const raw = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
             const u = new URL(raw, window.location.origin);
             if (u.pathname === '/api/app-store/live') {
-              const limit = u.searchParams.get('limit') || '500';
-              return origFetch(`?dbproxy=live&limit=${encodeURIComponent(limit)}`, { method: 'GET', cache: 'no-store' });
+              const limit = capLimit(u.searchParams.get('limit') || '500', u.pathname);
+              const target = `?dbproxy=live&limit=${encodeURIComponent(limit)}`;
+              return fetchWithCache(target, { method: 'GET', cache: 'no-store' }, `dbproxy|live|${limit}`, u.pathname);
             }
             if (u.pathname === '/api/app-store/historian') {
-              const limit = u.searchParams.get('limit') || '500';
+              const limit = capLimit(u.searchParams.get('limit') || '500', u.pathname);
               const tag = u.searchParams.get('tag') || '';
-              return origFetch(`?dbproxy=historian&limit=${encodeURIComponent(limit)}&tag=${encodeURIComponent(tag)}`, { method: 'GET', cache: 'no-store' });
+              const target = `?dbproxy=historian&limit=${encodeURIComponent(limit)}&tag=${encodeURIComponent(tag)}`;
+              return fetchWithCache(target, { method: 'GET', cache: 'no-store' }, `dbproxy|historian|${limit}|${tag}`, u.pathname);
             }
             if (u.pathname === '/api/app-store/logs') {
-              const limit = u.searchParams.get('limit') || '500';
-              return origFetch(`?dbproxy=logs&limit=${encodeURIComponent(limit)}`, { method: 'GET', cache: 'no-store' });
+              const limit = capLimit(u.searchParams.get('limit') || '500', u.pathname);
+              const target = `?dbproxy=logs&limit=${encodeURIComponent(limit)}`;
+              return fetchWithCache(target, { method: 'GET', cache: 'no-store' }, `dbproxy|logs|${limit}`, u.pathname);
             }
             if (u.pathname.startsWith('/api/')) {
-              const proxy = `?proxy=${encodeURIComponent(u.pathname.replace(/^\\//, '') + u.search)}&base=${encodeURIComponent(window.__TN_PROXY_BASE)}`;
-              return origFetch(proxy, init);
+              const proxyPath = mapProxyPath(u);
+              const proxy = `?proxy=${encodeURIComponent(proxyPath)}&base=${encodeURIComponent(window.__TN_PROXY_BASE)}`;
+              const cacheKey = `${window.__TN_PROXY_BASE}|${proxyPath}`;
+              return fetchWithCache(proxy, init, cacheKey, u.pathname);
             }
           } catch (_) {}
           return origFetch(input, init);

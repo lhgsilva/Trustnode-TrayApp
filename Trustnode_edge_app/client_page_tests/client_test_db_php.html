@@ -34,6 +34,28 @@
         window.__TN_API_BASE = API_BASE;
         window.__TN_DB_URL = DB_URL;
         window.__TN_DB_KEY = DB_KEY;
+        const LIMIT_CAPS = {
+          '/api/app-store/live': 240,
+          '/api/app-store/historian': 800,
+          '/api/app-store/logs': 1000,
+          '/api/v1/history': 800,
+          '/api/v1/latest': 400,
+          '/api/power/latest': 240,
+          '/api/power/status': 200,
+          '/api/plc/gateways/status': 120
+        };
+        const GET_CACHE_MS = {
+          '/api/app-store/live': 250,
+          '/api/power/latest': 250,
+          '/api/power/status': 400,
+          '/api/plc/gateways/status': 500,
+          '/api/v1/latest': 500,
+          '/api/app-store/historian': 1200,
+          '/api/app-store/logs': 1200,
+          '/api/v1/history': 1200
+        };
+        const inflight = new Map();
+        const responseCache = new Map();
 
         function jsonResponse(payload, status){
           return new Response(JSON.stringify(payload), {
@@ -84,7 +106,8 @@
 
         async function mapDbData(pathname, search){
           const sp = new URLSearchParams(search || '');
-          const limit = Math.max(1, Math.min(5000, Number(sp.get('limit') || '500')));
+          const limitCap = Number(LIMIT_CAPS[pathname] || 1000);
+          const limit = Math.max(1, Math.min(limitCap, Number(sp.get('limit') || '500')));
           if (pathname === '/api/app-store/live') {
             const rows = await queryWithFallback([
               `live_latest?select=ts_utc,source,gateway_id,gateway_name,device_name,plc_ip,database_name,tag_name,value,quality,quality_label&order=ts_utc.desc&limit=${limit}`,
@@ -146,6 +169,41 @@
           return null;
         }
 
+        function mapApiUrl(u){
+          const out = new URL(u.pathname + u.search, window.__TN_API_BASE);
+          const cap = LIMIT_CAPS[out.pathname];
+          if (cap && out.searchParams.has('limit')) {
+            const raw = Number(out.searchParams.get('limit') || cap);
+            out.searchParams.set('limit', String(Math.max(1, Math.min(cap, Number.isFinite(raw) ? raw : cap))));
+          }
+          return out.toString();
+        }
+
+        async function fetchWithCache(mapped, init){
+          const method = String((init && init.method) || 'GET').toUpperCase();
+          if (method !== 'GET') return origFetch(mapped, init);
+          const path = (() => { try { return new URL(mapped, window.location.origin).pathname; } catch (_) { return ''; } })();
+          const ttl = Number(GET_CACHE_MS[path] || 0);
+          const now = Date.now();
+          if (ttl > 0) {
+            const cached = responseCache.get(mapped);
+            if (cached && now - cached.ts <= ttl) {
+              return cached.response.clone();
+            }
+          }
+          if (inflight.has(mapped)) {
+            return inflight.get(mapped).then((r) => r.clone());
+          }
+          const req = origFetch(mapped, init).then((res) => {
+            if (ttl > 0 && res.ok) {
+              responseCache.set(mapped, { ts: Date.now(), response: res.clone() });
+            }
+            return res;
+          }).finally(() => inflight.delete(mapped));
+          inflight.set(mapped, req);
+          return req.then((r) => r.clone());
+        }
+
         const origFetch = window.fetch.bind(window);
         window.fetch = async function(input, init){
           try {
@@ -157,9 +215,8 @@
               if (dbMapped) {
                 return jsonResponse(dbMapped, 200);
               }
-              const base = new URL(window.__TN_API_BASE);
-              const mapped = `${base.origin}${u.pathname}${u.search}`;
-              return origFetch(mapped, init);
+              const mapped = mapApiUrl(u);
+              return fetchWithCache(mapped, init);
             }
           } catch (_) {}
           return origFetch(input, init);

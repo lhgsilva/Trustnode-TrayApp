@@ -74,14 +74,67 @@ if (isset($_GET['proxy'])) {
         }
         const fromStorage = (function(){ try { return (localStorage.getItem('tn_api_base') || '').trim(); } catch (_) { return ''; }})();
         window.__TN_PROXY_BASE = fromQuery || fromStorage || 'https://trustnode.lsapps.app';
+        const LIMIT_CAPS = {
+          '/api/app-store/live': 240,
+          '/api/app-store/historian': 800,
+          '/api/app-store/logs': 1000,
+          '/api/v1/history': 800,
+          '/api/v1/latest': 400,
+          '/api/power/latest': 240,
+          '/api/power/status': 200,
+          '/api/plc/gateways/status': 120
+        };
+        const GET_CACHE_MS = {
+          '/api/app-store/live': 250,
+          '/api/power/latest': 250,
+          '/api/power/status': 400,
+          '/api/plc/gateways/status': 500,
+          '/api/v1/latest': 500,
+          '/api/app-store/historian': 1200,
+          '/api/app-store/logs': 1200,
+          '/api/v1/history': 1200
+        };
+        const inflight = new Map();
+        const responseCache = new Map();
+
+        function mapProxyPath(u){
+          const cap = LIMIT_CAPS[u.pathname];
+          if (cap && u.searchParams.has('limit')) {
+            const raw = Number(u.searchParams.get('limit') || cap);
+            u.searchParams.set('limit', String(Math.max(1, Math.min(cap, Number.isFinite(raw) ? raw : cap))));
+          }
+          return u.pathname.replace(/^\\//, '') + u.search;
+        }
+
+        async function fetchWithCache(mapped, init, cacheKey, path){
+          const method = String((init && init.method) || 'GET').toUpperCase();
+          if (method !== 'GET') return origFetch(mapped, init);
+          const ttl = Number(GET_CACHE_MS[path] || 0);
+          const now = Date.now();
+          if (ttl > 0) {
+            const cached = responseCache.get(cacheKey);
+            if (cached && now - cached.ts <= ttl) return cached.response.clone();
+          }
+          if (inflight.has(cacheKey)) {
+            return inflight.get(cacheKey).then((r) => r.clone());
+          }
+          const req = origFetch(mapped, init).then((res) => {
+            if (ttl > 0 && res.ok) responseCache.set(cacheKey, { ts: Date.now(), response: res.clone() });
+            return res;
+          }).finally(() => inflight.delete(cacheKey));
+          inflight.set(cacheKey, req);
+          return req.then((r) => r.clone());
+        }
         const origFetch = window.fetch.bind(window);
         window.fetch = function(input, init){
           try {
             const raw = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
             const u = new URL(raw, window.location.origin);
             if (u.pathname.startsWith('/api/')) {
-              const proxy = `?proxy=${encodeURIComponent(u.pathname.replace(/^\\//, '') + u.search)}&base=${encodeURIComponent(window.__TN_PROXY_BASE)}`;
-              return origFetch(proxy, init);
+              const proxyPath = mapProxyPath(u);
+              const proxy = `?proxy=${encodeURIComponent(proxyPath)}&base=${encodeURIComponent(window.__TN_PROXY_BASE)}`;
+              const cacheKey = `${window.__TN_PROXY_BASE}|${proxyPath}`;
+              return fetchWithCache(proxy, init, cacheKey, u.pathname);
             }
           } catch (_) {}
           return origFetch(input, init);
