@@ -937,18 +937,16 @@ class AppStore:
             self._sync_wakeup_event.clear()
 
     def _live_sync_loop(self) -> None:
-        next_data_catchup_mono = 0.0
         while not self._stop_event.is_set():
             try:
                 if self._is_cloud_auto_sync_enabled():
+                    # Keep this loop focused on low-latency live snapshots only.
+                    # Full historian/log batch sync runs in the config/bulk loop;
+                    # mixing both paths here causes multi-second stalls.
                     self._flush_live_outbox_once()
-                    # Keep cloud historian close to real-time by flushing at least
-                    # one data batch on every live tick.
-                    self._flush_data_outbox_once()
-                    now_mono = time.monotonic()
-                    if now_mono >= next_data_catchup_mono:
-                        self._flush_data_outbox_burst()
-                        next_data_catchup_mono = now_mono + float(self._live_data_catchup_interval_seconds)
+                    # Nudge bulk/config sync worker after every live flush so
+                    # historian catch-up can run immediately without blocking live.
+                    self._sync_wakeup_event.set()
             except Exception as exc:
                 self._set_data_sync_state(last_data_error=f"Live sync loop error: {exc}")
             self._live_sync_wakeup_event.wait(timeout=self._live_sync_interval_seconds)
