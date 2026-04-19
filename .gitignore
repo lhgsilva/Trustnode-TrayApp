@@ -24,3 +24,11 @@ Thumbs.db
 build/
 dist/
 *.spec
+
+# --- Node ---
+node_modules/
+
+# --- Local diagnostics / temp artifacts ---
+.tmp*
+playwright-cloud.png
+Trustnode_edge_app/client_page_tests/diagnostics/output/
