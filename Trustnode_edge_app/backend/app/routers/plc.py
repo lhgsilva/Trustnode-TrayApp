@@ -431,9 +431,14 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
                     queue.append((child, depth + 1, node_id))
 
         variable_count = sum(1 for n in out if n.is_variable)
+        object_count = sum(1 for n in out if str(n.node_class).endswith("Object"))
+        method_count = sum(1 for n in out if str(n.node_class).endswith("Method"))
         return OpcUaBrowseResult(
             ok=True,
-            message=f"Browsed {len(out)} nodes from {endpoint} (variables: {variable_count})",
+            message=(
+                f"Browsed {len(out)} nodes from {endpoint} "
+                f"(objects: {object_count}, variables: {variable_count}, methods: {method_count})"
+            ),
             nodes=out,
         )
     except Exception as exc:  # pragma: no cover - runtime/device dependent

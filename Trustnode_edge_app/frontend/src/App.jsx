@@ -1574,6 +1574,7 @@ function AppShell() {
   const [gatewayOpcValidatedFor, setGatewayOpcValidatedFor] = useState("");
   const [gatewaySelectedTags, setGatewaySelectedTags] = useState([]);
   const [gatewayBrowseSearch, setGatewayBrowseSearch] = useState("");
+  const [gatewayOpcNodeSummary, setGatewayOpcNodeSummary] = useState({ total: 0, objects: 0, variables: 0, methods: 0 });
   const [gatewayForm, setGatewayForm] = useState({
     name: "",
     device_id: "",
@@ -7661,6 +7662,7 @@ function AppShell() {
     setGatewayOpcBrowseNodes([]);
     setGatewaySelectedTags([]);
     setGatewayBrowseSearch("");
+    setGatewayOpcNodeSummary({ total: 0, objects: 0, variables: 0, methods: 0 });
     setGatewayOpcValidationResult("");
     setGatewayOpcValidationRows([]);
     setGatewayOpcValidatedFor("");
@@ -7685,10 +7687,12 @@ function AppShell() {
     setGatewayOpcBrowseNodes([]);
     setGatewaySelectedTags([]);
     setGatewayBrowseSearch("");
+    setGatewayOpcNodeSummary({ total: 0, objects: 0, variables: 0, methods: 0 });
     setGatewayOpcValidationResult("");
     setGatewayOpcValidationRows([]);
     setGatewayOpcValidatedFor("");
     setGatewayBrowseSearch("");
+    setGatewayOpcNodeSummary({ total: 0, objects: 0, variables: 0, methods: 0 });
     setGatewayForm({
       name: gateway.name || "",
       device_id: gateway.device_id || "",
@@ -7809,6 +7813,13 @@ function AppShell() {
           variables_only: false
         });
         const nodes = Array.isArray(res.nodes) ? res.nodes : [];
+        const summary = {
+          total: nodes.length,
+          variables: nodes.filter((n) => Boolean(n?.is_variable)).length,
+          objects: nodes.filter((n) => String(n?.node_class || "").endsWith("Object")).length,
+          methods: nodes.filter((n) => String(n?.node_class || "").endsWith("Method")).length,
+        };
+        setGatewayOpcNodeSummary(summary);
         setGatewayOpcBrowseNodes(nodes);
         const variableNodeIds = nodes
           .filter((n) => Boolean(n?.is_variable))
@@ -7832,6 +7843,7 @@ function AppShell() {
       });
       const tags = Array.isArray(res.tags) ? res.tags : [];
       setGatewayOpcBrowseNodes([]);
+      setGatewayOpcNodeSummary({ total: 0, objects: 0, variables: 0, methods: 0 });
       setGatewayDiscoveredTags(tags);
       setGatewaySelectedTags([]);
       setGatewayBrowseSearch("");
@@ -7842,6 +7854,7 @@ function AppShell() {
       setGatewayOpcBrowseNodes([]);
       setGatewaySelectedTags([]);
       setGatewayBrowseSearch("");
+      setGatewayOpcNodeSummary({ total: 0, objects: 0, variables: 0, methods: 0 });
     } finally {
       setGatewayDiscoverBusy(false);
     }
@@ -13871,6 +13884,11 @@ function AppShell() {
                         ? `Browse Results (Variable Nodes: ${gatewayDiscoveredTags.length})`
                         : `Discovered Tags (${gatewayDiscoveredTags.length})`}
                     </strong>
+                    {gatewayForm.gateway_type === "siemens_opcua" ? (
+                      <div className="muted">
+                        {`Total: ${gatewayOpcNodeSummary.total} | Objects: ${gatewayOpcNodeSummary.objects} | Variables: ${gatewayOpcNodeSummary.variables} | Methods: ${gatewayOpcNodeSummary.methods}`}
+                      </div>
+                    ) : null}
                     {gatewayForm.gateway_type === "siemens_opcua" ? (
                       <input
                         className="gateway-browse-search"
