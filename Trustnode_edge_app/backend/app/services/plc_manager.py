@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Set
 from urllib.parse import quote_plus
 
 from app.models import GatewayConfig, GatewayReading, GatewayStatus
+from app.opcua_utils import resolve_requested_nodes, split_requested_identifiers
 from app.tenant import normalize_tenant_id
 
 
@@ -58,6 +59,8 @@ class GatewayWorker:
         self._ab_pylogix_client = None
         self._ab_pylogix_ip: str | None = None
         self._ab_pylogix_slot: int | None = None
+        self._opc_resolve_cache_key = ""
+        self._opc_resolved_targets: list[tuple[str, str]] = []
         self._telemetry_runtime_refresh_monotonic = 0.0
 
     def set_config(self, config: GatewayConfig) -> None:
@@ -67,6 +70,12 @@ class GatewayWorker:
             != str(getattr(config, "gateway_type", "") or "").strip().lower()
         ):
             self._dispose_gateway_clients()
+        if (
+            str(getattr(self.config, "opc_url", "") or "").strip() != str(getattr(config, "opc_url", "") or "").strip()
+            or list(getattr(self.config, "tags", []) or []) != list(getattr(config, "tags", []) or [])
+        ):
+            self._opc_resolve_cache_key = ""
+            self._opc_resolved_targets = []
         self.config = config
 
     def _normalize_db_sinks(
@@ -614,15 +623,8 @@ class GatewayWorker:
             raise RuntimeError(f"OPC-UA client not installed: {exc}") from exc
 
         endpoint = (self.config.opc_url or "").strip() or f"opc.tcp://{self.config.plc_ip.strip()}:4840"
-        node_ids: list[str] = []
-        for raw in self._get_read_tags():
-            node = str(raw or "").strip()
-            if not node:
-                continue
-            if not node.startswith("ns="):
-                node = f'ns=3;s="{node}"'
-            node_ids.append(node)
-        if not node_ids:
+        requested_ids = split_requested_identifiers(self._get_read_tags())
+        if not requested_ids:
             raise RuntimeError("OPC-UA read failed: no node ids/tags configured.")
 
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -630,7 +632,33 @@ class GatewayWorker:
         client = Client(endpoint, timeout=4.0)
         try:
             client.connect()
-            for node_id in node_ids:
+            cache_key = f"{endpoint}|{'|'.join(requested_ids)}"
+            resolved_targets: list[tuple[str, str]]
+            unresolved_items: list[str] = []
+            if self._opc_resolve_cache_key == cache_key and self._opc_resolved_targets:
+                resolved_targets = self._opc_resolved_targets
+            else:
+                resolved, unresolved_items = resolve_requested_nodes(client, requested_ids)
+                resolved_targets = [(t.requested, t.resolved_node_id) for t in resolved]
+                self._opc_resolved_targets = resolved_targets
+                self._opc_resolve_cache_key = cache_key
+            for unresolved in unresolved_items:
+                out.append(
+                    GatewayReading(
+                        ts_utc=ts,
+                        tag_name=unresolved,
+                        value=0.0,
+                        quality=0,
+                        quality_label="BAD",
+                        source=self.config.gateway_type,
+                        site=self.config.site,
+                        area=self.config.area,
+                        equipment=self.config.equipment,
+                    )
+                )
+            if not resolved_targets:
+                raise RuntimeError("OPC-UA read failed: no variable nodes resolved from configured tags.")
+            for requested_tag, node_id in resolved_targets:
                 try:
                     node = client.get_node(node_id)
                     data_value = node.get_data_value()
@@ -643,7 +671,7 @@ class GatewayWorker:
                     out.append(
                         GatewayReading(
                             ts_utc=ts,
-                            tag_name=node_id,
+                            tag_name=requested_tag,
                             value=float(value) if value is not None else 0.0,
                             quality=quality,
                             quality_label=quality_label,
@@ -657,7 +685,7 @@ class GatewayWorker:
                     out.append(
                         GatewayReading(
                             ts_utc=ts,
-                            tag_name=node_id,
+                            tag_name=requested_tag,
                             value=0.0,
                             quality=0,
                             quality_label="BAD",

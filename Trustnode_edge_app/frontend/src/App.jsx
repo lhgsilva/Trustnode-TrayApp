@@ -1573,6 +1573,7 @@ function AppShell() {
   const [gatewayOpcValidationRows, setGatewayOpcValidationRows] = useState([]);
   const [gatewayOpcValidatedFor, setGatewayOpcValidatedFor] = useState("");
   const [gatewaySelectedTags, setGatewaySelectedTags] = useState([]);
+  const [gatewayBrowseSearch, setGatewayBrowseSearch] = useState("");
   const [gatewayForm, setGatewayForm] = useState({
     name: "",
     device_id: "",
@@ -7659,6 +7660,7 @@ function AppShell() {
     setGatewayDiscoveredTags([]);
     setGatewayOpcBrowseNodes([]);
     setGatewaySelectedTags([]);
+    setGatewayBrowseSearch("");
     setGatewayOpcValidationResult("");
     setGatewayOpcValidationRows([]);
     setGatewayOpcValidatedFor("");
@@ -7682,9 +7684,11 @@ function AppShell() {
     setGatewayDiscoveredTags([]);
     setGatewayOpcBrowseNodes([]);
     setGatewaySelectedTags([]);
+    setGatewayBrowseSearch("");
     setGatewayOpcValidationResult("");
     setGatewayOpcValidationRows([]);
     setGatewayOpcValidatedFor("");
+    setGatewayBrowseSearch("");
     setGatewayForm({
       name: gateway.name || "",
       device_id: gateway.device_id || "",
@@ -7753,16 +7757,16 @@ function AppShell() {
     if (gatewayForm.gateway_type === "siemens_opcua") {
       const nodeIds = parseOpcNodeIds(gatewayForm.tags_text);
       if (!nodeIds.length) {
-        setError("At least one OPC NodeId is required for Siemens OPC-UA.");
+        setError("At least one OPC tag/node identifier is required for Siemens OPC-UA.");
         return;
       }
       const validationKey = `opcua|${plcIp}|${gatewayForm.opc_url.trim()}|${nodeIds.join(";")}`;
       if (gatewayOpcValidatedFor !== validationKey) {
-        setError("Run OPC Node Validation for current URL and NodeIds before saving.");
+        setError("Run OPC Node Validation for current URL and OPC tags before saving.");
         return;
       }
       if (!gatewayOpcValidationRows.length || gatewayOpcValidationRows.some((r) => !r.ok)) {
-        setError("One or more OPC NodeIds failed validation. Fix failed nodes before saving.");
+        setError("One or more OPC tags failed validation. Fix failed nodes before saving.");
         return;
       }
     }
@@ -7812,6 +7816,7 @@ function AppShell() {
           .filter(Boolean);
         setGatewayDiscoveredTags(variableNodeIds);
         setGatewaySelectedTags([]);
+        setGatewayBrowseSearch("");
         setGatewayDiscoverResult(
           res.message || `Browsed ${nodes.length} OPC-UA nodes (variables: ${variableNodeIds.length})`
         );
@@ -7829,12 +7834,14 @@ function AppShell() {
       setGatewayOpcBrowseNodes([]);
       setGatewayDiscoveredTags(tags);
       setGatewaySelectedTags([]);
+      setGatewayBrowseSearch("");
       setGatewayDiscoverResult(res.message || `Discovered ${res.tags?.length || 0} tags`);
     } catch (err) {
       setGatewayDiscoverResult(String(err));
       setGatewayDiscoveredTags([]);
       setGatewayOpcBrowseNodes([]);
       setGatewaySelectedTags([]);
+      setGatewayBrowseSearch("");
     } finally {
       setGatewayDiscoverBusy(false);
     }
@@ -7878,7 +7885,7 @@ function AppShell() {
       return;
     }
     if (!nodeIds.length) {
-      setGatewayOpcValidationResult("Add one or more OPC NodeIds in Tags before validation.");
+      setGatewayOpcValidationResult("Add one or more OPC tags/nodes in Tags before validation.");
       setGatewayOpcValidationRows([]);
       return;
     }
@@ -13864,6 +13871,14 @@ function AppShell() {
                         ? `Browse Results (Variable Nodes: ${gatewayDiscoveredTags.length})`
                         : `Discovered Tags (${gatewayDiscoveredTags.length})`}
                     </strong>
+                    {gatewayForm.gateway_type === "siemens_opcua" ? (
+                      <input
+                        className="gateway-browse-search"
+                        placeholder="Search OPC-UA tags (name/path/node id)"
+                        value={gatewayBrowseSearch}
+                        onChange={(e) => setGatewayBrowseSearch(e.target.value)}
+                      />
+                    ) : null}
                     <div className="row">
                       <button type="button" className="btn btn-primary btn-sm" onClick={selectAllDiscoveredTags}>
                         Select All
@@ -13883,7 +13898,20 @@ function AppShell() {
                   </div>
                   <div className="discovered-tags-list">
                     {gatewayForm.gateway_type === "siemens_opcua" && gatewayOpcBrowseNodes.length
-                      ? gatewayOpcBrowseNodes.map((node) => {
+                      ? gatewayOpcBrowseNodes
+                          .filter((node) => {
+                            const q = String(gatewayBrowseSearch || "").trim().toLowerCase();
+                            if (!q) return true;
+                            const text = [
+                              String(node.display_name || ""),
+                              String(node.browse_name || ""),
+                              String(node.node_id || ""),
+                            ]
+                              .join(" ")
+                              .toLowerCase();
+                            return text.includes(q);
+                          })
+                          .map((node) => {
                           const tag = String(node.node_id || "");
                           const selectable = Boolean(node.is_variable);
                           return (
@@ -14013,7 +14041,7 @@ function AppShell() {
                   <label>
                     OPC Node IDs (optional, one per line or comma separated)
                     <textarea
-                      placeholder={'Leave blank to test endpoint only, or provide:\nns=3;s="tag1"\nns=3;s="tag2"'}
+                      placeholder={'Leave blank to test endpoint only, or provide NodeIds / tag names:\n"DB1.Temp"\nObjects/DeviceSet/DB1.Temp'}
                       value={deviceForm.opc_node_ids_text}
                       onChange={(e) =>
                         setDeviceForm({

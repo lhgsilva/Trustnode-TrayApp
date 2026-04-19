@@ -2233,6 +2233,13 @@ input[type="checkbox"] {
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.gateway-browse-search {
+  min-width: 260px;
+  max-width: 520px;
+  flex: 1 1 320px;
 }
 
 .discovered-tags-list {

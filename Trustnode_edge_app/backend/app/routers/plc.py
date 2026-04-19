@@ -10,6 +10,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from app.models import GatewayConfig, GatewayReading, GatewayStatus
+from app.opcua_utils import resolve_requested_nodes, split_requested_identifiers
 from app.state import app_store, plc_manager
 
 router = APIRouter(prefix="/api/plc", tags=["plc"])
@@ -165,35 +166,10 @@ def _resolve_host_port(payload: DeviceConnectionTestRequest) -> tuple[str, int]:
 
 
 def _normalize_opc_node_ids(payload: DeviceConnectionTestRequest) -> list[str]:
-    def _extract_node_ids(text: str) -> list[str]:
-        raw = str(text or "").strip()
-        if not raw:
-            return []
-        matches = [
-            m.group(0).strip()
-            for m in re.finditer(
-                r'ns=\d+;(?:s="[^"]+"|s=[^,\n;|]+|i=\d+|g=[0-9a-fA-F-]+|b=[^,\n;|]+)',
-                raw,
-            )
-        ]
-        if matches:
-            return matches
-        # Fallback for plain names list.
-        out: list[str] = []
-        for part in re.split(r"[,;\n|]+", raw):
-            node = part.strip()
-            if not node:
-                continue
-            if not node.startswith("ns="):
-                node = f'ns=3;s="{node}"'
-            out.append(node)
-        return out
-
     nodes: list[str] = []
-    for raw in list(payload.opc_node_ids or []) + [payload.opc_node_id]:
-        for node in _extract_node_ids(str(raw or "")):
-            if node not in nodes:
-                nodes.append(node)
+    for raw in split_requested_identifiers(list(payload.opc_node_ids or []) + [payload.opc_node_id]):
+        if raw not in nodes:
+            nodes.append(raw)
 
     opc_url = (payload.opc_url or "").strip()
     if opc_url:
@@ -202,16 +178,15 @@ def _normalize_opc_node_ids(payload: DeviceConnectionTestRequest) -> list[str]:
             qs = parse_qs(parsed.query or "")
             for key in ("node", "nodeid", "nodes", "tags"):
                 values = qs.get(key, [])
-                for value in values:
-                    for node in _extract_node_ids(str(value or "")):
-                        if node not in nodes:
-                            nodes.append(node)
+                for node in split_requested_identifiers(values):
+                    if node not in nodes:
+                        nodes.append(node)
         except Exception:
             pass
 
         for match in re.finditer(r'ns=\d+;(?:s="[^"]+"|s=[^,\n;|]+|i=\d+|g=[0-9a-fA-F-]+|b=[^,\n;|]+)', opc_url):
             node = match.group(0).strip()
-            if node and node not in nodes:
+            if node not in nodes:
                 nodes.append(node)
     return nodes
 
@@ -233,15 +208,42 @@ def _check_opcua_handshake_and_read(payload: DeviceConnectionTestRequest, timeou
         results: list[dict] = []
         if not node_ids:
             return True, f"OPC-UA session OK ({endpoint}). Node read skipped (no node id provided).", results
+        resolved_targets, unresolved = resolve_requested_nodes(client, node_ids)
         ok_all = True
-        for node_id in node_ids:
+        for unresolved_item in unresolved:
+            ok_all = False
+            results.append(
+                {
+                    "node_id": unresolved_item,
+                    "ok": False,
+                    "value": None,
+                    "message": "Node could not be resolved from browse name/path. Browse and reselect this tag.",
+                }
+            )
+        for target in resolved_targets:
             try:
-                node = client.get_node(node_id)
+                node = client.get_node(target.resolved_node_id)
                 value = node.get_value()
-                results.append({"node_id": node_id, "ok": True, "value": value, "message": "Read OK"})
+                results.append(
+                    {
+                        "node_id": target.requested,
+                        "resolved_node_id": target.resolved_node_id,
+                        "ok": True,
+                        "value": value,
+                        "message": f"Read OK ({target.matched_by})",
+                    }
+                )
             except Exception as node_err:  # pragma: no cover - runtime/device dependent
                 ok_all = False
-                results.append({"node_id": node_id, "ok": False, "value": None, "message": str(node_err)})
+                results.append(
+                    {
+                        "node_id": target.requested,
+                        "resolved_node_id": target.resolved_node_id,
+                        "ok": False,
+                        "value": None,
+                        "message": str(node_err),
+                    }
+                )
         success_count = sum(1 for r in results if r.get("ok"))
         msg = f"OPC-UA session OK ({endpoint}). Node reads: {success_count}/{len(results)}"
         return ok_all, msg, results
@@ -269,6 +271,11 @@ def _discover_opcua_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
     queue: list = []
     try:
         client.connect()
+        namespace_count = 0
+        try:
+            namespace_count = len(client.get_namespace_array() or [])
+        except Exception:
+            namespace_count = 0
         try:
             root = client.get_node(ua.ObjectIds.ObjectsFolder)
         except Exception:
@@ -302,7 +309,10 @@ def _discover_opcua_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
             return TagDiscoveryResult(
                 ok=True,
                 tags=tags,
-                message=f"Discovered {len(tags)} OPC-UA tags from {endpoint}"
+                message=(
+                    f"Discovered {len(tags)} OPC-UA tags from {endpoint}"
+                    + (f" (namespaces: {namespace_count})" if namespace_count else "")
+                )
             )
         return TagDiscoveryResult(
             ok=False,
