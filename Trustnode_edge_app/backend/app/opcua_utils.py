@@ -48,6 +48,33 @@ def _normalize_text(value: str) -> str:
     return txt
 
 
+def _opc_node_class_name(node_class: object) -> str:
+    try:
+        name = getattr(node_class, "name", None)
+        if name:
+            return str(name)
+    except Exception:
+        pass
+    try:
+        txt = str(node_class)
+        if txt and not txt.isdigit():
+            return txt.split(".")[-1]
+        num = int(node_class)  # type: ignore[arg-type]
+        mapping = {
+            1: "Object",
+            2: "Variable",
+            4: "Method",
+            8: "ObjectType",
+            16: "VariableType",
+            32: "ReferenceType",
+            64: "DataType",
+            128: "View",
+        }
+        return mapping.get(num, str(num))
+    except Exception:
+        return "Unknown"
+
+
 def _match_keys_for_display(display_name: str, browse_name: str, browse_path: str) -> list[str]:
     keys = {
         _normalize_text(display_name),
@@ -83,7 +110,7 @@ def _build_variable_index(client: Any, max_nodes: int = 12000, max_depth: int = 
             continue
         seen.add(node_id)
         try:
-            node_class = str(node.get_node_class()).split(".")[-1]
+            node_class = _opc_node_class_name(node.get_node_class())
         except Exception:
             node_class = "Unknown"
         try:

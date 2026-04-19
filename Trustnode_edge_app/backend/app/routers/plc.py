@@ -85,6 +85,33 @@ class OpcUaBrowseResult(BaseModel):
     nodes: list[OpcUaBrowseNode] = Field(default_factory=list)
 
 
+def _opc_node_class_name(node_class: object) -> str:
+    try:
+        name = getattr(node_class, "name", None)
+        if name:
+            return str(name)
+    except Exception:
+        pass
+    try:
+        txt = str(node_class)
+        if txt and not txt.isdigit():
+            return txt.split(".")[-1]
+        num = int(node_class)  # type: ignore[arg-type]
+        mapping = {
+            1: "Object",
+            2: "Variable",
+            4: "Method",
+            8: "ObjectType",
+            16: "VariableType",
+            32: "ReferenceType",
+            64: "DataType",
+            128: "View",
+        }
+        return mapping.get(num, str(num))
+    except Exception:
+        return "Unknown"
+
+
 def _gateway_port(gateway_type: str) -> int:
     # Common default PLC/protocol ports used for quick connectivity verification.
     ports = {
@@ -301,9 +328,10 @@ def _discover_opcua_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
                     nclass = child.get_node_class()
                 except Exception:
                     nclass = None
-                if str(nclass).endswith("Variable"):
+                class_name = _opc_node_class_name(nclass)
+                if class_name.endswith("Variable"):
                     tags.append(node_id)
-                elif str(nclass).endswith("Object"):
+                elif class_name.endswith("Object"):
                     queue.append(child)
         if tags:
             return TagDiscoveryResult(
@@ -365,7 +393,7 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
             visited.add(node_id)
 
             try:
-                node_class = str(node.get_node_class()).split(".")[-1]
+                node_class = _opc_node_class_name(node.get_node_class())
             except Exception:
                 node_class = "Unknown"
             is_variable = node_class.endswith("Variable")
