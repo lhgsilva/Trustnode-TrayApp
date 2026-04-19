@@ -6,6 +6,7 @@ import shutil
 import hashlib
 import secrets
 import time
+import socket
 from urllib.parse import quote_plus
 from datetime import timedelta
 from datetime import datetime, timezone
@@ -131,8 +132,13 @@ class AppStore:
         self._strict_cloud_mirror = str(
             os.environ.get("TRUSTNODE_STRICT_CLOUD_MIRROR", "1")
         ).strip().lower() in {"1", "true", "yes", "on"}
+        self._edge_config_isolation_enabled = str(
+            os.environ.get("TRUSTNODE_EDGE_CONFIG_ISOLATION", "1")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._local_edge_id = self._derive_local_edge_id()
         self._ensure_schema()
         self._ensure_required_config_domains()
+        self._ensure_local_edge_profile()
         self._ensure_default_database_configuration()
         if not self._disable_config_push:
             self._compact_sync_outbox_for_domains()
@@ -273,6 +279,62 @@ class AppStore:
         except Exception:
             pass
         return False
+
+    def _derive_local_edge_id(self) -> str:
+        raw_host = (
+            str(os.environ.get("COMPUTERNAME") or "").strip()
+            or str(os.environ.get("HOSTNAME") or "").strip()
+            or str(socket.gethostname() or "").strip()
+            or "local"
+        )
+        safe = "".join(ch.lower() if ch.isalnum() else "-" for ch in raw_host).strip("-")
+        safe = safe or "local"
+        if not safe.startswith("edge-"):
+            safe = f"edge-{safe}"
+        return safe[:64]
+
+    def _ensure_local_edge_profile(self) -> None:
+        now = self._utc_now()
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json, version FROM config_documents WHERE domain = ?",
+                    ("app_settings",),
+                ).fetchone()
+                payload: Dict[str, Any] = {}
+                version = 1
+                if row:
+                    version = int(row["version"] or 1)
+                    try:
+                        raw = json.loads(str(row["payload_json"] or "{}"))
+                        if isinstance(raw, dict):
+                            payload = raw
+                    except Exception:
+                        payload = {}
+                edge_profile = payload.get("edge_profile")
+                if not isinstance(edge_profile, dict):
+                    edge_profile = {}
+                current_edge_id = str(edge_profile.get("edge_id") or "").strip()
+                if current_edge_id and current_edge_id != "edge-01":
+                    return
+                edge_profile["edge_id"] = self._local_edge_id
+                edge_profile["edge_name"] = str(edge_profile.get("edge_name") or self._local_edge_id)
+                edge_profile["description"] = str(edge_profile.get("description") or "")
+                edge_profile["location"] = str(edge_profile.get("location") or "")
+                edge_profile["machine_group"] = str(edge_profile.get("machine_group") or "")
+                payload["edge_profile"] = edge_profile
+                next_version = max(1, version + 1)
+                conn.execute(
+                    """
+                    INSERT INTO config_documents(domain, payload_json, version, updated_utc)
+                    VALUES(?, ?, ?, ?)
+                    ON CONFLICT(domain) DO UPDATE SET
+                      payload_json = excluded.payload_json,
+                      version = excluded.version,
+                      updated_utc = excluded.updated_utc
+                    """,
+                    ("app_settings", json.dumps(payload), next_version, now),
+                )
 
     def get_config_domain(self, domain: str, default: Any | None = None) -> Any:
         name = str(domain or "").strip()
@@ -898,6 +960,7 @@ class AppStore:
                 pass
 
         now = self._utc_now()
+        allow_cloud_control_domains = (not self._edge_config_isolation_enabled) or self._prefer_cloud_reads()
         applied = 0
         with self._lock:
             with self._connect() as conn:
@@ -905,6 +968,15 @@ class AppStore:
                     raw_domain = str(r[0] or "").strip()
                     domain = raw_domain[len(tenant_prefix):] if raw_domain.startswith(tenant_prefix) else raw_domain
                     if not domain:
+                        continue
+                    if (not allow_cloud_control_domains) and domain in {
+                        "devices",
+                        "gateway_configurations",
+                        "database_configurations",
+                        "power_management_config",
+                    }:
+                        # Edge runtime keeps local control configs isolated per machine.
+                        # Cloud/web mode still pulls these domains for shared web clients.
                         continue
                     payload_text = str(r[1] or "null")
                     remote_version = int(r[2] or 0)

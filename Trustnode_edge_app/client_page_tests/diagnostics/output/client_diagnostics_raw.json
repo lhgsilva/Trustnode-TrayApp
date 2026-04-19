@@ -1,0 +1,2983 @@
+{
+  "bench": [
+    {
+      "url": "https://trustnode.lsapps.app/client/client_test.html",
+      "runs": 8,
+      "ok": 8,
+      "fail": 0,
+      "status_codes": {
+        "200": 8
+      },
+      "min_ms": 1433.84,
+      "p50_ms": 1969.15,
+      "p95_ms": 9566.81,
+      "max_ms": 9566.81,
+      "avg_ms": 3043.31,
+      "avg_bytes": 2798009.0,
+      "content_type": "text/html",
+      "title": "Trustnode Edge - Single File Client (Cloud API HTML)",
+      "mode": "Unknown"
+    },
+    {
+      "url": "https://trustnode.lsapps.app/client/client_test.php",
+      "runs": 8,
+      "ok": 8,
+      "fail": 0,
+      "status_codes": {
+        "200": 8
+      },
+      "min_ms": 915.75,
+      "p50_ms": 1012.61,
+      "p95_ms": 1447.53,
+      "max_ms": 1447.53,
+      "avg_ms": 1075.48,
+      "avg_bytes": 2798017.0,
+      "content_type": "text/html; charset=UTF-8",
+      "title": "Trustnode Edge - Single File Client (Cloud API PHP Proxy)",
+      "mode": "PHP API proxy"
+    },
+    {
+      "url": "https://trustnode.lsapps.app/client/client_test_db_rest.html",
+      "runs": 8,
+      "ok": 8,
+      "fail": 0,
+      "status_codes": {
+        "200": 8
+      },
+      "min_ms": 818.98,
+      "p50_ms": 929.37,
+      "p95_ms": 966.87,
+      "max_ms": 966.87,
+      "avg_ms": 907.66,
+      "avg_bytes": 2803947.0,
+      "content_type": "text/html",
+      "title": "Trustnode Edge - Single File Client (Direct Cloud DB HTML)",
+      "mode": "Browser direct DB REST + API fallback"
+    },
+    {
+      "url": "https://trustnode.lsapps.app/client/client_test_db_php.html",
+      "runs": 8,
+      "ok": 8,
+      "fail": 0,
+      "status_codes": {
+        "200": 8
+      },
+      "min_ms": 727.41,
+      "p50_ms": 938.91,
+      "p95_ms": 974.62,
+      "max_ms": 974.62,
+      "avg_ms": 908.95,
+      "avg_bytes": 2803947.0,
+      "content_type": "text/html",
+      "title": "Trustnode Edge - Single File Client (Direct Cloud DB HTML)",
+      "mode": "Browser direct DB REST + API fallback"
+    },
+    {
+      "url": "https://trustnode.lsapps.app/client/client_test_db.php",
+      "runs": 8,
+      "ok": 8,
+      "fail": 0,
+      "status_codes": {
+        "200": 8
+      },
+      "min_ms": 710.66,
+      "p50_ms": 780.92,
+      "p95_ms": 975.06,
+      "max_ms": 975.06,
+      "avg_ms": 821.5,
+      "avg_bytes": 2799452.0,
+      "content_type": "text/html; charset=UTF-8",
+      "title": "Trustnode Edge - Single File Client (Direct Cloud DB PHP)",
+      "mode": "PHP direct DB + API proxy"
+    }
+  ],
+  "sync": {
+    "local_login_ok": true,
+    "cloud_login_ok": true,
+    "local_inspector": {
+      "ok": true,
+      "tenant_id": "default",
+      "inspector": {
+        "tenant_id": "default",
+        "db_path": "C:\\Users\\User\\.trustnode_edge\\data\\trustnode_app_store.db",
+        "db_exists": true,
+        "db_size_bytes": 1222721536,
+        "table_count": 13,
+        "tables": [
+          {
+            "name": "app_logs",
+            "rows": 0
+          },
+          {
+            "name": "auth_settings",
+            "rows": 1
+          },
+          {
+            "name": "config_audit",
+            "rows": 85016
+          },
+          {
+            "name": "config_documents",
+            "rows": 13
+          },
+          {
+            "name": "data_sync_state",
+            "rows": 1
+          },
+          {
+            "name": "historian_agg_day",
+            "rows": 0
+          },
+          {
+            "name": "historian_agg_hour",
+            "rows": 0
+          },
+          {
+            "name": "historian_agg_minute",
+            "rows": 0
+          },
+          {
+            "name": "historian_readings",
+            "rows": 2828084
+          },
+          {
+            "name": "retention_policy",
+            "rows": 1
+          },
+          {
+            "name": "retention_runs",
+            "rows": 0
+          },
+          {
+            "name": "sync_outbox",
+            "rows": 17980
+          },
+          {
+            "name": "sync_targets",
+            "rows": 1
+          }
+        ],
+        "config_domains_preview": [
+          {
+            "domain": "power_management_config",
+            "version": 6,
+            "updated_utc": "2026-04-15 20:38:18.954339+00:00"
+          },
+          {
+            "domain": "users_access",
+            "version": 761,
+            "updated_utc": "2026-04-15 17:51:56.435509+00:00"
+          },
+          {
+            "domain": "app_settings",
+            "version": 774,
+            "updated_utc": "2026-04-15 17:51:53.408400+00:00"
+          },
+          {
+            "domain": "metadata",
+            "version": 676,
+            "updated_utc": "2026-04-14 08:24:28.024269+00:00"
+          },
+          {
+            "domain": "database_configurations",
+            "version": 729,
+            "updated_utc": "2026-04-14 08:24:24.344197+00:00"
+          },
+          {
+            "domain": "gateway_configurations",
+            "version": 734,
+            "updated_utc": "2026-04-14 01:24:03.192084+00:00"
+          },
+          {
+            "domain": "devices",
+            "version": 739,
+            "updated_utc": "2026-04-14 01:23:58.704329+00:00"
+          },
+          {
+            "domain": "alarms_setup",
+            "version": 708,
+            "updated_utc": "2026-04-10 23:05:09.333280+00:00"
+          },
+          {
+            "domain": "triggers_limits",
+            "version": 718,
+            "updated_utc": "2026-04-10 23:05:06.370221+00:00"
+          },
+          {
+            "domain": "email_notifications",
+            "version": 687,
+            "updated_utc": "2026-04-10 23:04:41.909704+00:00"
+          }
+        ],
+        "sync_outbox_status": {
+          "pending": 0,
+          "failed": 0,
+          "sent": 17980,
+          "other": 0
+        },
+        "data_sync": {
+          "last_historian_id": 3123586,
+          "last_log_id": 0,
+          "last_data_sync_utc": "2026-04-16 17:47:29.368",
+          "last_data_error": "",
+          "total_historian_synced": 4345694,
+          "total_logs_synced": 0,
+          "local_historian_rows": 2828084,
+          "local_log_rows": 0,
+          "historian_backlog": 0,
+          "logs_backlog": 0
+        },
+        "cloud_target": {
+          "id": "db-1776124264793",
+          "name": "Supabase",
+          "engine": "postgresql",
+          "host": "db.tsfreqjcrgbxdwvmxeuk.supabase.co",
+          "port": 5432,
+          "database": "postgres",
+          "schema": "public",
+          "tls": true
+        },
+        "sync_target": {
+          "id": "auto_cloud_config",
+          "name": "Automatic Cloud Config Sync",
+          "target_type": "postgresql",
+          "enabled": true,
+          "last_sync_utc": "",
+          "last_error": "",
+          "updated_utc": "2026-04-16 17:47:40.606",
+          "config": {
+            "name": "Supabase",
+            "host": "db.tsfreqjcrgbxdwvmxeuk.supabase.co"
+          }
+        }
+      }
+    },
+    "local_live_1": {
+      "ok": true,
+      "tenant_id": "default",
+      "rows": [
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[4]",
+          "value": 1009.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[4]",
+          "value": 1130.0799560546875,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[3]",
+          "value": 120.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[3]",
+          "value": 134.39999389648438,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "temp",
+          "value": 888.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "Start",
+          "value": 1.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_delivered_total_wh",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_consumed_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "frequency_hz",
+          "value": 49.96647644042969,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "power_factor",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_total_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "current_a",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "voltage_v",
+          "value": 0.04775950312614441,
+          "quality": 192,
+          "quality_label": "GOOD"
+        }
+      ]
+    },
+    "local_hist_1": {
+      "ok": true,
+      "tenant_id": "default",
+      "rows": [
+        {
+          "ts": "2026-04-16 17:47:41.326",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[4]",
+          "value": 1011.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:41.326",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[4]",
+          "value": 1132.3199462890625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:41.326",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[3]",
+          "value": 122.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:41.326",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[3]",
+          "value": 136.63999938964844,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:41.326",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "temp",
+          "value": 888.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:41.326",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "Start",
+          "value": 1.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.912667+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_delivered_total_wh",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.912667+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_consumed_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.912667+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.912667+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.912667+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "frequency_hz",
+          "value": 49.96647644042969,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.912667+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "power_factor",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.912667+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_total_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.912667+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.912667+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "current_a",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.912667+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "voltage_v",
+          "value": 0.05281737446784973,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[4]",
+          "value": 1009.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[4]",
+          "value": 1130.0799560546875,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[3]",
+          "value": 120.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[3]",
+          "value": 134.39999389648438,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "temp",
+          "value": 888.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:40.617",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "Start",
+          "value": 1.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_delivered_total_wh",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_consumed_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "frequency_hz",
+          "value": 49.96647644042969,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "power_factor",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_total_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "current_a",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:40.250398+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "voltage_v",
+          "value": 0.04775950312614441,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:39.311",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[4]",
+          "value": 1008.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:39.311",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[4]",
+          "value": 1128.9599609375,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:39.311",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[3]",
+          "value": 119.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:39.311",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[3]",
+          "value": 133.27999877929688,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:39.311",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "temp",
+          "value": 888.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:39.311",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "Start",
+          "value": 1.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:38.916036+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_delivered_total_wh",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:38.916036+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_consumed_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:38.916036+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:38.916036+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:38.916036+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "frequency_hz",
+          "value": 49.96647644042969,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:38.916036+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "power_factor",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:38.916036+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_total_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:38.916036+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:38.916036+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "current_a",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16T17:47:38.916036+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "voltage_v",
+          "value": 0.05479966104030609,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:38.290",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[4]",
+          "value": 1007.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "ts": "2026-04-16 17:47:38.290",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[4]",
+          "value": 1127.8399658203125,
+          "quality": 192,
+          "quality_label": "GOOD"
+        }
+      ]
+    },
+    "cloud_inspector": {
+      "ok": true,
+      "tenant_id": "default",
+      "inspector": {
+        "tenant_id": "default",
+        "db_path": "/opt/trustnode-edge/data/trustnode_app_store.db",
+        "db_exists": true,
+        "db_size_bytes": 269979648,
+        "table_count": 13,
+        "tables": [
+          {
+            "name": "app_logs",
+            "rows": 100054
+          },
+          {
+            "name": "auth_settings",
+            "rows": 1
+          },
+          {
+            "name": "config_audit",
+            "rows": 247525
+          },
+          {
+            "name": "config_documents",
+            "rows": 13
+          },
+          {
+            "name": "data_sync_state",
+            "rows": 1
+          },
+          {
+            "name": "historian_agg_day",
+            "rows": 0
+          },
+          {
+            "name": "historian_agg_hour",
+            "rows": 0
+          },
+          {
+            "name": "historian_agg_minute",
+            "rows": 0
+          },
+          {
+            "name": "historian_readings",
+            "rows": 37
+          },
+          {
+            "name": "retention_policy",
+            "rows": 1
+          },
+          {
+            "name": "retention_runs",
+            "rows": 0
+          },
+          {
+            "name": "sync_outbox",
+            "rows": 16031
+          },
+          {
+            "name": "sync_targets",
+            "rows": 1
+          }
+        ],
+        "config_domains_preview": [
+          {
+            "domain": "users_access",
+            "version": 764,
+            "updated_utc": "2026-04-16 13:00:06.653"
+          },
+          {
+            "domain": "power_management_config",
+            "version": 6,
+            "updated_utc": "2026-04-15 20:38:18.954339+00:00"
+          },
+          {
+            "domain": "app_settings",
+            "version": 774,
+            "updated_utc": "2026-04-15 17:51:53.408400+00:00"
+          },
+          {
+            "domain": "metadata",
+            "version": 676,
+            "updated_utc": "2026-04-14 08:24:28.024269+00:00"
+          },
+          {
+            "domain": "database_configurations",
+            "version": 729,
+            "updated_utc": "2026-04-14 08:24:24.344197+00:00"
+          },
+          {
+            "domain": "gateway_configurations",
+            "version": 734,
+            "updated_utc": "2026-04-14 01:24:03.192084+00:00"
+          },
+          {
+            "domain": "devices",
+            "version": 739,
+            "updated_utc": "2026-04-14 01:23:58.704329+00:00"
+          },
+          {
+            "domain": "alarms_setup",
+            "version": 708,
+            "updated_utc": "2026-04-10 23:05:09.333280+00:00"
+          },
+          {
+            "domain": "triggers_limits",
+            "version": 718,
+            "updated_utc": "2026-04-10 23:05:06.370221+00:00"
+          },
+          {
+            "domain": "email_notifications",
+            "version": 687,
+            "updated_utc": "2026-04-10 23:04:41.909704+00:00"
+          }
+        ],
+        "sync_outbox_status": {
+          "pending": 0,
+          "failed": 0,
+          "sent": 16031,
+          "other": 0
+        },
+        "data_sync": {
+          "last_historian_id": 37,
+          "last_log_id": 100420,
+          "last_data_sync_utc": "2026-04-16 17:47:44.053",
+          "last_data_error": "",
+          "total_historian_synced": 46,
+          "total_logs_synced": 105478,
+          "local_historian_rows": 37,
+          "local_log_rows": 100054,
+          "historian_backlog": 0,
+          "logs_backlog": 0
+        },
+        "cloud_target": {
+          "id": "db-1776124264793",
+          "name": "Supabase",
+          "engine": "postgresql",
+          "host": "db.tsfreqjcrgbxdwvmxeuk.supabase.co",
+          "port": 5432,
+          "database": "postgres",
+          "schema": "public",
+          "tls": true
+        },
+        "sync_target": {
+          "id": "auto_cloud_config",
+          "name": "Automatic Cloud Config Sync",
+          "target_type": "postgresql",
+          "enabled": true,
+          "last_sync_utc": "2026-04-16 17:47:44.052",
+          "last_error": "",
+          "updated_utc": "2026-04-16 17:47:44.052",
+          "config": {
+            "name": "Supabase",
+            "host": "db.tsfreqjcrgbxdwvmxeuk.supabase.co",
+            "schema": "public"
+          }
+        }
+      }
+    },
+    "cloud_live_1": {
+      "ok": true,
+      "tenant_id": "default",
+      "rows": [
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[3]",
+          "value": 130.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[3]",
+          "value": 145.600006103516,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "temp",
+          "value": 888.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "Start",
+          "value": 1.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[4]",
+          "value": 1008.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[4]",
+          "value": 1128.9599609375,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_total_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "frequency_hz",
+          "value": 49.9664764404297,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "power_factor",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_consumed_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_delivered_total_wh",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "voltage_v",
+          "value": 0.0562769994139671,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "current_a",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 15:42:56.820439+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_wh_raw",
+          "value": 1023.54931640625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 15:42:56.820439+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_total_w_raw",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 15:42:56.820439+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_delivered_total_wh_raw",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 15:42:56.820439+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_consumed_total_wh_raw",
+          "value": 1023.54931640625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 15:42:56.820439+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_total_wh_raw",
+          "value": 1023.54931640625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 15:42:56.820439+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "power_factor_raw",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 15:42:56.820439+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "frequency_hz_raw",
+          "value": 50.0271873474121,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 15:42:56.820439+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "voltage_v_raw",
+          "value": 0.0531271547079086,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 15:42:56.820439+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "current_a_raw",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-16 15:42:56.820439+00:00",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_w_raw",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-13 18:06:51.057000+00:00",
+          "source": "allen_bradley",
+          "gateway_id": "gw-1775653238239",
+          "gateway_name": "gw-1775653238239",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[3]",
+          "value": 121.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-13 18:06:51.057000+00:00",
+          "source": "allen_bradley",
+          "gateway_id": "gw-1775653238239",
+          "gateway_name": "gw-1775653238239",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[3]",
+          "value": 135.520004272461,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-10 18:07:10.716000+00:00",
+          "source": "allen_bradley",
+          "gateway_id": "gw-1775842366432",
+          "gateway_name": "gw-1775842366432",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "CSV Mirror",
+          "tag": "SimDINT[3]",
+          "value": 103.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-10 18:07:10.716000+00:00",
+          "source": "allen_bradley",
+          "gateway_id": "gw-1775842366432",
+          "gateway_name": "gw-1775842366432",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "CSV Mirror",
+          "tag": "SimREAL[3]",
+          "value": 115.360000610352,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-09 20:56:41.155762+00:00",
+          "source": "latency_probe_api",
+          "gateway_id": "gw-latency-probe",
+          "gateway_name": "gw-latency-probe",
+          "device_name": "",
+          "plc_ip": "127.0.0.1",
+          "database_name": "Supabase",
+          "tag": "latency_probe_api",
+          "value": 10.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-09 20:54:01.181572+00:00",
+          "source": "latency_probe_db",
+          "gateway_id": "gw-latency-probe",
+          "gateway_name": "gw-latency-probe",
+          "device_name": "",
+          "plc_ip": "127.0.0.1",
+          "database_name": "Supabase",
+          "tag": "latency_probe_db",
+          "value": 7.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "tenant_id": "default",
+          "ts": "2026-04-09 20:53:13.077553+00:00",
+          "source": "latency_probe",
+          "gateway_id": "gw-latency-probe",
+          "gateway_name": "gw-latency-probe",
+          "device_name": "",
+          "plc_ip": "127.0.0.1",
+          "database_name": "Supabase",
+          "tag": "latency_probe",
+          "value": 10.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        }
+      ]
+    },
+    "cloud_hist_1": {
+      "ok": true,
+      "tenant_id": "default",
+      "rows": [
+        {
+          "local_id": 3123960,
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[4]",
+          "value": 1008.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123959,
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[4]",
+          "value": 1128.9599609375,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123958,
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[3]",
+          "value": 130.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123957,
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[3]",
+          "value": 145.600006103516,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123956,
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "temp",
+          "value": 888.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123955,
+          "ts": "2026-04-16 17:47:48.365000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "Start",
+          "value": 1.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123954,
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_delivered_total_wh",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123953,
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_consumed_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123952,
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123951,
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123950,
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "frequency_hz",
+          "value": 49.9664764404297,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123949,
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "power_factor",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123948,
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_total_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123947,
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123946,
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "current_a",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123945,
+          "ts": "2026-04-16 17:47:47.917869+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "voltage_v",
+          "value": 0.0562769994139671,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123944,
+          "ts": "2026-04-16 17:47:47.378000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[4]",
+          "value": 1006.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123943,
+          "ts": "2026-04-16 17:47:47.378000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[4]",
+          "value": 1126.71997070312,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123942,
+          "ts": "2026-04-16 17:47:47.378000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[3]",
+          "value": 128.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123941,
+          "ts": "2026-04-16 17:47:47.378000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[3]",
+          "value": 143.360000610352,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123940,
+          "ts": "2026-04-16 17:47:47.378000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "temp",
+          "value": 888.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123939,
+          "ts": "2026-04-16 17:47:47.378000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "Start",
+          "value": 1.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123938,
+          "ts": "2026-04-16 17:47:46.910939+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_delivered_total_wh",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123937,
+          "ts": "2026-04-16 17:47:46.910939+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_consumed_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123936,
+          "ts": "2026-04-16 17:47:46.910939+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123935,
+          "ts": "2026-04-16 17:47:46.910939+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123934,
+          "ts": "2026-04-16 17:47:46.910939+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "frequency_hz",
+          "value": 49.9664764404297,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123933,
+          "ts": "2026-04-16 17:47:46.910939+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "power_factor",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123932,
+          "ts": "2026-04-16 17:47:46.910939+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_total_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123931,
+          "ts": "2026-04-16 17:47:46.910939+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123930,
+          "ts": "2026-04-16 17:47:46.910939+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "current_a",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123929,
+          "ts": "2026-04-16 17:47:46.910939+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "voltage_v",
+          "value": 0.0585632920265198,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123928,
+          "ts": "2026-04-16 17:47:46.377000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[4]",
+          "value": 1004.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123927,
+          "ts": "2026-04-16 17:47:46.377000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[4]",
+          "value": 1124.47998046875,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123926,
+          "ts": "2026-04-16 17:47:46.377000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[3]",
+          "value": 127.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123925,
+          "ts": "2026-04-16 17:47:46.377000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[3]",
+          "value": 142.240005493164,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123924,
+          "ts": "2026-04-16 17:47:46.377000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "temp",
+          "value": 888.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123923,
+          "ts": "2026-04-16 17:47:46.377000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "Start",
+          "value": 1.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123922,
+          "ts": "2026-04-16 17:47:45.912925+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_delivered_total_wh",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123921,
+          "ts": "2026-04-16 17:47:45.912925+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_consumed_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123920,
+          "ts": "2026-04-16 17:47:45.912925+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_total_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123919,
+          "ts": "2026-04-16 17:47:45.912925+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "energy_wh",
+          "value": 16424.869140625,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123918,
+          "ts": "2026-04-16 17:47:45.912925+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "frequency_hz",
+          "value": 49.9664764404297,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123917,
+          "ts": "2026-04-16 17:47:45.912925+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "power_factor",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123916,
+          "ts": "2026-04-16 17:47:45.912925+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_total_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123915,
+          "ts": "2026-04-16 17:47:45.912925+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "active_power_w",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123914,
+          "ts": "2026-04-16 17:47:45.912925+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "current_a",
+          "value": 0.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123913,
+          "ts": "2026-04-16 17:47:45.912925+00:00",
+          "tenant_id": "default",
+          "source": "power_modbus",
+          "gateway_id": "power_meter_01",
+          "gateway_name": "Power Meter 01",
+          "device_name": "Power Meter 01",
+          "plc_ip": "192.168.10.117",
+          "database_name": "Power Management",
+          "tag": "voltage_v",
+          "value": 0.0627563893795013,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123912,
+          "ts": "2026-04-16 17:47:45.364000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimDINT[4]",
+          "value": 1004.0,
+          "quality": 192,
+          "quality_label": "GOOD"
+        },
+        {
+          "local_id": 3123911,
+          "ts": "2026-04-16 17:47:45.364000+00:00",
+          "tenant_id": "default",
+          "source": "allen_bradley",
+          "gateway_id": "gw-primary",
+          "gateway_name": "gw-primary",
+          "device_name": "",
+          "plc_ip": "192.168.10.240",
+          "database_name": "Supabase",
+          "tag": "SimREAL[4]",
+          "value": 1124.47998046875,
+          "quality": 192,
+          "quality_label": "GOOD"
+        }
+      ]
+    },
+    "live_lag_stream_key": "gw-primary::SimDINT[3]",
+    "live_lag_seconds_samples_local_minus_cloud": [
+      4.001,
+      -3.596,
+      6.008,
+      0.0,
+      -9.012,
+      8.069,
+      6.273,
+      6.083,
+      -3.015,
+      -2.01
+    ],
+    "live_lag_summary_seconds": {
+      "min": -9.012,
+      "p50": 2.001,
+      "p95": 8.069,
+      "max": 8.069,
+      "avg": 1.28
+    }
+  },
+  "stream_consistency": {
+    "streams": [
+      {
+        "gateway_id": "power_meter_01",
+        "tag": "energy_delivered_total_wh",
+        "local_rows": 180,
+        "cloud_rows": 180,
+        "latest_lag_seconds_local_minus_cloud": 2.994,
+        "local_median_interval_seconds": 1.002,
+        "cloud_median_interval_seconds": 1.002,
+        "value_consistency": {
+          "overlap_rows": 173,
+          "equal_rows": 173,
+          "mismatch_rows": 0,
+          "equal_ratio": 1.0
+        }
+      },
+      {
+        "gateway_id": "gw-primary",
+        "tag": "SimDINT[4]",
+        "local_rows": 180,
+        "cloud_rows": 180,
+        "latest_lag_seconds_local_minus_cloud": 10.851,
+        "local_median_interval_seconds": 1.003,
+        "cloud_median_interval_seconds": 1.003,
+        "value_consistency": {
+          "overlap_rows": 171,
+          "equal_rows": 171,
+          "mismatch_rows": 0,
+          "equal_ratio": 1.0
+        }
+      },
+      {
+        "gateway_id": "power_meter_01",
+        "tag": "energy_consumed_total_wh",
+        "local_rows": 180,
+        "cloud_rows": 180,
+        "latest_lag_seconds_local_minus_cloud": 17.0,
+        "local_median_interval_seconds": 1.002,
+        "cloud_median_interval_seconds": 1.002,
+        "value_consistency": {
+          "overlap_rows": 159,
+          "equal_rows": 159,
+          "mismatch_rows": 0,
+          "equal_ratio": 1.0
+        }
+      },
+      {
+        "gateway_id": "power_meter_01",
+        "tag": "energy_total_wh",
+        "local_rows": 180,
+        "cloud_rows": 180,
+        "latest_lag_seconds_local_minus_cloud": 5.001,
+        "local_median_interval_seconds": 1.002,
+        "cloud_median_interval_seconds": 1.002,
+        "value_consistency": {
+          "overlap_rows": 172,
+          "equal_rows": 172,
+          "mismatch_rows": 0,
+          "equal_ratio": 1.0
+        }
+      }
+    ],
+    "candidates": [
+      {
+        "gateway_id": "power_meter_01",
+        "tag": "energy_delivered_total_wh"
+      },
+      {
+        "gateway_id": "gw-primary",
+        "tag": "SimDINT[4]"
+      },
+      {
+        "gateway_id": "power_meter_01",
+        "tag": "energy_consumed_total_wh"
+      },
+      {
+        "gateway_id": "power_meter_01",
+        "tag": "energy_total_wh"
+      }
+    ]
+  },
+  "playwright": {
+    "generated_at": "2026-04-16T17:46:42.211Z",
+    "capture_seconds": 10,
+    "results": [
+      {
+        "url": "https://trustnode.lsapps.app/client/client_test.html",
+        "nav_status": "ok",
+        "login_attempted": true,
+        "login_success": true,
+        "request_count": 24,
+        "failed_request_count": 4,
+        "response_bytes": 2810161,
+        "websocket_count": 1,
+        "top_paths": [
+          {
+            "path": "/api/app-store/bootstrap",
+            "count": 2
+          },
+          {
+            "path": "/api/v1/history",
+            "count": 2
+          },
+          {
+            "path": "/api/app-store/logs",
+            "count": 2
+          },
+          {
+            "path": "/api/app-store/historian",
+            "count": 2
+          },
+          {
+            "path": "/client/client_test.html",
+            "count": 1
+          },
+          {
+            "path": "/api/plc/gateways/status",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/tenant/context",
+            "count": 1
+          },
+          {
+            "path": "/api/ui-source/config",
+            "count": 1
+          },
+          {
+            "path": "/api/auth/me",
+            "count": 1
+          },
+          {
+            "path": "/api/health",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/retention/policy",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/retention/runs",
+            "count": 1
+          }
+        ]
+      },
+      {
+        "url": "https://trustnode.lsapps.app/client/client_test.php",
+        "nav_status": "ok",
+        "login_attempted": true,
+        "login_success": false,
+        "request_count": 17,
+        "failed_request_count": 0,
+        "response_bytes": 2806435,
+        "websocket_count": 0,
+        "top_paths": [
+          {
+            "path": "/api/app-store/bootstrap",
+            "count": 4
+          },
+          {
+            "path": "/client/client_test.php",
+            "count": 1
+          },
+          {
+            "path": "/api/plc/gateways/status",
+            "count": 1
+          },
+          {
+            "path": "/api/ui-source/config",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/tenant/context",
+            "count": 1
+          },
+          {
+            "path": "/api/auth/me",
+            "count": 1
+          },
+          {
+            "path": "/api/health",
+            "count": 1
+          },
+          {
+            "path": "/api/v1/history",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/logs",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/retention/policy",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/retention/runs",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/backups",
+            "count": 1
+          }
+        ]
+      },
+      {
+        "url": "https://trustnode.lsapps.app/client/client_test_db_rest.html",
+        "nav_status": "ok",
+        "login_attempted": true,
+        "login_success": true,
+        "request_count": 21,
+        "failed_request_count": 2,
+        "response_bytes": 2808344,
+        "websocket_count": 1,
+        "top_paths": [
+          {
+            "path": "/api/app-store/bootstrap",
+            "count": 2
+          },
+          {
+            "path": "/api/v1/history",
+            "count": 2
+          },
+          {
+            "path": "/api/v1/latest",
+            "count": 2
+          },
+          {
+            "path": "/client/client_test_db_rest.html",
+            "count": 1
+          },
+          {
+            "path": "/api/plc/gateways/status",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/tenant/context",
+            "count": 1
+          },
+          {
+            "path": "/api/ui-source/config",
+            "count": 1
+          },
+          {
+            "path": "/api/auth/me",
+            "count": 1
+          },
+          {
+            "path": "/api/health",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/retention/policy",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/retention/runs",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/backups",
+            "count": 1
+          }
+        ]
+      },
+      {
+        "url": "https://trustnode.lsapps.app/client/client_test_db_php.html",
+        "nav_status": "ok",
+        "login_attempted": true,
+        "login_success": true,
+        "request_count": 29,
+        "failed_request_count": 2,
+        "response_bytes": 2814148,
+        "websocket_count": 1,
+        "top_paths": [
+          {
+            "path": "/api/app-store/bootstrap",
+            "count": 3
+          },
+          {
+            "path": "/api/v1/history",
+            "count": 3
+          },
+          {
+            "path": "/api/v1/edge/diagnostics",
+            "count": 3
+          },
+          {
+            "path": "/api/v1/latest",
+            "count": 3
+          },
+          {
+            "path": "/api/auth/me",
+            "count": 2
+          },
+          {
+            "path": "/api/app-store/inspector",
+            "count": 2
+          },
+          {
+            "path": "/client/client_test_db_php.html",
+            "count": 1
+          },
+          {
+            "path": "/api/plc/gateways/status",
+            "count": 1
+          },
+          {
+            "path": "/api/ui-source/config",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/tenant/context",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/retention/policy",
+            "count": 1
+          },
+          {
+            "path": "/api/health",
+            "count": 1
+          }
+        ]
+      },
+      {
+        "url": "https://trustnode.lsapps.app/client/client_test_db.php",
+        "nav_status": "ok",
+        "login_attempted": true,
+        "login_success": true,
+        "request_count": 22,
+        "failed_request_count": 5,
+        "response_bytes": 2803896,
+        "websocket_count": 1,
+        "top_paths": [
+          {
+            "path": "/api/app-store/bootstrap",
+            "count": 2
+          },
+          {
+            "path": "/api/v1/history",
+            "count": 2
+          },
+          {
+            "path": "/api/app-store/logs",
+            "count": 2
+          },
+          {
+            "path": "/api/app-store/historian",
+            "count": 2
+          },
+          {
+            "path": "/client/client_test_db.php",
+            "count": 1
+          },
+          {
+            "path": "/api/plc/gateways/status",
+            "count": 1
+          },
+          {
+            "path": "/api/ui-source/config",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/tenant/context",
+            "count": 1
+          },
+          {
+            "path": "/api/auth/me",
+            "count": 1
+          },
+          {
+            "path": "/api/health",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/retention/policy",
+            "count": 1
+          },
+          {
+            "path": "/api/app-store/retention/runs",
+            "count": 1
+          }
+        ]
+      }
+    ]
+  }
+}

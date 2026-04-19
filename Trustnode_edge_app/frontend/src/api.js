@@ -394,11 +394,33 @@ export async function discoverPlcTags(payload) {
 }
 
 export async function browseOpcUaNodes(payload) {
-  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/opcua/browse`, {
+  const request = {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  });
+  };
+  const requestedTimeout = Math.max(12000, Number(payload?.timeout_ms || 0));
+  const networkTimeoutMs = Math.min(60000, requestedTimeout + 12000);
+  let res;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const attemptTimeout = networkTimeoutMs + (attempt - 1) * 6000;
+      res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/opcua/browse`, request, attemptTimeout);
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientFetchError(err) || attempt === 3) break;
+      await sleep(300 * attempt);
+    }
+  }
+  if (!res) {
+    if (isTransientFetchError(lastErr)) {
+      throw new Error("OPC-UA browse timeout/network interruption. Check PLC route and retry.");
+    }
+    throw lastErr || new Error("OPC-UA browse request failed");
+  }
   if (!res.ok) {
     let detail = "";
     try {

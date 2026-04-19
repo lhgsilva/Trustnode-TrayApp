@@ -63,7 +63,7 @@ class TagDiscoveryResult(BaseModel):
 class OpcUaBrowseRequest(BaseModel):
     plc_ip: str
     opc_url: str = ""
-    timeout_ms: int = 7000
+    timeout_ms: int = 15000
     max_nodes: int = 2000
     max_depth: int = 8
     variables_only: bool = False
@@ -290,7 +290,7 @@ def _discover_opcua_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
         return TagDiscoveryResult(ok=False, tags=[], message=f"OPC-UA library not installed: {exc}")
 
     endpoint = (payload.opc_url or "").strip() or f"opc.tcp://{payload.plc_ip.strip()}:4840"
-    timeout_s = max(1.0, min(payload.timeout_ms, 20_000) / 1000.0)
+    timeout_s = max(1.0, min(payload.timeout_ms, 45_000) / 1000.0)
     max_tags = max(10, min(int(payload.max_tags or 500), 2000))
     client = Client(endpoint, timeout=timeout_s)
     tags: list[str] = []

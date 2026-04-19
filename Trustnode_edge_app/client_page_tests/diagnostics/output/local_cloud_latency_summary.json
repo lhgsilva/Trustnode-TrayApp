@@ -1,0 +1,14 @@
+{
+    "measured_at_utc":  "2026-04-16T16:34:37.1628592Z",
+    "local_login_ok":  true,
+    "cloud_login_ok":  true,
+    "sample_count":  20,
+    "plc_lag_avg_s":  3596.83,
+    "plc_lag_p95_s":  3599.007,
+    "meter_lag_avg_s":  -4.255,
+    "meter_lag_p95_s":  -1.991,
+    "plc_interval_avg_s":  1.021,
+    "plc_interval_p95_s":  1.21,
+    "meter_interval_avg_s":  1,
+    "meter_interval_p95_s":  1.006
+}

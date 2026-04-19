@@ -865,6 +865,37 @@ function normalizeTagName(raw) {
   return String(raw || "").trim().toLowerCase();
 }
 
+function extractOpcDisplayTagName(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return "";
+  let core = text;
+  const quoted = text.match(/^ns=\d+;s="(.+)"$/i);
+  if (quoted?.[1]) {
+    core = quoted[1];
+  } else {
+    const stringId = text.match(/^ns=\d+;s=(.+)$/i);
+    if (stringId?.[1]) {
+      core = stringId[1];
+    } else {
+      const numericId = text.match(/^ns=\d+;(i=\d+)$/i);
+      if (numericId?.[1]) {
+        core = numericId[1];
+      }
+    }
+  }
+  const clean = String(core || "").replace(/^"+|"+$/g, "").trim();
+  if (!clean) return text;
+  const parts = clean.split(/[/\\]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : clean;
+}
+
+function formatTagForDisplay(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return "-";
+  if (/^ns=\d+;/i.test(text)) return extractOpcDisplayTagName(text);
+  return text;
+}
+
 function normalizeHexColor(raw, fallback = "#16a34a") {
   const v = String(raw || "").trim();
   if (HEX_COLOR_RE.test(v)) return v.toLowerCase();
@@ -6525,7 +6556,13 @@ function AppShell() {
     return tagRows.filter((row) => {
       if (tagFilters.gatewayId && String(row.gateway_id) !== String(tagFilters.gatewayId)) return false;
       if (deviceNeedle && !String(row.device_name || "").toLowerCase().includes(deviceNeedle)) return false;
-      if (tagNeedle && !String(row.tag_name || "").toLowerCase().includes(tagNeedle)) return false;
+      if (
+        tagNeedle &&
+        !String(row.tag_name || "").toLowerCase().includes(tagNeedle) &&
+        !String(formatTagForDisplay(row.tag_name)).toLowerCase().includes(tagNeedle)
+      ) {
+        return false;
+      }
       if (valueNeedle && !String(row.last_value ?? "").toLowerCase().includes(valueNeedle)) return false;
       return true;
     });
@@ -6622,7 +6659,7 @@ function AppShell() {
       return {
         ...w,
         color: itemColor,
-        title: w.title || w.tag_name,
+        title: w.title || formatTagForDisplay(w.tag_name),
         gateway_name: gateway?.name || "-",
         device_name: device?.name || "-",
         last_value: visualLast ? Number(visualLast.value) : null,
@@ -6709,7 +6746,12 @@ function AppShell() {
   const historianRows = useMemo(() => {
     return dataLogView.filter((row) => {
       if (!inRange(row.ts, historianFilters.from, historianFilters.to)) return false;
-      if (historianFilters.tag && !String(row.tag || "").toLowerCase().includes(historianFilters.tag.toLowerCase())) return false;
+      if (historianFilters.tag) {
+        const needle = String(historianFilters.tag || "").toLowerCase();
+        const rawTag = String(row.tag || "").toLowerCase();
+        const displayTag = String(formatTagForDisplay(row.tag || "")).toLowerCase();
+        if (!rawTag.includes(needle) && !displayTag.includes(needle)) return false;
+      }
       if (historianFilters.gatewayId && row.gateway_id !== historianFilters.gatewayId) return false;
       if (historianFilters.deviceName && !String(row.device_name || "").toLowerCase().includes(historianFilters.deviceName.toLowerCase())) return false;
       if (historianFilters.quality !== "all" && String(row.quality_label || "").toUpperCase() !== historianFilters.quality) return false;
@@ -7807,7 +7849,7 @@ function AppShell() {
         const res = await browseOpcUaNodes({
           plc_ip: gatewayForm.plc_ip.trim(),
           opc_url: gatewayForm.opc_url.trim(),
-          timeout_ms: 9000,
+          timeout_ms: 20000,
           max_nodes: 4000,
           max_depth: 10,
           variables_only: false
@@ -7910,7 +7952,7 @@ function AppShell() {
         plc_ip: plcIp,
         opc_url: opcUrl,
         opc_node_ids: nodeIds,
-        timeout_ms: 9000
+        timeout_ms: 20000
       });
       const opcNodes = Array.isArray(res?.opc_nodes) ? res.opc_nodes : Array.isArray(res?.opcNodes) ? res.opcNodes : [];
       const mapped = nodeIds.map((id) => {
@@ -8044,7 +8086,7 @@ function AppShell() {
         opc_url: deviceForm.opc_url.trim(),
         opc_node_id: deviceForm.opc_node_id.trim(),
         opc_node_ids: parseOpcNodeIds(deviceForm.opc_node_ids_text),
-        timeout_ms: deviceForm.gateway_type === "siemens_opcua" ? 7000 : 2000
+        timeout_ms: deviceForm.gateway_type === "siemens_opcua" ? 20000 : 2000
       });
       const normalized = {
         ...res,
@@ -10418,7 +10460,7 @@ function AppShell() {
                         </div>
                         <div className="dashboard-kpi-meta">
                           <div className="dashboard-kpi-title">{item.title}</div>
-                          <div>Tag: {item.tag_name || "-"}</div>
+                          <div>Tag: {formatTagForDisplay(item.tag_name)}</div>
                           <div>Gateway: {item.gateway_name}</div>
                           <div>Device: {item.device_name}</div>
                           <div>
@@ -12898,7 +12940,7 @@ function AppShell() {
                     {historianRows.map((row, idx) => (
                       <div key={`${row.ts}-${row.tag}-${idx}`} className="trow">
                         <span>{fmtTs(row.ts)}</span>
-                        <span>{row.tag}</span>
+                        <span>{formatTagForDisplay(row.tag)}</span>
                         <span>{formatStandardValue(row.value, 3)}</span>
                         <span>{row.quality_label} ({row.quality})</span>
                         <span>{row.device_name || "-"}</span>
@@ -13173,7 +13215,7 @@ function AppShell() {
                     </div>
                     {filteredTagRows.map((row) => (
                       <div key={row.key} className="trow">
-                        <span>{row.tag_name}</span>
+                        <span>{formatTagForDisplay(row.tag_name)}</span>
                         <span>{row.device_name}</span>
                         <span>{row.gateway_name}</span>
                         <span>{row.last_value}</span>
@@ -13244,7 +13286,7 @@ function AppShell() {
                     return (
                       <div key={trigger.id} className="trow">
                         <span>{gatewayName}</span>
-                        <span>{trigger.tag_name}</span>
+                        <span>{formatTagForDisplay(trigger.tag_name)}</span>
                         <span>{trigger.trigger_type === "one_time" ? "ONE-TIME" : "CONTINUOUS"}</span>
                         <span>{`${trigger.operator} ${trigger.value}`}</span>
                         <span>
@@ -13298,7 +13340,7 @@ function AppShell() {
                     return (
                       <div key={rule.id} className="trow">
                         <span>{gatewayName}</span>
-                        <span>{rule.tag_name}</span>
+                        <span>{formatTagForDisplay(rule.tag_name)}</span>
                         <span>{rule.lower_enabled ? `${rule.lower_operator} ${rule.lower_value}` : "-"}</span>
                         <span>{rule.upper_enabled ? `${rule.upper_operator} ${rule.upper_value}` : "-"}</span>
                         <span>
@@ -13403,7 +13445,7 @@ function AppShell() {
                           {reportFilterOptions.tags.map((v) => (
                             <div key={`tag-${v}`} className="report-check-item tag-check-item">
                               <input type="checkbox" checked={isSelected(reportFilters.selected_tags, v)} onChange={() => toggleFilterSelection("selected_tags", v)} />
-                              <span>{v}</span>
+                              <span>{formatTagForDisplay(v)}</span>
                               <select value={getReportTagAxis(v)} onChange={(e) => setReportTagAxis(v, e.target.value)} title="Chart Y axis">
                                 <option value="left">Y-Left</option>
                                 <option value="right">Y-Right</option>
@@ -13485,7 +13527,7 @@ function AppShell() {
                       <div className="table historian-table reporting-pivot-table">
                         <div className="thead" style={{ gridTemplateColumns: `1.4fr repeat(${Math.max(1, reportSelectedTags.length)}, minmax(120px, 1fr))` }}>
                           <span>Timestamp</span>
-                          {reportSelectedTags.map((t) => <span key={`rh-${t}`}>{t}</span>)}
+                          {reportSelectedTags.map((t) => <span key={`rh-${t}`}>{formatTagForDisplay(t)}</span>)}
                         </div>
                         {reportPivotRows.map((row, idx) => (
                           <div key={`rp-${idx}`} className="trow" style={{ gridTemplateColumns: `1.4fr repeat(${Math.max(1, reportSelectedTags.length)}, minmax(120px, 1fr))` }}>
@@ -13640,7 +13682,7 @@ function AppShell() {
             <div className="form-grid">
               <label>
                 Tag
-                <input value={tagMonitorSelection.tag_name} disabled />
+                <input value={formatTagForDisplay(tagMonitorSelection.tag_name)} disabled />
               </label>
               <label>
                 Device
@@ -14713,8 +14755,8 @@ function AppShell() {
                   }}
                 >
                   <option value="">Select tag</option>
-                  {(triggerTagsByGateway[dashboardWidgetForm.gateway_id] || []).map((tag) => (
-                    <option key={tag} value={tag}>{tag}</option>
+                    {(triggerTagsByGateway[dashboardWidgetForm.gateway_id] || []).map((tag) => (
+                    <option key={tag} value={tag}>{formatTagForDisplay(tag)}</option>
                   ))}
                 </select>
               </label>
@@ -14782,7 +14824,7 @@ function AppShell() {
                 >
                   <option value="">Select tag</option>
                   {(triggerTagsByGateway[collectionTriggerForm.gateway_id] || []).map((tag) => (
-                    <option key={tag} value={tag}>{tag}</option>
+                    <option key={tag} value={tag}>{formatTagForDisplay(tag)}</option>
                   ))}
                 </select>
               </label>
@@ -14875,7 +14917,7 @@ function AppShell() {
                 >
                   <option value="">Select tag</option>
                   {(triggerTagsByGateway[triggerForm.gateway_id] || []).map((tag) => (
-                    <option key={tag} value={tag}>{tag}</option>
+                    <option key={tag} value={tag}>{formatTagForDisplay(tag)}</option>
                   ))}
                 </select>
               </label>
