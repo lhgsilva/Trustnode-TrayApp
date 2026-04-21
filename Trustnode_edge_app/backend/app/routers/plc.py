@@ -365,13 +365,15 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
         return OpcUaBrowseResult(ok=False, message=f"OPC-UA library not installed: {exc}", nodes=[])
 
     endpoint = (payload.opc_url or "").strip() or f"opc.tcp://{payload.plc_ip.strip()}:4840"
-    timeout_s = max(1.0, min(payload.timeout_ms, 20_000) / 1000.0)
-    max_nodes = max(10, min(int(payload.max_nodes or 2000), 10000))
+    total_budget_s = max(8.0, min(payload.timeout_ms, 120_000) / 1000.0)
+    max_nodes = max(10, min(int(payload.max_nodes or 2000), 12000))
     max_depth = max(1, min(int(payload.max_depth or 8), 20))
     variables_only = bool(payload.variables_only)
-    # Keep browse responsive on large Siemens namespaces.
-    hard_scan_cap = max(max_nodes * 6, 12000)
-    deadline = time.monotonic() + max(2.0, timeout_s * 0.85)
+    # Keep browse responsive on large Siemens namespaces and multi-layer trees.
+    hard_scan_cap = max(max_nodes * 20, 50000)
+    deadline = time.monotonic() + total_budget_s
+    # Per-node call timeout should stay small so one branch cannot block full browse.
+    per_call_timeout_s = max(1.2, min(4.0, total_budget_s / 12.0))
     root_skip_names = {"server", "types", "views"}
     metadata_leaf_names = {
         "devicemanual",
@@ -398,7 +400,7 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
         "db",
     )
 
-    client = Client(endpoint, timeout=timeout_s)
+    client = Client(endpoint, timeout=per_call_timeout_s)
     out: list[OpcUaBrowseNode] = []
     visited: set[str] = set()
 
@@ -409,14 +411,42 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
         except Exception:
             root = client.get_root_node()
 
-        queue: deque[tuple[object, int, str | None]] = deque([(root, 0, None)])
+        queue: deque[tuple[object, int, str | None, bool]] = deque([(root, 0, None, False)])
+        # Stage 0: seed queue with direct children and prioritize Siemens process folders.
+        try:
+            root_children = root.get_children()
+        except Exception:
+            root_children = []
+        prio: list[tuple[object, int, str | None, bool]] = []
+        normal: list[tuple[object, int, str | None, bool]] = []
+        for child in root_children:
+            try:
+                child_name = str(child.get_browse_name().Name or "").strip().lower()
+            except Exception:
+                child_name = ""
+            entry = (child, 1, None, any(k in child_name for k in priority_names))
+            if entry[3]:
+                prio.append(entry)
+            else:
+                normal.append(entry)
+        for entry in prio:
+            queue.appendleft(entry)
+        for entry in normal:
+            queue.append(entry)
+
         scanned = 0
         timed_out_partial = False
+        stage_relaxed = False
         while queue and len(out) < max_nodes:
             if scanned >= hard_scan_cap or time.monotonic() >= deadline:
                 timed_out_partial = True
+                # Stage 1 fallback: relax filters if we have very few process variables.
+                if (not stage_relaxed) and sum(1 for n in out if n.is_variable) < 25:
+                    stage_relaxed = True
+                    hard_scan_cap = max(hard_scan_cap, int(max_nodes * 30))
+                    continue
                 break
-            node, depth, parent_id = queue.popleft()
+            node, depth, parent_id, parent_priority = queue.popleft()
             scanned += 1
             if depth > max_depth:
                 continue
@@ -444,7 +474,7 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
                 browse_name = ""
             browse_name_norm = str(browse_name or "").strip().lower()
 
-            if depth == 1 and str(browse_name or "").strip().lower() in root_skip_names:
+            if depth == 1 and browse_name_norm in root_skip_names:
                 # Server/Types/Views are large and usually not user process tags.
                 continue
 
@@ -468,7 +498,7 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
                     children = node.get_children()
                 except Exception:
                     children = []
-                if browse_name_norm in metadata_leaf_names:
+                if (not stage_relaxed) and browse_name_norm in metadata_leaf_names:
                     # Keep traversal focused on process namespaces, not static device identity leaves.
                     children = []
 
@@ -478,18 +508,23 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
                     except Exception:
                         child_browse_name = ""
                     child_norm = child_browse_name.strip().lower()
+                    child_priority = parent_priority or any(k in child_norm for k in priority_names)
                     if child_norm in root_skip_names:
-                        queue.append((child, depth + 1, node_id))
+                        queue.append((child, depth + 1, node_id, child_priority))
                         continue
-                    if any(k in child_norm for k in priority_names):
-                        queue.appendleft((child, depth + 1, node_id))
+                    if child_priority:
+                        queue.appendleft((child, depth + 1, node_id, child_priority))
                     else:
-                        queue.append((child, depth + 1, node_id))
+                        queue.append((child, depth + 1, node_id, child_priority))
 
         variable_count = sum(1 for n in out if n.is_variable)
         object_count = sum(1 for n in out if str(n.node_class).endswith("Object"))
         method_count = sum(1 for n in out if str(n.node_class).endswith("Method"))
-        partial_note = " (partial; browse budget reached)" if timed_out_partial else ""
+        partial_note = (
+            f" (partial; scanned {scanned} nodes in {int(total_budget_s)}s budget)"
+            if timed_out_partial
+            else ""
+        )
         return OpcUaBrowseResult(
             ok=True,
             message=(
