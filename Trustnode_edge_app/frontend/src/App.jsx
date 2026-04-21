@@ -7849,10 +7849,10 @@ function AppShell() {
         const res = await browseOpcUaNodes({
           plc_ip: gatewayForm.plc_ip.trim(),
           opc_url: gatewayForm.opc_url.trim(),
-          timeout_ms: 20000,
-          max_nodes: 4000,
-          max_depth: 10,
-          variables_only: false
+          timeout_ms: 25000,
+          max_nodes: 2000,
+          max_depth: 7,
+          variables_only: true
         });
         const nodes = Array.isArray(res.nodes) ? res.nodes : [];
         const summary = {

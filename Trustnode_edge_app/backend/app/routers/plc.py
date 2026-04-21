@@ -2,6 +2,7 @@ import platform
 import re
 import socket
 import subprocess
+import time
 from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import parse_qs, urlparse
@@ -367,6 +368,10 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
     max_nodes = max(10, min(int(payload.max_nodes or 2000), 10000))
     max_depth = max(1, min(int(payload.max_depth or 8), 20))
     variables_only = bool(payload.variables_only)
+    # Keep browse responsive on large Siemens namespaces.
+    hard_scan_cap = max(max_nodes * 2, 3000)
+    deadline = time.monotonic() + max(2.0, timeout_s * 0.85)
+    root_skip_names = {"server", "types", "views"}
 
     client = Client(endpoint, timeout=timeout_s)
     out: list[OpcUaBrowseNode] = []
@@ -380,8 +385,14 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
             root = client.get_root_node()
 
         queue: list[tuple[object, int, str | None]] = [(root, 0, None)]
+        scanned = 0
+        timed_out_partial = False
         while queue and len(out) < max_nodes:
+            if scanned >= hard_scan_cap or time.monotonic() >= deadline:
+                timed_out_partial = True
+                break
             node, depth, parent_id = queue.pop(0)
+            scanned += 1
             if depth > max_depth:
                 continue
             try:
@@ -406,6 +417,10 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
                 browse_name = str(node.get_browse_name().Name or "")
             except Exception:
                 browse_name = ""
+
+            if depth == 1 and str(browse_name or "").strip().lower() in root_skip_names:
+                # Server/Types/Views are large and usually not user process tags.
+                continue
 
             if (not variables_only) or is_variable:
                 out.append(
@@ -433,11 +448,13 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
         variable_count = sum(1 for n in out if n.is_variable)
         object_count = sum(1 for n in out if str(n.node_class).endswith("Object"))
         method_count = sum(1 for n in out if str(n.node_class).endswith("Method"))
+        partial_note = " (partial; browse budget reached)" if timed_out_partial else ""
         return OpcUaBrowseResult(
             ok=True,
             message=(
                 f"Browsed {len(out)} nodes from {endpoint} "
                 f"(objects: {object_count}, variables: {variable_count}, methods: {method_count})"
+                f"{partial_note}"
             ),
             nodes=out,
         )
