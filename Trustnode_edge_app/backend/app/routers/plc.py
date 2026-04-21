@@ -3,6 +3,7 @@ import re
 import socket
 import subprocess
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import parse_qs, urlparse
@@ -369,9 +370,33 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
     max_depth = max(1, min(int(payload.max_depth or 8), 20))
     variables_only = bool(payload.variables_only)
     # Keep browse responsive on large Siemens namespaces.
-    hard_scan_cap = max(max_nodes * 2, 3000)
+    hard_scan_cap = max(max_nodes * 6, 12000)
     deadline = time.monotonic() + max(2.0, timeout_s * 0.85)
     root_skip_names = {"server", "types", "views"}
+    metadata_leaf_names = {
+        "devicemanual",
+        "devicerevision",
+        "engineeringrevision",
+        "hardwarerevision",
+        "manufacturer",
+        "model",
+        "productinstanceuri",
+        "producturi",
+        "serialnumber",
+        "softwarerevision",
+    }
+    priority_names = (
+        "deviceset",
+        "plc",
+        "tags",
+        "tagtable",
+        "program",
+        "programs",
+        "datablock",
+        "datablocks",
+        "globaldb",
+        "db",
+    )
 
     client = Client(endpoint, timeout=timeout_s)
     out: list[OpcUaBrowseNode] = []
@@ -384,14 +409,14 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
         except Exception:
             root = client.get_root_node()
 
-        queue: list[tuple[object, int, str | None]] = [(root, 0, None)]
+        queue: deque[tuple[object, int, str | None]] = deque([(root, 0, None)])
         scanned = 0
         timed_out_partial = False
         while queue and len(out) < max_nodes:
             if scanned >= hard_scan_cap or time.monotonic() >= deadline:
                 timed_out_partial = True
                 break
-            node, depth, parent_id = queue.pop(0)
+            node, depth, parent_id = queue.popleft()
             scanned += 1
             if depth > max_depth:
                 continue
@@ -417,6 +442,7 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
                 browse_name = str(node.get_browse_name().Name or "")
             except Exception:
                 browse_name = ""
+            browse_name_norm = str(browse_name or "").strip().lower()
 
             if depth == 1 and str(browse_name or "").strip().lower() in root_skip_names:
                 # Server/Types/Views are large and usually not user process tags.
@@ -442,8 +468,23 @@ def _browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
                     children = node.get_children()
                 except Exception:
                     children = []
+                if browse_name_norm in metadata_leaf_names:
+                    # Keep traversal focused on process namespaces, not static device identity leaves.
+                    children = []
+
                 for child in children:
-                    queue.append((child, depth + 1, node_id))
+                    try:
+                        child_browse_name = str(child.get_browse_name().Name or "")
+                    except Exception:
+                        child_browse_name = ""
+                    child_norm = child_browse_name.strip().lower()
+                    if child_norm in root_skip_names:
+                        queue.append((child, depth + 1, node_id))
+                        continue
+                    if any(k in child_norm for k in priority_names):
+                        queue.appendleft((child, depth + 1, node_id))
+                    else:
+                        queue.append((child, depth + 1, node_id))
 
         variable_count = sum(1 for n in out if n.is_variable)
         object_count = sum(1 for n in out if str(n.node_class).endswith("Object"))
