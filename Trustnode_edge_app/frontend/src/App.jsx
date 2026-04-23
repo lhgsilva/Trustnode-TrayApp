@@ -61,9 +61,25 @@ import {
   startPowerDevice,
   stopPowerDevice,
   getControlPlaneRuntimeContext,
+  getControlPlaneModuleCatalog,
+  getControlPlaneSummary,
+  getControlPlaneTenants,
+  upsertControlPlaneTenant,
+  getControlPlaneCustomers,
+  upsertControlPlaneCustomer,
+  getControlPlaneEdges,
+  upsertControlPlaneEdge,
+  getControlPlaneLicenses,
+  upsertControlPlaneLicense,
+  getControlPlaneLicenseModules,
+  setControlPlaneLicenseModules,
   getControlPlaneUsers,
   upsertControlPlaneUser,
   deleteControlPlaneUser,
+  issueControlPlaneActivationCode,
+  applyControlPlaneActivationCode,
+  issueControlPlanePasswordReset,
+  applyControlPlanePasswordReset,
 } from "./api";
 import { Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
@@ -132,7 +148,7 @@ const NAV_SECTIONS = [
   {
     id: "administration",
     title: "Settings",
-    items: ["Edge", "Interface", "Users and Access Control", "Email and Notifications", "Scheduled Reports"]
+    items: ["Edge", "Interface", "Users and Access Control", "Control Plane", "Email and Notifications", "Scheduled Reports"]
   }
 ];
 
@@ -1283,6 +1299,7 @@ const PERMISSION_LABELS = {
   database_overview: "Database Overview (Legacy)",
   database_inspector: "Database Inspector",
   backup_and_retention: "Backup and Retention",
+  control_plane: "Control Plane",
   email_and_notifications: "Email and Notifications",
   scheduled_reports: "Scheduled Reports",
   users_and_access_control: "Users and Access",
@@ -1292,7 +1309,7 @@ const PERMISSION_GROUPS = [
   { title: "Client Test Modules", items: ["dashboard", "power_overview", "historian", "client_module_alarms", "client_module_reporting", "client_module_interface"] },
   { title: "Collection and Monitoring", items: ["devices", "tags", "triggers_and_limits", "gateway_configuration"] },
   { title: "Operations", items: ["gateway_runtime_control", "alarms", "reporting", "data_log"] },
-  { title: "Administration", items: ["interface", "database", "backup_and_retention", "email_and_notifications", "scheduled_reports", "users_and_access_control"] },
+  { title: "Administration", items: ["interface", "database", "backup_and_retention", "control_plane", "email_and_notifications", "scheduled_reports", "users_and_access_control"] },
 ];
 
 const CLIENT_MODULE_DEFS = [
@@ -1394,6 +1411,7 @@ function buildRolePermissions(role) {
       database_overview: true,
       database_inspector: true,
       backup_and_retention: true,
+      control_plane: true,
       website_and_env: true,
       email_and_notifications: true,
       scheduled_reports: true,
@@ -1422,6 +1440,7 @@ function buildRolePermissions(role) {
       database_overview: false,
       database_inspector: false,
       backup_and_retention: false,
+      control_plane: false,
       website_and_env: false,
       email_and_notifications: false,
       scheduled_reports: false,
@@ -1450,6 +1469,7 @@ function buildRolePermissions(role) {
       database_overview: false,
       database_inspector: false,
       backup_and_retention: false,
+      control_plane: false,
       website_and_env: false,
       email_and_notifications: false,
       scheduled_reports: false,
@@ -1478,6 +1498,7 @@ function buildRolePermissions(role) {
       database_overview: false,
       database_inspector: false,
       backup_and_retention: false,
+      control_plane: false,
       website_and_env: false,
       email_and_notifications: false,
       scheduled_reports: false,
@@ -1505,6 +1526,7 @@ function buildRolePermissions(role) {
     database_overview: false,
     database_inspector: false,
     backup_and_retention: false,
+    control_plane: false,
     website_and_env: false,
     email_and_notifications: false,
     scheduled_reports: false,
@@ -1512,7 +1534,6 @@ function buildRolePermissions(role) {
     users_and_access_control: false
   };
 }
-
 function normalizePermissions(rawPermissions, role) {
   return {
     ...buildRolePermissions(role),
@@ -2046,6 +2067,72 @@ function AppShell() {
     role: "viewer",
     permissions: buildRolePermissions("viewer")
   });
+  const [cpBusy, setCpBusy] = useState(false);
+  const [cpResult, setCpResult] = useState("");
+  const [cpSummary, setCpSummary] = useState(null);
+  const [cpTenants, setCpTenants] = useState([]);
+  const [cpCustomers, setCpCustomers] = useState([]);
+  const [cpEdges, setCpEdges] = useState([]);
+  const [cpLicenses, setCpLicenses] = useState([]);
+  const [cpModuleCatalog, setCpModuleCatalog] = useState([]);
+  const [cpTenantForm, setCpTenantForm] = useState({
+    tenant_id: "",
+    name: "",
+    status: "active",
+    primary_domain: "",
+    timezone: "UTC",
+  });
+  const [cpCustomerForm, setCpCustomerForm] = useState({
+    customer_id: "",
+    company_name: "",
+    contact_email: "",
+    status: "active",
+  });
+  const [cpEdgeForm, setCpEdgeForm] = useState({
+    edge_id: "",
+    edge_name: "",
+    customer_id: "",
+    site: "",
+    area: "",
+    equipment: "",
+    status: "inactive",
+  });
+  const [cpLicenseForm, setCpLicenseForm] = useState({
+    license_id: "",
+    customer_id: "",
+    plan_code: "standard",
+    status: "active",
+    start_utc: "",
+    end_utc: "",
+    max_edges: 3,
+    max_users: 10,
+  });
+  const [cpSelectedLicenseId, setCpSelectedLicenseId] = useState("");
+  const [cpLicenseModulesText, setCpLicenseModulesText] = useState("");
+  const [cpActivationIssueForm, setCpActivationIssueForm] = useState({
+    customer_id: "",
+    edge_name: "",
+    ttl_minutes: 30,
+  });
+  const [cpActivationApplyForm, setCpActivationApplyForm] = useState({
+    activation_code: "",
+    edge_id: "",
+    edge_name: "",
+    site: "",
+    area: "",
+    equipment: "",
+  });
+  const [cpIssuedActivationCode, setCpIssuedActivationCode] = useState("");
+  const [cpPasswordResetIssueForm, setCpPasswordResetIssueForm] = useState({
+    username: "",
+    ttl_minutes: 15,
+  });
+  const [cpPasswordResetApplyForm, setCpPasswordResetApplyForm] = useState({
+    username: "",
+    reset_token: "",
+    new_password: "",
+  });
+  const [cpIssuedResetToken, setCpIssuedResetToken] = useState("");
   const [devices, setDevices] = useState([]);
   const [showDeviceModal, setShowDeviceModal] = useState(false);
   const [editingDeviceId, setEditingDeviceId] = useState(null);
@@ -5559,6 +5646,13 @@ function AppShell() {
     const fallback = fallbackCandidates.find((p) => canOpenPage(p));
     if (fallback) setActivePage(fallback);
   }, [activePage, canOpenPage, currentUser]);
+
+  useEffect(() => {
+    if (!currentUser) return;
+    if (activePage !== "control_plane") return;
+    if (!canOpenPage("control_plane")) return;
+    refreshControlPlaneData(currentTenantId || "default");
+  }, [activePage, currentUser, currentTenantId]);
 
   const addAppLog = (entry) => {
     const key = `${String(entry.level || "info")}|${String(entry.category || "system")}|${String(entry.gateway_id || "")}|${String(entry.database_name || "")}|${String(entry.message || "")}`;
@@ -10060,6 +10154,291 @@ function AppShell() {
     }
   };
 
+  const refreshControlPlaneData = async (tenantId = "") => {
+    const scopedTenantId = String(tenantId || currentTenantId || "default");
+    try {
+      const [summaryRes, tenantsRes, customersRes, edgesRes, licensesRes, modulesRes] = await Promise.all([
+        getControlPlaneSummary(scopedTenantId),
+        getControlPlaneTenants(true),
+        getControlPlaneCustomers(scopedTenantId),
+        getControlPlaneEdges(scopedTenantId),
+        getControlPlaneLicenses(scopedTenantId),
+        getControlPlaneModuleCatalog(),
+      ]);
+      setCpSummary(summaryRes || null);
+      setCpTenants(Array.isArray(tenantsRes?.rows) ? tenantsRes.rows : []);
+      setCpCustomers(Array.isArray(customersRes?.rows) ? customersRes.rows : []);
+      setCpEdges(Array.isArray(edgesRes?.rows) ? edgesRes.rows : []);
+      setCpLicenses(Array.isArray(licensesRes?.rows) ? licensesRes.rows : []);
+      setCpModuleCatalog(Array.isArray(modulesRes?.modules) ? modulesRes.modules : []);
+      return true;
+    } catch (err) {
+      setCpResult(`Control-plane refresh failed: ${String(err?.message || err)}`);
+      return false;
+    }
+  };
+
+  const saveControlPlaneTenant = async () => {
+    if (!canEditPage("control_plane")) return;
+    const tenantId = String(cpTenantForm.tenant_id || "").trim();
+    const name = String(cpTenantForm.name || "").trim();
+    if (!tenantId || !name) {
+      setCpResult("Tenant ID and Tenant Name are required.");
+      return;
+    }
+    setCpBusy(true);
+    try {
+      await upsertControlPlaneTenant({
+        tenant_id: tenantId,
+        name,
+        status: cpTenantForm.status || "active",
+        primary_domain: String(cpTenantForm.primary_domain || "").trim(),
+        timezone: String(cpTenantForm.timezone || "UTC").trim() || "UTC",
+        metadata: {},
+      });
+      await refreshControlPlaneData(tenantId);
+      setCpResult(`Tenant '${tenantId}' saved.`);
+    } catch (err) {
+      setCpResult(`Tenant save failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const saveControlPlaneCustomer = async () => {
+    if (!canEditPage("control_plane")) return;
+    const companyName = String(cpCustomerForm.company_name || "").trim();
+    if (!companyName) {
+      setCpResult("Customer company name is required.");
+      return;
+    }
+    setCpBusy(true);
+    try {
+      await upsertControlPlaneCustomer(
+        {
+          customer_id: String(cpCustomerForm.customer_id || "").trim(),
+          company_name: companyName,
+          contact_email: String(cpCustomerForm.contact_email || "").trim(),
+          status: cpCustomerForm.status || "active",
+          metadata: {},
+        },
+        currentTenantId || "default"
+      );
+      await refreshControlPlaneData(currentTenantId || "default");
+      setCpResult(`Customer '${companyName}' saved.`);
+    } catch (err) {
+      setCpResult(`Customer save failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const saveControlPlaneEdge = async () => {
+    if (!canEditPage("control_plane")) return;
+    const edgeName = String(cpEdgeForm.edge_name || "").trim();
+    if (!edgeName) {
+      setCpResult("Edge name is required.");
+      return;
+    }
+    setCpBusy(true);
+    try {
+      await upsertControlPlaneEdge(
+        {
+          edge_id: String(cpEdgeForm.edge_id || "").trim(),
+          edge_name: edgeName,
+          customer_id: String(cpEdgeForm.customer_id || "").trim(),
+          site: String(cpEdgeForm.site || "").trim(),
+          area: String(cpEdgeForm.area || "").trim(),
+          equipment: String(cpEdgeForm.equipment || "").trim(),
+          status: cpEdgeForm.status || "inactive",
+          metadata: {},
+        },
+        currentTenantId || "default"
+      );
+      await refreshControlPlaneData(currentTenantId || "default");
+      setCpResult(`Edge '${edgeName}' saved.`);
+    } catch (err) {
+      setCpResult(`Edge save failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const saveControlPlaneLicense = async () => {
+    if (!canEditPage("control_plane")) return;
+    setCpBusy(true);
+    try {
+      const payload = {
+        license_id: String(cpLicenseForm.license_id || "").trim(),
+        customer_id: String(cpLicenseForm.customer_id || "").trim(),
+        plan_code: String(cpLicenseForm.plan_code || "standard").trim() || "standard",
+        status: String(cpLicenseForm.status || "active").trim() || "active",
+        start_utc: String(cpLicenseForm.start_utc || "").trim(),
+        end_utc: String(cpLicenseForm.end_utc || "").trim(),
+        max_edges: Math.max(1, Number(cpLicenseForm.max_edges || 1)),
+        max_users: Math.max(1, Number(cpLicenseForm.max_users || 1)),
+        metadata: {},
+      };
+      await upsertControlPlaneLicense(payload, currentTenantId || "default");
+      await refreshControlPlaneData(currentTenantId || "default");
+      setCpResult(`License '${payload.license_id || payload.plan_code}' saved.`);
+    } catch (err) {
+      setCpResult(`License save failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const loadControlPlaneLicenseModules = async (licenseId) => {
+    const lid = String(licenseId || "").trim();
+    setCpSelectedLicenseId(lid);
+    if (!lid) {
+      setCpLicenseModulesText("");
+      return;
+    }
+    setCpBusy(true);
+    try {
+      const res = await getControlPlaneLicenseModules(lid);
+      const rows = Array.isArray(res?.rows) ? res.rows : [];
+      setCpLicenseModulesText(JSON.stringify(rows, null, 2));
+      setCpResult(`Loaded modules for license '${lid}'.`);
+    } catch (err) {
+      setCpResult(`Load license modules failed: ${String(err?.message || err)}`);
+      setCpLicenseModulesText("");
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const saveControlPlaneLicenseModules = async () => {
+    if (!canEditPage("control_plane")) return;
+    const lid = String(cpSelectedLicenseId || "").trim();
+    if (!lid) {
+      setCpResult("Select a license first.");
+      return;
+    }
+    let modules = [];
+    try {
+      modules = JSON.parse(String(cpLicenseModulesText || "[]"));
+      if (!Array.isArray(modules)) throw new Error("modules payload must be an array");
+    } catch (err) {
+      setCpResult(`Invalid modules JSON: ${String(err?.message || err)}`);
+      return;
+    }
+    setCpBusy(true);
+    try {
+      await setControlPlaneLicenseModules(lid, { modules });
+      await refreshControlPlaneData(currentTenantId || "default");
+      setCpResult(`License modules saved for '${lid}'.`);
+    } catch (err) {
+      setCpResult(`Save license modules failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const issueTenantActivationCode = async () => {
+    if (!canEditPage("control_plane")) return;
+    setCpBusy(true);
+    try {
+      const res = await issueControlPlaneActivationCode(
+        {
+          customer_id: String(cpActivationIssueForm.customer_id || "").trim(),
+          edge_name: String(cpActivationIssueForm.edge_name || "").trim(),
+          ttl_minutes: Math.max(1, Number(cpActivationIssueForm.ttl_minutes || 30)),
+          metadata: {},
+        },
+        currentTenantId || "default"
+      );
+      const code = String(res?.row?.activation_code || "");
+      setCpIssuedActivationCode(code);
+      if (code) {
+        setCpActivationApplyForm((prev) => ({ ...prev, activation_code: code }));
+      }
+      setCpResult(code ? "Activation code issued." : "Activation issue request completed.");
+    } catch (err) {
+      setCpResult(`Activation code issue failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const applyTenantActivationCode = async () => {
+    if (!canEditPage("control_plane")) return;
+    setCpBusy(true);
+    try {
+      const payload = {
+        activation_code: String(cpActivationApplyForm.activation_code || "").trim(),
+        edge_id: String(cpActivationApplyForm.edge_id || "").trim(),
+        edge_name: String(cpActivationApplyForm.edge_name || "").trim(),
+        site: String(cpActivationApplyForm.site || "").trim(),
+        area: String(cpActivationApplyForm.area || "").trim(),
+        equipment: String(cpActivationApplyForm.equipment || "").trim(),
+      };
+      if (!payload.activation_code || !payload.edge_id) {
+        setCpResult("Activation code and edge ID are required.");
+        return;
+      }
+      await applyControlPlaneActivationCode(payload);
+      await refreshControlPlaneData(currentTenantId || "default");
+      setCpResult(`Activation applied for edge '${payload.edge_id}'.`);
+    } catch (err) {
+      setCpResult(`Activation apply failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const issueTenantPasswordReset = async () => {
+    if (!canEditPage("control_plane")) return;
+    const username = String(cpPasswordResetIssueForm.username || "").trim();
+    if (!username) {
+      setCpResult("Username is required to issue password reset.");
+      return;
+    }
+    setCpBusy(true);
+    try {
+      const res = await issueControlPlanePasswordReset(
+        {
+          username,
+          ttl_minutes: Math.max(1, Number(cpPasswordResetIssueForm.ttl_minutes || 15)),
+        },
+        currentTenantId || "default"
+      );
+      const token = String(res?.row?.reset_token || "");
+      setCpIssuedResetToken(token);
+      setCpPasswordResetApplyForm((prev) => ({ ...prev, username, reset_token: token || prev.reset_token }));
+      setCpResult(token ? `Password reset token issued for '${username}'.` : "Password reset token issued.");
+    } catch (err) {
+      setCpResult(`Password reset issue failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const applyTenantPasswordReset = async () => {
+    if (!canEditPage("control_plane")) return;
+    const payload = {
+      username: String(cpPasswordResetApplyForm.username || "").trim(),
+      reset_token: String(cpPasswordResetApplyForm.reset_token || "").trim(),
+      new_password: String(cpPasswordResetApplyForm.new_password || ""),
+    };
+    if (!payload.username || !payload.reset_token || !payload.new_password) {
+      setCpResult("Username, reset token, and new password are required.");
+      return;
+    }
+    setCpBusy(true);
+    try {
+      await applyControlPlanePasswordReset(payload, currentTenantId || "default");
+      await refreshControlPlaneUsers(currentTenantId || "default");
+      setCpResult(`Password reset applied for '${payload.username}'.`);
+    } catch (err) {
+      setCpResult(`Password reset apply failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
   const submitLogin = async () => {
     const username = String(loginForm.username || "").trim();
     const password = String(loginForm.password || "");
@@ -13279,6 +13658,351 @@ function AppShell() {
               ) : (
                 <div className="lock-note">LOCK: only admin/admin can create users and edit permissions.</div>
               )}
+            </div>
+          ) : null}
+
+          {activePage === "control_plane" ? (
+            <div className="page-fill">
+              <section className="card">
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                  <h4 style={{ margin: 0 }}>Control Plane</h4>
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => refreshControlPlaneData(currentTenantId || "default")}
+                    disabled={cpBusy}
+                  >
+                    Refresh
+                  </button>
+                </div>
+                <div className="form-grid" style={{ marginTop: 10 }}>
+                  <label>
+                    Tenant Context
+                    <input value={currentTenantId || "default"} readOnly />
+                  </label>
+                  <label>
+                    Edges
+                    <input value={String(cpSummary?.edges_count ?? cpEdges.length ?? 0)} readOnly />
+                  </label>
+                  <label>
+                    Customers
+                    <input value={String(cpSummary?.customers_count ?? cpCustomers.length ?? 0)} readOnly />
+                  </label>
+                  <label>
+                    Licenses
+                    <input value={String(cpSummary?.licenses_count ?? cpLicenses.length ?? 0)} readOnly />
+                  </label>
+                </div>
+                {cpResult ? <div className={`status ${cpResult.toLowerCase().includes("failed") ? "error" : "ok"}`}>{cpResult}</div> : null}
+              </section>
+
+              <section className="card">
+                <h4>Tenant Setup</h4>
+                <div className="form-grid">
+                  <label>
+                    Tenant ID
+                    <input
+                      value={cpTenantForm.tenant_id}
+                      onChange={(e) => setCpTenantForm((p) => ({ ...p, tenant_id: e.target.value }))}
+                      placeholder="tenant_a"
+                    />
+                  </label>
+                  <label>
+                    Name
+                    <input
+                      value={cpTenantForm.name}
+                      onChange={(e) => setCpTenantForm((p) => ({ ...p, name: e.target.value }))}
+                      placeholder="Customer A"
+                    />
+                  </label>
+                  <label>
+                    Domain
+                    <input
+                      value={cpTenantForm.primary_domain}
+                      onChange={(e) => setCpTenantForm((p) => ({ ...p, primary_domain: e.target.value }))}
+                      placeholder="customer-a.trustnode.lsapps.app"
+                    />
+                  </label>
+                  <label>
+                    Timezone
+                    <input
+                      value={cpTenantForm.timezone}
+                      onChange={(e) => setCpTenantForm((p) => ({ ...p, timezone: e.target.value }))}
+                      placeholder="Europe/Dublin"
+                    />
+                  </label>
+                  <label>
+                    Status
+                    <select
+                      value={cpTenantForm.status}
+                      onChange={(e) => setCpTenantForm((p) => ({ ...p, status: e.target.value }))}
+                    >
+                      <option value="active">active</option>
+                      <option value="suspended">suspended</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="row">
+                  <button className="btn btn-success" onClick={saveControlPlaneTenant} disabled={cpBusy || !canEditPage("control_plane")}>
+                    Save Tenant
+                  </button>
+                </div>
+              </section>
+
+              <section className="card">
+                <h4>Customer / Edge / License</h4>
+                <div className="form-grid">
+                  <label>
+                    Customer ID
+                    <input value={cpCustomerForm.customer_id} onChange={(e) => setCpCustomerForm((p) => ({ ...p, customer_id: e.target.value }))} />
+                  </label>
+                  <label>
+                    Company Name
+                    <input value={cpCustomerForm.company_name} onChange={(e) => setCpCustomerForm((p) => ({ ...p, company_name: e.target.value }))} />
+                  </label>
+                  <label>
+                    Contact Email
+                    <input value={cpCustomerForm.contact_email} onChange={(e) => setCpCustomerForm((p) => ({ ...p, contact_email: e.target.value }))} />
+                  </label>
+                  <label>
+                    Customer Status
+                    <select value={cpCustomerForm.status} onChange={(e) => setCpCustomerForm((p) => ({ ...p, status: e.target.value }))}>
+                      <option value="active">active</option>
+                      <option value="inactive">inactive</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="row">
+                  <button className="btn btn-success" onClick={saveControlPlaneCustomer} disabled={cpBusy || !canEditPage("control_plane")}>Save Customer</button>
+                </div>
+
+                <div className="form-grid" style={{ marginTop: 12 }}>
+                  <label>
+                    Edge ID
+                    <input value={cpEdgeForm.edge_id} onChange={(e) => setCpEdgeForm((p) => ({ ...p, edge_id: e.target.value }))} />
+                  </label>
+                  <label>
+                    Edge Name
+                    <input value={cpEdgeForm.edge_name} onChange={(e) => setCpEdgeForm((p) => ({ ...p, edge_name: e.target.value }))} />
+                  </label>
+                  <label>
+                    Edge Customer ID
+                    <input value={cpEdgeForm.customer_id} onChange={(e) => setCpEdgeForm((p) => ({ ...p, customer_id: e.target.value }))} />
+                  </label>
+                  <label>
+                    Site
+                    <input value={cpEdgeForm.site} onChange={(e) => setCpEdgeForm((p) => ({ ...p, site: e.target.value }))} />
+                  </label>
+                  <label>
+                    Area
+                    <input value={cpEdgeForm.area} onChange={(e) => setCpEdgeForm((p) => ({ ...p, area: e.target.value }))} />
+                  </label>
+                  <label>
+                    Equipment
+                    <input value={cpEdgeForm.equipment} onChange={(e) => setCpEdgeForm((p) => ({ ...p, equipment: e.target.value }))} />
+                  </label>
+                  <label>
+                    Edge Status
+                    <select value={cpEdgeForm.status} onChange={(e) => setCpEdgeForm((p) => ({ ...p, status: e.target.value }))}>
+                      <option value="active">active</option>
+                      <option value="inactive">inactive</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="row">
+                  <button className="btn btn-success" onClick={saveControlPlaneEdge} disabled={cpBusy || !canEditPage("control_plane")}>Save Edge</button>
+                </div>
+
+                <div className="form-grid" style={{ marginTop: 12 }}>
+                  <label>
+                    License ID
+                    <input value={cpLicenseForm.license_id} onChange={(e) => setCpLicenseForm((p) => ({ ...p, license_id: e.target.value }))} />
+                  </label>
+                  <label>
+                    License Customer ID
+                    <input value={cpLicenseForm.customer_id} onChange={(e) => setCpLicenseForm((p) => ({ ...p, customer_id: e.target.value }))} />
+                  </label>
+                  <label>
+                    Plan Code
+                    <input value={cpLicenseForm.plan_code} onChange={(e) => setCpLicenseForm((p) => ({ ...p, plan_code: e.target.value }))} />
+                  </label>
+                  <label>
+                    License Status
+                    <select value={cpLicenseForm.status} onChange={(e) => setCpLicenseForm((p) => ({ ...p, status: e.target.value }))}>
+                      <option value="active">active</option>
+                      <option value="suspended">suspended</option>
+                    </select>
+                  </label>
+                  <label>
+                    Start UTC
+                    <input value={cpLicenseForm.start_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, start_utc: e.target.value }))} placeholder="2026-04-23T00:00:00Z" />
+                  </label>
+                  <label>
+                    End UTC
+                    <input value={cpLicenseForm.end_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, end_utc: e.target.value }))} placeholder="2027-04-23T00:00:00Z" />
+                  </label>
+                  <label>
+                    Max Edges
+                    <input type="number" min="1" value={cpLicenseForm.max_edges} onChange={(e) => setCpLicenseForm((p) => ({ ...p, max_edges: Number(e.target.value || 1) }))} />
+                  </label>
+                  <label>
+                    Max Users
+                    <input type="number" min="1" value={cpLicenseForm.max_users} onChange={(e) => setCpLicenseForm((p) => ({ ...p, max_users: Number(e.target.value || 1) }))} />
+                  </label>
+                </div>
+                <div className="row">
+                  <button className="btn btn-success" onClick={saveControlPlaneLicense} disabled={cpBusy || !canEditPage("control_plane")}>Save License</button>
+                </div>
+              </section>
+
+              <section className="card">
+                <h4>License Modules</h4>
+                <div className="form-grid">
+                  <label>
+                    License
+                    <select value={cpSelectedLicenseId} onChange={(e) => loadControlPlaneLicenseModules(e.target.value)}>
+                      <option value="">Select license</option>
+                      {cpLicenses.map((l) => (
+                        <option key={String(l.license_id || "")} value={String(l.license_id || "")}>
+                          {String(l.license_id || "")} | {String(l.plan_code || "")}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Module Catalog
+                    <input
+                      readOnly
+                      value={cpModuleCatalog.map((m) => String(m?.module_key || m?.key || "")).filter(Boolean).join(", ")}
+                      placeholder="No catalog"
+                    />
+                  </label>
+                </div>
+                <label>
+                  Modules JSON
+                  <textarea
+                    rows={8}
+                    value={cpLicenseModulesText}
+                    onChange={(e) => setCpLicenseModulesText(e.target.value)}
+                    placeholder='[{"module_key":"dashboard","enabled":true}]'
+                  />
+                </label>
+                <div className="row">
+                  <button className="btn btn-success" onClick={saveControlPlaneLicenseModules} disabled={cpBusy || !canEditPage("control_plane")}>Save Modules</button>
+                </div>
+              </section>
+
+              <section className="card">
+                <h4>Activation / Password Recovery</h4>
+                <div className="form-grid">
+                  <label>
+                    Issue Activation (Customer ID)
+                    <input value={cpActivationIssueForm.customer_id} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, customer_id: e.target.value }))} />
+                  </label>
+                  <label>
+                    Activation Edge Name
+                    <input value={cpActivationIssueForm.edge_name} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, edge_name: e.target.value }))} />
+                  </label>
+                  <label>
+                    Activation TTL (min)
+                    <input type="number" min="1" value={cpActivationIssueForm.ttl_minutes} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, ttl_minutes: Number(e.target.value || 30) }))} />
+                  </label>
+                </div>
+                <div className="row">
+                  <button className="btn btn-success" onClick={issueTenantActivationCode} disabled={cpBusy || !canEditPage("control_plane")}>Issue Activation Code</button>
+                  <input readOnly value={cpIssuedActivationCode} placeholder="Activation code will appear here" style={{ minWidth: 280 }} />
+                </div>
+                <div className="form-grid" style={{ marginTop: 12 }}>
+                  <label>
+                    Activation Code
+                    <input value={cpActivationApplyForm.activation_code} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, activation_code: e.target.value }))} />
+                  </label>
+                  <label>
+                    Edge ID
+                    <input value={cpActivationApplyForm.edge_id} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, edge_id: e.target.value }))} />
+                  </label>
+                  <label>
+                    Edge Name
+                    <input value={cpActivationApplyForm.edge_name} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, edge_name: e.target.value }))} />
+                  </label>
+                  <label>
+                    Site
+                    <input value={cpActivationApplyForm.site} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, site: e.target.value }))} />
+                  </label>
+                  <label>
+                    Area
+                    <input value={cpActivationApplyForm.area} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, area: e.target.value }))} />
+                  </label>
+                  <label>
+                    Equipment
+                    <input value={cpActivationApplyForm.equipment} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, equipment: e.target.value }))} />
+                  </label>
+                </div>
+                <div className="row">
+                  <button className="btn btn-primary" onClick={applyTenantActivationCode} disabled={cpBusy || !canEditPage("control_plane")}>Apply Activation</button>
+                </div>
+
+                <div className="form-grid" style={{ marginTop: 12 }}>
+                  <label>
+                    Reset Username
+                    <input value={cpPasswordResetIssueForm.username} onChange={(e) => setCpPasswordResetIssueForm((p) => ({ ...p, username: e.target.value }))} />
+                  </label>
+                  <label>
+                    Reset TTL (min)
+                    <input type="number" min="1" value={cpPasswordResetIssueForm.ttl_minutes} onChange={(e) => setCpPasswordResetIssueForm((p) => ({ ...p, ttl_minutes: Number(e.target.value || 15) }))} />
+                  </label>
+                </div>
+                <div className="row">
+                  <button className="btn btn-success" onClick={issueTenantPasswordReset} disabled={cpBusy || !canEditPage("control_plane")}>Issue Reset Token</button>
+                  <input readOnly value={cpIssuedResetToken} placeholder="Reset token will appear here" style={{ minWidth: 280 }} />
+                </div>
+                <div className="form-grid" style={{ marginTop: 12 }}>
+                  <label>
+                    Apply Username
+                    <input value={cpPasswordResetApplyForm.username} onChange={(e) => setCpPasswordResetApplyForm((p) => ({ ...p, username: e.target.value }))} />
+                  </label>
+                  <label>
+                    Reset Token
+                    <input value={cpPasswordResetApplyForm.reset_token} onChange={(e) => setCpPasswordResetApplyForm((p) => ({ ...p, reset_token: e.target.value }))} />
+                  </label>
+                  <label>
+                    New Password
+                    <input type="password" value={cpPasswordResetApplyForm.new_password} onChange={(e) => setCpPasswordResetApplyForm((p) => ({ ...p, new_password: e.target.value }))} />
+                  </label>
+                </div>
+                <div className="row">
+                  <button className="btn btn-primary" onClick={applyTenantPasswordReset} disabled={cpBusy || !canEditPage("control_plane")}>Apply Password Reset</button>
+                </div>
+              </section>
+
+              <section className="card">
+                <h4>Control Plane Rows</h4>
+                <div className="table-scroll">
+                  <div className="table">
+                    <div className="thead"><span>Customer</span><span>Status</span><span>Email</span></div>
+                    {cpCustomers.map((row, idx) => (
+                      <div className="trow" key={`${row.customer_id || "customer"}-${idx}`}>
+                        <span>{row.customer_id || "-"}</span>
+                        <span>{row.status || "-"}</span>
+                        <span>{row.contact_email || "-"}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div className="table-scroll" style={{ marginTop: 12 }}>
+                  <div className="table">
+                    <div className="thead"><span>Edge</span><span>Customer</span><span>Status</span><span>Site/Area</span><span>Last Heartbeat</span></div>
+                    {cpEdges.map((row, idx) => (
+                      <div className="trow" key={`${row.edge_id || "edge"}-${idx}`}>
+                        <span>{row.edge_id || "-"}</span>
+                        <span>{row.customer_id || "-"}</span>
+                        <span>{row.status || "-"}</span>
+                        <span>{[row.site || "-", row.area || "-"].join(" / ")}</span>
+                        <span>{fmtTs(row.last_heartbeat_utc || row.updated_utc || "")}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </section>
             </div>
           ) : null}
 

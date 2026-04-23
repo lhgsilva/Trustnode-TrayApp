@@ -1041,6 +1041,121 @@ export async function getControlPlaneRuntimeContext() {
   return res.json();
 }
 
+export async function getControlPlaneModuleCatalog() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/modules`);
+  if (!res.ok) throw new Error("Control-plane modules fetch failed");
+  return res.json();
+}
+
+export async function getControlPlaneSummary(tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/summary${suffix}`);
+  if (!res.ok) throw new Error("Control-plane summary fetch failed");
+  return res.json();
+}
+
+export async function getControlPlaneTenants(includeSuspended = true) {
+  const params = new URLSearchParams();
+  params.set("include_suspended", includeSuspended ? "true" : "false");
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/tenants?${params.toString()}`);
+  if (!res.ok) throw new Error("Control-plane tenants fetch failed");
+  return res.json();
+}
+
+export async function upsertControlPlaneTenant(payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/tenants`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane tenant upsert failed");
+  return res.json();
+}
+
+export async function getControlPlaneCustomers(tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/customers${suffix}`);
+  if (!res.ok) throw new Error("Control-plane customers fetch failed");
+  return res.json();
+}
+
+export async function upsertControlPlaneCustomer(payload, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/customers${suffix}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane customer upsert failed");
+  return res.json();
+}
+
+export async function getControlPlaneEdges(tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges${suffix}`);
+  if (!res.ok) throw new Error("Control-plane edges fetch failed");
+  return res.json();
+}
+
+export async function upsertControlPlaneEdge(payload, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges${suffix}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane edge upsert failed");
+  return res.json();
+}
+
+export async function getControlPlaneLicenses(tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/licenses${suffix}`);
+  if (!res.ok) throw new Error("Control-plane licenses fetch failed");
+  return res.json();
+}
+
+export async function upsertControlPlaneLicense(payload, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/licenses${suffix}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane license upsert failed");
+  return res.json();
+}
+
+export async function getControlPlaneLicenseModules(licenseId) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/licenses/${encodeURIComponent(String(licenseId || ""))}/modules`);
+  if (!res.ok) throw new Error("Control-plane license modules fetch failed");
+  return res.json();
+}
+
+export async function setControlPlaneLicenseModules(licenseId, payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/licenses/${encodeURIComponent(String(licenseId || ""))}/modules`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || { modules: [] })
+  });
+  if (!res.ok) throw new Error("Control-plane license modules update failed");
+  return res.json();
+}
+
 export async function getControlPlaneUsers(tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));
@@ -1071,5 +1186,54 @@ export async function deleteControlPlaneUser(username, tenantId = "") {
     method: "DELETE"
   });
   if (!res.ok) throw new Error("Control-plane user delete failed");
+  return res.json();
+}
+
+export async function issueControlPlaneActivationCode(payload, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/activation-code/issue${suffix}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane activation code issue failed");
+  return res.json();
+}
+
+export async function applyControlPlaneActivationCode(payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/activation-code/apply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane activation code apply failed");
+  return res.json();
+}
+
+export async function issueControlPlanePasswordReset(payload, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/password-reset/issue${suffix}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane password reset issue failed");
+  return res.json();
+}
+
+export async function applyControlPlanePasswordReset(payload, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/password-reset/apply${suffix}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane password reset apply failed");
   return res.json();
 }
