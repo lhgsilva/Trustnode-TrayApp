@@ -318,6 +318,21 @@ jobs:
               journalctl -u ${{ env.BACKEND_SERVICE }} -n 120 --no-pager || true
               exit 1
             fi
+
+      - name: Post-deploy control-plane smoke
+        if: ${{ steps.gate.outputs.deploy == 'true' }}
+        shell: pwsh
+        env:
+          TRUSTNODE_SMOKE_USER: ${{ secrets.TRUSTNODE_SMOKE_USER }}
+          TRUSTNODE_SMOKE_PASS: ${{ secrets.TRUSTNODE_SMOKE_PASS }}
+          TRUSTNODE_SMOKE_TENANT: ${{ secrets.TRUSTNODE_SMOKE_TENANT }}
+        run: |
+          $baseUrl = "${{ secrets.TRUSTNODE_CLOUD_API_URL }}"
+          if (-not $baseUrl) { $baseUrl = "https://trustnode.lsapps.app" }
+          $user = if ($env:TRUSTNODE_SMOKE_USER) { $env:TRUSTNODE_SMOKE_USER } else { "admin" }
+          $pass = if ($env:TRUSTNODE_SMOKE_PASS) { $env:TRUSTNODE_SMOKE_PASS } else { "admin" }
+          $tenant = if ($env:TRUSTNODE_SMOKE_TENANT) { $env:TRUSTNODE_SMOKE_TENANT } else { "default" }
+          pwsh -NoProfile -ExecutionPolicy Bypass -File "./Trustnode_edge_app/scripts/smoke-control-plane.ps1" -BaseUrl $baseUrl -Username $user -Password $pass -TenantId $tenant
             # Ensure /client/*.php executes via php-fpm (never served as source)
             if ! command -v php-fpm >/dev/null 2>&1; then
               if command -v dnf >/dev/null 2>&1; then
