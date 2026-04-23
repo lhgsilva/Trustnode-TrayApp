@@ -255,11 +255,36 @@ class IngestStore:
                 return "inserted"
             return "duplicate"
 
-    def query_history(self, tenant_id: str, limit: int = 1000) -> List[Dict[str, Any]]:
+    def query_history(
+        self,
+        tenant_id: str,
+        limit: int = 1000,
+        *,
+        customer_id: str = "",
+        plant_id: str = "",
+        machine_id: str = "",
+        gateway_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        where = ["tenant_id=?"]
+        params: List[Any] = [tenant_id]
+        if str(customer_id or "").strip():
+            where.append("customer_id=?")
+            params.append(str(customer_id).strip())
+        if str(plant_id or "").strip():
+            where.append("plant_id=?")
+            params.append(str(plant_id).strip())
+        if str(machine_id or "").strip():
+            where.append("machine_id=?")
+            params.append(str(machine_id).strip())
+        if str(gateway_id or "").strip():
+            where.append("gateway_id=?")
+            params.append(str(gateway_id).strip())
+        where_sql = " AND ".join(where)
+        params.append(max(1, min(10000, int(limit))))
         with self._connect() as conn:
             rs = conn.execute(
-                "SELECT * FROM telemetry_samples_raw WHERE tenant_id=? ORDER BY sample_ts_utc DESC, edge_monotonic_seq DESC LIMIT ?",
-                (tenant_id, max(1, min(10000, int(limit)))),
+                f"SELECT * FROM telemetry_samples_raw WHERE {where_sql} ORDER BY sample_ts_utc DESC, edge_monotonic_seq DESC LIMIT ?",
+                tuple(params),
             ).fetchall()
             out: List[Dict[str, Any]] = []
             for r in rs:
@@ -268,11 +293,36 @@ class IngestStore:
                 out.append(d)
             return out
 
-    def query_latest(self, tenant_id: str, limit: int = 500) -> List[Dict[str, Any]]:
+    def query_latest(
+        self,
+        tenant_id: str,
+        limit: int = 500,
+        *,
+        customer_id: str = "",
+        plant_id: str = "",
+        machine_id: str = "",
+        gateway_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        where = ["tenant_id=?"]
+        params: List[Any] = [tenant_id]
+        if str(customer_id or "").strip():
+            where.append("customer_id=?")
+            params.append(str(customer_id).strip())
+        if str(plant_id or "").strip():
+            where.append("plant_id=?")
+            params.append(str(plant_id).strip())
+        if str(machine_id or "").strip():
+            where.append("machine_id=?")
+            params.append(str(machine_id).strip())
+        if str(gateway_id or "").strip():
+            where.append("gateway_id=?")
+            params.append(str(gateway_id).strip())
+        where_sql = " AND ".join(where)
+        params.append(max(1, min(5000, int(limit))))
         with self._connect() as conn:
             rs = conn.execute(
-                "SELECT * FROM latest_machine_state WHERE tenant_id=? ORDER BY updated_at DESC LIMIT ?",
-                (tenant_id, max(1, min(5000, int(limit)))),
+                f"SELECT * FROM latest_machine_state WHERE {where_sql} ORDER BY updated_at DESC LIMIT ?",
+                tuple(params),
             ).fetchall()
             out: List[Dict[str, Any]] = []
             for r in rs:

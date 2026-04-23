@@ -672,12 +672,33 @@ export async function appendAppStoreLogs(rows) {
   return res.json();
 }
 
-export async function getAppStoreHistorian(limit = 1000) {
+function appendCloudEdgeParams(url, cloudEdge = null) {
+  if (!cloudEdge || typeof cloudEdge !== "object") return url;
+  const params = new URLSearchParams();
+  const edgeId = String(cloudEdge.edge_id || cloudEdge.key || "").trim();
+  const source = String(cloudEdge.source || "").trim();
+  const site = String(cloudEdge.site || "").trim();
+  const area = String(cloudEdge.area || "").trim();
+  const equipment = String(cloudEdge.equipment || "").trim();
+  if (edgeId) params.set("edge_id", edgeId);
+  if (source) params.set("source", source);
+  if (site) params.set("site", site);
+  if (area) params.set("area", area);
+  if (equipment) params.set("equipment", equipment);
+  if (!params.toString()) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}${params.toString()}`;
+}
+
+export async function getAppStoreHistorian(limit = 1000, cloudEdge = null) {
   const useV1Cloud = getBackendTarget().mode === "cloud";
   if (useV1Cloud) {
     try {
+      const v1Url = appendCloudEdgeParams(
+        `${getApiBase()}/api/v1/history?limit=${encodeURIComponent(String(limit))}`,
+        cloudEdge
+      );
       const resV1 = await fetchWithTimeout(
-        withNoCache(`${getApiBase()}/api/v1/history?limit=${encodeURIComponent(String(limit))}`),
+        withNoCache(v1Url),
         { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
       );
       if (resV1.ok) {
@@ -721,20 +742,28 @@ export async function getAppStoreHistorian(limit = 1000) {
       // Fallback to legacy app-store route below.
     }
   }
+  const legacyUrl = appendCloudEdgeParams(
+    `${getApiBase()}/api/app-store/historian?limit=${encodeURIComponent(String(limit))}`,
+    cloudEdge
+  );
   const res = await fetchWithTimeout(
-    withNoCache(`${getApiBase()}/api/app-store/historian?limit=${encodeURIComponent(String(limit))}`),
+    withNoCache(legacyUrl),
     { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
   );
   if (!res.ok) throw new Error("App store historian fetch failed");
   return res.json();
 }
 
-export async function getAppStoreLive(limit = 5000) {
+export async function getAppStoreLive(limit = 5000, cloudEdge = null) {
   const useV1Cloud = getBackendTarget().mode === "cloud";
   if (useV1Cloud) {
     try {
+      const v1Url = appendCloudEdgeParams(
+        `${getApiBase()}/api/v1/latest?limit=${encodeURIComponent(String(limit))}`,
+        cloudEdge
+      );
       const resV1 = await fetchWithTimeout(
-        withNoCache(`${getApiBase()}/api/v1/latest?limit=${encodeURIComponent(String(limit))}`),
+        withNoCache(v1Url),
         { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
       );
       if (resV1.ok) {
@@ -778,17 +807,25 @@ export async function getAppStoreLive(limit = 5000) {
       // Fallback to legacy app-store route below.
     }
   }
+  const legacyUrl = appendCloudEdgeParams(
+    `${getApiBase()}/api/app-store/live?limit=${encodeURIComponent(String(limit))}`,
+    cloudEdge
+  );
   const res = await fetchWithTimeout(
-    withNoCache(`${getApiBase()}/api/app-store/live?limit=${encodeURIComponent(String(limit))}`),
+    withNoCache(legacyUrl),
     { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
   );
   if (!res.ok) throw new Error("App store live fetch failed");
   return res.json();
 }
 
-export async function getAppStoreLogs(limit = 2000) {
+export async function getAppStoreLogs(limit = 2000, cloudEdge = null) {
+  const url = appendCloudEdgeParams(
+    `${getApiBase()}/api/app-store/logs?limit=${encodeURIComponent(String(limit))}`,
+    cloudEdge
+  );
   const res = await fetchWithTimeout(
-    withNoCache(`${getApiBase()}/api/app-store/logs?limit=${encodeURIComponent(String(limit))}`),
+    withNoCache(url),
     { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
   );
   if (!res.ok) throw new Error("App store logs fetch failed");

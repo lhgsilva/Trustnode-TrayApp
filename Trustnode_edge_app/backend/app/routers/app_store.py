@@ -123,6 +123,7 @@ def get_historian(
     gateway: str = "",
     device: str = "",
     tag: str = "",
+    edge_id: str = "",
 ) -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
     prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
@@ -137,31 +138,32 @@ def get_historian(
             gateway=gateway,
             device=device,
             tag=tag,
+            edge_id=edge_id,
         ),
     }
 
 
 @router.get("/live")
-def get_live(request: Request, limit: int = 5000) -> dict:
+def get_live(request: Request, limit: int = 5000, edge_id: str = "") -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
     prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
     safe_limit = max(50, min(int(limit or 5000), 800 if prefer_cloud_reads else 5000))
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
-        "rows": app_store.get_live_rows(limit=safe_limit, prefer_cloud_reads=prefer_cloud_reads),
+        "rows": app_store.get_live_rows(limit=safe_limit, prefer_cloud_reads=prefer_cloud_reads, edge_id=edge_id),
     }
 
 
 @router.get("/logs")
-def get_logs(request: Request, limit: int = 2000) -> dict:
+def get_logs(request: Request, limit: int = 2000, edge_id: str = "") -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
     prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
     safe_limit = max(50, min(int(limit or 2000), 1000 if prefer_cloud_reads else 5000))
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
-        "rows": app_store.get_log_rows(limit=safe_limit, prefer_cloud_reads=prefer_cloud_reads),
+        "rows": app_store.get_log_rows(limit=safe_limit, prefer_cloud_reads=prefer_cloud_reads, edge_id=edge_id),
     }
 
 

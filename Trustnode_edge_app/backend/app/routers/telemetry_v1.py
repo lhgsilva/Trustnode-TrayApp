@@ -86,6 +86,36 @@ def _recompute_payload_hash(record: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _resolve_edge_filters(
+    *,
+    edge_id: str = "",
+    source: str = "",
+    site: str = "",
+    area: str = "",
+    equipment: str = "",
+    gateway: str = "",
+) -> Dict[str, str]:
+    edge_txt = str(edge_id or "").strip()
+    src = str(source or "").strip()
+    st = str(site or "").strip()
+    ar = str(area or "").strip()
+    eq = str(equipment or "").strip()
+    gw = str(gateway or "").strip()
+    if edge_txt and "||" in edge_txt:
+        parts = edge_txt.split("||")
+        if len(parts) >= 4:
+            src = src or str(parts[0] or "").strip()
+            st = st or str(parts[1] or "").strip()
+            ar = ar or str(parts[2] or "").strip()
+            eq = eq or str(parts[3] or "").strip()
+    return {
+        "customer_id": src,
+        "plant_id": st,
+        "machine_id": eq,
+        "gateway_id": gw or ar,
+    }
+
+
 @router.get("/healthz")
 def healthz() -> Dict[str, Any]:
     return {"ok": True, "status": "healthy"}
@@ -249,25 +279,79 @@ async def ingest_batch(request: Request) -> IngestBatchResponse:
 
 
 @router.get("/history", response_model=HistoryQueryResponse)
-def history(request: Request, limit: int = 1000) -> HistoryQueryResponse:
+def history(
+    request: Request,
+    limit: int = 1000,
+    edge_id: str = "",
+    source: str = "",
+    site: str = "",
+    area: str = "",
+    equipment: str = "",
+    gateway: str = "",
+) -> HistoryQueryResponse:
     token = _parse_auth_token(request)
     try:
         claims = decode_access_token(token)
     except Exception as exc:
         raise HTTPException(status_code=401, detail=f"Invalid user token: {exc}") from exc
     tenant_id = normalize_tenant_id(str(claims.get("tenant_id") or "default"))
-    return HistoryQueryResponse(ok=True, rows=ingest_store.query_history(tenant_id=tenant_id, limit=limit))
+    filt = _resolve_edge_filters(
+        edge_id=edge_id,
+        source=source,
+        site=site,
+        area=area,
+        equipment=equipment,
+        gateway=gateway,
+    )
+    return HistoryQueryResponse(
+        ok=True,
+        rows=ingest_store.query_history(
+            tenant_id=tenant_id,
+            limit=limit,
+            customer_id=filt["customer_id"],
+            plant_id=filt["plant_id"],
+            machine_id=filt["machine_id"],
+            gateway_id=filt["gateway_id"],
+        ),
+    )
 
 
 @router.get("/latest", response_model=LatestQueryResponse)
-def latest(request: Request, limit: int = 500) -> LatestQueryResponse:
+def latest(
+    request: Request,
+    limit: int = 500,
+    edge_id: str = "",
+    source: str = "",
+    site: str = "",
+    area: str = "",
+    equipment: str = "",
+    gateway: str = "",
+) -> LatestQueryResponse:
     token = _parse_auth_token(request)
     try:
         claims = decode_access_token(token)
     except Exception as exc:
         raise HTTPException(status_code=401, detail=f"Invalid user token: {exc}") from exc
     tenant_id = normalize_tenant_id(str(claims.get("tenant_id") or "default"))
-    return LatestQueryResponse(ok=True, rows=ingest_store.query_latest(tenant_id=tenant_id, limit=limit))
+    filt = _resolve_edge_filters(
+        edge_id=edge_id,
+        source=source,
+        site=site,
+        area=area,
+        equipment=equipment,
+        gateway=gateway,
+    )
+    return LatestQueryResponse(
+        ok=True,
+        rows=ingest_store.query_latest(
+            tenant_id=tenant_id,
+            limit=limit,
+            customer_id=filt["customer_id"],
+            plant_id=filt["plant_id"],
+            machine_id=filt["machine_id"],
+            gateway_id=filt["gateway_id"],
+        ),
+    )
 
 
 @router.get("/edge/diagnostics")

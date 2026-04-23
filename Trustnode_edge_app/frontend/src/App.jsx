@@ -1589,6 +1589,11 @@ function AppShell() {
   const [endpointMode, setEndpointMode] = useState("local");
   const [cloudUrl, setCloudUrl] = useState("");
   const [selectedCloudEdgeKey, setSelectedCloudEdgeKey] = useState(CLOUD_EDGE_ALL_KEY);
+  const cloudEdgeApiFilter = useMemo(() => {
+    if (!(isHostedWebClient && endpointMode === "cloud")) return null;
+    if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY) return null;
+    return { edge_id: String(selectedCloudEdgeKey || "") };
+  }, [isHostedWebClient, endpointMode, selectedCloudEdgeKey]);
   const [edgeLinkState, setEdgeLinkState] = useState({ state: "unknown", message: "Not checked" });
   const [endpointVersion, setEndpointVersion] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
@@ -3107,7 +3112,10 @@ function AppShell() {
     let cancelled = false;
     const loadOperationalHistory = async () => {
       try {
-        const [histRes, logRes] = await Promise.all([getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT), getAppStoreLogs(CLOUD_LOG_FETCH_LIMIT)]);
+        const [histRes, logRes] = await Promise.all([
+          getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT, cloudEdgeApiFilter),
+          getAppStoreLogs(CLOUD_LOG_FETCH_LIMIT, cloudEdgeApiFilter),
+        ]);
         if (cancelled) return;
         if (histRes?.ok && Array.isArray(histRes.rows)) {
           setDataLog(histRes.rows);
@@ -3123,7 +3131,7 @@ function AppShell() {
     return () => {
       cancelled = true;
     };
-  }, [appStoreHydrated]);
+  }, [appStoreHydrated, cloudEdgeApiFilter]);
 
   useEffect(() => {
     if (!appStoreHydrated) return;
@@ -4286,7 +4294,7 @@ function AppShell() {
       if (stopped || runningLive) return;
       runningLive = true;
       try {
-        const liveRes = await getAppStoreLive(CLOUD_LIVE_FETCH_LIMIT);
+        const liveRes = await getAppStoreLive(CLOUD_LIVE_FETCH_LIMIT, cloudEdgeApiFilter);
         if (stopped) return;
         if (liveRes?.ok && Array.isArray(liveRes.rows)) {
           const rawRows = liveRes.rows;
@@ -4530,8 +4538,12 @@ function AppShell() {
       runningAux = true;
       try {
         const [histRes, logRes, inspectorRes] = await Promise.all([
-          (wantsHistorian || !cloudStreamConnected) ? getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT) : Promise.resolve(null),
-          (wantsLogs || !cloudStreamConnected) ? getAppStoreLogs(CLOUD_LOG_FETCH_LIMIT) : Promise.resolve(null),
+          (wantsHistorian || !cloudStreamConnected)
+            ? getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT, cloudEdgeApiFilter)
+            : Promise.resolve(null),
+          (wantsLogs || !cloudStreamConnected)
+            ? getAppStoreLogs(CLOUD_LOG_FETCH_LIMIT, cloudEdgeApiFilter)
+            : Promise.resolve(null),
           (wantsInspector || !cloudStreamConnected) ? getAppStoreInspector(20) : Promise.resolve(null)
         ]);
         if (stopped) return;
@@ -4572,7 +4584,7 @@ function AppShell() {
       clearInterval(liveTimer);
       clearInterval(auxTimer);
     };
-  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected, filterCloudRowsMonotonic, activePage]);
+  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected, filterCloudRowsMonotonic, activePage, cloudEdgeApiFilter]);
 
   useEffect(() => {
     if (!currentUser) return undefined;
@@ -5639,6 +5651,36 @@ function AppShell() {
 
   const canDeleteRecords = Boolean(!isReadonlyCloudMode && currentUser && currentUser.role === "admin");
   const canControlGateways = Boolean(!isReadonlyCloudMode && currentUser && (currentUser.role === "admin" || currentUser.permissions?.gateway_runtime_control));
+  const cpEdgeHeartbeatSummary = useMemo(() => {
+    const now = Date.now();
+    let healthy = 0;
+    let stale = 0;
+    let missing = 0;
+    let newest = "";
+    for (const edge of cpEdges || []) {
+      const hbTs = String(edge?.last_heartbeat_utc || "").trim();
+      if (!hbTs) {
+        missing += 1;
+        continue;
+      }
+      const hbMs = parseTimestampMs(hbTs);
+      if (!Number.isFinite(hbMs) || hbMs <= 0) {
+        missing += 1;
+        continue;
+      }
+      if (!newest || hbTs > newest) newest = hbTs;
+      const ageMs = Math.max(0, now - hbMs);
+      if (ageMs <= 90000) healthy += 1;
+      else stale += 1;
+    }
+    return {
+      total: Array.isArray(cpEdges) ? cpEdges.length : 0,
+      healthy,
+      stale,
+      missing,
+      latestHeartbeatUtc: newest,
+    };
+  }, [cpEdges]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -13747,6 +13789,28 @@ function AppShell() {
                   </label>
                 </div>
                 {cpResult ? <div className={`status ${cpResult.toLowerCase().includes("failed") ? "error" : "ok"}`}>{cpResult}</div> : null}
+              </section>
+
+              <section className="card">
+                <h4>Edge Heartbeat Health</h4>
+                <div className="form-grid">
+                  <label>
+                    Healthy (&lt;= 90s)
+                    <input readOnly value={String(cpEdgeHeartbeatSummary.healthy)} />
+                  </label>
+                  <label>
+                    Stale (&gt; 90s)
+                    <input readOnly value={String(cpEdgeHeartbeatSummary.stale)} />
+                  </label>
+                  <label>
+                    Missing heartbeat
+                    <input readOnly value={String(cpEdgeHeartbeatSummary.missing)} />
+                  </label>
+                  <label>
+                    Latest heartbeat
+                    <input readOnly value={fmtTs(cpEdgeHeartbeatSummary.latestHeartbeatUtc || "")} />
+                  </label>
+                </div>
               </section>
 
               <section className="card">
