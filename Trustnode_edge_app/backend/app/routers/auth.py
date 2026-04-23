@@ -103,18 +103,9 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
     password = str(payload.password or "")
     hit = _match_user(users_access, username, password)
     if not hit:
-        # Retry once with cloud-refreshed bootstrap so newly created users on cloud/local
-        # become valid for login immediately after sync propagation.
-        try:
-            cloud_users_access = _load_users_payload(prefer_cloud_reads=True)
-            hit = _match_user(cloud_users_access, username, password)
-            if hit:
-                users_access = cloud_users_access
-        except Exception:
-            hit = None
-    if not hit:
-        # Fallback: control-plane users are authoritative for tenant-scoped cloud users.
-        # This keeps existing bootstrap auth working while enabling customer accounts.
+        # Control-plane users are authoritative for tenant-scoped cloud users.
+        # Keep this ahead of cloud-bootstrap refresh to avoid login latency spikes
+        # on cloud runtimes where prefer_cloud_reads can be slow.
         try:
             cp_hit = control_plane_store.authenticate_user(
                 tenant_id=normalize_tenant_id(get_current_tenant()),
@@ -129,6 +120,16 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
                     "modules": cp_hit.get("modules") or [],
                     "tenant_id": cp_hit.get("tenant_id"),
                 }
+        except Exception:
+            hit = None
+    if not hit:
+        # Retry once with cloud-refreshed bootstrap so newly created legacy
+        # users_access users on cloud/local become valid after propagation.
+        try:
+            cloud_users_access = _load_users_payload(prefer_cloud_reads=True)
+            hit = _match_user(cloud_users_access, username, password)
+            if hit:
+                users_access = cloud_users_access
         except Exception:
             hit = None
     if not hit:
