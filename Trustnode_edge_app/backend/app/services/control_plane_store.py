@@ -28,7 +28,9 @@ class ControlPlaneStore:
     ]
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        # Re-entrant lock avoids self-deadlock for nested store calls
+        # (e.g. activation flow upserting edge metadata).
+        self._lock = threading.RLock()
         self._db_path = self._resolve_db_path()
         self._ensure_schema()
         self._seed_defaults()

@@ -1118,6 +1118,19 @@ export async function upsertControlPlaneEdge(payload, tenantId = "") {
   return res.json();
 }
 
+export async function heartbeatControlPlaneEdge(edgeId, payload = {}, tenantId = "") {
+  const params = new URLSearchParams();
+  params.set("edge_id", String(edgeId || ""));
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges/heartbeat?${params.toString()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane edge heartbeat failed");
+  return res.json();
+}
+
 export async function getControlPlaneLicenses(tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));

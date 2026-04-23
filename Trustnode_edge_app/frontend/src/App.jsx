@@ -69,6 +69,7 @@ import {
   upsertControlPlaneCustomer,
   getControlPlaneEdges,
   upsertControlPlaneEdge,
+  heartbeatControlPlaneEdge,
   getControlPlaneLicenses,
   upsertControlPlaneLicense,
   getControlPlaneLicenseModules,
@@ -5654,6 +5655,33 @@ function AppShell() {
     refreshControlPlaneData(currentTenantId || "default");
   }, [activePage, currentUser, currentTenantId]);
 
+  useEffect(() => {
+    if (!currentUser) return;
+    if (isHostedWebClient) return;
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled) return;
+      await syncControlPlaneEdgeHeartbeat();
+    };
+    run();
+    const timer = setInterval(run, 60000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [
+    currentUser,
+    isHostedWebClient,
+    currentTenantId,
+    edgeProfile?.edge_id,
+    edgeProfile?.edge_name,
+    edgeProfile?.location,
+    edgeProfile?.machine_group,
+    endpointMode,
+    cloudUrl,
+    wsState,
+  ]);
+
   const addAppLog = (entry) => {
     const key = `${String(entry.level || "info")}|${String(entry.category || "system")}|${String(entry.gateway_id || "")}|${String(entry.database_name || "")}|${String(entry.message || "")}`;
     const now = Date.now();
@@ -10174,6 +10202,32 @@ function AppShell() {
       return true;
     } catch (err) {
       setCpResult(`Control-plane refresh failed: ${String(err?.message || err)}`);
+      return false;
+    }
+  };
+
+  const syncControlPlaneEdgeHeartbeat = async () => {
+    if (isHostedWebClient) return false;
+    const edgeId = String(edgeProfile?.edge_id || "").trim();
+    if (!edgeId) return false;
+    try {
+      await heartbeatControlPlaneEdge(
+        edgeId,
+        {
+          edge_name: String(edgeProfile?.edge_name || "").trim(),
+          status: String(wsState === "connected" ? "active" : "inactive"),
+          site: String(edgeProfile?.location || "").trim(),
+          area: String(edgeProfile?.machine_group || "").trim(),
+          equipment: "",
+          endpoint_mode: endpointMode,
+          cloud_url: String(cloudUrl || "").trim(),
+          gateway_count: Array.isArray(gatewayConfigsRef.current) ? gatewayConfigsRef.current.length : 0,
+          device_count: Array.isArray(devicesRef.current) ? devicesRef.current.length : 0,
+        },
+        currentTenantId || "default"
+      );
+      return true;
+    } catch {
       return false;
     }
   };
