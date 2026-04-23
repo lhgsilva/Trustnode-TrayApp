@@ -44,7 +44,11 @@ jobs:
       - name: Backend syntax check
         run: |
           python -m py_compile Trustnode_edge_app/backend/app/routers/app_store.py
+          python -m py_compile Trustnode_edge_app/backend/app/routers/auth.py
+          python -m py_compile Trustnode_edge_app/backend/app/routers/control_plane.py
           python -m py_compile Trustnode_edge_app/backend/app/services/app_store.py
+          python -m py_compile Trustnode_edge_app/backend/app/services/control_plane_store.py
+          python -m py_compile Trustnode_edge_app/backend/app/tenant.py
           python -m py_compile Trustnode_edge_app/backend/app/main.py
 
       - name: Build cloud web bundle

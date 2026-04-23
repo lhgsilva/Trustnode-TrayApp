@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth import create_access_token, decode_access_token, verify_password
-from app.state import app_store
+from app.state import app_store, control_plane_store
 from app.tenant import get_current_tenant, normalize_tenant_id
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,7 @@ def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
         "username": str(user_row.get("username") or ""),
         "role": str(user_row.get("role") or "viewer"),
         "permissions": user_row.get("permissions") or {},
+        "modules": user_row.get("modules") or [],
         "tenant_id": normalize_tenant_id(str(user_row.get("tenant_id") or fallback_tenant)),
     }
 
@@ -112,6 +113,25 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
         except Exception:
             hit = None
     if not hit:
+        # Fallback: control-plane users are authoritative for tenant-scoped cloud users.
+        # This keeps existing bootstrap auth working while enabling customer accounts.
+        try:
+            cp_hit = control_plane_store.authenticate_user(
+                tenant_id=normalize_tenant_id(get_current_tenant()),
+                username=username,
+                password=password,
+            )
+            if cp_hit:
+                hit = {
+                    "username": cp_hit.get("username"),
+                    "role": cp_hit.get("role"),
+                    "permissions": cp_hit.get("permissions") or {},
+                    "modules": cp_hit.get("modules") or [],
+                    "tenant_id": cp_hit.get("tenant_id"),
+                }
+        except Exception:
+            hit = None
+    if not hit:
         logger.warning("Failed login attempt: user=%s ip=%s", username, client_host)
         raise HTTPException(status_code=401, detail="Invalid username or password")
     user_public = _public_user(hit)
@@ -135,6 +155,7 @@ def me(request: Request) -> Dict[str, Any]:
             "username": str(payload.get("sub") or ""),
             "role": str(payload.get("role") or "viewer"),
             "permissions": payload.get("permissions") or {},
+            "modules": payload.get("modules") or [],
             "tenant_id": normalize_tenant_id(str(payload.get("tenant_id") or get_current_tenant())),
         },
     }

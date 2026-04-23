@@ -1034,3 +1034,42 @@ export async function stopPowerDevice(deviceId) {
   if (!res.ok) throw new Error("Power device stop failed");
   return res.json();
 }
+
+export async function getControlPlaneRuntimeContext() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/runtime-context`);
+  if (!res.ok) throw new Error("Control-plane runtime-context fetch failed");
+  return res.json();
+}
+
+export async function getControlPlaneUsers(tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/users${suffix}`);
+  if (!res.ok) throw new Error("Control-plane users fetch failed");
+  return res.json();
+}
+
+export async function upsertControlPlaneUser(payload, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/users${suffix}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane user upsert failed");
+  return res.json();
+}
+
+export async function deleteControlPlaneUser(username, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/users/${encodeURIComponent(String(username || ""))}${suffix}`, {
+    method: "DELETE"
+  });
+  if (!res.ok) throw new Error("Control-plane user delete failed");
+  return res.json();
+}

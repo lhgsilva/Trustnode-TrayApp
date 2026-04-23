@@ -59,6 +59,7 @@ def create_access_token(user: Dict[str, Any], expires_seconds: int = 12 * 3600) 
         "sub": str(user.get("username") or ""),
         "role": str(user.get("role") or "viewer"),
         "permissions": user.get("permissions") or {},
+        "modules": user.get("modules") or [],
         "tenant_id": normalize_tenant_id(str(user.get("tenant_id") or get_current_tenant())),
         "iat": now,
         "exp": now + int(expires_seconds),

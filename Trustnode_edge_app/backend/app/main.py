@@ -18,6 +18,7 @@ from app.routers.ui_source import router as ui_source_router
 from app.routers.notifications import router as notifications_router
 from app.routers.telemetry_v1 import router as telemetry_v1_router
 from app.routers.power import router as power_router
+from app.routers.control_plane import router as control_plane_router
 from app.state import plc_manager, app_store, telemetry_service, ingest_store, power_manager
 from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
 
@@ -41,6 +42,18 @@ app.include_router(ui_source_router)
 app.include_router(notifications_router)
 app.include_router(telemetry_v1_router)
 app.include_router(power_router)
+app.include_router(control_plane_router)
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    # Ensure telemetry ingest URL and tenant context are hydrated even before
+    # any gateway loop iteration runs.
+    try:
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False)
+        telemetry_service.configure_from_bootstrap({"data": bootstrap})
+    except Exception:
+        pass
 
 
 PUBLIC_PATHS = {
@@ -85,6 +98,7 @@ async def auth_middleware(request: Request, call_next):
         return _apply_no_cache_headers(JSONResponse(status_code=401, content={"detail": "Authentication required"}))
     try:
         payload = decode_access_token(token)
+        request.state.user_payload = payload
         token_tenant = str(payload.get("tenant_id") or "").strip()
         if token_tenant:
             normalized_token_tenant = set_current_tenant(token_tenant)

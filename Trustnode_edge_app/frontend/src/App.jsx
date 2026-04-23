@@ -60,6 +60,10 @@ import {
   getPowerHistory,
   startPowerDevice,
   stopPowerDevice,
+  getControlPlaneRuntimeContext,
+  getControlPlaneUsers,
+  upsertControlPlaneUser,
+  deleteControlPlaneUser,
 } from "./api";
 import { Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
@@ -1305,6 +1309,33 @@ const CLIENT_MODULE_PERMISSION_BY_PAGE = CLIENT_MODULE_DEFS.reduce((acc, item) =
   acc[item.page] = item.key;
   return acc;
 }, {});
+const MODULE_KEY_BY_PAGE = {
+  dashboard: "dashboard",
+  power_overview: "power_overview",
+  historian: "historian",
+  alarms: "alarms",
+  reporting: "reporting",
+  interface: "interface",
+};
+
+function deriveModuleKeysFromPermissions(perms = {}) {
+  const keys = new Set();
+  if (perms.dashboard) keys.add("dashboard");
+  if (perms.power_overview) keys.add("power_overview");
+  if (perms.historian || perms.data_log) keys.add("historian");
+  if (perms.client_module_alarms || perms.alarms) keys.add("alarms");
+  if (perms.client_module_reporting || perms.reporting) keys.add("reporting");
+  if (perms.client_module_interface || perms.interface) keys.add("interface");
+  return Array.from(keys);
+}
+
+function userHasModuleForPage(user, page) {
+  const required = MODULE_KEY_BY_PAGE[page];
+  if (!required) return true;
+  const modules = Array.isArray(user?.modules) ? user.modules : [];
+  if (!modules.length) return true;
+  return modules.includes(required);
+}
 
 function parseForcedClientModules() {
   try {
@@ -2264,7 +2295,8 @@ function AppShell() {
     if (Array.isArray(usersAccess.users)) {
       const normalizedUsers = usersAccess.users.map((u) => ({
         ...u,
-        permissions: normalizePermissions(u.permissions, u.role)
+        permissions: normalizePermissions(u.permissions, u.role),
+        modules: Array.isArray(u.modules) ? u.modules : deriveModuleKeysFromPermissions(normalizePermissions(u.permissions, u.role)),
       }));
       setUsers(normalizedUsers);
     }
@@ -2566,7 +2598,8 @@ function AppShell() {
     if (isHostedWebClient) {
       const normalizedUsers = buildDefaultUsers().map((u) => ({
         ...u,
-        permissions: normalizePermissions(u.permissions, u.role)
+        permissions: normalizePermissions(u.permissions, u.role),
+        modules: Array.isArray(u.modules) ? u.modules : deriveModuleKeysFromPermissions(normalizePermissions(u.permissions, u.role)),
       }));
       setUsers(normalizedUsers);
       setCurrentUser(null);
@@ -2586,7 +2619,8 @@ function AppShell() {
     }
     const normalizedUsers = (Array.isArray(sourceUsers) ? sourceUsers : []).map((u) => ({
       ...u,
-      permissions: normalizePermissions(u.permissions, u.role)
+      permissions: normalizePermissions(u.permissions, u.role),
+      modules: Array.isArray(u.modules) ? u.modules : deriveModuleKeysFromPermissions(normalizePermissions(u.permissions, u.role)),
     }));
     setUsers(normalizedUsers);
 
@@ -2603,13 +2637,22 @@ function AppShell() {
         if (cancelled) return;
         const u = me?.user || null;
         if (!u?.username) return;
-        const matched = users.find((x) => x.username === u.username) || {
+        const existingUser = users.find((x) => x.username === u.username) || {};
+        const matched = {
+          ...existingUser,
           username: u.username,
           password: "",
-          role: u.role || "viewer",
-          permissions: normalizePermissions(u.permissions || {}, u.role || "viewer")
+          role: u.role || existingUser.role || "viewer",
+          permissions: normalizePermissions(u.permissions || existingUser.permissions || {}, u.role || existingUser.role || "viewer"),
+          modules: Array.isArray(u.modules)
+            ? u.modules
+            : (Array.isArray(existingUser.modules)
+              ? existingUser.modules
+              : deriveModuleKeysFromPermissions(normalizePermissions(u.permissions || existingUser.permissions || {}, u.role || existingUser.role || "viewer"))),
         };
         setCurrentUser(matched);
+        await refreshControlPlaneRuntimeContext();
+        await refreshControlPlaneUsers(u?.tenant_id || currentTenantId || "default");
       } catch (_) {
         clearAuthToken();
       }
@@ -2621,13 +2664,19 @@ function AppShell() {
   }, [users]);
 
   useEffect(() => {
+    if (!currentUser) return;
+    refreshControlPlaneRuntimeContext().catch(() => {});
+  }, [currentUser]);
+
+  useEffect(() => {
     if (!isReadonlyCloudMode) return;
     if (currentUser) return;
     const readonlyUser = {
       username: "web_readonly",
       password: "",
       role: "viewer",
-      permissions: buildRolePermissions("viewer")
+      permissions: buildRolePermissions("viewer"),
+      modules: [],
     };
     setCurrentUser(readonlyUser);
     if (!users.length) setUsers([readonlyUser]);
@@ -5409,6 +5458,7 @@ function AppShell() {
 
   const hasClientModuleAccess = useCallback(
     (page) => {
+      if (!userHasModuleForPage(currentUser, page)) return false;
       const perms = currentUser?.permissions || {};
       if (page === "dashboard") return Boolean(perms.dashboard ?? perms.data_log ?? true);
       if (page === "power_overview") return Boolean(perms.power_overview ?? perms.database ?? false);
@@ -5486,6 +5536,7 @@ function AppShell() {
     (user) => {
       const perms = user?.permissions || {};
       return CLIENT_MODULE_DEFS.filter((m) => {
+        if (!userHasModuleForPage(user, m.page)) return false;
         const key = CLIENT_MODULE_PERMISSION_BY_PAGE[m.page];
         if (!key) return false;
         if (m.page === "alarms") return Boolean(perms.client_module_alarms ?? perms.alarms);
@@ -9982,6 +10033,33 @@ function AppShell() {
     return false;
   };
 
+  const refreshControlPlaneRuntimeContext = async () => {
+    try {
+      const ctx = await getControlPlaneRuntimeContext();
+      if (ctx?.tenant_id) setCurrentTenantId(String(ctx.tenant_id));
+      return ctx || null;
+    } catch {
+      return null;
+    }
+  };
+
+  const refreshControlPlaneUsers = async (tenantId = "") => {
+    try {
+      const res = await getControlPlaneUsers(tenantId || currentTenantId || "default");
+      const rows = Array.isArray(res?.rows) ? res.rows : [];
+      const normalized = rows.map((u) => ({
+        ...u,
+        password: "",
+        permissions: normalizePermissions(u.permissions || {}, u.role || "viewer"),
+        modules: Array.isArray(u.modules) ? u.modules : deriveModuleKeysFromPermissions(normalizePermissions(u.permissions || {}, u.role || "viewer")),
+      }));
+      if (normalized.length) setUsers(normalized);
+      return normalized;
+    } catch {
+      return null;
+    }
+  };
+
   const submitLogin = async () => {
     const username = String(loginForm.username || "").trim();
     const password = String(loginForm.password || "");
@@ -10005,13 +10083,22 @@ function AppShell() {
         setLoginError("Login failed");
         return;
       }
-      const matched = users.find((x) => x.username === u.username) || {
+      const existingUser = users.find((x) => x.username === u.username) || {};
+      const matched = {
+        ...existingUser,
         username: u.username,
         password: "",
-        role: u.role || "viewer",
-        permissions: normalizePermissions(u.permissions || {}, u.role || "viewer")
+        role: u.role || existingUser.role || "viewer",
+        permissions: normalizePermissions(u.permissions || existingUser.permissions || {}, u.role || existingUser.role || "viewer"),
+        modules: Array.isArray(u.modules)
+          ? u.modules
+          : (Array.isArray(existingUser.modules)
+            ? existingUser.modules
+            : deriveModuleKeysFromPermissions(normalizePermissions(u.permissions || existingUser.permissions || {}, u.role || existingUser.role || "viewer"))),
       };
       setCurrentUser(matched);
+      await refreshControlPlaneRuntimeContext();
+      await refreshControlPlaneUsers(u?.tenant_id || currentTenantId || "default");
       setShowUserMenu(false);
       setLoginError("");
       setLoginForm({ username: "", password: "" });
@@ -10052,17 +10139,32 @@ function AppShell() {
       username: newUserForm.username.trim(),
       password: newUserForm.password,
       role: newUserForm.role,
-      permissions: normalizePermissions(newUserForm.permissions, newUserForm.role)
+      permissions: normalizePermissions(newUserForm.permissions, newUserForm.role),
+      modules: deriveModuleKeysFromPermissions(normalizePermissions(newUserForm.permissions, newUserForm.role)),
     };
     const nextUsers = [...users, newUser];
     const actor = currentUser?.username || "system";
-    saveAppStoreDomain(
-      "users_access",
-      { users: nextUsers, current_user: currentUser?.username || "" },
-      actor
+    upsertControlPlaneUser(
+      {
+        username: newUser.username,
+        password: newUser.password,
+        role: newUser.role,
+        status: "active",
+        email: "",
+        mfa_enabled: false,
+        modules: newUser.modules,
+        permissions: newUser.permissions,
+      },
+      currentTenantId || "default"
     )
       .then(async () => {
-        setUsers(nextUsers);
+        await refreshControlPlaneUsers(currentTenantId || "default");
+        // Backward-compat mirror for legacy bootstrap consumers.
+        await saveAppStoreDomain(
+          "users_access",
+          { users: nextUsers, current_user: currentUser?.username || "" },
+          actor
+        );
         setError("");
         setNewUserForm({
           username: "",
@@ -10110,13 +10212,26 @@ function AppShell() {
       };
     });
     const actor = currentUser?.username || "system";
-    saveAppStoreDomain(
-      "users_access",
-      { users: nextUsers, current_user: currentUser?.username || "" },
-      actor
+    upsertControlPlaneUser(
+      {
+        username: editingUsername,
+        password: String(editUserForm.password || "").trim() ? String(editUserForm.password || "") : null,
+        role: String(editUserForm.role || "viewer"),
+        status: "active",
+        email: "",
+        mfa_enabled: false,
+        modules: deriveModuleKeysFromPermissions(normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")),
+        permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer"),
+      },
+      currentTenantId || "default"
     )
       .then(async () => {
-        setUsers(nextUsers);
+        await refreshControlPlaneUsers(currentTenantId || "default");
+        await saveAppStoreDomain(
+          "users_access",
+          { users: nextUsers, current_user: currentUser?.username || "" },
+          actor
+        );
         if (currentUser?.username === editingUsername) {
           setCurrentUser((prev) => {
             if (!prev) return prev;
@@ -10124,7 +10239,8 @@ function AppShell() {
               ...prev,
               role: String(editUserForm.role || "viewer"),
               password: String(editUserForm.password || ""),
-              permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")
+              permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer"),
+              modules: deriveModuleKeysFromPermissions(normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")),
             };
           });
         }
@@ -10153,13 +10269,14 @@ function AppShell() {
     withConfirm("Delete User", `Delete user '${target}'?`, () => {
       const nextUsers = users.filter((u) => String(u.username) !== target);
       const actor = currentUser?.username || "system";
-      saveAppStoreDomain(
-        "users_access",
-        { users: nextUsers, current_user: currentUser?.username || "" },
-        actor
-      )
+      deleteControlPlaneUser(target, currentTenantId || "default")
         .then(async () => {
-          setUsers(nextUsers);
+          await refreshControlPlaneUsers(currentTenantId || "default");
+          await saveAppStoreDomain(
+            "users_access",
+            { users: nextUsers, current_user: currentUser?.username || "" },
+            actor
+          );
           setError("");
           if (currentUser?.username === target) logout();
           try {

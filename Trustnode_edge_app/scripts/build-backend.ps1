@@ -34,8 +34,11 @@ python -m PyInstaller `
     --hidden-import app.state `
     --hidden-import app.routers.health `
     --hidden-import app.routers.app_store `
+    --hidden-import app.routers.auth `
+    --hidden-import app.routers.control_plane `
     --hidden-import app.routers.plc `
     --hidden-import app.services.app_store `
+    --hidden-import app.services.control_plane_store `
     --hidden-import app.services.plc_manager `
     --name trustnode-service `
     app\__main__.py
