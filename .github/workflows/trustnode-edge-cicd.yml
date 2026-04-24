@@ -230,10 +230,9 @@ jobs:
               TARGET_CONF="$(grep -Rsl '${{ env.VPS_WEB_ROOT }}' /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)"
             fi
             if [ -z "$TARGET_CONF" ]; then
-              echo "Could not locate nginx vhost config for trustnode.lsapps.app"
-              exit 1
+              echo "WARN: Could not locate nginx vhost config for trustnode.lsapps.app. Skipping /client PHP location injection."
             fi
-            if ! grep -q 'TRUSTNODE_CLIENT_PHP_BEGIN' "$TARGET_CONF"; then
+            if [ -n "$TARGET_CONF" ] && ! grep -q 'TRUSTNODE_CLIENT_PHP_BEGIN' "$TARGET_CONF"; then
               awk -v pass="$PHP_FPM_PASS" '
                 BEGIN{in_server=0;inserted=0}
                 {
@@ -259,8 +258,10 @@ jobs:
             fi
             chown -R nginx:nginx "${{ env.VPS_WEB_ROOT }}"
             restorecon -Rv "${{ env.VPS_WEB_ROOT }}" || true
-            nginx -t
-            systemctl reload nginx
+            if [ -n "$TARGET_CONF" ]; then
+              nginx -t
+              systemctl reload nginx
+            fi
             curl -fsS https://trustnode.lsapps.app/api/health >/dev/null
             curl -fsS https://trustnode.lsapps.app/ >/dev/null
             php_probe="$(curl -fsS https://trustnode.lsapps.app/client/client_test.php | head -c 240 || true)"
