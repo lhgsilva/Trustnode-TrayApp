@@ -60,6 +60,7 @@ PUBLIC_PATHS = {
     "/api/health",
     "/api/auth/login",
     "/api/auth/me",
+    "/api/control-plane/portal-context",
     "/api/v1/healthz",
     "/api/v1/readyz",
 }
