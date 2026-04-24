@@ -375,6 +375,17 @@ class ControlPlaneStore:
                 row = conn.execute("SELECT * FROM cp_customers WHERE customer_id=?", (cid,)).fetchone()
         return dict(row) if row else {}
 
+    def delete_customer(self, *, tenant_id: str, customer_id: str) -> bool:
+        tid = normalize_tenant_id(tenant_id)
+        cid = str(customer_id or "").strip()
+        if not cid:
+            return False
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute("DELETE FROM cp_customers WHERE tenant_id=? AND customer_id=?", (tid, cid))
+                conn.commit()
+                return int(cur.rowcount or 0) > 0
+
     def list_edges(self, *, tenant_id: str) -> list[dict[str, Any]]:
         tid = normalize_tenant_id(tenant_id)
         with self._lock:
@@ -409,6 +420,17 @@ class ControlPlaneStore:
                 conn.commit()
                 row = conn.execute("SELECT * FROM cp_edges WHERE edge_id=?", (eid,)).fetchone()
         return dict(row) if row else {}
+
+    def delete_edge(self, *, tenant_id: str, edge_id: str) -> bool:
+        tid = normalize_tenant_id(tenant_id)
+        eid = str(edge_id or "").strip()
+        if not eid:
+            return False
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute("DELETE FROM cp_edges WHERE tenant_id=? AND edge_id=?", (tid, eid))
+                conn.commit()
+                return int(cur.rowcount or 0) > 0
 
     def heartbeat_edge(self, *, tenant_id: str, edge_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
@@ -452,6 +474,18 @@ class ControlPlaneStore:
                 conn.commit()
                 row = conn.execute("SELECT * FROM cp_licenses WHERE license_id=?", (lid,)).fetchone()
         return dict(row) if row else {}
+
+    def delete_license(self, *, tenant_id: str, license_id: str) -> bool:
+        tid = normalize_tenant_id(tenant_id)
+        lid = str(license_id or "").strip()
+        if not lid:
+            return False
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("DELETE FROM cp_license_modules WHERE license_id=?", (lid,))
+                cur = conn.execute("DELETE FROM cp_licenses WHERE tenant_id=? AND license_id=?", (tid, lid))
+                conn.commit()
+                return int(cur.rowcount or 0) > 0
 
     def list_licenses(self, *, tenant_id: str) -> list[dict[str, Any]]:
         tid = normalize_tenant_id(tenant_id)

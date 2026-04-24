@@ -68,11 +68,14 @@ import {
   upsertControlPlaneTenant,
   getControlPlaneCustomers,
   upsertControlPlaneCustomer,
+  deleteControlPlaneCustomer,
   getControlPlaneEdges,
   upsertControlPlaneEdge,
+  deleteControlPlaneEdge,
   heartbeatControlPlaneEdge,
   getControlPlaneLicenses,
   upsertControlPlaneLicense,
+  deleteControlPlaneLicense,
   getControlPlaneLicenseModules,
   setControlPlaneLicenseModules,
   getControlPlaneUsers,
@@ -2156,6 +2159,10 @@ function AppShell() {
     new_password: "",
   });
   const [cpIssuedResetToken, setCpIssuedResetToken] = useState("");
+  const [showCpCustomerModal, setShowCpCustomerModal] = useState(false);
+  const [showCpEdgeModal, setShowCpEdgeModal] = useState(false);
+  const [showCpLicenseModal, setShowCpLicenseModal] = useState(false);
+  const [cpLicenseModalModules, setCpLicenseModalModules] = useState([]);
   const [devices, setDevices] = useState([]);
   const [showDeviceModal, setShowDeviceModal] = useState(false);
   const [editingDeviceId, setEditingDeviceId] = useState(null);
@@ -10387,6 +10394,7 @@ function AppShell() {
       );
       await refreshControlPlaneData(currentTenantId || "default");
       setCpResult(`Customer '${companyName}' saved.`);
+      setShowCpCustomerModal(false);
     } catch (err) {
       setCpResult(`Customer save failed: ${String(err?.message || err)}`);
     } finally {
@@ -10418,6 +10426,7 @@ function AppShell() {
       );
       await refreshControlPlaneData(currentTenantId || "default");
       setCpResult(`Edge '${edgeName}' saved.`);
+      setShowCpEdgeModal(false);
     } catch (err) {
       setCpResult(`Edge save failed: ${String(err?.message || err)}`);
     } finally {
@@ -10443,6 +10452,207 @@ function AppShell() {
       await upsertControlPlaneLicense(payload, currentTenantId || "default");
       await refreshControlPlaneData(currentTenantId || "default");
       setCpResult(`License '${payload.license_id || payload.plan_code}' saved.`);
+    } catch (err) {
+      setCpResult(`License save failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const openCpCustomerCreate = () => {
+    setCpCustomerForm({
+      customer_id: "",
+      company_name: "",
+      contact_email: "",
+      status: "active",
+    });
+    setShowCpCustomerModal(true);
+  };
+
+  const openCpCustomerEdit = (row) => {
+    setCpCustomerForm({
+      customer_id: String(row?.customer_id || ""),
+      company_name: String(row?.company_name || ""),
+      contact_email: String(row?.contact_email || ""),
+      status: String(row?.status || "active"),
+    });
+    setShowCpCustomerModal(true);
+  };
+
+  const deleteCpCustomer = (row) => {
+    if (!canEditPage("control_plane")) return;
+    const customerId = String(row?.customer_id || "").trim();
+    if (!customerId) return;
+    openConfirmDialog(
+      "Delete Customer",
+      `Delete customer '${customerId}'? This is blocked if edges/licenses still reference it.`,
+      async () => {
+        setCpBusy(true);
+        try {
+          await deleteControlPlaneCustomer(customerId, currentTenantId || "default");
+          await refreshControlPlaneData(currentTenantId || "default");
+          setCpResult(`Customer '${customerId}' deleted.`);
+        } catch (err) {
+          setCpResult(`Customer delete failed: ${String(err?.message || err)}`);
+        } finally {
+          setCpBusy(false);
+        }
+      }
+    );
+  };
+
+  const openCpEdgeCreate = () => {
+    setCpEdgeForm({
+      edge_id: "",
+      edge_name: "",
+      customer_id: "",
+      site: "",
+      area: "",
+      equipment: "",
+      status: "inactive",
+    });
+    setShowCpEdgeModal(true);
+  };
+
+  const openCpEdgeEdit = (row) => {
+    setCpEdgeForm({
+      edge_id: String(row?.edge_id || ""),
+      edge_name: String(row?.edge_name || ""),
+      customer_id: String(row?.customer_id || ""),
+      site: String(row?.site || ""),
+      area: String(row?.area || ""),
+      equipment: String(row?.equipment || ""),
+      status: String(row?.status || "inactive"),
+    });
+    setShowCpEdgeModal(true);
+  };
+
+  const deleteCpEdge = (row) => {
+    if (!canEditPage("control_plane")) return;
+    const edgeId = String(row?.edge_id || "").trim();
+    if (!edgeId) return;
+    openConfirmDialog(
+      "Delete Edge",
+      `Delete edge '${edgeId}' from control plane registry?`,
+      async () => {
+        setCpBusy(true);
+        try {
+          await deleteControlPlaneEdge(edgeId, currentTenantId || "default");
+          await refreshControlPlaneData(currentTenantId || "default");
+          setCpResult(`Edge '${edgeId}' deleted.`);
+        } catch (err) {
+          setCpResult(`Edge delete failed: ${String(err?.message || err)}`);
+        } finally {
+          setCpBusy(false);
+        }
+      }
+    );
+  };
+
+  const openCpLicenseCreate = () => {
+    setCpLicenseForm({
+      license_id: "",
+      customer_id: "",
+      plan_code: "standard",
+      status: "active",
+      start_utc: "",
+      end_utc: "",
+      max_edges: 3,
+      max_users: 10,
+    });
+    setCpLicenseModalModules(cpModuleCatalog.map((m) => ({
+      module_key: String(m?.module_key || m?.key || ""),
+      enabled: Boolean(m?.default_enabled ?? true),
+    })).filter((m) => m.module_key));
+    setShowCpLicenseModal(true);
+  };
+
+  const openCpLicenseEdit = async (row) => {
+    const licenseId = String(row?.license_id || "");
+    setCpLicenseForm({
+      license_id: licenseId,
+      customer_id: String(row?.customer_id || ""),
+      plan_code: String(row?.plan_code || "standard"),
+      status: String(row?.status || "active"),
+      start_utc: String(row?.start_utc || ""),
+      end_utc: String(row?.end_utc || ""),
+      max_edges: Math.max(1, Number(row?.max_edges || 1)),
+      max_users: Math.max(1, Number(row?.max_users || 1)),
+    });
+    setCpBusy(true);
+    try {
+      const res = await getControlPlaneLicenseModules(licenseId);
+      const rows = Array.isArray(res?.rows) ? res.rows : [];
+      const byKey = new Map(rows.map((r) => [String(r?.module_key || ""), Boolean(r?.enabled)]));
+      const merged = cpModuleCatalog
+        .map((m) => {
+          const moduleKey = String(m?.module_key || m?.key || "");
+          if (!moduleKey) return null;
+          return {
+            module_key: moduleKey,
+            enabled: byKey.has(moduleKey) ? Boolean(byKey.get(moduleKey)) : Boolean(m?.default_enabled ?? true),
+          };
+        })
+        .filter(Boolean);
+      setCpLicenseModalModules(merged);
+      setShowCpLicenseModal(true);
+    } catch (err) {
+      setCpResult(`Load license modules failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const deleteCpLicense = (row) => {
+    if (!canEditPage("control_plane")) return;
+    const licenseId = String(row?.license_id || "").trim();
+    if (!licenseId) return;
+    openConfirmDialog(
+      "Delete License",
+      `Delete license '${licenseId}'?`,
+      async () => {
+        setCpBusy(true);
+        try {
+          await deleteControlPlaneLicense(licenseId, currentTenantId || "default");
+          await refreshControlPlaneData(currentTenantId || "default");
+          setCpResult(`License '${licenseId}' deleted.`);
+        } catch (err) {
+          setCpResult(`License delete failed: ${String(err?.message || err)}`);
+        } finally {
+          setCpBusy(false);
+        }
+      }
+    );
+  };
+
+  const saveCpLicenseModal = async () => {
+    if (!canEditPage("control_plane")) return;
+    setCpBusy(true);
+    try {
+      const payload = {
+        license_id: String(cpLicenseForm.license_id || "").trim(),
+        customer_id: String(cpLicenseForm.customer_id || "").trim(),
+        plan_code: String(cpLicenseForm.plan_code || "standard").trim() || "standard",
+        status: String(cpLicenseForm.status || "active").trim() || "active",
+        start_utc: String(cpLicenseForm.start_utc || "").trim(),
+        end_utc: String(cpLicenseForm.end_utc || "").trim(),
+        max_edges: Math.max(1, Number(cpLicenseForm.max_edges || 1)),
+        max_users: Math.max(1, Number(cpLicenseForm.max_users || 1)),
+        metadata: {},
+      };
+      const res = await upsertControlPlaneLicense(payload, currentTenantId || "default");
+      const finalLicenseId = String(res?.row?.license_id || payload.license_id || "").trim();
+      if (finalLicenseId) {
+        await setControlPlaneLicenseModules(finalLicenseId, {
+          modules: (cpLicenseModalModules || []).map((m) => ({
+            module_key: String(m?.module_key || ""),
+            enabled: Boolean(m?.enabled),
+          })),
+        });
+      }
+      await refreshControlPlaneData(currentTenantId || "default");
+      setCpResult(`License '${finalLicenseId || payload.plan_code}' saved.`);
+      setShowCpLicenseModal(false);
     } catch (err) {
       setCpResult(`License save failed: ${String(err?.message || err)}`);
     } finally {
@@ -13826,7 +14036,7 @@ function AppShell() {
             <div className="page-fill">
               <section className="card">
                 <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-                  <h4 style={{ margin: 0 }}>Control Plane</h4>
+                  <h4 style={{ margin: 0 }}>Developer Control Plane</h4>
                   <button
                     className="btn btn-primary"
                     onClick={() => refreshControlPlaneData(currentTenantId || "default")}
@@ -13857,29 +14067,89 @@ function AppShell() {
               </section>
 
               <section className="card">
-                <h4>Edge Heartbeat Health</h4>
-                <div className="form-grid">
-                  <label>
-                    Healthy (&lt;= 90s)
-                    <input readOnly value={String(cpEdgeHeartbeatSummary.healthy)} />
-                  </label>
-                  <label>
-                    Stale (&gt; 90s)
-                    <input readOnly value={String(cpEdgeHeartbeatSummary.stale)} />
-                  </label>
-                  <label>
-                    Missing heartbeat
-                    <input readOnly value={String(cpEdgeHeartbeatSummary.missing)} />
-                  </label>
-                  <label>
-                    Latest heartbeat
-                    <input readOnly value={fmtTs(cpEdgeHeartbeatSummary.latestHeartbeatUtc || "")} />
-                  </label>
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                  <h4 style={{ margin: 0 }}>Licensing</h4>
+                  <div className="row">
+                    <button className="btn btn-success" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add License</button>
+                  </div>
+                </div>
+                <div className="table-scroll" style={{ marginTop: 10 }}>
+                  <div className="table">
+                    <div className="thead"><span>License Key</span><span>Customer</span><span>Modules</span><span>Edges/Users</span><span>Active Window</span><span>Status</span><span>Actions</span></div>
+                    {cpLicenses.map((row, idx) => (
+                      <div className="trow" key={String(row?.license_id || `license-${idx}`)}>
+                        <span>{String(row?.license_id || "-")}</span>
+                        <span>{String(row?.customer_id || "-")}</span>
+                        <span>{String(row?.plan_code || "-")}</span>
+                        <span>{`${Number(row?.max_edges || 0)} / ${Number(row?.max_users || 0)}`}</span>
+                        <span>{`${String(row?.start_utc || "-")} -> ${String(row?.end_utc || "-")}`}</span>
+                        <span>{String(row?.status || "-")}</span>
+                        <span className="row-actions">
+                          <button className="icon-btn table-action-btn" onClick={() => openCpLicenseEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
+                          <button className="icon-btn danger table-action-btn" onClick={() => deleteCpLicense(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </section>
 
               <section className="card">
-                <h4>Tenant Setup</h4>
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                  <h4 style={{ margin: 0 }}>Customers</h4>
+                  <div className="row">
+                    <button className="btn btn-success" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Customer</button>
+                  </div>
+                </div>
+                <div className="table-scroll" style={{ marginTop: 10 }}>
+                  <div className="table">
+                    <div className="thead"><span>Customer ID</span><span>Company</span><span>Email</span><span>Status</span><span>Actions</span></div>
+                    {cpCustomers.map((row, idx) => (
+                      <div className="trow" key={String(row?.customer_id || `customer-${idx}`)}>
+                        <span>{String(row?.customer_id || "-")}</span>
+                        <span>{String(row?.company_name || "-")}</span>
+                        <span>{String(row?.contact_email || "-")}</span>
+                        <span>{String(row?.status || "-")}</span>
+                        <span className="row-actions">
+                          <button className="icon-btn table-action-btn" onClick={() => openCpCustomerEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
+                          <button className="icon-btn danger table-action-btn" onClick={() => deleteCpCustomer(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </section>
+
+              <section className="card">
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                  <h4 style={{ margin: 0 }}>Edges</h4>
+                  <div className="row">
+                    <button className="btn btn-success" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Edge</button>
+                  </div>
+                </div>
+                <div className="table-scroll" style={{ marginTop: 10 }}>
+                  <div className="table">
+                    <div className="thead"><span>Edge ID</span><span>Name</span><span>Customer</span><span>Site / Area / Equipment</span><span>Status</span><span>Last Heartbeat</span><span>Actions</span></div>
+                    {cpEdges.map((row, idx) => (
+                      <div className="trow" key={String(row?.edge_id || `edge-${idx}`)}>
+                        <span>{String(row?.edge_id || "-")}</span>
+                        <span>{String(row?.edge_name || "-")}</span>
+                        <span>{String(row?.customer_id || "-")}</span>
+                        <span>{`${String(row?.site || "-")} / ${String(row?.area || "-")} / ${String(row?.equipment || "-")}`}</span>
+                        <span>{String(row?.status || "-")}</span>
+                        <span>{fmtTs(row?.last_heartbeat_utc || row?.updated_utc || "")}</span>
+                        <span className="row-actions">
+                          <button className="icon-btn table-action-btn" onClick={() => openCpEdgeEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
+                          <button className="icon-btn danger table-action-btn" onClick={() => deleteCpEdge(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </section>
+
+              <section className="card">
+                <h4>Tenant + Bundle Provisioning</h4>
                 <div className="form-grid">
                   <label>
                     Tenant ID
@@ -13890,7 +14160,7 @@ function AppShell() {
                     />
                   </label>
                   <label>
-                    Name
+                    Tenant Name
                     <input
                       value={cpTenantForm.name}
                       onChange={(e) => setCpTenantForm((p) => ({ ...p, name: e.target.value }))}
@@ -13902,7 +14172,7 @@ function AppShell() {
                     <input
                       value={cpTenantForm.primary_domain}
                       onChange={(e) => setCpTenantForm((p) => ({ ...p, primary_domain: e.target.value }))}
-                      placeholder="customer-a.trustnode.lsapps.app"
+                      placeholder="customer-a-trustnode.lsapps.app"
                     />
                   </label>
                   <label>
@@ -13929,26 +14199,18 @@ function AppShell() {
                     Save Tenant
                   </button>
                 </div>
-              </section>
-
-              <section className="card">
-                <h4>Quick Customer Bundle Provision</h4>
-                <div className="form-grid">
+                <div className="form-grid" style={{ marginTop: 12 }}>
                   <label>
-                    Tenant ID
+                    Bundle Tenant ID
                     <input value={cpBundleForm.tenant_id} onChange={(e) => setCpBundleForm((p) => ({ ...p, tenant_id: e.target.value }))} placeholder="customer_a" />
                   </label>
                   <label>
-                    Tenant Name
+                    Bundle Tenant Name
                     <input value={cpBundleForm.tenant_name} onChange={(e) => setCpBundleForm((p) => ({ ...p, tenant_name: e.target.value }))} placeholder="Customer A" />
                   </label>
                   <label>
                     Primary Domain
                     <input value={cpBundleForm.primary_domain} onChange={(e) => setCpBundleForm((p) => ({ ...p, primary_domain: e.target.value }))} placeholder="customer-a-trustnode.lsapps.app" />
-                  </label>
-                  <label>
-                    Timezone
-                    <input value={cpBundleForm.timezone} onChange={(e) => setCpBundleForm((p) => ({ ...p, timezone: e.target.value }))} placeholder="Europe/Dublin" />
                   </label>
                   <label>
                     Customer ID
@@ -13959,32 +14221,12 @@ function AppShell() {
                     <input value={cpBundleForm.company_name} onChange={(e) => setCpBundleForm((p) => ({ ...p, company_name: e.target.value }))} placeholder="Customer A" />
                   </label>
                   <label>
-                    Contact Email
-                    <input value={cpBundleForm.contact_email} onChange={(e) => setCpBundleForm((p) => ({ ...p, contact_email: e.target.value }))} placeholder="admin-a@customer.local" />
-                  </label>
-                  <label>
                     Admin Username
                     <input value={cpBundleForm.admin_username} onChange={(e) => setCpBundleForm((p) => ({ ...p, admin_username: e.target.value }))} placeholder="admin_a" />
                   </label>
                   <label>
                     Admin Password
                     <input type="password" value={cpBundleForm.admin_password} onChange={(e) => setCpBundleForm((p) => ({ ...p, admin_password: e.target.value }))} placeholder="StrongPassword!" />
-                  </label>
-                  <label>
-                    License ID (optional)
-                    <input value={cpBundleForm.license_id} onChange={(e) => setCpBundleForm((p) => ({ ...p, license_id: e.target.value }))} placeholder="lic-customer_a" />
-                  </label>
-                  <label>
-                    Plan Code
-                    <input value={cpBundleForm.plan_code} onChange={(e) => setCpBundleForm((p) => ({ ...p, plan_code: e.target.value }))} placeholder="standard" />
-                  </label>
-                  <label>
-                    Max Edges
-                    <input type="number" min="1" value={cpBundleForm.max_edges} onChange={(e) => setCpBundleForm((p) => ({ ...p, max_edges: Number(e.target.value || 1) }))} />
-                  </label>
-                  <label>
-                    Max Users
-                    <input type="number" min="1" value={cpBundleForm.max_users} onChange={(e) => setCpBundleForm((p) => ({ ...p, max_users: Number(e.target.value || 1) }))} />
                   </label>
                 </div>
                 <div className="row">
@@ -13995,150 +14237,25 @@ function AppShell() {
               </section>
 
               <section className="card">
-                <h4>Customer / Edge / License</h4>
+                <h4>Edge Health / Activation / Password Recovery</h4>
                 <div className="form-grid">
                   <label>
-                    Customer ID
-                    <input value={cpCustomerForm.customer_id} onChange={(e) => setCpCustomerForm((p) => ({ ...p, customer_id: e.target.value }))} />
+                    Healthy (&lt;= 90s)
+                    <input readOnly value={String(cpEdgeHeartbeatSummary.healthy)} />
                   </label>
                   <label>
-                    Company Name
-                    <input value={cpCustomerForm.company_name} onChange={(e) => setCpCustomerForm((p) => ({ ...p, company_name: e.target.value }))} />
+                    Stale (&gt; 90s)
+                    <input readOnly value={String(cpEdgeHeartbeatSummary.stale)} />
                   </label>
                   <label>
-                    Contact Email
-                    <input value={cpCustomerForm.contact_email} onChange={(e) => setCpCustomerForm((p) => ({ ...p, contact_email: e.target.value }))} />
+                    Missing heartbeat
+                    <input readOnly value={String(cpEdgeHeartbeatSummary.missing)} />
                   </label>
                   <label>
-                    Customer Status
-                    <select value={cpCustomerForm.status} onChange={(e) => setCpCustomerForm((p) => ({ ...p, status: e.target.value }))}>
-                      <option value="active">active</option>
-                      <option value="inactive">inactive</option>
-                    </select>
+                    Latest heartbeat
+                    <input readOnly value={fmtTs(cpEdgeHeartbeatSummary.latestHeartbeatUtc || "")} />
                   </label>
                 </div>
-                <div className="row">
-                  <button className="btn btn-success" onClick={saveControlPlaneCustomer} disabled={cpBusy || !canEditPage("control_plane")}>Save Customer</button>
-                </div>
-
-                <div className="form-grid" style={{ marginTop: 12 }}>
-                  <label>
-                    Edge ID
-                    <input value={cpEdgeForm.edge_id} onChange={(e) => setCpEdgeForm((p) => ({ ...p, edge_id: e.target.value }))} />
-                  </label>
-                  <label>
-                    Edge Name
-                    <input value={cpEdgeForm.edge_name} onChange={(e) => setCpEdgeForm((p) => ({ ...p, edge_name: e.target.value }))} />
-                  </label>
-                  <label>
-                    Edge Customer ID
-                    <input value={cpEdgeForm.customer_id} onChange={(e) => setCpEdgeForm((p) => ({ ...p, customer_id: e.target.value }))} />
-                  </label>
-                  <label>
-                    Site
-                    <input value={cpEdgeForm.site} onChange={(e) => setCpEdgeForm((p) => ({ ...p, site: e.target.value }))} />
-                  </label>
-                  <label>
-                    Area
-                    <input value={cpEdgeForm.area} onChange={(e) => setCpEdgeForm((p) => ({ ...p, area: e.target.value }))} />
-                  </label>
-                  <label>
-                    Equipment
-                    <input value={cpEdgeForm.equipment} onChange={(e) => setCpEdgeForm((p) => ({ ...p, equipment: e.target.value }))} />
-                  </label>
-                  <label>
-                    Edge Status
-                    <select value={cpEdgeForm.status} onChange={(e) => setCpEdgeForm((p) => ({ ...p, status: e.target.value }))}>
-                      <option value="active">active</option>
-                      <option value="inactive">inactive</option>
-                    </select>
-                  </label>
-                </div>
-                <div className="row">
-                  <button className="btn btn-success" onClick={saveControlPlaneEdge} disabled={cpBusy || !canEditPage("control_plane")}>Save Edge</button>
-                </div>
-
-                <div className="form-grid" style={{ marginTop: 12 }}>
-                  <label>
-                    License ID
-                    <input value={cpLicenseForm.license_id} onChange={(e) => setCpLicenseForm((p) => ({ ...p, license_id: e.target.value }))} />
-                  </label>
-                  <label>
-                    License Customer ID
-                    <input value={cpLicenseForm.customer_id} onChange={(e) => setCpLicenseForm((p) => ({ ...p, customer_id: e.target.value }))} />
-                  </label>
-                  <label>
-                    Plan Code
-                    <input value={cpLicenseForm.plan_code} onChange={(e) => setCpLicenseForm((p) => ({ ...p, plan_code: e.target.value }))} />
-                  </label>
-                  <label>
-                    License Status
-                    <select value={cpLicenseForm.status} onChange={(e) => setCpLicenseForm((p) => ({ ...p, status: e.target.value }))}>
-                      <option value="active">active</option>
-                      <option value="suspended">suspended</option>
-                    </select>
-                  </label>
-                  <label>
-                    Start UTC
-                    <input value={cpLicenseForm.start_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, start_utc: e.target.value }))} placeholder="2026-04-23T00:00:00Z" />
-                  </label>
-                  <label>
-                    End UTC
-                    <input value={cpLicenseForm.end_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, end_utc: e.target.value }))} placeholder="2027-04-23T00:00:00Z" />
-                  </label>
-                  <label>
-                    Max Edges
-                    <input type="number" min="1" value={cpLicenseForm.max_edges} onChange={(e) => setCpLicenseForm((p) => ({ ...p, max_edges: Number(e.target.value || 1) }))} />
-                  </label>
-                  <label>
-                    Max Users
-                    <input type="number" min="1" value={cpLicenseForm.max_users} onChange={(e) => setCpLicenseForm((p) => ({ ...p, max_users: Number(e.target.value || 1) }))} />
-                  </label>
-                </div>
-                <div className="row">
-                  <button className="btn btn-success" onClick={saveControlPlaneLicense} disabled={cpBusy || !canEditPage("control_plane")}>Save License</button>
-                </div>
-              </section>
-
-              <section className="card">
-                <h4>License Modules</h4>
-                <div className="form-grid">
-                  <label>
-                    License
-                    <select value={cpSelectedLicenseId} onChange={(e) => loadControlPlaneLicenseModules(e.target.value)}>
-                      <option value="">Select license</option>
-                      {cpLicenses.map((l) => (
-                        <option key={String(l.license_id || "")} value={String(l.license_id || "")}>
-                          {String(l.license_id || "")} | {String(l.plan_code || "")}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    Module Catalog
-                    <input
-                      readOnly
-                      value={cpModuleCatalog.map((m) => String(m?.module_key || m?.key || "")).filter(Boolean).join(", ")}
-                      placeholder="No catalog"
-                    />
-                  </label>
-                </div>
-                <label>
-                  Modules JSON
-                  <textarea
-                    rows={8}
-                    value={cpLicenseModulesText}
-                    onChange={(e) => setCpLicenseModulesText(e.target.value)}
-                    placeholder='[{"module_key":"dashboard","enabled":true}]'
-                  />
-                </label>
-                <div className="row">
-                  <button className="btn btn-success" onClick={saveControlPlaneLicenseModules} disabled={cpBusy || !canEditPage("control_plane")}>Save Modules</button>
-                </div>
-              </section>
-
-              <section className="card">
-                <h4>Activation / Password Recovery</h4>
                 <div className="form-grid">
                   <label>
                     Issue Activation (Customer ID)
@@ -14217,36 +14334,6 @@ function AppShell() {
                 </div>
                 <div className="row">
                   <button className="btn btn-primary" onClick={applyTenantPasswordReset} disabled={cpBusy || !canEditPage("control_plane")}>Apply Password Reset</button>
-                </div>
-              </section>
-
-              <section className="card">
-                <h4>Control Plane Rows</h4>
-                <div className="table-scroll">
-                  <div className="table">
-                    <div className="thead"><span>Customer</span><span>Status</span><span>Email</span></div>
-                    {cpCustomers.map((row, idx) => (
-                      <div className="trow" key={`${row.customer_id || "customer"}-${idx}`}>
-                        <span>{row.customer_id || "-"}</span>
-                        <span>{row.status || "-"}</span>
-                        <span>{row.contact_email || "-"}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-                <div className="table-scroll" style={{ marginTop: 12 }}>
-                  <div className="table">
-                    <div className="thead"><span>Edge</span><span>Customer</span><span>Status</span><span>Site/Area</span><span>Last Heartbeat</span></div>
-                    {cpEdges.map((row, idx) => (
-                      <div className="trow" key={`${row.edge_id || "edge"}-${idx}`}>
-                        <span>{row.edge_id || "-"}</span>
-                        <span>{row.customer_id || "-"}</span>
-                        <span>{row.status || "-"}</span>
-                        <span>{[row.site || "-", row.area || "-"].join(" / ")}</span>
-                        <span>{fmtTs(row.last_heartbeat_utc || row.updated_utc || "")}</span>
-                      </div>
-                    ))}
-                  </div>
                 </div>
               </section>
             </div>
@@ -15721,6 +15808,153 @@ function AppShell() {
             <div className="row modal-actions">
               <button className="btn btn-primary" onClick={saveEditedUser} disabled={!canManageUsers}>Save</button>
               <button className="btn btn-danger" onClick={() => setShowEditUserModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showCpCustomerModal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card trigger-modal-card">
+            <h3>{cpCustomerForm.customer_id ? "Edit Customer" : "Add Customer"}</h3>
+            <div className="trigger-form-grid">
+              <label>
+                Customer ID
+                <input value={cpCustomerForm.customer_id} onChange={(e) => setCpCustomerForm((p) => ({ ...p, customer_id: e.target.value }))} placeholder="auto if empty" />
+              </label>
+              <label>
+                Company Name
+                <input value={cpCustomerForm.company_name} onChange={(e) => setCpCustomerForm((p) => ({ ...p, company_name: e.target.value }))} />
+              </label>
+              <label>
+                Contact Email
+                <input value={cpCustomerForm.contact_email} onChange={(e) => setCpCustomerForm((p) => ({ ...p, contact_email: e.target.value }))} />
+              </label>
+              <label>
+                Status
+                <select value={cpCustomerForm.status} onChange={(e) => setCpCustomerForm((p) => ({ ...p, status: e.target.value }))}>
+                  <option value="active">active</option>
+                  <option value="inactive">inactive</option>
+                </select>
+              </label>
+            </div>
+            <div className="row modal-actions">
+              <button className="btn btn-primary" onClick={saveControlPlaneCustomer} disabled={cpBusy || !canEditPage("control_plane")}>Save</button>
+              <button className="btn btn-danger" onClick={() => setShowCpCustomerModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showCpEdgeModal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card trigger-modal-card">
+            <h3>{cpEdgeForm.edge_id ? "Edit Edge" : "Add Edge"}</h3>
+            <div className="trigger-form-grid">
+              <label>
+                Edge ID
+                <input value={cpEdgeForm.edge_id} onChange={(e) => setCpEdgeForm((p) => ({ ...p, edge_id: e.target.value }))} placeholder="auto if empty" />
+              </label>
+              <label>
+                Edge Name
+                <input value={cpEdgeForm.edge_name} onChange={(e) => setCpEdgeForm((p) => ({ ...p, edge_name: e.target.value }))} />
+              </label>
+              <label>
+                Customer ID
+                <input value={cpEdgeForm.customer_id} onChange={(e) => setCpEdgeForm((p) => ({ ...p, customer_id: e.target.value }))} />
+              </label>
+              <label>
+                Site
+                <input value={cpEdgeForm.site} onChange={(e) => setCpEdgeForm((p) => ({ ...p, site: e.target.value }))} />
+              </label>
+              <label>
+                Area
+                <input value={cpEdgeForm.area} onChange={(e) => setCpEdgeForm((p) => ({ ...p, area: e.target.value }))} />
+              </label>
+              <label>
+                Equipment
+                <input value={cpEdgeForm.equipment} onChange={(e) => setCpEdgeForm((p) => ({ ...p, equipment: e.target.value }))} />
+              </label>
+              <label>
+                Status
+                <select value={cpEdgeForm.status} onChange={(e) => setCpEdgeForm((p) => ({ ...p, status: e.target.value }))}>
+                  <option value="active">active</option>
+                  <option value="inactive">inactive</option>
+                </select>
+              </label>
+            </div>
+            <div className="row modal-actions">
+              <button className="btn btn-primary" onClick={saveControlPlaneEdge} disabled={cpBusy || !canEditPage("control_plane")}>Save</button>
+              <button className="btn btn-danger" onClick={() => setShowCpEdgeModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showCpLicenseModal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card trigger-modal-card">
+            <h3>{cpLicenseForm.license_id ? "Edit License" : "Generate License"}</h3>
+            <div className="trigger-form-grid">
+              <label>
+                License Key
+                <input value={cpLicenseForm.license_id} onChange={(e) => setCpLicenseForm((p) => ({ ...p, license_id: e.target.value }))} placeholder="auto if empty" />
+              </label>
+              <label>
+                Customer ID
+                <input value={cpLicenseForm.customer_id} onChange={(e) => setCpLicenseForm((p) => ({ ...p, customer_id: e.target.value }))} />
+              </label>
+              <label>
+                Plan
+                <input value={cpLicenseForm.plan_code} onChange={(e) => setCpLicenseForm((p) => ({ ...p, plan_code: e.target.value }))} />
+              </label>
+              <label>
+                Status
+                <select value={cpLicenseForm.status} onChange={(e) => setCpLicenseForm((p) => ({ ...p, status: e.target.value }))}>
+                  <option value="active">active</option>
+                  <option value="suspended">suspended</option>
+                </select>
+              </label>
+              <label>
+                Start UTC
+                <input value={cpLicenseForm.start_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, start_utc: e.target.value }))} placeholder="2026-04-24T00:00:00Z" />
+              </label>
+              <label>
+                End UTC
+                <input value={cpLicenseForm.end_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, end_utc: e.target.value }))} placeholder="2027-04-24T00:00:00Z" />
+              </label>
+              <label>
+                Max Edges
+                <input type="number" min="1" value={cpLicenseForm.max_edges} onChange={(e) => setCpLicenseForm((p) => ({ ...p, max_edges: Number(e.target.value || 1) }))} />
+              </label>
+              <label>
+                Max Users
+                <input type="number" min="1" value={cpLicenseForm.max_users} onChange={(e) => setCpLicenseForm((p) => ({ ...p, max_users: Number(e.target.value || 1) }))} />
+              </label>
+            </div>
+            <div style={{ marginTop: 8 }}>
+              <div style={{ marginBottom: 6, fontWeight: 600 }}>Modules</div>
+              <div className="form-grid">
+                {cpLicenseModalModules.map((mod) => (
+                  <label key={String(mod?.module_key || "")} className="remember-row">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(mod?.enabled)}
+                      onChange={(e) =>
+                        setCpLicenseModalModules((prev) =>
+                          prev.map((x) =>
+                            String(x?.module_key || "") === String(mod?.module_key || "")
+                              ? { ...x, enabled: e.target.checked }
+                              : x
+                          )
+                        )
+                      }
+                    />
+                    <span className="remember-label">{String(mod?.module_key || "")}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="row modal-actions">
+              <button className="btn btn-primary" onClick={saveCpLicenseModal} disabled={cpBusy || !canEditPage("control_plane")}>Save</button>
+              <button className="btn btn-danger" onClick={() => setShowCpLicenseModal(false)}>Cancel</button>
             </div>
           </div>
         </div>

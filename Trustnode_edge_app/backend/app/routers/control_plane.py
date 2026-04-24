@@ -218,6 +218,21 @@ def upsert_customer(payload: CustomerUpsertRequest, request: Request, tenant_id:
     return {"ok": True, "tenant_id": tid, "row": row}
 
 
+@router.delete("/customers/{customer_id}")
+def delete_customer(request: Request, customer_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    try:
+        deleted = control_plane_store.delete_customer(tenant_id=tid, customer_id=customer_id)
+    except Exception as exc:
+        _audit(request, tenant_id=tid, action="customer.delete", outcome="error", details={"customer_id": customer_id, "error": str(exc)})
+        raise HTTPException(status_code=409, detail=f"customer_delete_blocked:{exc}") from exc
+    if not deleted:
+        _audit(request, tenant_id=tid, action="customer.delete", outcome="not_found", details={"customer_id": customer_id})
+        raise HTTPException(status_code=404, detail="customer_not_found")
+    _audit(request, tenant_id=tid, action="customer.delete", outcome="ok", details={"customer_id": customer_id})
+    return {"ok": True, "tenant_id": tid, "customer_id": customer_id}
+
+
 @router.get("/edges")
 def list_edges(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
     tid = _scoped_tenant(request, tenant_id)
@@ -246,6 +261,17 @@ def upsert_edge(payload: EdgeUpsertRequest, request: Request, tenant_id: str | N
         details={"edge_id": row.get("edge_id", "")},
     )
     return {"ok": True, "tenant_id": tid, "row": row}
+
+
+@router.delete("/edges/{edge_id}")
+def delete_edge(request: Request, edge_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    deleted = control_plane_store.delete_edge(tenant_id=tid, edge_id=edge_id)
+    if not deleted:
+        _audit(request, tenant_id=tid, action="edge.delete", outcome="not_found", details={"edge_id": edge_id})
+        raise HTTPException(status_code=404, detail="edge_not_found")
+    _audit(request, tenant_id=tid, action="edge.delete", outcome="ok", details={"edge_id": edge_id})
+    return {"ok": True, "tenant_id": tid, "edge_id": edge_id}
 
 
 @router.post("/edges/heartbeat")
@@ -288,6 +314,17 @@ def upsert_license(payload: LicenseUpsertRequest, request: Request, tenant_id: s
         details={"license_id": row.get("license_id", "")},
     )
     return {"ok": True, "tenant_id": tid, "row": row}
+
+
+@router.delete("/licenses/{license_id}")
+def delete_license(request: Request, license_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    deleted = control_plane_store.delete_license(tenant_id=tid, license_id=license_id)
+    if not deleted:
+        _audit(request, tenant_id=tid, action="license.delete", outcome="not_found", details={"license_id": license_id})
+        raise HTTPException(status_code=404, detail="license_not_found")
+    _audit(request, tenant_id=tid, action="license.delete", outcome="ok", details={"license_id": license_id})
+    return {"ok": True, "tenant_id": tid, "license_id": license_id}
 
 
 @router.get("/licenses/{license_id}/modules")
