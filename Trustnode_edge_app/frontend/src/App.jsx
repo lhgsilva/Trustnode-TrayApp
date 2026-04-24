@@ -61,6 +61,7 @@ import {
   startPowerDevice,
   stopPowerDevice,
   getControlPlaneRuntimeContext,
+  getControlPlanePortalContext,
   getControlPlaneModuleCatalog,
   getControlPlaneSummary,
   getControlPlaneTenants,
@@ -81,6 +82,7 @@ import {
   applyControlPlaneActivationCode,
   issueControlPlanePasswordReset,
   applyControlPlanePasswordReset,
+  provisionControlPlaneCustomerBundle,
 } from "./api";
 import { Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
@@ -2087,6 +2089,21 @@ function AppShell() {
     status: "active",
     primary_domain: "",
     timezone: "UTC",
+  });
+  const [cpBundleForm, setCpBundleForm] = useState({
+    tenant_id: "",
+    tenant_name: "",
+    primary_domain: "",
+    timezone: "Europe/Dublin",
+    customer_id: "",
+    company_name: "",
+    contact_email: "",
+    admin_username: "admin",
+    admin_password: "",
+    license_id: "",
+    plan_code: "standard",
+    max_edges: 10,
+    max_users: 50,
   });
   const [cpCustomerForm, setCpCustomerForm] = useState({
     customer_id: "",
@@ -10301,6 +10318,54 @@ function AppShell() {
     }
   };
 
+  const provisionControlPlaneBundle = async () => {
+    if (!canEditPage("control_plane")) return;
+    const tenantId = String(cpBundleForm.tenant_id || "").trim();
+    const tenantName = String(cpBundleForm.tenant_name || "").trim();
+    const primaryDomain = String(cpBundleForm.primary_domain || "").trim().toLowerCase();
+    const customerId = String(cpBundleForm.customer_id || "").trim();
+    const companyName = String(cpBundleForm.company_name || "").trim();
+    const adminPassword = String(cpBundleForm.admin_password || "");
+    if (!tenantId || !tenantName || !primaryDomain || !customerId || !companyName || !adminPassword) {
+      setCpResult("Bundle provisioning requires tenant, domain, customer, company, and admin password.");
+      return;
+    }
+    setCpBusy(true);
+    try {
+      const payload = {
+        tenant_id: tenantId,
+        tenant_name: tenantName,
+        primary_domain: primaryDomain,
+        timezone: String(cpBundleForm.timezone || "Europe/Dublin").trim() || "Europe/Dublin",
+        customer_id: customerId,
+        company_name: companyName,
+        contact_email: String(cpBundleForm.contact_email || "").trim(),
+        admin_username: String(cpBundleForm.admin_username || "admin").trim() || "admin",
+        admin_password: adminPassword,
+        license_id: String(cpBundleForm.license_id || "").trim(),
+        plan_code: String(cpBundleForm.plan_code || "standard").trim() || "standard",
+        max_edges: Math.max(1, Number(cpBundleForm.max_edges || 1)),
+        max_users: Math.max(1, Number(cpBundleForm.max_users || 1)),
+      };
+      await provisionControlPlaneCustomerBundle(payload);
+      await refreshControlPlaneData(tenantId);
+      let portalStatus = "";
+      try {
+        const ctx = await getControlPlanePortalContext();
+        if (ctx?.resolved) {
+          portalStatus = ` | current host tenant=${String(ctx.tenant_id || "")}`;
+        }
+      } catch {
+        portalStatus = "";
+      }
+      setCpResult(`Customer bundle provisioned for '${tenantId}' (${primaryDomain}).${portalStatus}`);
+    } catch (err) {
+      setCpResult(`Bundle provision failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
   const saveControlPlaneCustomer = async () => {
     if (!canEditPage("control_plane")) return;
     const companyName = String(cpCustomerForm.company_name || "").trim();
@@ -13862,6 +13927,69 @@ function AppShell() {
                 <div className="row">
                   <button className="btn btn-success" onClick={saveControlPlaneTenant} disabled={cpBusy || !canEditPage("control_plane")}>
                     Save Tenant
+                  </button>
+                </div>
+              </section>
+
+              <section className="card">
+                <h4>Quick Customer Bundle Provision</h4>
+                <div className="form-grid">
+                  <label>
+                    Tenant ID
+                    <input value={cpBundleForm.tenant_id} onChange={(e) => setCpBundleForm((p) => ({ ...p, tenant_id: e.target.value }))} placeholder="customer_a" />
+                  </label>
+                  <label>
+                    Tenant Name
+                    <input value={cpBundleForm.tenant_name} onChange={(e) => setCpBundleForm((p) => ({ ...p, tenant_name: e.target.value }))} placeholder="Customer A" />
+                  </label>
+                  <label>
+                    Primary Domain
+                    <input value={cpBundleForm.primary_domain} onChange={(e) => setCpBundleForm((p) => ({ ...p, primary_domain: e.target.value }))} placeholder="customer-a-trustnode.lsapps.app" />
+                  </label>
+                  <label>
+                    Timezone
+                    <input value={cpBundleForm.timezone} onChange={(e) => setCpBundleForm((p) => ({ ...p, timezone: e.target.value }))} placeholder="Europe/Dublin" />
+                  </label>
+                  <label>
+                    Customer ID
+                    <input value={cpBundleForm.customer_id} onChange={(e) => setCpBundleForm((p) => ({ ...p, customer_id: e.target.value }))} placeholder="cust-a" />
+                  </label>
+                  <label>
+                    Company Name
+                    <input value={cpBundleForm.company_name} onChange={(e) => setCpBundleForm((p) => ({ ...p, company_name: e.target.value }))} placeholder="Customer A" />
+                  </label>
+                  <label>
+                    Contact Email
+                    <input value={cpBundleForm.contact_email} onChange={(e) => setCpBundleForm((p) => ({ ...p, contact_email: e.target.value }))} placeholder="admin-a@customer.local" />
+                  </label>
+                  <label>
+                    Admin Username
+                    <input value={cpBundleForm.admin_username} onChange={(e) => setCpBundleForm((p) => ({ ...p, admin_username: e.target.value }))} placeholder="admin_a" />
+                  </label>
+                  <label>
+                    Admin Password
+                    <input type="password" value={cpBundleForm.admin_password} onChange={(e) => setCpBundleForm((p) => ({ ...p, admin_password: e.target.value }))} placeholder="StrongPassword!" />
+                  </label>
+                  <label>
+                    License ID (optional)
+                    <input value={cpBundleForm.license_id} onChange={(e) => setCpBundleForm((p) => ({ ...p, license_id: e.target.value }))} placeholder="lic-customer_a" />
+                  </label>
+                  <label>
+                    Plan Code
+                    <input value={cpBundleForm.plan_code} onChange={(e) => setCpBundleForm((p) => ({ ...p, plan_code: e.target.value }))} placeholder="standard" />
+                  </label>
+                  <label>
+                    Max Edges
+                    <input type="number" min="1" value={cpBundleForm.max_edges} onChange={(e) => setCpBundleForm((p) => ({ ...p, max_edges: Number(e.target.value || 1) }))} />
+                  </label>
+                  <label>
+                    Max Users
+                    <input type="number" min="1" value={cpBundleForm.max_users} onChange={(e) => setCpBundleForm((p) => ({ ...p, max_users: Number(e.target.value || 1) }))} />
+                  </label>
+                </div>
+                <div className="row">
+                  <button className="btn btn-success" onClick={provisionControlPlaneBundle} disabled={cpBusy || !canEditPage("control_plane")}>
+                    Provision Customer Bundle
                   </button>
                 </div>
               </section>

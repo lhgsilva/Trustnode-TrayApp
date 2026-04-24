@@ -91,6 +91,23 @@ class PasswordResetApplyRequest(BaseModel):
     new_password: str
 
 
+class CustomerBundleProvisionRequest(BaseModel):
+    tenant_id: str
+    tenant_name: str
+    primary_domain: str
+    timezone: str = "Europe/Dublin"
+    customer_id: str
+    company_name: str
+    contact_email: str = ""
+    admin_username: str = "admin"
+    admin_password: str
+    license_id: str = ""
+    plan_code: str = "standard"
+    max_edges: int = 5
+    max_users: int = 25
+    modules: list[dict[str, Any]] = Field(default_factory=list)
+
+
 def _require_auth_payload(request: Request) -> dict[str, Any]:
     payload = getattr(request.state, "user_payload", {}) or {}
     if not payload:
@@ -347,7 +364,9 @@ def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request,
 
 @router.post("/activation-code/apply")
 def apply_activation_code(payload: ActivationCodeApplyRequest, request: Request) -> dict[str, Any]:
-    _require_auth_payload(request)
+    auth_payload = getattr(request.state, "user_payload", {}) or {}
+    actor_type = "user" if auth_payload else "device"
+    actor_id = str(auth_payload.get("sub") or payload.edge_id or "edge")
     try:
         row = control_plane_store.activate_edge_with_code(
             activation_code=payload.activation_code,
@@ -358,14 +377,24 @@ def apply_activation_code(payload: ActivationCodeApplyRequest, request: Request)
             equipment=payload.equipment,
         )
         tid = normalize_tenant_id(str(row.get("tenant_id") or get_current_tenant()))
-        _audit(request, tenant_id=tid, action="activation_code.apply", outcome="ok", details={"edge_id": payload.edge_id})
+        control_plane_store.audit(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            tenant_id=tid,
+            action="activation_code.apply",
+            outcome="ok",
+            correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
+            details={"edge_id": payload.edge_id},
+        )
         return {"ok": True, "row": row}
     except Exception as exc:
-        _audit(
-            request,
+        control_plane_store.audit(
+            actor_type=actor_type,
+            actor_id=actor_id,
             tenant_id=get_current_tenant(),
             action="activation_code.apply",
             outcome="error",
+            correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
             details={"edge_id": payload.edge_id, "error": str(exc)},
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -447,3 +476,95 @@ def edge_bootstrap_status(request: Request) -> dict[str, Any]:
         "last_outbox_error": diag.get("last_outbox_error"),
         "by_gateway": diag.get("outbox_by_gateway") or [],
     }
+
+
+@router.post("/provision/customer-bundle")
+def provision_customer_bundle(payload: CustomerBundleProvisionRequest, request: Request) -> dict[str, Any]:
+    user_payload = _require_auth_payload(request)
+    if not _is_global_admin(user_payload):
+        raise HTTPException(status_code=403, detail="Global admin required")
+    license_id = str(payload.license_id or "").strip() or f"lic-{normalize_tenant_id(payload.tenant_id)}"
+    row = control_plane_store.provision_customer_bundle(
+        tenant_id=payload.tenant_id,
+        tenant_name=payload.tenant_name,
+        primary_domain=payload.primary_domain,
+        timezone_name=payload.timezone,
+        customer_id=payload.customer_id,
+        company_name=payload.company_name,
+        contact_email=payload.contact_email,
+        admin_username=payload.admin_username,
+        admin_password=payload.admin_password,
+        license_id=license_id,
+        plan_code=payload.plan_code,
+        max_edges=payload.max_edges,
+        max_users=payload.max_users,
+        modules=payload.modules,
+    )
+    _audit(
+        request,
+        tenant_id=normalize_tenant_id(payload.tenant_id),
+        action="customer_bundle.provision",
+        outcome="ok",
+        details={
+            "tenant_id": payload.tenant_id,
+            "customer_id": payload.customer_id,
+            "primary_domain": payload.primary_domain,
+            "license_id": license_id,
+        },
+    )
+    return {"ok": True, "row": row}
+
+
+@router.get("/portal-context")
+def portal_context(request: Request) -> dict[str, Any]:
+    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
+    tenant = control_plane_store.get_tenant_by_domain(host=host) if host else None
+    if not tenant:
+        return {"ok": True, "host": host, "resolved": False}
+    tid = normalize_tenant_id(str(tenant.get("tenant_id") or "default"))
+    return {
+        "ok": True,
+        "resolved": True,
+        "host": host,
+        "tenant_id": tid,
+        "tenant_name": str(tenant.get("name") or tid),
+        "primary_domain": str(tenant.get("primary_domain") or ""),
+        "timezone": str(tenant.get("timezone") or "UTC"),
+        "summary": control_plane_store.tenant_summary(tenant_id=tid).get("counts") or {},
+    }
+
+
+@router.post("/edge-link/bootstrap")
+def edge_link_bootstrap(payload: ActivationCodeApplyRequest, request: Request) -> dict[str, Any]:
+    cloud_url = f"{request.url.scheme}://{request.headers.get('host', '').split(':')[0]}".rstrip("/")
+    try:
+        row = control_plane_store.build_edge_bootstrap_payload(
+            activation_code=payload.activation_code,
+            edge_id=payload.edge_id,
+            edge_name=payload.edge_name,
+            site=payload.site,
+            area=payload.area,
+            equipment=payload.equipment,
+            cloud_url=cloud_url,
+        )
+        control_plane_store.audit(
+            actor_type="device",
+            actor_id=str(payload.edge_id or "edge"),
+            tenant_id=normalize_tenant_id(str(row.get("tenant_id") or "default")),
+            action="edge_link.bootstrap",
+            outcome="ok",
+            correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
+            details={"edge_id": payload.edge_id},
+        )
+        return {"ok": True, "row": row}
+    except Exception as exc:
+        control_plane_store.audit(
+            actor_type="device",
+            actor_id=str(payload.edge_id or "edge"),
+            tenant_id=get_current_tenant(),
+            action="edge_link.bootstrap",
+            outcome="error",
+            correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
+            details={"edge_id": payload.edge_id, "error": str(exc)},
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

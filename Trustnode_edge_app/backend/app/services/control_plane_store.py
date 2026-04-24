@@ -761,5 +761,171 @@ class ControlPlaneStore:
             "recent_audit": [dict(r) for r in recent_audit],
         }
 
+    def get_tenant_by_domain(self, *, host: str) -> dict[str, Any] | None:
+        host_txt = str(host or "").strip().lower().split(":")[0]
+        if not host_txt:
+            return None
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM cp_tenants WHERE LOWER(COALESCE(primary_domain,'')) = ? LIMIT 1",
+                    (host_txt,),
+                ).fetchone()
+        return dict(row) if row else None
+
+    def get_license_for_customer(self, *, tenant_id: str, customer_id: str) -> dict[str, Any] | None:
+        tid = normalize_tenant_id(tenant_id)
+        cid = str(customer_id or "").strip()
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT * FROM cp_licenses
+                    WHERE tenant_id=? AND customer_id=? AND status='active'
+                    ORDER BY created_utc DESC
+                    LIMIT 1
+                    """,
+                    (tid, cid),
+                ).fetchone()
+                if not row:
+                    row = conn.execute(
+                        """
+                        SELECT * FROM cp_licenses
+                        WHERE tenant_id=? AND status='active'
+                        ORDER BY created_utc DESC
+                        LIMIT 1
+                        """,
+                        (tid,),
+                    ).fetchone()
+        return dict(row) if row else None
+
+    def provision_customer_bundle(
+        self,
+        *,
+        tenant_id: str,
+        tenant_name: str,
+        primary_domain: str,
+        timezone_name: str,
+        customer_id: str,
+        company_name: str,
+        contact_email: str,
+        admin_username: str,
+        admin_password: str,
+        license_id: str,
+        plan_code: str,
+        max_edges: int,
+        max_users: int,
+        modules: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        tid = normalize_tenant_id(tenant_id)
+        tenant = self.upsert_tenant(
+            tenant_id=tid,
+            name=tenant_name,
+            status="active",
+            primary_domain=primary_domain,
+            timezone_name=timezone_name or "UTC",
+            metadata={},
+        )
+        customer = self.upsert_customer(
+            tenant_id=tid,
+            customer_id=customer_id,
+            company_name=company_name,
+            contact_email=contact_email,
+            status="active",
+            metadata={},
+        )
+        license_row = self.upsert_license(
+            tenant_id=tid,
+            license_id=license_id,
+            customer_id=str(customer.get("customer_id") or customer_id),
+            plan_code=plan_code or "standard",
+            status="active",
+            max_edges=max(1, int(max_edges or 1)),
+            max_users=max(1, int(max_users or 1)),
+            metadata={},
+        )
+        if modules:
+            self.set_license_modules(license_id=str(license_row.get("license_id") or license_id), modules=modules)
+        else:
+            defaults = [{"module_key": m["key"], "enabled": bool(m.get("default_enabled", True))} for m in self.MODULE_CATALOG]
+            self.set_license_modules(license_id=str(license_row.get("license_id") or license_id), modules=defaults)
+        user = self.upsert_user(
+            tenant_id=tid,
+            username=admin_username,
+            password=admin_password,
+            role="admin",
+            status="active",
+            email=contact_email,
+            mfa_enabled=False,
+            modules=[m["key"] for m in self.MODULE_CATALOG],
+            permissions={},
+        )
+        user.pop("password_hash", None)
+        return {
+            "tenant": tenant,
+            "customer": customer,
+            "license": license_row,
+            "user": user,
+        }
+
+    def build_edge_bootstrap_payload(
+        self,
+        *,
+        activation_code: str,
+        edge_id: str,
+        edge_name: str = "",
+        site: str = "",
+        area: str = "",
+        equipment: str = "",
+        cloud_url: str = "",
+    ) -> dict[str, Any]:
+        edge = self.activate_edge_with_code(
+            activation_code=activation_code,
+            edge_id=edge_id,
+            edge_name=edge_name,
+            site=site,
+            area=area,
+            equipment=equipment,
+        )
+        tenant_id = normalize_tenant_id(str(edge.get("tenant_id") or "default"))
+        customer_id = str(edge.get("customer_id") or "")
+        lic = self.get_license_for_customer(tenant_id=tenant_id, customer_id=customer_id) or {}
+        lic_id = str(lic.get("license_id") or "")
+        modules = self.list_license_modules(license_id=lic_id) if lic_id else []
+        tenant = None
+        with self._lock:
+            with self._connect() as conn:
+                tenant_row = conn.execute("SELECT * FROM cp_tenants WHERE tenant_id=?", (tenant_id,)).fetchone()
+                tenant = dict(tenant_row) if tenant_row else None
+        return {
+            "tenant_id": tenant_id,
+            "customer_id": customer_id,
+            "edge_id": str(edge.get("edge_id") or edge_id),
+            "edge_name": str(edge.get("edge_name") or edge_name or edge_id),
+            "site": str(edge.get("site") or site),
+            "area": str(edge.get("area") or area),
+            "equipment": str(edge.get("equipment") or equipment),
+            "primary_domain": str((tenant or {}).get("primary_domain") or ""),
+            "timezone": str((tenant or {}).get("timezone") or "UTC"),
+            "cloud_api_url": str(cloud_url or "").strip().rstrip("/"),
+            "license": {
+                "license_id": lic_id,
+                "plan_code": str(lic.get("plan_code") or ""),
+                "max_edges": int(lic.get("max_edges") or 0),
+                "max_users": int(lic.get("max_users") or 0),
+                "status": str(lic.get("status") or ""),
+                "modules": modules,
+            },
+            "app_settings_patch": {
+                "tenant_login_realm": tenant_id,
+                "tenant_id": tenant_id,
+                "endpoint_mode": "cloud",
+                "cloud_auto_sync_enabled": True,
+                "cloud_url": str(cloud_url or "").strip().rstrip("/"),
+                "tenant_web_client_url": f"https://{str((tenant or {}).get('primary_domain') or '').strip()}",
+                "tenant_company_name": "",
+            },
+        }
+
 
 

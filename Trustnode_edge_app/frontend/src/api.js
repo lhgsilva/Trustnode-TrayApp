@@ -1084,6 +1084,12 @@ export async function getControlPlaneEdgeBootstrapStatus() {
   return res.json();
 }
 
+export async function getControlPlanePortalContext() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/portal-context`);
+  if (!res.ok) throw new Error("Control-plane portal-context fetch failed");
+  return res.json();
+}
+
 export async function getControlPlaneModuleCatalog() {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/modules`);
   if (!res.ok) throw new Error("Control-plane modules fetch failed");
@@ -1291,5 +1297,15 @@ export async function applyControlPlanePasswordReset(payload, tenantId = "") {
     body: JSON.stringify(payload || {})
   });
   if (!res.ok) throw new Error("Control-plane password reset apply failed");
+  return res.json();
+}
+
+export async function provisionControlPlaneCustomerBundle(payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/provision/customer-bundle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane customer bundle provision failed");
   return res.json();
 }
