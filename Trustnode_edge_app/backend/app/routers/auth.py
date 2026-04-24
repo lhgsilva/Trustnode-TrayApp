@@ -123,6 +123,24 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
         except Exception:
             hit = None
     if not hit:
+        # Fallback for customer cloud logins on shared host when user is scoped
+        # to a single tenant but host tenant resolution is still default.
+        try:
+            cp_any = control_plane_store.authenticate_user_any_tenant(
+                username=username,
+                password=password,
+            )
+            if cp_any:
+                hit = {
+                    "username": cp_any.get("username"),
+                    "role": cp_any.get("role"),
+                    "permissions": cp_any.get("permissions") or {},
+                    "modules": cp_any.get("modules") or [],
+                    "tenant_id": cp_any.get("tenant_id"),
+                }
+        except Exception:
+            hit = None
+    if not hit:
         # Retry once with cloud-refreshed bootstrap so newly created legacy
         # users_access users on cloud/local become valid after propagation.
         try:

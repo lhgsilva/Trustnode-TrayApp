@@ -596,6 +596,35 @@ class ControlPlaneStore:
             "modules": modules,
         }
 
+    def list_user_tenants(self, *, username: str) -> list[str]:
+        uname = str(username or "").strip()
+        if not uname:
+            return []
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT tenant_id FROM cp_users WHERE username=? AND status='active' ORDER BY tenant_id",
+                    (uname,),
+                ).fetchall()
+        return [normalize_tenant_id(str(r[0] or "")) for r in rows if str(r[0] or "").strip()]
+
+    def authenticate_user_any_tenant(self, *, username: str, password: str) -> dict[str, Any] | None:
+        uname = str(username or "").strip()
+        if not uname:
+            return None
+        tenant_ids = self.list_user_tenants(username=uname)
+        if not tenant_ids:
+            return None
+        # Safe fallback only when username maps to exactly one active tenant.
+        unique_tenants = sorted(set(tenant_ids))
+        if len(unique_tenants) != 1:
+            return None
+        return self.authenticate_user(
+            tenant_id=unique_tenants[0],
+            username=uname,
+            password=password,
+        )
+
     def issue_activation_code(self, *, tenant_id: str, customer_id: str = "", edge_name: str = "", ttl_minutes: int = 30, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
         code = secrets.token_urlsafe(24)

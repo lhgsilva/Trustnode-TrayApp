@@ -13,6 +13,7 @@ _SAFE_TENANT_RE = re.compile(r"[^a-z0-9_\-]")
 _DOMAIN_CACHE: dict[str, str] = {}
 _DOMAIN_CACHE_TS: float = 0.0
 _DOMAIN_CACHE_TTL_SECONDS = 15.0
+_ALLOW_DYNAMIC_SUBDOMAIN = str(os.environ.get("TRUSTNODE_ALLOW_DYNAMIC_TENANT_SUBDOMAIN", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def normalize_tenant_id(raw: str | None) -> str:
@@ -52,7 +53,7 @@ def _resolve_from_host(host: str | None) -> Optional[str]:
     mapped = _tenant_from_configured_domains(host_txt)
     if mapped:
         return mapped
-    if host_txt.endswith(".trustnode.lsapps.app"):
+    if _ALLOW_DYNAMIC_SUBDOMAIN and host_txt.endswith(".trustnode.lsapps.app"):
         sub = host_txt[: -len(".trustnode.lsapps.app")]
         if sub and sub != "www":
             return normalize_tenant_id(sub)

@@ -1078,6 +1078,12 @@ export async function getControlPlaneRuntimeContext() {
   return res.json();
 }
 
+export async function getControlPlaneEdgeBootstrapStatus() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-bootstrap-status`);
+  if (!res.ok) throw new Error("Control-plane edge bootstrap status fetch failed");
+  return res.json();
+}
+
 export async function getControlPlaneModuleCatalog() {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/modules`);
   if (!res.ok) throw new Error("Control-plane modules fetch failed");

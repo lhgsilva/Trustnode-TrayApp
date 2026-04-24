@@ -1,9 +1,9 @@
-﻿from typing import Any
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.state import control_plane_store
+from app.state import control_plane_store, telemetry_service
 from app.tenant import get_current_tenant, normalize_tenant_id
 
 router = APIRouter(prefix="/api/control-plane", tags=["control-plane"])
@@ -91,22 +91,71 @@ class PasswordResetApplyRequest(BaseModel):
     new_password: str
 
 
-def _tenant_or_current(tenant_id: str | None) -> str:
-    return normalize_tenant_id(tenant_id or get_current_tenant())
+def _require_auth_payload(request: Request) -> dict[str, Any]:
+    payload = getattr(request.state, "user_payload", {}) or {}
+    if not payload:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return payload
+
+
+def _is_admin(payload: dict[str, Any]) -> bool:
+    return str(payload.get("role") or "").strip().lower() == "admin"
+
+
+def _is_global_admin(payload: dict[str, Any]) -> bool:
+    return _is_admin(payload) and normalize_tenant_id(str(payload.get("tenant_id") or "default")) == "default"
+
+
+def _scoped_tenant(request: Request, tenant_id: str | None, *, require_admin_write: bool = False) -> str:
+    payload = _require_auth_payload(request)
+    token_tenant = normalize_tenant_id(str(payload.get("tenant_id") or get_current_tenant()))
+    requested = normalize_tenant_id(tenant_id or token_tenant)
+    if requested != token_tenant and not _is_global_admin(payload):
+        raise HTTPException(status_code=403, detail="Cross-tenant access denied")
+    if require_admin_write and not _is_admin(payload):
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return requested
+
+
+def _audit(
+    request: Request,
+    *,
+    tenant_id: str,
+    action: str,
+    outcome: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    payload = getattr(request.state, "user_payload", {}) or {}
+    control_plane_store.audit(
+        actor_type="user",
+        actor_id=str(payload.get("sub") or "unknown"),
+        tenant_id=tenant_id,
+        action=action,
+        outcome=outcome,
+        correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
+        details=details or {},
+    )
 
 
 @router.get("/modules")
-def list_module_catalog() -> dict[str, Any]:
+def list_module_catalog(request: Request) -> dict[str, Any]:
+    _require_auth_payload(request)
     return {"ok": True, "modules": control_plane_store.module_catalog()}
 
 
 @router.get("/tenants")
-def list_tenants(include_suspended: bool = True) -> dict[str, Any]:
+def list_tenants(request: Request, include_suspended: bool = True) -> dict[str, Any]:
+    payload = _require_auth_payload(request)
+    if not _is_global_admin(payload):
+        raise HTTPException(status_code=403, detail="Global admin required")
     return {"ok": True, "rows": control_plane_store.list_tenants(include_suspended=include_suspended)}
 
 
 @router.post("/tenants")
-def upsert_tenant(payload: TenantUpsertRequest) -> dict[str, Any]:
+def upsert_tenant(payload: TenantUpsertRequest, request: Request) -> dict[str, Any]:
+    user_payload = _require_auth_payload(request)
+    if not _is_global_admin(user_payload):
+        raise HTTPException(status_code=403, detail="Global admin required")
     row = control_plane_store.upsert_tenant(
         tenant_id=payload.tenant_id,
         name=payload.name,
@@ -115,18 +164,25 @@ def upsert_tenant(payload: TenantUpsertRequest) -> dict[str, Any]:
         timezone_name=payload.timezone,
         metadata=payload.metadata,
     )
+    _audit(
+        request,
+        tenant_id=normalize_tenant_id(payload.tenant_id),
+        action="tenant.upsert",
+        outcome="ok",
+        details={"tenant_id": payload.tenant_id},
+    )
     return {"ok": True, "row": row}
 
 
 @router.get("/customers")
-def list_customers(tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def list_customers(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id)
     return {"ok": True, "tenant_id": tid, "rows": control_plane_store.list_customers(tenant_id=tid)}
 
 
 @router.post("/customers")
-def upsert_customer(payload: CustomerUpsertRequest, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def upsert_customer(payload: CustomerUpsertRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
     row = control_plane_store.upsert_customer(
         tenant_id=tid,
         customer_id=payload.customer_id,
@@ -135,18 +191,25 @@ def upsert_customer(payload: CustomerUpsertRequest, tenant_id: str | None = None
         status=payload.status,
         metadata=payload.metadata,
     )
+    _audit(
+        request,
+        tenant_id=tid,
+        action="customer.upsert",
+        outcome="ok",
+        details={"customer_id": row.get("customer_id", "")},
+    )
     return {"ok": True, "tenant_id": tid, "row": row}
 
 
 @router.get("/edges")
-def list_edges(tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def list_edges(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id)
     return {"ok": True, "tenant_id": tid, "rows": control_plane_store.list_edges(tenant_id=tid)}
 
 
 @router.post("/edges")
-def upsert_edge(payload: EdgeUpsertRequest, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def upsert_edge(payload: EdgeUpsertRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
     row = control_plane_store.upsert_edge(
         tenant_id=tid,
         edge_id=payload.edge_id,
@@ -158,27 +221,36 @@ def upsert_edge(payload: EdgeUpsertRequest, tenant_id: str | None = None) -> dic
         status=payload.status,
         metadata=payload.metadata,
     )
+    _audit(
+        request,
+        tenant_id=tid,
+        action="edge.upsert",
+        outcome="ok",
+        details={"edge_id": row.get("edge_id", "")},
+    )
     return {"ok": True, "tenant_id": tid, "row": row}
 
 
 @router.post("/edges/heartbeat")
-def heartbeat_edge(edge_id: str, payload: dict[str, Any] | None = None, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def heartbeat_edge(request: Request, edge_id: str, payload: dict[str, Any] | None = None, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id)
     row = control_plane_store.heartbeat_edge(tenant_id=tid, edge_id=edge_id, payload=payload or {})
     if not row:
+        _audit(request, tenant_id=tid, action="edge.heartbeat", outcome="not_found", details={"edge_id": edge_id})
         raise HTTPException(status_code=404, detail="edge_not_found")
+    _audit(request, tenant_id=tid, action="edge.heartbeat", outcome="ok", details={"edge_id": edge_id})
     return {"ok": True, "tenant_id": tid, "row": row}
 
 
 @router.get("/licenses")
-def list_licenses(tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def list_licenses(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id)
     return {"ok": True, "tenant_id": tid, "rows": control_plane_store.list_licenses(tenant_id=tid)}
 
 
 @router.post("/licenses")
-def upsert_license(payload: LicenseUpsertRequest, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def upsert_license(payload: LicenseUpsertRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
     row = control_plane_store.upsert_license(
         tenant_id=tid,
         license_id=payload.license_id,
@@ -191,28 +263,39 @@ def upsert_license(payload: LicenseUpsertRequest, tenant_id: str | None = None) 
         max_users=payload.max_users,
         metadata=payload.metadata,
     )
+    _audit(
+        request,
+        tenant_id=tid,
+        action="license.upsert",
+        outcome="ok",
+        details={"license_id": row.get("license_id", "")},
+    )
     return {"ok": True, "tenant_id": tid, "row": row}
 
 
 @router.get("/licenses/{license_id}/modules")
-def list_license_modules(license_id: str) -> dict[str, Any]:
+def list_license_modules(request: Request, license_id: str) -> dict[str, Any]:
+    _require_auth_payload(request)
     return {"ok": True, "license_id": license_id, "rows": control_plane_store.list_license_modules(license_id=license_id)}
 
 
 @router.put("/licenses/{license_id}/modules")
-def set_license_modules(license_id: str, payload: LicenseModulesRequest) -> dict[str, Any]:
-    return {"ok": True, **control_plane_store.set_license_modules(license_id=license_id, modules=payload.modules)}
+def set_license_modules(request: Request, license_id: str, payload: LicenseModulesRequest) -> dict[str, Any]:
+    tid = _scoped_tenant(request, None, require_admin_write=True)
+    out = {"ok": True, **control_plane_store.set_license_modules(license_id=license_id, modules=payload.modules)}
+    _audit(request, tenant_id=tid, action="license.modules.set", outcome="ok", details={"license_id": license_id})
+    return out
 
 
 @router.get("/users")
-def list_users(tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def list_users(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id)
     return {"ok": True, "tenant_id": tid, "rows": control_plane_store.list_users(tenant_id=tid)}
 
 
 @router.post("/users")
-def upsert_user(payload: UserUpsertRequest, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def upsert_user(payload: UserUpsertRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
     row = control_plane_store.upsert_user(
         tenant_id=tid,
         username=payload.username,
@@ -225,23 +308,26 @@ def upsert_user(payload: UserUpsertRequest, tenant_id: str | None = None) -> dic
         permissions=payload.permissions,
     )
     row.pop("password_hash", None)
+    _audit(request, tenant_id=tid, action="user.upsert", outcome="ok", details={"username": payload.username})
     return {"ok": True, "tenant_id": tid, "row": row}
 
 
 @router.delete("/users/{username}")
-def delete_user(username: str, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def delete_user(request: Request, username: str, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
     if str(username or "").strip().lower() == "admin":
         raise HTTPException(status_code=400, detail="builtin_admin_cannot_be_deleted")
     deleted = control_plane_store.delete_user(tenant_id=tid, username=username)
     if not deleted:
+        _audit(request, tenant_id=tid, action="user.delete", outcome="not_found", details={"username": username})
         raise HTTPException(status_code=404, detail="user_not_found")
+    _audit(request, tenant_id=tid, action="user.delete", outcome="ok", details={"username": username})
     return {"ok": True, "tenant_id": tid, "username": username}
 
 
 @router.post("/activation-code/issue")
-def issue_activation_code(payload: ActivationCodeIssueRequest, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
     row = control_plane_store.issue_activation_code(
         tenant_id=tid,
         customer_id=payload.customer_id,
@@ -249,55 +335,87 @@ def issue_activation_code(payload: ActivationCodeIssueRequest, tenant_id: str | 
         ttl_minutes=payload.ttl_minutes,
         metadata=payload.metadata,
     )
+    _audit(
+        request,
+        tenant_id=tid,
+        action="activation_code.issue",
+        outcome="ok",
+        details={"customer_id": payload.customer_id, "edge_name": payload.edge_name},
+    )
     return {"ok": True, "tenant_id": tid, "row": row}
 
 
 @router.post("/activation-code/apply")
-def apply_activation_code(payload: ActivationCodeApplyRequest) -> dict[str, Any]:
-    row = control_plane_store.activate_edge_with_code(
-        activation_code=payload.activation_code,
-        edge_id=payload.edge_id,
-        edge_name=payload.edge_name,
-        site=payload.site,
-        area=payload.area,
-        equipment=payload.equipment,
-    )
-    return {"ok": True, "row": row}
+def apply_activation_code(payload: ActivationCodeApplyRequest, request: Request) -> dict[str, Any]:
+    _require_auth_payload(request)
+    try:
+        row = control_plane_store.activate_edge_with_code(
+            activation_code=payload.activation_code,
+            edge_id=payload.edge_id,
+            edge_name=payload.edge_name,
+            site=payload.site,
+            area=payload.area,
+            equipment=payload.equipment,
+        )
+        tid = normalize_tenant_id(str(row.get("tenant_id") or get_current_tenant()))
+        _audit(request, tenant_id=tid, action="activation_code.apply", outcome="ok", details={"edge_id": payload.edge_id})
+        return {"ok": True, "row": row}
+    except Exception as exc:
+        _audit(
+            request,
+            tenant_id=get_current_tenant(),
+            action="activation_code.apply",
+            outcome="error",
+            details={"edge_id": payload.edge_id, "error": str(exc)},
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/password-reset/issue")
-def issue_password_reset(payload: PasswordResetIssueRequest, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def issue_password_reset(payload: PasswordResetIssueRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
     row = control_plane_store.issue_password_reset(
         tenant_id=tid,
         username=payload.username,
         ttl_minutes=payload.ttl_minutes,
     )
+    _audit(request, tenant_id=tid, action="password_reset.issue", outcome="ok", details={"username": payload.username})
     return {"ok": True, "tenant_id": tid, "row": row}
 
 
 @router.post("/password-reset/apply")
-def apply_password_reset(payload: PasswordResetApplyRequest, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
-    row = control_plane_store.reset_password_with_token(
-        tenant_id=tid,
-        username=payload.username,
-        reset_token=payload.reset_token,
-        new_password=payload.new_password,
-    )
-    row.pop("password_hash", None)
-    return {"ok": True, "tenant_id": tid, "row": row}
+def apply_password_reset(payload: PasswordResetApplyRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    try:
+        row = control_plane_store.reset_password_with_token(
+            tenant_id=tid,
+            username=payload.username,
+            reset_token=payload.reset_token,
+            new_password=payload.new_password,
+        )
+        row.pop("password_hash", None)
+        _audit(request, tenant_id=tid, action="password_reset.apply", outcome="ok", details={"username": payload.username})
+        return {"ok": True, "tenant_id": tid, "row": row}
+    except Exception as exc:
+        _audit(
+            request,
+            tenant_id=tid,
+            action="password_reset.apply",
+            outcome="error",
+            details={"username": payload.username, "error": str(exc)},
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/summary")
-def tenant_summary(tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _tenant_or_current(tenant_id)
+def tenant_summary(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id)
     return {"ok": True, "tenant_id": tid, **control_plane_store.tenant_summary(tenant_id=tid)}
 
 
 @router.get("/runtime-context")
 def runtime_context(request: Request) -> dict[str, Any]:
-    payload = getattr(request.state, "user_payload", {}) or {}
+    payload = _require_auth_payload(request)
     tenant_id = normalize_tenant_id(str(payload.get("tenant_id") or get_current_tenant()))
     return {
         "ok": True,
@@ -308,4 +426,24 @@ def runtime_context(request: Request) -> dict[str, Any]:
         "permissions": payload.get("permissions") or {},
         "edges": control_plane_store.list_edges(tenant_id=tenant_id),
         "customers": control_plane_store.list_customers(tenant_id=tenant_id),
+    }
+
+
+@router.get("/edge-bootstrap-status")
+def edge_bootstrap_status(request: Request) -> dict[str, Any]:
+    tid = _scoped_tenant(request, None)
+    diag = telemetry_service.diagnostics()
+    ingest_url = str(diag.get("vps_ingest_url") or "").strip()
+    device_token_mode = str(diag.get("device_token_mode") or "gateway_auto_issue")
+    outbox_depth = int(diag.get("outbox_depth") or 0)
+    return {
+        "ok": True,
+        "tenant_id": tid,
+        "ingest_ready": bool(ingest_url),
+        "ingest_url": ingest_url,
+        "device_token_mode": device_token_mode,
+        "outbox_depth": outbox_depth,
+        "oldest_unsynced_sample_ts_utc": diag.get("oldest_unsynced_sample_ts_utc"),
+        "last_outbox_error": diag.get("last_outbox_error"),
+        "by_gateway": diag.get("outbox_by_gateway") or [],
     }
