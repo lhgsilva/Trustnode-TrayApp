@@ -1290,7 +1290,7 @@ class GatewayWorker:
                         pool_recycle=60,
                         connect_args={
                             "sslmode": "require" if tls else "disable",
-                            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_PG_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
+                            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_PG_CONNECT_TIMEOUT_SECONDS", "6") or "6")),
                             "options": os.environ.get(
                                 "TRUSTNODE_PG_OPTIONS",
                                 "-c statement_timeout=5000 -c lock_timeout=1500 -c idle_in_transaction_session_timeout=5000",

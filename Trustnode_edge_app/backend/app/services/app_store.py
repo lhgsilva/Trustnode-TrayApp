@@ -215,7 +215,7 @@ class AppStore:
             )
             connect_args = {
                 "sslmode": "require" if cloud.get("tls", True) else "disable",
-                "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
+                "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "6") or "6")),
                 "prepare_threshold": None,
                 "options": os.environ.get(
                     "TRUSTNODE_CLOUD_DB_OPTIONS",
@@ -831,7 +831,7 @@ class AppStore:
         )
         connect_args = {
             "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
+            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "6") or "6")),
             # Supabase/PgBouncer transaction pooling is incompatible with
             # psycopg auto-prepared statements.
             "prepare_threshold": None,
@@ -949,7 +949,7 @@ class AppStore:
         )
         connect_args = {
             "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
+            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "6") or "6")),
             "prepare_threshold": None,
             "options": os.environ.get(
                 "TRUSTNODE_CLOUD_DB_OPTIONS",
@@ -3445,7 +3445,7 @@ class AppStore:
         )
         connect_args = {
             "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
+            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "6") or "6")),
             "prepare_threshold": None,
             "options": os.environ.get(
                 "TRUSTNODE_CLOUD_DB_OPTIONS",
@@ -3629,7 +3629,7 @@ class AppStore:
                     )
                     connect_args = {
                         "sslmode": "require" if cloud.get("tls", True) else "disable",
-                        "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
+                        "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "6") or "6")),
                         "prepare_threshold": None,
                         "options": os.environ.get(
                             "TRUSTNODE_CLOUD_DB_OPTIONS",
