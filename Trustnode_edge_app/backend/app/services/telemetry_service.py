@@ -192,13 +192,30 @@ class TelemetryService:
             )
 
     def configure_from_bootstrap(self, bootstrap: Dict[str, Any]) -> None:
-        data = (bootstrap or {}).get("data") if isinstance(bootstrap, dict) else {}
-        if not isinstance(data, dict):
-            data = {}
+        data: Dict[str, Any] = {}
+        if isinstance(bootstrap, dict):
+            wrapped = bootstrap.get("data")
+            if isinstance(wrapped, dict):
+                data = wrapped
+            else:
+                data = bootstrap
         app_settings = data.get("app_settings") if isinstance(data.get("app_settings"), dict) else {}
         endpoint_mode = str(app_settings.get("endpoint_mode") or "").strip().lower()
-        cloud_url = str(app_settings.get("cloud_url") or "").strip().rstrip("/")
+        cloud_url = (
+            str(
+                app_settings.get("cloud_url")
+                or app_settings.get("cloud_api_url")
+                or app_settings.get("vps_ingest_url")
+                or ""
+            )
+            .strip()
+            .rstrip("/")
+        )
         cloud_auto_sync_enabled = bool(app_settings.get("cloud_auto_sync_enabled", True))
+        if not cloud_url:
+            # Fallback for legacy settings where cloud URL is stored outside
+            # app_settings payload.
+            cloud_url = str(data.get("cloud_url") or data.get("cloud_api_url") or "").strip().rstrip("/")
         if endpoint_mode == "cloud" and cloud_url:
             self.vps_ingest_url = cloud_url
         # Keep ingest enabled for mirror mode even when UI endpoint_mode remains local.
@@ -746,17 +763,30 @@ class TelemetryService:
         while not self._stop.is_set():
             any_work = False
             try:
+                rows: List[Dict[str, Any]] = []
+                gateway_id = ""
+                # Keep lock scope minimal: do not hold it while performing network I/O.
                 with self._lock:
                     with self._connect() as conn:
                         batch = self._pull_upload_batch(conn)
                         if batch:
-                            any_work = True
                             rows = [dict(r) for r in batch]
                             gateway_id = str(rows[0].get("gateway_id") or "") if rows else ""
-                            ok_token, token_or_err = self._token_for_gateway(conn, gateway_id)
-                            if not ok_token:
-                                now = self._utc_now_text()
-                                err = f"device_token_unavailable:{token_or_err}"
+                            any_work = True
+                        self._metric_upsert(conn, "outbox_depth", self._outbox_depth(conn), None)
+
+                if rows:
+                    ok_token = False
+                    token_or_err = ""
+                    # Token fetch may perform cloud login / token issue: keep outside lock.
+                    with self._connect() as conn_token:
+                        ok_token, token_or_err = self._token_for_gateway(conn_token, gateway_id)
+
+                    if not ok_token:
+                        now = self._utc_now_text()
+                        err = f"device_token_unavailable:{token_or_err}"
+                        with self._lock:
+                            with self._connect() as conn:
                                 for row in rows:
                                     retries = int(row.get("retries") or 0) + 1
                                     delay = self._next_backoff(retries)
@@ -776,15 +806,18 @@ class TelemetryService:
                                     details={"gateway_id": gateway_id, "batch_size": len(rows), "error": str(token_or_err)},
                                 )
                                 self._metric_upsert(conn, "outbox_depth", self._outbox_depth(conn), None)
-                                continue
-                            records: List[Dict[str, Any]] = []
-                            for row in rows:
-                                rec = json.loads(row["payload_json"])
-                                records.append(rec)
+                        continue
 
-                            ok, result = self._post_ingest_batch(records, gateway_id=gateway_id, bearer_token=token_or_err)
-                            corr = str(result.get("correlation_id") or str(uuid.uuid4()))
+                    records: List[Dict[str, Any]] = []
+                    for row in rows:
+                        rec = json.loads(row["payload_json"])
+                        records.append(rec)
 
+                    ok, result = self._post_ingest_batch(records, gateway_id=gateway_id, bearer_token=token_or_err)
+                    corr = str(result.get("correlation_id") or str(uuid.uuid4()))
+
+                    with self._lock:
+                        with self._connect() as conn:
                             if ok:
                                 acked = set(result.get("acknowledged_ids") or [])
                                 dups = set(result.get("duplicate_ids") or [])
@@ -847,8 +880,7 @@ class TelemetryService:
                                     correlation_id=str(uuid.uuid4()),
                                     details={"batch_size": len(rows), "error": err},
                                 )
-
-                        self._metric_upsert(conn, "outbox_depth", self._outbox_depth(conn), None)
+                            self._metric_upsert(conn, "outbox_depth", self._outbox_depth(conn), None)
             except Exception:
                 pass
 
