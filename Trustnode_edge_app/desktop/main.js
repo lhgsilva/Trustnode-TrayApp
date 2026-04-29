@@ -652,7 +652,12 @@ app.whenReady().then(async () => {
   app.setName(APP_DISPLAY_NAME);
   if (process.platform === "win32") {
     app.setAppUserModelId("com.trustnode.app");
-    killBackendImageNamesWindows();
+    // Avoid killing backend images on startup by default.
+    // On some machines this creates startup races where UI loads before a stable API.
+    const killOnStart = String(process.env.TRUSTNODE_KILL_STALE_BACKEND_ON_START || "0").toLowerCase();
+    if (["1", "true", "yes", "on"].includes(killOnStart)) {
+      killBackendImageNamesWindows();
+    }
   }
   Menu.setApplicationMenu(null);
   await startBackend();

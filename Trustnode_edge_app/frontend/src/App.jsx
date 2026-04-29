@@ -14840,7 +14840,8 @@ function AppShell() {
               {(powerConfig?.devices || []).map((d) => {
                 const did = String(d?.id || "");
                 const st = powerDeviceStatuses[did] || {};
-                const running = d?.enabled !== false;
+                // Runtime state must come from backend status, not static config flag.
+                const running = Boolean(st?.running);
                 const connected = Boolean(st?.connected);
                 const powerText = formatMetricValue(Number(st?.active_power_w || st?.active_power_total_w || 0) / 1000.0, 3);
                 const pending = Number(st?.pending_count || st?.outbox_pending || 0);
