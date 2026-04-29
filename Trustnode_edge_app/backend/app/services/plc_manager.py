@@ -742,8 +742,20 @@ class GatewayWorker:
         self.last_error = None
 
     def _mark_db_write_error(self, msg: str) -> None:
-        self.db_last_error = msg
-        self.last_error = msg
+        text = str(msg or "")
+        self.db_last_error = text
+        # Keep transient remote timeout errors visible for diagnostics, but do not
+        # downgrade runtime state to hard "DB fails" while store-forward is active.
+        s = text.lower()
+        transient = (
+            "connectiontimeout" in s
+            or "connection timeout" in s
+            or "timed out" in s
+            or "read timeout" in s
+            or "could not connect" in s
+            or "network is unreachable" in s
+        )
+        self.last_error = None if transient else text
 
     def _dispose_db_engine(self) -> None:
         if self._db_engine is not None:
@@ -1250,187 +1262,209 @@ class GatewayWorker:
             self._mark_db_write_error("DB sink postgresql is missing host/port/username")
             return False
 
-        url = f"postgresql+psycopg://{quote_plus(username)}:{quote_plus(password)}@{host}:{port}/{quote_plus(database)}"
-        key = f"pg|{url}|{schema}|{table}|{tls}"
+        targets: list[tuple[str, int, str, str]] = [(host, port, username, "primary")]
         try:
-            if self._db_engine is None or self._db_engine_key != key:
-                self._dispose_db_engine()
-                self._db_engine = create_engine(
-                    url,
-                    pool_pre_ping=True,
-                    pool_recycle=60,
-                    connect_args={
-                        "sslmode": "require" if tls else "disable",
-                        "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_PG_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
-                        "options": os.environ.get(
-                            "TRUSTNODE_PG_OPTIONS",
-                            "-c statement_timeout=5000 -c lock_timeout=1500 -c idle_in_transaction_session_timeout=5000",
-                        ),
-                    },
-                )
-                self._db_engine_key = key
-            if self._db_schema_ready_key != key:
+            auto_pooler = str(os.environ.get("TRUSTNODE_SUPABASE_POOLER_AUTO", "1") or "1").strip().lower() in {"1", "true", "yes", "on"}
+            if auto_pooler and host.startswith("db.") and host.endswith(".supabase.co") and int(port) == 5432:
+                project_ref = host[len("db.") : -len(".supabase.co")].strip()
+                pooler_host = str(os.environ.get("TRUSTNODE_SUPABASE_POOLER_HOST", "aws-1-eu-west-1.pooler.supabase.com") or "").strip()
+                pooler_port = int(os.environ.get("TRUSTNODE_SUPABASE_POOLER_PORT", "6543") or "6543")
+                pooler_user = username
+                if username == "postgres" and project_ref:
+                    pooler_user = f"postgres.{project_ref}"
+                if pooler_host:
+                    targets.append((pooler_host, pooler_port, pooler_user, "supabase_pooler"))
+        except Exception:
+            pass
+
+        last_exc: Exception | None = None
+        for tgt_host, tgt_port, tgt_user, tgt_kind in targets:
+            url = f"postgresql+psycopg://{quote_plus(tgt_user)}:{quote_plus(password)}@{tgt_host}:{tgt_port}/{quote_plus(database)}"
+            key = f"pg|{url}|{schema}|{table}|{tls}|{tgt_kind}"
+            try:
+                if self._db_engine is None or self._db_engine_key != key:
+                    self._dispose_db_engine()
+                    self._db_engine = create_engine(
+                        url,
+                        pool_pre_ping=True,
+                        pool_recycle=60,
+                        connect_args={
+                            "sslmode": "require" if tls else "disable",
+                            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_PG_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
+                            "options": os.environ.get(
+                                "TRUSTNODE_PG_OPTIONS",
+                                "-c statement_timeout=5000 -c lock_timeout=1500 -c idle_in_transaction_session_timeout=5000",
+                            ),
+                            "prepare_threshold": None,
+                        },
+                    )
+                    self._db_engine_key = key
+                if self._db_schema_ready_key != key:
+                    with self._db_engine.begin() as conn:
+                        if schema != "public":
+                            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+                        conn.execute(
+                            text(
+                                f"""
+                                CREATE TABLE IF NOT EXISTS "{schema}"."{table}" (
+                                  id BIGSERIAL PRIMARY KEY,
+                                  ts_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                                  tag_name TEXT NOT NULL,
+                                  value DOUBLE PRECISION NULL,
+                                  quality INTEGER NULL,
+                                  quality_label TEXT NULL,
+                                  source TEXT NULL,
+                                  gateway_id TEXT NULL,
+                                  gateway_name TEXT NULL,
+                                  device_name TEXT NULL,
+                                  plc_ip TEXT NULL,
+                                  database_name TEXT NULL,
+                                  site TEXT NULL,
+                                  area TEXT NULL,
+                                  equipment TEXT NULL,
+                                  tenant_id TEXT NULL,
+                                  seq BIGINT NULL,
+                                  raw_payload JSONB NULL,
+                                  created_utc TIMESTAMPTZ NULL
+                                )
+                                """
+                            )
+                        )
+                        # Keep compatibility with already-provisioned tables that were
+                        # created before cloud mirror columns existed.
+                        conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS quality_label TEXT'))
+                        conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS gateway_id TEXT'))
+                        conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS gateway_name TEXT'))
+                        conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS device_name TEXT'))
+                        conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS plc_ip TEXT'))
+                        conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS database_name TEXT'))
+                        conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS tenant_id TEXT'))
+                        conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS created_utc TIMESTAMPTZ'))
+                        # Keep a lightweight latest-value table hot for cloud clients.
+                        conn.execute(
+                            text(
+                                f"""
+                                CREATE TABLE IF NOT EXISTS "{schema}"."live_latest" (
+                                  tenant_id TEXT NOT NULL DEFAULT 'default',
+                                  gateway_id TEXT NOT NULL,
+                                  tag_name TEXT NOT NULL,
+                                  ts_utc TIMESTAMPTZ NOT NULL,
+                                  source TEXT NULL,
+                                  gateway_name TEXT NULL,
+                                  device_name TEXT NULL,
+                                  plc_ip TEXT NULL,
+                                  database_name TEXT NULL,
+                                  value DOUBLE PRECISION NULL,
+                                  quality INTEGER NULL,
+                                  quality_label TEXT NULL,
+                                  updated_utc TIMESTAMPTZ NULL,
+                                  PRIMARY KEY (tenant_id, gateway_id, tag_name)
+                                )
+                                """
+                            )
+                        )
+                        conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_tenant_ts" ON "{schema}"."live_latest"(tenant_id, ts_utc DESC)'))
+                        conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_ts" ON "{schema}"."live_latest"(ts_utc DESC)'))
+                        self._db_schema_ready_key = key
+                tenant_id = normalize_tenant_id(str(self.db_sink.get("tenant_id") or os.environ.get("TRUSTNODE_TENANT_ID") or "default"))
+                db_name = str(self.db_sink.get("name") or database or "").strip()
+                now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                rows = [
+                    {
+                        "ts_utc": r.ts_utc,
+                        "tag_name": r.tag_name,
+                        "value": r.value,
+                        "quality": r.quality,
+                        "quality_label": r.quality_label,
+                        "source": r.source,
+                        "gateway_id": self.gateway_id,
+                        "gateway_name": self.gateway_id,
+                        "device_name": "",
+                        "plc_ip": self.config.plc_ip,
+                        "database_name": db_name,
+                        "site": r.site,
+                        "area": r.area,
+                        "equipment": r.equipment,
+                        "tenant_id": tenant_id,
+                        "created_utc": now_utc,
+                        "raw_payload": json.dumps(r.model_dump()),
+                    }
+                    for r in readings
+                ]
+                latest_by_tag: dict[str, dict[str, Any]] = {}
+                for row in rows:
+                    tag_name = str(row.get("tag_name") or "")
+                    if not tag_name:
+                        continue
+                    prev = latest_by_tag.get(tag_name)
+                    if not prev:
+                        latest_by_tag[tag_name] = row
+                        continue
+                    prev_ts = str(prev.get("ts_utc") or "")
+                    cur_ts = str(row.get("ts_utc") or "")
+                    if cur_ts >= prev_ts:
+                        latest_by_tag[tag_name] = row
+                live_rows = [
+                    {
+                        "tenant_id": str(r.get("tenant_id") or tenant_id),
+                        "gateway_id": str(r.get("gateway_id") or self.gateway_id),
+                        "tag_name": str(r.get("tag_name") or ""),
+                        "ts_utc": str(r.get("ts_utc") or now_utc),
+                        "source": str(r.get("source") or ""),
+                        "gateway_name": str(r.get("gateway_name") or self.gateway_id),
+                        "device_name": str(r.get("device_name") or ""),
+                        "plc_ip": str(r.get("plc_ip") or self.config.plc_ip),
+                        "database_name": str(r.get("database_name") or db_name),
+                        "value": r.get("value"),
+                        "quality": r.get("quality"),
+                        "quality_label": str(r.get("quality_label") or ""),
+                        "updated_utc": now_utc,
+                    }
+                    for r in latest_by_tag.values()
+                ]
                 with self._db_engine.begin() as conn:
-                    if schema != "public":
-                        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
                     conn.execute(
                         text(
                             f"""
-                            CREATE TABLE IF NOT EXISTS "{schema}"."{table}" (
-                              id BIGSERIAL PRIMARY KEY,
-                              ts_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                              tag_name TEXT NOT NULL,
-                              value DOUBLE PRECISION NULL,
-                              quality INTEGER NULL,
-                              quality_label TEXT NULL,
-                              source TEXT NULL,
-                              gateway_id TEXT NULL,
-                              gateway_name TEXT NULL,
-                              device_name TEXT NULL,
-                              plc_ip TEXT NULL,
-                              database_name TEXT NULL,
-                              site TEXT NULL,
-                              area TEXT NULL,
-                              equipment TEXT NULL,
-                              tenant_id TEXT NULL,
-                              seq BIGINT NULL,
-                              raw_payload JSONB NULL,
-                              created_utc TIMESTAMPTZ NULL
-                            )
-                            """
-                        )
-                    )
-                    # Keep compatibility with already-provisioned tables that were
-                    # created before cloud mirror columns existed.
-                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS quality_label TEXT'))
-                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS gateway_id TEXT'))
-                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS gateway_name TEXT'))
-                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS device_name TEXT'))
-                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS plc_ip TEXT'))
-                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS database_name TEXT'))
-                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS tenant_id TEXT'))
-                    conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS created_utc TIMESTAMPTZ'))
-                    # Keep a lightweight latest-value table hot for cloud clients.
-                    conn.execute(
-                        text(
-                            f"""
-                            CREATE TABLE IF NOT EXISTS "{schema}"."live_latest" (
-                              tenant_id TEXT NOT NULL DEFAULT 'default',
-                              gateway_id TEXT NOT NULL,
-                              tag_name TEXT NOT NULL,
-                              ts_utc TIMESTAMPTZ NOT NULL,
-                              source TEXT NULL,
-                              gateway_name TEXT NULL,
-                              device_name TEXT NULL,
-                              plc_ip TEXT NULL,
-                              database_name TEXT NULL,
-                              value DOUBLE PRECISION NULL,
-                              quality INTEGER NULL,
-                              quality_label TEXT NULL,
-                              updated_utc TIMESTAMPTZ NULL,
-                              PRIMARY KEY (tenant_id, gateway_id, tag_name)
-                            )
-                            """
-                        )
-                    )
-                    conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_tenant_ts" ON "{schema}"."live_latest"(tenant_id, ts_utc DESC)'))
-                    conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_ts" ON "{schema}"."live_latest"(ts_utc DESC)'))
-                self._db_schema_ready_key = key
-            tenant_id = normalize_tenant_id(str(self.db_sink.get("tenant_id") or os.environ.get("TRUSTNODE_TENANT_ID") or "default"))
-            db_name = str(self.db_sink.get("name") or database or "").strip()
-            now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            rows = [
-                {
-                    "ts_utc": r.ts_utc,
-                    "tag_name": r.tag_name,
-                    "value": r.value,
-                    "quality": r.quality,
-                    "quality_label": r.quality_label,
-                    "source": r.source,
-                    "gateway_id": self.gateway_id,
-                    "gateway_name": self.gateway_id,
-                    "device_name": "",
-                    "plc_ip": self.config.plc_ip,
-                    "database_name": db_name,
-                    "site": r.site,
-                    "area": r.area,
-                    "equipment": r.equipment,
-                    "tenant_id": tenant_id,
-                    "created_utc": now_utc,
-                    "raw_payload": json.dumps(r.model_dump()),
-                }
-                for r in readings
-            ]
-            latest_by_tag: dict[str, dict[str, Any]] = {}
-            for row in rows:
-                tag_name = str(row.get("tag_name") or "")
-                if not tag_name:
-                    continue
-                prev = latest_by_tag.get(tag_name)
-                if not prev:
-                    latest_by_tag[tag_name] = row
-                    continue
-                prev_ts = str(prev.get("ts_utc") or "")
-                cur_ts = str(row.get("ts_utc") or "")
-                if cur_ts >= prev_ts:
-                    latest_by_tag[tag_name] = row
-            live_rows = [
-                {
-                    "tenant_id": str(r.get("tenant_id") or tenant_id),
-                    "gateway_id": str(r.get("gateway_id") or self.gateway_id),
-                    "tag_name": str(r.get("tag_name") or ""),
-                    "ts_utc": str(r.get("ts_utc") or now_utc),
-                    "source": str(r.get("source") or ""),
-                    "gateway_name": str(r.get("gateway_name") or self.gateway_id),
-                    "device_name": str(r.get("device_name") or ""),
-                    "plc_ip": str(r.get("plc_ip") or self.config.plc_ip),
-                    "database_name": str(r.get("database_name") or db_name),
-                    "value": r.get("value"),
-                    "quality": r.get("quality"),
-                    "quality_label": str(r.get("quality_label") or ""),
-                    "updated_utc": now_utc,
-                }
-                for r in latest_by_tag.values()
-            ]
-            with self._db_engine.begin() as conn:
-                conn.execute(
-                    text(
-                        f"""
-                        INSERT INTO "{schema}"."{table}"
-                        (ts_utc, tag_name, value, quality, quality_label, source, gateway_id, gateway_name, device_name, plc_ip, database_name, site, area, equipment, tenant_id, created_utc, raw_payload)
-                        VALUES (CAST(:ts_utc AS timestamptz), :tag_name, :value, :quality, :quality_label, :source, :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :site, :area, :equipment, :tenant_id, CAST(:created_utc AS timestamptz), CAST(:raw_payload AS jsonb))
-                        """
-                    ),
-                    rows,
-                )
-                if live_rows:
-                    conn.execute(
-                        text(
-                            f"""
-                            INSERT INTO "{schema}"."live_latest"
-                            (tenant_id, gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
-                            VALUES
-                            (:tenant_id, :gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
-                            ON CONFLICT(tenant_id, gateway_id, tag_name) DO UPDATE SET
-                              ts_utc = excluded.ts_utc,
-                              source = excluded.source,
-                              gateway_name = excluded.gateway_name,
-                              device_name = excluded.device_name,
-                              plc_ip = excluded.plc_ip,
-                              database_name = excluded.database_name,
-                              value = excluded.value,
-                              quality = excluded.quality,
-                              quality_label = excluded.quality_label,
-                              updated_utc = excluded.updated_utc
+                            INSERT INTO "{schema}"."{table}"
+                            (ts_utc, tag_name, value, quality, quality_label, source, gateway_id, gateway_name, device_name, plc_ip, database_name, site, area, equipment, tenant_id, created_utc, raw_payload)
+                            VALUES (CAST(:ts_utc AS timestamptz), :tag_name, :value, :quality, :quality_label, :source, :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :site, :area, :equipment, :tenant_id, CAST(:created_utc AS timestamptz), CAST(:raw_payload AS jsonb))
                             """
                         ),
-                        live_rows,
+                        rows,
                     )
-            self._mark_db_write_success(len(rows))
-            return True
-        except Exception as exc:
-            self._mark_db_write_error(f"DB write failed (postgresql): {exc}")
-            return False
+                    if live_rows:
+                        conn.execute(
+                            text(
+                                f"""
+                                INSERT INTO "{schema}"."live_latest"
+                                (tenant_id, gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
+                                VALUES
+                                (:tenant_id, :gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
+                                ON CONFLICT(tenant_id, gateway_id, tag_name) DO UPDATE SET
+                                  ts_utc = excluded.ts_utc,
+                                  source = excluded.source,
+                                  gateway_name = excluded.gateway_name,
+                                  device_name = excluded.device_name,
+                                  plc_ip = excluded.plc_ip,
+                                  database_name = excluded.database_name,
+                                  value = excluded.value,
+                                  quality = excluded.quality,
+                                  quality_label = excluded.quality_label,
+                                  updated_utc = excluded.updated_utc
+                                """
+                            ),
+                            live_rows,
+                        )
+                    self._mark_db_write_success(len(rows))
+                    return True
+            except Exception as exc:
+                last_exc = exc
+                # Retry once with fallback target (e.g. Supabase pooler over IPv4).
+                continue
+
+        self._mark_db_write_error(f"DB write failed (postgresql): {last_exc}")
+        return False
 
     def _persist_sqlite(self, readings: List[GatewayReading]) -> bool:
         try:
