@@ -47,12 +47,6 @@ app.include_router(control_plane_router)
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    # Manual-control default: never auto-run gateways on backend boot.
-    # Users start gateways explicitly from UI/runtime controls.
-    try:
-        await plc_manager.stop_all_gateways()
-    except Exception:
-        pass
     # Ensure telemetry ingest URL and tenant context are hydrated even before
     # any gateway loop iteration runs.
     try:
@@ -66,9 +60,6 @@ PUBLIC_PATHS = {
     "/api/health",
     "/api/auth/login",
     "/api/auth/me",
-    "/api/control-plane/portal-context",
-    "/api/control-plane/activation-code/apply",
-    "/api/control-plane/edge-link/bootstrap",
     "/api/v1/healthz",
     "/api/v1/readyz",
 }

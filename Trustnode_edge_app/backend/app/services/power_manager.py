@@ -65,7 +65,7 @@ DEFAULT_DEVICE: dict[str, Any] = {
     "id": "power_meter_01",
     "name": "Power Meter 01",
     "description": "Weidmuller meter",
-    "enabled": True,
+    "enabled": False,
     "type": "modbus_tcp",
     "protocol": "modbus_tcp",
     "ip": "192.168.10.117",
@@ -89,7 +89,7 @@ DEFAULT_DEVICE: dict[str, Any] = {
 
 
 DEFAULT_POWER_CONFIG: dict[str, Any] = {
-    "enabled": True,
+    "enabled": False,
     "selected_device_id": "power_meter_01",
     "devices": [DEFAULT_DEVICE],
 }
@@ -104,6 +104,14 @@ class PowerManager:
         self._writer_stop = threading.Event()
         self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True, name="tn-power-writer")
         self._config: dict[str, Any] = self._load_config()
+        # Manual-start safety default: keep power gateways stopped after app boot.
+        # Existing deployments can opt back into auto-start with TRUSTNODE_POWER_AUTO_START=1.
+        if str(os.environ.get("TRUSTNODE_POWER_AUTO_START", "0") or "0").strip().lower() not in {"1", "true", "yes", "on"}:
+            self._config = self._force_stopped_config(self._config)
+            try:
+                self._app_store.upsert_domain("power_management_config", self._config, actor="system")
+            except Exception:
+                pass
         self._clients: dict[str, ModbusTcpClient] = {}
         self._last_samples: dict[str, dict[str, Any]] = {}
         self._status_by_device: dict[str, dict[str, Any]] = {}
@@ -229,9 +237,9 @@ class PowerManager:
                     "registers": raw.get("registers"),
                 }
             )
-            return {"enabled": bool(raw.get("enabled", True)), "selected_device_id": compat_device["id"], "devices": [compat_device]}
+            return {"enabled": bool(raw.get("enabled", False)), "selected_device_id": compat_device["id"], "devices": [compat_device]}
 
-        base["enabled"] = bool(raw.get("enabled", True))
+        base["enabled"] = bool(raw.get("enabled", False))
         devices_raw = raw.get("devices")
         devices: list[dict[str, Any]] = []
         if isinstance(devices_raw, list):
@@ -251,6 +259,17 @@ class PowerManager:
         else:
             base["selected_device_id"] = str(devices[0]["id"])
         return base
+
+    def _force_stopped_config(self, cfg: dict[str, Any]) -> dict[str, Any]:
+        out = self._normalize_config(cfg or {})
+        out["enabled"] = False
+        devices = []
+        for d in list(out.get("devices") or []):
+            nd = dict(d)
+            nd["enabled"] = False
+            devices.append(nd)
+        out["devices"] = devices
+        return out
 
     def _load_config(self) -> dict[str, Any]:
         try:
@@ -307,6 +326,8 @@ class PowerManager:
         if not changed:
             return self.get_config()
         cfg["devices"] = devices
+        if bool(enabled):
+            cfg["enabled"] = True
         return self.update_config(cfg, actor=actor)
 
     @staticmethod

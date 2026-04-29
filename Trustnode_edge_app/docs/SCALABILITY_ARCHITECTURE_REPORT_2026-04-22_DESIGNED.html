@@ -1,0 +1,479 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TrustNode Scalability Architecture Report</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --ink: #16202d;
+      --muted: #4c6078;
+      --brand: #0a7cff;
+      --brand-2: #0ea5e9;
+      --card: #ffffff;
+      --line: #d9e3ef;
+      --ok: #15803d;
+      --warn: #b45309;
+    }
+
+    @page {
+      size: A4;
+      margin: 16mm 14mm 16mm 14mm;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      padding: 0;
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      line-height: 1.35;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+
+    .page {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 18px 22px 28px;
+    }
+
+    .cover {
+      min-height: 260px;
+      border-radius: 18px;
+      padding: 26px;
+      color: #f8fbff;
+      background:
+        radial-gradient(1200px 500px at 110% -10%, rgba(56,189,248,.35), transparent 55%),
+        radial-gradient(900px 450px at -10% 110%, rgba(59,130,246,.35), transparent 55%),
+        linear-gradient(135deg, #0f172a 0%, #14263f 55%, #17365f 100%);
+      box-shadow: 0 20px 44px rgba(10, 25, 47, .22);
+      margin-bottom: 16px;
+    }
+
+    .cover h1 {
+      margin: 0;
+      font-size: 34px;
+      line-height: 1.1;
+      letter-spacing: .2px;
+    }
+
+    .cover h2 {
+      margin: 10px 0 0;
+      font-size: 18px;
+      color: #bfe6ff;
+      font-weight: 600;
+    }
+
+    .meta {
+      margin-top: 20px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .meta .box {
+      border: 1px solid rgba(191, 230, 255, .25);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,.06);
+    }
+
+    .meta .k {
+      display: block;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      color: #95c7ee;
+      margin-bottom: 4px;
+    }
+
+    h2.section {
+      margin: 18px 0 10px;
+      font-size: 21px;
+      color: #10243f;
+      border-left: 4px solid var(--brand);
+      padding-left: 10px;
+      page-break-after: avoid;
+    }
+
+    h3 {
+      margin: 14px 0 8px;
+      font-size: 16px;
+      color: #10315b;
+      page-break-after: avoid;
+    }
+
+    p, li {
+      font-size: 12.9px;
+      color: #1d2a3a;
+    }
+
+    .lead {
+      font-size: 14px;
+      color: #243a55;
+    }
+
+    .grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .grid.cols-2 {
+      grid-template-columns: 1fr 1fr;
+    }
+
+    .grid.cols-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      box-shadow: 0 5px 18px rgba(24, 47, 77, .08);
+      page-break-inside: avoid;
+    }
+
+    .badge {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 3px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .2px;
+      margin-right: 6px;
+    }
+
+    .ok { background: #e8f7ee; color: #0d7a35; }
+    .warn { background: #fff4e5; color: #a8510e; }
+    .info { background: #e8f1ff; color: #1556c3; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      margin-top: 8px;
+      page-break-inside: avoid;
+    }
+
+    th, td {
+      border: 1px solid var(--line);
+      padding: 8px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: #eef4fb;
+      color: #203b5f;
+      font-weight: 700;
+    }
+
+    .diagram-card {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      margin-top: 12px;
+      page-break-inside: avoid;
+    }
+
+    .diagram-title {
+      margin: 0 0 6px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #0f3768;
+    }
+
+    .mermaid {
+      background: #fbfdff;
+      border: 1px dashed #c8d8eb;
+      border-radius: 10px;
+      padding: 10px;
+      overflow: hidden;
+    }
+
+    .refs li {
+      word-break: break-all;
+      margin-bottom: 4px;
+    }
+
+    .small {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .break-before {
+      page-break-before: always;
+    }
+
+    @media print {
+      .page {
+        padding: 0;
+      }
+      a { color: #0b56b8; text-decoration: none; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+    window.__MERMAID_READY__ = false;
+    mermaid.initialize({ startOnLoad: false, theme: "default", securityLevel: "loose" });
+    try {
+      await mermaid.run({ querySelector: ".mermaid" });
+      window.__MERMAID_READY__ = true;
+    } catch (e) {
+      console.error("Mermaid render error:", e);
+      window.__MERMAID_READY__ = "error";
+    }
+  </script>
+</head>
+<body>
+  <div class="page">
+    <section class="cover">
+      <h1>TrustNode Scalability & Commercialization Architecture</h1>
+      <h2>Low-cost, secure, multi-customer, near-real-time rollout plan</h2>
+      <div class="meta">
+        <div class="box">
+          <span class="k">Prepared On</span>
+          <strong>22 April 2026</strong>
+        </div>
+        <div class="box">
+          <span class="k">Prepared For</span>
+          <strong>TrustNode Product & Engineering</strong>
+        </div>
+        <div class="box">
+          <span class="k">Scope</span>
+          <strong>Minimal-change architecture evolution</strong>
+        </div>
+      </div>
+    </section>
+
+    <h2 class="section">1. Executive Summary</h2>
+    <p class="lead">TrustNode already has the correct backbone for production: edge-first durable collection, outbox sync, ingest APIs, tenant-aware cloud schema, and live/historical split. The best strategy is to avoid a big rewrite and add a lean control plane for customer, edge, licensing, and URL tenancy management.</p>
+
+    <div class="grid cols-3">
+      <div class="card">
+        <span class="badge ok">Strength</span>
+        <h3>Edge-First Reliability</h3>
+        <p>Local persistence and outbox allow operations during cloud/network outages.</p>
+      </div>
+      <div class="card">
+        <span class="badge ok">Strength</span>
+        <h3>Ingest Idempotency</h3>
+        <p>Cloud ingest with scoped tokens and deduplication supports safe retries.</p>
+      </div>
+      <div class="card">
+        <span class="badge warn">Gap</span>
+        <h3>Commercial Control Plane</h3>
+        <p>Need central tenant/customer/edge/license lifecycle and activation workflows.</p>
+      </div>
+    </div>
+
+    <h2 class="section">2. Current vs Target Architecture</h2>
+    <div class="diagram-card">
+      <p class="diagram-title">Current Simplified Data Flow</p>
+      <div class="mermaid">
+flowchart LR
+  PLC[PLC / Meter] --> EDGE[Local Edge App]
+  EDGE --> SQLITE[(Local SQLite)]
+  EDGE --> OUTBOX[(sync_outbox_v1)]
+  OUTBOX --> VPS[TrustNode VPS API]
+  VPS --> CLOUD[(Cloud DB)]
+  LUI[Local UI] --> EDGE
+  CUI[Cloud UI] --> VPS
+      </div>
+    </div>
+
+    <div class="diagram-card">
+      <p class="diagram-title">Target Three-Plane Model (Minimal Change)</p>
+      <div class="mermaid">
+flowchart LR
+  subgraph OT[OT Site]
+    PLCs[PLCs/Meters] --> EDGE1[Edge A]
+    PLCs --> EDGE2[Edge B]
+    EDGE1 --> LDB1[(Local DB A)]
+    EDGE2 --> LDB2[(Local DB B)]
+  end
+
+  EDGE1 -- outbound TLS --> API[VPS API]
+  EDGE2 -- outbound TLS --> API
+
+  subgraph CLOUD[Cloud Data Plane]
+    RAW[(telemetry_samples_raw)]
+    LATEST[(latest_machine_state)]
+    AUDIT[(ingest_audit_log)]
+  end
+
+  API --> RAW
+  API --> LATEST
+  API --> AUDIT
+
+  subgraph CTRL[Control Plane]
+    REG[(Tenants/Customers/Edges)]
+    LIC[(Licenses/Modules)]
+    IAM[(Users + MFA + RBAC)]
+  end
+
+  API --> REG
+  API --> LIC
+  API --> IAM
+
+  U1[customer-a.trustnode.lsapps.app] --> API
+  U2[customer-b.trustnode.lsapps.app] --> API
+      </div>
+    </div>
+
+    <h2 class="section break-before">3. Security & Isolation Topology</h2>
+    <div class="diagram-card">
+      <p class="diagram-title">IT/OT Security Boundary (Zones and Conduits)</p>
+      <div class="mermaid">
+flowchart TB
+  subgraph OT_ZONE[OT Zone]
+    PLC[PLCs/Meters]
+    EDGE[Edge Host]
+    PLC --> EDGE
+  end
+
+  subgraph VPS_DMZ[VPS / DMZ]
+    WAF[WAF + Rate Limiting]
+    API[Ingest + Control API]
+    WAF --> API
+  end
+
+  subgraph CLOUD_ZONE[Cloud Zone]
+    DB[(Postgres/Supabase)]
+    SA[(Security Audit Logs)]
+  end
+
+  EDGE -- outbound HTTPS only --> WAF
+  API --> DB
+  API --> SA
+
+  CUSTOMER[Customer Browser] --> WAF
+  ADMIN[Developer Admin + MFA] --> WAF
+      </div>
+    </div>
+
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>Mandatory Security Controls</h3>
+        <ul>
+          <li>No inbound internet traffic into edge nodes.</li>
+          <li>Separate human auth and machine/device auth.</li>
+          <li>Tenant scope checks at token + API + query layers.</li>
+          <li>RLS for all user-facing data tables.</li>
+          <li>MFA for admin and privileged roles.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Data Protection Model</h3>
+        <ul>
+          <li>Immutable raw telemetry for auditability.</li>
+          <li>Latest snapshot for low-latency dashboards.</li>
+          <li>Per-tenant logical separation and policy boundaries.</li>
+          <li>PITR backups + restore drills for resiliency.</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 class="section">4. Customer URL and Licensing Strategy</h2>
+    <div class="card">
+      <p><strong>Recommended:</strong> wildcard subdomain tenancy on your VPS/frontend proxy:</p>
+      <p><code>customer-a.trustnode.lsapps.app</code>, <code>customer-b.trustnode.lsapps.app</code></p>
+      <p>Map host header → tenant context in backend; deny cross-tenant access by default.</p>
+      <h3>Control Plane Components</h3>
+      <ul>
+        <li>Customers/Tenants registry</li>
+        <li>Edges registry + activation workflow</li>
+        <li>Licenses + module entitlements</li>
+        <li>User memberships + role model</li>
+        <li>Password recovery + security events</li>
+      </ul>
+    </div>
+
+    <h2 class="section">5. Rollout Plan (Minimal Risk)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Phase</th>
+          <th>Timeline</th>
+          <th>Goal</th>
+          <th>Key Deliverables</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Phase 0</td>
+          <td>1-2 weeks</td>
+          <td>Stabilize current pipeline</td>
+          <td>Ingest URL/token diagnostics, startup checks, sync alarms</td>
+        </tr>
+        <tr>
+          <td>Phase 1</td>
+          <td>2-3 weeks</td>
+          <td>Control plane core</td>
+          <td>Tenant/customer/edge/license tables + APIs</td>
+        </tr>
+        <tr>
+          <td>Phase 2</td>
+          <td>2-3 weeks</td>
+          <td>Tenant URL routing</td>
+          <td>Wildcard subdomains, strict host-to-tenant binding</td>
+        </tr>
+        <tr>
+          <td>Phase 3</td>
+          <td>2-4 weeks</td>
+          <td>Security hardening</td>
+          <td>MFA enforcement, audit expansion, restore drills</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2 class="section">6. Commercial Readiness Outcomes</h2>
+    <div class="grid cols-2">
+      <div class="card">
+        <h3>Performance Targets</h3>
+        <ul>
+          <li>Local edge live update: &lt;= 1s</li>
+          <li>Cloud live update p95: &lt;= 2s</li>
+          <li>Outbox depth bounded under normal connectivity</li>
+          <li>No cross-tenant data exposure</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Commercial Targets</h3>
+        <ul>
+          <li>Per-customer onboarding and activation</li>
+          <li>Per-module licensing enforcement</li>
+          <li>Per-customer URL and role-based view control</li>
+          <li>Admin-level recovery and account operations</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2 class="section">7. Technical References</h2>
+    <ul class="refs">
+      <li>PostgreSQL RLS: https://www.postgresql.org/docs/current/ddl-rowsecurity.html</li>
+      <li>PostgreSQL partitioning: https://www.postgresql.org/docs/current/ddl-partitioning.html</li>
+      <li>Supabase RLS guide: https://supabase.com/docs/guides/database/postgres/row-level-security</li>
+      <li>Supabase API security: https://supabase.com/docs/guides/api/securing-your-api</li>
+      <li>Supabase read replicas: https://supabase.com/docs/guides/platform/read-replicas</li>
+      <li>Supabase custom domains: https://supabase.com/docs/guides/platform/custom-domains</li>
+      <li>Supabase backups/PITR: https://supabase.com/docs/guides/platform/backups</li>
+      <li>Supabase MFA: https://supabase.com/docs/guides/auth/auth-mfa</li>
+      <li>NIST SP 800-82r3: https://csrc.nist.gov/pubs/sp/800/82/r3/final</li>
+      <li>OWASP API Security Top 10: https://owasp.org/API-Security/editions/2023/en/0x11-t10/</li>
+      <li>Cloudflare wildcard DNS: https://developers.cloudflare.com/dns/manage-dns-records/reference/wildcard-dns-records/</li>
+      <li>NGINX wildcard host routing: https://nginx.org/en/docs/http/server_names.html</li>
+      <li>Let's Encrypt challenge types: https://letsencrypt.org/docs/challenge-types/</li>
+    </ul>
+
+    <p class="small">Generated from TrustNode architecture analysis - 22 April 2026.</p>
+  </div>
+</body>
+</html>

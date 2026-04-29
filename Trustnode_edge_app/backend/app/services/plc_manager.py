@@ -48,7 +48,7 @@ class GatewayWorker:
         self._remote_last_flush_started_monotonic = 0.0
         self._remote_last_pending_probe_monotonic = 0.0
         self._remote_flush_min_interval_seconds = max(
-            0.05, float(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MIN_SECONDS", "0.1") or "0.1")
+            0.1, float(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MIN_SECONDS", "0.5") or "0.5")
         )
         self._remote_pending_probe_seconds = max(
             0.25, float(os.environ.get("TRUSTNODE_REMOTE_PENDING_PROBE_SECONDS", "2.0") or "2.0")
@@ -163,7 +163,9 @@ class GatewayWorker:
         while self.running:
             cycle_started = time.monotonic()
             try:
-                readings = self._read_from_gateway()
+                # Gateway drivers are synchronous/blocking (socket I/O). Keep the
+                # asyncio loop responsive by executing reads off-loop.
+                readings = await asyncio.to_thread(self._read_from_gateway)
                 self.latest_readings = readings
                 persisted_local = False
                 persisted_edge_record_id: str | None = None
@@ -188,11 +190,13 @@ class GatewayWorker:
                                 pass
                             self._telemetry_runtime_refresh_monotonic = now_mono
 
-                        ok, err, edge_record_id = telemetry_service.record_collection_cycle(
-                            gateway_id=self.gateway_id,
-                            config=self.config,
-                            readings=readings,
-                            collection_status="ok",
+                        ok, err, edge_record_id = await asyncio.to_thread(
+                            lambda: telemetry_service.record_collection_cycle(
+                                gateway_id=self.gateway_id,
+                                config=self.config,
+                                readings=readings,
+                                collection_status="ok",
+                            )
                         )
                         persisted_local = bool(ok)
                         persisted_edge_record_id = edge_record_id
@@ -219,7 +223,9 @@ class GatewayWorker:
                     }
                 )
                 if collection_allowed:
-                    self._persist_readings(readings)
+                    # DB sink writes can be blocking (sqlite/file/remote enqueue).
+                    # Execute off-loop to avoid delaying other gateways/API calls.
+                    await asyncio.to_thread(self._persist_readings, readings)
             except Exception as exc:
                 self.last_error = str(exc)
                 # Do not keep stale values visible when a read cycle fails.
@@ -1137,7 +1143,7 @@ class GatewayWorker:
         schedule_again = False
         try:
             max_batches = max(1, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MAX_BATCHES", "12") or "12"))
-            batch_limit = max(50, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_BATCH_LIMIT", "500") or "500"))
+            batch_limit = max(25, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_BATCH_LIMIT", "120") or "120"))
             for _ in range(max_batches):
                 pending = self._load_pending(batch_limit)
                 if not pending:
@@ -1162,6 +1168,8 @@ class GatewayWorker:
                     self._mark_sent(ids)
                 else:
                     self._mark_failed(ids, self.db_last_error or "remote write failed")
+                    # Avoid tight retry loops on remote outage/timeouts.
+                    time.sleep(max(0.2, float(os.environ.get("TRUSTNODE_REMOTE_FLUSH_FAIL_SLEEP_SECONDS", "1.0") or "1.0")))
                     break
             self.db_pending_count = self._count_pending()
             schedule_again = self.db_pending_count > 0
@@ -1250,7 +1258,15 @@ class GatewayWorker:
                 self._db_engine = create_engine(
                     url,
                     pool_pre_ping=True,
-                    connect_args={"sslmode": "require" if tls else "disable", "connect_timeout": 6},
+                    pool_recycle=60,
+                    connect_args={
+                        "sslmode": "require" if tls else "disable",
+                        "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_PG_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
+                        "options": os.environ.get(
+                            "TRUSTNODE_PG_OPTIONS",
+                            "-c statement_timeout=5000 -c lock_timeout=1500 -c idle_in_transaction_session_timeout=5000",
+                        ),
+                    },
                 )
                 self._db_engine_key = key
             if self._db_schema_ready_key != key:
@@ -1724,7 +1740,8 @@ class PLCManager:
                         }
                     )
                 if rows:
-                    app_store.append_historian_rows(rows)
+                    # SQLite writes can be heavy; keep event loop free.
+                    await asyncio.to_thread(app_store.append_historian_rows, rows)
         except Exception:
             # Never block runtime broadcast due historian persistence error.
             pass

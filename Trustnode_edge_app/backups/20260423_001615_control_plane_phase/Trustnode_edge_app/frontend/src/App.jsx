@@ -61,31 +61,9 @@ import {
   startPowerDevice,
   stopPowerDevice,
   getControlPlaneRuntimeContext,
-  getControlPlanePortalContext,
-  getControlPlaneModuleCatalog,
-  getControlPlaneSummary,
-  getControlPlaneTenants,
-  upsertControlPlaneTenant,
-  getControlPlaneCustomers,
-  upsertControlPlaneCustomer,
-  deleteControlPlaneCustomer,
-  getControlPlaneEdges,
-  upsertControlPlaneEdge,
-  deleteControlPlaneEdge,
-  heartbeatControlPlaneEdge,
-  getControlPlaneLicenses,
-  upsertControlPlaneLicense,
-  deleteControlPlaneLicense,
-  getControlPlaneLicenseModules,
-  setControlPlaneLicenseModules,
   getControlPlaneUsers,
   upsertControlPlaneUser,
   deleteControlPlaneUser,
-  issueControlPlaneActivationCode,
-  applyControlPlaneActivationCode,
-  issueControlPlanePasswordReset,
-  applyControlPlanePasswordReset,
-  provisionControlPlaneCustomerBundle,
 } from "./api";
 import { Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
@@ -154,7 +132,7 @@ const NAV_SECTIONS = [
   {
     id: "administration",
     title: "Settings",
-    items: ["Edge", "Interface", "Users and Access Control", "Control Plane", "Email and Notifications", "Scheduled Reports"]
+    items: ["Edge", "Interface", "Users and Access Control", "Email and Notifications", "Scheduled Reports"]
   }
 ];
 
@@ -1305,7 +1283,6 @@ const PERMISSION_LABELS = {
   database_overview: "Database Overview (Legacy)",
   database_inspector: "Database Inspector",
   backup_and_retention: "Backup and Retention",
-  control_plane: "Control Plane",
   email_and_notifications: "Email and Notifications",
   scheduled_reports: "Scheduled Reports",
   users_and_access_control: "Users and Access",
@@ -1315,7 +1292,7 @@ const PERMISSION_GROUPS = [
   { title: "Client Test Modules", items: ["dashboard", "power_overview", "historian", "client_module_alarms", "client_module_reporting", "client_module_interface"] },
   { title: "Collection and Monitoring", items: ["devices", "tags", "triggers_and_limits", "gateway_configuration"] },
   { title: "Operations", items: ["gateway_runtime_control", "alarms", "reporting", "data_log"] },
-  { title: "Administration", items: ["interface", "database", "backup_and_retention", "control_plane", "email_and_notifications", "scheduled_reports", "users_and_access_control"] },
+  { title: "Administration", items: ["interface", "database", "backup_and_retention", "email_and_notifications", "scheduled_reports", "users_and_access_control"] },
 ];
 
 const CLIENT_MODULE_DEFS = [
@@ -1417,7 +1394,6 @@ function buildRolePermissions(role) {
       database_overview: true,
       database_inspector: true,
       backup_and_retention: true,
-      control_plane: true,
       website_and_env: true,
       email_and_notifications: true,
       scheduled_reports: true,
@@ -1446,7 +1422,6 @@ function buildRolePermissions(role) {
       database_overview: false,
       database_inspector: false,
       backup_and_retention: false,
-      control_plane: false,
       website_and_env: false,
       email_and_notifications: false,
       scheduled_reports: false,
@@ -1475,7 +1450,6 @@ function buildRolePermissions(role) {
       database_overview: false,
       database_inspector: false,
       backup_and_retention: false,
-      control_plane: false,
       website_and_env: false,
       email_and_notifications: false,
       scheduled_reports: false,
@@ -1504,7 +1478,6 @@ function buildRolePermissions(role) {
       database_overview: false,
       database_inspector: false,
       backup_and_retention: false,
-      control_plane: false,
       website_and_env: false,
       email_and_notifications: false,
       scheduled_reports: false,
@@ -1532,7 +1505,6 @@ function buildRolePermissions(role) {
     database_overview: false,
     database_inspector: false,
     backup_and_retention: false,
-    control_plane: false,
     website_and_env: false,
     email_and_notifications: false,
     scheduled_reports: false,
@@ -1540,6 +1512,7 @@ function buildRolePermissions(role) {
     users_and_access_control: false
   };
 }
+
 function normalizePermissions(rawPermissions, role) {
   return {
     ...buildRolePermissions(role),
@@ -1594,11 +1567,6 @@ function AppShell() {
   const [endpointMode, setEndpointMode] = useState("local");
   const [cloudUrl, setCloudUrl] = useState("");
   const [selectedCloudEdgeKey, setSelectedCloudEdgeKey] = useState(CLOUD_EDGE_ALL_KEY);
-  const cloudEdgeApiFilter = useMemo(() => {
-    if (!(isHostedWebClient && endpointMode === "cloud")) return null;
-    if (selectedCloudEdgeKey === CLOUD_EDGE_ALL_KEY) return null;
-    return { edge_id: String(selectedCloudEdgeKey || "") };
-  }, [isHostedWebClient, endpointMode, selectedCloudEdgeKey]);
   const [edgeLinkState, setEdgeLinkState] = useState({ state: "unknown", message: "Not checked" });
   const [endpointVersion, setEndpointVersion] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
@@ -2078,92 +2046,6 @@ function AppShell() {
     role: "viewer",
     permissions: buildRolePermissions("viewer")
   });
-  const [cpBusy, setCpBusy] = useState(false);
-  const [cpResult, setCpResult] = useState("");
-  const [cpSummary, setCpSummary] = useState(null);
-  const [cpTenants, setCpTenants] = useState([]);
-  const [cpCustomers, setCpCustomers] = useState([]);
-  const [cpEdges, setCpEdges] = useState([]);
-  const [cpLicenses, setCpLicenses] = useState([]);
-  const [cpModuleCatalog, setCpModuleCatalog] = useState([]);
-  const [cpTenantForm, setCpTenantForm] = useState({
-    tenant_id: "",
-    name: "",
-    status: "active",
-    primary_domain: "",
-    timezone: "UTC",
-  });
-  const [cpBundleForm, setCpBundleForm] = useState({
-    tenant_id: "",
-    tenant_name: "",
-    primary_domain: "",
-    timezone: "Europe/Dublin",
-    customer_id: "",
-    company_name: "",
-    contact_email: "",
-    admin_username: "admin",
-    admin_password: "",
-    license_id: "",
-    plan_code: "standard",
-    max_edges: 10,
-    max_users: 50,
-  });
-  const [cpCustomerForm, setCpCustomerForm] = useState({
-    customer_id: "",
-    company_name: "",
-    contact_email: "",
-    status: "active",
-  });
-  const [cpEdgeForm, setCpEdgeForm] = useState({
-    edge_id: "",
-    edge_name: "",
-    customer_id: "",
-    site: "",
-    area: "",
-    equipment: "",
-    status: "inactive",
-  });
-  const [cpLicenseForm, setCpLicenseForm] = useState({
-    license_id: "",
-    customer_id: "",
-    plan_code: "standard",
-    status: "active",
-    start_utc: "",
-    end_utc: "",
-    max_edges: 3,
-    max_users: 10,
-  });
-  const [cpSelectedLicenseId, setCpSelectedLicenseId] = useState("");
-  const [cpLicenseModulesText, setCpLicenseModulesText] = useState("");
-  const [cpActivationIssueForm, setCpActivationIssueForm] = useState({
-    customer_id: "",
-    edge_name: "",
-    ttl_minutes: 30,
-  });
-  const [cpActivationApplyForm, setCpActivationApplyForm] = useState({
-    activation_code: "",
-    edge_id: "",
-    edge_name: "",
-    site: "",
-    area: "",
-    equipment: "",
-  });
-  const [cpIssuedActivationCode, setCpIssuedActivationCode] = useState("");
-  const [cpPasswordResetIssueForm, setCpPasswordResetIssueForm] = useState({
-    username: "",
-    ttl_minutes: 15,
-  });
-  const [cpPasswordResetApplyForm, setCpPasswordResetApplyForm] = useState({
-    username: "",
-    reset_token: "",
-    new_password: "",
-  });
-  const [cpIssuedResetToken, setCpIssuedResetToken] = useState("");
-  const [showCpCustomerModal, setShowCpCustomerModal] = useState(false);
-  const [showCpEdgeModal, setShowCpEdgeModal] = useState(false);
-  const [showCpLicenseModal, setShowCpLicenseModal] = useState(false);
-  const [cpLicenseModalModules, setCpLicenseModalModules] = useState([]);
-  const [cpModalError, setCpModalError] = useState("");
   const [devices, setDevices] = useState([]);
   const [showDeviceModal, setShowDeviceModal] = useState(false);
   const [editingDeviceId, setEditingDeviceId] = useState(null);
@@ -3137,10 +3019,7 @@ function AppShell() {
     let cancelled = false;
     const loadOperationalHistory = async () => {
       try {
-        const [histRes, logRes] = await Promise.all([
-          getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT, cloudEdgeApiFilter),
-          getAppStoreLogs(CLOUD_LOG_FETCH_LIMIT, cloudEdgeApiFilter),
-        ]);
+        const [histRes, logRes] = await Promise.all([getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT), getAppStoreLogs(CLOUD_LOG_FETCH_LIMIT)]);
         if (cancelled) return;
         if (histRes?.ok && Array.isArray(histRes.rows)) {
           setDataLog(histRes.rows);
@@ -3156,7 +3035,7 @@ function AppShell() {
     return () => {
       cancelled = true;
     };
-  }, [appStoreHydrated, cloudEdgeApiFilter]);
+  }, [appStoreHydrated]);
 
   useEffect(() => {
     if (!appStoreHydrated) return;
@@ -3632,7 +3511,6 @@ function AppShell() {
         try {
           let cfg = null;
           let st = null;
-          let usedBootstrapFallback = false;
           try {
             cfg = await getConfig();
           } catch (cfgErr) {
@@ -3652,7 +3530,6 @@ function AppShell() {
                 interval_ms: Number(first?.interval_ms || FALLBACK_PLC_CONFIG.interval_ms),
                 tags: Array.isArray(first?.tags) ? first.tags : [],
               };
-              usedBootstrapFallback = true;
               setError(
                 `Config endpoint unavailable, using bootstrap fallback. Details: ${String(
                   cfgErr?.message || cfgErr || ""
@@ -3671,9 +3548,7 @@ function AppShell() {
           setConfig(cfg || { ...FALLBACK_PLC_CONFIG });
           setStatus(st || {});
           setBootState("ready");
-          if (!usedBootstrapFallback) {
-            setError("");
-          }
+          setError((prev) => (String(prev || "").includes("bootstrap fallback") ? prev : ""));
           return;
         } catch (e) {
           if (cancelled) return;
@@ -4323,7 +4198,7 @@ function AppShell() {
       if (stopped || runningLive) return;
       runningLive = true;
       try {
-        const liveRes = await getAppStoreLive(CLOUD_LIVE_FETCH_LIMIT, cloudEdgeApiFilter);
+        const liveRes = await getAppStoreLive(CLOUD_LIVE_FETCH_LIMIT);
         if (stopped) return;
         if (liveRes?.ok && Array.isArray(liveRes.rows)) {
           const rawRows = liveRes.rows;
@@ -4567,12 +4442,8 @@ function AppShell() {
       runningAux = true;
       try {
         const [histRes, logRes, inspectorRes] = await Promise.all([
-          (wantsHistorian || !cloudStreamConnected)
-            ? getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT, cloudEdgeApiFilter)
-            : Promise.resolve(null),
-          (wantsLogs || !cloudStreamConnected)
-            ? getAppStoreLogs(CLOUD_LOG_FETCH_LIMIT, cloudEdgeApiFilter)
-            : Promise.resolve(null),
+          (wantsHistorian || !cloudStreamConnected) ? getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT) : Promise.resolve(null),
+          (wantsLogs || !cloudStreamConnected) ? getAppStoreLogs(CLOUD_LOG_FETCH_LIMIT) : Promise.resolve(null),
           (wantsInspector || !cloudStreamConnected) ? getAppStoreInspector(20) : Promise.resolve(null)
         ]);
         if (stopped) return;
@@ -4613,7 +4484,7 @@ function AppShell() {
       clearInterval(liveTimer);
       clearInterval(auxTimer);
     };
-  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected, filterCloudRowsMonotonic, activePage, cloudEdgeApiFilter]);
+  }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected, filterCloudRowsMonotonic, activePage]);
 
   useEffect(() => {
     if (!currentUser) return undefined;
@@ -5680,36 +5551,6 @@ function AppShell() {
 
   const canDeleteRecords = Boolean(!isReadonlyCloudMode && currentUser && currentUser.role === "admin");
   const canControlGateways = Boolean(!isReadonlyCloudMode && currentUser && (currentUser.role === "admin" || currentUser.permissions?.gateway_runtime_control));
-  const cpEdgeHeartbeatSummary = useMemo(() => {
-    const now = Date.now();
-    let healthy = 0;
-    let stale = 0;
-    let missing = 0;
-    let newest = "";
-    for (const edge of cpEdges || []) {
-      const hbTs = String(edge?.last_heartbeat_utc || "").trim();
-      if (!hbTs) {
-        missing += 1;
-        continue;
-      }
-      const hbMs = parseTimestampMs(hbTs);
-      if (!Number.isFinite(hbMs) || hbMs <= 0) {
-        missing += 1;
-        continue;
-      }
-      if (!newest || hbTs > newest) newest = hbTs;
-      const ageMs = Math.max(0, now - hbMs);
-      if (ageMs <= 90000) healthy += 1;
-      else stale += 1;
-    }
-    return {
-      total: Array.isArray(cpEdges) ? cpEdges.length : 0,
-      healthy,
-      stale,
-      missing,
-      latestHeartbeatUtc: newest,
-    };
-  }, [cpEdges]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -5718,40 +5559,6 @@ function AppShell() {
     const fallback = fallbackCandidates.find((p) => canOpenPage(p));
     if (fallback) setActivePage(fallback);
   }, [activePage, canOpenPage, currentUser]);
-
-  useEffect(() => {
-    if (!currentUser) return;
-    if (activePage !== "control_plane") return;
-    if (!canOpenPage("control_plane")) return;
-    refreshControlPlaneData(currentTenantId || "default");
-  }, [activePage, currentUser, currentTenantId]);
-
-  useEffect(() => {
-    if (!currentUser) return;
-    if (isHostedWebClient) return;
-    let cancelled = false;
-    const run = async () => {
-      if (cancelled) return;
-      await syncControlPlaneEdgeHeartbeat();
-    };
-    run();
-    const timer = setInterval(run, 60000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [
-    currentUser,
-    isHostedWebClient,
-    currentTenantId,
-    edgeProfile?.edge_id,
-    edgeProfile?.edge_name,
-    edgeProfile?.location,
-    edgeProfile?.machine_group,
-    endpointMode,
-    cloudUrl,
-    wsState,
-  ]);
 
   const addAppLog = (entry) => {
     const key = `${String(entry.level || "info")}|${String(entry.category || "system")}|${String(entry.gateway_id || "")}|${String(entry.database_name || "")}|${String(entry.message || "")}`;
@@ -7538,9 +7345,7 @@ function AppShell() {
     configRestartSignatureRef.current = signature;
     if (configRestartBusyRef.current) return;
 
-    const targetGateways = gatewayConfigs.filter((g) =>
-      Boolean(gatewayRuntimeStatusesRef.current[String(g.id || "")]?.running)
-    );
+    const targetGateways = gatewayConfigs.slice();
     if (!targetGateways.length) return;
 
     let cancelled = false;
@@ -7550,7 +7355,7 @@ function AppShell() {
         addAppLog({
           level: "warning",
           category: "gateway",
-          message: `Configuration changed. Restarting ${targetGateways.length} running gateway(s) to apply updates.`
+          message: `Configuration changed. Restarting ${targetGateways.length} gateway(s) to apply updates.`
         });
         for (const g of targetGateways) {
           if (cancelled) return;
@@ -10252,611 +10057,6 @@ function AppShell() {
       return normalized;
     } catch {
       return null;
-    }
-  };
-
-  const refreshControlPlaneData = async (tenantId = "") => {
-    const scopedTenantId = String(tenantId || currentTenantId || "default");
-    try {
-      const [summaryRes, tenantsRes, customersRes, edgesRes, licensesRes, modulesRes] = await Promise.all([
-        getControlPlaneSummary(scopedTenantId),
-        getControlPlaneTenants(true),
-        getControlPlaneCustomers(scopedTenantId),
-        getControlPlaneEdges(scopedTenantId),
-        getControlPlaneLicenses(scopedTenantId),
-        getControlPlaneModuleCatalog(),
-      ]);
-      setCpSummary(summaryRes || null);
-      setCpTenants(Array.isArray(tenantsRes?.rows) ? tenantsRes.rows : []);
-      setCpCustomers(Array.isArray(customersRes?.rows) ? customersRes.rows : []);
-      setCpEdges(Array.isArray(edgesRes?.rows) ? edgesRes.rows : []);
-      setCpLicenses(Array.isArray(licensesRes?.rows) ? licensesRes.rows : []);
-      setCpModuleCatalog(Array.isArray(modulesRes?.modules) ? modulesRes.modules : []);
-      return true;
-    } catch (err) {
-      setCpResult(`Control-plane refresh failed: ${String(err?.message || err)}`);
-      return false;
-    }
-  };
-
-  const syncControlPlaneEdgeHeartbeat = async () => {
-    if (isHostedWebClient) return false;
-    const edgeId = String(edgeProfile?.edge_id || "").trim();
-    if (!edgeId) return false;
-    try {
-      await heartbeatControlPlaneEdge(
-        edgeId,
-        {
-          edge_name: String(edgeProfile?.edge_name || "").trim(),
-          status: String(wsState === "connected" ? "active" : "inactive"),
-          site: String(edgeProfile?.location || "").trim(),
-          area: String(edgeProfile?.machine_group || "").trim(),
-          equipment: "",
-          endpoint_mode: endpointMode,
-          cloud_url: String(cloudUrl || "").trim(),
-          gateway_count: Array.isArray(gatewayConfigsRef.current) ? gatewayConfigsRef.current.length : 0,
-          device_count: Array.isArray(devicesRef.current) ? devicesRef.current.length : 0,
-        },
-        currentTenantId || "default"
-      );
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  const saveControlPlaneTenant = async () => {
-    if (!canEditPage("control_plane")) return;
-    const tenantId = String(cpTenantForm.tenant_id || "").trim();
-    const name = String(cpTenantForm.name || "").trim();
-    if (!tenantId || !name) {
-      setCpResult("Tenant ID and Tenant Name are required.");
-      return;
-    }
-    setCpBusy(true);
-    try {
-      await upsertControlPlaneTenant({
-        tenant_id: tenantId,
-        name,
-        status: cpTenantForm.status || "active",
-        primary_domain: String(cpTenantForm.primary_domain || "").trim(),
-        timezone: String(cpTenantForm.timezone || "UTC").trim() || "UTC",
-        metadata: {},
-      });
-      await refreshControlPlaneData(tenantId);
-      setCpResult(`Tenant '${tenantId}' saved.`);
-    } catch (err) {
-      setCpResult(`Tenant save failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const provisionControlPlaneBundle = async () => {
-    if (!canEditPage("control_plane")) return;
-    const tenantId = String(cpBundleForm.tenant_id || "").trim();
-    const tenantName = String(cpBundleForm.tenant_name || "").trim();
-    const primaryDomain = String(cpBundleForm.primary_domain || "").trim().toLowerCase();
-    const customerId = String(cpBundleForm.customer_id || "").trim();
-    const companyName = String(cpBundleForm.company_name || "").trim();
-    const adminPassword = String(cpBundleForm.admin_password || "");
-    if (!tenantId || !tenantName || !primaryDomain || !customerId || !companyName || !adminPassword) {
-      setCpResult("Bundle provisioning requires tenant, domain, customer, company, and admin password.");
-      return;
-    }
-    setCpBusy(true);
-    try {
-      const payload = {
-        tenant_id: tenantId,
-        tenant_name: tenantName,
-        primary_domain: primaryDomain,
-        timezone: String(cpBundleForm.timezone || "Europe/Dublin").trim() || "Europe/Dublin",
-        customer_id: customerId,
-        company_name: companyName,
-        contact_email: String(cpBundleForm.contact_email || "").trim(),
-        admin_username: String(cpBundleForm.admin_username || "admin").trim() || "admin",
-        admin_password: adminPassword,
-        license_id: String(cpBundleForm.license_id || "").trim(),
-        plan_code: String(cpBundleForm.plan_code || "standard").trim() || "standard",
-        max_edges: Math.max(1, Number(cpBundleForm.max_edges || 1)),
-        max_users: Math.max(1, Number(cpBundleForm.max_users || 1)),
-      };
-      await provisionControlPlaneCustomerBundle(payload);
-      await refreshControlPlaneData(tenantId);
-      let portalStatus = "";
-      try {
-        const ctx = await getControlPlanePortalContext();
-        if (ctx?.resolved) {
-          portalStatus = ` | current host tenant=${String(ctx.tenant_id || "")}`;
-        }
-      } catch {
-        portalStatus = "";
-      }
-      setCpResult(`Customer bundle provisioned for '${tenantId}' (${primaryDomain}).${portalStatus}`);
-    } catch (err) {
-      setCpResult(`Bundle provision failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const saveControlPlaneCustomer = async () => {
-    if (!canEditPage("control_plane")) return;
-    const companyName = String(cpCustomerForm.company_name || "").trim();
-    if (!companyName) {
-      setCpModalError("Customer company name is required.");
-      return;
-    }
-    const email = String(cpCustomerForm.contact_email || "").trim();
-    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      setCpModalError("Contact email format looks invalid.");
-      return;
-    }
-    setCpModalError("");
-    setCpBusy(true);
-    try {
-      await upsertControlPlaneCustomer(
-        {
-          customer_id: String(cpCustomerForm.customer_id || "").trim(),
-          company_name: companyName,
-          contact_email: email,
-          status: cpCustomerForm.status || "active",
-          metadata: {},
-        },
-        currentTenantId || "default"
-      );
-      await refreshControlPlaneData(currentTenantId || "default");
-      setCpResult(`Customer '${companyName}' saved.`);
-      setCpModalError("");
-      setShowCpCustomerModal(false);
-    } catch (err) {
-      setCpModalError(`Customer save failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const saveControlPlaneEdge = async () => {
-    if (!canEditPage("control_plane")) return;
-    const edgeName = String(cpEdgeForm.edge_name || "").trim();
-    const customerId = String(cpEdgeForm.customer_id || "").trim();
-    if (!edgeName) {
-      setCpModalError("Edge name is required.");
-      return;
-    }
-    if (!customerId) {
-      setCpModalError("Select a customer for this edge.");
-      return;
-    }
-    setCpModalError("");
-    setCpBusy(true);
-    try {
-      await upsertControlPlaneEdge(
-        {
-          edge_id: String(cpEdgeForm.edge_id || "").trim(),
-          edge_name: edgeName,
-          customer_id: customerId,
-          site: String(cpEdgeForm.site || "").trim(),
-          area: String(cpEdgeForm.area || "").trim(),
-          equipment: String(cpEdgeForm.equipment || "").trim(),
-          status: cpEdgeForm.status || "inactive",
-          metadata: {},
-        },
-        currentTenantId || "default"
-      );
-      await refreshControlPlaneData(currentTenantId || "default");
-      setCpResult(`Edge '${edgeName}' saved.`);
-      setCpModalError("");
-      setShowCpEdgeModal(false);
-    } catch (err) {
-      setCpModalError(`Edge save failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const saveControlPlaneLicense = async () => {
-    if (!canEditPage("control_plane")) return;
-    setCpBusy(true);
-    try {
-      const payload = {
-        license_id: String(cpLicenseForm.license_id || "").trim(),
-        customer_id: String(cpLicenseForm.customer_id || "").trim(),
-        plan_code: String(cpLicenseForm.plan_code || "standard").trim() || "standard",
-        status: String(cpLicenseForm.status || "active").trim() || "active",
-        start_utc: String(cpLicenseForm.start_utc || "").trim(),
-        end_utc: String(cpLicenseForm.end_utc || "").trim(),
-        max_edges: Math.max(1, Number(cpLicenseForm.max_edges || 1)),
-        max_users: Math.max(1, Number(cpLicenseForm.max_users || 1)),
-        metadata: {},
-      };
-      await upsertControlPlaneLicense(payload, currentTenantId || "default");
-      await refreshControlPlaneData(currentTenantId || "default");
-      setCpResult(`License '${payload.license_id || payload.plan_code}' saved.`);
-    } catch (err) {
-      setCpResult(`License save failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const openCpCustomerCreate = () => {
-    setCpModalError("");
-    setCpCustomerForm({
-      customer_id: "",
-      company_name: "",
-      contact_email: "",
-      status: "active",
-    });
-    setShowCpCustomerModal(true);
-  };
-
-  const openCpCustomerEdit = (row) => {
-    setCpModalError("");
-    setCpCustomerForm({
-      customer_id: String(row?.customer_id || ""),
-      company_name: String(row?.company_name || ""),
-      contact_email: String(row?.contact_email || ""),
-      status: String(row?.status || "active"),
-    });
-    setShowCpCustomerModal(true);
-  };
-
-  const deleteCpCustomer = (row) => {
-    if (!canEditPage("control_plane")) return;
-    const customerId = String(row?.customer_id || "").trim();
-    if (!customerId) return;
-    openConfirmDialog(
-      "Delete Customer",
-      `Delete customer '${customerId}'? This is blocked if edges/licenses still reference it.`,
-      async () => {
-        setCpBusy(true);
-        try {
-          await deleteControlPlaneCustomer(customerId, currentTenantId || "default");
-          await refreshControlPlaneData(currentTenantId || "default");
-          setCpResult(`Customer '${customerId}' deleted.`);
-        } catch (err) {
-          setCpResult(`Customer delete failed: ${String(err?.message || err)}`);
-        } finally {
-          setCpBusy(false);
-        }
-      }
-    );
-  };
-
-  const openCpEdgeCreate = () => {
-    setCpModalError("");
-    const firstCustomerId = String(cpCustomers?.[0]?.customer_id || "");
-    setCpEdgeForm({
-      edge_id: "",
-      edge_name: "",
-      customer_id: firstCustomerId,
-      site: "",
-      area: "",
-      equipment: "",
-      status: "inactive",
-    });
-    setShowCpEdgeModal(true);
-  };
-
-  const openCpEdgeEdit = (row) => {
-    setCpModalError("");
-    setCpEdgeForm({
-      edge_id: String(row?.edge_id || ""),
-      edge_name: String(row?.edge_name || ""),
-      customer_id: String(row?.customer_id || ""),
-      site: String(row?.site || ""),
-      area: String(row?.area || ""),
-      equipment: String(row?.equipment || ""),
-      status: String(row?.status || "inactive"),
-    });
-    setShowCpEdgeModal(true);
-  };
-
-  const deleteCpEdge = (row) => {
-    if (!canEditPage("control_plane")) return;
-    const edgeId = String(row?.edge_id || "").trim();
-    if (!edgeId) return;
-    openConfirmDialog(
-      "Delete Edge",
-      `Delete edge '${edgeId}' from control plane registry?`,
-      async () => {
-        setCpBusy(true);
-        try {
-          await deleteControlPlaneEdge(edgeId, currentTenantId || "default");
-          await refreshControlPlaneData(currentTenantId || "default");
-          setCpResult(`Edge '${edgeId}' deleted.`);
-        } catch (err) {
-          setCpResult(`Edge delete failed: ${String(err?.message || err)}`);
-        } finally {
-          setCpBusy(false);
-        }
-      }
-    );
-  };
-
-  const openCpLicenseCreate = () => {
-    setCpModalError("");
-    const firstCustomerId = String(cpCustomers?.[0]?.customer_id || "");
-    setCpLicenseForm({
-      license_id: "",
-      customer_id: firstCustomerId,
-      plan_code: "standard",
-      status: "active",
-      start_utc: "",
-      end_utc: "",
-      max_edges: 3,
-      max_users: 10,
-    });
-    setCpLicenseModalModules(cpModuleCatalog.map((m) => ({
-      module_key: String(m?.module_key || m?.key || ""),
-      enabled: Boolean(m?.default_enabled ?? true),
-    })).filter((m) => m.module_key));
-    setShowCpLicenseModal(true);
-  };
-
-  const openCpLicenseEdit = async (row) => {
-    setCpModalError("");
-    const licenseId = String(row?.license_id || "");
-    setCpLicenseForm({
-      license_id: licenseId,
-      customer_id: String(row?.customer_id || ""),
-      plan_code: String(row?.plan_code || "standard"),
-      status: String(row?.status || "active"),
-      start_utc: String(row?.start_utc || ""),
-      end_utc: String(row?.end_utc || ""),
-      max_edges: Math.max(1, Number(row?.max_edges || 1)),
-      max_users: Math.max(1, Number(row?.max_users || 1)),
-    });
-    setCpBusy(true);
-    try {
-      const res = await getControlPlaneLicenseModules(licenseId);
-      const rows = Array.isArray(res?.rows) ? res.rows : [];
-      const byKey = new Map(rows.map((r) => [String(r?.module_key || ""), Boolean(r?.enabled)]));
-      const merged = cpModuleCatalog
-        .map((m) => {
-          const moduleKey = String(m?.module_key || m?.key || "");
-          if (!moduleKey) return null;
-          return {
-            module_key: moduleKey,
-            enabled: byKey.has(moduleKey) ? Boolean(byKey.get(moduleKey)) : Boolean(m?.default_enabled ?? true),
-          };
-        })
-        .filter(Boolean);
-      setCpLicenseModalModules(merged);
-      setShowCpLicenseModal(true);
-    } catch (err) {
-      setCpModalError(`Load license modules failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const deleteCpLicense = (row) => {
-    if (!canEditPage("control_plane")) return;
-    const licenseId = String(row?.license_id || "").trim();
-    if (!licenseId) return;
-    openConfirmDialog(
-      "Delete License",
-      `Delete license '${licenseId}'?`,
-      async () => {
-        setCpBusy(true);
-        try {
-          await deleteControlPlaneLicense(licenseId, currentTenantId || "default");
-          await refreshControlPlaneData(currentTenantId || "default");
-          setCpResult(`License '${licenseId}' deleted.`);
-        } catch (err) {
-          setCpResult(`License delete failed: ${String(err?.message || err)}`);
-        } finally {
-          setCpBusy(false);
-        }
-      }
-    );
-  };
-
-  const saveCpLicenseModal = async () => {
-    if (!canEditPage("control_plane")) return;
-    const customerId = String(cpLicenseForm.customer_id || "").trim();
-    if (!customerId) {
-      setCpModalError("Select a customer for this license.");
-      return;
-    }
-    const startUtc = String(cpLicenseForm.start_utc || "").trim();
-    const endUtc = String(cpLicenseForm.end_utc || "").trim();
-    if (startUtc && Number.isNaN(Date.parse(startUtc))) {
-      setCpModalError("Start UTC format is invalid. Use ISO format like 2026-04-24T00:00:00Z.");
-      return;
-    }
-    if (endUtc && Number.isNaN(Date.parse(endUtc))) {
-      setCpModalError("End UTC format is invalid. Use ISO format like 2027-04-24T00:00:00Z.");
-      return;
-    }
-    if (startUtc && endUtc && Date.parse(endUtc) < Date.parse(startUtc)) {
-      setCpModalError("End UTC must be later than Start UTC.");
-      return;
-    }
-    setCpModalError("");
-    setCpBusy(true);
-    try {
-      const payload = {
-        license_id: String(cpLicenseForm.license_id || "").trim(),
-        customer_id: customerId,
-        plan_code: String(cpLicenseForm.plan_code || "standard").trim() || "standard",
-        status: String(cpLicenseForm.status || "active").trim() || "active",
-        start_utc: startUtc,
-        end_utc: endUtc,
-        max_edges: Math.max(1, Number(cpLicenseForm.max_edges || 1)),
-        max_users: Math.max(1, Number(cpLicenseForm.max_users || 1)),
-        metadata: {},
-      };
-      const res = await upsertControlPlaneLicense(payload, currentTenantId || "default");
-      const finalLicenseId = String(res?.row?.license_id || payload.license_id || "").trim();
-      if (finalLicenseId) {
-        await setControlPlaneLicenseModules(finalLicenseId, {
-          modules: (cpLicenseModalModules || []).map((m) => ({
-            module_key: String(m?.module_key || ""),
-            enabled: Boolean(m?.enabled),
-          })),
-        });
-      }
-      await refreshControlPlaneData(currentTenantId || "default");
-      setCpResult(`License '${finalLicenseId || payload.plan_code}' saved.`);
-      setCpModalError("");
-      setShowCpLicenseModal(false);
-    } catch (err) {
-      setCpModalError(`License save failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const loadControlPlaneLicenseModules = async (licenseId) => {
-    const lid = String(licenseId || "").trim();
-    setCpSelectedLicenseId(lid);
-    if (!lid) {
-      setCpLicenseModulesText("");
-      return;
-    }
-    setCpBusy(true);
-    try {
-      const res = await getControlPlaneLicenseModules(lid);
-      const rows = Array.isArray(res?.rows) ? res.rows : [];
-      setCpLicenseModulesText(JSON.stringify(rows, null, 2));
-      setCpResult(`Loaded modules for license '${lid}'.`);
-    } catch (err) {
-      setCpResult(`Load license modules failed: ${String(err?.message || err)}`);
-      setCpLicenseModulesText("");
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const saveControlPlaneLicenseModules = async () => {
-    if (!canEditPage("control_plane")) return;
-    const lid = String(cpSelectedLicenseId || "").trim();
-    if (!lid) {
-      setCpResult("Select a license first.");
-      return;
-    }
-    let modules = [];
-    try {
-      modules = JSON.parse(String(cpLicenseModulesText || "[]"));
-      if (!Array.isArray(modules)) throw new Error("modules payload must be an array");
-    } catch (err) {
-      setCpResult(`Invalid modules JSON: ${String(err?.message || err)}`);
-      return;
-    }
-    setCpBusy(true);
-    try {
-      await setControlPlaneLicenseModules(lid, { modules });
-      await refreshControlPlaneData(currentTenantId || "default");
-      setCpResult(`License modules saved for '${lid}'.`);
-    } catch (err) {
-      setCpResult(`Save license modules failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const issueTenantActivationCode = async () => {
-    if (!canEditPage("control_plane")) return;
-    setCpBusy(true);
-    try {
-      const res = await issueControlPlaneActivationCode(
-        {
-          customer_id: String(cpActivationIssueForm.customer_id || "").trim(),
-          edge_name: String(cpActivationIssueForm.edge_name || "").trim(),
-          ttl_minutes: Math.max(1, Number(cpActivationIssueForm.ttl_minutes || 30)),
-          metadata: {},
-        },
-        currentTenantId || "default"
-      );
-      const code = String(res?.row?.activation_code || "");
-      setCpIssuedActivationCode(code);
-      if (code) {
-        setCpActivationApplyForm((prev) => ({ ...prev, activation_code: code }));
-      }
-      setCpResult(code ? "Activation code issued." : "Activation issue request completed.");
-    } catch (err) {
-      setCpResult(`Activation code issue failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const applyTenantActivationCode = async () => {
-    if (!canEditPage("control_plane")) return;
-    setCpBusy(true);
-    try {
-      const payload = {
-        activation_code: String(cpActivationApplyForm.activation_code || "").trim(),
-        edge_id: String(cpActivationApplyForm.edge_id || "").trim(),
-        edge_name: String(cpActivationApplyForm.edge_name || "").trim(),
-        site: String(cpActivationApplyForm.site || "").trim(),
-        area: String(cpActivationApplyForm.area || "").trim(),
-        equipment: String(cpActivationApplyForm.equipment || "").trim(),
-      };
-      if (!payload.activation_code || !payload.edge_id) {
-        setCpResult("Activation code and edge ID are required.");
-        return;
-      }
-      await applyControlPlaneActivationCode(payload);
-      await refreshControlPlaneData(currentTenantId || "default");
-      setCpResult(`Activation applied for edge '${payload.edge_id}'.`);
-    } catch (err) {
-      setCpResult(`Activation apply failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const issueTenantPasswordReset = async () => {
-    if (!canEditPage("control_plane")) return;
-    const username = String(cpPasswordResetIssueForm.username || "").trim();
-    if (!username) {
-      setCpResult("Username is required to issue password reset.");
-      return;
-    }
-    setCpBusy(true);
-    try {
-      const res = await issueControlPlanePasswordReset(
-        {
-          username,
-          ttl_minutes: Math.max(1, Number(cpPasswordResetIssueForm.ttl_minutes || 15)),
-        },
-        currentTenantId || "default"
-      );
-      const token = String(res?.row?.reset_token || "");
-      setCpIssuedResetToken(token);
-      setCpPasswordResetApplyForm((prev) => ({ ...prev, username, reset_token: token || prev.reset_token }));
-      setCpResult(token ? `Password reset token issued for '${username}'.` : "Password reset token issued.");
-    } catch (err) {
-      setCpResult(`Password reset issue failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
-    }
-  };
-
-  const applyTenantPasswordReset = async () => {
-    if (!canEditPage("control_plane")) return;
-    const payload = {
-      username: String(cpPasswordResetApplyForm.username || "").trim(),
-      reset_token: String(cpPasswordResetApplyForm.reset_token || "").trim(),
-      new_password: String(cpPasswordResetApplyForm.new_password || ""),
-    };
-    if (!payload.username || !payload.reset_token || !payload.new_password) {
-      setCpResult("Username, reset token, and new password are required.");
-      return;
-    }
-    setCpBusy(true);
-    try {
-      await applyControlPlanePasswordReset(payload, currentTenantId || "default");
-      await refreshControlPlaneUsers(currentTenantId || "default");
-      setCpResult(`Password reset applied for '${payload.username}'.`);
-    } catch (err) {
-      setCpResult(`Password reset apply failed: ${String(err?.message || err)}`);
-    } finally {
-      setCpBusy(false);
     }
   };
 
@@ -14082,316 +13282,6 @@ function AppShell() {
             </div>
           ) : null}
 
-          {activePage === "control_plane" ? (
-            <div className="page-fill">
-              <section className="card">
-                <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-                  <h4 style={{ margin: 0 }}>Developer Control Plane</h4>
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => refreshControlPlaneData(currentTenantId || "default")}
-                    disabled={cpBusy}
-                  >
-                    Refresh
-                  </button>
-                </div>
-                <div className="form-grid" style={{ marginTop: 10 }}>
-                  <label>
-                    Tenant Context
-                    <input value={currentTenantId || "default"} readOnly />
-                  </label>
-                  <label>
-                    Edges
-                    <input value={String(cpSummary?.edges_count ?? cpEdges.length ?? 0)} readOnly />
-                  </label>
-                  <label>
-                    Customers
-                    <input value={String(cpSummary?.customers_count ?? cpCustomers.length ?? 0)} readOnly />
-                  </label>
-                  <label>
-                    Licenses
-                    <input value={String(cpSummary?.licenses_count ?? cpLicenses.length ?? 0)} readOnly />
-                  </label>
-                </div>
-                {cpResult ? <div className={`status ${cpResult.toLowerCase().includes("failed") ? "error" : "ok"}`}>{cpResult}</div> : null}
-              </section>
-
-              <section className="card">
-                <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-                  <h4 style={{ margin: 0 }}>Licensing</h4>
-                  <div className="row">
-                    <button className="btn btn-success" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add License</button>
-                  </div>
-                </div>
-                <div className="table-scroll" style={{ marginTop: 10 }}>
-                  <div className="table">
-                    <div className="thead"><span>License Key</span><span>Customer</span><span>Modules</span><span>Edges/Users</span><span>Active Window</span><span>Status</span><span>Actions</span></div>
-                    {cpLicenses.map((row, idx) => (
-                      <div className="trow" key={String(row?.license_id || `license-${idx}`)}>
-                        <span>{String(row?.license_id || "-")}</span>
-                        <span>{String(row?.customer_id || "-")}</span>
-                        <span>{String(row?.plan_code || "-")}</span>
-                        <span>{`${Number(row?.max_edges || 0)} / ${Number(row?.max_users || 0)}`}</span>
-                        <span>{`${fmtTs(row?.start_utc || "") || "-"} -> ${fmtTs(row?.end_utc || "") || "-"}`}</span>
-                        <span>{String(row?.status || "-")}</span>
-                        <span className="row-actions">
-                          <button className="icon-btn table-action-btn" onClick={() => openCpLicenseEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
-                          <button className="icon-btn danger table-action-btn" onClick={() => deleteCpLicense(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
-                        </span>
-                      </div>
-                    ))}
-                    {!cpLicenses.length ? <div className="trow"><span>-</span><span>-</span><span>No licenses yet</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
-                  </div>
-                </div>
-              </section>
-
-              <section className="card">
-                <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-                  <h4 style={{ margin: 0 }}>Customers</h4>
-                  <div className="row">
-                    <button className="btn btn-success" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Customer</button>
-                  </div>
-                </div>
-                <div className="table-scroll" style={{ marginTop: 10 }}>
-                  <div className="table">
-                    <div className="thead"><span>Customer ID</span><span>Company</span><span>Email</span><span>Status</span><span>Actions</span></div>
-                    {cpCustomers.map((row, idx) => (
-                      <div className="trow" key={String(row?.customer_id || `customer-${idx}`)}>
-                        <span>{String(row?.customer_id || "-")}</span>
-                        <span>{String(row?.company_name || "-")}</span>
-                        <span>{String(row?.contact_email || "-")}</span>
-                        <span>{String(row?.status || "-")}</span>
-                        <span className="row-actions">
-                          <button className="icon-btn table-action-btn" onClick={() => openCpCustomerEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
-                          <button className="icon-btn danger table-action-btn" onClick={() => deleteCpCustomer(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
-                        </span>
-                      </div>
-                    ))}
-                    {!cpCustomers.length ? <div className="trow"><span>-</span><span>No customers yet</span><span>-</span><span>-</span><span>-</span></div> : null}
-                  </div>
-                </div>
-              </section>
-
-              <section className="card">
-                <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-                  <h4 style={{ margin: 0 }}>Edges</h4>
-                  <div className="row">
-                    <button className="btn btn-success" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Edge</button>
-                  </div>
-                </div>
-                <div className="table-scroll" style={{ marginTop: 10 }}>
-                  <div className="table">
-                    <div className="thead"><span>Edge ID</span><span>Name</span><span>Customer</span><span>Site / Area / Equipment</span><span>Status</span><span>Last Heartbeat</span><span>Actions</span></div>
-                    {cpEdges.map((row, idx) => (
-                      <div className="trow" key={String(row?.edge_id || `edge-${idx}`)}>
-                        <span>{String(row?.edge_id || "-")}</span>
-                        <span>{String(row?.edge_name || "-")}</span>
-                        <span>{String(row?.customer_id || "-")}</span>
-                        <span>{`${String(row?.site || "-")} / ${String(row?.area || "-")} / ${String(row?.equipment || "-")}`}</span>
-                        <span>{String(row?.status || "-")}</span>
-                        <span>{fmtTs(row?.last_heartbeat_utc || row?.updated_utc || "")}</span>
-                        <span className="row-actions">
-                          <button className="icon-btn table-action-btn" onClick={() => openCpEdgeEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
-                          <button className="icon-btn danger table-action-btn" onClick={() => deleteCpEdge(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
-                        </span>
-                      </div>
-                    ))}
-                    {!cpEdges.length ? <div className="trow"><span>-</span><span>No edges yet</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
-                  </div>
-                </div>
-              </section>
-
-              <section className="card">
-                <h4>Tenant + Bundle Provisioning</h4>
-                <div className="form-grid">
-                  <label>
-                    Tenant ID
-                    <input
-                      value={cpTenantForm.tenant_id}
-                      onChange={(e) => setCpTenantForm((p) => ({ ...p, tenant_id: e.target.value }))}
-                      placeholder="tenant_a"
-                    />
-                  </label>
-                  <label>
-                    Tenant Name
-                    <input
-                      value={cpTenantForm.name}
-                      onChange={(e) => setCpTenantForm((p) => ({ ...p, name: e.target.value }))}
-                      placeholder="Customer A"
-                    />
-                  </label>
-                  <label>
-                    Domain
-                    <input
-                      value={cpTenantForm.primary_domain}
-                      onChange={(e) => setCpTenantForm((p) => ({ ...p, primary_domain: e.target.value }))}
-                      placeholder="customer-a-trustnode.lsapps.app"
-                    />
-                  </label>
-                  <label>
-                    Timezone
-                    <input
-                      value={cpTenantForm.timezone}
-                      onChange={(e) => setCpTenantForm((p) => ({ ...p, timezone: e.target.value }))}
-                      placeholder="Europe/Dublin"
-                    />
-                  </label>
-                  <label>
-                    Status
-                    <select
-                      value={cpTenantForm.status}
-                      onChange={(e) => setCpTenantForm((p) => ({ ...p, status: e.target.value }))}
-                    >
-                      <option value="active">active</option>
-                      <option value="suspended">suspended</option>
-                    </select>
-                  </label>
-                </div>
-                <div className="row">
-                  <button className="btn btn-success" onClick={saveControlPlaneTenant} disabled={cpBusy || !canEditPage("control_plane")}>
-                    Save Tenant
-                  </button>
-                </div>
-                <div className="form-grid" style={{ marginTop: 12 }}>
-                  <label>
-                    Bundle Tenant ID
-                    <input value={cpBundleForm.tenant_id} onChange={(e) => setCpBundleForm((p) => ({ ...p, tenant_id: e.target.value }))} placeholder="customer_a" />
-                  </label>
-                  <label>
-                    Bundle Tenant Name
-                    <input value={cpBundleForm.tenant_name} onChange={(e) => setCpBundleForm((p) => ({ ...p, tenant_name: e.target.value }))} placeholder="Customer A" />
-                  </label>
-                  <label>
-                    Primary Domain
-                    <input value={cpBundleForm.primary_domain} onChange={(e) => setCpBundleForm((p) => ({ ...p, primary_domain: e.target.value }))} placeholder="customer-a-trustnode.lsapps.app" />
-                  </label>
-                  <label>
-                    Customer ID
-                    <input value={cpBundleForm.customer_id} onChange={(e) => setCpBundleForm((p) => ({ ...p, customer_id: e.target.value }))} placeholder="cust-a" />
-                  </label>
-                  <label>
-                    Company Name
-                    <input value={cpBundleForm.company_name} onChange={(e) => setCpBundleForm((p) => ({ ...p, company_name: e.target.value }))} placeholder="Customer A" />
-                  </label>
-                  <label>
-                    Admin Username
-                    <input value={cpBundleForm.admin_username} onChange={(e) => setCpBundleForm((p) => ({ ...p, admin_username: e.target.value }))} placeholder="admin_a" />
-                  </label>
-                  <label>
-                    Admin Password
-                    <input type="password" value={cpBundleForm.admin_password} onChange={(e) => setCpBundleForm((p) => ({ ...p, admin_password: e.target.value }))} placeholder="StrongPassword!" />
-                  </label>
-                </div>
-                <div className="row">
-                  <button className="btn btn-success" onClick={provisionControlPlaneBundle} disabled={cpBusy || !canEditPage("control_plane")}>
-                    Provision Customer Bundle
-                  </button>
-                </div>
-              </section>
-
-              <section className="card">
-                <h4>Edge Health / Activation / Password Recovery</h4>
-                <div className="form-grid">
-                  <label>
-                    Healthy (&lt;= 90s)
-                    <input readOnly value={String(cpEdgeHeartbeatSummary.healthy)} />
-                  </label>
-                  <label>
-                    Stale (&gt; 90s)
-                    <input readOnly value={String(cpEdgeHeartbeatSummary.stale)} />
-                  </label>
-                  <label>
-                    Missing heartbeat
-                    <input readOnly value={String(cpEdgeHeartbeatSummary.missing)} />
-                  </label>
-                  <label>
-                    Latest heartbeat
-                    <input readOnly value={fmtTs(cpEdgeHeartbeatSummary.latestHeartbeatUtc || "")} />
-                  </label>
-                </div>
-                <div className="form-grid">
-                  <label>
-                    Issue Activation (Customer ID)
-                    <input value={cpActivationIssueForm.customer_id} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, customer_id: e.target.value }))} />
-                  </label>
-                  <label>
-                    Activation Edge Name
-                    <input value={cpActivationIssueForm.edge_name} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, edge_name: e.target.value }))} />
-                  </label>
-                  <label>
-                    Activation TTL (min)
-                    <input type="number" min="1" value={cpActivationIssueForm.ttl_minutes} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, ttl_minutes: Number(e.target.value || 30) }))} />
-                  </label>
-                </div>
-                <div className="row">
-                  <button className="btn btn-success" onClick={issueTenantActivationCode} disabled={cpBusy || !canEditPage("control_plane")}>Issue Activation Code</button>
-                  <input readOnly value={cpIssuedActivationCode} placeholder="Activation code will appear here" style={{ minWidth: 280 }} />
-                </div>
-                <div className="form-grid" style={{ marginTop: 12 }}>
-                  <label>
-                    Activation Code
-                    <input value={cpActivationApplyForm.activation_code} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, activation_code: e.target.value }))} />
-                  </label>
-                  <label>
-                    Edge ID
-                    <input value={cpActivationApplyForm.edge_id} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, edge_id: e.target.value }))} />
-                  </label>
-                  <label>
-                    Edge Name
-                    <input value={cpActivationApplyForm.edge_name} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, edge_name: e.target.value }))} />
-                  </label>
-                  <label>
-                    Site
-                    <input value={cpActivationApplyForm.site} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, site: e.target.value }))} />
-                  </label>
-                  <label>
-                    Area
-                    <input value={cpActivationApplyForm.area} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, area: e.target.value }))} />
-                  </label>
-                  <label>
-                    Equipment
-                    <input value={cpActivationApplyForm.equipment} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, equipment: e.target.value }))} />
-                  </label>
-                </div>
-                <div className="row">
-                  <button className="btn btn-primary" onClick={applyTenantActivationCode} disabled={cpBusy || !canEditPage("control_plane")}>Apply Activation</button>
-                </div>
-
-                <div className="form-grid" style={{ marginTop: 12 }}>
-                  <label>
-                    Reset Username
-                    <input value={cpPasswordResetIssueForm.username} onChange={(e) => setCpPasswordResetIssueForm((p) => ({ ...p, username: e.target.value }))} />
-                  </label>
-                  <label>
-                    Reset TTL (min)
-                    <input type="number" min="1" value={cpPasswordResetIssueForm.ttl_minutes} onChange={(e) => setCpPasswordResetIssueForm((p) => ({ ...p, ttl_minutes: Number(e.target.value || 15) }))} />
-                  </label>
-                </div>
-                <div className="row">
-                  <button className="btn btn-success" onClick={issueTenantPasswordReset} disabled={cpBusy || !canEditPage("control_plane")}>Issue Reset Token</button>
-                  <input readOnly value={cpIssuedResetToken} placeholder="Reset token will appear here" style={{ minWidth: 280 }} />
-                </div>
-                <div className="form-grid" style={{ marginTop: 12 }}>
-                  <label>
-                    Apply Username
-                    <input value={cpPasswordResetApplyForm.username} onChange={(e) => setCpPasswordResetApplyForm((p) => ({ ...p, username: e.target.value }))} />
-                  </label>
-                  <label>
-                    Reset Token
-                    <input value={cpPasswordResetApplyForm.reset_token} onChange={(e) => setCpPasswordResetApplyForm((p) => ({ ...p, reset_token: e.target.value }))} />
-                  </label>
-                  <label>
-                    New Password
-                    <input type="password" value={cpPasswordResetApplyForm.new_password} onChange={(e) => setCpPasswordResetApplyForm((p) => ({ ...p, new_password: e.target.value }))} />
-                  </label>
-                </div>
-                <div className="row">
-                  <button className="btn btn-primary" onClick={applyTenantPasswordReset} disabled={cpBusy || !canEditPage("control_plane")}>Apply Password Reset</button>
-                </div>
-              </section>
-            </div>
-          ) : null}
-
           {activePage === "tags" ? (
             <div className="page-fill">
               <section className="card">
@@ -15861,170 +14751,6 @@ function AppShell() {
             <div className="row modal-actions">
               <button className="btn btn-primary" onClick={saveEditedUser} disabled={!canManageUsers}>Save</button>
               <button className="btn btn-danger" onClick={() => setShowEditUserModal(false)}>Cancel</button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-      {showCpCustomerModal ? (
-        <div className="modal-backdrop">
-          <div className="modal-card trigger-modal-card">
-            <h3>{cpCustomerForm.customer_id ? "Edit Customer" : "Add Customer"}</h3>
-            {cpModalError ? <div className="status error" style={{ marginBottom: 8 }}>{cpModalError}</div> : null}
-            <div className="trigger-form-grid">
-              <label>
-                Customer ID
-                <input value={cpCustomerForm.customer_id} onChange={(e) => setCpCustomerForm((p) => ({ ...p, customer_id: e.target.value }))} placeholder="auto if empty" />
-              </label>
-              <label>
-                Company Name *
-                <input value={cpCustomerForm.company_name} onChange={(e) => setCpCustomerForm((p) => ({ ...p, company_name: e.target.value }))} />
-              </label>
-              <label>
-                Contact Email
-                <input value={cpCustomerForm.contact_email} onChange={(e) => setCpCustomerForm((p) => ({ ...p, contact_email: e.target.value }))} />
-              </label>
-              <label>
-                Status
-                <select value={cpCustomerForm.status} onChange={(e) => setCpCustomerForm((p) => ({ ...p, status: e.target.value }))}>
-                  <option value="active">active</option>
-                  <option value="inactive">inactive</option>
-                </select>
-              </label>
-            </div>
-            <div className="row modal-actions">
-              <button className="btn btn-primary" onClick={saveControlPlaneCustomer} disabled={cpBusy || !canEditPage("control_plane")}>Save</button>
-              <button className="btn btn-danger" onClick={() => { setShowCpCustomerModal(false); setCpModalError(""); }}>Cancel</button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-      {showCpEdgeModal ? (
-        <div className="modal-backdrop">
-          <div className="modal-card trigger-modal-card">
-            <h3>{cpEdgeForm.edge_id ? "Edit Edge" : "Add Edge"}</h3>
-            {cpModalError ? <div className="status error" style={{ marginBottom: 8 }}>{cpModalError}</div> : null}
-            <div className="trigger-form-grid">
-              <label>
-                Edge ID
-                <input value={cpEdgeForm.edge_id} onChange={(e) => setCpEdgeForm((p) => ({ ...p, edge_id: e.target.value }))} placeholder="auto if empty" />
-              </label>
-              <label>
-                Edge Name *
-                <input value={cpEdgeForm.edge_name} onChange={(e) => setCpEdgeForm((p) => ({ ...p, edge_name: e.target.value }))} />
-              </label>
-              <label>
-                Customer ID *
-                <select value={cpEdgeForm.customer_id} onChange={(e) => setCpEdgeForm((p) => ({ ...p, customer_id: e.target.value }))}>
-                  <option value="">Select customer</option>
-                  {cpCustomers.map((row) => (
-                    <option key={`cp-edge-customer-${String(row?.customer_id || "")}`} value={String(row?.customer_id || "")}>
-                      {String(row?.customer_id || "")}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Site
-                <input value={cpEdgeForm.site} onChange={(e) => setCpEdgeForm((p) => ({ ...p, site: e.target.value }))} />
-              </label>
-              <label>
-                Area
-                <input value={cpEdgeForm.area} onChange={(e) => setCpEdgeForm((p) => ({ ...p, area: e.target.value }))} />
-              </label>
-              <label>
-                Equipment
-                <input value={cpEdgeForm.equipment} onChange={(e) => setCpEdgeForm((p) => ({ ...p, equipment: e.target.value }))} />
-              </label>
-              <label>
-                Status
-                <select value={cpEdgeForm.status} onChange={(e) => setCpEdgeForm((p) => ({ ...p, status: e.target.value }))}>
-                  <option value="active">active</option>
-                  <option value="inactive">inactive</option>
-                </select>
-              </label>
-            </div>
-            <div className="row modal-actions">
-              <button className="btn btn-primary" onClick={saveControlPlaneEdge} disabled={cpBusy || !canEditPage("control_plane")}>Save</button>
-              <button className="btn btn-danger" onClick={() => { setShowCpEdgeModal(false); setCpModalError(""); }}>Cancel</button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-      {showCpLicenseModal ? (
-        <div className="modal-backdrop">
-          <div className="modal-card trigger-modal-card">
-            <h3>{cpLicenseForm.license_id ? "Edit License" : "Generate License"}</h3>
-            {cpModalError ? <div className="status error" style={{ marginBottom: 8 }}>{cpModalError}</div> : null}
-            <div className="trigger-form-grid">
-              <label>
-                License Key
-                <input value={cpLicenseForm.license_id} onChange={(e) => setCpLicenseForm((p) => ({ ...p, license_id: e.target.value }))} placeholder="auto if empty" />
-              </label>
-              <label>
-                Customer ID *
-                <select value={cpLicenseForm.customer_id} onChange={(e) => setCpLicenseForm((p) => ({ ...p, customer_id: e.target.value }))}>
-                  <option value="">Select customer</option>
-                  {cpCustomers.map((row) => (
-                    <option key={`cp-license-customer-${String(row?.customer_id || "")}`} value={String(row?.customer_id || "")}>
-                      {String(row?.customer_id || "")}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Plan
-                <input value={cpLicenseForm.plan_code} onChange={(e) => setCpLicenseForm((p) => ({ ...p, plan_code: e.target.value }))} />
-              </label>
-              <label>
-                Status
-                <select value={cpLicenseForm.status} onChange={(e) => setCpLicenseForm((p) => ({ ...p, status: e.target.value }))}>
-                  <option value="active">active</option>
-                  <option value="suspended">suspended</option>
-                </select>
-              </label>
-              <label>
-                Start UTC
-                <input value={cpLicenseForm.start_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, start_utc: e.target.value }))} placeholder="2026-04-24T00:00:00Z" />
-              </label>
-              <label>
-                End UTC
-                <input value={cpLicenseForm.end_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, end_utc: e.target.value }))} placeholder="2027-04-24T00:00:00Z" />
-              </label>
-              <label>
-                Max Edges
-                <input type="number" min="1" value={cpLicenseForm.max_edges} onChange={(e) => setCpLicenseForm((p) => ({ ...p, max_edges: Number(e.target.value || 1) }))} />
-              </label>
-              <label>
-                Max Users
-                <input type="number" min="1" value={cpLicenseForm.max_users} onChange={(e) => setCpLicenseForm((p) => ({ ...p, max_users: Number(e.target.value || 1) }))} />
-              </label>
-            </div>
-            <div style={{ marginTop: 8 }}>
-              <div style={{ marginBottom: 6, fontWeight: 600 }}>Modules</div>
-              <div className="form-grid">
-                {cpLicenseModalModules.map((mod) => (
-                  <label key={String(mod?.module_key || "")} className="remember-row">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(mod?.enabled)}
-                      onChange={(e) =>
-                        setCpLicenseModalModules((prev) =>
-                          prev.map((x) =>
-                            String(x?.module_key || "") === String(mod?.module_key || "")
-                              ? { ...x, enabled: e.target.checked }
-                              : x
-                          )
-                        )
-                      }
-                    />
-                    <span className="remember-label">{String(mod?.module_key || "")}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-            <div className="row modal-actions">
-              <button className="btn btn-primary" onClick={saveCpLicenseModal} disabled={cpBusy || !canEditPage("control_plane")}>Save</button>
-              <button className="btn btn-danger" onClick={() => { setShowCpLicenseModal(false); setCpModalError(""); }}>Cancel</button>
             </div>
           </div>
         </div>

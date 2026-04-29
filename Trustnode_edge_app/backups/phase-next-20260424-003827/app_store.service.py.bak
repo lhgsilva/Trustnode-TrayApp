@@ -116,7 +116,6 @@ class AppStore:
         )
         self._live_fast_last_local_id = 0
         self._live_fast_pending_latest: dict[tuple[str, str, str], dict[str, Any]] = {}
-        self._local_live_latest_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._data_sync_tick = 0
         self._cloud_live_cache_rows: list[dict[str, Any]] = []
         self._cloud_live_cache_updated_utc = ""
@@ -3171,98 +3170,6 @@ class AppStore:
         out["dashboard_configurations"] = dash
         return out
 
-    def _normalize_edge_filter(self, edge_id: str) -> str:
-        return str(edge_id or "").strip().lower()
-
-    def _build_edge_selector_maps(self) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-        gateway_to_edge_ids: dict[str, set[str]] = {}
-        db_name_to_edge_ids: dict[str, set[str]] = {}
-        try:
-            db_configs_raw = self.get_config_domain("database_configurations")
-            db_configs = db_configs_raw if isinstance(db_configs_raw, list) else []
-            db_id_to_name: dict[str, str] = {}
-            for db in db_configs:
-                if not isinstance(db, dict):
-                    continue
-                if db.get("enabled") is False:
-                    continue
-                if db.get("cloud_sync_enabled") is False:
-                    continue
-                db_id = str(db.get("id") or "").strip()
-                db_name = str(db.get("name") or "").strip()
-                source = str(db.get("source") or "").strip() or "unknown-source"
-                site = str(db.get("site") or "").strip() or "unknown-site"
-                area = str(db.get("area") or "").strip() or "unknown-area"
-                equipment = str(db.get("equipment") or "").strip() or "unknown-equipment"
-                composite = f"{source}||{site}||{area}||{equipment}".lower()
-                configured_edge = str(db.get("edge_id") or "").strip().lower()
-                edge_ids = {composite}
-                if configured_edge:
-                    edge_ids.add(configured_edge)
-                if db_name:
-                    db_name_to_edge_ids.setdefault(db_name.lower(), set()).update(edge_ids)
-                if db_id and db_name:
-                    db_id_to_name[db_id] = db_name.lower()
-
-            gw_configs_raw = self.get_config_domain("gateway_configurations")
-            gw_configs = gw_configs_raw if isinstance(gw_configs_raw, list) else []
-            for gw in gw_configs:
-                if not isinstance(gw, dict):
-                    continue
-                gid = str(gw.get("id") or "").strip()
-                if not gid:
-                    continue
-                db_id = str(gw.get("database_id") or "").strip()
-                db_name_key = db_id_to_name.get(db_id, "")
-                if not db_name_key:
-                    continue
-                edge_ids = db_name_to_edge_ids.get(db_name_key, set())
-                if edge_ids:
-                    gateway_to_edge_ids.setdefault(gid, set()).update(edge_ids)
-        except Exception:
-            return {}, {}
-        return gateway_to_edge_ids, db_name_to_edge_ids
-
-    def _row_matches_edge_filter(
-        self,
-        row: dict[str, Any],
-        edge_filter: str,
-        gateway_to_edge_ids: dict[str, set[str]],
-        db_name_to_edge_ids: dict[str, set[str]],
-    ) -> bool:
-        if not edge_filter:
-            return True
-        source = str(row.get("source") or "").strip() or "unknown-source"
-        site = str(row.get("site") or "").strip() or "unknown-site"
-        area = str(row.get("area") or "").strip() or "unknown-area"
-        equipment = str(row.get("equipment") or "").strip() or "unknown-equipment"
-        row_composite = f"{source}||{site}||{area}||{equipment}".lower()
-        if row_composite == edge_filter:
-            return True
-        gid = str(row.get("gateway_id") or "").strip()
-        if gid and edge_filter in gateway_to_edge_ids.get(gid, set()):
-            return True
-        db_name = str(row.get("database_name") or "").strip().lower()
-        if db_name and edge_filter in db_name_to_edge_ids.get(db_name, set()):
-            return True
-        return False
-
-    def _filter_rows_by_edge(self, rows: list[dict[str, Any]], edge_id: str) -> list[dict[str, Any]]:
-        edge_filter = self._normalize_edge_filter(edge_id)
-        if not edge_filter:
-            return rows
-        gateway_to_edge_ids, db_name_to_edge_ids = self._build_edge_selector_maps()
-        return [
-            row
-            for row in rows
-            if self._row_matches_edge_filter(
-                row=row,
-                edge_filter=edge_filter,
-                gateway_to_edge_ids=gateway_to_edge_ids,
-                db_name_to_edge_ids=db_name_to_edge_ids,
-            )
-        ]
-
     def force_sync_now(self, actor: str = "manual") -> Dict[str, Any]:
         started_utc = self._utc_now()
         errors: list[str] = []
@@ -4018,16 +3925,6 @@ class AppStore:
                 except Exception:
                     max_local_id = 0
         if pending_live_rows:
-            # Keep a fast local latest cache for UI/live endpoints.
-            with self._lock:
-                for row in pending_live_rows:
-                    key = (
-                        normalize_tenant_id(str(row.get("tenant_id") or tenant_id)),
-                        str(row.get("gateway_id") or ""),
-                        str(row.get("tag_name") or ""),
-                    )
-                    if key[1] and key[2]:
-                        self._local_live_latest_cache[key] = dict(row)
             self._enqueue_live_fast_pending(pending_live_rows, max_local_id=max_local_id)
         self._sync_wakeup_event.set()
         self._live_sync_wakeup_event.set()
@@ -4075,11 +3972,8 @@ class AppStore:
         gateway: str = "",
         device: str = "",
         tag: str = "",
-        edge_id: str = "",
     ) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 1000), 10000))
-        edge_filter = self._normalize_edge_filter(edge_id)
-        fetch_lim = lim if not edge_filter else max(lim, min(50000, lim * 6))
         tenant_id = self._current_tenant_id()
         gateway_txt = str(gateway or "").strip()
         device_txt = str(device or "").strip()
@@ -4089,16 +3983,16 @@ class AppStore:
         prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
         if prefer_cloud:
             cloud_rows = self._fetch_historian_rows_from_cloud(
-                fetch_lim,
+                lim,
                 gateway=gateway_txt,
                 device=device_txt,
                 tag=tag_txt,
             )
             if cloud_rows:
-                return self._filter_rows_by_edge(cloud_rows, edge_filter)[:lim]
+                return cloud_rows
 
         where = "WHERE tenant_id = :tenant"
-        params: dict[str, Any] = {"tenant": tenant_id, "lim": fetch_lim}
+        params: dict[str, Any] = {"tenant": tenant_id, "lim": lim}
         if gateway_txt:
             where += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
             params["gateway"] = gateway_txt
@@ -4139,13 +4033,10 @@ class AppStore:
                     "quality_label": r["quality_label"] or "",
                 }
             )
-        out = self._filter_rows_by_edge(out, edge_filter)
-        return out[:lim]
+        return out
 
-    def get_live_rows(self, limit: int = 5000, prefer_cloud_reads: bool | None = None, edge_id: str = "") -> list[dict[str, Any]]:
+    def get_live_rows(self, limit: int = 5000, prefer_cloud_reads: bool | None = None) -> list[dict[str, Any]]:
         lim = max(100, min(int(limit or 5000), 50000))
-        edge_filter = self._normalize_edge_filter(edge_id)
-        fetch_lim = lim if not edge_filter else max(lim, min(50000, lim * 6))
         tenant_id = self._current_tenant_id()
         prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
         def _row_ts_ms(row: dict[str, Any]) -> int:
@@ -4200,64 +4091,38 @@ class AppStore:
                 except Exception:
                     age_ms = 999999
                 if age_ms <= int(max(1200, self._cloud_live_cache_interval_seconds * 2500)):
-                    return self._filter_rows_by_edge(cached_rows, edge_filter)[:lim]
-            cloud_live_fast = self._fetch_live_rows_from_cloud_fast(fetch_lim)
+                    return cached_rows[:lim]
+            cloud_live_fast = self._fetch_live_rows_from_cloud_fast(lim)
             if cloud_live_fast:
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 newest_fast_ms = max((_row_ts_ms(r) for r in cloud_live_fast), default=0)
                 if newest_fast_ms > 0 and max(0, now_ms - newest_fast_ms) <= int(self._live_source_max_stale_ms):
-                    return self._filter_rows_by_edge(cloud_live_fast, edge_filter)[:lim]
-            cloud_live = self._fetch_live_rows_from_cloud(fetch_lim)
+                    return cloud_live_fast
+            cloud_live = self._fetch_live_rows_from_cloud(lim)
             if cloud_live:
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 latest_live_ms = max((_row_ts_ms(r) for r in cloud_live), default=0)
                 live_age_ms = max(0, now_ms - latest_live_ms) if latest_live_ms > 0 else 999999
                 # Fast path: avoid expensive historian reads on every live request.
                 if live_age_ms <= int(max(1500, self._live_source_max_stale_ms)):
-                    return self._filter_rows_by_edge(cloud_live, edge_filter)[:lim]
-                cloud_hist = self._fetch_historian_rows_from_cloud(min(max(fetch_lim * 2, 500), 1500))
+                    return cloud_live
+                cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim * 2, 500), 1500))
                 if cloud_hist:
                     latest_hist_ms = max((_row_ts_ms(r) for r in cloud_hist), default=0)
                     # If live_latest lags materially behind historian, serve latest rows
                     # derived from historian so web charts remain visibly live.
                     if latest_hist_ms > 0 and latest_hist_ms > latest_live_ms + 1500:
-                        hist_live = _latest_per_gateway_tag(cloud_hist, fetch_lim)
+                        hist_live = _latest_per_gateway_tag(cloud_hist, lim)
                         if hist_live:
-                            return self._filter_rows_by_edge(hist_live, edge_filter)[:lim]
-                return self._filter_rows_by_edge(cloud_live, edge_filter)[:lim]
-            cloud_hist = self._fetch_historian_rows_from_cloud(min(max(fetch_lim * 2, 500), 1500))
+                            return hist_live
+                return cloud_live
+            cloud_hist = self._fetch_historian_rows_from_cloud(min(max(lim * 2, 500), 1500))
             if cloud_live:
-                return self._filter_rows_by_edge(cloud_live, edge_filter)[:lim]
+                return cloud_live
             if cloud_hist:
-                hist_live = _latest_per_gateway_tag(cloud_hist, fetch_lim)
+                hist_live = _latest_per_gateway_tag(cloud_hist, lim)
                 if hist_live:
-                    return self._filter_rows_by_edge(hist_live, edge_filter)[:lim]
-
-        # Local fast path: serve latest-per-tag rows from in-memory cache first.
-        with self._lock:
-            cache_rows = [
-                {
-                    "ts": str(v.get("ts_utc") or ""),
-                    "tenant_id": str(v.get("tenant_id") or tenant_id),
-                    "source": str(v.get("source") or ""),
-                    "gateway_id": str(v.get("gateway_id") or ""),
-                    "gateway_name": str(v.get("gateway_name") or ""),
-                    "device_name": str(v.get("device_name") or ""),
-                    "plc_ip": str(v.get("plc_ip") or ""),
-                    "database_name": str(v.get("database_name") or ""),
-                    "tag": str(v.get("tag_name") or ""),
-                    "value": v.get("value"),
-                    "quality": v.get("quality"),
-                    "quality_label": str(v.get("quality_label") or ""),
-                }
-                for (tnt, _gw, _tag), v in self._local_live_latest_cache.items()
-                if tnt == tenant_id
-            ]
-        if cache_rows:
-            cache_rows.sort(key=lambda r: _row_ts_ms(r), reverse=True)
-            local_rows = self._filter_rows_by_edge(cache_rows, edge_filter)
-            if local_rows:
-                return local_rows[:lim]
+                    return hist_live
 
         with self._lock:
             with self._connect() as conn:
@@ -4270,7 +4135,7 @@ class AppStore:
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    (tenant_id, max(fetch_lim, 20000)),
+                    (tenant_id, max(lim, 20000)),
                 ).fetchall()
 
         latest: dict[tuple[str, str], dict[str, Any]] = {}
@@ -4296,15 +4161,14 @@ class AppStore:
                 "quality": r["quality"],
                 "quality_label": str(r["quality_label"] or ""),
             }
-            if len(latest) >= fetch_lim:
+            if len(latest) >= lim:
                 break
 
         if latest:
-            local_rows = self._filter_rows_by_edge(list(latest.values()), edge_filter)
-            return local_rows[:lim]
-        cloud_live = self._fetch_live_rows_from_cloud(fetch_lim)
+            return list(latest.values())
+        cloud_live = self._fetch_live_rows_from_cloud(lim)
         if cloud_live:
-            return self._filter_rows_by_edge(cloud_live, edge_filter)[:lim]
+            return cloud_live
         return []
 
     def build_gateway_statuses_from_live_rows(
@@ -4401,17 +4265,15 @@ class AppStore:
         statuses.sort(key=lambda r: str(r.get("last_check_utc") or ""), reverse=True)
         return statuses
 
-    def get_log_rows(self, limit: int = 2000, prefer_cloud_reads: bool | None = None, edge_id: str = "") -> list[dict[str, Any]]:
+    def get_log_rows(self, limit: int = 2000, prefer_cloud_reads: bool | None = None) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 2000), 10000))
-        edge_filter = self._normalize_edge_filter(edge_id)
-        fetch_lim = lim if not edge_filter else max(lim, min(50000, lim * 6))
         tenant_id = self._current_tenant_id()
         # Hosted/web deployments should prefer cloud-backed log reads.
         prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
         if prefer_cloud:
-            cloud_rows = self._fetch_log_rows_from_cloud(fetch_lim)
+            cloud_rows = self._fetch_log_rows_from_cloud(lim)
             if cloud_rows:
-                return self._filter_rows_by_edge(cloud_rows, edge_filter)[:lim]
+                return cloud_rows
 
         with self._lock:
             with self._connect() as conn:
@@ -4423,7 +4285,7 @@ class AppStore:
                     ORDER BY id DESC
                     LIMIT ?
                     """,
-                    (tenant_id, fetch_lim),
+                    (tenant_id, lim),
                 ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
@@ -4440,12 +4302,11 @@ class AppStore:
                     "database_name": r["database_name"] or "",
                 }
             )
-        out = self._filter_rows_by_edge(out, edge_filter)
         if not out:
-            cloud_rows = self._fetch_log_rows_from_cloud(fetch_lim)
+            cloud_rows = self._fetch_log_rows_from_cloud(lim)
             if cloud_rows:
-                return self._filter_rows_by_edge(cloud_rows, edge_filter)[:lim]
-        return out[:lim]
+                return cloud_rows
+        return out
 
     def get_mirror_check(self) -> dict[str, Any]:
         tenant_id = self._current_tenant_id()
