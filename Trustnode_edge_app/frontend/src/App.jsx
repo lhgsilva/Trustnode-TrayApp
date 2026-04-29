@@ -40,6 +40,7 @@ import {
   manualPeriodSyncAppStore,
   clearAppStoreSyncQueue,
   dropAppStoreSyncBacklog,
+  clearEdgeIngestQueue,
   resetAppStoreFull,
   sendNotificationEmail,
   loginAuth,
@@ -9950,6 +9951,50 @@ function AppShell() {
     return lines.join("\n");
   };
 
+  const runDeleteLocalDatabaseData = async () => {
+    if (!canEditPage("database")) return;
+    const confirmed = window.confirm(
+      "Delete ALL local historian/log data now? This keeps configuration but removes collected runtime data."
+    );
+    if (!confirmed) return;
+    setForceSyncBusy(true);
+    setForceSyncResult("");
+    try {
+      const res = await cleanupAppStoreData({
+        mode: "all",
+        actor: currentUser?.username || "manual",
+      });
+      if (!res?.ok) throw new Error(res?.message || "Local cleanup failed");
+      setForceSyncResult(String(res?.message || "Local data deleted."));
+      await refreshDatabaseOverviewCards("Delete Local Data");
+    } catch (err) {
+      setForceSyncResult(`Delete local data failed: ${String(err)}`);
+    } finally {
+      setForceSyncBusy(false);
+    }
+  };
+
+  const runClearEdgeIngestQueue = async () => {
+    if (!canEditPage("database")) return;
+    setForceSyncBusy(true);
+    setForceSyncResult("");
+    try {
+      const res = await clearEdgeIngestQueue({
+        include_acked: false,
+        actor: currentUser?.username || "manual",
+      });
+      if (!res?.ok) throw new Error(res?.message || "Edge ingest queue clear failed");
+      setForceSyncResult(
+        `Edge ingest queue cleared: deleted ${Number(res?.deleted_rows || 0)} row(s), depth ${Number(res?.before_depth || 0)} -> ${Number(res?.after_depth || 0)}.`
+      );
+      await refreshEdgeIngestDiagnostics();
+    } catch (err) {
+      setForceSyncResult(`Clear edge queue failed: ${String(err)}`);
+    } finally {
+      setForceSyncBusy(false);
+    }
+  };
+
   const buildReportSvgChart = (doc) => {
     const rows = (doc.preview_rows || []).slice(-120);
     const series = (doc.chart_series || []).filter((s) => (doc.columns || []).includes(s.tag));
@@ -12262,6 +12307,14 @@ function AppShell() {
                     >
                       Remove
                     </button>
+                    <button
+                      className="btn btn-danger btn-sm"
+                      onClick={runDeleteLocalDatabaseData}
+                      disabled={!isAdminDatabaseUser || forceSyncBusy}
+                      title="Delete local historian/log rows (keeps configuration)"
+                    >
+                      Delete Data
+                    </button>
                   </div>
                 </div>
                 <div className="table db-table local-data-table">
@@ -12424,6 +12477,14 @@ function AppShell() {
                     </button>
                     <button className="btn btn-danger btn-sm" onClick={runResetLocalAndSync} disabled={!isAdminDatabaseUser || forceSyncBusy}>
                       Reset Local + Sync
+                    </button>
+                    <button
+                      className="btn btn-danger btn-sm"
+                      onClick={runClearEdgeIngestQueue}
+                      disabled={!isAdminDatabaseUser || forceSyncBusy}
+                      title="Clear device-ingest queue when token/URL is not configured"
+                    >
+                      Clear Edge Queue
                     </button>
                     <button
                       className="btn btn-primary btn-sm"

@@ -3,7 +3,7 @@ from typing import Any, Dict, Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from app.state import app_store
+from app.state import app_store, telemetry_service
 from app.tenant import get_current_tenant
 
 router = APIRouter(prefix="/api/app-store", tags=["app-store"])
@@ -72,6 +72,10 @@ class ClearSyncQueueRequest(BaseModel):
 
 
 class DropBacklogRequest(BaseModel):
+    actor: str = "manual"
+
+class ClearEdgeIngestQueueRequest(BaseModel):
+    include_acked: bool = False
     actor: str = "manual"
 
 
@@ -255,6 +259,10 @@ def clear_sync_queue(payload: ClearSyncQueueRequest) -> dict:
 @router.post("/sync/backlog/drop")
 def drop_sync_backlog(payload: DropBacklogRequest) -> dict:
     return app_store.drop_data_backlog(actor=payload.actor)
+
+@router.post("/sync/edge-ingest/clear")
+def clear_edge_ingest_queue(payload: ClearEdgeIngestQueueRequest) -> dict:
+    return telemetry_service.clear_outbox(include_acked=payload.include_acked, actor=payload.actor)
 
 
 @router.post("/reset/full")

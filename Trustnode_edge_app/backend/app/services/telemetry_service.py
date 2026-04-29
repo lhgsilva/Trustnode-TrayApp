@@ -35,6 +35,8 @@ class TelemetryService:
         self.tenant_id = str(os.environ.get("TRUSTNODE_TENANT_ID", "default") or "default")
         self.customer_id = str(os.environ.get("TRUSTNODE_CUSTOMER_ID", "default") or "default")
         self.vps_ingest_url = str(os.environ.get("TRUSTNODE_VPS_INGEST_URL", "")).strip().rstrip("/")
+        ingest_env = str(os.environ.get("TRUSTNODE_EDGE_INGEST_ENABLED", "") or "").strip().lower()
+        self.ingest_enabled = ingest_env in {"1", "true", "yes", "on"} or bool(self.vps_ingest_url)
         self.device_token = str(os.environ.get("TRUSTNODE_DEVICE_TOKEN", "")).strip()
         self.cloud_bootstrap_user = str(os.environ.get("TRUSTNODE_CLOUD_BOOTSTRAP_USER", "admin") or "admin").strip()
         self.cloud_bootstrap_password = str(os.environ.get("TRUSTNODE_CLOUD_BOOTSTRAP_PASSWORD", "admin") or "admin").strip()
@@ -49,11 +51,12 @@ class TelemetryService:
         self._stop = threading.Event()
         self._sync_thread = threading.Thread(target=self._sync_loop, daemon=True, name="tn-outbox-sync-v1")
         self._ensure_schema()
-        self._sync_thread.start()
+        if self.ingest_enabled:
+            self._sync_thread.start()
 
     def shutdown(self) -> None:
         self._stop.set()
-        if self._sync_thread.is_alive():
+        if self.ingest_enabled and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=2)
 
     def _load_or_create_instance_id(self) -> str:
@@ -488,22 +491,23 @@ class TelemetryService:
                     outbox_payload = dict(record_core)
                     outbox_payload["edge_record_id"] = edge_record_id
                     outbox_payload["payload_hash_sha256"] = payload_hash
-                    conn.execute(
-                        """
-                        INSERT INTO sync_outbox_v1(edge_record_id, gateway_id, sample_ts_utc, edge_monotonic_seq, payload_json, payload_hash_sha256, status, retries, created_utc, updated_utc)
-                        VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
-                        """,
-                        (
-                            edge_record_id,
-                            gateway_id,
-                            record_core["sample_ts_utc"],
-                            record_core["edge_monotonic_seq"],
-                            self._canonical_json(outbox_payload),
-                            payload_hash,
-                            self._utc_now_text(),
-                            self._utc_now_text(),
-                        ),
-                    )
+                    if self.ingest_enabled:
+                        conn.execute(
+                            """
+                            INSERT INTO sync_outbox_v1(edge_record_id, gateway_id, sample_ts_utc, edge_monotonic_seq, payload_json, payload_hash_sha256, status, retries, created_utc, updated_utc)
+                            VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                            """,
+                            (
+                                edge_record_id,
+                                gateway_id,
+                                record_core["sample_ts_utc"],
+                                record_core["edge_monotonic_seq"],
+                                self._canonical_json(outbox_payload),
+                                payload_hash,
+                                self._utc_now_text(),
+                                self._utc_now_text(),
+                            ),
+                        )
 
                     machine_key = f"{self.tenant_id}:{record_core['plant_id']}:{record_core['machine_id']}"
                     current = conn.execute(
@@ -676,6 +680,7 @@ class TelemetryService:
                 "db_path": str(self.db_path),
                 "tenant_id": self.tenant_id,
                 "customer_id": self.customer_id,
+                "ingest_enabled": self.ingest_enabled,
                 "vps_ingest_url": self.vps_ingest_url,
                 "cloud_bootstrap_user": self.cloud_bootstrap_user,
                 "device_token_mode": "static_env" if bool(self.device_token) else "gateway_auto_issue",
@@ -691,6 +696,39 @@ class TelemetryService:
                     "updated_utc": str(last_error["updated_utc"] or ""),
                 } if last_error else None,
             }
+
+    def clear_outbox(self, *, include_acked: bool = False, actor: str = "admin") -> Dict[str, Any]:
+        with self._lock:
+            with self._connect() as conn:
+                before = int(self._outbox_depth(conn))
+                if include_acked:
+                    deleted = int(conn.execute("DELETE FROM sync_outbox_v1").rowcount or 0)
+                else:
+                    deleted = int(
+                        conn.execute(
+                            "DELETE FROM sync_outbox_v1 WHERE status IN ('pending','retry','rejected')"
+                        ).rowcount
+                        or 0
+                    )
+                self._metric_upsert(conn, "outbox_depth", self._outbox_depth(conn), None)
+                self._audit(
+                    conn,
+                    actor_type="user",
+                    actor_id=str(actor or "admin"),
+                    tenant_id=self.tenant_id,
+                    action="edge_ingest_queue_clear",
+                    outcome="success",
+                    correlation_id=str(uuid.uuid4()),
+                    details={"include_acked": bool(include_acked), "deleted": deleted, "before_depth": before},
+                )
+                after = int(self._outbox_depth(conn))
+                return {
+                    "ok": True,
+                    "deleted_rows": deleted,
+                    "before_depth": before,
+                    "after_depth": after,
+                    "message": f"Edge ingest outbox cleared: deleted {deleted} row(s).",
+                }
 
     def _pull_upload_batch(self, conn: sqlite3.Connection) -> List[sqlite3.Row]:
         now = self._utc_now_text()

@@ -991,6 +991,16 @@ export async function dropAppStoreSyncBacklog(payload = {}) {
   return res.json();
 }
 
+export async function clearEdgeIngestQueue(payload = {}) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/sync/edge-ingest/clear`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) throw new Error("Clear edge ingest queue failed");
+  return res.json();
+}
+
 export async function resetAppStoreFull(payload = {}) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/app-store/reset/full`, {
     method: "POST",
