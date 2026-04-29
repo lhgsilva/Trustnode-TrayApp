@@ -367,6 +367,19 @@ function formatChartValue(value, maxDigits = 3) {
   return String(Number(fixed));
 }
 
+function isTransientCloudDbError(message) {
+  const s = String(message || "").toLowerCase();
+  if (!s) return false;
+  return (
+    s.includes("connectiontimeout") ||
+    s.includes("connection timeout") ||
+    s.includes("timed out") ||
+    s.includes("read timeout") ||
+    s.includes("could not connect") ||
+    s.includes("network is unreachable")
+  );
+}
+
 function formatStandardValue(value, digits = 3) {
   const num = Number(value);
   if (!Number.isFinite(num)) return "-";
@@ -5861,7 +5874,7 @@ function AppShell() {
         if (dbErr) {
           const db = dbConnections.find((c) => c.id === g.database_id);
           addAppLog({
-            level: "error",
+            level: isTransientCloudDbError(dbErr) ? "warning" : "error",
             category: "database",
             gateway_id: g.id,
             gateway_name: g.name || g.id,
@@ -5962,7 +5975,11 @@ function AppShell() {
     const msg = String(status?.db_last_error || "").trim();
     if (!msg || msg === lastDbErrorLogRef.current) return;
     lastDbErrorLogRef.current = msg;
-    addAppLog({ level: "error", category: "database", message: `DB write error: ${msg}` });
+    addAppLog({
+      level: isTransientCloudDbError(msg) ? "warning" : "error",
+      category: "database",
+      message: `DB write error: ${msg}`
+    });
   }, [status?.db_last_error]);
 
   const primaryValue = useMemo(() => {
@@ -11321,7 +11338,15 @@ function AppShell() {
         <main className="content">
           <div className="content-scroll" style={{ paddingBottom: `${contentBottomPad}px` }}>
           {error ? <div className="error">{error}</div> : null}
-          {status?.db_last_error ? <div className="error">Database write error: {status.db_last_error}</div> : null}
+          {status?.db_last_error ? (
+            isTransientCloudDbError(status.db_last_error) ? (
+              <div className="lock-note">
+                Cloud database sync delayed (store-and-forward active). Local collection remains running. Details: {status.db_last_error}
+              </div>
+            ) : (
+              <div className="error">Database write error: {status.db_last_error}</div>
+            )
+          ) : null}
           {activePage === "gateway_configuration" && appStoreHydrated && startupWarningsReady && unknownRunningGateways.length ? (
             <div className="error">
               Found running gateway workers not mapped in this page ({unknownRunningGateways.map((g) => g.gateway_id).join(", ")}).

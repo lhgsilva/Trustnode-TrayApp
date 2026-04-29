@@ -215,8 +215,12 @@ class AppStore:
             )
             connect_args = {
                 "sslmode": "require" if cloud.get("tls", True) else "disable",
-                "connect_timeout": 5,
+                "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
                 "prepare_threshold": None,
+                "options": os.environ.get(
+                    "TRUSTNODE_CLOUD_DB_OPTIONS",
+                    "-c lock_timeout=1200ms -c statement_timeout=4500ms",
+                ),
             }
             engine = create_engine(
                 url,
@@ -827,10 +831,14 @@ class AppStore:
         )
         connect_args = {
             "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": 8,
+            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
             # Supabase/PgBouncer transaction pooling is incompatible with
             # psycopg auto-prepared statements.
             "prepare_threshold": None,
+            "options": os.environ.get(
+                "TRUSTNODE_CLOUD_DB_OPTIONS",
+                "-c lock_timeout=1200ms -c statement_timeout=4500ms",
+            ),
         }
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
@@ -941,9 +949,12 @@ class AppStore:
         )
         connect_args = {
             "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": 8,
+            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
             "prepare_threshold": None,
-            "options": "-c lock_timeout=1000ms -c statement_timeout=5000ms",
+            "options": os.environ.get(
+                "TRUSTNODE_CLOUD_DB_OPTIONS",
+                "-c lock_timeout=1200ms -c statement_timeout=4500ms",
+            ),
         }
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         try:
@@ -3434,8 +3445,12 @@ class AppStore:
         )
         connect_args = {
             "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": 8,
+            "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
             "prepare_threshold": None,
+            "options": os.environ.get(
+                "TRUSTNODE_CLOUD_DB_OPTIONS",
+                "-c lock_timeout=1200ms -c statement_timeout=4500ms",
+            ),
         }
         engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
         target_key = self._cloud_target_schema_key(cloud, schema)
@@ -3614,8 +3629,12 @@ class AppStore:
                     )
                     connect_args = {
                         "sslmode": "require" if cloud.get("tls", True) else "disable",
-                        "connect_timeout": 8,
+                        "connect_timeout": max(1, int(os.environ.get("TRUSTNODE_CLOUD_DB_CONNECT_TIMEOUT_SECONDS", "2") or "2")),
                         "prepare_threshold": None,
+                        "options": os.environ.get(
+                            "TRUSTNODE_CLOUD_DB_OPTIONS",
+                            "-c lock_timeout=1200ms -c statement_timeout=4500ms",
+                        ),
                     }
                     engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
                     try:
