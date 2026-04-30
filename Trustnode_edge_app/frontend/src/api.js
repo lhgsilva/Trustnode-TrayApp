@@ -1159,9 +1159,13 @@ export async function deleteControlPlaneCustomer(customerId, tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/customers/${encodeURIComponent(String(customerId || ""))}${suffix}`, {
-    method: "DELETE"
-  });
+  const cid = encodeURIComponent(String(customerId || ""));
+  const deleteUrl = `${getApiBase()}/api/control-plane/customers/${cid}${suffix}`;
+  let res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
+  if (res.status === 404 || res.status === 405) {
+    const postFallbackUrl = `${getApiBase()}/api/control-plane/customers/${cid}/delete${suffix}`;
+    res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
+  }
   if (!res.ok) throw new Error("Control-plane customer delete failed");
   return res.json();
 }
@@ -1192,9 +1196,13 @@ export async function deleteControlPlaneEdge(edgeId, tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges/${encodeURIComponent(String(edgeId || ""))}${suffix}`, {
-    method: "DELETE"
-  });
+  const eid = encodeURIComponent(String(edgeId || ""));
+  const deleteUrl = `${getApiBase()}/api/control-plane/edges/${eid}${suffix}`;
+  let res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
+  if (res.status === 404 || res.status === 405) {
+    const postFallbackUrl = `${getApiBase()}/api/control-plane/edges/${eid}/delete${suffix}`;
+    res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
+  }
   if (!res.ok) throw new Error("Control-plane edge delete failed");
   return res.json();
 }
@@ -1238,9 +1246,13 @@ export async function deleteControlPlaneLicense(licenseId, tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/licenses/${encodeURIComponent(String(licenseId || ""))}${suffix}`, {
-    method: "DELETE"
-  });
+  const lid = encodeURIComponent(String(licenseId || ""));
+  const deleteUrl = `${getApiBase()}/api/control-plane/licenses/${lid}${suffix}`;
+  let res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
+  if (res.status === 404 || res.status === 405) {
+    const postFallbackUrl = `${getApiBase()}/api/control-plane/licenses/${lid}/delete${suffix}`;
+    res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
+  }
   if (!res.ok) throw new Error("Control-plane license delete failed");
   return res.json();
 }
@@ -1287,9 +1299,13 @@ export async function deleteControlPlaneUser(username, tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/users/${encodeURIComponent(String(username || ""))}${suffix}`, {
-    method: "DELETE"
-  });
+  const uname = encodeURIComponent(String(username || ""));
+  const deleteUrl = `${getApiBase()}/api/control-plane/users/${uname}${suffix}`;
+  let res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
+  if (res.status === 404 || res.status === 405) {
+    const postFallbackUrl = `${getApiBase()}/api/control-plane/users/${uname}/delete${suffix}`;
+    res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
+  }
   if (!res.ok) throw new Error("Control-plane user delete failed");
   return res.json();
 }

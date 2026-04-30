@@ -262,6 +262,10 @@ def delete_customer(request: Request, customer_id: str, tenant_id: str | None = 
     _audit(request, tenant_id=tid, action="customer.delete", outcome="ok", details={"customer_id": customer_id})
     return {"ok": True, "tenant_id": tid, "customer_id": customer_id}
 
+@router.post("/customers/{customer_id}/delete")
+def delete_customer_post(request: Request, customer_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    return delete_customer(request=request, customer_id=customer_id, tenant_id=tenant_id)
+
 
 @router.get("/edges")
 def list_edges(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
@@ -302,6 +306,10 @@ def delete_edge(request: Request, edge_id: str, tenant_id: str | None = None) ->
         raise HTTPException(status_code=404, detail="edge_not_found")
     _audit(request, tenant_id=tid, action="edge.delete", outcome="ok", details={"edge_id": edge_id})
     return {"ok": True, "tenant_id": tid, "edge_id": edge_id}
+
+@router.post("/edges/{edge_id}/delete")
+def delete_edge_post(request: Request, edge_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    return delete_edge(request=request, edge_id=edge_id, tenant_id=tenant_id)
 
 
 @router.post("/edges/heartbeat")
@@ -356,6 +364,10 @@ def delete_license(request: Request, license_id: str, tenant_id: str | None = No
     _audit(request, tenant_id=tid, action="license.delete", outcome="ok", details={"license_id": license_id})
     return {"ok": True, "tenant_id": tid, "license_id": license_id}
 
+@router.post("/licenses/{license_id}/delete")
+def delete_license_post(request: Request, license_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    return delete_license(request=request, license_id=license_id, tenant_id=tenant_id)
+
 
 @router.get("/licenses/{license_id}/modules")
 def list_license_modules(request: Request, license_id: str) -> dict[str, Any]:
@@ -407,6 +419,10 @@ def delete_user(request: Request, username: str, tenant_id: str | None = None) -
         raise HTTPException(status_code=404, detail="user_not_found")
     _audit(request, tenant_id=tid, action="user.delete", outcome="ok", details={"username": username})
     return {"ok": True, "tenant_id": tid, "username": username}
+
+@router.post("/users/{username}/delete")
+def delete_user_post(request: Request, username: str, tenant_id: str | None = None) -> dict[str, Any]:
+    return delete_user(request=request, username=username, tenant_id=tenant_id)
 
 
 @router.post("/activation-code/issue")
