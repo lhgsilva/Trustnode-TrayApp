@@ -2160,6 +2160,7 @@ function AppShell() {
   const [cpCustomers, setCpCustomers] = useState([]);
   const [cpEdges, setCpEdges] = useState([]);
   const [cpLicenses, setCpLicenses] = useState([]);
+  const [cpUsers, setCpUsers] = useState([]);
   const [cpActivationCodes, setCpActivationCodes] = useState([]);
   const [cpModuleCatalog, setCpModuleCatalog] = useState([]);
   const [cpTenantForm, setCpTenantForm] = useState({
@@ -10541,7 +10542,7 @@ function AppShell() {
   const refreshControlPlaneData = async (tenantId = "") => {
     const scopedTenantId = String(tenantId || currentTenantId || "default");
     try {
-      const [summaryRes, tenantsRes, customersRes, edgesRes, licensesRes, modulesRes, activationRes] = await Promise.all([
+      const [summaryRes, tenantsRes, customersRes, edgesRes, licensesRes, modulesRes, activationRes, usersRes] = await Promise.all([
         getControlPlaneSummary(scopedTenantId),
         getControlPlaneTenants(true),
         getControlPlaneCustomers(scopedTenantId),
@@ -10549,6 +10550,7 @@ function AppShell() {
         getControlPlaneLicenses(scopedTenantId),
         getControlPlaneModuleCatalog(),
         getControlPlaneActivationCodes(scopedTenantId, cpCustomerFilter !== "__all__" ? cpCustomerFilter : ""),
+        getControlPlaneUsers(scopedTenantId),
       ]);
       setCpSummary(summaryRes || null);
       setCpTenants(Array.isArray(tenantsRes?.rows) ? tenantsRes.rows : []);
@@ -10557,6 +10559,7 @@ function AppShell() {
       setCpLicenses(Array.isArray(licensesRes?.rows) ? licensesRes.rows : []);
       setCpModuleCatalog(Array.isArray(modulesRes?.modules) ? modulesRes.modules : []);
       setCpActivationCodes(Array.isArray(activationRes?.rows) ? activationRes.rows : []);
+      setCpUsers(Array.isArray(usersRes?.rows) ? usersRes.rows : []);
       return true;
     } catch (err) {
       setCpResult(`Control-plane refresh failed: ${String(err?.message || err)}`);
