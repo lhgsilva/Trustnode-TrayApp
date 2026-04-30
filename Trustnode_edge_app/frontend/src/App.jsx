@@ -1653,7 +1653,8 @@ function AppShell() {
     notifications: false,
     data_log: false,
     settings: false,
-    administration: false
+    administration: false,
+    portal: true
   });
   const [theme, setTheme] = useState("light");
   const [interfaceThemePrefs, setInterfaceThemePrefs] = useState(() => loadInterfaceThemePrefs());
@@ -2237,6 +2238,14 @@ function AppShell() {
   const [cpModalError, setCpModalError] = useState("");
   const [cpPortalPage, setCpPortalPage] = useState("customers");
   const [cpCustomerFilter, setCpCustomerFilter] = useState("__all__");
+  const isPortalOnly = useMemo(() => {
+    try {
+      const path = String(window.location.pathname || "").toLowerCase();
+      return path === "/portal" || path.startsWith("/portal/");
+    } catch {
+      return false;
+    }
+  }, []);
   const [devices, setDevices] = useState([]);
   const [showDeviceModal, setShowDeviceModal] = useState(false);
   const [editingDeviceId, setEditingDeviceId] = useState(null);
@@ -11363,7 +11372,10 @@ function AppShell() {
 
   if (!currentUser) {
     const showRegisterTab = !isHostedWebClient && !edgeLinked;
-    const authShellClass = isHostedWebClient ? "auth-shell auth-shell--themed" : "auth-shell auth-shell--fixed-dark";
+    const authShellClass = (() => {
+      if (theme === "dark") return "auth-shell auth-shell--fixed-dark";
+      return "auth-shell auth-shell--themed";
+    })();
     return (
       <div className={authShellClass}>
         <div className="auth-card">
@@ -11430,7 +11442,7 @@ function AppShell() {
               <button className="btn btn-primary auth-submit" onClick={submitEdgeRegister} disabled={edgeRegisterBusy}>
                 {edgeRegisterBusy ? "Registering..." : "Activate Edge"}
               </button>
-              <button className="btn" type="button" style={{ width: "100%" }} onClick={() => setLoginTab("login")}>
+              <button className="btn btn-secondary auth-submit" type="button" onClick={() => setLoginTab("login")}>
                 Back to Login
               </button>
             </>
@@ -11544,7 +11556,7 @@ function AppShell() {
           </div>
         </div>
         <div className="header-center">
-          {(isHostedWebClient || endpointMode === "cloud") ? (
+          {!isPortalOnly && (isHostedWebClient || endpointMode === "cloud") ? (
             <div className="header-cloud-controls">
               <span className="header-cloud-label">Edge</span>
               <select
@@ -11593,7 +11605,38 @@ function AppShell() {
       <div className={`body ${sidebarCollapsed ? "sidebar-hidden" : ""}`}>
         <aside className={`sidebar ${sidebarCollapsed ? "hidden" : ""}`}>
           <div className="sidebar-scroll">
-            {NAV_SECTIONS.map((section) => {
+            {isPortalOnly ? (
+              <div className="nav-section">
+                <button className="nav-group-btn" onClick={() => toggleSection("portal")}>
+                  {sidebarCollapsed ? "PO" : "Portal"}
+                  {!sidebarCollapsed ? <span>{expandedSections.portal ? "-" : "+"}</span> : null}
+                </button>
+                {!sidebarCollapsed && expandedSections.portal ? (
+                  <>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "customers" ? "active" : ""}`} onClick={() => setCpPortalPage("customers")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Customers</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "modules" ? "active" : ""}`} onClick={() => setCpPortalPage("modules")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Modules</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "licenses" ? "active" : ""}`} onClick={() => setCpPortalPage("licenses")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Licenses</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "edges" ? "active" : ""}`} onClick={() => setCpPortalPage("edges")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Edge Apps</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "users" ? "active" : ""}`} onClick={() => setCpPortalPage("users")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Users</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "activation" ? "active" : ""}`} onClick={() => setCpPortalPage("activation")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Activation</span></button>
+                    <div className="portal-filter-block">
+                      <label style={{ fontSize: 12, color: "var(--muted)" }}>Customer</label>
+                      <select value={cpCustomerFilter} onChange={(e) => setCpCustomerFilter(e.target.value)}>
+                        <option value="__all__">All customers</option>
+                        {cpCustomerOptions.map((c) => (
+                          <option key={`cp-side-filter-${c.customer_id}`} value={c.customer_id}>
+                            {c.company_name || c.customer_id}
+                          </option>
+                        ))}
+                      </select>
+                      <button className="btn btn-primary" style={{ marginTop: 8 }} onClick={() => refreshControlPlaneData(currentTenantId || "default")} disabled={cpBusy}>
+                        Load
+                      </button>
+                    </div>
+                  </>
+                ) : null}
+              </div>
+            ) : NAV_SECTIONS.map((section) => {
               const hideLockedNavItems = forcedClientMode || currentUser?.role === "client";
               const sectionItems = section.items.filter((item) => {
                 const id = pageId(item);
@@ -11674,7 +11717,7 @@ function AppShell() {
                     <LogoutIcon />
                     <span>Logout</span>
                   </button>
-                  {currentUser?.role === "admin" ? (
+                  {currentUser?.role === "admin" && !isPortalOnly ? (
                     <button className="user-menu-item" onClick={unlinkCurrentEdge}>
                       <span style={{ width: 16, textAlign: "center" }}>x</span>
                       <span>Unlink Edge</span>
@@ -11688,8 +11731,8 @@ function AppShell() {
 
         <main className="content">
           <div className="content-scroll" style={{ paddingBottom: `${contentBottomPad}px` }}>
-          {error ? <div className="error">{error}</div> : null}
-          {status?.db_last_error ? (
+          {!isPortalOnly && error ? <div className="error">{error}</div> : null}
+          {!isPortalOnly && status?.db_last_error ? (
             isTransientCloudDbError(status.db_last_error) ? (
               <div className="lock-note">
                 Cloud database sync delayed (store-and-forward active). Local collection remains running. Details: {status.db_last_error}
@@ -11698,7 +11741,7 @@ function AppShell() {
               <div className="error">Database write error: {status.db_last_error}</div>
             )
           ) : null}
-          {activePage === "gateway_configuration" && appStoreHydrated && startupWarningsReady && unknownRunningGateways.length ? (
+          {!isPortalOnly && activePage === "gateway_configuration" && appStoreHydrated && startupWarningsReady && unknownRunningGateways.length ? (
             <div className="error">
               Found running gateway workers not mapped in this page ({unknownRunningGateways.map((g) => g.gateway_id).join(", ")}).
               Use "Stop All" to stop every worker.
@@ -14477,6 +14520,7 @@ function AppShell() {
           {activePage === "control_plane" ? (
             <div className="page-fill">
               <div className="row" style={{ alignItems: "stretch", gap: 12 }}>
+                {!isPortalOnly ? (
                 <aside className="card" style={{ width: 280, minWidth: 260 }}>
                   <h4 style={{ marginTop: 0 }}>Portal Navigation</h4>
                   <div className="stacked-inputs">
@@ -14485,6 +14529,7 @@ function AppShell() {
                     <button className={`btn ${cpPortalPage === "licenses" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("licenses")}>Licenses</button>
                     <button className={`btn ${cpPortalPage === "edges" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("edges")}>Edge Apps</button>
                     <button className={`btn ${cpPortalPage === "users" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("users")}>Users</button>
+                    <button className={`btn ${cpPortalPage === "activation" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("activation")}>Activation</button>
                   </div>
                   <div className="form-grid" style={{ marginTop: 12 }}>
                     <label>
@@ -14503,6 +14548,7 @@ function AppShell() {
                     Refresh
                   </button>
                 </aside>
+                ) : null}
 
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <section className="card">
@@ -14657,6 +14703,7 @@ function AppShell() {
                 </div>
               </div>
 
+              {!isPortalOnly ? (
               <section className="card">
                 <h4>Tenant + Bundle Provisioning</h4>
                 <div className="form-grid">
@@ -14744,7 +14791,9 @@ function AppShell() {
                   </button>
                 </div>
               </section>
+              ) : null}
 
+              {(!isPortalOnly || cpPortalPage === "activation") ? (
               <section className="card">
                 <h4>Edge Health / Activation / Password Recovery</h4>
                 <div className="form-grid">
@@ -14845,6 +14894,7 @@ function AppShell() {
                   <button className="btn btn-primary" onClick={applyTenantPasswordReset} disabled={cpBusy || !canEditPage("control_plane")}>Apply Password Reset</button>
                 </div>
               </section>
+              ) : null}
             </div>
           ) : null}
 
@@ -15226,6 +15276,7 @@ function AppShell() {
             </div>
           ) : null}
           </div>
+          {!isPortalOnly ? (
           <footer ref={footerRef} className={`gateway-footer ${footerCollapsed ? "collapsed" : ""}`}>
             <div className="gateway-footer-title">Enabled Gateways</div>
               <div className="gateway-footer-table">
@@ -15311,6 +15362,8 @@ function AppShell() {
               })}
             </div>
           </footer>
+          ) : null}
+          {!isPortalOnly ? (
           <button
             className={`footer-toggle-fab ${anyGatewayRunning ? "running" : "stopped"} ${footerCollapsed ? "is-collapsed" : "is-expanded"}`}
             onClick={() => setFooterCollapsed((v) => !v)}
@@ -15320,6 +15373,7 @@ function AppShell() {
           >
             {anyGatewayRunning ? "Running" : "Stopped"}
           </button>
+          ) : null}
         </main>
       </div>
       {reportPreviewDoc ? (
