@@ -5923,18 +5923,19 @@ function AppShell() {
 
   useEffect(() => {
     if (!currentUser) return;
+    if (isPortalOnly) return;
     if (canOpenPage(activePage)) return;
     const fallbackCandidates = ["dashboard", "power_overview", "alarms", "reporting", "historian", "interface", "logs"];
     const fallback = fallbackCandidates.find((p) => canOpenPage(p));
     if (fallback) setActivePage(fallback);
-  }, [activePage, canOpenPage, currentUser]);
+  }, [activePage, canOpenPage, currentUser, isPortalOnly]);
 
   useEffect(() => {
     if (!currentUser) return;
     if (activePage !== "control_plane") return;
-    if (!canOpenPage("control_plane")) return;
+    if (!isPortalOnly && !canOpenPage("control_plane")) return;
     refreshControlPlaneData(currentTenantId || "default");
-  }, [activePage, currentUser, currentTenantId]);
+  }, [activePage, currentUser, currentTenantId, isPortalOnly]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -14737,6 +14738,13 @@ function AppShell() {
 
                 <div style={{ flex: 1, minWidth: 0 }}>
                   {cpResult ? <section className="card">{cpResult ? <div className={`status ${cpResult.toLowerCase().includes("failed") ? "error" : "ok"}`}>{cpResult}</div> : null}</section> : null}
+                  {!canEditPage("control_plane") ? (
+                    <section className="card">
+                      <div className="status warning">
+                        Read-only portal mode: this user cannot add, edit, or delete control-plane records.
+                      </div>
+                    </section>
+                  ) : null}
 
                   {cpPortalPage === "customers" ? (
                     <section className="card">
