@@ -64,6 +64,18 @@ if (Test-Path $outputRoot) {
 New-Item -ItemType Directory -Path $outputRoot | Out-Null
 Copy-Item -Recurse -Force (Join-Path $frontendRoot "dist_cloud_readonly\*") $outputRoot
 
+# Create dedicated standalone portal entry path, outside the main app route flow.
+$rootIndexPath = Join-Path $outputRoot "index.html"
+$portalDir = Join-Path $outputRoot "developer-portal"
+if (-not (Test-Path $portalDir)) {
+    New-Item -ItemType Directory -Path $portalDir | Out-Null
+}
+if (Test-Path $rootIndexPath) {
+    $idx = Get-Content -Path $rootIndexPath -Raw
+    $idx = $idx -replace "<title>Trustnode Edge</title>", "<title>Trustnode Developer Portal</title>"
+    Set-Content -Path (Join-Path $portalDir "index.html") -Value $idx -Encoding UTF8
+}
+
 $readme = @"
 Trustnode Cloud Web Build
 

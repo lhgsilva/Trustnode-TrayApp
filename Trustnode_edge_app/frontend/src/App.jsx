@@ -2241,7 +2241,12 @@ function AppShell() {
   const isPortalOnly = useMemo(() => {
     try {
       const path = String(window.location.pathname || "").toLowerCase();
-      return path === "/portal" || path.startsWith("/portal/");
+      return (
+        path === "/portal" ||
+        path.startsWith("/portal/") ||
+        path === "/developer-portal" ||
+        path.startsWith("/developer-portal/")
+      );
     } catch {
       return false;
     }
