@@ -717,6 +717,52 @@ class ControlPlaneStore:
                 edge = conn.execute("SELECT * FROM cp_edges WHERE edge_id=?", (str(edge_id or ""),)).fetchone()
         return dict(edge) if edge else {}
 
+    def list_activation_codes(self, *, tenant_id: str, customer_id: str = "") -> list[dict[str, Any]]:
+        tid = normalize_tenant_id(tenant_id)
+        cid = str(customer_id or "").strip()
+        with self._lock:
+            with self._connect() as conn:
+                if cid:
+                    rows = conn.execute(
+                        "SELECT id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? AND customer_id=? ORDER BY id DESC LIMIT 300",
+                        (tid, cid),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? ORDER BY id DESC LIMIT 300",
+                        (tid,),
+                    ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_activation_code(self, *, tenant_id: str, row_id: int, status: str = "", expires_utc: str = "") -> dict[str, Any]:
+        tid = normalize_tenant_id(tenant_id)
+        rid = int(row_id or 0)
+        if rid <= 0:
+            raise ValueError("invalid_activation_id")
+        patch_status = str(status or "").strip().lower()
+        patch_exp = str(expires_utc or "").strip()
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE id=? AND tenant_id=?",
+                    (rid, tid),
+                ).fetchone()
+                if not row:
+                    raise ValueError("activation_code_not_found")
+                current = dict(row)
+                next_status = patch_status if patch_status in {"issued", "used", "expired", "revoked"} else str(current.get("status") or "issued")
+                next_exp = patch_exp or str(current.get("expires_utc") or "")
+                conn.execute(
+                    "UPDATE cp_edge_activation_codes SET status=?, expires_utc=? WHERE id=? AND tenant_id=?",
+                    (next_status, next_exp, rid, tid),
+                )
+                conn.commit()
+                out = conn.execute(
+                    "SELECT id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE id=? AND tenant_id=?",
+                    (rid, tid),
+                ).fetchone()
+        return dict(out) if out else {}
+
     def issue_password_reset(self, *, tenant_id: str, username: str, ttl_minutes: int = 15) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
         uname = str(username or "").strip()
@@ -960,6 +1006,35 @@ class ControlPlaneStore:
                 "tenant_company_name": "",
             },
         }
+
+    def check_edge_license(self, *, tenant_id: str, edge_id: str) -> dict[str, Any]:
+        tid = normalize_tenant_id(tenant_id)
+        eid = str(edge_id or "").strip()
+        if not eid:
+            return {"ok": False, "reason": "edge_id_required"}
+        now = self._utc_now()
+        with self._lock:
+            with self._connect() as conn:
+                edge = conn.execute(
+                    "SELECT * FROM cp_edges WHERE tenant_id=? AND edge_id=? LIMIT 1",
+                    (tid, eid),
+                ).fetchone()
+                if not edge:
+                    return {"ok": False, "reason": "edge_not_found"}
+                edge_row = dict(edge)
+                customer_id = str(edge_row.get("customer_id") or "").strip()
+                if not customer_id:
+                    return {"ok": False, "reason": "edge_customer_missing", "edge": edge_row}
+                lic = self.get_license_for_customer(tenant_id=tid, customer_id=customer_id)
+                if not lic:
+                    return {"ok": False, "reason": "license_not_found", "edge": edge_row}
+                status = str(lic.get("status") or "").strip().lower()
+                if status != "active":
+                    return {"ok": False, "reason": "license_inactive", "edge": edge_row, "license": lic}
+                end_utc = str(lic.get("end_utc") or "").strip()
+                if end_utc and end_utc < now:
+                    return {"ok": False, "reason": "license_expired", "edge": edge_row, "license": lic}
+                return {"ok": True, "edge": edge_row, "license": lic}
 
 
 

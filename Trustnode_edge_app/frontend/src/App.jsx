@@ -83,8 +83,11 @@ import {
   deleteControlPlaneUser,
   issueControlPlaneActivationCode,
   applyControlPlaneActivationCode,
+  getControlPlaneActivationCodes,
+  updateControlPlaneActivationCode,
   registerControlPlaneEdgeLink,
   unlinkControlPlaneEdgeLink,
+  checkControlPlaneEdgeLicense,
   issueControlPlanePasswordReset,
   applyControlPlanePasswordReset,
   issuePublicPasswordReset,
@@ -2157,6 +2160,7 @@ function AppShell() {
   const [cpCustomers, setCpCustomers] = useState([]);
   const [cpEdges, setCpEdges] = useState([]);
   const [cpLicenses, setCpLicenses] = useState([]);
+  const [cpActivationCodes, setCpActivationCodes] = useState([]);
   const [cpModuleCatalog, setCpModuleCatalog] = useState([]);
   const [cpTenantForm, setCpTenantForm] = useState({
     tenant_id: "",
@@ -2236,8 +2240,15 @@ function AppShell() {
   const [showCpLicenseModal, setShowCpLicenseModal] = useState(false);
   const [cpLicenseModalModules, setCpLicenseModalModules] = useState([]);
   const [cpModalError, setCpModalError] = useState("");
-  const [cpPortalPage, setCpPortalPage] = useState("customers");
+  const [cpPortalPage, setCpPortalPage] = useState("workspace");
   const [cpCustomerFilter, setCpCustomerFilter] = useState("__all__");
+  const [cpListFilters, setCpListFilters] = useState({
+    customers: "",
+    modules: "",
+    licenses: "",
+    edges: "",
+    users: "",
+  });
   const isPortalOnly = useMemo(() => {
     try {
       const path = String(window.location.pathname || "").toLowerCase();
@@ -2250,6 +2261,11 @@ function AppShell() {
     } catch {
       return false;
     }
+  }, []);
+  const logoSrc = useMemo(() => {
+    const base = String(import.meta?.env?.BASE_URL || "/");
+    const normalized = base.endsWith("/") ? base : `${base}/`;
+    return `${normalized}trustnode_logo.png`;
   }, []);
   const [devices, setDevices] = useState([]);
   const [showDeviceModal, setShowDeviceModal] = useState(false);
@@ -5823,6 +5839,87 @@ function AppShell() {
     return rows.filter((r) => String(r?.customer_id || "") === cpCustomerFilter);
   }, [cpLicenses, cpCustomerFilter]);
 
+  const cpCustomersView = useMemo(() => {
+    const rows = Array.isArray(cpCustomers) ? cpCustomers : [];
+    if (!cpCustomerFilter || cpCustomerFilter === "__all__") return rows;
+    return rows.filter((r) => String(r?.customer_id || "") === cpCustomerFilter);
+  }, [cpCustomers, cpCustomerFilter]);
+
+  const cpUsersView = useMemo(() => {
+    const rows = Array.isArray(cpUsers) ? cpUsers : [];
+    if (!cpCustomerFilter || cpCustomerFilter === "__all__") return rows;
+    return rows.filter((r) => String(r?.customer_id || "") === cpCustomerFilter);
+  }, [cpUsers, cpCustomerFilter]);
+
+  const cpModulesView = useMemo(() => Array.isArray(cpModuleCatalog) ? cpModuleCatalog : [], [cpModuleCatalog]);
+
+  const cpCustomersFiltered = useMemo(() => {
+    const q = String(cpListFilters.customers || "").trim().toLowerCase();
+    if (!q) return cpCustomersView;
+    return cpCustomersView.filter((r) =>
+      String(r?.customer_id || "").toLowerCase().includes(q) ||
+      String(r?.company_name || "").toLowerCase().includes(q) ||
+      String(r?.contact_email || "").toLowerCase().includes(q)
+    );
+  }, [cpCustomersView, cpListFilters.customers]);
+
+  const cpLicensesFiltered = useMemo(() => {
+    const q = String(cpListFilters.licenses || "").trim().toLowerCase();
+    if (!q) return cpLicensesView;
+    return cpLicensesView.filter((r) =>
+      String(r?.license_id || "").toLowerCase().includes(q) ||
+      String(r?.customer_id || "").toLowerCase().includes(q) ||
+      String(r?.plan_code || "").toLowerCase().includes(q) ||
+      String(r?.status || "").toLowerCase().includes(q)
+    );
+  }, [cpLicensesView, cpListFilters.licenses]);
+
+  const cpEdgesFiltered = useMemo(() => {
+    const q = String(cpListFilters.edges || "").trim().toLowerCase();
+    if (!q) return cpEdgesView;
+    return cpEdgesView.filter((r) =>
+      String(r?.edge_id || "").toLowerCase().includes(q) ||
+      String(r?.edge_name || "").toLowerCase().includes(q) ||
+      String(r?.customer_id || "").toLowerCase().includes(q) ||
+      String(r?.site || "").toLowerCase().includes(q) ||
+      String(r?.area || "").toLowerCase().includes(q) ||
+      String(r?.equipment || "").toLowerCase().includes(q) ||
+      String(r?.status || "").toLowerCase().includes(q)
+    );
+  }, [cpEdgesView, cpListFilters.edges]);
+
+  const cpUsersFiltered = useMemo(() => {
+    const q = String(cpListFilters.users || "").trim().toLowerCase();
+    if (!q) return cpUsersView;
+    return cpUsersView.filter((r) =>
+      String(r?.username || "").toLowerCase().includes(q) ||
+      String(r?.email || "").toLowerCase().includes(q) ||
+      String(r?.role || "").toLowerCase().includes(q) ||
+      String(r?.status || "").toLowerCase().includes(q)
+    );
+  }, [cpUsersView, cpListFilters.users]);
+
+  const cpModulesFiltered = useMemo(() => {
+    const q = String(cpListFilters.modules || "").trim().toLowerCase();
+    if (!q) return cpModulesView;
+    return cpModulesView.filter((m) =>
+      String(m?.module_key || m?.key || "").toLowerCase().includes(q) ||
+      String(m?.label || "").toLowerCase().includes(q)
+    );
+  }, [cpModulesView, cpListFilters.modules]);
+
+  const cpActivationCodesFiltered = useMemo(() => {
+    const rows = Array.isArray(cpActivationCodes) ? cpActivationCodes : [];
+    const q = String(cpListFilters.licenses || "").trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter((r) =>
+      String(r?.customer_id || "").toLowerCase().includes(q) ||
+      String(r?.edge_name || "").toLowerCase().includes(q) ||
+      String(r?.status || "").toLowerCase().includes(q) ||
+      String(r?.id || "").toLowerCase().includes(q)
+    );
+  }, [cpActivationCodes, cpListFilters.licenses]);
+
   useEffect(() => {
     if (!currentUser) return;
     if (canOpenPage(activePage)) return;
@@ -5864,6 +5961,32 @@ function AppShell() {
     cloudUrl,
     wsState,
   ]);
+
+  useEffect(() => {
+    if (!currentUser || isHostedWebClient) return;
+    const run = async () => {
+      try {
+        const edgeId = String(edgeProfile?.edge_id || "").trim();
+        if (!edgeId) return;
+        const key = `trustnode_edge_license_check_${edgeId}`;
+        const today = new Date().toISOString().slice(0, 10);
+        const last = String(localStorage.getItem(key) || "");
+        if (last === today) return;
+        const out = await checkControlPlaneEdgeLicense(edgeId, currentTenantId || "default");
+        localStorage.setItem(key, today);
+        if (!out?.ok) {
+          setError(`License check warning for edge '${edgeId}': ${String(out?.reason || "invalid_license")}`);
+        }
+      } catch {
+        // Keep local runtime working even if cloud check is unavailable.
+      }
+    };
+    run();
+    const timer = setInterval(run, 60 * 60 * 1000);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [currentUser, isHostedWebClient, edgeProfile?.edge_id, currentTenantId]);
 
   const addAppLog = (entry) => {
     const key = `${String(entry.level || "info")}|${String(entry.category || "system")}|${String(entry.gateway_id || "")}|${String(entry.database_name || "")}|${String(entry.message || "")}`;
@@ -10418,13 +10541,14 @@ function AppShell() {
   const refreshControlPlaneData = async (tenantId = "") => {
     const scopedTenantId = String(tenantId || currentTenantId || "default");
     try {
-      const [summaryRes, tenantsRes, customersRes, edgesRes, licensesRes, modulesRes] = await Promise.all([
+      const [summaryRes, tenantsRes, customersRes, edgesRes, licensesRes, modulesRes, activationRes] = await Promise.all([
         getControlPlaneSummary(scopedTenantId),
         getControlPlaneTenants(true),
         getControlPlaneCustomers(scopedTenantId),
         getControlPlaneEdges(scopedTenantId),
         getControlPlaneLicenses(scopedTenantId),
         getControlPlaneModuleCatalog(),
+        getControlPlaneActivationCodes(scopedTenantId, cpCustomerFilter !== "__all__" ? cpCustomerFilter : ""),
       ]);
       setCpSummary(summaryRes || null);
       setCpTenants(Array.isArray(tenantsRes?.rows) ? tenantsRes.rows : []);
@@ -10432,6 +10556,7 @@ function AppShell() {
       setCpEdges(Array.isArray(edgesRes?.rows) ? edgesRes.rows : []);
       setCpLicenses(Array.isArray(licensesRes?.rows) ? licensesRes.rows : []);
       setCpModuleCatalog(Array.isArray(modulesRes?.modules) ? modulesRes.modules : []);
+      setCpActivationCodes(Array.isArray(activationRes?.rows) ? activationRes.rows : []);
       return true;
     } catch (err) {
       setCpResult(`Control-plane refresh failed: ${String(err?.message || err)}`);
@@ -11024,6 +11149,47 @@ function AppShell() {
     }
   };
 
+  const updateActivationCodeStatus = async (row, status) => {
+    const rowId = Number(row?.id || 0);
+    if (!rowId) return;
+    setCpBusy(true);
+    try {
+      await updateControlPlaneActivationCode(
+        rowId,
+        { status, expires_utc: String(row?.expires_utc || "") },
+        currentTenantId || "default"
+      );
+      setCpResult(`Activation code #${rowId} updated to '${status}'.`);
+      await refreshControlPlaneData(currentTenantId || "default");
+    } catch (err) {
+      setCpResult(`Activation code update failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  const deleteCpUser = (username) => {
+    const target = String(username || "").trim();
+    if (!target || target.toLowerCase() === "admin") return;
+    setConfirmModal({
+      open: true,
+      title: "Delete User",
+      message: `Delete user '${target}' from control-plane?`,
+      onConfirm: async () => {
+        setCpBusy(true);
+        try {
+          await deleteControlPlaneUser(target, currentTenantId || "default");
+          setCpResult(`User '${target}' deleted.`);
+          await refreshControlPlaneUsers(currentTenantId || "default");
+        } catch (err) {
+          setCpResult(`User delete failed: ${String(err?.message || err)}`);
+        } finally {
+          setCpBusy(false);
+        }
+      },
+    });
+  };
+
   const submitLogin = async () => {
     const username = String(loginForm.username || "").trim();
     const password = String(loginForm.password || "");
@@ -11390,7 +11556,7 @@ function AppShell() {
             </button>
           </div>
           <div className="auth-brand">
-            <img src="trustnode_logo.png" alt="Trustnode" className="auth-logo" />
+            <img src={logoSrc} alt="Trustnode" className="auth-logo" />
             <div>
               <div className="auth-title">Trustnode Edge</div>
               <div className="auth-subtitle">Secure PLC Data Gateway</div>
@@ -11528,7 +11694,7 @@ function AppShell() {
     return (
       <div className="loading">
         <div className="loading-card">
-          <img src="trustnode_logo.png" alt="Trustnode" className="loading-logo" />
+          <img src={logoSrc} alt="Trustnode" className="loading-logo" />
           <div className="loading-title">
             {bootState === "waiting_backend"
               ? "Waiting for backend service..."
@@ -11553,7 +11719,7 @@ function AppShell() {
             <HamburgerIcon />
           </button>
           <div className="brand">
-            <img src="trustnode_logo.png" alt="Trustnode" className="brand-logo" />
+            <img src={logoSrc} alt="Trustnode" className="brand-logo" />
             <div>
               <div className="brand-title">Trustnode Edge</div>
               <div className="brand-subtitle">Industrial Data Gateway</div>
@@ -11618,6 +11784,7 @@ function AppShell() {
                 </button>
                 {!sidebarCollapsed && expandedSections.portal ? (
                   <>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "workspace" ? "active" : ""}`} onClick={() => setCpPortalPage("workspace")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Workspace</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "customers" ? "active" : ""}`} onClick={() => setCpPortalPage("customers")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Customers</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "modules" ? "active" : ""}`} onClick={() => setCpPortalPage("modules")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Modules</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "licenses" ? "active" : ""}`} onClick={() => setCpPortalPage("licenses")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Licenses</span></button>
@@ -11634,7 +11801,7 @@ function AppShell() {
                           </option>
                         ))}
                       </select>
-                      <button className="btn btn-primary" style={{ marginTop: 8 }} onClick={() => refreshControlPlaneData(currentTenantId || "default")} disabled={cpBusy}>
+                      <button className="btn btn-primary" style={{ marginTop: 8 }} onClick={() => { setCpPortalPage("workspace"); refreshControlPlaneData(currentTenantId || "default"); }} disabled={cpBusy}>
                         Load
                       </button>
                     </div>
@@ -14529,6 +14696,7 @@ function AppShell() {
                 <aside className="card" style={{ width: 280, minWidth: 260 }}>
                   <h4 style={{ marginTop: 0 }}>Portal Navigation</h4>
                   <div className="stacked-inputs">
+                    <button className={`btn ${cpPortalPage === "workspace" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("workspace")}>Workspace</button>
                     <button className={`btn ${cpPortalPage === "customers" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("customers")}>Customers</button>
                     <button className={`btn ${cpPortalPage === "modules" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("modules")}>Modules</button>
                     <button className={`btn ${cpPortalPage === "licenses" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("licenses")}>Licenses</button>
@@ -14549,25 +14717,14 @@ function AppShell() {
                       </select>
                     </label>
                   </div>
-                  <button className="btn btn-primary" onClick={() => refreshControlPlaneData(currentTenantId || "default")} disabled={cpBusy}>
+                  <button className="btn btn-primary" onClick={() => { setCpPortalPage("workspace"); refreshControlPlaneData(currentTenantId || "default"); }} disabled={cpBusy}>
                     Refresh
                   </button>
                 </aside>
                 ) : null}
 
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <section className="card">
-                    <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-                      <h4 style={{ margin: 0 }}>Developer Control Plane</h4>
-                    </div>
-                    <div className="form-grid" style={{ marginTop: 10 }}>
-                      <label><span>Tenant</span><input value={currentTenantId || "default"} readOnly /></label>
-                      <label><span>Customers</span><input value={String(cpSummary?.customers_count ?? cpCustomers.length ?? 0)} readOnly /></label>
-                      <label><span>Edges</span><input value={String(cpSummary?.edges_count ?? cpEdges.length ?? 0)} readOnly /></label>
-                      <label><span>Licenses</span><input value={String(cpSummary?.licenses_count ?? cpLicenses.length ?? 0)} readOnly /></label>
-                    </div>
-                    {cpResult ? <div className={`status ${cpResult.toLowerCase().includes("failed") ? "error" : "ok"}`}>{cpResult}</div> : null}
-                  </section>
+                  {cpResult ? <section className="card">{cpResult ? <div className={`status ${cpResult.toLowerCase().includes("failed") ? "error" : "ok"}`}>{cpResult}</div> : null}</section> : null}
 
                   {cpPortalPage === "customers" ? (
                     <section className="card">
@@ -14575,10 +14732,20 @@ function AppShell() {
                         <h4 style={{ margin: 0 }}>Customers</h4>
                         <button className="btn btn-success" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Customer</button>
                       </div>
+                      <div className="form-grid" style={{ marginTop: 10 }}>
+                        <label>
+                          Filter
+                          <input
+                            value={cpListFilters.customers}
+                            onChange={(e) => setCpListFilters((p) => ({ ...p, customers: e.target.value }))}
+                            placeholder="Search customer id, company, email"
+                          />
+                        </label>
+                      </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table">
                           <div className="thead"><span>Customer ID</span><span>Company</span><span>Email</span><span>Status</span><span>Actions</span></div>
-                          {cpCustomers.map((row, idx) => (
+                          {cpCustomersFiltered.map((row, idx) => (
                             <div className="trow" key={String(row?.customer_id || `customer-${idx}`)}>
                               <span>{String(row?.customer_id || "-")}</span>
                               <span>{String(row?.company_name || "-")}</span>
@@ -14590,20 +14757,122 @@ function AppShell() {
                               </span>
                             </div>
                           ))}
-                          {!cpCustomers.length ? <div className="trow"><span>-</span><span>No customers yet</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpCustomersFiltered.length ? <div className="trow"><span>-</span><span>No customers yet</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
+                  ) : null}
+
+                  {cpPortalPage === "workspace" ? (
+                    <div className="row" style={{ alignItems: "stretch", gap: 12, flexWrap: "wrap" }}>
+                      <section className="card" style={{ flex: "1 1 460px", minWidth: 360 }}>
+                        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                          <h4 style={{ margin: 0 }}>Customers</h4>
+                          <button className="btn btn-success btn-sm" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
+                        </div>
+                        <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
+                          <div className="table">
+                            <div className="thead"><span>Customer</span><span>Email</span><span>Status</span><span>Actions</span></div>
+                            {cpCustomersFiltered.slice(0, 8).map((row, idx) => (
+                              <div className="trow" key={`ws-customer-${idx}`}>
+                                <span>{String(row?.company_name || row?.customer_id || "-")}</span>
+                                <span>{String(row?.contact_email || "-")}</span>
+                                <span>{String(row?.status || "-")}</span>
+                                <span className="row-actions">
+                                  <button className="icon-btn table-action-btn" onClick={() => openCpCustomerEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
+                                  <button className="icon-btn danger table-action-btn" onClick={() => deleteCpCustomer(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </section>
+                      <section className="card" style={{ flex: "1 1 460px", minWidth: 360 }}>
+                        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                          <h4 style={{ margin: 0 }}>Licenses</h4>
+                          <button className="btn btn-success btn-sm" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
+                        </div>
+                        <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
+                          <div className="table">
+                            <div className="thead"><span>License</span><span>Customer</span><span>Status</span><span>Actions</span></div>
+                            {cpLicensesFiltered.slice(0, 8).map((row, idx) => (
+                              <div className="trow" key={`ws-license-${idx}`}>
+                                <span>{String(row?.license_id || "-")}</span>
+                                <span>{String(row?.customer_id || "-")}</span>
+                                <span>{String(row?.status || "-")}</span>
+                                <span className="row-actions">
+                                  <button className="icon-btn table-action-btn" onClick={() => openCpLicenseEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
+                                  <button className="icon-btn danger table-action-btn" onClick={() => deleteCpLicense(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </section>
+                      <section className="card" style={{ flex: "1 1 460px", minWidth: 360 }}>
+                        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                          <h4 style={{ margin: 0 }}>Edge Apps</h4>
+                          <button className="btn btn-success btn-sm" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
+                        </div>
+                        <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
+                          <div className="table">
+                            <div className="thead"><span>Edge</span><span>Customer</span><span>Status</span><span>Actions</span></div>
+                            {cpEdgesFiltered.slice(0, 8).map((row, idx) => (
+                              <div className="trow" key={`ws-edge-${idx}`}>
+                                <span>{String(row?.edge_name || row?.edge_id || "-")}</span>
+                                <span>{String(row?.customer_id || "-")}</span>
+                                <span>{String(row?.status || "-")}</span>
+                                <span className="row-actions">
+                                  <button className="icon-btn table-action-btn" onClick={() => openCpEdgeEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
+                                  <button className="icon-btn danger table-action-btn" onClick={() => deleteCpEdge(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </section>
+                      <section className="card" style={{ flex: "1 1 460px", minWidth: 360 }}>
+                        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                          <h4 style={{ margin: 0 }}>Users</h4>
+                          <button className="btn btn-primary btn-sm" onClick={() => handleNavClick("users_and_access_control")}>Open Access</button>
+                        </div>
+                        <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
+                          <div className="table">
+                            <div className="thead"><span>User</span><span>Role</span><span>Status</span><span>Actions</span></div>
+                            {cpUsersFiltered.slice(0, 8).map((row, idx) => (
+                              <div className="trow" key={`ws-user-${idx}`}>
+                                <span>{String(row?.username || "-")}</span>
+                                <span>{String(row?.role || "-")}</span>
+                                <span>{String(row?.status || "-")}</span>
+                                <span className="row-actions">
+                                  <button className="icon-btn danger table-action-btn" onClick={() => deleteCpUser(String(row?.username || ""))} disabled={cpBusy || !canEditPage("control_plane") || String(row?.username || "").toLowerCase() === "admin"} title="Delete"><DeleteIcon /></button>
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </section>
+                    </div>
                   ) : null}
 
                   {cpPortalPage === "modules" ? (
                     <section className="card">
                       <h4>Modules and Permissions</h4>
                       <p className="hint">Manage module entitlement per license. Global catalog is listed below.</p>
+                      <div className="form-grid" style={{ marginTop: 10 }}>
+                        <label>
+                          Filter
+                          <input
+                            value={cpListFilters.modules}
+                            onChange={(e) => setCpListFilters((p) => ({ ...p, modules: e.target.value }))}
+                            placeholder="Search module key or label"
+                          />
+                        </label>
+                      </div>
                       <div className="table-scroll">
                         <div className="table">
                           <div className="thead"><span>Module Key</span><span>Label</span><span>Default</span></div>
-                          {(cpModuleCatalog || []).map((m, idx) => (
+                          {cpModulesFiltered.map((m, idx) => (
                             <div className="trow" key={`cp-mod-${idx}`}>
                               <span>{String(m?.module_key || m?.key || "-")}</span>
                               <span>{String(m?.label || m?.module_key || m?.key || "-")}</span>
@@ -14621,10 +14890,20 @@ function AppShell() {
                         <h4 style={{ margin: 0 }}>Licenses</h4>
                         <button className="btn btn-success" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add License</button>
                       </div>
+                      <div className="form-grid" style={{ marginTop: 10 }}>
+                        <label>
+                          Filter
+                          <input
+                            value={cpListFilters.licenses}
+                            onChange={(e) => setCpListFilters((p) => ({ ...p, licenses: e.target.value }))}
+                            placeholder="Search license, customer, plan, status"
+                          />
+                        </label>
+                      </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table">
                           <div className="thead"><span>License Key</span><span>Customer</span><span>Modules</span><span>Edges/Users</span><span>Active Window</span><span>Status</span><span>Actions</span></div>
-                          {cpLicensesView.map((row, idx) => (
+                          {cpLicensesFiltered.map((row, idx) => (
                             <div className="trow" key={String(row?.license_id || `license-${idx}`)}>
                               <span>{String(row?.license_id || "-")}</span>
                               <span>{String(row?.customer_id || "-")}</span>
@@ -14638,7 +14917,7 @@ function AppShell() {
                               </span>
                             </div>
                           ))}
-                          {!cpLicensesView.length ? <div className="trow"><span>-</span><span>-</span><span>No licenses yet</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpLicensesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No licenses yet</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
@@ -14650,10 +14929,20 @@ function AppShell() {
                         <h4 style={{ margin: 0 }}>Edge Apps</h4>
                         <button className="btn btn-success" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Edge</button>
                       </div>
+                      <div className="form-grid" style={{ marginTop: 10 }}>
+                        <label>
+                          Filter
+                          <input
+                            value={cpListFilters.edges}
+                            onChange={(e) => setCpListFilters((p) => ({ ...p, edges: e.target.value }))}
+                            placeholder="Search edge id, name, customer, location"
+                          />
+                        </label>
+                      </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table">
                           <div className="thead"><span>Edge ID</span><span>Name</span><span>Customer</span><span>Site / Area / Equipment</span><span>Status</span><span>Client View</span><span>Actions</span></div>
-                          {cpEdgesView.map((row, idx) => (
+                          {cpEdgesFiltered.map((row, idx) => (
                             <div className="trow" key={String(row?.edge_id || `edge-${idx}`)}>
                               <span>{String(row?.edge_id || "-")}</span>
                               <span>{String(row?.edge_name || "-")}</span>
@@ -14671,7 +14960,7 @@ function AppShell() {
                               </span>
                             </div>
                           ))}
-                          {!cpEdgesView.length ? <div className="trow"><span>-</span><span>No edges yet</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpEdgesFiltered.length ? <div className="trow"><span>-</span><span>No edges yet</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
@@ -14685,10 +14974,20 @@ function AppShell() {
                           Open Users and Access Control
                         </button>
                       </div>
+                      <div className="form-grid" style={{ marginTop: 10 }}>
+                        <label>
+                          Filter
+                          <input
+                            value={cpListFilters.users}
+                            onChange={(e) => setCpListFilters((p) => ({ ...p, users: e.target.value }))}
+                            placeholder="Search username, role, email"
+                          />
+                        </label>
+                      </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table">
                           <div className="thead"><span>Username</span><span>Role</span><span>Email</span><span>Status</span><span>MFA</span><span>Actions</span></div>
-                          {(users || []).map((row, idx) => (
+                          {(cpUsersFiltered || []).map((row, idx) => (
                             <div className="trow" key={`cp-user-${idx}`}>
                               <span>{String(row?.username || "-")}</span>
                               <span>{String(row?.role || "-")}</span>
@@ -14696,11 +14995,11 @@ function AppShell() {
                               <span>{String(row?.status || "-")}</span>
                               <span>{Boolean(row?.mfa_enabled) ? "yes" : "no"}</span>
                               <span className="row-actions">
-                                <button className="icon-btn danger table-action-btn" onClick={() => deleteUser(String(row?.username || ""))} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
+                                <button className="icon-btn danger table-action-btn" onClick={() => deleteCpUser(String(row?.username || ""))} disabled={cpBusy || !canEditPage("control_plane") || String(row?.username || "").toLowerCase() === "admin"} title="Delete"><DeleteIcon /></button>
                               </span>
                             </div>
                           ))}
-                          {!users?.length ? <div className="trow"><span>-</span><span>No users found</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpUsersFiltered?.length ? <div className="trow"><span>-</span><span>No users found</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
@@ -14865,6 +15164,28 @@ function AppShell() {
                 </div>
                 <div className="row">
                   <button className="btn btn-primary" onClick={applyTenantActivationCode} disabled={cpBusy || !canEditPage("control_plane")}>Apply Activation</button>
+                </div>
+
+                <h5 style={{ marginTop: 12, marginBottom: 6 }}>Issued Activation Codes</h5>
+                <div className="table-scroll" style={{ maxHeight: 220 }}>
+                  <div className="table">
+                    <div className="thead"><span>ID</span><span>Customer</span><span>Edge Name</span><span>Status</span><span>Expires</span><span>Used</span><span>Actions</span></div>
+                    {cpActivationCodesFiltered.map((row, idx) => (
+                      <div className="trow" key={`cp-ac-${idx}`}>
+                        <span>{String(row?.id || "-")}</span>
+                        <span>{String(row?.customer_id || "-")}</span>
+                        <span>{String(row?.edge_name || "-")}</span>
+                        <span>{String(row?.status || "-")}</span>
+                        <span>{fmtTs(String(row?.expires_utc || "")) || "-"}</span>
+                        <span>{fmtTs(String(row?.used_utc || "")) || "-"}</span>
+                        <span className="row-actions">
+                          <button className="btn btn-sm" onClick={() => updateActivationCodeStatus(row, "issued")} disabled={cpBusy || !canEditPage("control_plane")}>Re-issue</button>
+                          <button className="btn btn-sm btn-danger" onClick={() => updateActivationCodeStatus(row, "revoked")} disabled={cpBusy || !canEditPage("control_plane")}>Revoke</button>
+                        </span>
+                      </div>
+                    ))}
+                    {!cpActivationCodesFiltered.length ? <div className="trow"><span>-</span><span>No activation codes</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                  </div>
                 </div>
 
                 <div className="form-grid" style={{ marginTop: 12 }}>

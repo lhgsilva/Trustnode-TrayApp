@@ -81,6 +81,11 @@ class ActivationCodeApplyRequest(BaseModel):
     equipment: str = ""
 
 
+class ActivationCodeUpdateRequest(BaseModel):
+    status: str = ""
+    expires_utc: str = ""
+
+
 class EdgeRegisterRequest(BaseModel):
     activation_code: str
     edge_id: str
@@ -460,6 +465,30 @@ def apply_activation_code(payload: ActivationCodeApplyRequest, request: Request)
             details={"edge_id": payload.edge_id, "error": str(exc)},
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/activation-codes")
+def list_activation_codes(request: Request, tenant_id: str | None = None, customer_id: str = "") -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id)
+    rows = control_plane_store.list_activation_codes(tenant_id=tid, customer_id=customer_id)
+    return {"ok": True, "tenant_id": tid, "rows": rows}
+
+
+@router.put("/activation-codes/{row_id}")
+def update_activation_code(row_id: int, payload: ActivationCodeUpdateRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    try:
+        row = control_plane_store.update_activation_code(
+            tenant_id=tid,
+            row_id=row_id,
+            status=payload.status,
+            expires_utc=payload.expires_utc,
+        )
+    except Exception as exc:
+        _audit(request, tenant_id=tid, action="activation_code.update", outcome="error", details={"id": row_id, "error": str(exc)})
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _audit(request, tenant_id=tid, action="activation_code.update", outcome="ok", details={"id": row_id, "status": row.get("status")})
+    return {"ok": True, "tenant_id": tid, "row": row}
 
 
 @router.post("/password-reset/issue")
@@ -852,3 +881,15 @@ def edge_link_unlink(request: Request) -> dict[str, Any]:
     telemetry_service.configure_from_bootstrap({"data": app_store.get_bootstrap(prefer_cloud_reads=False)})
     _audit(request, tenant_id=tenant_id, action="edge_link.unlink", outcome="ok", details={"edge_id": edge_id})
     return {"ok": True, "tenant_id": tenant_id, "edge_id": edge_id}
+
+
+@router.get("/edge-link/license-check")
+def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id)
+    check_edge_id = str(edge_id or "").strip()
+    if not check_edge_id:
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        app_settings = dict(bootstrap.get("app_settings") or {})
+        check_edge_id = str(app_settings.get("edge_id") or "").strip()
+    out = control_plane_store.check_edge_license(tenant_id=tid, edge_id=check_edge_id)
+    return {"ok": bool(out.get("ok")), "tenant_id": tid, "edge_id": check_edge_id, **out}

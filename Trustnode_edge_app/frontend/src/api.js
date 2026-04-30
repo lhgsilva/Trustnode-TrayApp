@@ -1317,6 +1317,29 @@ export async function applyControlPlaneActivationCode(payload) {
   return res.json();
 }
 
+export async function getControlPlaneActivationCodes(tenantId = "", customerId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  if (customerId) params.set("customer_id", String(customerId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/activation-codes${suffix}`);
+  if (!res.ok) throw new Error("Control-plane activation-codes fetch failed");
+  return res.json();
+}
+
+export async function updateControlPlaneActivationCode(rowId, payload, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/activation-codes/${encodeURIComponent(String(rowId || ""))}${suffix}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  if (!res.ok) throw new Error("Control-plane activation-code update failed");
+  return res.json();
+}
+
 export async function registerControlPlaneEdgeLink(payload) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-link/register`, {
     method: "POST",
@@ -1332,6 +1355,16 @@ export async function unlinkControlPlaneEdgeLink() {
     method: "POST",
   });
   if (!res.ok) throw new Error("Control-plane edge-link unlink failed");
+  return res.json();
+}
+
+export async function checkControlPlaneEdgeLicense(edgeId = "", tenantId = "") {
+  const params = new URLSearchParams();
+  if (edgeId) params.set("edge_id", String(edgeId));
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-link/license-check${suffix}`);
+  if (!res.ok) throw new Error("Control-plane edge license check failed");
   return res.json();
 }
 
