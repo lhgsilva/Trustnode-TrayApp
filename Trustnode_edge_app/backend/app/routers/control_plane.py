@@ -103,6 +103,19 @@ class PasswordResetApplyRequest(BaseModel):
     new_password: str
 
 
+class PasswordResetPublicIssueRequest(BaseModel):
+    username: str
+    tenant_id: str = ""
+    ttl_minutes: int = 15
+
+
+class PasswordResetPublicApplyRequest(BaseModel):
+    username: str
+    tenant_id: str = ""
+    reset_token: str
+    new_password: str
+
+
 class CustomerBundleProvisionRequest(BaseModel):
     tenant_id: str
     tenant_name: str
@@ -481,6 +494,69 @@ def apply_password_reset(payload: PasswordResetApplyRequest, request: Request, t
             action="password_reset.apply",
             outcome="error",
             details={"username": payload.username, "error": str(exc)},
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/password-reset/public/issue")
+def issue_password_reset_public(payload: PasswordResetPublicIssueRequest, request: Request) -> dict[str, Any]:
+    username = str(payload.username or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="username_required")
+    tid = normalize_tenant_id(str(payload.tenant_id or get_current_tenant()))
+    row = control_plane_store.issue_password_reset(
+        tenant_id=tid,
+        username=username,
+        ttl_minutes=max(1, int(payload.ttl_minutes or 15)),
+    )
+    control_plane_store.audit(
+        actor_type="system",
+        actor_id="public",
+        tenant_id=tid,
+        action="password_reset.public_issue",
+        outcome="ok",
+        correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
+        details={"username": username},
+    )
+    # Local edge flow uses this verification code in-app.
+    return {"ok": True, "tenant_id": tid, "row": row}
+
+
+@router.post("/password-reset/public/apply")
+def apply_password_reset_public(payload: PasswordResetPublicApplyRequest, request: Request) -> dict[str, Any]:
+    username = str(payload.username or "").strip()
+    reset_token = str(payload.reset_token or "").strip()
+    new_password = str(payload.new_password or "")
+    if not username or not reset_token or not new_password:
+        raise HTTPException(status_code=400, detail="username_reset_token_new_password_required")
+    tid = normalize_tenant_id(str(payload.tenant_id or get_current_tenant()))
+    try:
+        row = control_plane_store.reset_password_with_token(
+            tenant_id=tid,
+            username=username,
+            reset_token=reset_token,
+            new_password=new_password,
+        )
+        row.pop("password_hash", None)
+        control_plane_store.audit(
+            actor_type="system",
+            actor_id="public",
+            tenant_id=tid,
+            action="password_reset.public_apply",
+            outcome="ok",
+            correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
+            details={"username": username},
+        )
+        return {"ok": True, "tenant_id": tid, "row": row}
+    except Exception as exc:
+        control_plane_store.audit(
+            actor_type="system",
+            actor_id="public",
+            tenant_id=tid,
+            action="password_reset.public_apply",
+            outcome="error",
+            correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
+            details={"username": username, "error": str(exc)},
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

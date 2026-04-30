@@ -87,6 +87,8 @@ import {
   unlinkControlPlaneEdgeLink,
   issueControlPlanePasswordReset,
   applyControlPlanePasswordReset,
+  issuePublicPasswordReset,
+  applyPublicPasswordReset,
   provisionControlPlaneCustomerBundle,
 } from "./api";
 import { Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -2082,11 +2084,12 @@ function AppShell() {
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(getFullscreenState);
   const [loginForm, setLoginForm] = useState({ username: "", password: "" });
+  const [loginTab, setLoginTab] = useState("login");
+  const [edgeLinked, setEdgeLinked] = useState(false);
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [rememberUser, setRememberUser] = useState(true);
   const [loginError, setLoginError] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
-  const [showEdgeRegisterModal, setShowEdgeRegisterModal] = useState(false);
   const [edgeRegisterBusy, setEdgeRegisterBusy] = useState(false);
   const [edgeRegisterResult, setEdgeRegisterResult] = useState("");
   const [edgeRegisterForm, setEdgeRegisterForm] = useState({
@@ -2098,6 +2101,14 @@ function AppShell() {
     equipment: "",
     admin_username: "admin",
     admin_password: "",
+  });
+  const [forgotBusy, setForgotBusy] = useState(false);
+  const [forgotResult, setForgotResult] = useState("");
+  const [forgotForm, setForgotForm] = useState({
+    username: "",
+    tenant_id: "",
+    reset_token: "",
+    new_password: "",
   });
   const [newUserForm, setNewUserForm] = useState({
     username: "",
@@ -2413,6 +2424,11 @@ function AppShell() {
     if (typeof appSettings.tenant_web_client_url === "string") setTenantWebClientUrl(appSettings.tenant_web_client_url);
     if (typeof appSettings.tenant_company_name === "string") setTenantCompanyName(appSettings.tenant_company_name);
     if (typeof appSettings.tenant_login_realm === "string") setTenantLoginRealm(appSettings.tenant_login_realm);
+    const linkedFlag = Boolean(appSettings.edge_linked);
+    const linkedEdge = String(appSettings.edge_id || "").trim();
+    const linkedTenant = String(appSettings.tenant_id || "").trim();
+    const linkedLicense = String(appSettings.license_id || "").trim();
+    setEdgeLinked(linkedFlag || Boolean(linkedEdge && (linkedTenant || linkedLicense)));
     if (appSettings.edge_profile && typeof appSettings.edge_profile === "object" && !Array.isArray(appSettings.edge_profile)) {
       setEdgeProfile((prev) => ({
         ...prev,
@@ -11100,7 +11116,7 @@ function AppShell() {
       edge_name: String(prev.edge_name || "Local Edge"),
     }));
     setEdgeRegisterResult("");
-    setShowEdgeRegisterModal(true);
+    setLoginTab("register");
   };
 
   const submitEdgeRegister = async () => {
@@ -11133,6 +11149,58 @@ function AppShell() {
       setEdgeRegisterResult(`Edge registration failed: ${String(err?.message || err)}`);
     } finally {
       setEdgeRegisterBusy(false);
+    }
+  };
+
+  const requestForgotPasswordCode = async () => {
+    const username = String(forgotForm.username || "").trim();
+    if (!username) {
+      setForgotResult("Enter your username first.");
+      return;
+    }
+    setForgotBusy(true);
+    setForgotResult("");
+    try {
+      const res = await issuePublicPasswordReset({
+        username,
+        tenant_id: String(forgotForm.tenant_id || "").trim(),
+        ttl_minutes: 15,
+      });
+      const token = String(res?.row?.reset_token || "");
+      setForgotForm((prev) => ({ ...prev, reset_token: token || prev.reset_token }));
+      setForgotResult(token
+        ? "Verification code generated. Use this code to set a new password."
+        : "Verification code issued. Check portal/admin support channel.");
+    } catch (err) {
+      setForgotResult(`Code request failed: ${String(err?.message || err)}`);
+    } finally {
+      setForgotBusy(false);
+    }
+  };
+
+  const applyForgotPasswordReset = async () => {
+    const username = String(forgotForm.username || "").trim();
+    const reset_token = String(forgotForm.reset_token || "").trim();
+    const new_password = String(forgotForm.new_password || "");
+    if (!username || !reset_token || !new_password) {
+      setForgotResult("Username, verification code and new password are required.");
+      return;
+    }
+    setForgotBusy(true);
+    setForgotResult("");
+    try {
+      await applyPublicPasswordReset({
+        username,
+        tenant_id: String(forgotForm.tenant_id || "").trim(),
+        reset_token,
+        new_password,
+      });
+      setForgotResult("Password reset completed. You can login now.");
+      setLoginForm((prev) => ({ ...prev, username }));
+    } catch (err) {
+      setForgotResult(`Reset failed: ${String(err?.message || err)}`);
+    } finally {
+      setForgotBusy(false);
     }
   };
 
@@ -11245,8 +11313,9 @@ function AppShell() {
   };
 
   if (!currentUser) {
+    const showRegisterTab = !isHostedWebClient && !edgeLinked;
     return (
-      <div className="auth-shell">
+      <div className="auth-shell auth-shell--fixed-dark">
         <div className="auth-card">
           <div className="auth-brand">
             <img src="trustnode_logo.png" alt="Trustnode" className="auth-logo" />
@@ -11255,121 +11324,130 @@ function AppShell() {
               <div className="auth-subtitle">Secure PLC Data Gateway</div>
             </div>
           </div>
-          <h3 className="auth-heading">Sign In</h3>
-          <label>
-            Username
-            <input
-              value={loginForm.username}
-              onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value })}
-              placeholder="Enter username"
-            />
-          </label>
-          <label>
-            Password
-            <div className="pw-input-wrap">
-              <input
-                type={showLoginPassword ? "text" : "password"}
-                value={loginForm.password}
-                onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
-                placeholder="Enter password"
-              />
-              <button className="pw-icon-btn" onClick={() => setShowLoginPassword((v) => !v)} type="button" aria-label="Toggle password visibility">
-                <EyeIcon open={showLoginPassword} />
+          <div className="auth-tabs">
+            <button className={`auth-tab ${loginTab === "login" ? "active" : ""}`} type="button" onClick={() => setLoginTab("login")}>
+              Login
+            </button>
+            {showRegisterTab ? (
+              <button className={`auth-tab ${loginTab === "register" ? "active" : ""}`} type="button" onClick={openEdgeRegisterModal}>
+                Registration
               </button>
-            </div>
-          </label>
-          <label className="remember-row">
-            <input
-              type="checkbox"
-              checked={rememberUser}
-              onChange={(e) => setRememberUser(e.target.checked)}
-            />
-            <span className="remember-label">Remember this user</span>
-          </label>
-          {loginError ? <div className="error">{loginError}</div> : null}
-          <button className="btn btn-primary auth-submit" onClick={submitLogin} disabled={loginBusy}>
-            {loginBusy ? "Signing in..." : "Sign In"}
-          </button>
-          <button className="btn" onClick={openEdgeRegisterModal} disabled={loginBusy} style={{ width: "100%" }}>
-            Register Edge App
-          </button>
-          <div className="auth-help">
-            Default admin credentials: <strong>admin / admin</strong>
+            ) : null}
           </div>
-        </div>
-        {showEdgeRegisterModal ? (
-          <div className="modal-backdrop" onClick={() => setShowEdgeRegisterModal(false)}>
-            <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 760 }}>
-              <div className="modal-title">Register Local Edge</div>
+          {loginTab === "register" && showRegisterTab ? (
+            <>
+              <h3 className="auth-heading">Register Local Edge</h3>
               <div className="grid two">
                 <label>
                   Activation Code
-                  <input
-                    value={edgeRegisterForm.activation_code}
-                    onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, activation_code: e.target.value }))}
-                  />
+                  <input value={edgeRegisterForm.activation_code} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, activation_code: e.target.value }))} />
                 </label>
                 <label>
                   Edge ID
-                  <input
-                    value={edgeRegisterForm.edge_id}
-                    onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, edge_id: e.target.value }))}
-                  />
+                  <input value={edgeRegisterForm.edge_id} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, edge_id: e.target.value }))} />
                 </label>
                 <label>
                   Edge Name
-                  <input
-                    value={edgeRegisterForm.edge_name}
-                    onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, edge_name: e.target.value }))}
-                  />
+                  <input value={edgeRegisterForm.edge_name} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, edge_name: e.target.value }))} />
                 </label>
                 <label>
                   Admin Username
-                  <input
-                    value={edgeRegisterForm.admin_username}
-                    onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_username: e.target.value }))}
-                  />
+                  <input value={edgeRegisterForm.admin_username} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_username: e.target.value }))} />
                 </label>
                 <label>
                   Site
-                  <input
-                    value={edgeRegisterForm.site}
-                    onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, site: e.target.value }))}
-                  />
+                  <input value={edgeRegisterForm.site} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, site: e.target.value }))} />
                 </label>
                 <label>
                   Area
-                  <input
-                    value={edgeRegisterForm.area}
-                    onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, area: e.target.value }))}
-                  />
+                  <input value={edgeRegisterForm.area} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, area: e.target.value }))} />
                 </label>
                 <label>
                   Equipment
-                  <input
-                    value={edgeRegisterForm.equipment}
-                    onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, equipment: e.target.value }))}
-                  />
+                  <input value={edgeRegisterForm.equipment} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, equipment: e.target.value }))} />
                 </label>
                 <label>
                   Admin Password
-                  <input
-                    type="password"
-                    value={edgeRegisterForm.admin_password}
-                    onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_password: e.target.value }))}
-                  />
+                  <input type="password" value={edgeRegisterForm.admin_password} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_password: e.target.value }))} />
                 </label>
               </div>
               {edgeRegisterResult ? <div className={edgeRegisterResult.includes("failed") ? "error" : "lock-note"}>{edgeRegisterResult}</div> : null}
-              <div className="row" style={{ justifyContent: "flex-end", gap: 8 }}>
-                <button className="btn" onClick={() => setShowEdgeRegisterModal(false)}>Close</button>
-                <button className="btn btn-primary" onClick={submitEdgeRegister} disabled={edgeRegisterBusy}>
-                  {edgeRegisterBusy ? "Registering..." : "Activate Edge"}
+              <button className="btn btn-primary auth-submit" onClick={submitEdgeRegister} disabled={edgeRegisterBusy}>
+                {edgeRegisterBusy ? "Registering..." : "Activate Edge"}
+              </button>
+              <button className="btn" type="button" style={{ width: "100%" }} onClick={() => setLoginTab("login")}>
+                Back to Login
+              </button>
+            </>
+          ) : (
+            <>
+              <h3 className="auth-heading">Sign In</h3>
+              <label>
+                Username
+                <input value={loginForm.username} onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value })} placeholder="Enter username" />
+              </label>
+              <label>
+                Password
+                <div className="pw-input-wrap">
+                  <input
+                    type={showLoginPassword ? "text" : "password"}
+                    value={loginForm.password}
+                    onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+                    placeholder="Enter password"
+                  />
+                  <button className="pw-icon-btn" onClick={() => setShowLoginPassword((v) => !v)} type="button" aria-label="Toggle password visibility">
+                    <EyeIcon open={showLoginPassword} />
+                  </button>
+                </div>
+              </label>
+              <label className="remember-row">
+                <input type="checkbox" checked={rememberUser} onChange={(e) => setRememberUser(e.target.checked)} />
+                <span className="remember-label">Remember this user</span>
+              </label>
+              <div className="auth-links">
+                <button className="btn btn-ghost-link" type="button" onClick={() => setForgotResult("Fill username and click Request Code.")}>
+                  Forgot password?
                 </button>
               </div>
-            </div>
-          </div>
-        ) : null}
+              {forgotResult ? (
+                <div className="auth-forgot-box">
+                  <label>
+                    Tenant (optional)
+                    <input value={forgotForm.tenant_id} onChange={(e) => setForgotForm((p) => ({ ...p, tenant_id: e.target.value }))} placeholder="default" />
+                  </label>
+                  <label>
+                    Username
+                    <input value={forgotForm.username} onChange={(e) => setForgotForm((p) => ({ ...p, username: e.target.value }))} />
+                  </label>
+                  <label>
+                    Verification Code
+                    <input value={forgotForm.reset_token} onChange={(e) => setForgotForm((p) => ({ ...p, reset_token: e.target.value }))} />
+                  </label>
+                  <label>
+                    New Password
+                    <input type="password" value={forgotForm.new_password} onChange={(e) => setForgotForm((p) => ({ ...p, new_password: e.target.value }))} />
+                  </label>
+                  <div className="row" style={{ gap: 8 }}>
+                    <button className="btn" type="button" onClick={requestForgotPasswordCode} disabled={forgotBusy}>
+                      {forgotBusy ? "Requesting..." : "Request Code"}
+                    </button>
+                    <button className="btn btn-primary" type="button" onClick={applyForgotPasswordReset} disabled={forgotBusy}>
+                      Apply Reset
+                    </button>
+                  </div>
+                  <div className="lock-note">{forgotResult}</div>
+                </div>
+              ) : null}
+              {loginError ? <div className="error">{loginError}</div> : null}
+              <button className="btn btn-primary auth-submit" onClick={submitLogin} disabled={loginBusy}>
+                {loginBusy ? "Signing in..." : "Sign In"}
+              </button>
+              <div className="auth-help">
+                Default admin credentials: <strong>admin / admin</strong>
+              </div>
+            </>
+          )}
+        </div>
       </div>
     );
   }

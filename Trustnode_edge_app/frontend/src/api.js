@@ -1361,6 +1361,26 @@ export async function applyControlPlanePasswordReset(payload, tenantId = "") {
   return res.json();
 }
 
+export async function issuePublicPasswordReset(payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/password-reset/public/issue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Password reset code issue failed");
+  return res.json();
+}
+
+export async function applyPublicPasswordReset(payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/password-reset/public/apply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Password reset apply failed");
+  return res.json();
+}
+
 export async function provisionControlPlaneCustomerBundle(payload) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/provision/customer-bundle`, {
     method: "POST",
