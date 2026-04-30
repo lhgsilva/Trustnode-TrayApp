@@ -10542,7 +10542,7 @@ function AppShell() {
   const refreshControlPlaneData = async (tenantId = "") => {
     const scopedTenantId = String(tenantId || currentTenantId || "default");
     try {
-      const [summaryRes, tenantsRes, customersRes, edgesRes, licensesRes, modulesRes, activationRes, usersRes] = await Promise.all([
+      const results = await Promise.allSettled([
         getControlPlaneSummary(scopedTenantId),
         getControlPlaneTenants(true),
         getControlPlaneCustomers(scopedTenantId),
@@ -10552,14 +10552,23 @@ function AppShell() {
         getControlPlaneActivationCodes(scopedTenantId, cpCustomerFilter !== "__all__" ? cpCustomerFilter : ""),
         getControlPlaneUsers(scopedTenantId),
       ]);
-      setCpSummary(summaryRes || null);
-      setCpTenants(Array.isArray(tenantsRes?.rows) ? tenantsRes.rows : []);
-      setCpCustomers(Array.isArray(customersRes?.rows) ? customersRes.rows : []);
-      setCpEdges(Array.isArray(edgesRes?.rows) ? edgesRes.rows : []);
-      setCpLicenses(Array.isArray(licensesRes?.rows) ? licensesRes.rows : []);
-      setCpModuleCatalog(Array.isArray(modulesRes?.modules) ? modulesRes.modules : []);
-      setCpActivationCodes(Array.isArray(activationRes?.rows) ? activationRes.rows : []);
-      setCpUsers(Array.isArray(usersRes?.rows) ? usersRes.rows : []);
+      const [summaryRes, tenantsRes, customersRes, edgesRes, licensesRes, modulesRes, activationRes, usersRes] = results;
+      setCpSummary(summaryRes?.status === "fulfilled" ? (summaryRes.value || null) : null);
+      setCpTenants(tenantsRes?.status === "fulfilled" && Array.isArray(tenantsRes.value?.rows) ? tenantsRes.value.rows : []);
+      setCpCustomers(customersRes?.status === "fulfilled" && Array.isArray(customersRes.value?.rows) ? customersRes.value.rows : []);
+      setCpEdges(edgesRes?.status === "fulfilled" && Array.isArray(edgesRes.value?.rows) ? edgesRes.value.rows : []);
+      setCpLicenses(licensesRes?.status === "fulfilled" && Array.isArray(licensesRes.value?.rows) ? licensesRes.value.rows : []);
+      setCpModuleCatalog(modulesRes?.status === "fulfilled" && Array.isArray(modulesRes.value?.modules) ? modulesRes.value.modules : []);
+      setCpActivationCodes(activationRes?.status === "fulfilled" && Array.isArray(activationRes.value?.rows) ? activationRes.value.rows : []);
+      setCpUsers(usersRes?.status === "fulfilled" && Array.isArray(usersRes.value?.rows) ? usersRes.value.rows : []);
+
+      const failed = results.filter((r) => r.status === "rejected");
+      if (failed.length) {
+        const msg = String(failed[0]?.reason?.message || failed[0]?.reason || "some sections failed");
+        setCpResult(`Control-plane partially loaded: ${msg}`);
+      } else {
+        setCpResult("");
+      }
       return true;
     } catch (err) {
       setCpResult(`Control-plane refresh failed: ${String(err?.message || err)}`);

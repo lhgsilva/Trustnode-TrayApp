@@ -724,12 +724,12 @@ class ControlPlaneStore:
             with self._connect() as conn:
                 if cid:
                     rows = conn.execute(
-                        "SELECT id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? AND customer_id=? ORDER BY id DESC LIMIT 300",
+                        "SELECT rowid AS id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? AND customer_id=? ORDER BY rowid DESC LIMIT 300",
                         (tid, cid),
                     ).fetchall()
                 else:
                     rows = conn.execute(
-                        "SELECT id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? ORDER BY id DESC LIMIT 300",
+                        "SELECT rowid AS id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? ORDER BY rowid DESC LIMIT 300",
                         (tid,),
                     ).fetchall()
         return [dict(r) for r in rows]
@@ -744,7 +744,7 @@ class ControlPlaneStore:
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE id=? AND tenant_id=?",
+                    "SELECT rowid AS id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
                     (rid, tid),
                 ).fetchone()
                 if not row:
@@ -753,12 +753,12 @@ class ControlPlaneStore:
                 next_status = patch_status if patch_status in {"issued", "used", "expired", "revoked"} else str(current.get("status") or "issued")
                 next_exp = patch_exp or str(current.get("expires_utc") or "")
                 conn.execute(
-                    "UPDATE cp_edge_activation_codes SET status=?, expires_utc=? WHERE id=? AND tenant_id=?",
+                    "UPDATE cp_edge_activation_codes SET status=?, expires_utc=? WHERE rowid=? AND tenant_id=?",
                     (next_status, next_exp, rid, tid),
                 )
                 conn.commit()
                 out = conn.execute(
-                    "SELECT id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE id=? AND tenant_id=?",
+                    "SELECT rowid AS id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
                     (rid, tid),
                 ).fetchone()
         return dict(out) if out else {}
