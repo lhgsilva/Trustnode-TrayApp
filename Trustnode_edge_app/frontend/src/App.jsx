@@ -131,6 +131,7 @@ const DASHBOARD_LAYOUT_STORAGE_KEY = "trustnode_dashboard_layout";
 const DASHBOARD_TAG_COLORS_STORAGE_KEY = "trustnode_dashboard_tag_colors";
 const EMAIL_SETTINGS_STORAGE_KEY = "trustnode_email_settings";
 const DEFAULT_LOCAL_DB_BADGE_DISMISS_KEY = "trustnode_default_local_db_badge_dismissed";
+const EDGE_LINKED_STORAGE_KEY = "trustnode_edge_linked_local";
 const LOCAL_DB_ENGINES = new Set(["sqlite", "csv_file", "txt_file"]);
 const MAIN_LOCAL_SQLITE_FALLBACK_ID = "__main_local_sqlite__";
 const KNOWN_SUPABASE_DEFAULTS = {
@@ -2104,7 +2105,13 @@ function AppShell() {
   const [isFullscreen, setIsFullscreen] = useState(getFullscreenState);
   const [loginForm, setLoginForm] = useState({ username: "", password: "" });
   const [loginTab, setLoginTab] = useState("login");
-  const [edgeLinked, setEdgeLinked] = useState(false);
+  const [edgeLinked, setEdgeLinked] = useState(() => {
+    try {
+      return localStorage.getItem(EDGE_LINKED_STORAGE_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [rememberUser, setRememberUser] = useState(true);
   const [loginError, setLoginError] = useState("");
@@ -2451,7 +2458,13 @@ function AppShell() {
     const linkedEdge = String(appSettings.edge_id || "").trim();
     const linkedTenant = String(appSettings.tenant_id || "").trim();
     const linkedLicense = String(appSettings.license_id || "").trim();
-    setEdgeLinked(linkedFlag || Boolean(linkedEdge && (linkedTenant || linkedLicense)));
+    const linked = linkedFlag || Boolean(linkedEdge && (linkedTenant || linkedLicense));
+    setEdgeLinked(linked);
+    try {
+      localStorage.setItem(EDGE_LINKED_STORAGE_KEY, linked ? "true" : "false");
+    } catch {
+      // ignore local storage errors
+    }
     if (appSettings.edge_profile && typeof appSettings.edge_profile === "object" && !Array.isArray(appSettings.edge_profile)) {
       setEdgeProfile((prev) => ({
         ...prev,
@@ -11130,6 +11143,8 @@ function AppShell() {
           await unlinkControlPlaneEdgeLink();
           clearAuthToken();
           localStorage.removeItem(CURRENT_USER_STORAGE_KEY);
+          localStorage.setItem(EDGE_LINKED_STORAGE_KEY, "false");
+          setEdgeLinked(false);
           setCurrentUser(null);
           setShowUserMenu(false);
         } catch (err) {
@@ -11171,6 +11186,9 @@ function AppShell() {
       setEdgeRegisterResult(
         `Activated edge '${String(res?.edge_id || payload.edge_id)}' for tenant '${String(res?.tenant_id || "")}'. You can login now.`
       );
+      localStorage.setItem(EDGE_LINKED_STORAGE_KEY, "true");
+      setEdgeLinked(true);
+      setLoginTab("login");
       setLoginForm((prev) => ({
         ...prev,
         username: payload.admin_username,
@@ -11349,6 +11367,11 @@ function AppShell() {
     return (
       <div className={authShellClass}>
         <div className="auth-card">
+          <div className="auth-header-row">
+            <button className="icon-btn theme-btn auth-theme-btn" onClick={toggleTheme} title="Toggle light/dark mode">
+              <ThemeIcon theme={theme} />
+            </button>
+          </div>
           <div className="auth-brand">
             <img src="trustnode_logo.png" alt="Trustnode" className="auth-logo" />
             <div>
