@@ -1082,27 +1082,42 @@ export async function stopPowerDevice(deviceId) {
   return res.json();
 }
 
+async function parseApiErrorDetail(res) {
+  try {
+    const body = await res.json();
+    return String(body?.detail || body?.error || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+async function ensureOk(res, message) {
+  if (res.ok) return;
+  const detail = await parseApiErrorDetail(res);
+  throw new Error(`${message} (HTTP ${res.status})${detail ? `: ${detail}` : ""}`);
+}
+
 export async function getControlPlaneRuntimeContext() {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/runtime-context`);
-  if (!res.ok) throw new Error("Control-plane runtime-context fetch failed");
+  await ensureOk(res, "Control-plane runtime-context fetch failed");
   return res.json();
 }
 
 export async function getControlPlaneEdgeBootstrapStatus() {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-bootstrap-status`);
-  if (!res.ok) throw new Error("Control-plane edge bootstrap status fetch failed");
+  await ensureOk(res, "Control-plane edge bootstrap status fetch failed");
   return res.json();
 }
 
 export async function getControlPlanePortalContext() {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/portal-context`);
-  if (!res.ok) throw new Error("Control-plane portal-context fetch failed");
+  await ensureOk(res, "Control-plane portal-context fetch failed");
   return res.json();
 }
 
 export async function getControlPlaneModuleCatalog() {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/modules`);
-  if (!res.ok) throw new Error("Control-plane modules fetch failed");
+  await ensureOk(res, "Control-plane modules fetch failed");
   return res.json();
 }
 
@@ -1111,7 +1126,7 @@ export async function getControlPlaneSummary(tenantId = "") {
   if (tenantId) params.set("tenant_id", String(tenantId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/summary${suffix}`);
-  if (!res.ok) throw new Error("Control-plane summary fetch failed");
+  await ensureOk(res, "Control-plane summary fetch failed");
   return res.json();
 }
 
@@ -1119,7 +1134,7 @@ export async function getControlPlaneTenants(includeSuspended = true) {
   const params = new URLSearchParams();
   params.set("include_suspended", includeSuspended ? "true" : "false");
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/tenants?${params.toString()}`);
-  if (!res.ok) throw new Error("Control-plane tenants fetch failed");
+  await ensureOk(res, "Control-plane tenants fetch failed");
   return res.json();
 }
 
@@ -1129,7 +1144,7 @@ export async function upsertControlPlaneTenant(payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane tenant upsert failed");
+  await ensureOk(res, "Control-plane tenant upsert failed");
   return res.json();
 }
 
@@ -1138,7 +1153,7 @@ export async function getControlPlaneCustomers(tenantId = "") {
   if (tenantId) params.set("tenant_id", String(tenantId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/customers${suffix}`);
-  if (!res.ok) throw new Error("Control-plane customers fetch failed");
+  await ensureOk(res, "Control-plane customers fetch failed");
   return res.json();
 }
 
@@ -1151,7 +1166,7 @@ export async function upsertControlPlaneCustomer(payload, tenantId = "") {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane customer upsert failed");
+  await ensureOk(res, "Control-plane customer upsert failed");
   return res.json();
 }
 
@@ -1166,7 +1181,7 @@ export async function deleteControlPlaneCustomer(customerId, tenantId = "") {
     const postFallbackUrl = `${getApiBase()}/api/control-plane/customers/${cid}/delete${suffix}`;
     res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
   }
-  if (!res.ok) throw new Error("Control-plane customer delete failed");
+  await ensureOk(res, "Control-plane customer delete failed");
   return res.json();
 }
 
@@ -1175,7 +1190,7 @@ export async function getControlPlaneEdges(tenantId = "") {
   if (tenantId) params.set("tenant_id", String(tenantId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges${suffix}`);
-  if (!res.ok) throw new Error("Control-plane edges fetch failed");
+  await ensureOk(res, "Control-plane edges fetch failed");
   return res.json();
 }
 
@@ -1188,7 +1203,7 @@ export async function upsertControlPlaneEdge(payload, tenantId = "") {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane edge upsert failed");
+  await ensureOk(res, "Control-plane edge upsert failed");
   return res.json();
 }
 
@@ -1203,7 +1218,7 @@ export async function deleteControlPlaneEdge(edgeId, tenantId = "") {
     const postFallbackUrl = `${getApiBase()}/api/control-plane/edges/${eid}/delete${suffix}`;
     res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
   }
-  if (!res.ok) throw new Error("Control-plane edge delete failed");
+  await ensureOk(res, "Control-plane edge delete failed");
   return res.json();
 }
 
@@ -1216,7 +1231,7 @@ export async function heartbeatControlPlaneEdge(edgeId, payload = {}, tenantId =
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane edge heartbeat failed");
+  await ensureOk(res, "Control-plane edge heartbeat failed");
   return res.json();
 }
 
@@ -1225,7 +1240,7 @@ export async function getControlPlaneLicenses(tenantId = "") {
   if (tenantId) params.set("tenant_id", String(tenantId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/licenses${suffix}`);
-  if (!res.ok) throw new Error("Control-plane licenses fetch failed");
+  await ensureOk(res, "Control-plane licenses fetch failed");
   return res.json();
 }
 
@@ -1238,7 +1253,7 @@ export async function upsertControlPlaneLicense(payload, tenantId = "") {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane license upsert failed");
+  await ensureOk(res, "Control-plane license upsert failed");
   return res.json();
 }
 
@@ -1253,13 +1268,13 @@ export async function deleteControlPlaneLicense(licenseId, tenantId = "") {
     const postFallbackUrl = `${getApiBase()}/api/control-plane/licenses/${lid}/delete${suffix}`;
     res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
   }
-  if (!res.ok) throw new Error("Control-plane license delete failed");
+  await ensureOk(res, "Control-plane license delete failed");
   return res.json();
 }
 
 export async function getControlPlaneLicenseModules(licenseId) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/licenses/${encodeURIComponent(String(licenseId || ""))}/modules`);
-  if (!res.ok) throw new Error("Control-plane license modules fetch failed");
+  await ensureOk(res, "Control-plane license modules fetch failed");
   return res.json();
 }
 
@@ -1269,7 +1284,7 @@ export async function setControlPlaneLicenseModules(licenseId, payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || { modules: [] })
   });
-  if (!res.ok) throw new Error("Control-plane license modules update failed");
+  await ensureOk(res, "Control-plane license modules update failed");
   return res.json();
 }
 
@@ -1278,7 +1293,7 @@ export async function getControlPlaneUsers(tenantId = "") {
   if (tenantId) params.set("tenant_id", String(tenantId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/users${suffix}`);
-  if (!res.ok) throw new Error("Control-plane users fetch failed");
+  await ensureOk(res, "Control-plane users fetch failed");
   return res.json();
 }
 
@@ -1291,7 +1306,7 @@ export async function upsertControlPlaneUser(payload, tenantId = "") {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane user upsert failed");
+  await ensureOk(res, "Control-plane user upsert failed");
   return res.json();
 }
 
@@ -1306,7 +1321,7 @@ export async function deleteControlPlaneUser(username, tenantId = "") {
     const postFallbackUrl = `${getApiBase()}/api/control-plane/users/${uname}/delete${suffix}`;
     res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
   }
-  if (!res.ok) throw new Error("Control-plane user delete failed");
+  await ensureOk(res, "Control-plane user delete failed");
   return res.json();
 }
 
@@ -1319,7 +1334,7 @@ export async function issueControlPlaneActivationCode(payload, tenantId = "") {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane activation code issue failed");
+  await ensureOk(res, "Control-plane activation code issue failed");
   return res.json();
 }
 
@@ -1329,7 +1344,7 @@ export async function applyControlPlaneActivationCode(payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane activation code apply failed");
+  await ensureOk(res, "Control-plane activation code apply failed");
   return res.json();
 }
 
@@ -1339,7 +1354,9 @@ export async function getControlPlaneActivationCodes(tenantId = "", customerId =
   if (customerId) params.set("customer_id", String(customerId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/activation-codes${suffix}`);
-  if (!res.ok) throw new Error("Control-plane activation-codes fetch failed");
+  // Older deployed backends may not expose activation-codes yet.
+  if (res.status === 404) return { ok: true, rows: [] };
+  await ensureOk(res, "Control-plane activation-codes fetch failed");
   return res.json();
 }
 
@@ -1352,7 +1369,7 @@ export async function updateControlPlaneActivationCode(rowId, payload, tenantId 
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {}),
   });
-  if (!res.ok) throw new Error("Control-plane activation-code update failed");
+  await ensureOk(res, "Control-plane activation-code update failed");
   return res.json();
 }
 
@@ -1362,7 +1379,7 @@ export async function registerControlPlaneEdgeLink(payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane edge-link register failed");
+  await ensureOk(res, "Control-plane edge-link register failed");
   return res.json();
 }
 
@@ -1370,7 +1387,7 @@ export async function unlinkControlPlaneEdgeLink() {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-link/unlink`, {
     method: "POST",
   });
-  if (!res.ok) throw new Error("Control-plane edge-link unlink failed");
+  await ensureOk(res, "Control-plane edge-link unlink failed");
   return res.json();
 }
 
@@ -1380,7 +1397,7 @@ export async function checkControlPlaneEdgeLicense(edgeId = "", tenantId = "") {
   if (tenantId) params.set("tenant_id", String(tenantId));
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-link/license-check${suffix}`);
-  if (!res.ok) throw new Error("Control-plane edge license check failed");
+  await ensureOk(res, "Control-plane edge license check failed");
   return res.json();
 }
 
@@ -1393,7 +1410,7 @@ export async function issueControlPlanePasswordReset(payload, tenantId = "") {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane password reset issue failed");
+  await ensureOk(res, "Control-plane password reset issue failed");
   return res.json();
 }
 
@@ -1406,7 +1423,7 @@ export async function applyControlPlanePasswordReset(payload, tenantId = "") {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane password reset apply failed");
+  await ensureOk(res, "Control-plane password reset apply failed");
   return res.json();
 }
 
@@ -1416,7 +1433,7 @@ export async function issuePublicPasswordReset(payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Password reset code issue failed");
+  await ensureOk(res, "Password reset code issue failed");
   return res.json();
 }
 
@@ -1426,7 +1443,7 @@ export async function applyPublicPasswordReset(payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Password reset apply failed");
+  await ensureOk(res, "Password reset apply failed");
   return res.json();
 }
 
@@ -1436,6 +1453,6 @@ export async function provisionControlPlaneCustomerBundle(payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
   });
-  if (!res.ok) throw new Error("Control-plane customer bundle provision failed");
+  await ensureOk(res, "Control-plane customer bundle provision failed");
   return res.json();
 }
