@@ -10577,6 +10577,11 @@ function AppShell() {
     }
   };
 
+  const getControlPlaneTenantScope = () => {
+    if (cpTenantFilter && cpTenantFilter !== "__all__") return String(cpTenantFilter);
+    return String(currentTenantId || currentUser?.tenant_id || "default");
+  };
+
   const syncControlPlaneEdgeHeartbeat = async () => {
     if (isHostedWebClient) return false;
     const edgeId = String(edgeProfile?.edge_id || "").trim();
@@ -10693,6 +10698,7 @@ function AppShell() {
     setCpModalError("");
     setCpBusy(true);
     try {
+      const scopedTenant = getControlPlaneTenantScope();
       await upsertControlPlaneCustomer(
         {
           customer_id: String(cpCustomerForm.customer_id || "").trim(),
@@ -10701,9 +10707,9 @@ function AppShell() {
           status: cpCustomerForm.status || "active",
           metadata: {},
         },
-        currentTenantId || "default"
+        scopedTenant
       );
-      await refreshControlPlaneData(currentTenantId || "default");
+      await refreshControlPlaneData(scopedTenant);
       setCpResult(`Customer '${companyName}' saved.`);
       setCpModalError("");
       setShowCpCustomerModal(false);
@@ -10729,6 +10735,7 @@ function AppShell() {
     setCpModalError("");
     setCpBusy(true);
     try {
+      const scopedTenant = getControlPlaneTenantScope();
       await upsertControlPlaneEdge(
         {
           edge_id: String(cpEdgeForm.edge_id || "").trim(),
@@ -10740,9 +10747,9 @@ function AppShell() {
           status: cpEdgeForm.status || "inactive",
           metadata: {},
         },
-        currentTenantId || "default"
+        scopedTenant
       );
-      await refreshControlPlaneData(currentTenantId || "default");
+      await refreshControlPlaneData(scopedTenant);
       setCpResult(`Edge '${edgeName}' saved.`);
       setCpModalError("");
       setShowCpEdgeModal(false);
@@ -10768,8 +10775,9 @@ function AppShell() {
         max_users: Math.max(1, Number(cpLicenseForm.max_users || 1)),
         metadata: {},
       };
-      await upsertControlPlaneLicense(payload, currentTenantId || "default");
-      await refreshControlPlaneData(currentTenantId || "default");
+      const scopedTenant = getControlPlaneTenantScope();
+      await upsertControlPlaneLicense(payload, scopedTenant);
+      await refreshControlPlaneData(scopedTenant);
       setCpResult(`License '${payload.license_id || payload.plan_code}' saved.`);
     } catch (err) {
       setCpResult(`License save failed: ${String(err?.message || err)}`);
@@ -10810,8 +10818,9 @@ function AppShell() {
       async () => {
         setCpBusy(true);
         try {
-          await deleteControlPlaneCustomer(customerId, currentTenantId || "default");
-          await refreshControlPlaneData(currentTenantId || "default");
+          const scopedTenant = getControlPlaneTenantScope();
+          await deleteControlPlaneCustomer(customerId, scopedTenant);
+          await refreshControlPlaneData(scopedTenant);
           setCpResult(`Customer '${customerId}' deleted.`);
         } catch (err) {
           setCpResult(`Customer delete failed: ${String(err?.message || err)}`);
@@ -10863,8 +10872,9 @@ function AppShell() {
       async () => {
         setCpBusy(true);
         try {
-          await deleteControlPlaneEdge(edgeId, currentTenantId || "default");
-          await refreshControlPlaneData(currentTenantId || "default");
+          const scopedTenant = getControlPlaneTenantScope();
+          await deleteControlPlaneEdge(edgeId, scopedTenant);
+          await refreshControlPlaneData(scopedTenant);
           setCpResult(`Edge '${edgeId}' deleted.`);
         } catch (err) {
           setCpResult(`Edge delete failed: ${String(err?.message || err)}`);
@@ -10944,8 +10954,9 @@ function AppShell() {
       async () => {
         setCpBusy(true);
         try {
-          await deleteControlPlaneLicense(licenseId, currentTenantId || "default");
-          await refreshControlPlaneData(currentTenantId || "default");
+          const scopedTenant = getControlPlaneTenantScope();
+          await deleteControlPlaneLicense(licenseId, scopedTenant);
+          await refreshControlPlaneData(scopedTenant);
           setCpResult(`License '${licenseId}' deleted.`);
         } catch (err) {
           setCpResult(`License delete failed: ${String(err?.message || err)}`);
@@ -10991,7 +11002,8 @@ function AppShell() {
         max_users: Math.max(1, Number(cpLicenseForm.max_users || 1)),
         metadata: {},
       };
-      const res = await upsertControlPlaneLicense(payload, currentTenantId || "default");
+      const scopedTenant = getControlPlaneTenantScope();
+      const res = await upsertControlPlaneLicense(payload, scopedTenant);
       const finalLicenseId = String(res?.row?.license_id || payload.license_id || "").trim();
       if (finalLicenseId) {
         await setControlPlaneLicenseModules(finalLicenseId, {
@@ -11001,7 +11013,7 @@ function AppShell() {
           })),
         });
       }
-      await refreshControlPlaneData(currentTenantId || "default");
+      await refreshControlPlaneData(getControlPlaneTenantScope());
       setCpResult(`License '${finalLicenseId || payload.plan_code}' saved.`);
       setCpModalError("");
       setShowCpLicenseModal(false);
@@ -11050,8 +11062,9 @@ function AppShell() {
     }
     setCpBusy(true);
     try {
+      const scopedTenant = getControlPlaneTenantScope();
       await setControlPlaneLicenseModules(lid, { modules });
-      await refreshControlPlaneData(currentTenantId || "default");
+      await refreshControlPlaneData(scopedTenant);
       setCpResult(`License modules saved for '${lid}'.`);
     } catch (err) {
       setCpResult(`Save license modules failed: ${String(err?.message || err)}`);
@@ -11126,7 +11139,7 @@ function AppShell() {
           username,
           ttl_minutes: Math.max(1, Number(cpPasswordResetIssueForm.ttl_minutes || 15)),
         },
-        currentTenantId || "default"
+        getControlPlaneTenantScope()
       );
       const token = String(res?.row?.reset_token || "");
       setCpIssuedResetToken(token);
@@ -11152,8 +11165,9 @@ function AppShell() {
     }
     setCpBusy(true);
     try {
-      await applyControlPlanePasswordReset(payload, currentTenantId || "default");
-      await refreshControlPlaneUsers(currentTenantId || "default");
+      const scopedTenant = getControlPlaneTenantScope();
+      await applyControlPlanePasswordReset(payload, scopedTenant);
+      await refreshControlPlaneUsers(scopedTenant);
       setCpResult(`Password reset applied for '${payload.username}'.`);
     } catch (err) {
       setCpResult(`Password reset apply failed: ${String(err?.message || err)}`);
@@ -11167,13 +11181,14 @@ function AppShell() {
     if (!rowId) return;
     setCpBusy(true);
     try {
+      const scopedTenant = getControlPlaneTenantScope();
       await updateControlPlaneActivationCode(
         rowId,
         { status, expires_utc: String(row?.expires_utc || "") },
-        currentTenantId || "default"
+        getControlPlaneTenantScope()
       );
       setCpResult(`Activation code #${rowId} updated to '${status}'.`);
-      await refreshControlPlaneData(currentTenantId || "default");
+      await refreshControlPlaneData(scopedTenant);
     } catch (err) {
       setCpResult(`Activation code update failed: ${String(err?.message || err)}`);
     } finally {
@@ -11191,9 +11206,10 @@ function AppShell() {
       onConfirm: async () => {
         setCpBusy(true);
         try {
-          await deleteControlPlaneUser(target, currentTenantId || "default");
+          const scopedTenant = getControlPlaneTenantScope();
+          await deleteControlPlaneUser(target, scopedTenant);
           setCpResult(`User '${target}' deleted.`);
-          await refreshControlPlaneUsers(currentTenantId || "default");
+          await refreshControlPlaneUsers(scopedTenant);
         } catch (err) {
           setCpResult(`User delete failed: ${String(err?.message || err)}`);
         } finally {
@@ -11532,9 +11548,9 @@ function AppShell() {
     withConfirm("Delete User", `Delete user '${target}'?`, () => {
       const nextUsers = users.filter((u) => String(u.username) !== target);
       const actor = currentUser?.username || "system";
-      deleteControlPlaneUser(target, currentTenantId || "default")
+      deleteControlPlaneUser(target, getControlPlaneTenantScope())
         .then(async () => {
-          await refreshControlPlaneUsers(currentTenantId || "default");
+          await refreshControlPlaneUsers(getControlPlaneTenantScope());
           await saveAppStoreDomain(
             "users_access",
             { users: nextUsers, current_user: currentUser?.username || "" },
