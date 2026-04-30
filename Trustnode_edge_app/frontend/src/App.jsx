@@ -93,13 +93,32 @@ import {
 } from "./api";
 import { Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
-const THEME_STORAGE_KEY = "trustnode_theme";
-const INTERFACE_THEME_PREFS_STORAGE_KEY = "trustnode_interface_theme_prefs";
-const CHART_PALETTE_STORAGE_KEY = "trustnode_chart_palette";
-const ACTIVE_PAGE_STORAGE_KEY = "trustnode_active_page";
-const TAG_MONITOR_CHART_TYPE_STORAGE_KEY = "trustnode_tag_monitor_chart_type";
-const TREND_CHART_TYPE_STORAGE_KEY = "trustnode_trend_chart_type";
-const SIDEBAR_COLLAPSED_STORAGE_KEY = "trustnode_sidebar_collapsed";
+function getUiStorageScope() {
+  try {
+    const browserProtocol = String(window.location.protocol || "").toLowerCase();
+    const browserHost = String(window.location.hostname || "").toLowerCase();
+    const isLocalHost = browserHost === "localhost" || browserHost === "127.0.0.1" || browserHost === "::1";
+    const isElectronRuntime = /electron/i.test(String(window.navigator?.userAgent || ""));
+    const hasDesktopBackendOverride = Boolean(new URLSearchParams(window.location.search).get("backendUrl"));
+    const isHostedWebClient =
+      !isElectronRuntime &&
+      !hasDesktopBackendOverride &&
+      (browserProtocol === "https:" || browserProtocol === "http:") &&
+      !isLocalHost;
+    return isHostedWebClient ? "cloud" : "local";
+  } catch {
+    return "local";
+  }
+}
+
+const UI_STORAGE_SCOPE = getUiStorageScope();
+const THEME_STORAGE_KEY = `trustnode_theme_${UI_STORAGE_SCOPE}`;
+const INTERFACE_THEME_PREFS_STORAGE_KEY = `trustnode_interface_theme_prefs_${UI_STORAGE_SCOPE}`;
+const CHART_PALETTE_STORAGE_KEY = `trustnode_chart_palette_${UI_STORAGE_SCOPE}`;
+const ACTIVE_PAGE_STORAGE_KEY = `trustnode_active_page_${UI_STORAGE_SCOPE}`;
+const TAG_MONITOR_CHART_TYPE_STORAGE_KEY = `trustnode_tag_monitor_chart_type_${UI_STORAGE_SCOPE}`;
+const TREND_CHART_TYPE_STORAGE_KEY = `trustnode_trend_chart_type_${UI_STORAGE_SCOPE}`;
+const SIDEBAR_COLLAPSED_STORAGE_KEY = `trustnode_sidebar_collapsed_${UI_STORAGE_SCOPE}`;
 const USERS_STORAGE_KEY = "trustnode_users";
 const CURRENT_USER_STORAGE_KEY = "trustnode_current_user";
 const DEVICES_STORAGE_KEY = "trustnode_devices";
@@ -2342,7 +2361,11 @@ function AppShell() {
       tenant_login_realm: tenantLoginRealm,
       edge_profile: edgeProfile,
       interface_theme_prefs: interfaceThemePrefs,
-      chart_palette: chartPalette
+      chart_palette: chartPalette,
+      interface_theme_prefs_local: isHostedWebClient ? undefined : interfaceThemePrefs,
+      interface_theme_prefs_cloud: isHostedWebClient ? interfaceThemePrefs : undefined,
+      chart_palette_local: isHostedWebClient ? undefined : chartPalette,
+      chart_palette_cloud: isHostedWebClient ? chartPalette : undefined
     },
     users_access: {
       users,
@@ -2439,13 +2462,17 @@ function AppShell() {
         machine_group: String(appSettings.edge_profile.machine_group || ""),
       }));
     }
-    if (appSettings.interface_theme_prefs && typeof appSettings.interface_theme_prefs === "object") {
+    const scopedThemePrefs =
+      isHostedWebClient
+        ? appSettings.interface_theme_prefs_cloud || appSettings.interface_theme_prefs
+        : appSettings.interface_theme_prefs_local || appSettings.interface_theme_prefs;
+    if (scopedThemePrefs && typeof scopedThemePrefs === "object") {
       const merged = {
         light: { ...DEFAULT_INTERFACE_THEME_PREFS.light },
         dark: { ...DEFAULT_INTERFACE_THEME_PREFS.dark }
       };
       for (const mode of ["light", "dark"]) {
-        const incomingMode = appSettings.interface_theme_prefs?.[mode];
+        const incomingMode = scopedThemePrefs?.[mode];
         if (incomingMode && typeof incomingMode === "object") {
           for (const [k, v] of Object.entries(incomingMode)) {
             if (k in merged[mode]) merged[mode][k] = normalizeHexColor(v, merged[mode][k]);
@@ -2454,9 +2481,13 @@ function AppShell() {
       }
       setInterfaceThemePrefs(merged);
     }
-    if (Array.isArray(appSettings.chart_palette) && appSettings.chart_palette.length) {
+    const scopedPalette =
+      isHostedWebClient
+        ? appSettings.chart_palette_cloud || appSettings.chart_palette
+        : appSettings.chart_palette_local || appSettings.chart_palette;
+    if (Array.isArray(scopedPalette) && scopedPalette.length) {
       setChartPalette(
-        appSettings.chart_palette.map((c, idx) =>
+        scopedPalette.map((c, idx) =>
           normalizeHexColor(c, DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length])
         )
       );
@@ -11314,8 +11345,9 @@ function AppShell() {
 
   if (!currentUser) {
     const showRegisterTab = !isHostedWebClient && !edgeLinked;
+    const authShellClass = isHostedWebClient ? "auth-shell auth-shell--themed" : "auth-shell auth-shell--fixed-dark";
     return (
-      <div className="auth-shell auth-shell--fixed-dark">
+      <div className={authShellClass}>
         <div className="auth-card">
           <div className="auth-brand">
             <img src="trustnode_logo.png" alt="Trustnode" className="auth-logo" />

@@ -79,6 +79,13 @@ body {
   color: #e5e7eb;
 }
 
+.auth-shell--themed {
+  background:
+    radial-gradient(circle at 18% 16%, color-mix(in srgb, var(--brand) 16%, transparent) 0%, transparent 38%),
+    radial-gradient(circle at 82% 84%, color-mix(in srgb, var(--brand) 12%, transparent) 0%, transparent 34%),
+    linear-gradient(165deg, color-mix(in srgb, var(--bg) 92%, #ffffff 8%) 0%, var(--bg) 100%);
+}
+
 .auth-card {
   width: min(470px, 92vw);
   background: var(--card);
@@ -94,9 +101,20 @@ body {
   color: #e5e7eb;
 }
 
+.auth-shell--themed .auth-card {
+  background: color-mix(in srgb, var(--card) 92%, #ffffff 8%);
+  border-color: color-mix(in srgb, var(--stroke) 88%, #ffffff 12%);
+  box-shadow: 0 20px 48px rgba(17, 24, 39, 0.16);
+}
+
 .auth-shell--fixed-dark .auth-subtitle,
 .auth-shell--fixed-dark .auth-help {
   color: #94a3b8;
+}
+
+.auth-shell--themed .auth-subtitle,
+.auth-shell--themed .auth-help {
+  color: var(--muted);
 }
 
 .auth-shell--fixed-dark input,
@@ -105,6 +123,14 @@ body {
   background: #111827;
   border-color: #334155;
   color: #e5e7eb;
+}
+
+.auth-shell--themed input,
+.auth-shell--themed select,
+.auth-shell--themed textarea {
+  background: color-mix(in srgb, var(--bg) 72%, #ffffff 28%);
+  border-color: color-mix(in srgb, var(--stroke) 82%, #ffffff 18%);
+  color: var(--text);
 }
 
 .auth-brand {
@@ -173,10 +199,21 @@ body {
   color: #94a3b8;
 }
 
+.auth-shell--themed .auth-tab {
+  border-color: color-mix(in srgb, var(--stroke) 84%, #ffffff 16%);
+  color: var(--muted);
+}
+
 .auth-shell--fixed-dark .auth-tab.active {
   border-color: #0ea5e9;
   color: #e5e7eb;
   background: rgba(14, 165, 233, 0.16);
+}
+
+.auth-shell--themed .auth-tab.active {
+  border-color: var(--brand);
+  color: var(--text);
+  background: color-mix(in srgb, var(--brand) 16%, transparent);
 }
 
 .auth-links {
@@ -196,6 +233,10 @@ body {
   color: #38bdf8;
 }
 
+.auth-shell--themed .btn-ghost-link {
+  color: var(--brand);
+}
+
 .auth-forgot-box {
   border: 1px dashed var(--stroke);
   border-radius: 10px;
@@ -205,6 +246,11 @@ body {
 
 .auth-shell--fixed-dark .auth-forgot-box {
   border-color: #334155;
+}
+
+.auth-shell--themed .auth-forgot-box {
+  border-color: color-mix(in srgb, var(--stroke) 82%, #ffffff 18%);
+  background: color-mix(in srgb, var(--card) 78%, #ffffff 22%);
 }
 
 .pw-input-wrap {
