@@ -1317,6 +1317,24 @@ export async function applyControlPlaneActivationCode(payload) {
   return res.json();
 }
 
+export async function registerControlPlaneEdgeLink(payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-link/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  });
+  if (!res.ok) throw new Error("Control-plane edge-link register failed");
+  return res.json();
+}
+
+export async function unlinkControlPlaneEdgeLink() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-link/unlink`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error("Control-plane edge-link unlink failed");
+  return res.json();
+}
+
 export async function issueControlPlanePasswordReset(payload, tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));

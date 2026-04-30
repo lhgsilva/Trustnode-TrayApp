@@ -22,6 +22,17 @@ const PREVIOUS_USER_DATA_DIRS = ["trustnode-desktop"];
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
 if (!gotSingleInstanceLock) {
+  try {
+    dialog.showMessageBoxSync({
+      type: "warning",
+      title: "Trustnode Already Running",
+      message: "Trustnode is already running (possibly minimized to tray).",
+      detail:
+        "Close the existing Trustnode instance from the tray or use the restart script to relaunch cleanly.",
+      buttons: ["OK"],
+      noLink: true,
+    });
+  } catch (_) {}
   app.quit();
   try {
     process.exit(0);

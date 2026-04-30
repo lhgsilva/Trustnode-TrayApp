@@ -48,7 +48,7 @@ class GatewayWorker:
         self._remote_last_flush_started_monotonic = 0.0
         self._remote_last_pending_probe_monotonic = 0.0
         self._remote_flush_min_interval_seconds = max(
-            0.1, float(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MIN_SECONDS", "0.5") or "0.5")
+            0.05, float(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MIN_SECONDS", "0.15") or "0.15")
         )
         self._remote_pending_probe_seconds = max(
             0.25, float(os.environ.get("TRUSTNODE_REMOTE_PENDING_PROBE_SECONDS", "2.0") or "2.0")
@@ -1154,8 +1154,9 @@ class GatewayWorker:
     def _flush_remote_outbox_once(self, engine_name: str) -> None:
         schedule_again = False
         try:
-            max_batches = max(1, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MAX_BATCHES", "12") or "12"))
-            batch_limit = max(25, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_BATCH_LIMIT", "120") or "120"))
+            # Higher defaults reduce pending buildup and cloud lag under multi-tag 1s gateways.
+            max_batches = max(1, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_MAX_BATCHES", "40") or "40"))
+            batch_limit = max(50, int(os.environ.get("TRUSTNODE_REMOTE_FLUSH_BATCH_LIMIT", "500") or "500"))
             for _ in range(max_batches):
                 pending = self._load_pending(batch_limit)
                 if not pending:
@@ -1750,24 +1751,31 @@ class PLCManager:
                 gateway_id = str(message.get("gateway_id") or "")
                 worker = self.workers.get(gateway_id)
                 db_name = ""
+                gateway_name = gateway_id
+                device_name = ""
                 try:
                     db_name = str((worker.db_sink or {}).get("name") or "")
+                    gateway_name = str((worker.config.name if worker else "") or gateway_id)
+                    device_name = str((worker.config.device_name if worker else "") or "")
                 except Exception:
                     db_name = ""
                 rows = []
                 for r in message.get("readings") or []:
                     if not isinstance(r, dict):
                         continue
+                    tag_name = str(r.get("tag_name") or "").strip()
+                    if not tag_name:
+                        continue
                     rows.append(
                         {
                             "ts_utc": str(r.get("ts_utc") or datetime.now(timezone.utc).isoformat()),
                             "source": str(r.get("source") or ""),
                             "gateway_id": gateway_id,
-                            "gateway_name": gateway_id,
-                            "device_name": "",
+                            "gateway_name": gateway_name,
+                            "device_name": device_name,
                             "plc_ip": str((worker.config.plc_ip if worker else "") or ""),
                             "database_name": db_name,
-                            "tag_name": str(r.get("tag_name") or ""),
+                            "tag_name": tag_name,
                             "value": r.get("value"),
                             "quality": r.get("quality"),
                             "quality_label": str(r.get("quality_label") or ""),

@@ -69,6 +69,7 @@ PUBLIC_PATHS = {
     "/api/control-plane/portal-context",
     "/api/control-plane/activation-code/apply",
     "/api/control-plane/edge-link/bootstrap",
+    "/api/control-plane/edge-link/register",
     "/api/v1/healthz",
     "/api/v1/readyz",
 }

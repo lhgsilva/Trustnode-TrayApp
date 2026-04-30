@@ -1,9 +1,10 @@
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.state import control_plane_store, telemetry_service
+from app.state import app_store, control_plane_store, telemetry_service
 from app.tenant import get_current_tenant, normalize_tenant_id
 
 router = APIRouter(prefix="/api/control-plane", tags=["control-plane"])
@@ -78,6 +79,17 @@ class ActivationCodeApplyRequest(BaseModel):
     site: str = ""
     area: str = ""
     equipment: str = ""
+
+
+class EdgeRegisterRequest(BaseModel):
+    activation_code: str
+    edge_id: str
+    edge_name: str = ""
+    site: str = ""
+    area: str = ""
+    equipment: str = ""
+    admin_username: str = "admin"
+    admin_password: str
 
 
 class PasswordResetIssueRequest(BaseModel):
@@ -605,3 +617,162 @@ def edge_link_bootstrap(payload: ActivationCodeApplyRequest, request: Request) -
             details={"edge_id": payload.edge_id, "error": str(exc)},
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/edge-link/register")
+def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[str, Any]:
+    cloud_url = f"{request.url.scheme}://{request.headers.get('host', '').split(':')[0]}".rstrip("/")
+    try:
+        row = control_plane_store.build_edge_bootstrap_payload(
+            activation_code=payload.activation_code,
+            edge_id=payload.edge_id,
+            edge_name=payload.edge_name,
+            site=payload.site,
+            area=payload.area,
+            equipment=payload.equipment,
+            cloud_url=cloud_url,
+        )
+        tenant_id = normalize_tenant_id(str(row.get("tenant_id") or "default"))
+        admin_username = str(payload.admin_username or "").strip() or "admin"
+        admin_password = str(payload.admin_password or "")
+        if not admin_password:
+            raise ValueError("admin_password_required")
+
+        # Create/refresh tenant admin in control-plane auth store.
+        control_plane_store.upsert_user(
+            tenant_id=tenant_id,
+            username=admin_username,
+            password=admin_password,
+            role="admin",
+            status="active",
+            email="",
+            mfa_enabled=False,
+            modules=[],
+            permissions={},
+        )
+
+        # Materialize local bootstrap so first login works immediately.
+        existing = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        users_access = existing.get("users_access") if isinstance(existing.get("users_access"), dict) else {}
+        users = users_access.get("users") if isinstance(users_access.get("users"), list) else []
+        next_users = []
+        replaced = False
+        for u in users:
+            if not isinstance(u, dict):
+                continue
+            if str(u.get("username") or "").strip() == admin_username:
+                next_users.append(
+                    {
+                        "username": admin_username,
+                        "password": admin_password,
+                        "role": "admin",
+                        "permissions": u.get("permissions") or {},
+                        "modules": u.get("modules") or [],
+                        "tenant_id": tenant_id,
+                    }
+                )
+                replaced = True
+            else:
+                next_users.append(dict(u))
+        if not replaced:
+            next_users.append(
+                {
+                    "username": admin_username,
+                    "password": admin_password,
+                    "role": "admin",
+                    "permissions": {},
+                    "modules": [],
+                    "tenant_id": tenant_id,
+                }
+            )
+        app_settings_patch = dict(row.get("app_settings_patch") or {})
+        app_settings_patch["edge_id"] = str(row.get("edge_id") or payload.edge_id)
+        app_settings_patch["edge_name"] = str(row.get("edge_name") or payload.edge_name or payload.edge_id)
+        app_settings_patch["customer_id"] = str(row.get("customer_id") or "")
+        app_settings_patch["edge_linked"] = True
+        app_settings_patch["license_id"] = str((row.get("license") or {}).get("license_id") or "")
+        app_store.save_bootstrap(
+            {
+                "app_settings": app_settings_patch,
+                "users_access": {
+                    "users": next_users,
+                    "current_user": admin_username,
+                },
+            },
+            actor=f"edge_register:{admin_username}",
+        )
+        telemetry_service.configure_from_bootstrap({"data": app_store.get_bootstrap(prefer_cloud_reads=False)})
+        control_plane_store.audit(
+            actor_type="device",
+            actor_id=str(payload.edge_id or "edge"),
+            tenant_id=tenant_id,
+            action="edge_link.register",
+            outcome="ok",
+            correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
+            details={"edge_id": payload.edge_id, "admin_username": admin_username},
+        )
+        return {
+            "ok": True,
+            "tenant_id": tenant_id,
+            "edge_id": str(row.get("edge_id") or payload.edge_id),
+            "customer_id": str(row.get("customer_id") or ""),
+            "license_id": str((row.get("license") or {}).get("license_id") or ""),
+            "cloud_api_url": str(row.get("cloud_api_url") or ""),
+            "primary_domain": str(row.get("primary_domain") or ""),
+        }
+    except Exception as exc:
+        control_plane_store.audit(
+            actor_type="device",
+            actor_id=str(payload.edge_id or "edge"),
+            tenant_id=get_current_tenant(),
+            action="edge_link.register",
+            outcome="error",
+            correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
+            details={"edge_id": payload.edge_id, "error": str(exc)},
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/edge-link/unlink")
+def edge_link_unlink(request: Request) -> dict[str, Any]:
+    payload = _require_auth_payload(request)
+    if not _is_admin(payload):
+        raise HTTPException(status_code=403, detail="Admin role required")
+    tenant_id = normalize_tenant_id(str(payload.get("tenant_id") or get_current_tenant()))
+    bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+    app_settings = dict(bootstrap.get("app_settings") or {})
+    edge_id = str(app_settings.get("edge_id") or "").strip()
+    if edge_id:
+        # Mark linked edge inactive in control-plane metadata.
+        try:
+            edge_rows = control_plane_store.list_edges(tenant_id=tenant_id)
+            current = next((r for r in edge_rows if str(r.get("edge_id") or "") == edge_id), None)
+            if current:
+                control_plane_store.upsert_edge(
+                    tenant_id=tenant_id,
+                    edge_id=edge_id,
+                    edge_name=str(current.get("edge_name") or edge_id),
+                    customer_id=str(current.get("customer_id") or ""),
+                    site=str(current.get("site") or ""),
+                    area=str(current.get("area") or ""),
+                    equipment=str(current.get("equipment") or ""),
+                    status="inactive",
+                    metadata={"unlinked_utc": datetime.now(timezone.utc).isoformat()},
+                )
+        except Exception:
+            pass
+    reset_settings = {
+        "tenant_login_realm": "",
+        "tenant_id": "",
+        "edge_id": "",
+        "edge_name": "",
+        "customer_id": "",
+        "license_id": "",
+        "edge_linked": False,
+        "endpoint_mode": "local",
+        "cloud_auto_sync_enabled": False,
+    }
+    app_store.save_bootstrap({"app_settings": reset_settings}, actor=f"edge_unlink:{payload.get('sub') or 'admin'}")
+    telemetry_service.configure_from_bootstrap({"data": app_store.get_bootstrap(prefer_cloud_reads=False)})
+    _audit(request, tenant_id=tenant_id, action="edge_link.unlink", outcome="ok", details={"edge_id": edge_id})
+    return {"ok": True, "tenant_id": tenant_id, "edge_id": edge_id}
