@@ -1,13 +1,34 @@
 from datetime import datetime, timezone
+import os
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+import requests
 
 from app.state import app_store, control_plane_store, telemetry_service
 from app.tenant import get_current_tenant, normalize_tenant_id
 
 router = APIRouter(prefix="/api/control-plane", tags=["control-plane"])
+
+
+def _resolve_cloud_control_plane_base(request: Request) -> str:
+    explicit = str(os.getenv("TRUSTNODE_CONTROL_PLANE_URL") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    try:
+        boot = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        settings = boot.get("app_settings") if isinstance(boot, dict) else {}
+        if isinstance(settings, dict):
+            from_settings = str(settings.get("cloud_url") or settings.get("cloud_api_url") or "").strip().rstrip("/")
+            if from_settings:
+                return from_settings
+    except Exception:
+        pass
+    host = str(request.headers.get("host", "")).split(":")[0].strip().lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return "https://trustnode.lsapps.app"
+    return f"{request.url.scheme}://{host}".rstrip("/")
 
 
 class TenantUpsertRequest(BaseModel):
@@ -732,7 +753,7 @@ def portal_context(request: Request) -> dict[str, Any]:
 
 @router.post("/edge-link/bootstrap")
 def edge_link_bootstrap(payload: ActivationCodeApplyRequest, request: Request) -> dict[str, Any]:
-    cloud_url = f"{request.url.scheme}://{request.headers.get('host', '').split(':')[0]}".rstrip("/")
+    cloud_url = _resolve_cloud_control_plane_base(request)
     try:
         row = control_plane_store.build_edge_bootstrap_payload(
             activation_code=payload.activation_code,
@@ -754,6 +775,35 @@ def edge_link_bootstrap(payload: ActivationCodeApplyRequest, request: Request) -
         )
         return {"ok": True, "row": row}
     except Exception as exc:
+        if "activation_code_not_found" in str(exc or "") and cloud_url:
+            try:
+                upstream = requests.post(
+                    f"{cloud_url}/api/control-plane/edge-link/register",
+                    json={
+                        "activation_code": payload.activation_code,
+                        "edge_id": payload.edge_id,
+                        "edge_name": payload.edge_name,
+                        "site": payload.site,
+                        "area": payload.area,
+                        "equipment": payload.equipment,
+                        "admin_username": payload.admin_username,
+                        "admin_password": payload.admin_password,
+                    },
+                    headers={"Content-Type": "application/json"},
+                    timeout=20,
+                )
+                if 200 <= upstream.status_code < 300:
+                    data = upstream.json()
+                    if isinstance(data, dict) and data.get("ok"):
+                        return data
+                    return {"ok": True, "row": data}
+                try:
+                    detail = (upstream.json() or {}).get("detail")
+                except Exception:
+                    detail = upstream.text
+                raise ValueError(str(detail or f"upstream_error_{upstream.status_code}"))
+            except Exception as up_exc:
+                exc = up_exc
         control_plane_store.audit(
             actor_type="device",
             actor_id=str(payload.edge_id or "edge"),
@@ -768,7 +818,7 @@ def edge_link_bootstrap(payload: ActivationCodeApplyRequest, request: Request) -
 
 @router.post("/edge-link/register")
 def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[str, Any]:
-    cloud_url = f"{request.url.scheme}://{request.headers.get('host', '').split(':')[0]}".rstrip("/")
+    cloud_url = _resolve_cloud_control_plane_base(request)
     try:
         row = control_plane_store.build_edge_bootstrap_payload(
             activation_code=payload.activation_code,
