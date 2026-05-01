@@ -832,15 +832,43 @@ def edge_link_bootstrap(payload: ActivationCodeApplyRequest, request: Request) -
 def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[str, Any]:
     cloud_url = _resolve_cloud_control_plane_base(request)
     try:
-        row = control_plane_store.build_edge_bootstrap_payload(
-            activation_code=payload.activation_code,
-            edge_id=payload.edge_id,
-            edge_name=payload.edge_name,
-            site=payload.site,
-            area=payload.area,
-            equipment=payload.equipment,
-            cloud_url=cloud_url,
-        )
+        try:
+            row = control_plane_store.build_edge_bootstrap_payload(
+                activation_code=payload.activation_code,
+                edge_id=payload.edge_id,
+                edge_name=payload.edge_name,
+                site=payload.site,
+                area=payload.area,
+                equipment=payload.equipment,
+                cloud_url=cloud_url,
+            )
+        except Exception as bootstrap_exc:
+            # Desktop/local edge can run against a local app-store where control-plane
+            # rows are absent. In that case, resolve activation against cloud control-plane.
+            if "activation_code_not_found" in str(bootstrap_exc or "") and cloud_url:
+                upstream = requests.post(
+                    f"{cloud_url}/api/control-plane/edge-link/register",
+                    json={
+                        "activation_code": payload.activation_code,
+                        "edge_id": payload.edge_id,
+                        "edge_name": payload.edge_name,
+                        "site": payload.site,
+                        "area": payload.area,
+                        "equipment": payload.equipment,
+                        "admin_username": payload.admin_username,
+                        "admin_password": payload.admin_password,
+                    },
+                    headers={"Content-Type": "application/json"},
+                    timeout=20,
+                )
+                if 200 <= upstream.status_code < 300:
+                    return upstream.json()
+                try:
+                    detail = (upstream.json() or {}).get("detail")
+                except Exception:
+                    detail = upstream.text
+                raise ValueError(str(detail or f"upstream_error_{upstream.status_code}")) from bootstrap_exc
+            raise
         # Finalize one-time activation only at registration commit.
         control_plane_store.activate_edge_with_code(
             activation_code=payload.activation_code,
@@ -910,6 +938,15 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
         app_settings_patch["customer_id"] = str(row.get("customer_id") or "")
         app_settings_patch["edge_linked"] = True
         app_settings_patch["license_id"] = str((row.get("license") or {}).get("license_id") or "")
+        app_settings_patch["edge_profile"] = {
+            "edge_id": str(row.get("edge_id") or payload.edge_id or ""),
+            "edge_name": str(row.get("edge_name") or payload.edge_name or payload.edge_id or ""),
+            "description": "",
+            "location": " / ".join(
+                [p for p in [str(payload.site or "").strip(), str(payload.area or "").strip()] if p]
+            ),
+            "machine_group": str(payload.equipment or "").strip(),
+        }
         app_store.save_bootstrap(
             {
                 "app_settings": app_settings_patch,
@@ -1016,6 +1053,13 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
         app_settings["customer_id"] = str(payload.customer_id or "")
         app_settings["license_id"] = str(payload.license_id or "")
         app_settings["edge_linked"] = True
+        app_settings["edge_profile"] = {
+            "edge_id": str(payload.edge_id or ""),
+            "edge_name": str(payload.edge_name or payload.edge_id or ""),
+            "description": "",
+            "location": "",
+            "machine_group": "",
+        }
         if str(payload.cloud_api_url or "").strip():
             app_settings["cloud_url"] = str(payload.cloud_api_url or "").strip()
         if str(payload.primary_domain or "").strip():

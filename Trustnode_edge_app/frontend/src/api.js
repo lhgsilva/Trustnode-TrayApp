@@ -1439,8 +1439,7 @@ export async function registerControlPlaneEdgeLink(payload) {
     return primaryRes.json();
   } catch (err) {
     primaryError = err;
-    const msg = String(err?.message || err || "");
-    const shouldFallback = !isHostedWebClientRuntime() && msg.includes("activation_code_not_found");
+    const shouldFallback = !isHostedWebClientRuntime();
     if (!shouldFallback) throw err;
   }
 

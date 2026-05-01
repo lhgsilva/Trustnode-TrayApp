@@ -1846,6 +1846,8 @@ function AppShell() {
   const [tenantWebClientUrl, setTenantWebClientUrl] = useState("https://trustnode.lsapps.app");
   const [tenantCompanyName, setTenantCompanyName] = useState("");
   const [tenantLoginRealm, setTenantLoginRealm] = useState("");
+  const [linkedCustomerId, setLinkedCustomerId] = useState("");
+  const [linkedLicenseId, setLinkedLicenseId] = useState("");
   const [edgeProfile, setEdgeProfile] = useState({
     edge_id: "edge-01",
     edge_name: "Primary Edge",
@@ -2504,6 +2506,8 @@ function AppShell() {
     if (typeof appSettings.tenant_web_client_url === "string") setTenantWebClientUrl(appSettings.tenant_web_client_url);
     if (typeof appSettings.tenant_company_name === "string") setTenantCompanyName(appSettings.tenant_company_name);
     if (typeof appSettings.tenant_login_realm === "string") setTenantLoginRealm(appSettings.tenant_login_realm);
+    setLinkedCustomerId(String(appSettings.customer_id || ""));
+    setLinkedLicenseId(String(appSettings.license_id || ""));
     const linkedFlag = Boolean(appSettings.edge_linked);
     const linkedEdge = String(appSettings.edge_id || "").trim();
     const linkedTenant = String(appSettings.tenant_id || "").trim();
@@ -2523,6 +2527,12 @@ function AppShell() {
         description: String(appSettings.edge_profile.description || ""),
         location: String(appSettings.edge_profile.location || ""),
         machine_group: String(appSettings.edge_profile.machine_group || ""),
+      }));
+    } else if (linkedEdge) {
+      setEdgeProfile((prev) => ({
+        ...prev,
+        edge_id: linkedEdge,
+        edge_name: String(appSettings.edge_name || prev.edge_name || linkedEdge),
       }));
     }
     const scopedThemePrefs =
@@ -11536,6 +11546,9 @@ function AppShell() {
           localStorage.removeItem(CURRENT_USER_STORAGE_KEY);
           localStorage.setItem(EDGE_LINKED_STORAGE_KEY, "false");
           setEdgeLinked(false);
+          setTenantLoginRealm("");
+          setLinkedCustomerId("");
+          setLinkedLicenseId("");
           setCurrentUser(null);
           setShowUserMenu(false);
         } catch (err) {
@@ -11579,6 +11592,16 @@ function AppShell() {
       );
       localStorage.setItem(EDGE_LINKED_STORAGE_KEY, "true");
       setEdgeLinked(true);
+      setTenantLoginRealm(String(res?.tenant_id || ""));
+      setLinkedCustomerId(String(res?.customer_id || ""));
+      setLinkedLicenseId(String(res?.license_id || ""));
+      setEdgeProfile((prev) => ({
+        ...prev,
+        edge_id: String(res?.edge_id || payload.edge_id || prev.edge_id || ""),
+        edge_name: String(payload.edge_name || prev.edge_name || "Local Edge"),
+        location: [payload.site, payload.area].filter(Boolean).join(" / "),
+        machine_group: String(payload.equipment || prev.machine_group || ""),
+      }));
       setLoginTab("login");
       setLoginForm((prev) => ({
         ...prev,
@@ -13939,6 +13962,18 @@ function AppShell() {
                       disabled={!canEditPage("edge")}
                     />
                   </label>
+                  <label>
+                    Linked Tenant
+                    <input value={tenantLoginRealm || "-"} disabled />
+                  </label>
+                  <label>
+                    Linked Customer ID
+                    <input value={linkedCustomerId || "-"} disabled />
+                  </label>
+                  <label>
+                    Linked License ID
+                    <input value={linkedLicenseId || "-"} disabled />
+                  </label>
                 </div>
                 <label>
                   Description
@@ -13953,6 +13988,13 @@ function AppShell() {
                 <div className="lock-note">
                   This identity is persisted with the app configuration and used by cloud UI selection/filtering context.
                 </div>
+                {currentUser?.role === "admin" ? (
+                  <div className="row" style={{ marginTop: 10 }}>
+                    <button className="btn btn-danger" onClick={unlinkCurrentEdge}>
+                      Unlink Local Edge
+                    </button>
+                  </div>
+                ) : null}
               </section>
             </>
           ) : null}
