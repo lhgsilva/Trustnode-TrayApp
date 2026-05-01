@@ -169,16 +169,19 @@ body {
 .auth-title {
   font-size: 18px;
   font-weight: 700;
+  text-align: center;
 }
 
 .auth-subtitle {
   font-size: 12px;
   color: var(--muted);
+  text-align: center;
 }
 
 .auth-heading {
   margin: 10px 0 12px;
   font-size: 34px;
+  text-align: center;
 }
 
 .auth-submit {
@@ -241,7 +244,7 @@ body {
 
 .auth-links {
   display: flex;
-  justify-content: flex-end;
+  justify-content: center;
 }
 
 .btn-ghost-link {
@@ -2018,7 +2021,7 @@ body {
 
 .cp-customers-table .thead,
 .cp-customers-table .trow {
-  grid-template-columns: 40px 1.15fr 1.25fr 1.2fr .7fr 120px;
+  grid-template-columns: 40px 1fr 1fr 1.2fr 1fr .7fr 120px;
 }
 
 .cp-licenses-table .thead,
@@ -2038,12 +2041,12 @@ body {
 
 .cp-activation-table .thead,
 .cp-activation-table .trow {
-  grid-template-columns: 40px .45fr .8fr .85fr .9fr 1fr .65fr .95fr .95fr 200px;
+  grid-template-columns: 40px .45fr 1.2fr .8fr .85fr .85fr .65fr .95fr .95fr 200px;
 }
 
 .cp-workspace-table .thead,
 .cp-workspace-table .trow {
-  grid-template-columns: 1.2fr 1.2fr .8fr 120px;
+  grid-template-columns: 1.2fr 1.2fr .8fr .7fr 120px;
 }
 
 .thead,

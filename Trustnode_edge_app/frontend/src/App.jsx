@@ -2256,6 +2256,7 @@ function AppShell() {
     licenses: "",
     edges: "",
     users: "",
+    activation: "",
   });
   const [cpSelectedRows, setCpSelectedRows] = useState({
     customers: {},
@@ -5959,15 +5960,18 @@ function AppShell() {
 
   const cpActivationCodesFiltered = useMemo(() => {
     const rows = Array.isArray(cpActivationCodes) ? cpActivationCodes : [];
-    const q = String(cpListFilters.licenses || "").trim().toLowerCase();
+    const q = String(cpListFilters.activation || "").trim().toLowerCase();
     if (!q) return rows;
     return rows.filter((r) =>
+      String(r?.activation_code || "").toLowerCase().includes(q) ||
       String(r?.customer_id || "").toLowerCase().includes(q) ||
+      String(r?.edge_id || "").toLowerCase().includes(q) ||
+      String(r?.license_id || "").toLowerCase().includes(q) ||
       String(r?.edge_name || "").toLowerCase().includes(q) ||
       String(r?.status || "").toLowerCase().includes(q) ||
       String(r?.id || "").toLowerCase().includes(q)
     );
-  }, [cpActivationCodes, cpListFilters.licenses]);
+  }, [cpActivationCodes, cpListFilters.activation]);
 
   const cpActivationEdgesForCustomer = useMemo(() => {
     const cid = String(cpActivationIssueForm.customer_id || "").trim();
@@ -11609,18 +11613,19 @@ function AppShell() {
   };
 
   const submitEdgeRegister = async () => {
+    const generatedEdgeId = `edge-${Date.now()}`;
     const payload = {
       activation_code: String(edgeRegisterForm.activation_code || "").trim(),
-      edge_id: String(edgeRegisterForm.edge_id || "").trim(),
-      edge_name: String(edgeRegisterForm.edge_name || "").trim(),
-      site: String(edgeRegisterForm.site || "").trim(),
-      area: String(edgeRegisterForm.area || "").trim(),
-      equipment: String(edgeRegisterForm.equipment || "").trim(),
+      edge_id: String(edgeRegisterForm.edge_id || "").trim() || generatedEdgeId,
+      edge_name: String(edgeRegisterForm.edge_name || "").trim() || "Local Edge",
+      site: "",
+      area: "",
+      equipment: "",
       admin_username: String(edgeRegisterForm.admin_username || "").trim() || "admin",
       admin_password: String(edgeRegisterForm.admin_password || ""),
     };
-    if (!payload.activation_code || !payload.edge_id || !payload.admin_password) {
-      setEdgeRegisterResult("Activation code, Edge ID and admin password are required.");
+    if (!payload.activation_code || !payload.admin_password) {
+      setEdgeRegisterResult("Activation code, admin username and admin password are required.");
       return;
     }
     setEdgeRegisterBusy(true);
@@ -11637,9 +11642,9 @@ function AppShell() {
       setEdgeProfile((prev) => ({
         ...prev,
         edge_id: String(res?.edge_id || payload.edge_id || prev.edge_id || ""),
-        edge_name: String(payload.edge_name || prev.edge_name || "Local Edge"),
-        location: [payload.site, payload.area].filter(Boolean).join(" / "),
-        machine_group: String(payload.equipment || prev.machine_group || ""),
+        edge_name: String(res?.edge_name || payload.edge_name || prev.edge_name || "Local Edge"),
+        location: [String(res?.site || ""), String(res?.area || "")].filter(Boolean).join(" / "),
+        machine_group: String(res?.equipment || prev.machine_group || ""),
       }));
       setLoginTab("login");
       setLoginForm((prev) => ({
@@ -11829,7 +11834,7 @@ function AppShell() {
             </button>
           </div>
           <div className="auth-brand">
-            <img src={logoSrc} alt="Trustnode" className="auth-logo" />
+            <img src={logoSrc} alt="Trustnode" className="auth-logo" onError={(e) => { e.currentTarget.onerror = null; e.currentTarget.src = "/trustnode_logo.png"; }} />
             <div>
               <div className="auth-title">Trustnode Edge</div>
               <div className="auth-subtitle">Secure PLC Data Gateway</div>
@@ -11841,41 +11846,21 @@ function AppShell() {
             </button>
             {showRegisterTab ? (
               <button className={`auth-tab ${loginTab === "register" ? "active" : ""}`} type="button" onClick={openEdgeRegisterModal}>
-                Registration
+                Activation
               </button>
             ) : null}
           </div>
           {loginTab === "register" && showRegisterTab ? (
             <>
-              <h3 className="auth-heading">Register Local Edge</h3>
+              <h3 className="auth-heading">Activate Local Edge</h3>
               <div className="grid two">
                 <label>
                   Activation Code
                   <input value={edgeRegisterForm.activation_code} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, activation_code: e.target.value }))} />
                 </label>
                 <label>
-                  Edge ID
-                  <input value={edgeRegisterForm.edge_id} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, edge_id: e.target.value }))} />
-                </label>
-                <label>
-                  Edge Name
-                  <input value={edgeRegisterForm.edge_name} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, edge_name: e.target.value }))} />
-                </label>
-                <label>
                   Admin Username
                   <input value={edgeRegisterForm.admin_username} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_username: e.target.value }))} />
-                </label>
-                <label>
-                  Site
-                  <input value={edgeRegisterForm.site} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, site: e.target.value }))} />
-                </label>
-                <label>
-                  Area
-                  <input value={edgeRegisterForm.area} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, area: e.target.value }))} />
-                </label>
-                <label>
-                  Equipment
-                  <input value={edgeRegisterForm.equipment} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, equipment: e.target.value }))} />
                 </label>
                 <label>
                   Admin Password
@@ -11967,7 +11952,7 @@ function AppShell() {
     return (
       <div className="loading">
         <div className="loading-card">
-          <img src={logoSrc} alt="Trustnode" className="loading-logo" />
+          <img src={logoSrc} alt="Trustnode" className="loading-logo" onError={(e) => { e.currentTarget.onerror = null; e.currentTarget.src = "/trustnode_logo.png"; }} />
           <div className="loading-title">
             {bootState === "waiting_backend"
               ? "Waiting for backend service..."
@@ -11992,7 +11977,7 @@ function AppShell() {
             <HamburgerIcon />
           </button>
           <div className="brand">
-            <img src={logoSrc} alt="Trustnode" className="brand-logo" />
+            <img src={logoSrc} alt="Trustnode" className="brand-logo" onError={(e) => { e.currentTarget.onerror = null; e.currentTarget.src = "/trustnode_logo.png"; }} />
             <div>
               <div className="brand-title">Trustnode Edge</div>
               <div className="brand-subtitle">Industrial Data Gateway</div>
@@ -15398,6 +15383,7 @@ function AppShell() {
                   ) : null}
 
                   {cpPortalPage === "activation" ? (
+                    <>
                     <section className="card">
                       <h4 style={{ marginTop: 0 }}>Activation Flow</h4>
                       <div className="form-grid">
@@ -15483,18 +15469,45 @@ function AppShell() {
                       <div className="row">
                         <button className="btn btn-primary" onClick={applyTenantActivationCode} disabled={cpBusy || !canEditPage("control_plane")}>Validate Activation</button>
                       </div>
-                      <h5 style={{ marginTop: 12, marginBottom: 6 }}>Issued Activation Codes</h5>
-                      <div className="table-scroll" style={{ marginTop: 6 }}>
+                    </section>
+                    <section className="card">
+                      <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                        <h4 style={{ marginTop: 0, marginBottom: 0 }}>Issued Activation Codes</h4>
+                        <button
+                          className="btn btn-danger"
+                          onClick={() => bulkDeleteCpItems(
+                            "activation",
+                            cpActivationCodesFiltered,
+                            (row) => row?.id,
+                            async (row) => deleteControlPlaneActivationCode(Number(row?.id || 0), getRowTenantScope(row)),
+                            "activation codes"
+                          )}
+                          disabled={cpBusy || !canEditPage("control_plane")}
+                        >
+                          Delete Selected
+                        </button>
+                      </div>
+                      <div className="form-grid" style={{ marginTop: 10 }}>
+                        <label>
+                          Filter
+                          <input
+                            value={cpListFilters.activation}
+                            onChange={(e) => setCpListFilters((p) => ({ ...p, activation: e.target.value }))}
+                            placeholder="Search activation code, customer, edge, license, status"
+                          />
+                        </label>
+                      </div>
+                      <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table cp-activation-table">
-                          <div className="thead"><span><input type="checkbox" checked={cpActivationCodesFiltered.length > 0 && cpActivationCodesFiltered.every((row) => isCpRowSelected("activation", row?.id))} onChange={(e) => setCpRowsSelectedAll("activation", cpActivationCodesFiltered, (row) => row?.id, e.target.checked)} /></span><span>ID</span><span>Customer</span><span>Edge ID</span><span>License</span><span>Edge Name</span><span>Status</span><span>Expires</span><span>Used</span><span>Actions</span></div>
+                          <div className="thead"><span><input type="checkbox" checked={cpActivationCodesFiltered.length > 0 && cpActivationCodesFiltered.every((row) => isCpRowSelected("activation", row?.id))} onChange={(e) => setCpRowsSelectedAll("activation", cpActivationCodesFiltered, (row) => row?.id, e.target.checked)} /></span><span>ID</span><span>Activation Code</span><span>Customer</span><span>Edge ID</span><span>License</span><span>Status</span><span>Expires</span><span>Used</span><span>Actions</span></div>
                           {cpActivationCodesFiltered.map((row, idx) => (
                             <div className="trow" key={`cp-main-ac-${idx}`}>
                               <span><input type="checkbox" checked={isCpRowSelected("activation", row?.id)} onChange={(e) => setCpRowSelected("activation", row?.id, e.target.checked)} /></span>
                               <span>{String(row?.id || "-")}</span>
+                              <span title={String(row?.activation_code || "-")}>{String(row?.activation_code || "-")}</span>
                               <span>{String(row?.customer_id || "-")}</span>
                               <span>{String(row?.edge_id || "-")}</span>
                               <span>{String(row?.license_id || "-")}</span>
-                              <span>{String(row?.edge_name || "-")}</span>
                               <span>{String(row?.status || "-")}</span>
                               <span>{fmtTs(String(row?.expires_utc || "")) || "-"}</span>
                               <span>{fmtTs(String(row?.used_utc || "")) || "-"}</span>
@@ -15505,9 +15518,11 @@ function AppShell() {
                               </span>
                             </div>
                           ))}
+                          {!cpActivationCodesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No activation codes</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
+                    </>
                   ) : null}
                 </div>
               </div>
