@@ -1176,8 +1176,16 @@ export async function deleteControlPlaneCustomer(customerId, tenantId = "") {
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const cid = encodeURIComponent(String(customerId || ""));
   const deleteUrl = `${getApiBase()}/api/control-plane/customers/${cid}${suffix}`;
-  let res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
-  if (res.status === 404 || res.status === 405) {
+  let res = null;
+  let needPostFallback = false;
+  try {
+    res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
+    needPostFallback = res.status === 404 || res.status === 405;
+  } catch {
+    // Some reverse proxies/browser CORS paths block DELETE outright.
+    needPostFallback = true;
+  }
+  if (needPostFallback) {
     const postFallbackUrl = `${getApiBase()}/api/control-plane/customers/${cid}/delete${suffix}`;
     res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
   }
@@ -1213,8 +1221,15 @@ export async function deleteControlPlaneEdge(edgeId, tenantId = "") {
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const eid = encodeURIComponent(String(edgeId || ""));
   const deleteUrl = `${getApiBase()}/api/control-plane/edges/${eid}${suffix}`;
-  let res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
-  if (res.status === 404 || res.status === 405) {
+  let res = null;
+  let needPostFallback = false;
+  try {
+    res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
+    needPostFallback = res.status === 404 || res.status === 405;
+  } catch {
+    needPostFallback = true;
+  }
+  if (needPostFallback) {
     const postFallbackUrl = `${getApiBase()}/api/control-plane/edges/${eid}/delete${suffix}`;
     res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
   }
@@ -1263,8 +1278,15 @@ export async function deleteControlPlaneLicense(licenseId, tenantId = "") {
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const lid = encodeURIComponent(String(licenseId || ""));
   const deleteUrl = `${getApiBase()}/api/control-plane/licenses/${lid}${suffix}`;
-  let res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
-  if (res.status === 404 || res.status === 405) {
+  let res = null;
+  let needPostFallback = false;
+  try {
+    res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
+    needPostFallback = res.status === 404 || res.status === 405;
+  } catch {
+    needPostFallback = true;
+  }
+  if (needPostFallback) {
     const postFallbackUrl = `${getApiBase()}/api/control-plane/licenses/${lid}/delete${suffix}`;
     res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
   }
@@ -1316,8 +1338,15 @@ export async function deleteControlPlaneUser(username, tenantId = "") {
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const uname = encodeURIComponent(String(username || ""));
   const deleteUrl = `${getApiBase()}/api/control-plane/users/${uname}${suffix}`;
-  let res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
-  if (res.status === 404 || res.status === 405) {
+  let res = null;
+  let needPostFallback = false;
+  try {
+    res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
+    needPostFallback = res.status === 404 || res.status === 405;
+  } catch {
+    needPostFallback = true;
+  }
+  if (needPostFallback) {
     const postFallbackUrl = `${getApiBase()}/api/control-plane/users/${uname}/delete${suffix}`;
     res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
   }
