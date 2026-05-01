@@ -2192,6 +2192,7 @@ function AppShell() {
     customer_id: "",
     company_name: "",
     contact_email: "",
+    customer_domain: "",
     status: "active",
   });
   const [cpEdgeForm, setCpEdgeForm] = useState({
@@ -5857,6 +5858,23 @@ function AppShell() {
     })).filter((r) => r.customer_id);
   }, [cpCustomers]);
 
+  const customerDomainById = useMemo(() => {
+    const map = new Map();
+    for (const row of Array.isArray(cpCustomers) ? cpCustomers : []) {
+      const cid = String(row?.customer_id || "").trim();
+      if (!cid) continue;
+      let domain = "";
+      try {
+        const meta = row?.metadata_json ? JSON.parse(String(row.metadata_json)) : {};
+        domain = String(meta?.customer_domain || meta?.domain || "").trim().toLowerCase();
+      } catch {
+        domain = "";
+      }
+      map.set(cid, domain);
+    }
+    return map;
+  }, [cpCustomers]);
+
   const cpEdgesView = useMemo(() => {
     const rows = Array.isArray(cpEdges) ? cpEdges : [];
     if (!cpCustomerFilter || cpCustomerFilter === "__all__") return rows;
@@ -5889,9 +5907,10 @@ function AppShell() {
     return cpCustomersView.filter((r) =>
       String(r?.customer_id || "").toLowerCase().includes(q) ||
       String(r?.company_name || "").toLowerCase().includes(q) ||
-      String(r?.contact_email || "").toLowerCase().includes(q)
+      String(r?.contact_email || "").toLowerCase().includes(q) ||
+      String(customerDomainById.get(String(r?.customer_id || "")) || "").toLowerCase().includes(q)
     );
-  }, [cpCustomersView, cpListFilters.customers]);
+  }, [cpCustomersView, cpListFilters.customers, customerDomainById]);
 
   const cpLicensesFiltered = useMemo(() => {
     const q = String(cpListFilters.licenses || "").trim().toLowerCase();
@@ -5974,6 +5993,11 @@ function AppShell() {
     const fallback = fallbackCandidates.find((p) => canOpenPage(p));
     if (fallback) setActivePage(fallback);
   }, [activePage, canOpenPage, currentUser, isPortalOnly]);
+
+  useEffect(() => {
+    if (!isPortalOnly) return;
+    if (activePage !== "control_plane") setActivePage("control_plane");
+  }, [isPortalOnly, activePage]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -6211,6 +6235,10 @@ function AppShell() {
     const m = String(d.getUTCMonth() + 1).padStart(2, "0");
     const day = String(d.getUTCDate()).padStart(2, "0");
     return `${y}-${m}-${day}`;
+  }, []);
+  const openPortalPage = useCallback((page) => {
+    setActivePage("control_plane");
+    setCpPortalPage(String(page || "workspace"));
   }, []);
   const toUtcStartOfDay = useCallback((dateTxt) => {
     const txt = String(dateTxt || "").trim();
@@ -10832,7 +10860,9 @@ function AppShell() {
           company_name: companyName,
           contact_email: email,
           status: cpCustomerForm.status || "active",
-          metadata: {},
+          metadata: {
+            customer_domain: String(cpCustomerForm.customer_domain || "").trim().toLowerCase(),
+          },
         },
         scopedTenant
       );
@@ -10921,6 +10951,7 @@ function AppShell() {
       customer_id: "",
       company_name: "",
       contact_email: "",
+      customer_domain: "",
       status: "active",
     });
     setShowCpCustomerModal(true);
@@ -10932,6 +10963,14 @@ function AppShell() {
       customer_id: String(row?.customer_id || ""),
       company_name: String(row?.company_name || ""),
       contact_email: String(row?.contact_email || ""),
+      customer_domain: (() => {
+        try {
+          const meta = row?.metadata_json ? JSON.parse(String(row.metadata_json)) : {};
+          return String(meta?.customer_domain || meta?.domain || "");
+        } catch {
+          return "";
+        }
+      })(),
       status: String(row?.status || "active"),
     });
     setShowCpCustomerModal(true);
@@ -12018,13 +12057,13 @@ function AppShell() {
                 </button>
                 {!sidebarCollapsed && expandedSections.portal ? (
                   <>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "workspace" ? "active" : ""}`} onClick={() => setCpPortalPage("workspace")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Workspace</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "customers" ? "active" : ""}`} onClick={() => setCpPortalPage("customers")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Customers</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "modules" ? "active" : ""}`} onClick={() => setCpPortalPage("modules")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Modules</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "licenses" ? "active" : ""}`} onClick={() => setCpPortalPage("licenses")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Licenses</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "edges" ? "active" : ""}`} onClick={() => setCpPortalPage("edges")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Edge Apps</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "users" ? "active" : ""}`} onClick={() => setCpPortalPage("users")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Users</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "activation" ? "active" : ""}`} onClick={() => setCpPortalPage("activation")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Activation</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "workspace" ? "active" : ""}`} onClick={() => openPortalPage("workspace")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Workspace</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "customers" ? "active" : ""}`} onClick={() => openPortalPage("customers")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Customers</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "modules" ? "active" : ""}`} onClick={() => openPortalPage("modules")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Modules</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "licenses" ? "active" : ""}`} onClick={() => openPortalPage("licenses")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Licenses</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "edges" ? "active" : ""}`} onClick={() => openPortalPage("edges")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Edge Apps</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "users" ? "active" : ""}`} onClick={() => openPortalPage("users")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Users</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "activation" ? "active" : ""}`} onClick={() => openPortalPage("activation")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Activation</span></button>
                     <div className="portal-filter-block">
                       <label style={{ fontSize: 12, color: "var(--muted)" }}>Customer</label>
                       <select value={cpCustomerFilter} onChange={(e) => setCpCustomerFilter(e.target.value)}>
@@ -12035,7 +12074,7 @@ function AppShell() {
                           </option>
                         ))}
                       </select>
-                      <button className="btn btn-primary" style={{ marginTop: 8 }} onClick={() => { setCpPortalPage("workspace"); refreshControlPlaneData(currentTenantId || "default"); }} disabled={cpBusy}>
+                      <button className="btn btn-primary" style={{ marginTop: 8 }} onClick={() => { openPortalPage("workspace"); refreshControlPlaneData(currentTenantId || "default"); }} disabled={cpBusy}>
                         Load
                       </button>
                     </div>
@@ -14942,20 +14981,20 @@ function AppShell() {
             </div>
           ) : null}
 
-          {activePage === "control_plane" ? (
+          {(activePage === "control_plane" || isPortalOnly) ? (
             <div className="page-fill control-plane-page-fill">
               <div className="row control-plane-layout" style={{ alignItems: "stretch", gap: 12 }}>
                 {!isPortalOnly ? (
                 <aside className="card" style={{ width: 280, minWidth: 260 }}>
                   <h4 style={{ marginTop: 0 }}>Portal Navigation</h4>
                   <div className="stacked-inputs">
-                    <button className={`btn ${cpPortalPage === "workspace" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("workspace")}>Workspace</button>
-                    <button className={`btn ${cpPortalPage === "customers" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("customers")}>Customers</button>
-                    <button className={`btn ${cpPortalPage === "modules" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("modules")}>Modules</button>
-                    <button className={`btn ${cpPortalPage === "licenses" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("licenses")}>Licenses</button>
-                    <button className={`btn ${cpPortalPage === "edges" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("edges")}>Edge Apps</button>
-                    <button className={`btn ${cpPortalPage === "users" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("users")}>Users</button>
-                    <button className={`btn ${cpPortalPage === "activation" ? "btn-primary" : ""}`} onClick={() => setCpPortalPage("activation")}>Activation</button>
+                    <button className={`btn ${cpPortalPage === "workspace" ? "btn-primary" : ""}`} onClick={() => openPortalPage("workspace")}>Workspace</button>
+                    <button className={`btn ${cpPortalPage === "customers" ? "btn-primary" : ""}`} onClick={() => openPortalPage("customers")}>Customers</button>
+                    <button className={`btn ${cpPortalPage === "modules" ? "btn-primary" : ""}`} onClick={() => openPortalPage("modules")}>Modules</button>
+                    <button className={`btn ${cpPortalPage === "licenses" ? "btn-primary" : ""}`} onClick={() => openPortalPage("licenses")}>Licenses</button>
+                    <button className={`btn ${cpPortalPage === "edges" ? "btn-primary" : ""}`} onClick={() => openPortalPage("edges")}>Edge Apps</button>
+                    <button className={`btn ${cpPortalPage === "users" ? "btn-primary" : ""}`} onClick={() => openPortalPage("users")}>Users</button>
+                    <button className={`btn ${cpPortalPage === "activation" ? "btn-primary" : ""}`} onClick={() => openPortalPage("activation")}>Activation</button>
                   </div>
                   <div className="form-grid" style={{ marginTop: 12 }}>
                     <label>
@@ -14970,7 +15009,7 @@ function AppShell() {
                       </select>
                     </label>
                   </div>
-                  <button className="btn btn-primary" onClick={() => { setCpPortalPage("workspace"); refreshControlPlaneData(currentTenantId || "default"); }} disabled={cpBusy}>
+                  <button className="btn btn-primary" onClick={() => { openPortalPage("workspace"); refreshControlPlaneData(currentTenantId || "default"); }} disabled={cpBusy}>
                     Refresh
                   </button>
                 </aside>
@@ -15013,12 +15052,13 @@ function AppShell() {
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table cp-customers-table">
-                          <div className="thead"><span><input type="checkbox" checked={cpCustomersFiltered.length > 0 && cpCustomersFiltered.every((row) => isCpRowSelected("customers", row?.customer_id))} onChange={(e) => setCpRowsSelectedAll("customers", cpCustomersFiltered, (row) => row?.customer_id, e.target.checked)} /></span><span>Customer ID</span><span>Company</span><span>Email</span><span>Status</span><span>Actions</span></div>
+                          <div className="thead"><span><input type="checkbox" checked={cpCustomersFiltered.length > 0 && cpCustomersFiltered.every((row) => isCpRowSelected("customers", row?.customer_id))} onChange={(e) => setCpRowsSelectedAll("customers", cpCustomersFiltered, (row) => row?.customer_id, e.target.checked)} /></span><span>Customer ID</span><span>Company</span><span>Domain</span><span>Email</span><span>Status</span><span>Actions</span></div>
                           {cpCustomersFiltered.map((row, idx) => (
                             <div className="trow" key={String(row?.customer_id || `customer-${idx}`)}>
                               <span><input type="checkbox" checked={isCpRowSelected("customers", row?.customer_id)} onChange={(e) => setCpRowSelected("customers", row?.customer_id, e.target.checked)} /></span>
                               <span>{String(row?.customer_id || "-")}</span>
                               <span>{String(row?.company_name || "-")}</span>
+                              <span>{String(customerDomainById.get(String(row?.customer_id || "")) || "-")}</span>
                               <span>{String(row?.contact_email || "-")}</span>
                               <span>{String(row?.status || "-")}</span>
                               <span className="row-actions">
@@ -15027,7 +15067,7 @@ function AppShell() {
                               </span>
                             </div>
                           ))}
-                          {!cpCustomersFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No customers yet</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpCustomersFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No customers yet</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
@@ -15046,10 +15086,11 @@ function AppShell() {
                         {!cpWorkspaceCollapsed.customers ? (
                         <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
                           <div className="table cp-workspace-table">
-                            <div className="thead"><span>Customer</span><span>Email</span><span>Status</span><span>Actions</span></div>
+                            <div className="thead"><span>Customer</span><span>Domain</span><span>Email</span><span>Status</span><span>Actions</span></div>
                             {cpCustomersFiltered.slice(0, 8).map((row, idx) => (
                               <div className="trow" key={`ws-customer-${idx}`}>
                                 <span>{String(row?.company_name || row?.customer_id || "-")}</span>
+                                <span>{String(customerDomainById.get(String(row?.customer_id || "")) || "-")}</span>
                                 <span>{String(row?.contact_email || "-")}</span>
                                 <span>{String(row?.status || "-")}</span>
                                 <span className="row-actions">
@@ -15120,7 +15161,7 @@ function AppShell() {
                         <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                           <h4 style={{ margin: 0 }}>Users</h4>
                           <div className="row">
-                            <button className="btn btn-primary btn-sm" onClick={() => handleNavClick("users_and_access_control")}>Open Access</button>
+                            <button className="btn btn-primary btn-sm" onClick={() => openPortalPage("users")}>Open Access</button>
                             <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("users")}>{cpWorkspaceCollapsed.users ? "Expand" : "Collapse"}</button>
                           </div>
                         </div>
@@ -15286,9 +15327,14 @@ function AppShell() {
                               <span>{`${String(row?.site || "-")} / ${String(row?.area || "-")} / ${String(row?.equipment || "-")}`}</span>
                               <span>{String(row?.status || "-")}</span>
                               <span>
-                                <a href={`https://${window.location.host}/?edge=${encodeURIComponent(String(row?.edge_id || ""))}`} target="_blank" rel="noreferrer">
-                                  Open
-                                </a>
+                                {(() => {
+                                  const edgeId = String(row?.edge_id || "").trim();
+                                  const cid = String(row?.customer_id || "").trim();
+                                  const domain = String(customerDomainById.get(cid) || "").trim();
+                                  const baseHost = domain || String(window.location.host || "").trim();
+                                  const href = `https://${baseHost}/client/client_test.html?edge=${encodeURIComponent(edgeId)}&customer_id=${encodeURIComponent(cid)}`;
+                                  return <a href={href} target="_blank" rel="noreferrer">Open</a>;
+                                })()}
                               </span>
                               <span className="row-actions">
                                 <button className="icon-btn table-action-btn" onClick={() => openCpEdgeEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
@@ -15314,7 +15360,7 @@ function AppShell() {
                             async (row) => deleteControlPlaneUser(String(row?.username || ""), getRowTenantScope(row)),
                             "users"
                           )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
-                          <button className="btn btn-primary" onClick={() => handleNavClick("users_and_access_control")}>
+                          <button className="btn btn-primary" onClick={() => openPortalPage("users")}>
                             Open Users and Access Control
                           </button>
                         </div>
@@ -17239,6 +17285,10 @@ function AppShell() {
               <label>
                 Contact Email
                 <input value={cpCustomerForm.contact_email} onChange={(e) => setCpCustomerForm((p) => ({ ...p, contact_email: e.target.value }))} />
+              </label>
+              <label>
+                Customer Domain
+                <input value={cpCustomerForm.customer_domain} onChange={(e) => setCpCustomerForm((p) => ({ ...p, customer_domain: e.target.value }))} placeholder="customer-a-trustnode.lsapps.app" />
               </label>
               <label>
                 Status
