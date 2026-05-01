@@ -10812,7 +10812,7 @@ function AppShell() {
     if (!canEditPage("control_plane")) return;
     const customerId = String(row?.customer_id || "").trim();
     if (!customerId) return;
-    openConfirmDialog(
+    withConfirm(
       "Delete Customer",
       `Delete customer '${customerId}'? This is blocked if edges/licenses still reference it.`,
       async () => {
@@ -10866,7 +10866,7 @@ function AppShell() {
     if (!canEditPage("control_plane")) return;
     const edgeId = String(row?.edge_id || "").trim();
     if (!edgeId) return;
-    openConfirmDialog(
+    withConfirm(
       "Delete Edge",
       `Delete edge '${edgeId}' from control plane registry?`,
       async () => {
@@ -10948,7 +10948,7 @@ function AppShell() {
     if (!canEditPage("control_plane")) return;
     const licenseId = String(row?.license_id || "").trim();
     if (!licenseId) return;
-    openConfirmDialog(
+    withConfirm(
       "Delete License",
       `Delete license '${licenseId}'?`,
       async () => {
