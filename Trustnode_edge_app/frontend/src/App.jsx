@@ -10582,6 +10582,12 @@ function AppShell() {
     return String(currentTenantId || currentUser?.tenant_id || "default");
   };
 
+  const getRowTenantScope = (row) => {
+    const rowTenant = String(row?.tenant_id || "").trim();
+    if (rowTenant) return rowTenant;
+    return getControlPlaneTenantScope();
+  };
+
   const syncControlPlaneEdgeHeartbeat = async () => {
     if (isHostedWebClient) return false;
     const edgeId = String(edgeProfile?.edge_id || "").trim();
@@ -10818,7 +10824,7 @@ function AppShell() {
       async () => {
         setCpBusy(true);
         try {
-          const scopedTenant = getControlPlaneTenantScope();
+          const scopedTenant = getRowTenantScope(row);
           await deleteControlPlaneCustomer(customerId, scopedTenant);
           await refreshControlPlaneData(scopedTenant);
           setCpResult(`Customer '${customerId}' deleted.`);
@@ -10872,7 +10878,7 @@ function AppShell() {
       async () => {
         setCpBusy(true);
         try {
-          const scopedTenant = getControlPlaneTenantScope();
+          const scopedTenant = getRowTenantScope(row);
           await deleteControlPlaneEdge(edgeId, scopedTenant);
           await refreshControlPlaneData(scopedTenant);
           setCpResult(`Edge '${edgeId}' deleted.`);
@@ -10954,7 +10960,7 @@ function AppShell() {
       async () => {
         setCpBusy(true);
         try {
-          const scopedTenant = getControlPlaneTenantScope();
+          const scopedTenant = getRowTenantScope(row);
           await deleteControlPlaneLicense(licenseId, scopedTenant);
           await refreshControlPlaneData(scopedTenant);
           setCpResult(`License '${licenseId}' deleted.`);
