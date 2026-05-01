@@ -743,6 +743,7 @@ class ControlPlaneStore:
     ) -> dict[str, Any]:
         code_raw = str(activation_code or "").strip()
         code_norm = code_raw.replace("–", "-").replace("—", "-")
+        code_compact = "".join(code_norm.split())
         code_hash = self._sha256(code_norm)
         now = self._utc_now()
         with self._lock:
@@ -750,10 +751,17 @@ class ControlPlaneStore:
                 row = conn.execute("SELECT * FROM cp_edge_activation_codes WHERE code_hash=?", (code_hash,)).fetchone()
                 if not row:
                     # Retry once with fully collapsed whitespace to tolerate copy/paste formatting.
-                    compact = "".join(code_norm.split())
-                    if compact and compact != code_norm:
-                        code_hash = self._sha256(compact)
+                    if code_compact and code_compact != code_norm:
+                        code_hash = self._sha256(code_compact)
                         row = conn.execute("SELECT * FROM cp_edge_activation_codes WHERE code_hash=?", (code_hash,)).fetchone()
+                if not row:
+                    # Final fallback by plaintext code to tolerate pre-hash normalization mismatches.
+                    row = conn.execute(
+                        "SELECT * FROM cp_edge_activation_codes WHERE activation_code IN (?, ?) LIMIT 1",
+                        (code_norm, code_compact or code_norm),
+                    ).fetchone()
+                    if row:
+                        code_hash = str(dict(row).get("code_hash") or code_hash)
                 if not row:
                     raise ValueError("activation_code_not_found")
                 r = dict(row)

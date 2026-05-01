@@ -463,15 +463,30 @@ def delete_user_post(request: Request, username: str, tenant_id: str | None = No
 @router.post("/activation-code/issue")
 def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
     tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
-    row = control_plane_store.issue_activation_code(
-        tenant_id=tid,
-        customer_id=payload.customer_id,
-        edge_id=payload.edge_id,
-        license_id=payload.license_id,
-        edge_name=payload.edge_name,
-        ttl_minutes=payload.ttl_minutes,
-        metadata=payload.metadata,
-    )
+    try:
+        row = control_plane_store.issue_activation_code(
+            tenant_id=tid,
+            customer_id=payload.customer_id,
+            edge_id=payload.edge_id,
+            license_id=payload.license_id,
+            edge_name=payload.edge_name,
+            ttl_minutes=payload.ttl_minutes,
+            metadata=payload.metadata,
+        )
+    except Exception as exc:
+        _audit(
+            request,
+            tenant_id=tid,
+            action="activation_code.issue",
+            outcome="error",
+            details={
+                "customer_id": payload.customer_id,
+                "edge_id": payload.edge_id,
+                "license_id": payload.license_id,
+                "error": str(exc),
+            },
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     _audit(
         request,
         tenant_id=tid,
