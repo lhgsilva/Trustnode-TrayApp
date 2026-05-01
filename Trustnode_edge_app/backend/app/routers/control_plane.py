@@ -208,15 +208,19 @@ def _audit(
     details: dict[str, Any] | None = None,
 ) -> None:
     payload = getattr(request.state, "user_payload", {}) or {}
-    control_plane_store.audit(
-        actor_type="user",
-        actor_id=str(payload.get("sub") or "unknown"),
-        tenant_id=tenant_id,
-        action=action,
-        outcome=outcome,
-        correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
-        details=details or {},
-    )
+    try:
+        control_plane_store.audit(
+            actor_type="user",
+            actor_id=str(payload.get("sub") or "unknown"),
+            tenant_id=tenant_id,
+            action=action,
+            outcome=outcome,
+            correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
+            details=details or {},
+        )
+    except Exception:
+        # Never let audit logging failures break primary portal/activation flows.
+        return
 
 
 @router.get("/modules")
