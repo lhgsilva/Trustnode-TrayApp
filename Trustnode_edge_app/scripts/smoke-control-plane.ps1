@@ -98,6 +98,8 @@ try {
 
     $activation = Invoke-Json -Method "POST" -Url "$BaseUrl/api/control-plane/activation-code/issue?tenant_id=$TenantId" -Headers $auth -Body @{
         customer_id = $customerId
+        edge_id = $edgeId
+        license_id = $licenseId
         edge_name = "Smoke Activation Edge"
         ttl_minutes = 20
         metadata = @{ source = "smoke-control-plane.ps1" }
@@ -108,7 +110,7 @@ try {
     if ($code) {
         $applied = Invoke-Json -Method "POST" -Url "$BaseUrl/api/control-plane/activation-code/apply" -Headers $auth -Body @{
             activation_code = $code
-            edge_id = "$edgeId-applied"
+            edge_id = $edgeId
             edge_name = "Smoke Applied Edge"
             site = "SmokeSite"
             area = "SmokeArea"
