@@ -6,6 +6,9 @@ const FORCE_CLOUD_URL =
   /(^https?:\/\/your-cloud-backend\.example\.com$)|(^https?:\/\/api\.example\.com$)/i.test(FORCE_CLOUD_URL_RAW)
     ? ""
     : FORCE_CLOUD_URL_RAW;
+const CONTROL_PLANE_FALLBACK_URL = normalizeBaseUrl(
+  import.meta.env.VITE_TRUSTNODE_CONTROL_PLANE_URL || "https://trustnode.lsapps.app"
+);
 const FORCE_READONLY = String(import.meta.env.VITE_TRUSTNODE_READONLY || "").toLowerCase() === "true";
 
 function normalizeBaseUrl(raw) {
@@ -1423,13 +1426,40 @@ export async function deleteControlPlaneActivationCode(rowId, tenantId = "") {
 }
 
 export async function registerControlPlaneEdgeLink(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-link/register`, {
+  const req = {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {})
-  });
-  await ensureOk(res, "Control-plane edge-link register failed");
-  return res.json();
+  };
+  const primaryBase = normalizeBaseUrl(getApiBase());
+  let primaryError = null;
+  try {
+    const primaryRes = await fetchWithTimeout(`${primaryBase}/api/control-plane/edge-link/register`, req);
+    await ensureOk(primaryRes, "Control-plane edge-link register failed");
+    return primaryRes.json();
+  } catch (err) {
+    primaryError = err;
+    const msg = String(err?.message || err || "");
+    const shouldFallback = !isHostedWebClientRuntime() && msg.includes("activation_code_not_found");
+    if (!shouldFallback) throw err;
+  }
+
+  const candidates = [];
+  const storedCloud = normalizeBaseUrl(localStorage.getItem(STORAGE_CLOUD_URL_KEY) || "");
+  if (storedCloud && storedCloud !== primaryBase) candidates.push(storedCloud);
+  if (CONTROL_PLANE_FALLBACK_URL && CONTROL_PLANE_FALLBACK_URL !== primaryBase && CONTROL_PLANE_FALLBACK_URL !== storedCloud) {
+    candidates.push(CONTROL_PLANE_FALLBACK_URL);
+  }
+  for (const base of candidates) {
+    try {
+      const res = await fetchWithTimeout(`${base}/api/control-plane/edge-link/register`, req, 20000);
+      await ensureOk(res, "Control-plane edge-link register failed");
+      return res.json();
+    } catch {
+      // Try next candidate.
+    }
+  }
+  throw primaryError || new Error("Control-plane edge-link register failed");
 }
 
 export async function unlinkControlPlaneEdgeLink() {
