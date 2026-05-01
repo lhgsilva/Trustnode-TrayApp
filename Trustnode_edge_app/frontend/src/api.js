@@ -1454,7 +1454,30 @@ export async function registerControlPlaneEdgeLink(payload) {
     try {
       const res = await fetchWithTimeout(`${base}/api/control-plane/edge-link/register`, req, 20000);
       await ensureOk(res, "Control-plane edge-link register failed");
-      return res.json();
+      const data = await res.json();
+      // Cloud fallback succeeded: finalize local bootstrap/auth so desktop login works immediately.
+      if (primaryBase && primaryBase !== base) {
+        try {
+          await fetchWithTimeout(`${primaryBase}/api/control-plane/edge-link/local-finalize`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              tenant_id: String(data?.tenant_id || ""),
+              edge_id: String(data?.edge_id || payload?.edge_id || ""),
+              edge_name: String(payload?.edge_name || data?.edge_id || ""),
+              customer_id: String(data?.customer_id || ""),
+              license_id: String(data?.license_id || ""),
+              cloud_api_url: String(data?.cloud_api_url || base || ""),
+              primary_domain: String(data?.primary_domain || ""),
+              admin_username: String(payload?.admin_username || "admin"),
+              admin_password: String(payload?.admin_password || ""),
+            }),
+          }, 20000);
+        } catch {
+          // Registration already succeeded upstream; local finalize is best-effort.
+        }
+      }
+      return data;
     } catch {
       // Try next candidate.
     }

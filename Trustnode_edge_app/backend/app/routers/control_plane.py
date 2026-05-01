@@ -120,6 +120,18 @@ class EdgeRegisterRequest(BaseModel):
     admin_password: str
 
 
+class EdgeLocalFinalizeRequest(BaseModel):
+    tenant_id: str
+    edge_id: str
+    edge_name: str = ""
+    customer_id: str = ""
+    license_id: str = ""
+    cloud_api_url: str = ""
+    primary_domain: str = ""
+    admin_username: str = "admin"
+    admin_password: str
+
+
 class PasswordResetIssueRequest(BaseModel):
     username: str
     ttl_minutes: int = 15
@@ -937,6 +949,91 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
             details={"edge_id": payload.edge_id, "error": str(exc)},
         )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/edge-link/local-finalize")
+def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request) -> dict[str, Any]:
+    try:
+        tenant_id = normalize_tenant_id(str(payload.tenant_id or "default"))
+        admin_username = str(payload.admin_username or "").strip() or "admin"
+        admin_password = str(payload.admin_password or "")
+        if not admin_password:
+            raise ValueError("admin_password_required")
+
+        # Ensure local auth store contains the edge admin for immediate login.
+        control_plane_store.upsert_user(
+            tenant_id=tenant_id,
+            username=admin_username,
+            password=admin_password,
+            role="admin",
+            status="active",
+            email="",
+            mfa_enabled=False,
+            modules=[],
+            permissions={},
+        )
+
+        existing = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        users_access = existing.get("users_access") if isinstance(existing.get("users_access"), dict) else {}
+        users = users_access.get("users") if isinstance(users_access.get("users"), list) else []
+        next_users = []
+        replaced = False
+        for u in users:
+            if not isinstance(u, dict):
+                continue
+            if str(u.get("username") or "").strip() == admin_username:
+                next_users.append(
+                    {
+                        "username": admin_username,
+                        "password": admin_password,
+                        "role": "admin",
+                        "permissions": u.get("permissions") or {},
+                        "modules": u.get("modules") or [],
+                        "tenant_id": tenant_id,
+                    }
+                )
+                replaced = True
+            else:
+                next_users.append(dict(u))
+        if not replaced:
+            next_users.append(
+                {
+                    "username": admin_username,
+                    "password": admin_password,
+                    "role": "admin",
+                    "permissions": {},
+                    "modules": [],
+                    "tenant_id": tenant_id,
+                }
+            )
+
+        app_settings = dict((existing.get("app_settings") if isinstance(existing, dict) else {}) or {})
+        app_settings["tenant_login_realm"] = tenant_id
+        app_settings["tenant_id"] = tenant_id
+        app_settings["edge_id"] = str(payload.edge_id or "")
+        app_settings["edge_name"] = str(payload.edge_name or payload.edge_id or "")
+        app_settings["customer_id"] = str(payload.customer_id or "")
+        app_settings["license_id"] = str(payload.license_id or "")
+        app_settings["edge_linked"] = True
+        if str(payload.cloud_api_url or "").strip():
+            app_settings["cloud_url"] = str(payload.cloud_api_url or "").strip()
+        if str(payload.primary_domain or "").strip():
+            app_settings["tenant_web_client_url"] = f"https://{str(payload.primary_domain or '').strip()}"
+
+        app_store.save_bootstrap(
+            {
+                "app_settings": app_settings,
+                "users_access": {
+                    "users": next_users,
+                    "current_user": admin_username,
+                },
+            },
+            actor=f"edge_local_finalize:{admin_username}",
+        )
+        telemetry_service.configure_from_bootstrap({"data": app_store.get_bootstrap(prefer_cloud_reads=False)})
+        return {"ok": True, "tenant_id": tenant_id, "edge_id": str(payload.edge_id or "")}
+    except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

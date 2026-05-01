@@ -245,6 +245,8 @@ class ControlPlaneStore:
                     cur.execute("ALTER TABLE cp_edge_activation_codes ADD COLUMN edge_id TEXT")
                 if "license_id" not in cols:
                     cur.execute("ALTER TABLE cp_edge_activation_codes ADD COLUMN license_id TEXT")
+                if "activation_code" not in cols:
+                    cur.execute("ALTER TABLE cp_edge_activation_codes ADD COLUMN activation_code TEXT")
                 conn.commit()
 
     def _seed_defaults(self) -> None:
@@ -714,8 +716,8 @@ class ControlPlaneStore:
                 meta.setdefault("license_id", lid)
                 payload = json.dumps(meta, separators=(",", ":"), sort_keys=True)
                 conn.execute(
-                    "INSERT INTO cp_edge_activation_codes(code_hash, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, metadata_json, created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (code_hash, tid, cid, eid, lid, str(edge_name or ""), exp, None, "issued", payload, now),
+                    "INSERT INTO cp_edge_activation_codes(code_hash, activation_code, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, metadata_json, created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (code_hash, code, tid, cid, eid, lid, str(edge_name or ""), exp, None, "issued", payload, now),
                 )
                 conn.commit()
         return {
@@ -821,12 +823,12 @@ class ControlPlaneStore:
             with self._connect() as conn:
                 if cid:
                     rows = conn.execute(
-                        "SELECT rowid AS id, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? AND customer_id=? ORDER BY rowid DESC LIMIT 300",
+                        "SELECT rowid AS id, activation_code, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? AND customer_id=? ORDER BY rowid DESC LIMIT 300",
                         (tid, cid),
                     ).fetchall()
                 else:
                     rows = conn.execute(
-                        "SELECT rowid AS id, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? ORDER BY rowid DESC LIMIT 300",
+                        "SELECT rowid AS id, activation_code, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? ORDER BY rowid DESC LIMIT 300",
                         (tid,),
                     ).fetchall()
         return [dict(r) for r in rows]
@@ -841,7 +843,7 @@ class ControlPlaneStore:
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT rowid AS id, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
+                    "SELECT rowid AS id, activation_code, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
                     (rid, tid),
                 ).fetchone()
                 if not row:
@@ -855,7 +857,7 @@ class ControlPlaneStore:
                 )
                 conn.commit()
                 out = conn.execute(
-                    "SELECT rowid AS id, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
+                    "SELECT rowid AS id, activation_code, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
                     (rid, tid),
                 ).fetchone()
         return dict(out) if out else {}

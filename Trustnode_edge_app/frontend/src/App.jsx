@@ -15108,13 +15108,15 @@ function AppShell() {
                         {!cpWorkspaceCollapsed.activation ? (
                         <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
                           <div className="table cp-workspace-table">
-                            <div className="thead"><span>ID</span><span>Customer</span><span>Edge Name</span><span>Status</span><span>Actions</span></div>
+                            <div className="thead"><span>ID</span><span>Activation Code</span><span>Customer</span><span>Edge Name</span><span>Status</span><span>Activated</span><span>Actions</span></div>
                             {cpActivationCodesFiltered.slice(0, 8).map((row, idx) => (
                               <div className="trow" key={`ws-activation-${idx}`}>
                                 <span>{String(row?.id || "-")}</span>
+                                <span>{String(row?.activation_code || "-")}</span>
                                 <span>{String(row?.customer_id || "-")}</span>
                                 <span>{String(row?.edge_name || "-")}</span>
                                 <span>{String(row?.status || "-")}</span>
+                                <span>{String(row?.used_utc || "-")}</span>
                                 <span className="row-actions">
                                   <button className="icon-btn danger table-action-btn" onClick={() => deleteCpActivationCode(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
                                 </span>
