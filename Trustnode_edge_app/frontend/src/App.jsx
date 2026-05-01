@@ -15422,7 +15422,7 @@ function AppShell() {
                 </div>
               </div>
 
-              {!isPortalOnly ? (
+              {!isPortalOnly && cpPortalPage === "activation" ? (
               <section className="card">
                 <h4>Tenant + Bundle Provisioning</h4>
                 <div className="form-grid">
@@ -15512,8 +15512,8 @@ function AppShell() {
               </section>
               ) : null}
 
-              {!isPortalOnly ? (
-              <section className="card">
+              {!isPortalOnly && cpPortalPage === "activation" ? (
+              <section className="card control-plane-activation-card">
                 <h4>Edge Health / Activation / Password Recovery</h4>
                 <div className="form-grid">
                   <label>
@@ -17298,10 +17298,12 @@ function AppShell() {
               <label>
                 Start Date
                 <input type="date" value={cpLicenseForm.start_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, start_utc: e.target.value }))} />
+                <small className="hint">Display: {fmtDateDdMmYyyy(cpLicenseForm.start_utc) || "DD-MM-YYYY"} (00:00 start)</small>
               </label>
               <label>
                 End Date
                 <input type="date" value={cpLicenseForm.end_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, end_utc: e.target.value }))} />
+                <small className="hint">Display: {fmtDateDdMmYyyy(cpLicenseForm.end_utc) || "DD-MM-YYYY"} (23:59 end)</small>
               </label>
               <label>
                 Max Edges

@@ -2001,6 +2001,11 @@ body {
   flex: 1 1 auto;
 }
 
+.control-plane-activation-card {
+  min-height: calc(100vh - 220px);
+  align-content: start;
+}
+
 .control-plane-workspace {
   display: grid;
   grid-template-columns: 1fr;

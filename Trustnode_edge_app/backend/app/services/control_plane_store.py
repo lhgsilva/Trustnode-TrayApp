@@ -739,15 +739,35 @@ class ControlPlaneStore:
         equipment: str = "",
         consume_code: bool = True,
     ) -> dict[str, Any]:
-        code_hash = self._sha256(str(activation_code or ""))
+        code_raw = str(activation_code or "").strip()
+        code_norm = code_raw.replace("–", "-").replace("—", "-")
+        code_hash = self._sha256(code_norm)
         now = self._utc_now()
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute("SELECT * FROM cp_edge_activation_codes WHERE code_hash=?", (code_hash,)).fetchone()
                 if not row:
+                    # Retry once with fully collapsed whitespace to tolerate copy/paste formatting.
+                    compact = "".join(code_norm.split())
+                    if compact and compact != code_norm:
+                        code_hash = self._sha256(compact)
+                        row = conn.execute("SELECT * FROM cp_edge_activation_codes WHERE code_hash=?", (code_hash,)).fetchone()
+                if not row:
                     raise ValueError("activation_code_not_found")
                 r = dict(row)
-                if str(r.get("status") or "") != "issued":
+                status = str(r.get("status") or "")
+                if status != "issued":
+                    if status == "used":
+                        code_edge_id = str(r.get("edge_id") or "").strip()
+                        current_edge_id = str(edge_id or "").strip()
+                        # Idempotent re-apply for the same edge to avoid false failures after transient UI/network errors.
+                        if code_edge_id and current_edge_id and current_edge_id == code_edge_id:
+                            edge = conn.execute("SELECT * FROM cp_edges WHERE edge_id=?", (current_edge_id,)).fetchone()
+                            if edge:
+                                return dict(edge)
+                        raise ValueError("activation_code_used")
+                    if status == "revoked":
+                        raise ValueError("activation_code_revoked")
                     raise ValueError("activation_code_not_issued")
                 if str(r.get("expires_utc") or "") < now:
                     conn.execute("UPDATE cp_edge_activation_codes SET status='expired' WHERE code_hash=?", (code_hash,))
