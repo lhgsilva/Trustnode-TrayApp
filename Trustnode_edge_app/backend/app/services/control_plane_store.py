@@ -198,6 +198,8 @@ class ControlPlaneStore:
                       code_hash TEXT PRIMARY KEY,
                       tenant_id TEXT NOT NULL,
                       customer_id TEXT,
+                      edge_id TEXT,
+                      license_id TEXT,
                       edge_name TEXT,
                       expires_utc TEXT NOT NULL,
                       used_utc TEXT,
@@ -238,6 +240,11 @@ class ControlPlaneStore:
                     CREATE INDEX IF NOT EXISTS ix_cp_audit_tenant_ts ON cp_security_audit_log(tenant_id, ts_utc DESC);
                     """
                 )
+                cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(cp_edge_activation_codes)").fetchall()}
+                if "edge_id" not in cols:
+                    cur.execute("ALTER TABLE cp_edge_activation_codes ADD COLUMN edge_id TEXT")
+                if "license_id" not in cols:
+                    cur.execute("ALTER TABLE cp_edge_activation_codes ADD COLUMN license_id TEXT")
                 conn.commit()
 
     def _seed_defaults(self) -> None:
@@ -645,30 +652,93 @@ class ControlPlaneStore:
             password=password,
         )
 
-    def issue_activation_code(self, *, tenant_id: str, customer_id: str = "", edge_name: str = "", ttl_minutes: int = 30, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    def issue_activation_code(
+        self,
+        *,
+        tenant_id: str,
+        customer_id: str = "",
+        edge_id: str = "",
+        license_id: str = "",
+        edge_name: str = "",
+        ttl_minutes: int = 30,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
+        cid = str(customer_id or "").strip()
+        eid = str(edge_id or "").strip()
+        lid = str(license_id or "").strip()
+        if not cid:
+            raise ValueError("customer_id_required")
+        if not eid:
+            raise ValueError("edge_id_required")
+        if not lid:
+            raise ValueError("license_id_required")
         code = secrets.token_urlsafe(24)
         code_hash = self._sha256(code)
         now_dt = datetime.now(timezone.utc)
         exp = (now_dt + timedelta(minutes=max(5, int(ttl_minutes or 30)))).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         now = now_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        payload = json.dumps(metadata or {}, separators=(",", ":"), sort_keys=True)
+        meta = dict(metadata or {})
         with self._lock:
             with self._connect() as conn:
+                customer = conn.execute(
+                    "SELECT customer_id FROM cp_customers WHERE tenant_id=? AND customer_id=? LIMIT 1",
+                    (tid, cid),
+                ).fetchone()
+                if not customer:
+                    raise ValueError("customer_not_found")
+                edge_row = conn.execute(
+                    "SELECT edge_id, edge_name, customer_id FROM cp_edges WHERE tenant_id=? AND edge_id=? LIMIT 1",
+                    (tid, eid),
+                ).fetchone()
+                if not edge_row:
+                    raise ValueError("edge_not_found")
+                edge = dict(edge_row)
+                if str(edge.get("customer_id") or "").strip() != cid:
+                    raise ValueError("edge_not_linked_to_customer")
+                lic_row = conn.execute(
+                    "SELECT license_id, customer_id, status FROM cp_licenses WHERE tenant_id=? AND license_id=? LIMIT 1",
+                    (tid, lid),
+                ).fetchone()
+                if not lic_row:
+                    raise ValueError("license_not_found")
+                lic = dict(lic_row)
+                if str(lic.get("customer_id") or "").strip() != cid:
+                    raise ValueError("license_not_linked_to_customer")
+                if str(lic.get("status") or "").strip().lower() != "active":
+                    raise ValueError("license_not_active")
+                if not edge_name:
+                    edge_name = str(edge.get("edge_name") or "")
+                meta.setdefault("customer_id", cid)
+                meta.setdefault("edge_id", eid)
+                meta.setdefault("license_id", lid)
+                payload = json.dumps(meta, separators=(",", ":"), sort_keys=True)
                 conn.execute(
-                    "INSERT INTO cp_edge_activation_codes(code_hash, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, metadata_json, created_utc) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (code_hash, tid, str(customer_id or ""), str(edge_name or ""), exp, None, "issued", payload, now),
+                    "INSERT INTO cp_edge_activation_codes(code_hash, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, metadata_json, created_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (code_hash, tid, cid, eid, lid, str(edge_name or ""), exp, None, "issued", payload, now),
                 )
                 conn.commit()
         return {
             "tenant_id": tid,
-            "customer_id": str(customer_id or ""),
+            "customer_id": cid,
+            "edge_id": eid,
+            "license_id": lid,
             "edge_name": str(edge_name or ""),
             "activation_code": code,
             "expires_utc": exp,
         }
 
-    def activate_edge_with_code(self, *, activation_code: str, edge_id: str, edge_name: str = "", site: str = "", area: str = "", equipment: str = "") -> dict[str, Any]:
+    def activate_edge_with_code(
+        self,
+        *,
+        activation_code: str,
+        edge_id: str,
+        edge_name: str = "",
+        site: str = "",
+        area: str = "",
+        equipment: str = "",
+        consume_code: bool = True,
+    ) -> dict[str, Any]:
         code_hash = self._sha256(str(activation_code or ""))
         now = self._utc_now()
         with self._lock:
@@ -683,22 +753,43 @@ class ControlPlaneStore:
                     conn.execute("UPDATE cp_edge_activation_codes SET status='expired' WHERE code_hash=?", (code_hash,))
                     conn.commit()
                     raise ValueError("activation_code_expired")
+                code_edge_id = str(r.get("edge_id") or "").strip()
+                if code_edge_id and str(edge_id or "").strip() != code_edge_id:
+                    raise ValueError("activation_code_edge_mismatch")
                 tid = normalize_tenant_id(str(r.get("tenant_id") or "default"))
+                cid = str(r.get("customer_id") or "").strip()
+                lid = str(r.get("license_id") or "").strip()
+                if cid and lid:
+                    lic = conn.execute(
+                        "SELECT status, end_utc, customer_id FROM cp_licenses WHERE tenant_id=? AND license_id=? LIMIT 1",
+                        (tid, lid),
+                    ).fetchone()
+                    if not lic:
+                        raise ValueError("activation_license_not_found")
+                    l = dict(lic)
+                    if str(l.get("customer_id") or "").strip() != cid:
+                        raise ValueError("activation_license_customer_mismatch")
+                    if str(l.get("status") or "").strip().lower() != "active":
+                        raise ValueError("activation_license_not_active")
+                    end_utc = str(l.get("end_utc") or "").strip()
+                    if end_utc and end_utc < now:
+                        raise ValueError("activation_license_expired")
                 self.upsert_edge(
                     tenant_id=tid,
                     edge_id=str(edge_id or "").strip(),
                     edge_name=str(edge_name or r.get("edge_name") or edge_id),
-                    customer_id=str(r.get("customer_id") or ""),
+                    customer_id=cid,
                     site=site,
                     area=area,
                     equipment=equipment,
                     status="active",
-                    metadata={"activated_via": "code"},
+                    metadata={"activated_via": "code", "license_id": lid},
                 )
-                conn.execute(
-                    "UPDATE cp_edge_activation_codes SET status='used', used_utc=? WHERE code_hash=?",
-                    (now, code_hash),
-                )
+                if consume_code:
+                    conn.execute(
+                        "UPDATE cp_edge_activation_codes SET status='used', used_utc=? WHERE code_hash=?",
+                        (now, code_hash),
+                    )
                 conn.commit()
                 edge = conn.execute("SELECT * FROM cp_edges WHERE edge_id=?", (str(edge_id or ""),)).fetchone()
         return dict(edge) if edge else {}
@@ -710,12 +801,12 @@ class ControlPlaneStore:
             with self._connect() as conn:
                 if cid:
                     rows = conn.execute(
-                        "SELECT rowid AS id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? AND customer_id=? ORDER BY rowid DESC LIMIT 300",
+                        "SELECT rowid AS id, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? AND customer_id=? ORDER BY rowid DESC LIMIT 300",
                         (tid, cid),
                     ).fetchall()
                 else:
                     rows = conn.execute(
-                        "SELECT rowid AS id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? ORDER BY rowid DESC LIMIT 300",
+                        "SELECT rowid AS id, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? ORDER BY rowid DESC LIMIT 300",
                         (tid,),
                     ).fetchall()
         return [dict(r) for r in rows]
@@ -730,7 +821,7 @@ class ControlPlaneStore:
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT rowid AS id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
+                    "SELECT rowid AS id, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
                     (rid, tid),
                 ).fetchone()
                 if not row:
@@ -744,7 +835,7 @@ class ControlPlaneStore:
                 )
                 conn.commit()
                 out = conn.execute(
-                    "SELECT rowid AS id, tenant_id, customer_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
+                    "SELECT rowid AS id, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
                     (rid, tid),
                 ).fetchone()
         return dict(out) if out else {}
@@ -966,6 +1057,7 @@ class ControlPlaneStore:
             site=site,
             area=area,
             equipment=equipment,
+            consume_code=False,
         )
         tenant_id = normalize_tenant_id(str(edge.get("tenant_id") or "default"))
         customer_id = str(edge.get("customer_id") or "")

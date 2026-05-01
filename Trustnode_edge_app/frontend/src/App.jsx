@@ -2215,6 +2215,8 @@ function AppShell() {
   const [cpLicenseModulesText, setCpLicenseModulesText] = useState("");
   const [cpActivationIssueForm, setCpActivationIssueForm] = useState({
     customer_id: "",
+    edge_id: "",
+    license_id: "",
     edge_name: "",
     ttl_minutes: 30,
   });
@@ -5938,6 +5940,22 @@ function AppShell() {
     );
   }, [cpActivationCodes, cpListFilters.licenses]);
 
+  const cpActivationEdgesForCustomer = useMemo(() => {
+    const cid = String(cpActivationIssueForm.customer_id || "").trim();
+    if (!cid) return [];
+    return (cpEdgesView || []).filter((r) => String(r?.customer_id || "").trim() === cid);
+  }, [cpActivationIssueForm.customer_id, cpEdgesView]);
+
+  const cpActivationLicensesForCustomer = useMemo(() => {
+    const cid = String(cpActivationIssueForm.customer_id || "").trim();
+    if (!cid) return [];
+    return (cpLicensesView || []).filter(
+      (r) =>
+        String(r?.customer_id || "").trim() === cid &&
+        String(r?.status || "").trim().toLowerCase() === "active"
+    );
+  }, [cpActivationIssueForm.customer_id, cpLicensesView]);
+
   useEffect(() => {
     if (!currentUser) return;
     if (isPortalOnly) return;
@@ -6006,6 +6024,16 @@ function AppShell() {
       clearInterval(timer);
     };
   }, [currentUser, isHostedWebClient, edgeProfile?.edge_id, currentTenantId]);
+
+  useEffect(() => {
+    const edgeId = String(cpActivationIssueForm.edge_id || "").trim();
+    if (!edgeId) return;
+    const hit = (cpActivationEdgesForCustomer || []).find((r) => String(r?.edge_id || "").trim() === edgeId);
+    if (!hit) return;
+    const edgeName = String(hit?.edge_name || "").trim();
+    if (!edgeName || edgeName === String(cpActivationIssueForm.edge_name || "").trim()) return;
+    setCpActivationIssueForm((prev) => ({ ...prev, edge_name: edgeName }));
+  }, [cpActivationIssueForm.edge_id, cpActivationIssueForm.edge_name, cpActivationEdgesForCustomer]);
 
   const addAppLog = (entry) => {
     const key = `${String(entry.level || "info")}|${String(entry.category || "system")}|${String(entry.gateway_id || "")}|${String(entry.database_name || "")}|${String(entry.message || "")}`;
@@ -11137,21 +11165,30 @@ function AppShell() {
 
   const issueTenantActivationCode = async () => {
     if (!canEditPage("control_plane")) return;
+    const payload = {
+      customer_id: String(cpActivationIssueForm.customer_id || "").trim(),
+      edge_id: String(cpActivationIssueForm.edge_id || "").trim(),
+      license_id: String(cpActivationIssueForm.license_id || "").trim(),
+      edge_name: String(cpActivationIssueForm.edge_name || "").trim(),
+      ttl_minutes: Math.max(1, Number(cpActivationIssueForm.ttl_minutes || 30)),
+      metadata: {},
+    };
+    if (!payload.customer_id || !payload.edge_id || !payload.license_id) {
+      setCpResult("Customer, edge app and license are required to issue activation code.");
+      return;
+    }
     setCpBusy(true);
     try {
-      const res = await issueControlPlaneActivationCode(
-        {
-          customer_id: String(cpActivationIssueForm.customer_id || "").trim(),
-          edge_name: String(cpActivationIssueForm.edge_name || "").trim(),
-          ttl_minutes: Math.max(1, Number(cpActivationIssueForm.ttl_minutes || 30)),
-          metadata: {},
-        },
-        currentTenantId || "default"
-      );
+      const res = await issueControlPlaneActivationCode(payload, currentTenantId || "default");
       const code = String(res?.row?.activation_code || "");
       setCpIssuedActivationCode(code);
       if (code) {
-        setCpActivationApplyForm((prev) => ({ ...prev, activation_code: code }));
+        setCpActivationApplyForm((prev) => ({
+          ...prev,
+          activation_code: code,
+          edge_id: payload.edge_id,
+          edge_name: payload.edge_name,
+        }));
       }
       setCpResult(code ? "Activation code issued." : "Activation issue request completed.");
     } catch (err) {
@@ -15355,8 +15392,56 @@ function AppShell() {
                 </div>
                 <div className="form-grid">
                   <label>
-                    Issue Activation (Customer ID)
-                    <input value={cpActivationIssueForm.customer_id} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, customer_id: e.target.value }))} />
+                    Customer
+                    <select
+                      value={cpActivationIssueForm.customer_id}
+                      onChange={(e) =>
+                        setCpActivationIssueForm((p) => ({
+                          ...p,
+                          customer_id: e.target.value,
+                          edge_id: "",
+                          license_id: "",
+                          edge_name: "",
+                        }))
+                      }
+                    >
+                      <option value="">Select customer</option>
+                      {(cpCustomersView || []).map((c) => (
+                        <option key={`cp-activation-customer-${String(c?.customer_id || "")}`} value={String(c?.customer_id || "")}>
+                          {String(c?.company_name || c?.customer_id || "-")}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Edge App
+                    <select
+                      value={cpActivationIssueForm.edge_id}
+                      onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, edge_id: e.target.value }))}
+                      disabled={!cpActivationIssueForm.customer_id}
+                    >
+                      <option value="">Select edge app</option>
+                      {cpActivationEdgesForCustomer.map((r) => (
+                        <option key={`cp-activation-edge-${String(r?.edge_id || "")}`} value={String(r?.edge_id || "")}>
+                          {String(r?.edge_name || r?.edge_id || "-")}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    License
+                    <select
+                      value={cpActivationIssueForm.license_id}
+                      onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, license_id: e.target.value }))}
+                      disabled={!cpActivationIssueForm.customer_id}
+                    >
+                      <option value="">Select active license</option>
+                      {cpActivationLicensesForCustomer.map((r) => (
+                        <option key={`cp-activation-license-${String(r?.license_id || "")}`} value={String(r?.license_id || "")}>
+                          {String(r?.license_id || "-")} | {String(r?.plan_code || "-")}
+                        </option>
+                      ))}
+                    </select>
                   </label>
                   <label>
                     Activation Edge Name
@@ -15413,12 +15498,14 @@ function AppShell() {
                 </div>
                 <div className="table-scroll" style={{ maxHeight: 220 }}>
                   <div className="table cp-activation-table">
-                    <div className="thead"><span><input type="checkbox" checked={cpActivationCodesFiltered.length > 0 && cpActivationCodesFiltered.every((row) => isCpRowSelected("activation", row?.id))} onChange={(e) => setCpRowsSelectedAll("activation", cpActivationCodesFiltered, (row) => row?.id, e.target.checked)} /></span><span>ID</span><span>Customer</span><span>Edge Name</span><span>Status</span><span>Expires</span><span>Used</span><span>Actions</span></div>
+                    <div className="thead"><span><input type="checkbox" checked={cpActivationCodesFiltered.length > 0 && cpActivationCodesFiltered.every((row) => isCpRowSelected("activation", row?.id))} onChange={(e) => setCpRowsSelectedAll("activation", cpActivationCodesFiltered, (row) => row?.id, e.target.checked)} /></span><span>ID</span><span>Customer</span><span>Edge ID</span><span>License</span><span>Edge Name</span><span>Status</span><span>Expires</span><span>Used</span><span>Actions</span></div>
                     {cpActivationCodesFiltered.map((row, idx) => (
                       <div className="trow" key={`cp-ac-${idx}`}>
                         <span><input type="checkbox" checked={isCpRowSelected("activation", row?.id)} onChange={(e) => setCpRowSelected("activation", row?.id, e.target.checked)} /></span>
                         <span>{String(row?.id || "-")}</span>
                         <span>{String(row?.customer_id || "-")}</span>
+                        <span>{String(row?.edge_id || "-")}</span>
+                        <span>{String(row?.license_id || "-")}</span>
                         <span>{String(row?.edge_name || "-")}</span>
                         <span>{String(row?.status || "-")}</span>
                         <span>{fmtTs(String(row?.expires_utc || "")) || "-"}</span>
@@ -15430,7 +15517,7 @@ function AppShell() {
                         </span>
                       </div>
                     ))}
-                    {!cpActivationCodesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No activation codes</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                    {!cpActivationCodesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No activation codes</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                   </div>
                 </div>
 

@@ -66,7 +66,9 @@ class UserUpsertRequest(BaseModel):
 
 
 class ActivationCodeIssueRequest(BaseModel):
-    customer_id: str = ""
+    customer_id: str
+    edge_id: str
+    license_id: str
     edge_name: str = ""
     ttl_minutes: int = 30
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -431,6 +433,8 @@ def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request,
     row = control_plane_store.issue_activation_code(
         tenant_id=tid,
         customer_id=payload.customer_id,
+        edge_id=payload.edge_id,
+        license_id=payload.license_id,
         edge_name=payload.edge_name,
         ttl_minutes=payload.ttl_minutes,
         metadata=payload.metadata,
@@ -440,7 +444,12 @@ def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request,
         tenant_id=tid,
         action="activation_code.issue",
         outcome="ok",
-        details={"customer_id": payload.customer_id, "edge_name": payload.edge_name},
+        details={
+            "customer_id": payload.customer_id,
+            "edge_id": payload.edge_id,
+            "license_id": payload.license_id,
+            "edge_name": payload.edge_name,
+        },
     )
     return {"ok": True, "tenant_id": tid, "row": row}
 
@@ -768,6 +777,16 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             area=payload.area,
             equipment=payload.equipment,
             cloud_url=cloud_url,
+        )
+        # Finalize one-time activation only at registration commit.
+        control_plane_store.activate_edge_with_code(
+            activation_code=payload.activation_code,
+            edge_id=payload.edge_id,
+            edge_name=payload.edge_name,
+            site=payload.site,
+            area=payload.area,
+            equipment=payload.equipment,
+            consume_code=True,
         )
         tenant_id = normalize_tenant_id(str(row.get("tenant_id") or "default"))
         admin_username = str(payload.admin_username or "").strip() or "admin"

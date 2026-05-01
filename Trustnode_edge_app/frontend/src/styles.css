@@ -2033,7 +2033,7 @@ body {
 
 .cp-activation-table .thead,
 .cp-activation-table .trow {
-  grid-template-columns: 40px .55fr .95fr 1.1fr .7fr 1fr 1fr 200px;
+  grid-template-columns: 40px .45fr .8fr .85fr .9fr 1fr .65fr .95fr .95fr 200px;
 }
 
 .cp-workspace-table .thead,
