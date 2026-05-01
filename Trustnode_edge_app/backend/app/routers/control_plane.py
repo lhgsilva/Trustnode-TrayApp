@@ -507,6 +507,22 @@ def update_activation_code(row_id: int, payload: ActivationCodeUpdateRequest, re
     return {"ok": True, "tenant_id": tid, "row": row}
 
 
+@router.delete("/activation-codes/{row_id}")
+def delete_activation_code(row_id: int, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    deleted = control_plane_store.delete_activation_code(tenant_id=tid, row_id=row_id)
+    if not deleted:
+        _audit(request, tenant_id=tid, action="activation_code.delete", outcome="not_found", details={"id": row_id})
+        raise HTTPException(status_code=404, detail="activation_code_not_found")
+    _audit(request, tenant_id=tid, action="activation_code.delete", outcome="ok", details={"id": row_id})
+    return {"ok": True, "tenant_id": tid, "id": row_id}
+
+
+@router.post("/activation-codes/{row_id}/delete")
+def delete_activation_code_post(row_id: int, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    return delete_activation_code(row_id=row_id, request=request, tenant_id=tenant_id)
+
+
 @router.post("/password-reset/issue")
 def issue_password_reset(payload: PasswordResetIssueRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
     tid = _scoped_tenant(request, tenant_id, require_admin_write=True)

@@ -85,6 +85,7 @@ import {
   applyControlPlaneActivationCode,
   getControlPlaneActivationCodes,
   updateControlPlaneActivationCode,
+  deleteControlPlaneActivationCode,
   registerControlPlaneEdgeLink,
   unlinkControlPlaneEdgeLink,
   checkControlPlaneEdgeLicense,
@@ -2242,6 +2243,7 @@ function AppShell() {
   const [cpLicenseModalModules, setCpLicenseModalModules] = useState([]);
   const [cpModalError, setCpModalError] = useState("");
   const [cpPortalPage, setCpPortalPage] = useState("workspace");
+  const [cpTenantFilter, setCpTenantFilter] = useState("__all__");
   const [cpCustomerFilter, setCpCustomerFilter] = useState("__all__");
   const [cpListFilters, setCpListFilters] = useState({
     customers: "",
@@ -2249,6 +2251,13 @@ function AppShell() {
     licenses: "",
     edges: "",
     users: "",
+  });
+  const [cpSelectedRows, setCpSelectedRows] = useState({
+    customers: {},
+    licenses: {},
+    edges: {},
+    users: {},
+    activation: {},
   });
   const isPortalOnly = useMemo(() => {
     try {
@@ -10588,6 +10597,38 @@ function AppShell() {
     return getControlPlaneTenantScope();
   };
 
+  const isCpRowSelected = (group, key) => Boolean(cpSelectedRows?.[group]?.[String(key || "")]);
+
+  const setCpRowSelected = (group, key, selected) => {
+    const k = String(key || "").trim();
+    if (!k) return;
+    setCpSelectedRows((prev) => {
+      const nextGroup = { ...(prev?.[group] || {}) };
+      if (selected) nextGroup[k] = true;
+      else delete nextGroup[k];
+      return { ...(prev || {}), [group]: nextGroup };
+    });
+  };
+
+  const setCpRowsSelectedAll = (group, rows, keyFn, selected) => {
+    const source = Array.isArray(rows) ? rows : [];
+    setCpSelectedRows((prev) => {
+      const nextGroup = selected ? {} : { ...(prev?.[group] || {}) };
+      if (selected) {
+        for (const row of source) {
+          const key = String(keyFn(row) || "").trim();
+          if (key) nextGroup[key] = true;
+        }
+      } else {
+        for (const row of source) {
+          const key = String(keyFn(row) || "").trim();
+          if (key) delete nextGroup[key];
+        }
+      }
+      return { ...(prev || {}), [group]: nextGroup };
+    });
+  };
+
   const syncControlPlaneEdgeHeartbeat = async () => {
     if (isHostedWebClient) return false;
     const edgeId = String(edgeProfile?.edge_id || "").trim();
@@ -11202,6 +11243,29 @@ function AppShell() {
     }
   };
 
+  const deleteCpActivationCode = (row) => {
+    if (!canEditPage("control_plane")) return;
+    const rowId = Number(row?.id || 0);
+    if (!rowId) return;
+    withConfirm(
+      "Delete Activation Code",
+      `Delete activation code record #${rowId}?`,
+      async () => {
+        setCpBusy(true);
+        try {
+          const scopedTenant = getRowTenantScope(row);
+          await deleteControlPlaneActivationCode(rowId, scopedTenant);
+          await refreshControlPlaneData(scopedTenant);
+          setCpResult(`Activation code #${rowId} deleted.`);
+        } catch (err) {
+          setCpResult(`Activation code delete failed: ${String(err?.message || err)}`);
+        } finally {
+          setCpBusy(false);
+        }
+      }
+    );
+  };
+
   const deleteCpUser = (username) => {
     const target = String(username || "").trim();
     if (!target || target.toLowerCase() === "admin") return;
@@ -11223,6 +11287,36 @@ function AppShell() {
         }
       },
     });
+  };
+
+  const bulkDeleteCpItems = (group, rows, keyFn, deleteFn, label) => {
+    if (!canEditPage("control_plane")) return;
+    const source = Array.isArray(rows) ? rows : [];
+    const selected = source.filter((row) => isCpRowSelected(group, keyFn(row)));
+    if (!selected.length) {
+      setCpResult(`No ${label} selected.`);
+      return;
+    }
+    withConfirm(
+      `Delete ${label}`,
+      `Delete ${selected.length} selected ${label}?`,
+      async () => {
+        setCpBusy(true);
+        try {
+          for (const row of selected) {
+            await deleteFn(row);
+          }
+          const scopedTenant = getControlPlaneTenantScope();
+          await refreshControlPlaneData(scopedTenant);
+          setCpSelectedRows((prev) => ({ ...(prev || {}), [group]: {} }));
+          setCpResult(`Deleted ${selected.length} ${label}.`);
+        } catch (err) {
+          setCpResult(`Bulk delete failed: ${String(err?.message || err)}`);
+        } finally {
+          setCpBusy(false);
+        }
+      }
+    );
   };
 
   const submitLogin = async () => {
@@ -14772,7 +14866,16 @@ function AppShell() {
                     <section className="card">
                       <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                         <h4 style={{ margin: 0 }}>Customers</h4>
-                        <button className="btn btn-success" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Customer</button>
+                        <div className="row">
+                          <button className="btn btn-danger" onClick={() => bulkDeleteCpItems(
+                            "customers",
+                            cpCustomersFiltered,
+                            (row) => row?.customer_id,
+                            async (row) => deleteControlPlaneCustomer(String(row?.customer_id || ""), getRowTenantScope(row)),
+                            "customers"
+                          )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
+                          <button className="btn btn-success" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Customer</button>
+                        </div>
                       </div>
                       <div className="form-grid" style={{ marginTop: 10 }}>
                         <label>
@@ -14786,9 +14889,10 @@ function AppShell() {
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table">
-                          <div className="thead"><span>Customer ID</span><span>Company</span><span>Email</span><span>Status</span><span>Actions</span></div>
+                          <div className="thead"><span><input type="checkbox" checked={cpCustomersFiltered.length > 0 && cpCustomersFiltered.every((row) => isCpRowSelected("customers", row?.customer_id))} onChange={(e) => setCpRowsSelectedAll("customers", cpCustomersFiltered, (row) => row?.customer_id, e.target.checked)} /></span><span>Customer ID</span><span>Company</span><span>Email</span><span>Status</span><span>Actions</span></div>
                           {cpCustomersFiltered.map((row, idx) => (
                             <div className="trow" key={String(row?.customer_id || `customer-${idx}`)}>
+                              <span><input type="checkbox" checked={isCpRowSelected("customers", row?.customer_id)} onChange={(e) => setCpRowSelected("customers", row?.customer_id, e.target.checked)} /></span>
                               <span>{String(row?.customer_id || "-")}</span>
                               <span>{String(row?.company_name || "-")}</span>
                               <span>{String(row?.contact_email || "-")}</span>
@@ -14799,7 +14903,7 @@ function AppShell() {
                               </span>
                             </div>
                           ))}
-                          {!cpCustomersFiltered.length ? <div className="trow"><span>-</span><span>No customers yet</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpCustomersFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No customers yet</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
@@ -14930,7 +15034,16 @@ function AppShell() {
                     <section className="card">
                       <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                         <h4 style={{ margin: 0 }}>Licenses</h4>
-                        <button className="btn btn-success" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add License</button>
+                        <div className="row">
+                          <button className="btn btn-danger" onClick={() => bulkDeleteCpItems(
+                            "licenses",
+                            cpLicensesFiltered,
+                            (row) => row?.license_id,
+                            async (row) => deleteControlPlaneLicense(String(row?.license_id || ""), getRowTenantScope(row)),
+                            "licenses"
+                          )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
+                          <button className="btn btn-success" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add License</button>
+                        </div>
                       </div>
                       <div className="form-grid" style={{ marginTop: 10 }}>
                         <label>
@@ -14944,9 +15057,10 @@ function AppShell() {
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table">
-                          <div className="thead"><span>License Key</span><span>Customer</span><span>Modules</span><span>Edges/Users</span><span>Active Window</span><span>Status</span><span>Actions</span></div>
+                          <div className="thead"><span><input type="checkbox" checked={cpLicensesFiltered.length > 0 && cpLicensesFiltered.every((row) => isCpRowSelected("licenses", row?.license_id))} onChange={(e) => setCpRowsSelectedAll("licenses", cpLicensesFiltered, (row) => row?.license_id, e.target.checked)} /></span><span>License Key</span><span>Customer</span><span>Modules</span><span>Edges/Users</span><span>Active Window</span><span>Status</span><span>Actions</span></div>
                           {cpLicensesFiltered.map((row, idx) => (
                             <div className="trow" key={String(row?.license_id || `license-${idx}`)}>
+                              <span><input type="checkbox" checked={isCpRowSelected("licenses", row?.license_id)} onChange={(e) => setCpRowSelected("licenses", row?.license_id, e.target.checked)} /></span>
                               <span>{String(row?.license_id || "-")}</span>
                               <span>{String(row?.customer_id || "-")}</span>
                               <span>{String(row?.plan_code || "-")}</span>
@@ -14959,7 +15073,7 @@ function AppShell() {
                               </span>
                             </div>
                           ))}
-                          {!cpLicensesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No licenses yet</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpLicensesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>-</span><span>No licenses yet</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
@@ -14969,7 +15083,16 @@ function AppShell() {
                     <section className="card">
                       <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                         <h4 style={{ margin: 0 }}>Edge Apps</h4>
-                        <button className="btn btn-success" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Edge</button>
+                        <div className="row">
+                          <button className="btn btn-danger" onClick={() => bulkDeleteCpItems(
+                            "edges",
+                            cpEdgesFiltered,
+                            (row) => row?.edge_id,
+                            async (row) => deleteControlPlaneEdge(String(row?.edge_id || ""), getRowTenantScope(row)),
+                            "edges"
+                          )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
+                          <button className="btn btn-success" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Edge</button>
+                        </div>
                       </div>
                       <div className="form-grid" style={{ marginTop: 10 }}>
                         <label>
@@ -14983,9 +15106,10 @@ function AppShell() {
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table">
-                          <div className="thead"><span>Edge ID</span><span>Name</span><span>Customer</span><span>Site / Area / Equipment</span><span>Status</span><span>Client View</span><span>Actions</span></div>
+                          <div className="thead"><span><input type="checkbox" checked={cpEdgesFiltered.length > 0 && cpEdgesFiltered.every((row) => isCpRowSelected("edges", row?.edge_id))} onChange={(e) => setCpRowsSelectedAll("edges", cpEdgesFiltered, (row) => row?.edge_id, e.target.checked)} /></span><span>Edge ID</span><span>Name</span><span>Customer</span><span>Site / Area / Equipment</span><span>Status</span><span>Client View</span><span>Actions</span></div>
                           {cpEdgesFiltered.map((row, idx) => (
                             <div className="trow" key={String(row?.edge_id || `edge-${idx}`)}>
+                              <span><input type="checkbox" checked={isCpRowSelected("edges", row?.edge_id)} onChange={(e) => setCpRowSelected("edges", row?.edge_id, e.target.checked)} /></span>
                               <span>{String(row?.edge_id || "-")}</span>
                               <span>{String(row?.edge_name || "-")}</span>
                               <span>{String(row?.customer_id || "-")}</span>
@@ -15002,7 +15126,7 @@ function AppShell() {
                               </span>
                             </div>
                           ))}
-                          {!cpEdgesFiltered.length ? <div className="trow"><span>-</span><span>No edges yet</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpEdgesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No edges yet</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
@@ -15012,9 +15136,18 @@ function AppShell() {
                     <section className="card">
                       <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                         <h4 style={{ margin: 0 }}>Users and Access</h4>
-                        <button className="btn btn-primary" onClick={() => handleNavClick("users_and_access_control")}>
-                          Open Users and Access Control
-                        </button>
+                        <div className="row">
+                          <button className="btn btn-danger" onClick={() => bulkDeleteCpItems(
+                            "users",
+                            cpUsersFiltered,
+                            (row) => row?.username,
+                            async (row) => deleteControlPlaneUser(String(row?.username || ""), getRowTenantScope(row)),
+                            "users"
+                          )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
+                          <button className="btn btn-primary" onClick={() => handleNavClick("users_and_access_control")}>
+                            Open Users and Access Control
+                          </button>
+                        </div>
                       </div>
                       <div className="form-grid" style={{ marginTop: 10 }}>
                         <label>
@@ -15028,9 +15161,10 @@ function AppShell() {
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table">
-                          <div className="thead"><span>Username</span><span>Role</span><span>Email</span><span>Status</span><span>MFA</span><span>Actions</span></div>
+                          <div className="thead"><span><input type="checkbox" checked={cpUsersFiltered.length > 0 && cpUsersFiltered.every((row) => isCpRowSelected("users", row?.username))} onChange={(e) => setCpRowsSelectedAll("users", cpUsersFiltered, (row) => row?.username, e.target.checked)} /></span><span>Username</span><span>Role</span><span>Email</span><span>Status</span><span>MFA</span><span>Actions</span></div>
                           {(cpUsersFiltered || []).map((row, idx) => (
                             <div className="trow" key={`cp-user-${idx}`}>
+                              <span><input type="checkbox" checked={isCpRowSelected("users", row?.username)} onChange={(e) => setCpRowSelected("users", row?.username, e.target.checked)} disabled={String(row?.username || "").toLowerCase() === "admin"} /></span>
                               <span>{String(row?.username || "-")}</span>
                               <span>{String(row?.role || "-")}</span>
                               <span>{String(row?.email || "-")}</span>
@@ -15041,7 +15175,7 @@ function AppShell() {
                               </span>
                             </div>
                           ))}
-                          {!cpUsersFiltered?.length ? <div className="trow"><span>-</span><span>No users found</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpUsersFiltered?.length ? <div className="trow"><span>-</span><span>-</span><span>No users found</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
@@ -15209,11 +15343,21 @@ function AppShell() {
                 </div>
 
                 <h5 style={{ marginTop: 12, marginBottom: 6 }}>Issued Activation Codes</h5>
+                <div className="row" style={{ marginBottom: 8 }}>
+                  <button className="btn btn-danger" onClick={() => bulkDeleteCpItems(
+                    "activation",
+                    cpActivationCodesFiltered,
+                    (row) => row?.id,
+                    async (row) => deleteControlPlaneActivationCode(Number(row?.id || 0), getRowTenantScope(row)),
+                    "activation codes"
+                  )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
+                </div>
                 <div className="table-scroll" style={{ maxHeight: 220 }}>
                   <div className="table">
-                    <div className="thead"><span>ID</span><span>Customer</span><span>Edge Name</span><span>Status</span><span>Expires</span><span>Used</span><span>Actions</span></div>
+                    <div className="thead"><span><input type="checkbox" checked={cpActivationCodesFiltered.length > 0 && cpActivationCodesFiltered.every((row) => isCpRowSelected("activation", row?.id))} onChange={(e) => setCpRowsSelectedAll("activation", cpActivationCodesFiltered, (row) => row?.id, e.target.checked)} /></span><span>ID</span><span>Customer</span><span>Edge Name</span><span>Status</span><span>Expires</span><span>Used</span><span>Actions</span></div>
                     {cpActivationCodesFiltered.map((row, idx) => (
                       <div className="trow" key={`cp-ac-${idx}`}>
+                        <span><input type="checkbox" checked={isCpRowSelected("activation", row?.id)} onChange={(e) => setCpRowSelected("activation", row?.id, e.target.checked)} /></span>
                         <span>{String(row?.id || "-")}</span>
                         <span>{String(row?.customer_id || "-")}</span>
                         <span>{String(row?.edge_name || "-")}</span>
@@ -15223,10 +15367,11 @@ function AppShell() {
                         <span className="row-actions">
                           <button className="btn btn-sm" onClick={() => updateActivationCodeStatus(row, "issued")} disabled={cpBusy || !canEditPage("control_plane")}>Re-issue</button>
                           <button className="btn btn-sm btn-danger" onClick={() => updateActivationCodeStatus(row, "revoked")} disabled={cpBusy || !canEditPage("control_plane")}>Revoke</button>
+                          <button className="icon-btn danger table-action-btn" onClick={() => deleteCpActivationCode(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
                         </span>
                       </div>
                     ))}
-                    {!cpActivationCodesFiltered.length ? <div className="trow"><span>-</span><span>No activation codes</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                    {!cpActivationCodesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No activation codes</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                   </div>
                 </div>
 

@@ -1402,6 +1402,26 @@ export async function updateControlPlaneActivationCode(rowId, payload, tenantId 
   return res.json();
 }
 
+export async function deleteControlPlaneActivationCode(rowId, tenantId = "") {
+  const rid = encodeURIComponent(String(rowId || ""));
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const deleteUrl = `${getApiBase()}/api/control-plane/activation-codes/${rid}${suffix}`;
+  let res;
+  try {
+    res = await fetchWithTimeout(deleteUrl, { method: "DELETE" });
+  } catch {
+    res = null;
+  }
+  if (!res || res.status === 404 || res.status === 405 || res.status === 501) {
+    const postFallbackUrl = `${getApiBase()}/api/control-plane/activation-codes/${rid}/delete${suffix}`;
+    res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
+  }
+  await ensureOk(res, "Control-plane activation-code delete failed");
+  return res.json();
+}
+
 export async function registerControlPlaneEdgeLink(payload) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-link/register`, {
     method: "POST",

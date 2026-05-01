@@ -763,6 +763,20 @@ class ControlPlaneStore:
                 ).fetchone()
         return dict(out) if out else {}
 
+    def delete_activation_code(self, *, tenant_id: str, row_id: int) -> bool:
+        tid = normalize_tenant_id(tenant_id)
+        rid = int(row_id or 0)
+        if rid <= 0:
+            return False
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM cp_edge_activation_codes WHERE rowid=? AND tenant_id=?",
+                    (rid, tid),
+                )
+                conn.commit()
+                return int(cur.rowcount or 0) > 0
+
     def issue_password_reset(self, *, tenant_id: str, username: str, ttl_minutes: int = 15) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
         uname = str(username or "").strip()
