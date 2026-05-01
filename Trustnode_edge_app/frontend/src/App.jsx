@@ -2259,6 +2259,14 @@ function AppShell() {
     users: {},
     activation: {},
   });
+  const [cpWorkspaceCollapsed, setCpWorkspaceCollapsed] = useState({
+    customers: false,
+    modules: false,
+    licenses: false,
+    edges: false,
+    users: false,
+    activation: false,
+  });
   const isPortalOnly = useMemo(() => {
     try {
       const path = String(window.location.pathname || "").toLowerCase();
@@ -10629,6 +10637,10 @@ function AppShell() {
     });
   };
 
+  const toggleCpWorkspaceCard = (key) => {
+    setCpWorkspaceCollapsed((prev) => ({ ...(prev || {}), [key]: !Boolean(prev?.[key]) }));
+  };
+
   const syncControlPlaneEdgeHeartbeat = async () => {
     if (isHostedWebClient) return false;
     const edgeId = String(edgeProfile?.edge_id || "").trim();
@@ -10757,6 +10769,8 @@ function AppShell() {
         scopedTenant
       );
       await refreshControlPlaneData(scopedTenant);
+      setCpCustomerFilter("__all__");
+      setCpListFilters((prev) => ({ ...(prev || {}), customers: "" }));
       setCpResult(`Customer '${companyName}' saved.`);
       setCpModalError("");
       setShowCpCustomerModal(false);
@@ -10868,6 +10882,7 @@ function AppShell() {
           const scopedTenant = getRowTenantScope(row);
           await deleteControlPlaneCustomer(customerId, scopedTenant);
           await refreshControlPlaneData(scopedTenant);
+          if (cpCustomerFilter === customerId) setCpCustomerFilter("__all__");
           setCpResult(`Customer '${customerId}' deleted.`);
         } catch (err) {
           setCpResult(`Customer delete failed: ${String(err?.message || err)}`);
@@ -14819,8 +14834,8 @@ function AppShell() {
           ) : null}
 
           {activePage === "control_plane" ? (
-            <div className="page-fill">
-              <div className="row" style={{ alignItems: "stretch", gap: 12 }}>
+            <div className="page-fill control-plane-page-fill">
+              <div className="row control-plane-layout" style={{ alignItems: "stretch", gap: 12 }}>
                 {!isPortalOnly ? (
                 <aside className="card" style={{ width: 280, minWidth: 260 }}>
                   <h4 style={{ marginTop: 0 }}>Portal Navigation</h4>
@@ -14852,7 +14867,7 @@ function AppShell() {
                 </aside>
                 ) : null}
 
-                <div style={{ flex: 1, minWidth: 0 }}>
+                <div className="control-plane-main" style={{ flex: 1, minWidth: 0 }}>
                   {cpResult ? <section className="card">{cpResult ? <div className={`status ${cpResult.toLowerCase().includes("failed") ? "error" : "ok"}`}>{cpResult}</div> : null}</section> : null}
                   {!canEditPage("control_plane") ? (
                     <section className="card">
@@ -14888,7 +14903,7 @@ function AppShell() {
                         </label>
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
-                        <div className="table">
+                        <div className="table cp-customers-table">
                           <div className="thead"><span><input type="checkbox" checked={cpCustomersFiltered.length > 0 && cpCustomersFiltered.every((row) => isCpRowSelected("customers", row?.customer_id))} onChange={(e) => setCpRowsSelectedAll("customers", cpCustomersFiltered, (row) => row?.customer_id, e.target.checked)} /></span><span>Customer ID</span><span>Company</span><span>Email</span><span>Status</span><span>Actions</span></div>
                           {cpCustomersFiltered.map((row, idx) => (
                             <div className="trow" key={String(row?.customer_id || `customer-${idx}`)}>
@@ -14910,14 +14925,18 @@ function AppShell() {
                   ) : null}
 
                   {cpPortalPage === "workspace" ? (
-                    <div className="row" style={{ alignItems: "stretch", gap: 12, flexWrap: "wrap" }}>
-                      <section className="card" style={{ flex: "1 1 460px", minWidth: 360 }}>
+                    <div className="control-plane-workspace">
+                      <section className="card control-plane-workspace-card">
                         <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                           <h4 style={{ margin: 0 }}>Customers</h4>
-                          <button className="btn btn-success btn-sm" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
+                          <div className="row">
+                            <button className="btn btn-success btn-sm" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
+                            <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("customers")}>{cpWorkspaceCollapsed.customers ? "Expand" : "Collapse"}</button>
+                          </div>
                         </div>
+                        {!cpWorkspaceCollapsed.customers ? (
                         <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
-                          <div className="table">
+                          <div className="table cp-workspace-table">
                             <div className="thead"><span>Customer</span><span>Email</span><span>Status</span><span>Actions</span></div>
                             {cpCustomersFiltered.slice(0, 8).map((row, idx) => (
                               <div className="trow" key={`ws-customer-${idx}`}>
@@ -14932,14 +14951,19 @@ function AppShell() {
                             ))}
                           </div>
                         </div>
+                        ) : null}
                       </section>
-                      <section className="card" style={{ flex: "1 1 460px", minWidth: 360 }}>
+                      <section className="card control-plane-workspace-card">
                         <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                           <h4 style={{ margin: 0 }}>Licenses</h4>
-                          <button className="btn btn-success btn-sm" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
+                          <div className="row">
+                            <button className="btn btn-success btn-sm" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
+                            <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("licenses")}>{cpWorkspaceCollapsed.licenses ? "Expand" : "Collapse"}</button>
+                          </div>
                         </div>
+                        {!cpWorkspaceCollapsed.licenses ? (
                         <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
-                          <div className="table">
+                          <div className="table cp-workspace-table">
                             <div className="thead"><span>License</span><span>Customer</span><span>Status</span><span>Actions</span></div>
                             {cpLicensesFiltered.slice(0, 8).map((row, idx) => (
                               <div className="trow" key={`ws-license-${idx}`}>
@@ -14954,14 +14978,19 @@ function AppShell() {
                             ))}
                           </div>
                         </div>
+                        ) : null}
                       </section>
-                      <section className="card" style={{ flex: "1 1 460px", minWidth: 360 }}>
+                      <section className="card control-plane-workspace-card">
                         <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                           <h4 style={{ margin: 0 }}>Edge Apps</h4>
-                          <button className="btn btn-success btn-sm" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
+                          <div className="row">
+                            <button className="btn btn-success btn-sm" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
+                            <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("edges")}>{cpWorkspaceCollapsed.edges ? "Expand" : "Collapse"}</button>
+                          </div>
                         </div>
+                        {!cpWorkspaceCollapsed.edges ? (
                         <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
-                          <div className="table">
+                          <div className="table cp-workspace-table">
                             <div className="thead"><span>Edge</span><span>Customer</span><span>Status</span><span>Actions</span></div>
                             {cpEdgesFiltered.slice(0, 8).map((row, idx) => (
                               <div className="trow" key={`ws-edge-${idx}`}>
@@ -14976,14 +15005,19 @@ function AppShell() {
                             ))}
                           </div>
                         </div>
+                        ) : null}
                       </section>
-                      <section className="card" style={{ flex: "1 1 460px", minWidth: 360 }}>
+                      <section className="card control-plane-workspace-card">
                         <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                           <h4 style={{ margin: 0 }}>Users</h4>
-                          <button className="btn btn-primary btn-sm" onClick={() => handleNavClick("users_and_access_control")}>Open Access</button>
+                          <div className="row">
+                            <button className="btn btn-primary btn-sm" onClick={() => handleNavClick("users_and_access_control")}>Open Access</button>
+                            <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("users")}>{cpWorkspaceCollapsed.users ? "Expand" : "Collapse"}</button>
+                          </div>
                         </div>
+                        {!cpWorkspaceCollapsed.users ? (
                         <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
-                          <div className="table">
+                          <div className="table cp-workspace-table">
                             <div className="thead"><span>User</span><span>Role</span><span>Status</span><span>Actions</span></div>
                             {cpUsersFiltered.slice(0, 8).map((row, idx) => (
                               <div className="trow" key={`ws-user-${idx}`}>
@@ -14997,6 +15031,31 @@ function AppShell() {
                             ))}
                           </div>
                         </div>
+                        ) : null}
+                      </section>
+                      <section className="card control-plane-workspace-card">
+                        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                          <h4 style={{ margin: 0 }}>Activation</h4>
+                          <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("activation")}>{cpWorkspaceCollapsed.activation ? "Expand" : "Collapse"}</button>
+                        </div>
+                        {!cpWorkspaceCollapsed.activation ? (
+                        <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
+                          <div className="table cp-workspace-table">
+                            <div className="thead"><span>ID</span><span>Customer</span><span>Edge Name</span><span>Status</span><span>Actions</span></div>
+                            {cpActivationCodesFiltered.slice(0, 8).map((row, idx) => (
+                              <div className="trow" key={`ws-activation-${idx}`}>
+                                <span>{String(row?.id || "-")}</span>
+                                <span>{String(row?.customer_id || "-")}</span>
+                                <span>{String(row?.edge_name || "-")}</span>
+                                <span>{String(row?.status || "-")}</span>
+                                <span className="row-actions">
+                                  <button className="icon-btn danger table-action-btn" onClick={() => deleteCpActivationCode(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                        ) : null}
                       </section>
                     </div>
                   ) : null}
@@ -15056,7 +15115,7 @@ function AppShell() {
                         </label>
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
-                        <div className="table">
+                        <div className="table cp-licenses-table">
                           <div className="thead"><span><input type="checkbox" checked={cpLicensesFiltered.length > 0 && cpLicensesFiltered.every((row) => isCpRowSelected("licenses", row?.license_id))} onChange={(e) => setCpRowsSelectedAll("licenses", cpLicensesFiltered, (row) => row?.license_id, e.target.checked)} /></span><span>License Key</span><span>Customer</span><span>Modules</span><span>Edges/Users</span><span>Active Window</span><span>Status</span><span>Actions</span></div>
                           {cpLicensesFiltered.map((row, idx) => (
                             <div className="trow" key={String(row?.license_id || `license-${idx}`)}>
@@ -15105,7 +15164,7 @@ function AppShell() {
                         </label>
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
-                        <div className="table">
+                        <div className="table cp-edges-table">
                           <div className="thead"><span><input type="checkbox" checked={cpEdgesFiltered.length > 0 && cpEdgesFiltered.every((row) => isCpRowSelected("edges", row?.edge_id))} onChange={(e) => setCpRowsSelectedAll("edges", cpEdgesFiltered, (row) => row?.edge_id, e.target.checked)} /></span><span>Edge ID</span><span>Name</span><span>Customer</span><span>Site / Area / Equipment</span><span>Status</span><span>Client View</span><span>Actions</span></div>
                           {cpEdgesFiltered.map((row, idx) => (
                             <div className="trow" key={String(row?.edge_id || `edge-${idx}`)}>
@@ -15160,7 +15219,7 @@ function AppShell() {
                         </label>
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
-                        <div className="table">
+                        <div className="table cp-users-table">
                           <div className="thead"><span><input type="checkbox" checked={cpUsersFiltered.length > 0 && cpUsersFiltered.every((row) => isCpRowSelected("users", row?.username))} onChange={(e) => setCpRowsSelectedAll("users", cpUsersFiltered, (row) => row?.username, e.target.checked)} /></span><span>Username</span><span>Role</span><span>Email</span><span>Status</span><span>MFA</span><span>Actions</span></div>
                           {(cpUsersFiltered || []).map((row, idx) => (
                             <div className="trow" key={`cp-user-${idx}`}>
@@ -15353,7 +15412,7 @@ function AppShell() {
                   )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
                 </div>
                 <div className="table-scroll" style={{ maxHeight: 220 }}>
-                  <div className="table">
+                  <div className="table cp-activation-table">
                     <div className="thead"><span><input type="checkbox" checked={cpActivationCodesFiltered.length > 0 && cpActivationCodesFiltered.every((row) => isCpRowSelected("activation", row?.id))} onChange={(e) => setCpRowsSelectedAll("activation", cpActivationCodesFiltered, (row) => row?.id, e.target.checked)} /></span><span>ID</span><span>Customer</span><span>Edge Name</span><span>Status</span><span>Expires</span><span>Used</span><span>Actions</span></div>
                     {cpActivationCodesFiltered.map((row, idx) => (
                       <div className="trow" key={`cp-ac-${idx}`}>

@@ -1983,6 +1983,64 @@ body {
   align-content: start;
 }
 
+.control-plane-page-fill {
+  min-height: calc(100vh - 140px);
+}
+
+.control-plane-layout {
+  min-height: calc(100vh - 170px);
+}
+
+.control-plane-main {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - 170px);
+}
+
+.control-plane-main > .card {
+  flex: 1 1 auto;
+}
+
+.control-plane-workspace {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+.control-plane-workspace-card {
+  width: 100%;
+}
+
+.cp-customers-table .thead,
+.cp-customers-table .trow {
+  grid-template-columns: 40px 1.15fr 1.25fr 1.2fr .7fr 120px;
+}
+
+.cp-licenses-table .thead,
+.cp-licenses-table .trow {
+  grid-template-columns: 40px 1fr .95fr .9fr .9fr 1.35fr .7fr 120px;
+}
+
+.cp-edges-table .thead,
+.cp-edges-table .trow {
+  grid-template-columns: 40px 1fr 1fr .95fr 1.4fr .65fr .75fr 120px;
+}
+
+.cp-users-table .thead,
+.cp-users-table .trow {
+  grid-template-columns: 40px 1fr .85fr 1.2fr .7fr .55fr 120px;
+}
+
+.cp-activation-table .thead,
+.cp-activation-table .trow {
+  grid-template-columns: 40px .55fr .95fr 1.1fr .7fr 1fr 1fr 200px;
+}
+
+.cp-workspace-table .thead,
+.cp-workspace-table .trow {
+  grid-template-columns: 1.2fr 1.2fr .8fr 120px;
+}
+
 .thead,
 .trow {
   display: grid;

@@ -251,23 +251,9 @@ class ControlPlaneStore:
                         "INSERT INTO cp_tenants(tenant_id, name, status, primary_domain, timezone, metadata_json, created_utc, updated_utc) VALUES(?,?,?,?,?,?,?,?)",
                         ("default", "Default Tenant", "active", "trustnode.lsapps.app", "Europe/Dublin", "{}", now, now),
                     )
-                cur.execute("SELECT customer_id FROM cp_customers WHERE customer_id='cust-default'")
-                if not cur.fetchone():
-                    cur.execute(
-                        "INSERT INTO cp_customers(customer_id, tenant_id, company_name, contact_email, status, metadata_json, created_utc, updated_utc) VALUES(?,?,?,?,?,?,?,?)",
-                        ("cust-default", "default", "Default Customer", "", "active", "{}", now, now),
-                    )
-                cur.execute("SELECT license_id FROM cp_licenses WHERE license_id='lic-default'")
-                if not cur.fetchone():
-                    cur.execute(
-                        "INSERT INTO cp_licenses(license_id, tenant_id, customer_id, plan_code, status, start_utc, end_utc, max_edges, max_users, metadata_json, created_utc, updated_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        ("lic-default", "default", "cust-default", "standard", "active", now, "", 5, 50, "{}", now, now),
-                    )
-                for module in self.MODULE_CATALOG:
-                    cur.execute(
-                        "INSERT OR IGNORE INTO cp_license_modules(license_id, module_key, enabled, updated_utc) VALUES(?,?,?,?)",
-                        ("lic-default", module["key"], int(bool(module.get("default_enabled", True))), now),
-                    )
+                # NOTE:
+                # We intentionally do NOT auto-reseed default customer/license rows.
+                # Operators must be able to delete them permanently from portal UI.
                 cur.execute("SELECT id FROM cp_users WHERE tenant_id='default' AND username='admin'")
                 if not cur.fetchone():
                     cur.execute(
