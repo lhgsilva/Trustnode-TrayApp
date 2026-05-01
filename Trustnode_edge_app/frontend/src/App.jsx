@@ -6192,6 +6192,36 @@ function AppShell() {
   const fmtTsShort = useCallback((value) => {
     return formatTimeDisplay(value, displayTimeZone);
   }, [displayTimeZone]);
+  const toDateInputValue = useCallback((value) => {
+    const txt = String(value || "").trim();
+    if (!txt) return "";
+    const d = new Date(txt);
+    if (Number.isNaN(d.getTime())) return "";
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(d.getUTCDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }, []);
+  const toUtcStartOfDay = useCallback((dateTxt) => {
+    const txt = String(dateTxt || "").trim();
+    if (!txt) return "";
+    return `${txt}T00:00:00Z`;
+  }, []);
+  const toUtcEndOfDay = useCallback((dateTxt) => {
+    const txt = String(dateTxt || "").trim();
+    if (!txt) return "";
+    return `${txt}T23:59:59Z`;
+  }, []);
+  const fmtDateDdMmYyyy = useCallback((value) => {
+    const txt = String(value || "").trim();
+    if (!txt) return "";
+    const d = new Date(txt);
+    if (Number.isNaN(d.getTime())) return txt;
+    const day = String(d.getUTCDate()).padStart(2, "0");
+    const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const year = d.getUTCFullYear();
+    return `${day}-${month}-${year}`;
+  }, []);
 
   const inRange = (value, from, to) => {
     if (!from && !to) return true;
@@ -11005,8 +11035,8 @@ function AppShell() {
       customer_id: String(row?.customer_id || ""),
       plan_code: String(row?.plan_code || "standard"),
       status: String(row?.status || "active"),
-      start_utc: String(row?.start_utc || ""),
-      end_utc: String(row?.end_utc || ""),
+      start_utc: toDateInputValue(String(row?.start_utc || "")),
+      end_utc: toDateInputValue(String(row?.end_utc || "")),
       max_edges: Math.max(1, Number(row?.max_edges || 1)),
       max_users: Math.max(1, Number(row?.max_users || 1)),
     });
@@ -11064,18 +11094,18 @@ function AppShell() {
       setCpModalError("Select a customer for this license.");
       return;
     }
-    const startUtc = String(cpLicenseForm.start_utc || "").trim();
-    const endUtc = String(cpLicenseForm.end_utc || "").trim();
-    if (startUtc && Number.isNaN(Date.parse(startUtc))) {
-      setCpModalError("Start UTC format is invalid. Use ISO format like 2026-04-24T00:00:00Z.");
+    const startDate = String(cpLicenseForm.start_utc || "").trim();
+    const endDate = String(cpLicenseForm.end_utc || "").trim();
+    if (startDate && Number.isNaN(Date.parse(`${startDate}T00:00:00Z`))) {
+      setCpModalError("Start date format is invalid.");
       return;
     }
-    if (endUtc && Number.isNaN(Date.parse(endUtc))) {
-      setCpModalError("End UTC format is invalid. Use ISO format like 2027-04-24T00:00:00Z.");
+    if (endDate && Number.isNaN(Date.parse(`${endDate}T00:00:00Z`))) {
+      setCpModalError("End date format is invalid.");
       return;
     }
-    if (startUtc && endUtc && Date.parse(endUtc) < Date.parse(startUtc)) {
-      setCpModalError("End UTC must be later than Start UTC.");
+    if (startDate && endDate && Date.parse(`${endDate}T00:00:00Z`) < Date.parse(`${startDate}T00:00:00Z`)) {
+      setCpModalError("End date must be later than start date.");
       return;
     }
     setCpModalError("");
@@ -11086,8 +11116,8 @@ function AppShell() {
         customer_id: customerId,
         plan_code: String(cpLicenseForm.plan_code || "standard").trim() || "standard",
         status: String(cpLicenseForm.status || "active").trim() || "active",
-        start_utc: startUtc,
-        end_utc: endUtc,
+        start_utc: toUtcStartOfDay(startDate),
+        end_utc: toUtcEndOfDay(endDate),
         max_edges: Math.max(1, Number(cpLicenseForm.max_edges || 1)),
         max_users: Math.max(1, Number(cpLicenseForm.max_users || 1)),
         metadata: {},
@@ -15161,7 +15191,7 @@ function AppShell() {
                               <span>{String(row?.customer_id || "-")}</span>
                               <span>{String(row?.plan_code || "-")}</span>
                               <span>{`${Number(row?.max_edges || 0)} / ${Number(row?.max_users || 0)}`}</span>
-                              <span>{`${fmtTs(row?.start_utc || "") || "-"} -> ${fmtTs(row?.end_utc || "") || "-"}`}</span>
+                              <span>{`${fmtDateDdMmYyyy(row?.start_utc || "") || "-"} -> ${fmtDateDdMmYyyy(row?.end_utc || "") || "-"}`}</span>
                               <span>{String(row?.status || "-")}</span>
                               <span className="row-actions">
                                 <button className="icon-btn table-action-btn" onClick={() => openCpLicenseEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>
@@ -15276,6 +15306,119 @@ function AppShell() {
                       </div>
                     </section>
                   ) : null}
+
+                  {cpPortalPage === "activation" ? (
+                    <section className="card">
+                      <h4 style={{ marginTop: 0 }}>Activation Flow</h4>
+                      <div className="form-grid">
+                        <label>
+                          Customer
+                          <select
+                            value={cpActivationIssueForm.customer_id}
+                            onChange={(e) =>
+                              setCpActivationIssueForm((p) => ({
+                                ...p,
+                                customer_id: e.target.value,
+                                edge_id: "",
+                                license_id: "",
+                                edge_name: "",
+                              }))
+                            }
+                          >
+                            <option value="">Select customer</option>
+                            {(cpCustomersView || []).map((c) => (
+                              <option key={`cp-activation-customer-main-${String(c?.customer_id || "")}`} value={String(c?.customer_id || "")}>
+                                {String(c?.company_name || c?.customer_id || "-")}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          Edge App
+                          <select
+                            value={cpActivationIssueForm.edge_id}
+                            onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, edge_id: e.target.value }))}
+                            disabled={!cpActivationIssueForm.customer_id}
+                          >
+                            <option value="">Select edge app</option>
+                            {cpActivationEdgesForCustomer.map((r) => (
+                              <option key={`cp-activation-edge-main-${String(r?.edge_id || "")}`} value={String(r?.edge_id || "")}>
+                                {String(r?.edge_name || r?.edge_id || "-")}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          License
+                          <select
+                            value={cpActivationIssueForm.license_id}
+                            onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, license_id: e.target.value }))}
+                            disabled={!cpActivationIssueForm.customer_id}
+                          >
+                            <option value="">Select active license</option>
+                            {cpActivationLicensesForCustomer.map((r) => (
+                              <option key={`cp-activation-license-main-${String(r?.license_id || "")}`} value={String(r?.license_id || "")}>
+                                {String(r?.license_id || "-")} | {String(r?.plan_code || "-")}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          Activation Edge Name
+                          <input value={cpActivationIssueForm.edge_name} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, edge_name: e.target.value }))} />
+                        </label>
+                        <label>
+                          Activation TTL (min)
+                          <input type="number" min="1" value={cpActivationIssueForm.ttl_minutes} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, ttl_minutes: Number(e.target.value || 30) }))} />
+                        </label>
+                      </div>
+                      <div className="row">
+                        <button className="btn btn-success" onClick={issueTenantActivationCode} disabled={cpBusy || !canEditPage("control_plane")}>Issue Activation Code</button>
+                        <input readOnly value={cpIssuedActivationCode} placeholder="Activation code will appear here" style={{ minWidth: 280 }} />
+                      </div>
+                      <div className="form-grid" style={{ marginTop: 12 }}>
+                        <label>
+                          Activation Code
+                          <input value={cpActivationApplyForm.activation_code} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, activation_code: e.target.value }))} />
+                        </label>
+                        <label>
+                          Edge ID
+                          <input value={cpActivationApplyForm.edge_id} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, edge_id: e.target.value }))} />
+                        </label>
+                        <label>
+                          Edge Name
+                          <input value={cpActivationApplyForm.edge_name} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, edge_name: e.target.value }))} />
+                        </label>
+                      </div>
+                      <div className="row">
+                        <button className="btn btn-primary" onClick={applyTenantActivationCode} disabled={cpBusy || !canEditPage("control_plane")}>Validate Activation</button>
+                      </div>
+                      <h5 style={{ marginTop: 12, marginBottom: 6 }}>Issued Activation Codes</h5>
+                      <div className="table-scroll" style={{ marginTop: 6 }}>
+                        <div className="table cp-activation-table">
+                          <div className="thead"><span><input type="checkbox" checked={cpActivationCodesFiltered.length > 0 && cpActivationCodesFiltered.every((row) => isCpRowSelected("activation", row?.id))} onChange={(e) => setCpRowsSelectedAll("activation", cpActivationCodesFiltered, (row) => row?.id, e.target.checked)} /></span><span>ID</span><span>Customer</span><span>Edge ID</span><span>License</span><span>Edge Name</span><span>Status</span><span>Expires</span><span>Used</span><span>Actions</span></div>
+                          {cpActivationCodesFiltered.map((row, idx) => (
+                            <div className="trow" key={`cp-main-ac-${idx}`}>
+                              <span><input type="checkbox" checked={isCpRowSelected("activation", row?.id)} onChange={(e) => setCpRowSelected("activation", row?.id, e.target.checked)} /></span>
+                              <span>{String(row?.id || "-")}</span>
+                              <span>{String(row?.customer_id || "-")}</span>
+                              <span>{String(row?.edge_id || "-")}</span>
+                              <span>{String(row?.license_id || "-")}</span>
+                              <span>{String(row?.edge_name || "-")}</span>
+                              <span>{String(row?.status || "-")}</span>
+                              <span>{fmtTs(String(row?.expires_utc || "")) || "-"}</span>
+                              <span>{fmtTs(String(row?.used_utc || "")) || "-"}</span>
+                              <span className="row-actions">
+                                <button className="btn btn-sm" onClick={() => updateActivationCodeStatus(row, "issued")} disabled={cpBusy || !canEditPage("control_plane")}>Re-issue</button>
+                                <button className="btn btn-sm btn-danger" onClick={() => updateActivationCodeStatus(row, "revoked")} disabled={cpBusy || !canEditPage("control_plane")}>Revoke</button>
+                                <button className="icon-btn danger table-action-btn" onClick={() => deleteCpActivationCode(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </section>
+                  ) : null}
                 </div>
               </div>
 
@@ -15369,7 +15512,7 @@ function AppShell() {
               </section>
               ) : null}
 
-              {(!isPortalOnly || cpPortalPage === "activation") ? (
+              {!isPortalOnly ? (
               <section className="card">
                 <h4>Edge Health / Activation / Password Recovery</h4>
                 <div className="form-grid">
@@ -17153,12 +17296,12 @@ function AppShell() {
                 </select>
               </label>
               <label>
-                Start UTC
-                <input value={cpLicenseForm.start_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, start_utc: e.target.value }))} placeholder="2026-04-24T00:00:00Z" />
+                Start Date
+                <input type="date" value={cpLicenseForm.start_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, start_utc: e.target.value }))} />
               </label>
               <label>
-                End UTC
-                <input value={cpLicenseForm.end_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, end_utc: e.target.value }))} placeholder="2027-04-24T00:00:00Z" />
+                End Date
+                <input type="date" value={cpLicenseForm.end_utc} onChange={(e) => setCpLicenseForm((p) => ({ ...p, end_utc: e.target.value }))} />
               </label>
               <label>
                 Max Edges

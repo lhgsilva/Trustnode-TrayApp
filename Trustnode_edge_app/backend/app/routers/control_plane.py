@@ -467,6 +467,7 @@ def apply_activation_code(payload: ActivationCodeApplyRequest, request: Request)
             site=payload.site,
             area=payload.area,
             equipment=payload.equipment,
+            consume_code=False,
         )
         tid = normalize_tenant_id(str(row.get("tenant_id") or get_current_tenant()))
         control_plane_store.audit(
