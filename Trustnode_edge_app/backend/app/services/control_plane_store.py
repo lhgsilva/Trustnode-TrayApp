@@ -784,8 +784,15 @@ class ControlPlaneStore:
                     conn.commit()
                     raise ValueError("activation_code_expired")
                 code_edge_id = str(r.get("edge_id") or "").strip()
-                if code_edge_id and str(edge_id or "").strip() != code_edge_id:
-                    raise ValueError("activation_code_edge_mismatch")
+                requested_edge_id = str(edge_id or "").strip()
+                # Activation code is the source of truth for bound edge identity.
+                # If local UI sends a generated edge id, prefer the code-bound edge.
+                if code_edge_id:
+                    edge_id = code_edge_id
+                elif requested_edge_id:
+                    edge_id = requested_edge_id
+                else:
+                    raise ValueError("edge_id_required")
                 tid = normalize_tenant_id(str(r.get("tenant_id") or "default"))
                 cid = str(r.get("customer_id") or "").strip()
                 lid = str(r.get("license_id") or "").strip()

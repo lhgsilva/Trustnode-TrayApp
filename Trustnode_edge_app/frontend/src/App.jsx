@@ -2287,10 +2287,26 @@ function AppShell() {
     }
   }, []);
   const logoSrc = useMemo(() => {
-    const base = String(import.meta?.env?.BASE_URL || "/");
-    const normalized = base.endsWith("/") ? base : `${base}/`;
-    return `${normalized}trustnode_logo.png`;
+    try {
+      const protocol = String(window.location?.protocol || "");
+      if (protocol === "file:") return "trustnode_logo.png";
+      return `${String(window.location?.origin || "").replace(/\/+$/, "")}/trustnode_logo.png`;
+    } catch {
+      const base = String(import.meta?.env?.BASE_URL || "/");
+      const normalized = base.endsWith("/") ? base : `${base}/`;
+      return `${normalized}trustnode_logo.png`;
+    }
   }, []);
+  const handleLogoLoadError = (e) => {
+    const img = e?.currentTarget;
+    if (!img) return;
+    const fallbackOrder = ["trustnode_logo.png", "./trustnode_logo.png", "/trustnode_logo.png"];
+    const tried = String(img.dataset.logoTried || "");
+    const next = fallbackOrder.find((src) => !tried.split("|").includes(src));
+    if (!next) return;
+    img.dataset.logoTried = tried ? `${tried}|${next}` : next;
+    img.src = next;
+  };
   const [devices, setDevices] = useState([]);
   const [showDeviceModal, setShowDeviceModal] = useState(false);
   const [editingDeviceId, setEditingDeviceId] = useState(null);
@@ -5958,8 +5974,14 @@ function AppShell() {
     );
   }, [cpModulesView, cpListFilters.modules]);
 
-  const cpActivationCodesFiltered = useMemo(() => {
+  const cpActivationCodesView = useMemo(() => {
     const rows = Array.isArray(cpActivationCodes) ? cpActivationCodes : [];
+    if (!cpCustomerFilter || cpCustomerFilter === "__all__") return rows;
+    return rows.filter((r) => String(r?.customer_id || "") === cpCustomerFilter);
+  }, [cpActivationCodes, cpCustomerFilter]);
+
+  const cpActivationCodesFiltered = useMemo(() => {
+    const rows = cpActivationCodesView;
     const q = String(cpListFilters.activation || "").trim().toLowerCase();
     if (!q) return rows;
     return rows.filter((r) =>
@@ -5971,7 +5993,7 @@ function AppShell() {
       String(r?.status || "").toLowerCase().includes(q) ||
       String(r?.id || "").toLowerCase().includes(q)
     );
-  }, [cpActivationCodes, cpListFilters.activation]);
+  }, [cpActivationCodesView, cpListFilters.activation]);
 
   const cpActivationEdgesForCustomer = useMemo(() => {
     const cid = String(cpActivationIssueForm.customer_id || "").trim();
@@ -11602,22 +11624,20 @@ function AppShell() {
   };
 
   const openEdgeRegisterModal = () => {
-    const autoEdgeId = `edge-${Date.now()}`;
     setEdgeRegisterForm((prev) => ({
       ...prev,
-      edge_id: String(prev.edge_id || autoEdgeId),
-      edge_name: String(prev.edge_name || "Local Edge"),
+      edge_id: "",
+      edge_name: "Local Edge",
     }));
     setEdgeRegisterResult("");
     setLoginTab("register");
   };
 
   const submitEdgeRegister = async () => {
-    const generatedEdgeId = `edge-${Date.now()}`;
     const payload = {
       activation_code: String(edgeRegisterForm.activation_code || "").trim(),
-      edge_id: String(edgeRegisterForm.edge_id || "").trim() || generatedEdgeId,
-      edge_name: String(edgeRegisterForm.edge_name || "").trim() || "Local Edge",
+      edge_id: "",
+      edge_name: "",
       site: "",
       area: "",
       equipment: "",
@@ -11632,7 +11652,7 @@ function AppShell() {
     try {
       const res = await registerControlPlaneEdgeLink(payload);
       setEdgeRegisterResult(
-        `Activated edge '${String(res?.edge_id || payload.edge_id)}' for tenant '${String(res?.tenant_id || "")}'. You can login now.`
+        `Activated edge '${String(res?.edge_id || "")}' for tenant '${String(res?.tenant_id || "")}'. You can login now.`
       );
       localStorage.setItem(EDGE_LINKED_STORAGE_KEY, "true");
       setEdgeLinked(true);
@@ -11641,8 +11661,8 @@ function AppShell() {
       setLinkedLicenseId(String(res?.license_id || ""));
       setEdgeProfile((prev) => ({
         ...prev,
-        edge_id: String(res?.edge_id || payload.edge_id || prev.edge_id || ""),
-        edge_name: String(res?.edge_name || payload.edge_name || prev.edge_name || "Local Edge"),
+        edge_id: String(res?.edge_id || prev.edge_id || ""),
+        edge_name: String(res?.edge_name || prev.edge_name || "Local Edge"),
         location: [String(res?.site || ""), String(res?.area || "")].filter(Boolean).join(" / "),
         machine_group: String(res?.equipment || prev.machine_group || ""),
       }));
@@ -11834,7 +11854,7 @@ function AppShell() {
             </button>
           </div>
           <div className="auth-brand">
-            <img src={logoSrc} alt="Trustnode" className="auth-logo" onError={(e) => { e.currentTarget.onerror = null; e.currentTarget.src = "/trustnode_logo.png"; }} />
+            <img src={logoSrc} alt="Trustnode" className="auth-logo" onError={handleLogoLoadError} />
             <div>
               <div className="auth-title">Trustnode Edge</div>
               <div className="auth-subtitle">Secure PLC Data Gateway</div>
@@ -11952,7 +11972,7 @@ function AppShell() {
     return (
       <div className="loading">
         <div className="loading-card">
-          <img src={logoSrc} alt="Trustnode" className="loading-logo" onError={(e) => { e.currentTarget.onerror = null; e.currentTarget.src = "/trustnode_logo.png"; }} />
+          <img src={logoSrc} alt="Trustnode" className="loading-logo" onError={handleLogoLoadError} />
           <div className="loading-title">
             {bootState === "waiting_backend"
               ? "Waiting for backend service..."
@@ -11971,13 +11991,13 @@ function AppShell() {
 
   return (
     <div className="shell">
-      <header className="app-header">
+      <header className={`app-header ${isPortalOnly ? "portal-header" : ""}`}>
         <div className="header-left">
           <button className="nav-toggle-btn" onClick={() => setSidebarCollapsed((v) => !v)} aria-label="Toggle navigation">
             <HamburgerIcon />
           </button>
           <div className="brand">
-            <img src={logoSrc} alt="Trustnode" className="brand-logo" onError={(e) => { e.currentTarget.onerror = null; e.currentTarget.src = "/trustnode_logo.png"; }} />
+            <img src={logoSrc} alt="Trustnode" className="brand-logo" onError={handleLogoLoadError} />
             <div>
               <div className="brand-title">Trustnode Edge</div>
               <div className="brand-subtitle">Industrial Data Gateway</div>
