@@ -2126,6 +2126,14 @@ function AppShell() {
   const [rememberUser, setRememberUser] = useState(true);
   const [loginError, setLoginError] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
+  const [showAuthBackground, setShowAuthBackground] = useState(() => {
+    try {
+      const raw = localStorage.getItem("tn_auth_bg");
+      return raw == null ? true : raw !== "0";
+    } catch {
+      return true;
+    }
+  });
   const [edgeRegisterBusy, setEdgeRegisterBusy] = useState(false);
   const [edgeRegisterResult, setEdgeRegisterResult] = useState("");
   const [edgeRegisterForm, setEdgeRegisterForm] = useState({
@@ -11903,15 +11911,44 @@ function AppShell() {
   };
 
   if (!currentUser) {
-    const showRegisterTab = !isHostedWebClient && !edgeLinked;
+  const showRegisterTab = !isHostedWebClient && !edgeLinked;
+    const isPortalV1Login = (() => {
+      try {
+        const path = String(window.location?.pathname || "");
+        return path.startsWith("/portal/v1");
+      } catch {
+        return false;
+      }
+    })();
     const authShellClass = (() => {
-      if (theme === "dark") return "auth-shell auth-shell--fixed-dark";
-      return "auth-shell auth-shell--themed";
+      const classes = ["auth-shell"];
+      if (theme === "dark") classes.push("auth-shell--fixed-dark");
+      else classes.push("auth-shell--themed");
+      if (!showAuthBackground) classes.push("auth-shell--no-bg");
+      if (isPortalV1Login) classes.push("auth-shell--v1");
+      return classes.join(" ");
     })();
     return (
       <div className={authShellClass}>
         <div className="auth-card">
           <div className="auth-header-row">
+            <button
+              className="icon-btn theme-btn auth-theme-btn"
+              onClick={() =>
+                setShowAuthBackground((v) => {
+                  const next = !v;
+                  try {
+                    localStorage.setItem("tn_auth_bg", next ? "1" : "0");
+                  } catch {
+                    // ignore localStorage errors
+                  }
+                  return next;
+                })
+              }
+              title={showAuthBackground ? "Hide background image" : "Show background image"}
+            >
+              {showAuthBackground ? "🖼" : "⬛"}
+            </button>
             <button className="icon-btn theme-btn auth-theme-btn" onClick={toggleTheme} title="Toggle light/dark mode">
               <ThemeIcon theme={theme} />
             </button>
