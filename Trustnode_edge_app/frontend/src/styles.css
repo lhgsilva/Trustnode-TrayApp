@@ -1,6 +1,6 @@
 :root {
   --bg: #f3f3f3;
-  --header: #000000;
+  --header: #141414;
   --header-text: #d4d4d4;
   --header-border: #1f1f1f;
   --header-surface: #111111;
@@ -27,7 +27,7 @@
 
 [data-theme="dark"] {
   --bg: #1e1e1e;
-  --header: #000000;
+  --header: #141414;
   --header-text: #d4d4d4;
   --header-border: #1f1f1f;
   --header-surface: #111111;

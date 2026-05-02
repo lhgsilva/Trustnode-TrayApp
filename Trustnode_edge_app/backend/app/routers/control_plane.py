@@ -111,13 +111,13 @@ class ActivationCodeUpdateRequest(BaseModel):
 
 class EdgeRegisterRequest(BaseModel):
     activation_code: str
-    edge_id: str
+    edge_id: str = ""
     edge_name: str = ""
     site: str = ""
     area: str = ""
     equipment: str = ""
     admin_username: str = "admin"
-    admin_password: str
+    admin_password: str = ""
 
 
 class EdgeLocalFinalizeRequest(BaseModel):
@@ -129,7 +129,7 @@ class EdgeLocalFinalizeRequest(BaseModel):
     cloud_api_url: str = ""
     primary_domain: str = ""
     admin_username: str = "admin"
-    admin_password: str
+    admin_password: str = ""
 
 
 class PasswordResetIssueRequest(BaseModel):
@@ -851,7 +851,7 @@ def edge_link_bootstrap(payload: ActivationCodeApplyRequest, request: Request) -
 def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[str, Any]:
     cloud_url = _resolve_cloud_control_plane_base(request)
     admin_username = str(payload.admin_username or "").strip() or "admin"
-    admin_password = str(payload.admin_password or "")
+    admin_password = str(payload.admin_password or "").strip() or "admin"
     try:
         proxied_row: dict[str, Any] | None = None
         try:
@@ -884,7 +884,7 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                         "area": payload.area,
                         "equipment": payload.equipment,
                         "admin_username": payload.admin_username,
-                        "admin_password": payload.admin_password,
+                        "admin_password": admin_password,
                     },
                     headers={"Content-Type": "application/json"},
                     timeout=20,
@@ -928,9 +928,6 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                 consume_code=True,
             )
         tenant_id = normalize_tenant_id(str(row.get("tenant_id") or "default"))
-        if not admin_password:
-            raise ValueError("admin_password_required")
-
         # Create/refresh tenant admin in control-plane auth store.
         control_plane_store.upsert_user(
             tenant_id=tenant_id,
@@ -1072,9 +1069,7 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
     try:
         tenant_id = normalize_tenant_id(str(payload.tenant_id or "default"))
         admin_username = str(payload.admin_username or "").strip() or "admin"
-        admin_password = str(payload.admin_password or "")
-        if not admin_password:
-            raise ValueError("admin_password_required")
+        admin_password = str(payload.admin_password or "").strip() or "admin"
 
         # Ensure local auth store contains the edge admin for immediate login.
         control_plane_store.upsert_user(

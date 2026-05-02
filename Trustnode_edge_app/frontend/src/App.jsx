@@ -1855,6 +1855,9 @@ function AppShell() {
     location: "",
     machine_group: "",
   });
+  const [edgeProfileSaveResult, setEdgeProfileSaveResult] = useState("");
+  const [edgeLicenseSnapshot, setEdgeLicenseSnapshot] = useState(null);
+  const [edgeLicenseBusy, setEdgeLicenseBusy] = useState(false);
   const [cloudSupabaseMode, setCloudSupabaseMode] = useState("auto");
   const [cloudSupabaseHasIpv4AddOn, setCloudSupabaseHasIpv4AddOn] = useState(true);
   const [cloudSupabaseApplyResult, setCloudSupabaseApplyResult] = useState("");
@@ -6070,6 +6073,7 @@ function AppShell() {
         const last = String(localStorage.getItem(key) || "");
         if (last === today) return;
         const out = await checkControlPlaneEdgeLicense(edgeId, currentTenantId || "default");
+        setEdgeLicenseSnapshot(out || null);
         localStorage.setItem(key, today);
         if (!out?.ok) {
           setError(`License check warning for edge '${edgeId}': ${String(out?.reason || "invalid_license")}`);
@@ -10672,7 +10676,8 @@ function AppShell() {
         permissions: normalizePermissions(u.permissions || {}, u.role || "viewer"),
         modules: Array.isArray(u.modules) ? u.modules : deriveModuleKeysFromPermissions(normalizePermissions(u.permissions || {}, u.role || "viewer")),
       }));
-      if (normalized.length) setUsers(normalized);
+      setUsers(normalized);
+      setCpUsers(normalized);
       return normalized;
     } catch {
       return null;
@@ -11560,6 +11565,7 @@ function AppShell() {
     };
     const nextUsers = [...users, newUser];
     const actor = currentUser?.username || "system";
+    const tenantScope = getControlPlaneTenantScope();
     upsertControlPlaneUser(
       {
         username: newUser.username,
@@ -11571,16 +11577,19 @@ function AppShell() {
         modules: newUser.modules,
         permissions: newUser.permissions,
       },
-      currentTenantId || "default"
+      tenantScope
     )
       .then(async () => {
-        await refreshControlPlaneUsers(currentTenantId || "default");
-        // Backward-compat mirror for legacy bootstrap consumers.
-        await saveAppStoreDomain(
-          "users_access",
-          { users: nextUsers, current_user: currentUser?.username || "" },
-          actor
-        );
+        await refreshControlPlaneUsers(tenantScope);
+        await refreshControlPlaneData(tenantScope);
+        // Local desktop only: keep users_access mirror for bootstrap compatibility.
+        if (!isHostedWebClientRuntime()) {
+          await saveAppStoreDomain(
+            "users_access",
+            { users: nextUsers, current_user: currentUser?.username || "" },
+            actor
+          );
+        }
         setError("");
         setNewUserForm({
           username: "",
@@ -11588,10 +11597,12 @@ function AppShell() {
           role: "viewer",
           permissions: buildRolePermissions("viewer")
         });
-        try {
-          await forceAppStoreSyncNow(actor);
-        } catch {
-          // Best-effort immediate propagation. Background sync still runs.
+        if (!isHostedWebClientRuntime()) {
+          try {
+            await forceAppStoreSyncNow(actor);
+          } catch {
+            // Best-effort immediate propagation. Background sync still runs.
+          }
         }
       })
       .catch((err) => {
@@ -11628,10 +11639,53 @@ function AppShell() {
       ...prev,
       edge_id: "",
       edge_name: "Local Edge",
+      admin_username: "admin",
+      admin_password: "",
     }));
     setEdgeRegisterResult("");
     setLoginTab("register");
   };
+
+  const refreshEdgeLicenseSnapshot = async () => {
+    try {
+      const edgeId = String(edgeProfile?.edge_id || "").trim();
+      if (!edgeId) return;
+      setEdgeLicenseBusy(true);
+      const out = await checkControlPlaneEdgeLicense(edgeId, currentTenantId || "default");
+      setEdgeLicenseSnapshot(out || null);
+    } catch {
+      // Keep current UI state if refresh fails.
+    } finally {
+      setEdgeLicenseBusy(false);
+    }
+  };
+
+  const saveEdgeIdentity = async () => {
+    if (!canEditPage("edge")) return;
+    setEdgeProfileSaveResult("");
+    try {
+      const payload = {
+        edge_profile: {
+          edge_id: String(edgeProfile?.edge_id || "").trim(),
+          edge_name: String(edgeProfile?.edge_name || "").trim(),
+          location: String(edgeProfile?.location || "").trim(),
+          machine_group: String(edgeProfile?.machine_group || "").trim(),
+          description: String(edgeProfile?.description || "").trim(),
+        },
+      };
+      await saveAppStoreDomain("app_settings", payload, currentUser?.username || "system");
+      setEdgeProfileSaveResult("Edge information saved.");
+      await refreshEdgeLicenseSnapshot();
+    } catch (err) {
+      setEdgeProfileSaveResult(`Save failed: ${String(err?.message || err)}`);
+    }
+  };
+
+  useEffect(() => {
+    if (!currentUser || isHostedWebClient) return;
+    if (activePage !== "edge") return;
+    refreshEdgeLicenseSnapshot();
+  }, [activePage, currentUser, isHostedWebClient, edgeProfile?.edge_id, currentTenantId]);
 
   const submitEdgeRegister = async () => {
     const payload = {
@@ -11641,11 +11695,11 @@ function AppShell() {
       site: "",
       area: "",
       equipment: "",
-      admin_username: String(edgeRegisterForm.admin_username || "").trim() || "admin",
-      admin_password: String(edgeRegisterForm.admin_password || ""),
+      admin_username: "admin",
+      admin_password: "admin",
     };
-    if (!payload.activation_code || !payload.admin_password) {
-      setEdgeRegisterResult("Activation code, admin username and admin password are required.");
+    if (!payload.activation_code) {
+      setEdgeRegisterResult("Activation code is required.");
       return;
     }
     setEdgeRegisterBusy(true);
@@ -11669,8 +11723,8 @@ function AppShell() {
       setLoginTab("login");
       setLoginForm((prev) => ({
         ...prev,
-        username: payload.admin_username,
-        password: payload.admin_password,
+        username: "admin",
+        password: "admin",
       }));
     } catch (err) {
       setEdgeRegisterResult(`Edge registration failed: ${String(err?.message || err)}`);
@@ -11760,6 +11814,7 @@ function AppShell() {
       };
     });
     const actor = currentUser?.username || "system";
+    const tenantScope = getControlPlaneTenantScope();
     upsertControlPlaneUser(
       {
         username: editingUsername,
@@ -11771,15 +11826,18 @@ function AppShell() {
         modules: deriveModuleKeysFromPermissions(normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")),
         permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer"),
       },
-      currentTenantId || "default"
+      tenantScope
     )
       .then(async () => {
-        await refreshControlPlaneUsers(currentTenantId || "default");
-        await saveAppStoreDomain(
-          "users_access",
-          { users: nextUsers, current_user: currentUser?.username || "" },
-          actor
-        );
+        await refreshControlPlaneUsers(tenantScope);
+        await refreshControlPlaneData(tenantScope);
+        if (!isHostedWebClientRuntime()) {
+          await saveAppStoreDomain(
+            "users_access",
+            { users: nextUsers, current_user: currentUser?.username || "" },
+            actor
+          );
+        }
         if (currentUser?.username === editingUsername) {
           setCurrentUser((prev) => {
             if (!prev) return prev;
@@ -11795,10 +11853,12 @@ function AppShell() {
         setShowEditUserModal(false);
         setEditingUsername("");
         setError("");
-        try {
-          await forceAppStoreSyncNow(actor);
-        } catch {
-          // Best-effort immediate propagation. Background sync still runs.
+        if (!isHostedWebClientRuntime()) {
+          try {
+            await forceAppStoreSyncNow(actor);
+          } catch {
+            // Best-effort immediate propagation. Background sync still runs.
+          }
         }
       })
       .catch((err) => {
@@ -11817,20 +11877,26 @@ function AppShell() {
     withConfirm("Delete User", `Delete user '${target}'?`, () => {
       const nextUsers = users.filter((u) => String(u.username) !== target);
       const actor = currentUser?.username || "system";
-      deleteControlPlaneUser(target, getControlPlaneTenantScope())
+      const tenantScope = getControlPlaneTenantScope();
+      deleteControlPlaneUser(target, tenantScope)
         .then(async () => {
-          await refreshControlPlaneUsers(getControlPlaneTenantScope());
-          await saveAppStoreDomain(
-            "users_access",
-            { users: nextUsers, current_user: currentUser?.username || "" },
-            actor
-          );
+          await refreshControlPlaneUsers(tenantScope);
+          await refreshControlPlaneData(tenantScope);
+          if (!isHostedWebClientRuntime()) {
+            await saveAppStoreDomain(
+              "users_access",
+              { users: nextUsers, current_user: currentUser?.username || "" },
+              actor
+            );
+          }
           setError("");
           if (currentUser?.username === target) logout();
-          try {
-            await forceAppStoreSyncNow(actor);
-          } catch {
-            // Best-effort immediate propagation. Background sync still runs.
+          if (!isHostedWebClientRuntime()) {
+            try {
+              await forceAppStoreSyncNow(actor);
+            } catch {
+              // Best-effort immediate propagation. Background sync still runs.
+            }
           }
         })
         .catch((err) => {
@@ -11877,14 +11943,6 @@ function AppShell() {
                 <label>
                   Activation Code
                   <input value={edgeRegisterForm.activation_code} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, activation_code: e.target.value }))} />
-                </label>
-                <label>
-                  Admin Username
-                  <input value={edgeRegisterForm.admin_username} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_username: e.target.value }))} />
-                </label>
-                <label>
-                  Admin Password
-                  <input type="password" value={edgeRegisterForm.admin_password} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_password: e.target.value }))} />
                 </label>
               </div>
               {edgeRegisterResult ? <div className={edgeRegisterResult.includes("failed") ? "error" : "lock-note"}>{edgeRegisterResult}</div> : null}
@@ -13974,11 +14032,24 @@ function AppShell() {
                     Edge ID
                     <input
                       value={edgeProfile.edge_id}
-                      onChange={(e) => setEdgeProfile((p) => ({ ...p, edge_id: String(e.target.value || "").trim() }))}
                       placeholder="edge-01"
-                      disabled={!canEditPage("edge")}
+                      disabled
                     />
                   </label>
+                  <label>
+                    Linked Customer ID
+                    <input value={linkedCustomerId || "-"} disabled />
+                  </label>
+                  <label>
+                    Linked License ID
+                    <input value={linkedLicenseId || "-"} disabled />
+                  </label>
+                  <label>
+                    Linked Tenant
+                    <input value={tenantLoginRealm || "-"} disabled />
+                  </label>
+                </div>
+                <div className="form-grid">
                   <label>
                     Edge Name
                     <input
@@ -14006,18 +14077,6 @@ function AppShell() {
                       disabled={!canEditPage("edge")}
                     />
                   </label>
-                  <label>
-                    Linked Tenant
-                    <input value={tenantLoginRealm || "-"} disabled />
-                  </label>
-                  <label>
-                    Linked Customer ID
-                    <input value={linkedCustomerId || "-"} disabled />
-                  </label>
-                  <label>
-                    Linked License ID
-                    <input value={linkedLicenseId || "-"} disabled />
-                  </label>
                 </div>
                 <label>
                   Description
@@ -14032,6 +14091,16 @@ function AppShell() {
                 <div className="lock-note">
                   This identity is persisted with the app configuration and used by cloud UI selection/filtering context.
                 </div>
+                <div className="row" style={{ marginTop: 10, gap: 8 }}>
+                  <button className="btn btn-primary" onClick={saveEdgeIdentity} disabled={!canEditPage("edge")}>
+                    Save Edge Information
+                  </button>
+                </div>
+                {edgeProfileSaveResult ? (
+                  <div className={edgeProfileSaveResult.startsWith("Save failed") ? "error" : "info-note"} style={{ marginTop: 8 }}>
+                    {edgeProfileSaveResult}
+                  </div>
+                ) : null}
                 {currentUser?.role === "admin" ? (
                   <div className="row" style={{ marginTop: 10 }}>
                     <button className="btn btn-danger" onClick={unlinkCurrentEdge}>
@@ -14039,6 +14108,43 @@ function AppShell() {
                     </button>
                   </div>
                 ) : null}
+              </section>
+              <section className="card">
+                <div className="row interface-header-row">
+                  <h3 className="card-title" style={{ margin: 0 }}>License and Modules</h3>
+                  <button className="btn btn-secondary btn-sm" onClick={refreshEdgeLicenseSnapshot} disabled={edgeLicenseBusy}>
+                    {edgeLicenseBusy ? "Refreshing..." : "Refresh"}
+                  </button>
+                </div>
+                <div className="form-grid">
+                  <label>
+                    Status
+                    <input value={String(edgeLicenseSnapshot?.license?.status || edgeLicenseSnapshot?.reason || "-")} disabled />
+                  </label>
+                  <label>
+                    Start Date
+                    <input value={String(edgeLicenseSnapshot?.license?.start_utc || "-")} disabled />
+                  </label>
+                  <label>
+                    Expiry Date
+                    <input value={String(edgeLicenseSnapshot?.license?.end_utc || "-")} disabled />
+                  </label>
+                  <label>
+                    Activated Date
+                    <input value={String(edgeLicenseSnapshot?.edge?.updated_utc || "-")} disabled />
+                  </label>
+                </div>
+                <label>
+                  Enabled Modules
+                  <textarea
+                    rows={3}
+                    disabled
+                    value={(Array.isArray(edgeLicenseSnapshot?.license?.modules) ? edgeLicenseSnapshot.license.modules : [])
+                      .map((m) => String(m?.module_key || m?.key || "").trim())
+                      .filter(Boolean)
+                      .join(", ") || "-"}
+                  />
+                </label>
               </section>
             </>
           ) : null}
