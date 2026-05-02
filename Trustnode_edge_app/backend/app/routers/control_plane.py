@@ -866,8 +866,14 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             )
         except Exception as bootstrap_exc:
             # Desktop/local edge can run against a local app-store where control-plane
-            # rows are absent. In that case, resolve activation against cloud control-plane.
-            if "activation_code_not_found" in str(bootstrap_exc or "") and cloud_url:
+            # rows are absent or stale. Resolve activation against cloud control-plane
+            # for any activation-related local resolution error.
+            bootstrap_err = str(bootstrap_exc or "")
+            should_try_cloud = cloud_url and (
+                "activation_code_" in bootstrap_err
+                or "activation_" in bootstrap_err
+            )
+            if should_try_cloud:
                 upstream = requests.post(
                     f"{cloud_url}/api/control-plane/edge-link/register",
                     json={
@@ -908,7 +914,8 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                     except Exception:
                         detail = upstream.text
                     raise ValueError(str(detail or f"upstream_error_{upstream.status_code}")) from bootstrap_exc
-            raise
+            else:
+                raise
         # Finalize one-time activation only at registration commit (local store path).
         if proxied_row is None:
             control_plane_store.activate_edge_with_code(
