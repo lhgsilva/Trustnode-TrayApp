@@ -11961,6 +11961,10 @@ function AppShell() {
           ) : (
             <>
               <h3 className="auth-heading">Sign In</h3>
+              <div className="auth-welcome">
+                <div className="auth-welcome-title">Welcome back</div>
+                <div className="auth-welcome-subtitle">Sign in to access your edge gateway dashboard and industrial insights.</div>
+              </div>
               <label>
                 Username
                 <input value={loginForm.username} onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value })} placeholder="Enter username" />

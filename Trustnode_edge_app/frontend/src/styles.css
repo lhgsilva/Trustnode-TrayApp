@@ -71,41 +71,47 @@ body {
   min-height: 100vh;
   display: grid;
   place-items: center;
-  background: radial-gradient(circle at 20% 20%, var(--header-surface) 0%, var(--bg) 58%);
+  background:
+    radial-gradient(circle at 16% 22%, rgba(34, 211, 238, 0.14), transparent 34%),
+    radial-gradient(circle at 78% 70%, rgba(59, 130, 246, 0.12), transparent 38%),
+    linear-gradient(135deg, #031525 0%, #071d2f 45%, #0b2438 100%);
 }
 
 .auth-shell--fixed-dark {
   background:
-    radial-gradient(circle at 16% 14%, rgba(255, 255, 255, 0.04) 0%, transparent 36%),
-    linear-gradient(180deg, #1e1e1e 0%, #1b1b1b 100%);
+    radial-gradient(circle at 16% 14%, rgba(34, 211, 238, 0.15) 0%, transparent 34%),
+    radial-gradient(circle at 82% 84%, rgba(59, 130, 246, 0.12) 0%, transparent 36%),
+    linear-gradient(140deg, #02101d 0%, #071a2a 55%, #0b2438 100%);
   color: #e5e7eb;
 }
 
 .auth-shell--themed {
   background:
-    radial-gradient(circle at 18% 16%, color-mix(in srgb, var(--header) 10%, transparent) 0%, transparent 38%),
-    radial-gradient(circle at 82% 84%, color-mix(in srgb, var(--header-surface) 12%, transparent) 0%, transparent 34%),
-    linear-gradient(165deg, #f4f6f8 0%, #e9edf2 100%);
+    radial-gradient(circle at 18% 16%, rgba(37, 99, 235, 0.22) 0%, transparent 38%),
+    radial-gradient(circle at 82% 84%, rgba(20, 184, 166, 0.16) 0%, transparent 34%),
+    linear-gradient(165deg, #dfeaf7 0%, #cbdced 100%);
 }
 
 .auth-card {
-  width: min(470px, 92vw);
-  background: var(--header);
-  border: 1px solid var(--stroke);
-  border-radius: 18px;
-  padding: 14px 16px 16px;
-  box-shadow: 0 18px 40px rgba(16, 24, 40, 0.22);
+  width: min(560px, 94vw);
+  background: rgba(20, 20, 20, 0.74);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 22px;
+  padding: 16px 20px 18px;
+  box-shadow: 0 24px 60px rgba(2, 8, 23, 0.42);
+  backdrop-filter: blur(7px);
+  -webkit-backdrop-filter: blur(7px);
 }
 
 .auth-shell--fixed-dark .auth-card {
-  background: #141414;
-  border-color: #3c3c3c;
+  background: rgba(20, 20, 20, 0.76);
+  border-color: rgba(255, 255, 255, 0.3);
   color: #e5e7eb;
 }
 
 .auth-shell--themed .auth-card {
-  background: #141414;
-  border-color: #3c3c3c;
+  background: rgba(20, 20, 20, 0.72);
+  border-color: rgba(255, 255, 255, 0.36);
   box-shadow: 0 20px 48px rgba(17, 24, 39, 0.24);
   color: #e5e7eb;
 }
@@ -156,32 +162,51 @@ body {
   flex-direction: column;
   align-items: center;
   gap: 4px;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
   text-align: center;
 }
 
 .auth-logo {
-  width: 34px;
-  height: 34px;
-  border-radius: 7px;
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
 }
 
 .auth-title {
-  font-size: 16px;
+  font-size: 42px;
+  line-height: 1;
   font-weight: 700;
   text-align: center;
 }
 
 .auth-subtitle {
-  font-size: 11px;
-  color: var(--muted);
+  font-size: 18px;
+  color: #bad3e7;
   text-align: center;
 }
 
 .auth-heading {
-  margin: 4px 0 8px;
-  font-size: 22px;
+  margin: 6px 0 8px;
+  font-size: 48px;
   text-align: center;
+}
+
+.auth-welcome {
+  margin: 2px 0 10px;
+  text-align: left;
+}
+
+.auth-welcome-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #f0f7ff;
+}
+
+.auth-welcome-subtitle {
+  margin-top: 3px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: #bdd0df;
 }
 
 .auth-submit {
@@ -190,8 +215,8 @@ body {
 
 .auth-help {
   margin-top: 6px;
-  font-size: 12px;
-  color: var(--muted);
+  font-size: 13px;
+  color: #b9cede;
 }
 
 .auth-tabs {
@@ -204,10 +229,10 @@ body {
 }
 
 .auth-tab {
-  border: 1px solid var(--stroke);
-  background: transparent;
-  color: var(--muted);
-  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.14);
+  color: #dbe9f6;
+  border-radius: 999px;
   padding: 7px 14px;
   cursor: pointer;
   font-weight: 600;
@@ -215,9 +240,9 @@ body {
 }
 
 .auth-tab.active {
-  border-color: var(--brand);
-  color: var(--text);
-  background: rgba(59, 130, 246, 0.12);
+  border-color: rgba(45, 212, 191, 0.85);
+  color: #ffffff;
+  background: linear-gradient(90deg, #0f766e 0%, #0ea5a4 100%);
 }
 
 .auth-shell--fixed-dark .auth-tab {
@@ -231,15 +256,15 @@ body {
 }
 
 .auth-shell--fixed-dark .auth-tab.active {
-  border-color: #007acc;
-  color: #e5e7eb;
-  background: rgba(0, 122, 204, 0.18);
+  border-color: rgba(45, 212, 191, 0.85);
+  color: #ffffff;
+  background: linear-gradient(90deg, #0f766e 0%, #0ea5a4 100%);
 }
 
 .auth-shell--themed .auth-tab.active {
-  border-color: #0b84d8;
-  color: #0f172a;
-  background: rgba(11, 132, 216, 0.12);
+  border-color: rgba(45, 212, 191, 0.85);
+  color: #ffffff;
+  background: linear-gradient(90deg, #0f766e 0%, #14b8a6 100%);
 }
 
 .auth-links {
@@ -254,8 +279,8 @@ body {
 
 .btn-ghost-link {
   border: 1px solid transparent;
-  background: color-mix(in srgb, var(--brand) 20%, #000 80%);
-  color: #f8fafc;
+  background: linear-gradient(90deg, #0b7285 0%, #0f766e 100%);
+  color: #f0fdff;
   padding: 9px 12px;
   font-size: 14px;
   font-weight: 600;
@@ -264,14 +289,14 @@ body {
 }
 
 .auth-shell--fixed-dark .btn-ghost-link {
-  background: #0b84d8;
-  border-color: #0ea5e9;
+  background: linear-gradient(90deg, #0b7285 0%, #0f766e 100%);
+  border-color: rgba(103, 232, 249, 0.55);
   color: #ffffff;
 }
 
 .auth-shell--themed .btn-ghost-link {
-  background: #0b84d8;
-  border-color: #0a72b9;
+  background: linear-gradient(90deg, #0b7285 0%, #0f766e 100%);
+  border-color: rgba(103, 232, 249, 0.55);
   color: #ffffff;
 }
 
@@ -296,7 +321,7 @@ body {
 }
 
 .auth-card label {
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 600;
   color: inherit;
   gap: 4px;
@@ -305,9 +330,10 @@ body {
 .auth-card input,
 .auth-card select,
 .auth-card textarea {
-  min-height: 38px;
-  padding: 8px 10px;
-  font-size: 14px;
+  min-height: 44px;
+  padding: 10px 12px;
+  font-size: 18px;
+  border-radius: 10px;
 }
 
 .auth-card .grid.two {
@@ -330,7 +356,7 @@ body {
 
 .auth-shell--themed .auth-forgot-box {
   border-color: #d7dce2;
-  background: #f8fafc;
+  background: rgba(15, 23, 42, 0.44);
 }
 
 .pw-input-wrap {
@@ -368,7 +394,7 @@ body {
   align-items: center;
   gap: 8px;
   margin: 4px 0 6px;
-  font-size: 13px;
+  font-size: 15px;
   width: 100%;
   min-width: 0;
 }
