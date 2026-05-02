@@ -11966,7 +11966,7 @@ function AppShell() {
             </button>
             {showRegisterTab ? (
               <button className={`auth-tab ${loginTab === "register" ? "active" : ""}`} type="button" onClick={openEdgeRegisterModal}>
-                Activation
+                {isPortalV1Login ? "Activate" : "Activation"}
               </button>
             ) : null}
           </div>
