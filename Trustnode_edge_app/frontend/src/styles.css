@@ -90,24 +90,24 @@ body {
 
 .auth-card {
   width: min(470px, 92vw);
-  background: var(--card);
+  background: var(--header);
   border: 1px solid var(--stroke);
   border-radius: 18px;
-  padding: 22px 22px 24px;
+  padding: 14px 16px 16px;
   box-shadow: 0 18px 40px rgba(16, 24, 40, 0.22);
 }
 
 .auth-shell--fixed-dark .auth-card {
-  background: #252526;
+  background: #141414;
   border-color: #3c3c3c;
   color: #e5e7eb;
 }
 
 .auth-shell--themed .auth-card {
-  background: #ffffff;
-  border-color: #d7dce2;
-  box-shadow: 0 20px 48px rgba(17, 24, 39, 0.16);
-  color: #111827;
+  background: #141414;
+  border-color: #3c3c3c;
+  box-shadow: 0 20px 48px rgba(17, 24, 39, 0.24);
+  color: #e5e7eb;
 }
 
 .auth-shell--fixed-dark .auth-subtitle,
@@ -117,7 +117,7 @@ body {
 
 .auth-shell--themed .auth-subtitle,
 .auth-shell--themed .auth-help {
-  color: #6b7280;
+  color: #9da0a6;
 }
 
 .auth-shell--fixed-dark input,
@@ -131,15 +131,15 @@ body {
 .auth-shell--themed input,
 .auth-shell--themed select,
 .auth-shell--themed textarea {
-  background: #ffffff;
-  border-color: #cfd6de;
-  color: #111827;
+  background: #1e1e1e;
+  border-color: #3c3c3c;
+  color: #e5e7eb;
 }
 
 .auth-header-row {
   display: flex;
   justify-content: flex-end;
-  margin-bottom: 8px;
+  margin-bottom: 4px;
 }
 
 .auth-theme-btn {
@@ -155,8 +155,8 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 14px;
+  gap: 4px;
+  margin-bottom: 8px;
   text-align: center;
 }
 
@@ -167,20 +167,20 @@ body {
 }
 
 .auth-title {
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 700;
   text-align: center;
 }
 
 .auth-subtitle {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--muted);
   text-align: center;
 }
 
 .auth-heading {
-  margin: 10px 0 12px;
-  font-size: 34px;
+  margin: 4px 0 8px;
+  font-size: 22px;
   text-align: center;
 }
 
@@ -189,7 +189,7 @@ body {
 }
 
 .auth-help {
-  margin-top: 10px;
+  margin-top: 6px;
   font-size: 12px;
   color: var(--muted);
 }
@@ -198,7 +198,7 @@ body {
   display: flex;
   justify-content: center;
   gap: 8px;
-  margin: 8px auto 12px;
+  margin: 2px auto 8px;
   width: 100%;
   max-width: 260px;
 }
@@ -208,7 +208,7 @@ body {
   background: transparent;
   color: var(--muted);
   border-radius: 10px;
-  padding: 9px 16px;
+  padding: 7px 14px;
   cursor: pointer;
   font-weight: 600;
   min-width: 110px;
@@ -247,46 +247,71 @@ body {
   justify-content: center;
 }
 
+.auth-links-full {
+  width: 100%;
+  margin: 4px 0 2px;
+}
+
 .btn-ghost-link {
-  border: 0;
-  background: transparent;
-  color: var(--brand);
-  padding: 0;
-  font-size: 12px;
+  border: 1px solid transparent;
+  background: color-mix(in srgb, var(--brand) 20%, #000 80%);
+  color: #f8fafc;
+  padding: 9px 12px;
+  font-size: 14px;
+  font-weight: 600;
+  border-radius: 10px;
+  cursor: pointer;
 }
 
 .auth-shell--fixed-dark .btn-ghost-link {
-  color: #4fc1ff;
+  background: #0b84d8;
+  border-color: #0ea5e9;
+  color: #ffffff;
 }
 
 .auth-shell--themed .btn-ghost-link {
-  color: #0b84d8;
+  background: #0b84d8;
+  border-color: #0a72b9;
+  color: #ffffff;
+}
+
+.auth-forgot-btn {
+  width: 100%;
+  min-height: 38px;
+}
+
+.auth-forgot-btn:hover {
+  filter: brightness(1.06);
+}
+
+.auth-forgot-btn:active {
+  filter: brightness(0.97);
 }
 
 .auth-forgot-box {
   border: 1px dashed var(--stroke);
   border-radius: 10px;
-  padding: 12px;
-  margin: 8px 0 12px;
+  padding: 8px;
+  margin: 6px 0 8px;
 }
 
 .auth-card label {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
-  color: var(--text);
-  gap: 7px;
+  color: inherit;
+  gap: 4px;
 }
 
 .auth-card input,
 .auth-card select,
 .auth-card textarea {
-  min-height: 42px;
-  padding: 10px 12px;
-  font-size: 15px;
+  min-height: 38px;
+  padding: 8px 10px;
+  font-size: 14px;
 }
 
 .auth-card .grid.two {
-  gap: 10px;
+  gap: 8px;
 }
 
 .portal-filter-block {
@@ -342,7 +367,7 @@ body {
   grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   gap: 8px;
-  margin: 8px 0;
+  margin: 4px 0 6px;
   font-size: 13px;
   width: 100%;
   min-width: 0;

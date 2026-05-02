@@ -2130,11 +2130,6 @@ function AppShell() {
   const [edgeRegisterResult, setEdgeRegisterResult] = useState("");
   const [edgeRegisterForm, setEdgeRegisterForm] = useState({
     activation_code: "",
-    edge_id: "",
-    edge_name: "",
-    site: "",
-    area: "",
-    equipment: "",
     admin_username: "admin",
     admin_password: "",
   });
@@ -11637,8 +11632,6 @@ function AppShell() {
   const openEdgeRegisterModal = () => {
     setEdgeRegisterForm((prev) => ({
       ...prev,
-      edge_id: "",
-      edge_name: "Local Edge",
       admin_username: "admin",
       admin_password: "",
     }));
@@ -11695,11 +11688,15 @@ function AppShell() {
       site: "",
       area: "",
       equipment: "",
-      admin_username: "admin",
-      admin_password: "admin",
+      admin_username: String(edgeRegisterForm.admin_username || "").trim(),
+      admin_password: String(edgeRegisterForm.admin_password || ""),
     };
     if (!payload.activation_code) {
       setEdgeRegisterResult("Activation code is required.");
+      return;
+    }
+    if (!payload.admin_username || !payload.admin_password) {
+      setEdgeRegisterResult("Admin username and password are required.");
       return;
     }
     setEdgeRegisterBusy(true);
@@ -11723,8 +11720,8 @@ function AppShell() {
       setLoginTab("login");
       setLoginForm((prev) => ({
         ...prev,
-        username: "admin",
-        password: "admin",
+        username: payload.admin_username,
+        password: payload.admin_password,
       }));
     } catch (err) {
       setEdgeRegisterResult(`Edge registration failed: ${String(err?.message || err)}`);
@@ -11944,6 +11941,14 @@ function AppShell() {
                   Activation Code
                   <input value={edgeRegisterForm.activation_code} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, activation_code: e.target.value }))} />
                 </label>
+                <label>
+                  Admin Username
+                  <input value={edgeRegisterForm.admin_username} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_username: e.target.value }))} />
+                </label>
+                <label>
+                  Admin Password
+                  <input type="password" value={edgeRegisterForm.admin_password} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_password: e.target.value }))} />
+                </label>
               </div>
               {edgeRegisterResult ? <div className={edgeRegisterResult.includes("failed") ? "error" : "lock-note"}>{edgeRegisterResult}</div> : null}
               <button className="btn btn-primary auth-submit" onClick={submitEdgeRegister} disabled={edgeRegisterBusy}>
@@ -11974,15 +11979,15 @@ function AppShell() {
                   </button>
                 </div>
               </label>
+              <div className="auth-links auth-links-full">
+                <button className="btn btn-ghost-link auth-forgot-btn" type="button" onClick={() => setForgotResult("Fill username and click Request Code.")}>
+                  Forgot password?
+                </button>
+              </div>
               <label className="remember-row">
                 <input type="checkbox" checked={rememberUser} onChange={(e) => setRememberUser(e.target.checked)} />
                 <span className="remember-label">Remember this user</span>
               </label>
-              <div className="auth-links">
-                <button className="btn btn-ghost-link" type="button" onClick={() => setForgotResult("Fill username and click Request Code.")}>
-                  Forgot password?
-                </button>
-              </div>
               {forgotResult ? (
                 <div className="auth-forgot-box">
                   <label>
