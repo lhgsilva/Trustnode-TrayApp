@@ -1,10 +1,24 @@
 {
   "permissions": {
+    "allow": [
+      "Bash(ls -la \"d:\\\\Trustnode\\\\Trustnode-AB\\\\Tray_app\\\\Trustnode_edge_app\\\\frontend\\\\src\"\" 2>/dev/null || echo \"Path not found \")",
+      "Bash(npm run *)",
+      "Bash(dir \"d:\\\\Trustnode\\\\Trustnode-AB\\\\Tray_app\\\\Trustnode_edge_app\\\\desktop\\\\dist\")",
+      "PowerShell($file = Get-Item 'd:\\\\Trustnode\\\\Trustnode-AB\\\\Tray_app\\\\Trustnode_edge_app\\\\desktop\\\\dist\\\\Trustnode 0.1.0.exe'; Write-Host \"File: $\\($file.FullName\\)`nSize: $\\([math]::Round\\($file.Length/1MB, 2\\)\\) MB`nDate: $\\($file.LastWriteTime\\)\")",
+      "PowerShell($file = Get-Item 'd:\\\\Trustnode\\\\Trustnode-AB\\\\Tray_app\\\\Trustnode_edge_app\\\\desktop\\\\dist\\\\Trustnode 0.1.0.exe'; Write-Host \"✓ Updated Portable Executable`n`nFile: $\\($file.Name\\)`nSize: $\\([math]::Round\\($file.Length/1MB, 2\\)\\) MB`nLocation: d:\\\\Trustnode\\\\Trustnode-AB\\\\Tray_app\\\\Trustnode_edge_app\\\\desktop\\\\dist\\\\`nBuilt: $\\($file.LastWriteTime\\)\")",
+      "Bash(powershell -NoProfile -Command \"\\(Get-Content 'D:\\\\Trustnode\\\\Trustnode-AB\\\\Tray_app\\\\Trustnode_edge_app\\\\desktop\\\\dist\\\\TrustNode Login _standalone_ \\(1\\).html' -Encoding UTF8\\) -match 'class=' | Select-Object -First 30\")",
+      "Bash(powershell -NoProfile -Command \"\\(Get-Content 'D:\\\\Trustnode\\\\Trustnode-AB\\\\Tray_app\\\\Trustnode_edge_app\\\\desktop\\\\dist\\\\TrustNode Login _standalone_ \\(1\\).html' -Raw -Encoding UTF8\\).Substring\\(0, 300000\\) | Select-String -Pattern 'button|input|\\\\.card|\\\\.container|\\\\.form' | Select-Object -First 20\")",
+      "Bash(powershell -NoProfile -Command ' *)",
+      "Bash(exe\")",
+      "Read(//c/Users/User/AppData/Local/Temp/claude/d--Trustnode-Trustnode-AB-Tray_app/e1f4c928-c438-4139-a35b-bc68d7c31fdc/tasks/**)",
+      "Bash(bash -c 'until grep -q \"Build complete\\\\|npm error\" \"C:\\\\\\\\Users\\\\\\\\User\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\d--Trustnode-Trustnode-AB-Tray-app\\\\\\\\e1f4c928-c438-4139-a35b-bc68d7c31fdc\\\\\\\\tasks\\\\\\\\bfizx1asx.output\"; do sleep 10; done; tail -20 \"C:\\\\\\\\Users\\\\\\\\User\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\d--Trustnode-Trustnode-AB-Tray-app\\\\\\\\e1f4c928-c438-4139-a35b-bc68d7c31fdc\\\\\\\\tasks\\\\\\\\bfizx1asx.output\"')",
+      "Bash(bash -c 'until grep -q \"Build complete\\\\|npm error\" \"C:\\\\\\\\Users\\\\\\\\User\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\d--Trustnode-Trustnode-AB-Tray-app\\\\\\\\e1f4c928-c438-4139-a35b-bc68d7c31fdc\\\\\\\\tasks\\\\\\\\b5750xf8g.output\"; do sleep 15; done; tail -5 \"C:\\\\\\\\Users\\\\\\\\User\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\d--Trustnode-Trustnode-AB-Tray-app\\\\\\\\e1f4c928-c438-4139-a35b-bc68d7c31fdc\\\\\\\\tasks\\\\\\\\b5750xf8g.output\"')",
+      "Bash(bash -c 'until grep -q \"Build complete\\\\|npm error\\\\|output file\" \"C:\\\\\\\\Users\\\\\\\\User\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\d--Trustnode-Trustnode-AB-Tray-app\\\\\\\\e1f4c928-c438-4139-a35b-bc68d7c31fdc\\\\\\\\tasks\\\\\\\\b4kiwf8yi.output\"; do sleep 20; done; echo \"Build finished\"; tail -3 \"C:\\\\\\\\Users\\\\\\\\User\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\d--Trustnode-Trustnode-AB-Tray-app\\\\\\\\e1f4c928-c438-4139-a35b-bc68d7c31fdc\\\\\\\\tasks\\\\\\\\b4kiwf8yi.output\"')",
+      "Bash(bash -c 'until [ -f \"d:\\\\\\\\Trustnode\\\\\\\\Trustnode-AB\\\\\\\\Tray_app\\\\\\\\Trustnode_edge_app\\\\\\\\desktop\\\\\\\\dist\\\\\\\\Trustnode 0.1.0.exe\" ] && [ $\\(stat -c%Y \"d:\\\\\\\\Trustnode\\\\\\\\Trustnode-AB\\\\\\\\Tray_app\\\\\\\\Trustnode_edge_app\\\\\\\\desktop\\\\\\\\dist\\\\\\\\Trustnode 0.1.0.exe\"\\) -gt $\\(date -d \"2 minutes ago\" +%s\\) ]; do sleep 30; done; echo \"Portable exe updated\"; ls -lh \"d:\\\\\\\\Trustnode\\\\\\\\Trustnode-AB\\\\\\\\Tray_app\\\\\\\\Trustnode_edge_app\\\\\\\\desktop\\\\\\\\dist\\\\\\\\Trustnode 0.1.0.exe\"')",
+      "PowerShell($file = Get-ChildItem \"d:\\\\Trustnode\\\\Trustnode-AB\\\\Tray_app\\\\Trustnode_edge_app\\\\desktop\\\\dist\\\\\" -Filter \"Trustnode 0.1.0.exe\"; Write-Output \"File: $\\($file.Name\\)\"; Write-Output \"Last Modified: $\\($file.LastWriteTime\\)\"; Write-Output \"Size: $\\([math]::Round\\($file.Length/1MB,1\\)\\) MB\")"
+    ],
     "additionalDirectories": [
       "d:\\Trustnode\\Trustnode-AB\\Tray_app\\.claude"
-    ],
-    "allow": [
-      "Bash(ls -la \"d:\\\\Trustnode\\\\Trustnode-AB\\\\Tray_app\\\\Trustnode_edge_app\\\\frontend\\\\src\"\" 2>/dev/null || echo \"Path not found \")"
     ]
   }
 }
