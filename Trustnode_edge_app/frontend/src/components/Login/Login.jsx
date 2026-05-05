@@ -165,6 +165,16 @@ export const Login = ({
   }
 
   const showRegisterTab = !isHostedWebClient && !edgeLinked;
+  const loginSurface = (() => {
+    try {
+      const path = String(window.location?.pathname || "").toLowerCase();
+      if (path.startsWith("/portal") || path.startsWith("/developer-portal")) return "portal";
+      if (isHostedWebClient) return "client";
+      return "local";
+    } catch {
+      return "local";
+    }
+  })();
   const isPortalV1Login = (() => {
     try {
       const path = String(window.location?.pathname || "");
