@@ -18062,6 +18062,15 @@ function AppShell() {
 }
 
 export default function App() {
+  try {
+    const path = String(window.location?.pathname || "");
+    if ((path === "/portal/v1" || path === "/portal/v1/") && !path.endsWith("/index.html")) {
+      window.location.replace("/portal/v1/index.html");
+      return null;
+    }
+  } catch {
+    // ignore; fall through to app shell
+  }
   return (
     <AppErrorBoundary>
       <AppShell />
