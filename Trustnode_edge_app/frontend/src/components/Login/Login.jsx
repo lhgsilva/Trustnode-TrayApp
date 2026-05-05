@@ -3,6 +3,7 @@ import { loginAuth, issuePublicPasswordReset, applyPublicPasswordReset } from ".
 import "./Login.css";
 import { EyeIcon } from "../Icons/EyeIcon";
 import { ThemeIcon } from "../Icons/ThemeIcon";
+import trustnodeLogo from "./trustenode-002.png";
 
 export const Login = ({
   currentUser,
@@ -34,9 +35,8 @@ export const Login = ({
   const [edgeRegisterResult, setEdgeRegisterResult] = useState("");
   const [edgeRegisterBusy, setEdgeRegisterBusy] = useState(false);
 
-  const logoSrc = "/trustnode_logo.png";
+  const logoSrc = trustnodeLogo;
 
-  // Load logo as fallback
   const [logoError, setLogoError] = React.useState(false);
 
   const handleLogoLoadError = (e) => {
@@ -172,7 +172,7 @@ export const Login = ({
   })();
 
   return (
-    <div className="login-container">
+    <div className={`login-container theme-${theme}`} data-theme={theme}>
       <div className={`auth-card ${loginTab === "register" ? "activate-mode" : ""}`}>
         <button
           className="theme-toggle-btn"
@@ -240,7 +240,7 @@ export const Login = ({
                   }
                 />
               </div>
-              <div style={{ fontSize: "11px", color: "var(--text-soft)", marginTop: "6px" }}>
+              <div style={{ fontSize: "11px", color: "var(--ink-soft)", marginTop: "6px" }}>
                 A single string provided with your Edge license.
               </div>
             </label>
@@ -269,7 +269,7 @@ export const Login = ({
                   }
                 />
               </div>
-              <div style={{ fontSize: "11px", color: "var(--text-soft)", marginTop: "6px" }}>
+              <div style={{ fontSize: "11px", color: "var(--ink-soft)", marginTop: "6px" }}>
                 This is the username you'll log in with after activation.
               </div>
             </label>
@@ -328,7 +328,7 @@ export const Login = ({
               onClick={submitEdgeRegister}
               disabled={edgeRegisterBusy}
             >
-              {edgeRegisterBusy ? "Activating..." : "Activate Edge app →"}
+              {edgeRegisterBusy ? "Activating..." : "Activate Edge app ->"}
             </button>
           </>
         ) : (
@@ -488,7 +488,7 @@ export const Login = ({
               onClick={submitLogin}
               disabled={loginBusy}
             >
-              {loginBusy ? "Signing in..." : "Sign in to TrustNode portal →"}
+              {loginBusy ? "Signing in..." : "Sign in to TrustNode portal ->"}
             </button>
           </>
         )}

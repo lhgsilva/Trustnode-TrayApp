@@ -1,43 +1,96 @@
-/* TrustNode Login - Brand Identity Implementation */
+/* ============================================================
+   TrustNode Login — brand tokens + dark/light themes
+   Brand: Navy #1F3A5F + Teal #14A89A accents
+   ============================================================ */
 
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
 
 :root {
-  /* Brand Colors */
+  /* Brand */
   --navy: #1F3A5F;
+  --navy-deep: #16314F;
   --teal: #14A89A;
   --teal-deep: #0E8479;
   --teal-bright: #3CD2C2;
 
-  /* Dark Theme (Default) */
-  --bg-page: #0B0E12;
-  --bg-card: #0F131B;
-  --text-ink: #F2F4F7;
-  --text-muted: #B6C0CC;
-  --text-soft: #8A98AB;
-  --border-color: rgba(255, 255, 255, 0.08);
-  --input-bg: rgba(255, 255, 255, 0.04);
-  --input-bg-focus: rgba(255, 255, 255, 0.06);
+  /* Greys (neutral spine) */
+  --grey-950: #0B0E12;
+  --grey-900: #12161C;
+  --grey-850: #181D25;
+  --grey-800: #1F252F;
+  --grey-700: #2A3340;
+  --grey-600: #3A4654;
+  --grey-500: #5C6B7C;
+  --grey-400: #8A98AB;
+  --grey-300: #B6C0CC;
+  --grey-200: #D6DDE5;
+  --grey-100: #ECEFF3;
+  --grey-50: #F6F8FA;
 
-  /* Semantic */
-  --error: #E2585D;
-  --success: #14A89A;
-
-  /* Geometry */
-  --radius-lg: 16px;
-  --radius-md: 10px;
+  --radius: 18px;
+  --radius-sm: 10px;
+  font-family: 'Manrope', system-ui, sans-serif;
 }
 
-/* Light Mode */
-[data-theme="light"] {
+/* ============================================================
+   DARK THEME — black/dark grey base
+   ============================================================ */
+.theme-dark {
+  --bg-page: #0B0E12;
+  --bg-elev: #181D25;
+  --bg-card: #232A36;
+  --bg-card-edge: #2E3744;
+  --ink: #F2F4F7;
+  --ink-muted: #B6C0CC;
+  --ink-soft: #8A98AB;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --field-bg: #2A3340;
+  --field-bg-focus: #313B49;
+  --accent: var(--teal);
+  --accent-deep: var(--teal-deep);
+  --accent-bright: var(--teal-bright);
+  --shadow-card: 0 30px 80px -20px rgba(0, 0, 0, 0.7), 0 8px 24px -8px rgba(0, 0, 0, 0.55);
+}
+
+/* ============================================================
+   LIGHT THEME — white card on light grey page
+   ============================================================ */
+.theme-light {
   --bg-page: #ECEFF3;
+  --bg-elev: #FFFFFF;
   --bg-card: #FFFFFF;
-  --text-ink: #0E1116;
-  --text-muted: #4A5566;
-  --text-soft: #6E7989;
-  --border-color: rgba(14, 17, 22, 0.08);
-  --input-bg: rgba(14, 17, 22, 0.04);
-  --input-bg-focus: rgba(14, 17, 22, 0.08);
+  --bg-card-edge: #E1E6EC;
+  --ink: #0E1116;
+  --ink-muted: #4A5566;
+  --ink-soft: #6E7989;
+  --line: rgba(14, 17, 22, 0.08);
+  --line-strong: rgba(14, 17, 22, 0.16);
+  --field-bg: #F6F8FA;
+  --field-bg-focus: #FFFFFF;
+  --accent: var(--teal);
+  --accent-deep: var(--teal-deep);
+  --accent-bright: var(--teal);
+  --shadow-card: 0 24px 60px -24px rgba(14, 17, 22, 0.20), 0 4px 14px -6px rgba(14, 17, 22, 0.10);
+}
+
+/* Default to dark theme if no class is set */
+:root {
+  --bg-page: #0B0E12;
+  --bg-elev: #181D25;
+  --bg-card: #232A36;
+  --bg-card-edge: #2E3744;
+  --ink: #F2F4F7;
+  --ink-muted: #B6C0CC;
+  --ink-soft: #8A98AB;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --field-bg: #2A3340;
+  --field-bg-focus: #313B49;
+  --accent: var(--teal);
+  --accent-deep: var(--teal-deep);
+  --accent-bright: var(--teal-bright);
+  --shadow-card: 0 30px 80px -20px rgba(0, 0, 0, 0.7), 0 8px 24px -8px rgba(0, 0, 0, 0.55);
 }
 
 * {
@@ -48,11 +101,15 @@
 
 html, body {
   background: var(--bg-page);
-  color: var(--text-ink);
+  color: var(--ink);
   font-family: 'Manrope', system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
+  transition: background-color 0.3s, color 0.3s;
 }
 
+/* ============================================================
+   LOGIN CONTAINER — Centered, full viewport
+   ============================================================ */
 .login-container {
   min-height: 100vh;
   display: flex;
@@ -60,32 +117,38 @@ html, body {
   justify-content: center;
   background: var(--bg-page);
   padding: 16px;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
-/* Card - Centered, compact */
+/* ============================================================
+   AUTH CARD — Centered, compact
+   ============================================================ */
+
 .auth-card {
   width: 100%;
   max-width: 480px;
   background: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: 16px;
+  border: 1px solid var(--line);
+  border-radius: 24px;
   padding: 32px 32px;
   display: flex;
   flex-direction: column;
   gap: 14px;
   position: relative;
+  box-shadow: var(--shadow-card);
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
 }
 
-/* Theme toggle button */
 .theme-toggle-btn {
   position: absolute;
-  top: 16px;
-  right: 16px;
+  top: 20px;
+  right: 20px;
   background: none;
   border: none;
-  color: var(--text-soft);
+  color: var(--ink-soft);
   cursor: pointer;
-  padding: 6px;
+  padding: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -93,35 +156,42 @@ html, body {
 }
 
 .theme-toggle-btn:hover {
-  color: var(--teal);
+  color: var(--accent);
 }
 
-/* Brand/Logo section */
+.theme-toggle-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
 .auth-brand {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 0;
+  gap: 10px;
+  margin-bottom: 4px;
+  text-align: center;
 }
 
 .auth-logo {
   width: 56px;
   height: 56px;
+  object-fit: contain;
 }
 
 .auth-title {
-  font-size: 20px;
-  font-weight: 600;
+  font-size: 18px;
+  font-weight: 700;
   letter-spacing: -0.01em;
+  color: var(--ink);
 }
 
-/* Tabs - pill-shaped */
 .auth-tabs {
-  display: flex;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
   padding: 4px;
-  background: var(--input-bg);
+  background: var(--field-bg);
   border-radius: 999px;
   margin-bottom: 8px;
 }
@@ -131,7 +201,7 @@ html, body {
   padding: 10px 16px;
   border: none;
   background: transparent;
-  color: var(--text-soft);
+  color: var(--ink-soft);
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
@@ -140,7 +210,7 @@ html, body {
 }
 
 .auth-tab:hover:not(.active) {
-  color: var(--text-muted);
+  color: var(--ink-muted);
 }
 
 .auth-tab.active {
@@ -149,7 +219,7 @@ html, body {
   box-shadow: 0 4px 12px rgba(20, 168, 154, 0.25);
 }
 
-/* Headings - Consistent 28px for both Login and Activate */
+/* Headings */
 .auth-welcome,
 .auth-welcome-title,
 .auth-heading {
@@ -157,20 +227,21 @@ html, body {
 }
 
 .auth-welcome {
-  margin-bottom: 8px;
+  margin-bottom: 4px;
 }
 
 .auth-welcome-title,
 .auth-heading {
-  font-size: 28px;
+  font-size: 24px;
   font-weight: 700;
   margin-bottom: 6px;
   letter-spacing: -0.02em;
+  color: var(--ink);
 }
 
 .auth-welcome-subtitle {
   font-size: 13px;
-  color: var(--text-soft);
+  color: var(--ink-soft);
   line-height: 1.5;
   margin: 0;
   margin-bottom: 12px;
@@ -185,7 +256,6 @@ label {
   font-size: 13px;
 }
 
-/* Extra compact spacing for Activate tab */
 .auth-card.activate-mode label {
   margin-bottom: 8px;
 }
@@ -193,14 +263,14 @@ label {
 label span {
   font-size: 10px;
   font-weight: 700;
-  color: var(--text-muted);
+  color: var(--ink-muted);
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
 label > div {
   font-size: 11px;
-  color: var(--text-soft);
+  color: var(--ink-soft);
   font-weight: 400;
   margin-top: 6px;
   padding-left: 2px;
@@ -217,7 +287,7 @@ label > div {
 .pw-field-header span {
   font-size: 10px;
   font-weight: 700;
-  color: var(--text-muted);
+  color: var(--ink-muted);
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
@@ -225,15 +295,20 @@ label > div {
 .forgot-link {
   font-size: 12px;
   font-weight: 600;
-  color: var(--teal);
+  color: var(--accent);
   background: none;
   border: none;
   cursor: pointer;
   padding: 0;
+  text-decoration: none;
+}
+
+.theme-dark .forgot-link {
+  color: var(--accent-bright);
 }
 
 .forgot-link:hover {
-  color: var(--teal-bright);
+  text-decoration: underline;
 }
 
 /* Input fields */
@@ -243,10 +318,10 @@ input[type="email"],
 select {
   width: 100%;
   padding: 10px 12px 10px 36px;
-  border: 1px solid var(--border-color);
-  border-radius: 10px;
-  background: var(--input-bg);
-  color: var(--text-ink);
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--field-bg);
+  color: var(--ink);
   font-size: 13px;
   font-family: 'Manrope', inherit;
   font-weight: 400;
@@ -257,7 +332,7 @@ select {
 input[type="text"]::placeholder,
 input[type="password"]::placeholder,
 input[type="email"]::placeholder {
-  color: var(--text-soft);
+  color: var(--ink-soft);
   font-weight: 400;
 }
 
@@ -266,18 +341,18 @@ input[type="password"]:focus,
 input[type="email"]:focus,
 select:focus {
   outline: none;
-  border-color: var(--teal);
-  background: var(--input-bg-focus);
-  box-shadow: 0 0 0 3px rgba(20, 168, 154, 0.12);
+  border-color: var(--accent);
+  background: var(--field-bg-focus);
+  box-shadow: 0 0 0 4px rgba(20, 168, 154, 0.18);
 }
 
 /* Input icon wrapper */
 .field-icon {
   position: absolute;
-  left: 10px;
+  left: 12px;
   top: 50%;
   transform: translateY(-50%);
-  color: var(--text-soft);
+  color: var(--ink-soft);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -315,7 +390,7 @@ select:focus {
   transform: translateY(-50%);
   background: none;
   border: none;
-  color: var(--text-soft);
+  color: var(--ink-soft);
   cursor: pointer;
   padding: 4px;
   display: flex;
@@ -325,7 +400,7 @@ select:focus {
 }
 
 .pw-icon-btn:hover {
-  color: var(--teal);
+  color: var(--accent);
 }
 
 .pw-icon-btn svg {
@@ -348,14 +423,14 @@ select:focus {
 input[type="checkbox"] {
   width: 16px;
   height: 16px;
-  accent-color: var(--teal);
+  accent-color: var(--accent);
   cursor: pointer;
   flex-shrink: 0;
   border-radius: 3px;
 }
 
 .remember-label {
-  color: var(--text-muted);
+  color: var(--ink-muted);
   cursor: pointer;
   font-weight: 400;
 }
@@ -363,7 +438,7 @@ input[type="checkbox"] {
 /* Buttons */
 .btn {
   border: none;
-  border-radius: 10px;
+  border-radius: 12px;
   font-family: 'Manrope', inherit;
   font-size: 13px;
   font-weight: 600;
@@ -378,18 +453,19 @@ input[type="checkbox"] {
   padding: 13px 16px;
   min-height: 44px;
   font-size: 14px;
-  font-weight: 600;
-  box-shadow: 0 8px 16px rgba(31, 58, 95, 0.3);
+  font-weight: 700;
+  box-shadow: 0 12px 28px -14px rgba(31, 58, 95, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.22);
   margin-bottom: 0;
 }
 
 .btn-primary:hover:not(:disabled) {
-  box-shadow: 0 12px 24px rgba(20, 168, 154, 0.3);
   transform: translateY(-1px);
+  filter: brightness(1.06);
+  box-shadow: 0 16px 32px -12px rgba(20, 168, 154, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.28);
 }
 
 .btn-primary:active:not(:disabled) {
-  transform: scale(0.99);
+  transform: translateY(0);
 }
 
 .btn-primary:disabled {
@@ -403,30 +479,35 @@ input[type="checkbox"] {
 
 .btn-ghost-link {
   background: none;
-  color: var(--teal);
+  color: var(--accent);
   padding: 0;
   font-size: 12px;
   font-weight: 600;
+  text-decoration: none;
+}
+
+.theme-dark .btn-ghost-link {
+  color: var(--accent-bright);
 }
 
 .btn-ghost-link:hover {
-  color: var(--teal-bright);
+  text-decoration: underline;
 }
 
 /* Forgot password box */
 .auth-forgot-box {
-  background: rgba(20, 168, 154, 0.05);
-  border: 1px solid rgba(20, 168, 154, 0.15);
-  border-radius: 10px;
-  padding: 18px;
+  background: rgba(20, 168, 154, 0.08);
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
 }
 
-[data-theme="light"] .auth-forgot-box {
-  background: rgba(14, 168, 154, 0.04);
-  border-color: rgba(14, 168, 154, 0.12);
+.theme-light .auth-forgot-box {
+  background: rgba(20, 168, 154, 0.04);
+  border: 1px solid var(--line);
 }
 
 .auth-forgot-box label {
@@ -445,19 +526,23 @@ input[type="checkbox"] {
   line-height: 1.4;
 }
 
-[data-theme="light"] .error {
+.theme-light .error {
   color: #E2585D;
 }
 
 .lock-note {
   background: rgba(20, 168, 154, 0.1);
-  color: var(--teal-bright);
+  color: var(--accent-bright);
   padding: 11px 13px;
   border-radius: 10px;
   font-size: 12px;
   border: 1px solid rgba(20, 168, 154, 0.25);
   margin-bottom: 16px;
   line-height: 1.4;
+}
+
+.theme-light .lock-note {
+  color: var(--accent);
 }
 
 /* Utilities */
@@ -482,20 +567,17 @@ input[type="checkbox"] {
 
 @media (max-width: 600px) {
   .auth-card {
-    padding: 32px 24px;
-    gap: 18px;
+    padding: 28px 24px;
+    gap: 12px;
   }
 
   .auth-title {
-    font-size: 18px;
+    font-size: 16px;
   }
 
-  .auth-welcome-title {
-    font-size: 24px;
-  }
-
+  .auth-welcome-title,
   .auth-heading {
-    font-size: 22px;
+    font-size: 20px;
   }
 
   .grid.two {
