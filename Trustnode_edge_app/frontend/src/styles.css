@@ -2237,6 +2237,10 @@ body {
 
 .control-plane-page-fill {
   min-height: calc(100vh - 140px);
+  background:
+    radial-gradient(1200px 420px at 12% -10%, color-mix(in srgb, var(--brand) 16%, transparent), transparent 60%),
+    radial-gradient(900px 360px at 88% -10%, color-mix(in srgb, var(--ok) 12%, transparent), transparent 58%);
+  border-radius: 12px;
 }
 
 .control-plane-layout {
@@ -2251,6 +2255,8 @@ body {
 
 .control-plane-main > .card {
   flex: 1 1 auto;
+  border: 1px solid color-mix(in srgb, var(--stroke) 84%, transparent);
+  box-shadow: 0 10px 24px color-mix(in srgb, black 18%, transparent);
 }
 
 .control-plane-activation-card {
@@ -2266,6 +2272,24 @@ body {
 
 .control-plane-workspace-card {
   width: 100%;
+}
+
+.control-plane-main h4,
+.control-plane-main .card-title {
+  letter-spacing: 0.1px;
+}
+
+.control-plane-main .thead {
+  color: var(--text);
+  opacity: 0.95;
+}
+
+.control-plane-main .trow {
+  background: color-mix(in srgb, var(--table-row) 88%, var(--card) 12%);
+}
+
+.control-plane-main .trow:hover {
+  background: color-mix(in srgb, var(--brand) 14%, var(--table-row) 86%);
 }
 
 .cp-customers-table .thead,

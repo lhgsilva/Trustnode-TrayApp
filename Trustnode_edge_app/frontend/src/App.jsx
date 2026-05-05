@@ -1,4 +1,5 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Login } from "./components/Login/Login";
 import {
   getHealth,
   getBackendTarget,
@@ -2113,8 +2114,6 @@ function AppShell() {
   const [currentUser, setCurrentUser] = useState(null);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(getFullscreenState);
-  const [loginForm, setLoginForm] = useState({ username: "", password: "" });
-  const [loginTab, setLoginTab] = useState("login");
   const [edgeLinked, setEdgeLinked] = useState(() => {
     try {
       return localStorage.getItem(EDGE_LINKED_STORAGE_KEY) === "true";
@@ -2122,33 +2121,7 @@ function AppShell() {
       return false;
     }
   });
-  const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [rememberUser, setRememberUser] = useState(true);
-  const [loginError, setLoginError] = useState("");
-  const [loginBusy, setLoginBusy] = useState(false);
-  const [showAuthBackground, setShowAuthBackground] = useState(() => {
-    try {
-      const raw = localStorage.getItem("tn_auth_bg");
-      return raw == null ? true : raw !== "0";
-    } catch {
-      return true;
-    }
-  });
-  const [edgeRegisterBusy, setEdgeRegisterBusy] = useState(false);
-  const [edgeRegisterResult, setEdgeRegisterResult] = useState("");
-  const [edgeRegisterForm, setEdgeRegisterForm] = useState({
-    activation_code: "",
-    admin_username: "admin",
-    admin_password: "",
-  });
-  const [forgotBusy, setForgotBusy] = useState(false);
-  const [forgotResult, setForgotResult] = useState("");
-  const [forgotForm, setForgotForm] = useState({
-    username: "",
-    tenant_id: "",
-    reset_token: "",
-    new_password: "",
-  });
   const [newUserForm, setNewUserForm] = useState({
     username: "",
     password: "",
@@ -11484,59 +11457,6 @@ function AppShell() {
     );
   };
 
-  const submitLogin = async () => {
-    const username = String(loginForm.username || "").trim();
-    const password = String(loginForm.password || "");
-    if (!username || !password) {
-      setLoginError("Enter username and password");
-      return;
-    }
-    setLoginBusy(true);
-    try {
-      let res;
-      try {
-        res = await loginAuth({ username, password });
-      } catch (firstErr) {
-        if (!isNetworkFetchError(firstErr)) throw firstErr;
-        setLoginError("Backend is starting, retrying...");
-        await waitForBackendReady(6000, 500);
-        res = await loginAuth({ username, password });
-      }
-      const u = res?.user || null;
-      if (!u?.username) {
-        setLoginError("Login failed");
-        return;
-      }
-      const existingUser = users.find((x) => x.username === u.username) || {};
-      const matched = {
-        ...existingUser,
-        username: u.username,
-        password: "",
-        role: u.role || existingUser.role || "viewer",
-        permissions: normalizePermissions(u.permissions || existingUser.permissions || {}, u.role || existingUser.role || "viewer"),
-        modules: Array.isArray(u.modules)
-          ? u.modules
-          : (Array.isArray(existingUser.modules)
-            ? existingUser.modules
-            : deriveModuleKeysFromPermissions(normalizePermissions(u.permissions || existingUser.permissions || {}, u.role || existingUser.role || "viewer"))),
-      };
-      setCurrentUser(matched);
-      await refreshControlPlaneRuntimeContext();
-      await refreshControlPlaneUsers(u?.tenant_id || currentTenantId || "default");
-      setShowUserMenu(false);
-      setLoginError("");
-      setLoginForm({ username: "", password: "" });
-    } catch (err) {
-      clearAuthToken();
-      if (isNetworkFetchError(err)) {
-        setLoginError("Backend not ready yet. Please try again in a moment.");
-      } else {
-        setLoginError(String(err?.message || "Invalid username or password"));
-      }
-    } finally {
-      setLoginBusy(false);
-    }
-  };
 
   const switchUser = () => {
     clearAuthToken();
@@ -11637,15 +11557,6 @@ function AppShell() {
     );
   };
 
-  const openEdgeRegisterModal = () => {
-    setEdgeRegisterForm((prev) => ({
-      ...prev,
-      admin_username: "admin",
-      admin_password: "",
-    }));
-    setEdgeRegisterResult("");
-    setLoginTab("register");
-  };
 
   const refreshEdgeLicenseSnapshot = async () => {
     try {
@@ -11688,107 +11599,7 @@ function AppShell() {
     refreshEdgeLicenseSnapshot();
   }, [activePage, currentUser, isHostedWebClient, edgeProfile?.edge_id, currentTenantId]);
 
-  const submitEdgeRegister = async () => {
-    const payload = {
-      activation_code: String(edgeRegisterForm.activation_code || "").trim(),
-      edge_id: "",
-      edge_name: "",
-      site: "",
-      area: "",
-      equipment: "",
-      admin_username: String(edgeRegisterForm.admin_username || "").trim(),
-      admin_password: String(edgeRegisterForm.admin_password || ""),
-    };
-    if (!payload.activation_code) {
-      setEdgeRegisterResult("Activation code is required.");
-      return;
-    }
-    if (!payload.admin_username || !payload.admin_password) {
-      setEdgeRegisterResult("Admin username and password are required.");
-      return;
-    }
-    setEdgeRegisterBusy(true);
-    try {
-      const res = await registerControlPlaneEdgeLink(payload);
-      setEdgeRegisterResult(
-        `Activated edge '${String(res?.edge_id || "")}' for tenant '${String(res?.tenant_id || "")}'. You can login now.`
-      );
-      localStorage.setItem(EDGE_LINKED_STORAGE_KEY, "true");
-      setEdgeLinked(true);
-      setTenantLoginRealm(String(res?.tenant_id || ""));
-      setLinkedCustomerId(String(res?.customer_id || ""));
-      setLinkedLicenseId(String(res?.license_id || ""));
-      setEdgeProfile((prev) => ({
-        ...prev,
-        edge_id: String(res?.edge_id || prev.edge_id || ""),
-        edge_name: String(res?.edge_name || prev.edge_name || "Local Edge"),
-        location: [String(res?.site || ""), String(res?.area || "")].filter(Boolean).join(" / "),
-        machine_group: String(res?.equipment || prev.machine_group || ""),
-      }));
-      setLoginTab("login");
-      setLoginForm((prev) => ({
-        ...prev,
-        username: payload.admin_username,
-        password: payload.admin_password,
-      }));
-    } catch (err) {
-      setEdgeRegisterResult(`Edge registration failed: ${String(err?.message || err)}`);
-    } finally {
-      setEdgeRegisterBusy(false);
-    }
-  };
 
-  const requestForgotPasswordCode = async () => {
-    const username = String(forgotForm.username || "").trim();
-    if (!username) {
-      setForgotResult("Enter your username first.");
-      return;
-    }
-    setForgotBusy(true);
-    setForgotResult("");
-    try {
-      const res = await issuePublicPasswordReset({
-        username,
-        tenant_id: String(forgotForm.tenant_id || "").trim(),
-        ttl_minutes: 15,
-      });
-      const token = String(res?.row?.reset_token || "");
-      setForgotForm((prev) => ({ ...prev, reset_token: token || prev.reset_token }));
-      setForgotResult(token
-        ? "Verification code generated. Use this code to set a new password."
-        : "Verification code issued. Check portal/admin support channel.");
-    } catch (err) {
-      setForgotResult(`Code request failed: ${String(err?.message || err)}`);
-    } finally {
-      setForgotBusy(false);
-    }
-  };
-
-  const applyForgotPasswordReset = async () => {
-    const username = String(forgotForm.username || "").trim();
-    const reset_token = String(forgotForm.reset_token || "").trim();
-    const new_password = String(forgotForm.new_password || "");
-    if (!username || !reset_token || !new_password) {
-      setForgotResult("Username, verification code and new password are required.");
-      return;
-    }
-    setForgotBusy(true);
-    setForgotResult("");
-    try {
-      await applyPublicPasswordReset({
-        username,
-        tenant_id: String(forgotForm.tenant_id || "").trim(),
-        reset_token,
-        new_password,
-      });
-      setForgotResult("Password reset completed. You can login now.");
-      setLoginForm((prev) => ({ ...prev, username }));
-    } catch (err) {
-      setForgotResult(`Reset failed: ${String(err?.message || err)}`);
-    } finally {
-      setForgotBusy(false);
-    }
-  };
 
   const canManageUsers = Boolean(
     currentUser &&
@@ -11911,164 +11722,15 @@ function AppShell() {
   };
 
   if (!currentUser) {
-  const showRegisterTab = !isHostedWebClient && !edgeLinked;
-    const isPortalV1Login = (() => {
-      try {
-        const path = String(window.location?.pathname || "");
-        return path.startsWith("/portal/v1");
-      } catch {
-        return false;
-      }
-    })();
-    const authShellClass = (() => {
-      const classes = ["auth-shell"];
-      if (theme === "dark") classes.push("auth-shell--fixed-dark");
-      else classes.push("auth-shell--themed");
-      if (!showAuthBackground) classes.push("auth-shell--no-bg");
-      if (isPortalV1Login) classes.push("auth-shell--v1");
-      return classes.join(" ");
-    })();
     return (
-      <div className={authShellClass}>
-        <div className="auth-card">
-          <div className="auth-header-row">
-            <button
-              className="icon-btn theme-btn auth-theme-btn"
-              onClick={() =>
-                setShowAuthBackground((v) => {
-                  const next = !v;
-                  try {
-                    localStorage.setItem("tn_auth_bg", next ? "1" : "0");
-                  } catch {
-                    // ignore localStorage errors
-                  }
-                  return next;
-                })
-              }
-              title={showAuthBackground ? "Hide background image" : "Show background image"}
-            >
-              {showAuthBackground ? "🖼" : "⬛"}
-            </button>
-            <button className="icon-btn theme-btn auth-theme-btn" onClick={toggleTheme} title="Toggle light/dark mode">
-              <ThemeIcon theme={theme} />
-            </button>
-          </div>
-          <div className="auth-brand">
-            <img src={logoSrc} alt="Trustnode" className="auth-logo" onError={handleLogoLoadError} />
-            <div>
-              <div className="auth-title">Trustnode Edge</div>
-              <div className="auth-subtitle">Secure PLC Data Gateway</div>
-            </div>
-          </div>
-          <div className="auth-tabs">
-            <button className={`auth-tab ${loginTab === "login" ? "active" : ""}`} type="button" onClick={() => setLoginTab("login")}>
-              Login
-            </button>
-            {showRegisterTab ? (
-              <button className={`auth-tab ${loginTab === "register" ? "active" : ""}`} type="button" onClick={openEdgeRegisterModal}>
-                {isPortalV1Login ? "Activate" : "Activation"}
-              </button>
-            ) : null}
-          </div>
-          {loginTab === "register" && showRegisterTab ? (
-            <>
-              <h3 className="auth-heading">Activate Local Edge</h3>
-              <div className="grid two">
-                <label>
-                  Activation Code
-                  <input value={edgeRegisterForm.activation_code} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, activation_code: e.target.value }))} />
-                </label>
-                <label>
-                  Admin Username
-                  <input value={edgeRegisterForm.admin_username} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_username: e.target.value }))} />
-                </label>
-                <label>
-                  Admin Password
-                  <input type="password" value={edgeRegisterForm.admin_password} onChange={(e) => setEdgeRegisterForm((p) => ({ ...p, admin_password: e.target.value }))} />
-                </label>
-              </div>
-              {edgeRegisterResult ? <div className={edgeRegisterResult.includes("failed") ? "error" : "lock-note"}>{edgeRegisterResult}</div> : null}
-              <button className="btn btn-primary auth-submit" onClick={submitEdgeRegister} disabled={edgeRegisterBusy}>
-                {edgeRegisterBusy ? "Registering..." : "Activate Edge"}
-              </button>
-              <button className="btn btn-secondary auth-submit" type="button" onClick={() => setLoginTab("login")}>
-                Back to Login
-              </button>
-            </>
-          ) : (
-            <>
-              <h3 className="auth-heading">Sign In</h3>
-              <div className="auth-welcome">
-                <div className="auth-welcome-title">Welcome back</div>
-                <div className="auth-welcome-subtitle">Sign in to access your edge gateway dashboard and industrial insights.</div>
-              </div>
-              <label>
-                Username
-                <input value={loginForm.username} onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value })} placeholder="Enter username" />
-              </label>
-              <label>
-                Password
-                <div className="pw-input-wrap">
-                  <input
-                    type={showLoginPassword ? "text" : "password"}
-                    value={loginForm.password}
-                    onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
-                    placeholder="Enter password"
-                  />
-                  <button className="pw-icon-btn" onClick={() => setShowLoginPassword((v) => !v)} type="button" aria-label="Toggle password visibility">
-                    <EyeIcon open={showLoginPassword} />
-                  </button>
-                </div>
-              </label>
-              <div className="auth-links auth-links-full">
-                <button className="btn btn-ghost-link auth-forgot-btn" type="button" onClick={() => setForgotResult("Fill username and click Request Code.")}>
-                  Forgot password?
-                </button>
-              </div>
-              <label className="remember-row">
-                <input type="checkbox" checked={rememberUser} onChange={(e) => setRememberUser(e.target.checked)} />
-                <span className="remember-label">Remember this user</span>
-              </label>
-              {forgotResult ? (
-                <div className="auth-forgot-box">
-                  <label>
-                    Tenant (optional)
-                    <input value={forgotForm.tenant_id} onChange={(e) => setForgotForm((p) => ({ ...p, tenant_id: e.target.value }))} placeholder="default" />
-                  </label>
-                  <label>
-                    Username
-                    <input value={forgotForm.username} onChange={(e) => setForgotForm((p) => ({ ...p, username: e.target.value }))} />
-                  </label>
-                  <label>
-                    Verification Code
-                    <input value={forgotForm.reset_token} onChange={(e) => setForgotForm((p) => ({ ...p, reset_token: e.target.value }))} />
-                  </label>
-                  <label>
-                    New Password
-                    <input type="password" value={forgotForm.new_password} onChange={(e) => setForgotForm((p) => ({ ...p, new_password: e.target.value }))} />
-                  </label>
-                  <div className="row" style={{ gap: 8 }}>
-                    <button className="btn" type="button" onClick={requestForgotPasswordCode} disabled={forgotBusy}>
-                      {forgotBusy ? "Requesting..." : "Request Code"}
-                    </button>
-                    <button className="btn btn-primary" type="button" onClick={applyForgotPasswordReset} disabled={forgotBusy}>
-                      Apply Reset
-                    </button>
-                  </div>
-                  <div className="lock-note">{forgotResult}</div>
-                </div>
-              ) : null}
-              {loginError ? <div className="error">{loginError}</div> : null}
-              <button className="btn btn-primary auth-submit" onClick={submitLogin} disabled={loginBusy}>
-                {loginBusy ? "Signing in..." : "Sign In"}
-              </button>
-              <div className="auth-help">
-                Default admin credentials: <strong>admin / admin</strong>
-              </div>
-            </>
-          )}
-        </div>
-      </div>
+      <Login
+        currentUser={currentUser}
+        isHostedWebClient={isHostedWebClient}
+        edgeLinked={edgeLinked}
+        theme={theme}
+        toggleTheme={toggleTheme}
+        onLoginSuccess={setCurrentUser}
+      />
     );
   }
 
@@ -12173,6 +11835,7 @@ function AppShell() {
                     <button className={`nav-item nav-subitem ${cpPortalPage === "edges" ? "active" : ""}`} onClick={() => openPortalPage("edges")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Edge Apps</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "users" ? "active" : ""}`} onClick={() => openPortalPage("users")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Users</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "activation" ? "active" : ""}`} onClick={() => openPortalPage("activation")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Activation</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "interface" ? "active" : ""}`} onClick={() => openPortalPage("interface")}><span className="nav-icon"><MenuIcon page="interface" /></span><span>Interface</span></button>
                     <div className="portal-filter-block">
                       <label style={{ fontSize: 12, color: "var(--muted)" }}>Customer</label>
                       <select value={cpCustomerFilter} onChange={(e) => setCpCustomerFilter(e.target.value)}>
@@ -15152,6 +14815,7 @@ function AppShell() {
                     <button className={`btn ${cpPortalPage === "edges" ? "btn-primary" : ""}`} onClick={() => openPortalPage("edges")}>Edge Apps</button>
                     <button className={`btn ${cpPortalPage === "users" ? "btn-primary" : ""}`} onClick={() => openPortalPage("users")}>Users</button>
                     <button className={`btn ${cpPortalPage === "activation" ? "btn-primary" : ""}`} onClick={() => openPortalPage("activation")}>Activation</button>
+                    <button className={`btn ${cpPortalPage === "interface" ? "btn-primary" : ""}`} onClick={() => openPortalPage("interface")}>Interface</button>
                   </div>
                   <div className="form-grid" style={{ marginTop: 12 }}>
                     <label>
@@ -15695,6 +15359,72 @@ function AppShell() {
                       </div>
                     </section>
                     </>
+                  ) : null}
+
+                  {cpPortalPage === "interface" ? (
+                    <section className="card">
+                      <div className="row interface-header-row">
+                        <h3 className="card-title" style={{ margin: 0 }}>Portal Interface</h3>
+                        <button className="btn btn-danger btn-sm" onClick={resetAllInterfaceSettings} disabled={!canEditPage("interface")}>
+                          Reset All
+                        </button>
+                      </div>
+                      <div className="interface-theme-grid">
+                        {["light", "dark"].map((mode) => (
+                          <article key={`cp-theme-mode-${mode}`} className="interface-theme-card">
+                            <div className="row interface-theme-card-head">
+                              <h4>{mode === "dark" ? "Dark Mode" : "Light Mode"}</h4>
+                              <button className="btn btn-primary btn-sm" onClick={() => resetInterfaceThemeMode(mode)} disabled={!canEditPage("interface")}>
+                                Reset
+                              </button>
+                            </div>
+                            <div className="interface-color-grid">
+                              {INTERFACE_THEME_TOKEN_FIELDS.map((field) => {
+                                const fallback = DEFAULT_INTERFACE_THEME_PREFS[mode][field.key];
+                                const color = normalizeHexColor(interfaceThemePrefs?.[mode]?.[field.key], fallback);
+                                return (
+                                  <label key={`cp-${mode}-${field.key}`} className="interface-color-field">
+                                    <span>{field.label}</span>
+                                    <div className="interface-color-inputs">
+                                      <input type="color" value={color} onChange={(e) => updateInterfaceThemeToken(mode, field.key, e.target.value)} disabled={!canEditPage("interface")} />
+                                      <input type="text" value={color} onChange={(e) => updateInterfaceThemeToken(mode, field.key, e.target.value)} disabled={!canEditPage("interface")} />
+                                    </div>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          </article>
+                        ))}
+                      </div>
+                      <div className="row interface-header-row" style={{ marginTop: 12 }}>
+                        <h3 className="card-title" style={{ margin: 0 }}>Portal Chart Palette</h3>
+                        <button className="btn btn-primary btn-sm" onClick={resetChartPalette} disabled={!canEditPage("interface")}>
+                          Reset Palette
+                        </button>
+                      </div>
+                      <div className="interface-palette-grid">
+                        {seriesColors.map((color, idx) => (
+                          <label key={`cp-palette-${idx}`} className="interface-palette-item">
+                            <span>{`Series ${idx + 1}`}</span>
+                            <div className="interface-color-inputs">
+                              <input
+                                type="color"
+                                value={normalizeHexColor(color, DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length])}
+                                onChange={(e) => setChartPaletteColor(idx, e.target.value)}
+                                disabled={!canEditPage("interface")}
+                              />
+                              <input
+                                type="text"
+                                value={normalizeHexColor(color, DEFAULT_REPORT_SERIES_COLORS[idx % DEFAULT_REPORT_SERIES_COLORS.length])}
+                                onChange={(e) => setChartPaletteColor(idx, e.target.value)}
+                                disabled={!canEditPage("interface")}
+                              />
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                      <div className="lock-note">Portal theme uses the same identity tokens, so colors stay consistent across menus, cards and pages.</div>
+                    </section>
                   ) : null}
                 </div>
               </div>

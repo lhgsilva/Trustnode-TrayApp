@@ -1,0 +1,504 @@
+/* TrustNode Login - Brand Identity Implementation */
+
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
+
+:root {
+  /* Brand Colors */
+  --navy: #1F3A5F;
+  --teal: #14A89A;
+  --teal-deep: #0E8479;
+  --teal-bright: #3CD2C2;
+
+  /* Dark Theme (Default) */
+  --bg-page: #0B0E12;
+  --bg-card: #0F131B;
+  --text-ink: #F2F4F7;
+  --text-muted: #B6C0CC;
+  --text-soft: #8A98AB;
+  --border-color: rgba(255, 255, 255, 0.08);
+  --input-bg: rgba(255, 255, 255, 0.04);
+  --input-bg-focus: rgba(255, 255, 255, 0.06);
+
+  /* Semantic */
+  --error: #E2585D;
+  --success: #14A89A;
+
+  /* Geometry */
+  --radius-lg: 16px;
+  --radius-md: 10px;
+}
+
+/* Light Mode */
+[data-theme="light"] {
+  --bg-page: #ECEFF3;
+  --bg-card: #FFFFFF;
+  --text-ink: #0E1116;
+  --text-muted: #4A5566;
+  --text-soft: #6E7989;
+  --border-color: rgba(14, 17, 22, 0.08);
+  --input-bg: rgba(14, 17, 22, 0.04);
+  --input-bg-focus: rgba(14, 17, 22, 0.08);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  background: var(--bg-page);
+  color: var(--text-ink);
+  font-family: 'Manrope', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.login-container {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-page);
+  padding: 16px;
+}
+
+/* Card - Centered, compact */
+.auth-card {
+  width: 100%;
+  max-width: 480px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  padding: 32px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  position: relative;
+}
+
+/* Theme toggle button */
+.theme-toggle-btn {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: none;
+  border: none;
+  color: var(--text-soft);
+  cursor: pointer;
+  padding: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.2s ease;
+}
+
+.theme-toggle-btn:hover {
+  color: var(--teal);
+}
+
+/* Brand/Logo section */
+.auth-brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 0;
+}
+
+.auth-logo {
+  width: 56px;
+  height: 56px;
+}
+
+.auth-title {
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* Tabs - pill-shaped */
+.auth-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 4px;
+  background: var(--input-bg);
+  border-radius: 999px;
+  margin-bottom: 8px;
+}
+
+.auth-tab {
+  flex: 1;
+  padding: 10px 16px;
+  border: none;
+  background: transparent;
+  color: var(--text-soft);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: 999px;
+  transition: all 0.2s ease;
+}
+
+.auth-tab:hover:not(.active) {
+  color: var(--text-muted);
+}
+
+.auth-tab.active {
+  background: linear-gradient(135deg, var(--teal-deep) 0%, var(--teal) 100%);
+  color: white;
+  box-shadow: 0 4px 12px rgba(20, 168, 154, 0.25);
+}
+
+/* Headings - Consistent 28px for both Login and Activate */
+.auth-welcome,
+.auth-welcome-title,
+.auth-heading {
+  display: block;
+}
+
+.auth-welcome {
+  margin-bottom: 8px;
+}
+
+.auth-welcome-title,
+.auth-heading {
+  font-size: 28px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  letter-spacing: -0.02em;
+}
+
+.auth-welcome-subtitle {
+  font-size: 13px;
+  color: var(--text-soft);
+  line-height: 1.5;
+  margin: 0;
+  margin-bottom: 12px;
+}
+
+/* Form fields */
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+/* Extra compact spacing for Activate tab */
+.auth-card.activate-mode label {
+  margin-bottom: 8px;
+}
+
+label span {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+label > div {
+  font-size: 11px;
+  color: var(--text-soft);
+  font-weight: 400;
+  margin-top: 6px;
+  padding-left: 2px;
+}
+
+/* Password field header with forgot link */
+.pw-field-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.pw-field-header span {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-muted);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.forgot-link {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--teal);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+}
+
+.forgot-link:hover {
+  color: var(--teal-bright);
+}
+
+/* Input fields */
+input[type="text"],
+input[type="password"],
+input[type="email"],
+select {
+  width: 100%;
+  padding: 10px 12px 10px 36px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--input-bg);
+  color: var(--text-ink);
+  font-size: 13px;
+  font-family: 'Manrope', inherit;
+  font-weight: 400;
+  transition: all 0.18s ease;
+  height: 40px;
+}
+
+input[type="text"]::placeholder,
+input[type="password"]::placeholder,
+input[type="email"]::placeholder {
+  color: var(--text-soft);
+  font-weight: 400;
+}
+
+input[type="text"]:focus,
+input[type="password"]:focus,
+input[type="email"]:focus,
+select:focus {
+  outline: none;
+  border-color: var(--teal);
+  background: var(--input-bg-focus);
+  box-shadow: 0 0 0 3px rgba(20, 168, 154, 0.12);
+}
+
+/* Input icon wrapper */
+.field-icon {
+  position: absolute;
+  left: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-soft);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  pointer-events: none;
+}
+
+.field-icon svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  stroke-width: 2;
+  flex-shrink: 0;
+}
+
+/* Input wrapper for icons */
+.input-wrapper {
+  position: relative;
+}
+
+.pw-input-wrap {
+  position: relative;
+}
+
+.pw-input-wrap input {
+  padding-right: 40px;
+  padding-left: 40px;
+}
+
+.pw-icon-btn {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--text-soft);
+  cursor: pointer;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.18s ease;
+}
+
+.pw-icon-btn:hover {
+  color: var(--teal);
+}
+
+.pw-icon-btn svg {
+  width: 18px;
+  height: 18px;
+  stroke: currentColor;
+  stroke-width: 2;
+}
+
+/* Checkbox */
+.remember-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  margin-bottom: 12px;
+  cursor: pointer;
+}
+
+input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--teal);
+  cursor: pointer;
+  flex-shrink: 0;
+  border-radius: 3px;
+}
+
+.remember-label {
+  color: var(--text-muted);
+  cursor: pointer;
+  font-weight: 400;
+}
+
+/* Buttons */
+.btn {
+  border: none;
+  border-radius: 10px;
+  font-family: 'Manrope', inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-primary {
+  width: 100%;
+  background: linear-gradient(135deg, var(--navy) 0%, var(--teal-deep) 100%);
+  color: white;
+  padding: 13px 16px;
+  min-height: 44px;
+  font-size: 14px;
+  font-weight: 600;
+  box-shadow: 0 8px 16px rgba(31, 58, 95, 0.3);
+  margin-bottom: 0;
+}
+
+.btn-primary:hover:not(:disabled) {
+  box-shadow: 0 12px 24px rgba(20, 168, 154, 0.3);
+  transform: translateY(-1px);
+}
+
+.btn-primary:active:not(:disabled) {
+  transform: scale(0.99);
+}
+
+.btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.auth-submit {
+  margin-top: 8px;
+}
+
+.btn-ghost-link {
+  background: none;
+  color: var(--teal);
+  padding: 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.btn-ghost-link:hover {
+  color: var(--teal-bright);
+}
+
+/* Forgot password box */
+.auth-forgot-box {
+  background: rgba(20, 168, 154, 0.05);
+  border: 1px solid rgba(20, 168, 154, 0.15);
+  border-radius: 10px;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+[data-theme="light"] .auth-forgot-box {
+  background: rgba(14, 168, 154, 0.04);
+  border-color: rgba(14, 168, 154, 0.12);
+}
+
+.auth-forgot-box label {
+  margin-bottom: 0;
+}
+
+/* Messages */
+.error {
+  background: rgba(226, 88, 93, 0.1);
+  color: #FF8A80;
+  padding: 11px 13px;
+  border-radius: 10px;
+  font-size: 12px;
+  border: 1px solid rgba(226, 88, 93, 0.25);
+  margin-bottom: 16px;
+  line-height: 1.4;
+}
+
+[data-theme="light"] .error {
+  color: #E2585D;
+}
+
+.lock-note {
+  background: rgba(20, 168, 154, 0.1);
+  color: var(--teal-bright);
+  padding: 11px 13px;
+  border-radius: 10px;
+  font-size: 12px;
+  border: 1px solid rgba(20, 168, 154, 0.25);
+  margin-bottom: 16px;
+  line-height: 1.4;
+}
+
+/* Utilities */
+.row {
+  display: flex;
+  gap: 10px;
+}
+
+.row .btn {
+  flex: 1;
+}
+
+.grid.two {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+.grid.two label {
+  margin-bottom: 0;
+}
+
+@media (max-width: 600px) {
+  .auth-card {
+    padding: 32px 24px;
+    gap: 18px;
+  }
+
+  .auth-title {
+    font-size: 18px;
+  }
+
+  .auth-welcome-title {
+    font-size: 24px;
+  }
+
+  .auth-heading {
+    font-size: 22px;
+  }
+
+  .grid.two {
+    grid-template-columns: 1fr;
+  }
+}

@@ -159,7 +159,14 @@ export function getAuthToken() {
   return localStorage.getItem(AUTH_TOKEN_KEY) || "";
 }
 
-export async function loginAuth(payload) {
+export async function loginAuth(payloadOrUsername, maybePassword) {
+  const payload =
+    payloadOrUsername && typeof payloadOrUsername === "object"
+      ? payloadOrUsername
+      : {
+          username: String(payloadOrUsername || ""),
+          password: String(maybePassword || ""),
+        };
   const request = {
     method: "POST",
     headers: { "Content-Type": "application/json" },
