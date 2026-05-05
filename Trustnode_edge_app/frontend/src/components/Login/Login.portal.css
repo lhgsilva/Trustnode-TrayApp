@@ -1,0 +1,24 @@
+/* Portal specific login skin */
+.login-container.auth-surface-portal .auth-card {
+  max-width: 760px;
+}
+.login-container.auth-surface-portal .auth-logo {
+  width: 420px;
+  height: 130px;
+}
+.login-container.auth-surface-portal .auth-heading,
+.login-container.auth-surface-portal .auth-welcome-title {
+  font-size: 52px;
+}
+.login-container.auth-surface-portal .auth-welcome-subtitle,
+.login-container.auth-surface-portal .auth-activate-subtitle {
+  font-size: 18px;
+}
+.login-container.auth-surface-portal label span {
+  font-size: 13px;
+}
+.login-container.auth-surface-portal input,
+.login-container.auth-surface-portal select {
+  height: 60px;
+  font-size: 30px;
+}

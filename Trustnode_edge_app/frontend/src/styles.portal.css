@@ -1,0 +1,10 @@
+/* Developer Portal surface-only styling.
+   Scope all rules with `.surface-portal` to avoid affecting local/client. */
+
+.surface-portal {
+  /* Reserved for portal-only overrides */
+}
+
+.surface-portal .app-header {
+  background: #141414;
+}

@@ -1,0 +1,10 @@
+/* Customer Client View surface-only styling.
+   Scope all rules with `.surface-client` to avoid affecting local/portal. */
+
+.surface-client {
+  /* Reserved for client-only overrides */
+}
+
+.surface-client .app-header {
+  background: #141414;
+}

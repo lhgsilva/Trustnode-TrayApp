@@ -1,0 +1,12 @@
+/* Local edge app login skin */
+.login-container.auth-surface-local .auth-card {
+  max-width: 520px;
+}
+.login-container.auth-surface-local .auth-logo {
+  width: 260px;
+  height: 96px;
+}
+.login-container.auth-surface-local.activate-mode .auth-card,
+.login-container.auth-surface-local .auth-card.activate-mode {
+  gap: 3px;
+}

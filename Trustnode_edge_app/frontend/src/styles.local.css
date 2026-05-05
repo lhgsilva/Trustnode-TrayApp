@@ -1,0 +1,6 @@
+/* Local Edge App surface-only styling.
+   Scope all rules with `.surface-local` to avoid affecting portal/client. */
+
+.surface-local {
+  /* Reserved for local-only overrides */
+}

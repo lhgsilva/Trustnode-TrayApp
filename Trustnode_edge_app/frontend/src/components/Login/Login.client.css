@@ -1,0 +1,24 @@
+/* Customer web client login skin */
+.login-container.auth-surface-client .auth-card {
+  max-width: 640px;
+}
+.login-container.auth-surface-client .auth-logo {
+  width: 340px;
+  height: 112px;
+}
+.login-container.auth-surface-client .auth-heading,
+.login-container.auth-surface-client .auth-welcome-title {
+  font-size: 44px;
+}
+.login-container.auth-surface-client .auth-welcome-subtitle,
+.login-container.auth-surface-client .auth-activate-subtitle {
+  font-size: 16px;
+}
+.login-container.auth-surface-client label span {
+  font-size: 12px;
+}
+.login-container.auth-surface-client input,
+.login-container.auth-surface-client select {
+  height: 52px;
+  font-size: 24px;
+}

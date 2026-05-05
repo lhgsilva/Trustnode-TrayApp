@@ -1,6 +1,9 @@
 import React, { useState } from "react";
 import { loginAuth, issuePublicPasswordReset, applyPublicPasswordReset } from "../../api";
 import "./Login.css";
+import "./Login.local.css";
+import "./Login.portal.css";
+import "./Login.client.css";
 import { EyeIcon } from "../Icons/EyeIcon";
 import { ThemeIcon } from "../Icons/ThemeIcon";
 import trustnodeLogo from "./trustenode-002.png";
@@ -172,7 +175,7 @@ export const Login = ({
   })();
 
   return (
-    <div className={`login-container theme-${theme}`} data-theme={theme}>
+    <div className={`login-container theme-${theme} auth-surface-${loginSurface} ${isPortalV1Login ? "auth-shell--v1" : ""}`} data-theme={theme}>
       <div className={`auth-card ${loginTab === "register" ? "activate-mode" : ""}`}>
         <button
           className="theme-toggle-btn"
@@ -189,9 +192,6 @@ export const Login = ({
             className="auth-logo"
             onError={handleLogoLoadError}
           />
-          <div>
-            <div className="auth-title">Trustnode</div>
-          </div>
         </div>
 
         <div className="auth-tabs">
@@ -216,7 +216,7 @@ export const Login = ({
         {loginTab === "register" && showRegisterTab ? (
           <>
             <h3 className="auth-heading">Activate TrustNode Edge</h3>
-            <p style={{ fontSize: "14px", color: "#666", marginBottom: "24px" }}>
+            <p className="auth-activate-subtitle">
               Paste your activation code, then choose the administrator account you'll use to sign in to this Edge app.
             </p>
 
@@ -240,12 +240,12 @@ export const Login = ({
                   }
                 />
               </div>
-              <div style={{ fontSize: "11px", color: "var(--ink-soft)", marginTop: "6px" }}>
+              <div className="auth-field-help">
                 A single string provided with your Edge license.
               </div>
             </label>
 
-            <div style={{ fontSize: "12px", color: "#999", fontWeight: "600", marginTop: "20px", marginBottom: "12px" }}>
+            <div className="auth-section-label">
               CREATE ADMINISTRATOR ACCOUNT
             </div>
 
@@ -269,7 +269,7 @@ export const Login = ({
                   }
                 />
               </div>
-              <div style={{ fontSize: "11px", color: "var(--ink-soft)", marginTop: "6px" }}>
+              <div className="auth-field-help">
                 This is the username you'll log in with after activation.
               </div>
             </label>
@@ -496,3 +496,4 @@ export const Login = ({
     </div>
   );
 };
+

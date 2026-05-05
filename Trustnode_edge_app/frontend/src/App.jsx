@@ -11754,9 +11754,10 @@ function AppShell() {
   }
 
   const renderLock = (page) => (!canEditPage(page) ? <span className="lock-tag">LOCK</span> : null);
+  const appSurface = isPortalOnly ? "portal" : (isHostedWebClient ? "client" : "local");
 
   return (
-    <div className="shell">
+    <div className={`shell surface-${appSurface}`}>
       <header className={`app-header ${isPortalOnly ? "portal-header" : ""}`}>
         <div className="header-left">
           <button className="nav-toggle-btn" onClick={() => setSidebarCollapsed((v) => !v)} aria-label="Toggle navigation">
