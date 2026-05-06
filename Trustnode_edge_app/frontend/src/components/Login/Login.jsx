@@ -63,7 +63,7 @@ export const Login = ({
 
     try {
       const result = await loginAuth(loginForm.username, loginForm.password);
-      if (result?.success) {
+      if (result?.ok || result?.success || result?.token) {
         if (rememberWorkstation) {
           try {
             localStorage.setItem("tn_remember_workstation", loginForm.username);
@@ -73,7 +73,12 @@ export const Login = ({
         }
         onLoginSuccess?.(result);
       } else {
-        setLoginError(result?.error || "Login failed");
+        setLoginError(
+          result?.error ||
+            result?.detail ||
+            result?.message ||
+            "Login failed"
+        );
       }
     } catch (err) {
       setLoginError(err?.message || "Network error during login");
