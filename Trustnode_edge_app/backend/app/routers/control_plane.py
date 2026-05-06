@@ -12,6 +12,17 @@ from app.tenant import get_current_tenant, normalize_tenant_id
 router = APIRouter(prefix="/api/control-plane", tags=["control-plane"])
 
 
+def _is_same_origin_as_request(base_url: str, request: Request) -> bool:
+    try:
+        b = str(base_url or "").strip().rstrip("/").lower()
+        if not b:
+            return False
+        req_origin = f"{request.url.scheme}://{str(request.headers.get('host', '')).strip()}".rstrip("/").lower()
+        return b == req_origin
+    except Exception:
+        return False
+
+
 def _resolve_cloud_control_plane_base(request: Request) -> str:
     explicit = str(os.getenv("TRUSTNODE_CONTROL_PLANE_URL") or "").strip().rstrip("/")
     if explicit:
@@ -806,7 +817,7 @@ def edge_link_bootstrap(payload: ActivationCodeApplyRequest, request: Request) -
         )
         return {"ok": True, "row": row}
     except Exception as exc:
-        if "activation_code_not_found" in str(exc or "") and cloud_url:
+        if "activation_code_not_found" in str(exc or "") and cloud_url and (not _is_same_origin_as_request(cloud_url, request)):
             try:
                 upstream = requests.post(
                     f"{cloud_url}/api/control-plane/edge-link/register",
@@ -869,7 +880,7 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             # rows are absent or stale. Resolve activation against cloud control-plane
             # for any activation-related local resolution error.
             bootstrap_err = str(bootstrap_exc or "")
-            should_try_cloud = cloud_url and (
+            should_try_cloud = cloud_url and (not _is_same_origin_as_request(cloud_url, request)) and (
                 "activation_code_" in bootstrap_err
                 or "activation_" in bootstrap_err
             )

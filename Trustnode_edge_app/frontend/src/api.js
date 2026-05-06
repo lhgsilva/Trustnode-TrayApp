@@ -1439,23 +1439,31 @@ export async function registerControlPlaneEdgeLink(payload) {
     body: JSON.stringify(payload || {})
   };
   const primaryBase = normalizeBaseUrl(getApiBase());
-  let primaryError = null;
-  try {
-    const primaryRes = await fetchWithTimeout(`${primaryBase}/api/control-plane/edge-link/register`, req);
-    await ensureOk(primaryRes, "Control-plane edge-link register failed");
-    return primaryRes.json();
-  } catch (err) {
-    primaryError = err;
-    const shouldFallback = !isHostedWebClientRuntime();
-    if (!shouldFallback) throw err;
-  }
-
   const candidates = [];
   const storedCloud = normalizeBaseUrl(localStorage.getItem(STORAGE_CLOUD_URL_KEY) || "");
-  if (storedCloud && storedCloud !== primaryBase) candidates.push(storedCloud);
-  if (CONTROL_PLANE_FALLBACK_URL && CONTROL_PLANE_FALLBACK_URL !== primaryBase && CONTROL_PLANE_FALLBACK_URL !== storedCloud) {
-    candidates.push(CONTROL_PLANE_FALLBACK_URL);
+  const pushUnique = (base) => {
+    const normalized = normalizeBaseUrl(base || "");
+    if (!normalized) return;
+    if (!candidates.includes(normalized)) candidates.push(normalized);
+  };
+
+  const hostedRuntime = isHostedWebClientRuntime();
+  if (hostedRuntime) {
+    // Hosted runtime should prefer same-origin API first.
+    pushUnique(primaryBase);
+    if (storedCloud && storedCloud !== primaryBase) pushUnique(storedCloud);
+    if (CONTROL_PLANE_FALLBACK_URL && CONTROL_PLANE_FALLBACK_URL !== primaryBase) {
+      pushUnique(CONTROL_PLANE_FALLBACK_URL);
+    }
+  } else {
+    // Desktop/local runtime: activation codes are issued in cloud control-plane.
+    // Prefer cloud first, then local as fallback.
+    if (storedCloud) pushUnique(storedCloud);
+    if (CONTROL_PLANE_FALLBACK_URL) pushUnique(CONTROL_PLANE_FALLBACK_URL);
+    pushUnique(primaryBase);
   }
+
+  let lastErr = null;
   for (const base of candidates) {
     try {
       const res = await fetchWithTimeout(`${base}/api/control-plane/edge-link/register`, req, 20000);
@@ -1484,11 +1492,12 @@ export async function registerControlPlaneEdgeLink(payload) {
         }
       }
       return data;
-    } catch {
+    } catch (err) {
+      lastErr = err;
       // Try next candidate.
     }
   }
-  throw primaryError || new Error("Control-plane edge-link register failed");
+  throw lastErr || new Error("Control-plane edge-link register failed");
 }
 
 export async function unlinkControlPlaneEdgeLink() {

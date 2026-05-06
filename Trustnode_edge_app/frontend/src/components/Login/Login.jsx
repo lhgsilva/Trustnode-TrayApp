@@ -1,5 +1,10 @@
 import React, { useState } from "react";
-import { loginAuth, issuePublicPasswordReset, applyPublicPasswordReset } from "../../api";
+import {
+  loginAuth,
+  issuePublicPasswordReset,
+  applyPublicPasswordReset,
+  registerControlPlaneEdgeLink,
+} from "../../api";
 import "./Login.css";
 import "./Login.local.css";
 import "./Login.portal.css";
@@ -130,31 +135,53 @@ export const Login = ({
   };
 
   const submitEdgeRegister = async () => {
-    setEdgeRegisterResult("Registering...");
+    setEdgeRegisterResult("Activating...");
     setEdgeRegisterBusy(true);
     try {
-      const response = await fetch("/api/edge/register", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(edgeRegisterForm),
-      });
-      const result = await response.json();
-      if (result?.success) {
-        setEdgeRegisterResult("Edge activated successfully!");
+      const payload = {
+        activation_code: String(edgeRegisterForm.activation_code || "").trim(),
+        // Edge identity is resolved from the activation code binding in control-plane.
+        edge_id: "",
+        edge_name: "",
+        site: "",
+        area: "",
+        equipment: "",
+        admin_username: String(edgeRegisterForm.admin_username || "").trim(),
+        admin_password: String(edgeRegisterForm.admin_password || ""),
+      };
+      const result = await registerControlPlaneEdgeLink(payload);
+      if (result?.ok) {
+        setEdgeRegisterResult("Edge activated successfully. You can login now.");
         setEdgeRegisterForm({
           activation_code: "",
           admin_username: "",
           admin_password: "",
         });
+        setLoginForm((prev) => ({
+          ...prev,
+          username: String(payload.admin_username || prev.username || ""),
+        }));
+        setLoginTab("login");
       } else {
-        setEdgeRegisterResult(result?.error || "Registration failed");
+        setEdgeRegisterResult(
+          String(result?.detail || result?.error || "Activation failed")
+        );
       }
     } catch (err) {
-      setEdgeRegisterResult(err?.message || "Network error during registration");
+      setEdgeRegisterResult(
+        `Edge registration failed: ${String(err?.message || err)}`
+      );
     } finally {
       setEdgeRegisterBusy(false);
     }
   };
+
+  const canActivate = (() => {
+    const code = String(edgeRegisterForm.activation_code || "").trim();
+    const user = String(edgeRegisterForm.admin_username || "").trim();
+    const pass = String(edgeRegisterForm.admin_password || "");
+    return code.length > 0 && user.length > 0 && pass.length > 0;
+  })();
 
   const openEdgeRegisterModal = () => {
     setLoginTab("register");
@@ -164,7 +191,6 @@ export const Login = ({
     return null;
   }
 
-  const showRegisterTab = !isHostedWebClient && !edgeLinked;
   const loginSurface = (() => {
     try {
       const path = String(window.location?.pathname || "").toLowerCase();
@@ -183,6 +209,15 @@ export const Login = ({
       return false;
     }
   })();
+  const showRegisterTab =
+    (loginSurface === "local" || loginSurface === "portal") && !edgeLinked;
+  const loginActionLabelBySurface = {
+    local: "Sign in to TrustNode Edge",
+    portal: "Sign in to TrustNode Portal",
+    client: "Sign in to Trusnode Client View",
+  };
+  const loginActionLabel =
+    loginActionLabelBySurface[loginSurface] || "Sign in";
 
   return (
     <div className={`login-container theme-${theme} auth-surface-${loginSurface} ${isPortalV1Login ? "auth-shell--v1" : ""}`} data-theme={theme}>
@@ -336,7 +371,7 @@ export const Login = ({
             <button
               className="btn btn-primary auth-submit"
               onClick={submitEdgeRegister}
-              disabled={edgeRegisterBusy}
+              disabled={edgeRegisterBusy || !canActivate}
             >
               {edgeRegisterBusy ? "Activating..." : "Activate Edge app ->"}
             </button>
@@ -498,7 +533,7 @@ export const Login = ({
               onClick={submitLogin}
               disabled={loginBusy}
             >
-              {loginBusy ? "Signing in..." : "Sign in to TrustNode portal ->"}
+              {loginBusy ? "Signing in..." : loginActionLabel}
             </button>
           </>
         )}

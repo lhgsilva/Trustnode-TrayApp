@@ -36,9 +36,9 @@
    DARK THEME — black/dark grey base
    ============================================================ */
 .theme-dark {
-  --bg-page: #0B0E12;
-  --bg-elev: #181D25;
-  --bg-card: #232A36;
+  --bg-page: #2A3340;
+  --bg-elev: #0B0E12;
+  --bg-card: #000000;
   --bg-card-edge: #2E3744;
   --ink: #F2F4F7;
   --ink-muted: #B6C0CC;
@@ -76,7 +76,7 @@
 
 /* Default to dark theme if no class is set */
 :root {
-  --bg-page: #0B0E12;
+  --bg-page: #2A3340;
   --bg-elev: #181D25;
   --bg-card: #232A36;
   --bg-card-edge: #2E3744;
@@ -422,6 +422,12 @@ select:focus {
 .pw-input-wrap input {
   position: relative;
   z-index: 1;
+  background: var(--field-bg) !important;
+}
+
+/* Ensure icon spacing applies even when input has no explicit type attribute */
+.input-wrapper input {
+  padding-left: 50px;
 }
 
 .pw-input-wrap {
@@ -670,6 +676,4 @@ input[type="checkbox"] {
 .theme-light label span {
   color: #4b5563;
 }
-
-
 
