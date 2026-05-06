@@ -29,6 +29,46 @@ def _check_rate_limit(ip: str):
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
+_FULL_PERMISSIONS: Dict[str, bool] = {
+    "devices": True,
+    "tags": True,
+    "triggers_and_limits": True,
+    "alarms": True,
+    "reporting": True,
+    "data_log": True,
+    "gateway_configuration": True,
+    "gateway_runtime_control": True,
+    "database": True,
+    "database_overview": True,
+    "database_inspector": True,
+    "backup_and_retention": True,
+    "website_and_env": True,
+    "email_and_notifications": True,
+    "scheduled_reports": True,
+    "frontend_source": True,
+    "users_and_access_control": True,
+    "control_plane": True,
+    "interface": True,
+}
+
+
+def _master_admin_credentials() -> tuple[str, str]:
+    user = str(__import__("os").environ.get("TRUSTNODE_MASTER_ADMIN_USER", "admin") or "admin").strip() or "admin"
+    pwd = str(__import__("os").environ.get("TRUSTNODE_MASTER_ADMIN_PASSWORD", "admin") or "admin")
+    return user, pwd
+
+
+def _master_admin_user_row() -> Dict[str, Any]:
+    user, _ = _master_admin_credentials()
+    return {
+        "username": user,
+        "role": "admin",
+        "permissions": dict(_FULL_PERMISSIONS),
+        "modules": [],
+        "tenant_id": "default",
+    }
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -82,10 +122,17 @@ def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         configured_tenant = "default"
     fallback_tenant = configured_tenant if configured_tenant != "default" else normalize_tenant_id(get_current_tenant())
+    role = str(user_row.get("role") or "viewer")
+    permissions = user_row.get("permissions") or {}
+    if role.lower() == "admin":
+        merged = dict(_FULL_PERMISSIONS)
+        if isinstance(permissions, dict):
+            merged.update({k: bool(v) for k, v in permissions.items()})
+        permissions = merged
     return {
         "username": str(user_row.get("username") or ""),
-        "role": str(user_row.get("role") or "viewer"),
-        "permissions": user_row.get("permissions") or {},
+        "role": role,
+        "permissions": permissions,
         "modules": user_row.get("modules") or [],
         "tenant_id": normalize_tenant_id(str(user_row.get("tenant_id") or fallback_tenant)),
     }
@@ -101,6 +148,11 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail="No users configured. Complete first-run setup.")
     username = str(payload.username or "").strip()
     password = str(payload.password or "")
+    master_user, master_pass = _master_admin_credentials()
+    if username == master_user and verify_password(password, master_pass):
+        user_public = _public_user(_master_admin_user_row())
+        token = create_access_token(user_public)
+        return {"ok": True, "token": token, "user": user_public}
     hit = _match_user(users_access, username, password)
     if not hit:
         # Control-plane users are authoritative for tenant-scoped cloud users.
@@ -168,12 +220,19 @@ def me(request: Request) -> Dict[str, Any]:
         payload = decode_access_token(token)
     except Exception as exc:
         raise HTTPException(status_code=401, detail=f"Invalid token: {exc}") from exc
+    role = str(payload.get("role") or "viewer")
+    permissions = payload.get("permissions") or {}
+    if role.lower() == "admin":
+        merged = dict(_FULL_PERMISSIONS)
+        if isinstance(permissions, dict):
+            merged.update({k: bool(v) for k, v in permissions.items()})
+        permissions = merged
     return {
         "ok": True,
         "user": {
             "username": str(payload.get("sub") or ""),
-            "role": str(payload.get("role") or "viewer"),
-            "permissions": payload.get("permissions") or {},
+            "role": role,
+            "permissions": permissions,
             "modules": payload.get("modules") or [],
             "tenant_id": normalize_tenant_id(str(payload.get("tenant_id") or get_current_tenant())),
         },

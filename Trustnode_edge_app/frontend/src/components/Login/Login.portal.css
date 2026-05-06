@@ -1,24 +1,74 @@
-/* Portal specific login skin */
+/* Portal login mirrors local edge proportions and spacing */
 .login-container.auth-surface-portal .auth-card {
-  max-width: 760px;
+  max-width: 500px;
+  padding: 18px 20px 16px;
 }
+
 .login-container.auth-surface-portal .auth-logo {
-  width: 420px;
-  height: 130px;
+  width: 340px;
+  height: 124px;
+  object-fit: contain;
+  object-position: center;
 }
-.login-container.auth-surface-portal .auth-heading,
-.login-container.auth-surface-portal .auth-welcome-title {
-  font-size: 52px;
+
+.login-container.auth-surface-portal .auth-brand {
+  gap: 2px;
+  margin-bottom: 0;
 }
-.login-container.auth-surface-portal .auth-welcome-subtitle,
-.login-container.auth-surface-portal .auth-activate-subtitle {
-  font-size: 18px;
+
+.login-container.auth-surface-portal .field-icon {
+  left: 14px;
+  width: 20px;
+  height: 20px;
 }
-.login-container.auth-surface-portal label span {
-  font-size: 13px;
-}
-.login-container.auth-surface-portal input,
+
+.login-container.auth-surface-portal .input-wrapper input,
+.login-container.auth-surface-portal input[type="text"],
+.login-container.auth-surface-portal input[type="password"],
+.login-container.auth-surface-portal input[type="email"],
 .login-container.auth-surface-portal select {
-  height: 60px;
-  font-size: 30px;
+  padding-left: 56px !important;
+  text-indent: 0 !important;
+}
+
+.login-container.auth-surface-portal .pw-input-wrap input {
+  padding-left: 56px !important;
+  text-indent: 0 !important;
+}
+
+.login-container.auth-surface-portal.activate-mode .auth-card,
+.login-container.auth-surface-portal .auth-card.activate-mode {
+  gap: 0;
+}
+
+.login-container.auth-surface-portal .auth-card.activate-mode h3,
+.login-container.auth-surface-portal .auth-card.activate-mode .auth-heading {
+  margin-bottom: 0;
+}
+
+.login-container.auth-surface-portal .auth-card.activate-mode p,
+.login-container.auth-surface-portal .auth-card.activate-mode .auth-activate-subtitle {
+  margin-bottom: 2px;
+  line-height: 1.2;
+}
+
+.login-container.auth-surface-portal .auth-card.activate-mode label {
+  margin-bottom: 8px;
+}
+
+.login-container.auth-surface-portal .auth-card.activate-mode .auth-field-help {
+  margin-top: 4px;
+  margin-bottom: 0;
+}
+
+@media (max-width: 600px) {
+  .login-container.auth-surface-portal .auth-card {
+    max-width: 96vw;
+    padding: 16px 16px 14px;
+  }
+
+  .login-container.auth-surface-portal .auth-logo {
+    width: 280px;
+    height: 104px;
+  }
 }

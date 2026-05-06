@@ -1,24 +1,49 @@
-/* Customer web client login skin */
+/* Client-view login mirrors local edge proportions and spacing */
 .login-container.auth-surface-client .auth-card {
-  max-width: 640px;
+  max-width: 500px;
+  padding: 18px 20px 16px;
 }
+
 .login-container.auth-surface-client .auth-logo {
   width: 340px;
-  height: 112px;
+  height: 124px;
+  object-fit: contain;
+  object-position: center;
 }
-.login-container.auth-surface-client .auth-heading,
-.login-container.auth-surface-client .auth-welcome-title {
-  font-size: 44px;
+
+.login-container.auth-surface-client .auth-brand {
+  gap: 2px;
+  margin-bottom: 0;
 }
-.login-container.auth-surface-client .auth-welcome-subtitle,
-.login-container.auth-surface-client .auth-activate-subtitle {
-  font-size: 16px;
+
+.login-container.auth-surface-client .field-icon {
+  left: 14px;
+  width: 20px;
+  height: 20px;
 }
-.login-container.auth-surface-client label span {
-  font-size: 12px;
-}
-.login-container.auth-surface-client input,
+
+.login-container.auth-surface-client .input-wrapper input,
+.login-container.auth-surface-client input[type="text"],
+.login-container.auth-surface-client input[type="password"],
+.login-container.auth-surface-client input[type="email"],
 .login-container.auth-surface-client select {
-  height: 52px;
-  font-size: 24px;
+  padding-left: 56px !important;
+  text-indent: 0 !important;
+}
+
+.login-container.auth-surface-client .pw-input-wrap input {
+  padding-left: 56px !important;
+  text-indent: 0 !important;
+}
+
+@media (max-width: 600px) {
+  .login-container.auth-surface-client .auth-card {
+    max-width: 96vw;
+    padding: 16px 16px 14px;
+  }
+
+  .login-container.auth-surface-client .auth-logo {
+    width: 280px;
+    height: 104px;
+  }
 }

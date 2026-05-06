@@ -4,6 +4,7 @@ import {
   issuePublicPasswordReset,
   applyPublicPasswordReset,
   registerControlPlaneEdgeLink,
+  getAuthMe,
 } from "../../api";
 import "./Login.css";
 import "./Login.local.css";
@@ -71,7 +72,13 @@ export const Login = ({
             // ignore localStorage errors
           }
         }
-        onLoginSuccess?.(result);
+        const sessionUser =
+          result?.user || (await getAuthMe().catch(() => null))?.user || null;
+        if (sessionUser?.username) {
+          onLoginSuccess?.(sessionUser);
+        } else {
+          setLoginError("Login succeeded but user session payload is missing");
+        }
       } else {
         setLoginError(
           result?.error ||
@@ -546,4 +553,6 @@ export const Login = ({
     </div>
   );
 };
+
+
 
