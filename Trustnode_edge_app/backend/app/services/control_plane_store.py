@@ -57,6 +57,47 @@ class ControlPlaneStore:
     def _utc_now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
+    def _parse_dt_utc(self, raw: str, *, end_of_day_for_date_only: bool = False) -> datetime | None:
+        txt = str(raw or "").strip()
+        if not txt:
+            return None
+        txt = txt.replace("T", " ").replace("Z", "+00:00")
+        fmts = [
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d",
+            "%d/%m/%Y %H:%M:%S.%f",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y",
+            "%d-%m-%Y %H:%M:%S.%f",
+            "%d-%m-%Y %H:%M:%S",
+            "%d-%m-%Y",
+        ]
+        for fmt in fmts:
+            try:
+                dt = datetime.strptime(txt, fmt)
+                if fmt in {"%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"} and end_of_day_for_date_only:
+                    dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
+                return dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+        try:
+            dt = datetime.fromisoformat(txt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _is_expired_utc(self, end_raw: str, now_raw: str) -> bool:
+        end_dt = self._parse_dt_utc(end_raw, end_of_day_for_date_only=True)
+        if not end_dt:
+            return False
+        now_dt = self._parse_dt_utc(now_raw)
+        if not now_dt:
+            now_dt = datetime.now(timezone.utc)
+        return end_dt < now_dt
+
     def _sha256(self, raw: str) -> str:
         return hashlib.sha256(str(raw).encode("utf-8")).hexdigest()
 
@@ -779,7 +820,7 @@ class ControlPlaneStore:
                     if status == "revoked":
                         raise ValueError("activation_code_revoked")
                     raise ValueError("activation_code_not_issued")
-                if str(r.get("expires_utc") or "") < now:
+                if self._is_expired_utc(str(r.get("expires_utc") or ""), now):
                     conn.execute("UPDATE cp_edge_activation_codes SET status='expired' WHERE code_hash=?", (code_hash,))
                     conn.commit()
                     raise ValueError("activation_code_expired")
@@ -809,7 +850,7 @@ class ControlPlaneStore:
                     if str(l.get("status") or "").strip().lower() != "active":
                         raise ValueError("activation_license_not_active")
                     end_utc = str(l.get("end_utc") or "").strip()
-                    if end_utc and end_utc < now:
+                    if end_utc and self._is_expired_utc(end_utc, now):
                         raise ValueError("activation_license_expired")
                 self.upsert_edge(
                     tenant_id=tid,
@@ -924,7 +965,7 @@ class ControlPlaneStore:
                 evt = dict(ev)
                 if str(evt.get("status") or "") != "issued":
                     raise ValueError("reset_token_not_active")
-                if str(evt.get("expires_utc") or "") < now:
+                if self._is_expired_utc(str(evt.get("expires_utc") or ""), now):
                     conn.execute("UPDATE cp_password_reset_events SET status='expired' WHERE id=?", (int(evt.get("id")),))
                     conn.commit()
                     raise ValueError("reset_token_expired")
@@ -1161,7 +1202,7 @@ class ControlPlaneStore:
                 if status != "active":
                     return {"ok": False, "reason": "license_inactive", "edge": edge_row, "license": lic}
                 end_utc = str(lic.get("end_utc") or "").strip()
-                if end_utc and end_utc < now:
+                if end_utc and self._is_expired_utc(end_utc, now):
                     return {"ok": False, "reason": "license_expired", "edge": edge_row, "license": lic}
                 return {"ok": True, "edge": edge_row, "license": lic}
 
