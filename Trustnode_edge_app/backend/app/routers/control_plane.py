@@ -940,12 +940,31 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                 equipment=payload.equipment,
                 consume_code=True,
             )
+        # Safety fallback: always resolve customer/license scope from activation record.
+        # Some legacy bootstrap paths can return incomplete customer linkage.
+        resolved_customer_id = str(row.get("customer_id") or "").strip()
+        resolved_license_id = str((row.get("license") or {}).get("license_id") or "").strip()
+        if not resolved_customer_id or not resolved_license_id:
+            try:
+                probe = control_plane_store.activate_edge_with_code(
+                    activation_code=payload.activation_code,
+                    edge_id=str(row.get("edge_id") or payload.edge_id or ""),
+                    edge_name=str(row.get("edge_name") or payload.edge_name or ""),
+                    site=str(row.get("site") or payload.site or ""),
+                    area=str(row.get("area") or payload.area or ""),
+                    equipment=str(row.get("equipment") or payload.equipment or ""),
+                    consume_code=False,
+                )
+                resolved_customer_id = resolved_customer_id or str(probe.get("customer_id") or "").strip()
+                resolved_license_id = resolved_license_id or str((probe.get("license") or {}).get("license_id") or "").strip()
+            except Exception:
+                pass
         tenant_id = normalize_tenant_id(str(row.get("tenant_id") or "default"))
         # Create/refresh tenant admin in control-plane auth store.
         # This is mandatory for first login after activation.
         local_user_row = control_plane_store.upsert_user(
             tenant_id=tenant_id,
-            customer_id=str(row.get("customer_id") or ""),
+            customer_id=resolved_customer_id,
             username=admin_username,
             password=admin_password,
             role="admin",
@@ -965,7 +984,7 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                 upstream_user = requests.post(
                     f"{cloud_url}/api/control-plane/users?tenant_id={tenant_id}",
                     json={
-                        "customer_id": str(row.get("customer_id") or ""),
+                        "customer_id": resolved_customer_id,
                         "username": admin_username,
                         "password": admin_password,
                         "role": "admin",
@@ -1029,9 +1048,9 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             app_settings_patch = dict(row.get("app_settings_patch") or {})
             app_settings_patch["edge_id"] = str(row.get("edge_id") or payload.edge_id)
             app_settings_patch["edge_name"] = str(row.get("edge_name") or payload.edge_name or payload.edge_id)
-            app_settings_patch["customer_id"] = str(row.get("customer_id") or "")
+            app_settings_patch["customer_id"] = resolved_customer_id
             app_settings_patch["edge_linked"] = True
-            app_settings_patch["license_id"] = str((row.get("license") or {}).get("license_id") or "")
+            app_settings_patch["license_id"] = resolved_license_id
             app_settings_patch["edge_profile"] = {
                 "edge_id": str(row.get("edge_id") or payload.edge_id or ""),
                 "edge_name": str(row.get("edge_name") or payload.edge_name or payload.edge_id or ""),
@@ -1069,8 +1088,8 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             "tenant_id": tenant_id,
             "edge_id": str(row.get("edge_id") or payload.edge_id),
             "edge_name": str(row.get("edge_name") or payload.edge_name or payload.edge_id),
-            "customer_id": str(row.get("customer_id") or ""),
-            "license_id": str((row.get("license") or {}).get("license_id") or ""),
+            "customer_id": resolved_customer_id,
+            "license_id": resolved_license_id,
             "cloud_api_url": str(row.get("cloud_api_url") or ""),
             "primary_domain": str(row.get("primary_domain") or ""),
             "site": str(row.get("site") or payload.site or ""),
