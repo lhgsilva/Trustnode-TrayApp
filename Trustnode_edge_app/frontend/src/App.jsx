@@ -5892,6 +5892,11 @@ function AppShell() {
   const cpUsersView = useMemo(() => {
     const rows = Array.isArray(cpUsers) ? cpUsers : [];
     if (!cpCustomerFilter || cpCustomerFilter === "__all__") return rows;
+    // Control-plane users are tenant-scoped and may not carry customer_id.
+    // Keep customer-scoped rows when present; otherwise keep rows visible
+    // so freshly activated admin users are not hidden by an empty customer_id.
+    const hasAnyCustomerScopedUser = rows.some((r) => String(r?.customer_id || "").trim().length > 0);
+    if (!hasAnyCustomerScopedUser) return rows;
     return rows.filter((r) => String(r?.customer_id || "") === cpCustomerFilter);
   }, [cpUsers, cpCustomerFilter]);
 

@@ -87,6 +87,7 @@ class LicenseModulesRequest(BaseModel):
 
 
 class UserUpsertRequest(BaseModel):
+    customer_id: str = ""
     username: str
     password: str | None = None
     role: str = "viewer"
@@ -444,6 +445,7 @@ def upsert_user(payload: UserUpsertRequest, request: Request, tenant_id: str | N
     tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
     row = control_plane_store.upsert_user(
         tenant_id=tid,
+        customer_id=payload.customer_id,
         username=payload.username,
         password=payload.password,
         role=payload.role,
@@ -940,8 +942,10 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             )
         tenant_id = normalize_tenant_id(str(row.get("tenant_id") or "default"))
         # Create/refresh tenant admin in control-plane auth store.
-        control_plane_store.upsert_user(
+        # This is mandatory for first login after activation.
+        local_user_row = control_plane_store.upsert_user(
             tenant_id=tenant_id,
+            customer_id=str(row.get("customer_id") or ""),
             username=admin_username,
             password=admin_password,
             role="admin",
@@ -951,6 +955,41 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             modules=[],
             permissions={},
         )
+        if not local_user_row:
+            raise ValueError("activation_admin_user_create_failed_local")
+
+        # When activation was proxied to cloud control-plane, force cloud-side user upsert too.
+        # This guarantees portal users list + hosted login can immediately authenticate.
+        if proxied_row is not None and cloud_url:
+            try:
+                upstream_user = requests.post(
+                    f"{cloud_url}/api/control-plane/users?tenant_id={tenant_id}",
+                    json={
+                        "customer_id": str(row.get("customer_id") or ""),
+                        "username": admin_username,
+                        "password": admin_password,
+                        "role": "admin",
+                        "status": "active",
+                        "email": "",
+                        "mfa_enabled": False,
+                        "modules": [],
+                        "permissions": {},
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        # Reuse caller auth if available so cloud endpoint can authorize admin write.
+                        "Authorization": request.headers.get("Authorization", ""),
+                    },
+                    timeout=20,
+                )
+                if not (200 <= upstream_user.status_code < 300):
+                    try:
+                        detail = (upstream_user.json() or {}).get("detail")
+                    except Exception:
+                        detail = upstream_user.text
+                    raise ValueError(str(detail or f"cloud_user_upsert_failed_{upstream_user.status_code}"))
+            except Exception as exc:
+                raise ValueError(f"activation_admin_user_create_failed_cloud:{exc}") from exc
 
         # Materialize local bootstrap so first login works immediately.
         try:

@@ -209,6 +209,7 @@ class ControlPlaneStore:
                     CREATE TABLE IF NOT EXISTS cp_users (
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
                       tenant_id TEXT NOT NULL,
+                      customer_id TEXT,
                       username TEXT NOT NULL,
                       password_hash TEXT NOT NULL,
                       role TEXT NOT NULL DEFAULT 'viewer',
@@ -277,11 +278,15 @@ class ControlPlaneStore:
                     CREATE INDEX IF NOT EXISTS ix_cp_customers_tenant ON cp_customers(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_edges_tenant ON cp_edges(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_users_tenant ON cp_users(tenant_id);
+                    CREATE INDEX IF NOT EXISTS ix_cp_users_tenant_customer ON cp_users(tenant_id, customer_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_licenses_tenant ON cp_licenses(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_audit_tenant_ts ON cp_security_audit_log(tenant_id, ts_utc DESC);
                     """
                 )
                 cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(cp_edge_activation_codes)").fetchall()}
+                user_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(cp_users)").fetchall()}
+                if "customer_id" not in user_cols:
+                    cur.execute("ALTER TABLE cp_users ADD COLUMN customer_id TEXT")
                 if "edge_id" not in cols:
                     cur.execute("ALTER TABLE cp_edge_activation_codes ADD COLUMN edge_id TEXT")
                 if "license_id" not in cols:
@@ -555,9 +560,10 @@ class ControlPlaneStore:
                 rows = conn.execute("SELECT module_key, enabled FROM cp_license_modules WHERE license_id=? ORDER BY module_key", (lid,)).fetchall()
         return [{"module_key": r[0], "enabled": bool(r[1])} for r in rows]
 
-    def upsert_user(self, *, tenant_id: str, username: str, password: str | None = None, role: str = "viewer", status: str = "active", email: str = "", mfa_enabled: bool = False, modules: list[str] | None = None, permissions: dict[str, Any] | None = None) -> dict[str, Any]:
+    def upsert_user(self, *, tenant_id: str, customer_id: str = "", username: str, password: str | None = None, role: str = "viewer", status: str = "active", email: str = "", mfa_enabled: bool = False, modules: list[str] | None = None, permissions: dict[str, Any] | None = None) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
         uname = str(username or "").strip()
+        cid = str(customer_id or "").strip()
         if not uname:
             raise ValueError("username required")
         now = self._utc_now()
@@ -583,6 +589,9 @@ class ControlPlaneStore:
                         json.dumps(permissions or {}, separators=(",", ":"), sort_keys=True),
                         now,
                     ]
+                    if cid:
+                        updates.append("customer_id=?")
+                        params.append(cid)
                     if password is not None and str(password) != "":
                         updates.append("password_hash=?")
                         params.append(self._hash_password(str(password)))
@@ -593,9 +602,10 @@ class ControlPlaneStore:
                     )
                 else:
                     conn.execute(
-                        "INSERT INTO cp_users(tenant_id, username, password_hash, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        "INSERT INTO cp_users(tenant_id, customer_id, username, password_hash, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             tid,
+                            cid,
                             uname,
                             self._hash_password(str(password or "ChangeMe123!")),
                             str(role or "viewer"),
@@ -616,7 +626,7 @@ class ControlPlaneStore:
         tid = normalize_tenant_id(tenant_id)
         with self._lock:
             with self._connect() as conn:
-                rows = conn.execute("SELECT id, tenant_id, username, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc, last_login_utc FROM cp_users WHERE tenant_id=? ORDER BY username", (tid,)).fetchall()
+                rows = conn.execute("SELECT id, tenant_id, customer_id, username, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc, last_login_utc FROM cp_users WHERE tenant_id=? ORDER BY username", (tid,)).fetchall()
         output: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
