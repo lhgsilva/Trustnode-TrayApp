@@ -278,7 +278,6 @@ class ControlPlaneStore:
                     CREATE INDEX IF NOT EXISTS ix_cp_customers_tenant ON cp_customers(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_edges_tenant ON cp_edges(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_users_tenant ON cp_users(tenant_id);
-                    CREATE INDEX IF NOT EXISTS ix_cp_users_tenant_customer ON cp_users(tenant_id, customer_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_licenses_tenant ON cp_licenses(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_audit_tenant_ts ON cp_security_audit_log(tenant_id, ts_utc DESC);
                     """
@@ -287,6 +286,8 @@ class ControlPlaneStore:
                 user_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(cp_users)").fetchall()}
                 if "customer_id" not in user_cols:
                     cur.execute("ALTER TABLE cp_users ADD COLUMN customer_id TEXT")
+                # Create this index only after customer_id exists on legacy DBs.
+                cur.execute("CREATE INDEX IF NOT EXISTS ix_cp_users_tenant_customer ON cp_users(tenant_id, customer_id)")
                 if "edge_id" not in cols:
                     cur.execute("ALTER TABLE cp_edge_activation_codes ADD COLUMN edge_id TEXT")
                 if "license_id" not in cols:
