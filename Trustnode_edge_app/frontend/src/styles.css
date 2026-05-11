@@ -748,6 +748,36 @@ body {
   min-width: 0;
 }
 
+.window-native-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  -webkit-app-region: no-drag;
+}
+
+.window-native-btn {
+  width: 46px;
+  height: 28px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.window-native-btn:hover {
+  background: color-mix(in srgb, var(--card) 86%, var(--text) 14%);
+}
+
+.window-native-btn-close:hover {
+  background: #c42b1c;
+  color: #ffffff;
+}
+
 .window-bar-actions .icon-btn {
   min-width: 26px;
   width: 26px;
