@@ -212,6 +212,14 @@ html, body {
   overflow: hidden;
 }
 
+.auth-tabs.single-tab {
+  grid-template-columns: 1fr;
+}
+
+.auth-tabs.single-tab .auth-tab {
+  width: 100%;
+}
+
 .auth-tab {
   flex: 1;
   min-height: calc(var(--auth-control-h) - 2px);

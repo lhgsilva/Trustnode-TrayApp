@@ -11890,7 +11890,7 @@ function AppShell() {
 
   if (!currentUser) {
     return (
-      <div className={`shell auth-shell surface-${isHostedWebClient ? "client" : "local"} ${useDesktopFramelessHeader ? "desktop-frameless-shell desktop-auth-view" : ""}`}>
+      <div className={`shell ${!useDesktopFramelessHeader ? "auth-shell" : ""} surface-${isHostedWebClient ? "client" : "local"} ${useDesktopFramelessHeader ? "desktop-frameless-shell desktop-auth-view" : ""}`}>
         {useDesktopFramelessHeader ? (
           <div className="window-bar-strip">
             <div className="window-bar-center-spacer" />
@@ -11919,7 +11919,7 @@ function AppShell() {
 
   if (!config) {
     return (
-      <div className={`shell auth-shell surface-${isHostedWebClient ? "client" : "local"} ${useDesktopFramelessHeader ? "desktop-frameless-shell desktop-auth-view" : ""}`}>
+      <div className={`shell ${!useDesktopFramelessHeader ? "auth-shell" : ""} surface-${isHostedWebClient ? "client" : "local"} ${useDesktopFramelessHeader ? "desktop-frameless-shell desktop-auth-view" : ""}`}>
         {useDesktopFramelessHeader ? (
           <div className="window-bar-strip">
             <div className="window-bar-center-spacer" />

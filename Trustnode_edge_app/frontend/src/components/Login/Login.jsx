@@ -239,8 +239,10 @@ export const Login = ({
       return false;
     }
   })();
-  const showRegisterTab =
-    (loginSurface === "local" || loginSurface === "portal") && !edgeLinked;
+  const isPortalLoginOnly = loginSurface === "portal";
+  const showRegisterTab = loginSurface === "local" && !edgeLinked;
+  const effectiveLoginTab =
+    isPortalLoginOnly && loginTab === "register" ? "login" : loginTab;
   const loginActionLabelBySurface = {
     local: "Sign in to TrustNode Edge",
     portal: "Sign in to TrustNode Portal",
@@ -251,7 +253,7 @@ export const Login = ({
 
   return (
     <div className={`login-container theme-${theme} auth-surface-${loginSurface} ${isPortalV1Login ? "auth-shell--v1" : ""}`} data-theme={theme}>
-      <div className={`auth-card ${loginTab === "register" ? "activate-mode" : ""}`}>
+      <div className={`auth-card ${effectiveLoginTab === "register" ? "activate-mode" : ""}`}>
         <button
           className="theme-toggle-btn"
           onClick={toggleTheme}
@@ -269,9 +271,9 @@ export const Login = ({
           />
         </div>
 
-        <div className="auth-tabs">
+        <div className={`auth-tabs ${isPortalLoginOnly ? "single-tab" : ""}`}>
           <button
-            className={`auth-tab ${loginTab === "login" ? "active active-login" : ""}`}
+            className={`auth-tab ${effectiveLoginTab === "login" ? "active active-login" : ""}`}
             type="button"
             onClick={() => setLoginTab("login")}
           >
@@ -279,7 +281,7 @@ export const Login = ({
           </button>
           {showRegisterTab ? (
             <button
-              className={`auth-tab ${loginTab === "register" ? "active active-activate" : ""}`}
+              className={`auth-tab ${effectiveLoginTab === "register" ? "active active-activate" : ""}`}
               type="button"
               onClick={openEdgeRegisterModal}
             >
@@ -288,7 +290,7 @@ export const Login = ({
           ) : null}
         </div>
 
-        {loginTab === "register" && showRegisterTab ? (
+        {effectiveLoginTab === "register" && showRegisterTab ? (
           <>
             <label>
               <span>Activation code</span>

@@ -20,12 +20,30 @@ if ($qs !== '') {
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Trustnode Portal - Single Page (PHP)</title>
   <style>
-    :root { color-scheme: dark; }
-    html, body { margin:0; height:100%; background:#111; font-family:Segoe UI, Arial, sans-serif; }
+    :root {
+      color-scheme: dark light;
+      --bg-canvas: #0e1116;
+      --bg-card: #111827;
+      --ink: #f2f4f7;
+      --ink-soft: #b6c0cc;
+      --line: rgba(255,255,255,.10);
+      --accent: #14a89a;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg-canvas: #eceff3;
+        --bg-card: #ffffff;
+        --ink: #0e1116;
+        --ink-soft: #4a5566;
+        --line: #d3dae3;
+        --accent: #0e8479;
+      }
+    }
+    html, body { margin:0; height:100%; background:var(--bg-canvas); color:var(--ink); font-family:Manrope, "Segoe UI", Arial, sans-serif; }
     .shell { height:100%; display:flex; flex-direction:column; }
-    .bar { height:42px; display:flex; align-items:center; justify-content:space-between; padding:0 12px; background:#1e1e1e; border-bottom:1px solid #2f2f2f; color:#d4d4d4; }
-    .bar a { color:#4fc3f7; text-decoration:none; font-size:12px; }
-    .frame { flex:1; width:100%; border:0; background:#111; }
+    .bar { height:46px; display:flex; align-items:center; justify-content:space-between; padding:0 14px; background:var(--bg-card); border-bottom:1px solid var(--line); color:var(--ink); }
+    .bar a { color:var(--accent); text-decoration:none; font-size:12px; font-weight:600; }
+    .frame { flex:1; width:100%; border:0; background:var(--bg-canvas); }
   </style>
 </head>
 <body>
