@@ -147,6 +147,39 @@ def get_historian(
     }
 
 
+@router.get("/historian/range")
+def get_historian_range(
+    request: Request,
+    from_utc: str = "",
+    to_utc: str = "",
+    limit: int = 5000,
+    offset: int = 0,
+    gateway: str = "",
+    device: str = "",
+    tag: str = "",
+    edge_id: str = "",
+) -> dict:
+    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
+    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    safe_limit = max(50, min(int(limit or 5000), 10000 if prefer_cloud_reads else 50000))
+    safe_offset = max(0, int(offset or 0))
+    return {
+        "ok": True,
+        "tenant_id": get_current_tenant(),
+        "rows": app_store.get_historian_rows_range(
+            from_utc=from_utc,
+            to_utc=to_utc,
+            limit=safe_limit,
+            offset=safe_offset,
+            prefer_cloud_reads=prefer_cloud_reads,
+            gateway=gateway,
+            device=device,
+            tag=tag,
+            edge_id=edge_id,
+        ),
+    }
+
+
 @router.get("/live")
 def get_live(request: Request, limit: int = 5000, edge_id: str = "") -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]

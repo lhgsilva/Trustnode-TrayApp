@@ -1,5 +1,6 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Login } from "./components/Login/Login";
+import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
 import {
   getHealth,
   getBackendTarget,
@@ -23,6 +24,7 @@ import {
   appendAppStoreLogs,
   getAppStoreLive,
   getAppStoreHistorian,
+  getAppStoreHistorianRange,
   getAppStoreLogs,
   getAppStoreInspector,
   getEdgeIngestDiagnostics,
@@ -2830,11 +2832,11 @@ function AppShell() {
 
   useEffect(() => {
     const savedPage = loadStringSetting(ACTIVE_PAGE_STORAGE_KEY, "");
+    const path = String(window.location.pathname || "").toLowerCase();
     if (savedPage) {
       const mappedPage = savedPage === "database_overview" ? "database" : savedPage;
       setActivePage(mappedPage);
     } else {
-      const path = String(window.location.pathname || "").toLowerCase();
       if (path === "/portal" || path.startsWith("/portal/")) {
         setActivePage("control_plane");
       }
@@ -2849,6 +2851,9 @@ function AppShell() {
         setSidebarCollapsed(rawSidebar === "true");
       }
     } catch {}
+    if (path === "/portal" || path.startsWith("/portal/")) {
+      setSidebarCollapsed(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -11982,6 +11987,17 @@ function AppShell() {
       ) : null}
       <header className={`app-header ${isPortalOnly ? "portal-header" : ""} ${useDesktopFramelessHeader ? "desktop-titlebar" : ""}`}>
         <div className="header-left">
+          {!useDesktopFramelessHeader ? (
+            <button
+              type="button"
+              className="window-bar-menu-btn header-menu-toggle"
+              onClick={() => setSidebarCollapsed((v) => !v)}
+              aria-label="Toggle navigation"
+              title="Toggle navigation"
+            >
+              <HamburgerIcon />
+            </button>
+          ) : null}
           <div className="brand">
             <img src={headerLogoSrc} alt="Trustnode Edge" className="brand-full-logo" onError={handleLogoLoadError} />
           </div>
@@ -12187,181 +12203,27 @@ function AppShell() {
           </section>
 
           {activePage === "dashboard" ? (
-            <>
-              <section className="page-tools dashboard-tools">
-                <button className="btn btn-primary icon-text-btn" onClick={openAddDashboardWidget} disabled={!canEditPage("dashboard")}>
-                  <AddIcon />
-                  <span>Add Item</span>
-                </button>
-                <label className="dashboard-per-row-label">
-                  Per Row
-                  <select value={dashboardPerRow} onChange={(e) => setDashboardPerRow(Math.min(4, Math.max(1, Number(e.target.value || 2))))}>
-                    <option value={1}>1</option>
-                    <option value={2}>2</option>
-                    <option value={3}>3</option>
-                    <option value={4}>4</option>
-                  </select>
-                </label>
-                <div className="dashboard-mode-toggle" role="group" aria-label="Dashboard mode">
-                  <button
-                    className="icon-btn icon-btn-start"
-                    onClick={() => setDashboardMode((prev) => (prev === "kpi" ? "chart" : "kpi"))}
-                    type="button"
-                    title={dashboardMode === "kpi" ? "Switch to chart mode" : "Switch to KPI mode"}
-                  >
-                    {dashboardMode === "kpi" ? <ListIcon /> : <ChartIcon />}
-                  </button>
-                </div>
-              </section>
-              <section
-                className={`dashboard-grid dashboard-grid-${dashboardPerRow} dashboard-mode-${dashboardMode}`}
-                style={{ gridTemplateColumns: `repeat(${dashboardPerRow}, minmax(0, 1fr))` }}
-              >
-                {dashboardItems.map((item, idx) => (
-                  <article key={item.id} className="card dashboard-card">
-                    {dashboardMode === "kpi" ? (
-                      <div className="dashboard-kpi-card">
-                        <div className="dashboard-kpi-value" style={{ color: item.color }}>
-                          <div className="dashboard-kpi-value-main">
-                            {item.last_value === null ? "-" : item.last_value.toFixed(3)}
-                          </div>
-                          <div className="dashboard-kpi-value-last">Last: {item.last_ts}</div>
-                        </div>
-                        <div className="dashboard-kpi-meta">
-                          <div className="dashboard-kpi-title">{item.title}</div>
-                          <div>Tag: {formatTagForDisplay(item.tag_name)}</div>
-                          <div>Gateway: {item.gateway_name}</div>
-                          <div>Device: {item.device_name}</div>
-                          <div>
-                            <span className={`status-pill ${freshnessBadgeClass(item.freshness?.level)}`}>
-                              {item.freshness?.label || "-"}
-                            </span>
-                          </div>
-                        </div>
-                                                <div className="dashboard-kpi-actions">
-                          <div className="dashboard-kpi-main-actions">
-                            <button className="icon-btn table-action-btn" onClick={() => openTagMonitor(item.monitorRow)} title="Open tag monitor">
-                              <ChartIcon />
-                            </button>
-                            <button className="icon-btn table-action-btn" onClick={() => openEditDashboardWidget(item)} disabled={!canEditPage("dashboard")} title="Edit">
-                              <EditIcon />
-                            </button>
-                            <button className="icon-btn table-action-btn danger" onClick={() => removeDashboardWidget(item.id)} disabled={!canEditPage("dashboard")} title="Delete">
-                              <DeleteIcon />
-                            </button>
-                          </div>
-                          <div className="dashboard-kpi-move-actions">
-                            <button className="icon-btn table-action-btn" onClick={() => moveDashboardWidget(item.id, -1)} disabled={!canEditPage("dashboard") || idx === 0} title="Move up">
-                              <MoveUpIcon />
-                            </button>
-                            <button className="icon-btn table-action-btn" onClick={() => moveDashboardWidget(item.id, 1)} disabled={!canEditPage("dashboard") || idx === dashboardItems.length - 1} title="Move down">
-                              <MoveDownIcon />
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="dashboard-chart-card">
-                        <div className="row trend-header-row">
-                          <h3>
-                            {item.title}
-                            <span className="dashboard-title-divider">|</span>
-                            <span className="dashboard-live-inline" style={{ color: item.color }}>
-                              {item.last_value === null ? "-" : item.last_value.toFixed(3)}
-                            </span>
-                          </h3>
-                          <div className="row">
-                            <button
-                              className="btn btn-primary btn-sm"
-                              onClick={() => toggleDashboardWidgetChartType(item.id)}
-                              disabled={!canEditPage("dashboard")}
-                              type="button"
-                              title="Toggle line/bar"
-                            >
-                              {item.chart_type === "bar" ? "Line" : "Bar"}
-                            </button>
-                            <button className="icon-btn table-action-btn" onClick={() => openTagMonitor(item.monitorRow)} title="Open tag monitor">
-                              <ChartIcon />
-                            </button>
-                            <button className="icon-btn table-action-btn" onClick={() => openEditDashboardWidget(item)} disabled={!canEditPage("dashboard")} title="Edit">
-                              <EditIcon />
-                            </button>
-                            <button className="icon-btn table-action-btn danger" onClick={() => removeDashboardWidget(item.id)} disabled={!canEditPage("dashboard")} title="Delete">
-                              <DeleteIcon />
-                            </button>
-                          </div>
-                        </div>
-                        <div className="meta">
-                          <span>Value: {item.last_value === null ? "-" : item.last_value.toFixed(3)}</span>
-                          <span>Last: {item.last_ts}</span>
-                          <span>
-                            <span className={`status-pill ${freshnessBadgeClass(item.freshness?.level)}`}>
-                              {item.freshness?.label || "-"}
-                            </span>
-                          </span>
-                          <span>Device: {item.device_name}</span>
-                          <span>Gateway: {item.gateway_name}</span>
-                        </div>
-                        <div className="chart-wrap">
-                          {item.chart_type === "bar" ? (
-                            <ResponsiveContainer width="100%" height={150}>
-                              <BarChart data={item.series} margin={{ top: 8, right: 18, left: 30, bottom: 8 }} barCategoryGap="24%">
-                                <XAxis
-                                  dataKey="idx"
-                                  type="number"
-                                  tickFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || ""}
-                                  domain={item.xDomain || [1, 121]}
-                                  allowDataOverflow
-                                />
-                                <YAxis
-                                  width={60}
-                                  domain={item.yDomain || ["auto", "auto"]}
-                                  ticks={buildYAxisTicks(item.yDomain || ["auto", "auto"], 0.5, 12)}
-                                  tickFormatter={(v) => formatChartValue(v, 3)}
-                                />
-                                <Tooltip
-                                  labelFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || String(v)}
-                                  formatter={(v) => formatChartValue(v, 3)}
-                                />
-                                <Bar isAnimationActive={false} dataKey="value" fill={item.color || "#16a34a"} maxBarSize={20} />
-                              </BarChart>
-                            </ResponsiveContainer>
-                          ) : (
-                            <ResponsiveContainer width="100%" height={150}>
-                              <LineChart data={item.series} margin={{ top: 8, right: 18, left: 24, bottom: 8 }}>
-                                <XAxis
-                                  dataKey="idx"
-                                  type="number"
-                                  tickFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || ""}
-                                  domain={item.xDomain || [1, 121]}
-                                  allowDataOverflow
-                                />
-                                <YAxis
-                                  width={52}
-                                  domain={item.yDomain || ["auto", "auto"]}
-                                  ticks={buildYAxisTicks(item.yDomain || ["auto", "auto"], 0.5, 12)}
-                                  tickFormatter={(v) => formatChartValue(v, 3)}
-                                />
-                                <Tooltip
-                                  labelFormatter={(v) => item.series.find((h) => h.idx === v)?.ts || String(v)}
-                                  formatter={(v) => formatChartValue(v, 3)}
-                                />
-                                <Line isAnimationActive={false} type="linear" dataKey="value" stroke={item.color || "#16a34a"} strokeWidth={2} dot={false} />
-                              </LineChart>
-                            </ResponsiveContainer>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </article>
-                ))}
-                {!dashboardItems.length ? (
-                  <article className="card dashboard-empty-card">
-                    <p>No dashboard items configured. Use <strong>Add Item</strong> to select gateway tags and build your KPI/chart view.</p>
-                  </article>
-                ) : null}
-              </section>
-            </>
+            <DashboardDesigner
+              canEdit={canEditPage("dashboard")}
+              widgets={dashboardWidgets}
+              setWidgets={setDashboardWidgets}
+              tagRows={tagRows}
+              dataLogView={dataLogView}
+              formatTagForDisplay={formatTagForDisplay}
+              gatewayCatalog={allGatewayOptions}
+              tagsByGateway={triggerTagsByGateway}
+              showGridMeta={Boolean(isHostedWebClient || isPortalOnly)}
+              fetchHistoricalRows={async ({ fromUtc, toUtc, limit = 12000 }) => {
+                const res = await getAppStoreHistorianRange({
+                  fromUtc,
+                  toUtc,
+                  limit,
+                  offset: 0,
+                  cloudEdge: cloudEdgeApiFilter,
+                });
+                return Array.isArray(res?.rows) ? res.rows : [];
+              }}
+            />
           ) : null}
 
           {activePage === "power_overview" ? (

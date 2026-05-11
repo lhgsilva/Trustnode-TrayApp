@@ -548,6 +548,23 @@ class AppStore:
     def _utc_now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
+    def _normalize_utc_filter(self, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            iso = text.replace("Z", "+00:00")
+            if " " in iso and "T" not in iso:
+                iso = iso.replace(" ", "T")
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return ""
+
     def _hash_password_if_needed(self, password_value: Any) -> str:
         raw = str(password_value or "")
         if raw.startswith("pbkdf2_sha256$"):
@@ -1317,6 +1334,9 @@ class AppStore:
         gateway: str = "",
         device: str = "",
         tag: str = "",
+        from_utc: str = "",
+        to_utc: str = "",
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         cloud = self._get_cloud_database_target()
         if not cloud:
@@ -1327,13 +1347,16 @@ class AppStore:
         except Exception:
             return []
         schema = str(cloud.get("schema") or "public")
-        lim = max(1, min(int(limit or 1000), 10000))
+        lim = max(1, min(int(limit or 1000), 50000))
+        off = max(0, int(offset or 0))
         gateway_txt = str(gateway or "").strip()
         device_txt = str(device or "").strip()
         tag_txt = str(tag or "").strip()
+        from_txt = self._normalize_utc_filter(from_utc)
+        to_txt = self._normalize_utc_filter(to_utc)
         filters_sql = ""
         filters_sql_unscoped = ""
-        params: dict[str, Any] = {"lim": lim, "tenant": tenant_id}
+        params: dict[str, Any] = {"lim": lim, "off": off, "tenant": tenant_id}
         if gateway_txt:
             filters_sql += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
             filters_sql_unscoped += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
@@ -1346,6 +1369,14 @@ class AppStore:
             filters_sql += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
             filters_sql_unscoped += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
             params["tag_like"] = f"%{tag_txt}%"
+        if from_txt:
+            filters_sql += " AND ts_utc >= :from_utc"
+            filters_sql_unscoped += " AND ts_utc >= :from_utc"
+            params["from_utc"] = from_txt
+        if to_txt:
+            filters_sql += " AND ts_utc <= :to_utc"
+            filters_sql_unscoped += " AND ts_utc <= :to_utc"
+            params["to_utc"] = to_txt
         try:
             engine, _ = self._get_or_create_cloud_engine(cloud, schema)
         except Exception:
@@ -1362,6 +1393,7 @@ class AppStore:
                             WHERE tenant_id = :tenant AND local_id IS NOT NULL{filters_sql}
                             ORDER BY ts_utc DESC, COALESCE(local_id, 0) DESC, id DESC
                             LIMIT :lim
+                            OFFSET :off
                             """
                         ),
                         params,
@@ -1416,6 +1448,7 @@ class AppStore:
                                 WHERE tenant_id = :tenant{filters_sql}
                                 ORDER BY ts_utc DESC
                                 LIMIT :lim
+                                OFFSET :off
                                 """
                             ),
                             params,
@@ -1432,6 +1465,7 @@ class AppStore:
                                 WHERE 1=1{filters_sql_unscoped}
                                 ORDER BY ts_utc DESC
                                 LIMIT :lim
+                                OFFSET :off
                                 """
                             ),
                             {k: v for k, v in params.items() if k != "tenant"},
@@ -4137,6 +4171,93 @@ class AppStore:
                     {where}
                     ORDER BY id DESC
                     LIMIT :lim
+                    """,
+                    params,
+                ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "ts": r["ts_utc"],
+                    "tenant_id": str(r["tenant_id"] or tenant_id),
+                    "source": r["source"] or "",
+                    "gateway_id": r["gateway_id"] or "",
+                    "gateway_name": r["gateway_name"] or "",
+                    "device_name": r["device_name"] or "",
+                    "plc_ip": r["plc_ip"] or "",
+                    "database_name": r["database_name"] or "",
+                    "tag": r["tag_name"] or "",
+                    "value": r["value"],
+                    "quality": r["quality"],
+                    "quality_label": r["quality_label"] or "",
+                }
+            )
+        out = self._filter_rows_by_edge(out, edge_filter)
+        return out[:lim]
+
+    def get_historian_rows_range(
+        self,
+        from_utc: str = "",
+        to_utc: str = "",
+        limit: int = 5000,
+        offset: int = 0,
+        prefer_cloud_reads: bool | None = None,
+        gateway: str = "",
+        device: str = "",
+        tag: str = "",
+        edge_id: str = "",
+    ) -> list[dict[str, Any]]:
+        lim = max(1, min(int(limit or 5000), 50000))
+        off = max(0, int(offset or 0))
+        edge_filter = self._normalize_edge_filter(edge_id)
+        tenant_id = self._current_tenant_id()
+        gateway_txt = str(gateway or "").strip()
+        device_txt = str(device or "").strip()
+        tag_txt = str(tag or "").strip()
+        from_txt = self._normalize_utc_filter(from_utc)
+        to_txt = self._normalize_utc_filter(to_utc)
+        prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
+        if prefer_cloud:
+            cloud_rows = self._fetch_historian_rows_from_cloud(
+                limit=lim,
+                gateway=gateway_txt,
+                device=device_txt,
+                tag=tag_txt,
+                from_utc=from_txt,
+                to_utc=to_txt,
+                offset=off,
+            )
+            if cloud_rows:
+                return self._filter_rows_by_edge(cloud_rows, edge_filter)[:lim]
+
+        where = "WHERE tenant_id = :tenant"
+        params: dict[str, Any] = {"tenant": tenant_id, "lim": lim, "off": off}
+        if gateway_txt:
+            where += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+            params["gateway"] = gateway_txt
+        if device_txt:
+            where += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
+            params["device_like"] = f"%{device_txt}%"
+        if tag_txt:
+            where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+            params["tag_like"] = f"%{tag_txt}%"
+        if from_txt:
+            where += " AND ts_utc >= :from_utc"
+            params["from_utc"] = from_txt
+        if to_txt:
+            where += " AND ts_utc <= :to_utc"
+            params["to_utc"] = to_txt
+
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                           tag_name, value, quality, quality_label
+                    FROM historian_readings
+                    {where}
+                    ORDER BY ts_utc DESC, id DESC
+                    LIMIT :lim OFFSET :off
                     """,
                     params,
                 ).fetchall()

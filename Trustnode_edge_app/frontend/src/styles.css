@@ -736,6 +736,10 @@ body {
   border-color: color-mix(in srgb, var(--brand) 34%, var(--stroke) 66%);
 }
 
+.header-menu-toggle {
+  flex-shrink: 0;
+}
+
 .window-bar-actions {
   display: flex;
   align-items: center;

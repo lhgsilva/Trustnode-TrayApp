@@ -764,6 +764,34 @@ export async function getAppStoreHistorian(limit = 1000, cloudEdge = null) {
   return res.json();
 }
 
+export async function getAppStoreHistorianRange({
+  fromUtc = "",
+  toUtc = "",
+  limit = 5000,
+  offset = 0,
+  gateway = "",
+  device = "",
+  tag = "",
+  cloudEdge = null,
+} = {}) {
+  const params = new URLSearchParams();
+  if (fromUtc) params.set("from_utc", String(fromUtc));
+  if (toUtc) params.set("to_utc", String(toUtc));
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
+  if (gateway) params.set("gateway", String(gateway));
+  if (device) params.set("device", String(device));
+  if (tag) params.set("tag", String(tag));
+  const baseUrl = `${getApiBase()}/api/app-store/historian/range?${params.toString()}`;
+  const url = appendCloudEdgeParams(baseUrl, cloudEdge);
+  const res = await fetchWithTimeout(
+    withNoCache(url),
+    { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } }
+  );
+  if (!res.ok) throw new Error("App store historian range fetch failed");
+  return res.json();
+}
+
 export async function getAppStoreLive(limit = 5000, cloudEdge = null) {
   const useV1Cloud = getBackendTarget().mode === "cloud";
   if (useV1Cloud) {
