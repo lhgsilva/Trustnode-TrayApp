@@ -137,6 +137,10 @@ body {
   overflow: hidden;
 }
 
+.shell.auth-shell {
+  grid-template-rows: 1fr;
+}
+
 .shell.with-window-bar {
   grid-template-rows: 28px 64px 1fr;
 }
