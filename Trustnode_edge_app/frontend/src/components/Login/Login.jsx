@@ -50,7 +50,9 @@ export const Login = ({
 
   const logoSrc = React.useMemo(() => {
     try {
-      const origin = typeof window !== "undefined" ? String(window.location?.origin || "") : "";
+      const protocol = String(window.location?.protocol || "");
+      if (protocol === "file:") return "assets/trustenode-002.png";
+      const origin = String(window.location?.origin || "");
       if (origin) return `${origin.replace(/\/+$/, "")}/assets/trustenode-002.png`;
     } catch {}
     return trustnodeLogo;

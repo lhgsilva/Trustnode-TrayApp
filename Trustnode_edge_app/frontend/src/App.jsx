@@ -2941,6 +2941,17 @@ function AppShell() {
       clearInterval(timer);
     };
   }, []);
+  const headerLogoSrc = useMemo(() => {
+    try {
+      const protocol = String(window.location?.protocol || "");
+      if (protocol === "file:") return "assets/trustenode-004.png";
+      return `${String(window.location?.origin || "").replace(/\/+$/, "")}/assets/trustenode-004.png`;
+    } catch {
+      const base = String(import.meta?.env?.BASE_URL || "/");
+      const normalized = base.endsWith("/") ? base : `${base}/`;
+      return `${normalized}assets/trustenode-004.png`;
+    }
+  }, []);
 
   useEffect(() => {
     try {
@@ -7601,7 +7612,8 @@ function AppShell() {
   const hasDesktopBackendOverrideForHeader =
     typeof window !== "undefined" &&
     Boolean(new URLSearchParams(window.location.search).get("backendUrl"));
-  const useDesktopFramelessHeader = isElectronRuntime || hasDesktopWindowControls;
+  const useDesktopFramelessHeader =
+    !isHostedWebClient && (isElectronRuntime || hasDesktopWindowControls);
   const toggleSection = (sectionId) => {
     setExpandedSections((prev) => {
       const nextOpen = !prev[sectionId];
@@ -11971,7 +11983,7 @@ function AppShell() {
       <header className={`app-header ${isPortalOnly ? "portal-header" : ""} ${useDesktopFramelessHeader ? "desktop-titlebar" : ""}`}>
         <div className="header-left">
           <div className="brand">
-            <img src="/assets/trustenode-004.png" alt="Trustnode Edge" className="brand-full-logo" onError={handleLogoLoadError} />
+            <img src={headerLogoSrc} alt="Trustnode Edge" className="brand-full-logo" onError={handleLogoLoadError} />
           </div>
         </div>
         <div className="header-center">
