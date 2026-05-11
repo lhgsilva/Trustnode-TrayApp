@@ -25,7 +25,7 @@ class AppStore:
         "triggers_limits": {"collection_triggers": [], "collection_trigger_mode": "any", "trigger_rules": []},
         "dashboard_configurations": {"widgets": [], "mode": "kpi", "per_row": 2},
         "alarms_setup": {"alarms": []},
-        "reporting_setup": {"filters": {}, "documents": [], "schedules": []},
+        "reporting_setup": {"filters": {}, "documents": [], "templates": [], "schedules": []},
         "tags": {"alarm_prefs": {}},
         "email_notifications": {"settings": {}, "profiles": [], "active_profile_id": ""},
         "metadata": {},

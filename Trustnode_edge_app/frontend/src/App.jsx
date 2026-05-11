@@ -175,7 +175,7 @@ const NAV_SECTIONS = [
     title: "Collection and Monitoring",
     items: ["Gateway Configuration", "Devices", "Tags", "Triggers and Limits"]
   },
-  { id: "notifications", title: "Notifications", items: ["Alarms", "Reporting"] },
+  { id: "notifications", title: "Notifications", items: ["Alarms", "Reporting", "Scheduled Reports"] },
   { id: "data_log", title: "Data History", items: ["Historian", "Logs"] },
   {
     id: "settings",
@@ -185,7 +185,7 @@ const NAV_SECTIONS = [
   {
     id: "administration",
     title: "Settings",
-    items: ["Edge", "Interface", "Users and Access Control", "Control Plane", "Email and Notifications", "Scheduled Reports"]
+    items: ["Edge", "Interface", "Users and Access Control", "Control Plane", "Email and Notifications"]
   }
 ];
 
@@ -1040,14 +1040,87 @@ function sanitizeReportDocuments(rawDocs) {
       created_utc: String(d.created_utc || ""),
       generated_by: String(d.generated_by || ""),
       summary: String(d.summary || ""),
+      format: String(d.format || "csv"),
       csv_content: String(d.csv_content || ""),
+      text_content: String(d.text_content || ""),
       html_content: String(d.html_content || ""),
+      schedule_id: String(d.schedule_id || ""),
+      schedule_name: String(d.schedule_name || ""),
+      template_id: String(d.template_id || ""),
+      trigger_mode: String(d.trigger_mode || ""),
+      triggered_by: String(d.triggered_by || "manual"),
       row_count: Number(d.row_count || 0),
       size_bytes: Number(d.size_bytes || 0),
       columns: Array.isArray(d.columns) ? d.columns.map((x) => String(x)) : [],
       preview_rows: Array.isArray(d.preview_rows) ? d.preview_rows : [],
       chart_series: Array.isArray(d.chart_series) ? d.chart_series : []
     }));
+}
+
+function sanitizeReportTemplates(rawTemplates) {
+  if (!Array.isArray(rawTemplates)) return [];
+  return rawTemplates
+    .filter((t) => t && typeof t === "object")
+    .map((t, idx) => ({
+      id: String(t.id || `tpl-${idx}`),
+      name: String(t.name || `Template ${idx + 1}`),
+      description: String(t.description || ""),
+      created_utc: String(t.created_utc || ""),
+      updated_utc: String(t.updated_utc || ""),
+      created_by: String(t.created_by || ""),
+      filters: normalizeReportFiltersShape(t.filters || {}, {}),
+    }));
+}
+
+function sanitizeScheduledReports(rawSchedules) {
+  if (!Array.isArray(rawSchedules)) return [];
+  return rawSchedules
+    .filter((s) => s && typeof s === "object")
+    .map((s, idx) => {
+      const triggerMode = String(s.trigger_mode || "time").toLowerCase();
+      const mode = ["time", "tag", "both"].includes(triggerMode) ? triggerMode : "time";
+      const logic = String(s.condition_logic || "all").toLowerCase();
+      const conditionLogic = logic === "any" ? "any" : "all";
+      const conditions = Array.isArray(s.tag_conditions)
+        ? s.tag_conditions
+            .filter((c) => c && typeof c === "object")
+            .map((c, cIdx) => ({
+              id: String(c.id || `cond-${idx}-${cIdx}`),
+              gateway_id: String(c.gateway_id || ""),
+              tag_name: String(c.tag_name || ""),
+              operator: ["<", "<=", ">", ">=", "==", "!="].includes(String(c.operator || "")) ? String(c.operator) : ">=",
+              value: String(c.value ?? ""),
+              enabled: c.enabled !== false,
+            }))
+        : [];
+      const normalizedFilters = normalizeReportFiltersShape(s.filters || {}, {
+        from: "",
+        to: "",
+        selected_gateway_ids: [],
+        selected_tags: [],
+        batch: "",
+        max_rows: 3000,
+      });
+      return {
+        ...s,
+        id: String(s.id || `schedule-${idx}`),
+        name: String(s.name || `Scheduled Report ${idx + 1}`),
+        recurrence: ["daily", "weekly", "monthly"].includes(String(s.recurrence || "")) ? String(s.recurrence) : "daily",
+        hour: String(s.hour ?? "08").padStart(2, "0"),
+        minute: String(s.minute ?? "00").padStart(2, "0"),
+        day_of_week: String(s.day_of_week ?? "1"),
+        day_of_month: String(s.day_of_month ?? "1"),
+        format: ["pdf", "csv", "txt", "json"].includes(String(s.format || "").toLowerCase()) ? String(s.format).toLowerCase() : "csv",
+        recipients: String(s.recipients || ""),
+        template_id: String(s.template_id || ""),
+        trigger_mode: mode,
+        condition_logic: conditionLogic,
+        tag_conditions: conditions,
+        deliver_email: s.deliver_email !== false,
+        enabled: s.enabled !== false,
+        filters: normalizedFilters,
+      };
+    });
 }
 
 function toStringArray(value) {
@@ -1451,8 +1524,8 @@ const PERMISSION_LABELS = {
 const PERMISSION_GROUPS = [
   { title: "Client Test Modules", items: ["dashboard", "power_overview", "historian", "client_module_alarms", "client_module_reporting", "client_module_interface"] },
   { title: "Collection and Monitoring", items: ["devices", "tags", "triggers_and_limits", "gateway_configuration"] },
-  { title: "Operations", items: ["gateway_runtime_control", "alarms", "reporting", "data_log"] },
-  { title: "Administration", items: ["interface", "database", "backup_and_retention", "control_plane", "email_and_notifications", "scheduled_reports", "users_and_access_control"] },
+  { title: "Operations", items: ["gateway_runtime_control", "alarms", "reporting", "scheduled_reports", "data_log"] },
+  { title: "Administration", items: ["interface", "database", "backup_and_retention", "control_plane", "email_and_notifications", "users_and_access_control"] },
 ];
 
 const CLIENT_MODULE_DEFS = [
@@ -1529,6 +1602,8 @@ function compareByOperator(value, operator, threshold) {
   if (operator === "<=") return value <= threshold;
   if (operator === ">") return value > threshold;
   if (operator === ">=") return value >= threshold;
+  if (operator === "==") return value === threshold;
+  if (operator === "!=") return value !== threshold;
   return false;
 }
 
@@ -2155,10 +2230,21 @@ function AppShell() {
   });
   const [tagAlarmPrefs, setTagAlarmPrefs] = useState({});
   const [reportDocuments, setReportDocuments] = useState([]);
+  const [reportTemplates, setReportTemplates] = useState([]);
+  const [selectedReportTemplateId, setSelectedReportTemplateId] = useState("");
+  const [reportTemplateForm, setReportTemplateForm] = useState({
+    name: "",
+    description: "",
+  });
   const [reportLoadedRows, setReportLoadedRows] = useState([]);
   const [reportLoadedAt, setReportLoadedAt] = useState("");
   const [reportSummaryText, setReportSummaryText] = useState("");
   const [scheduledReports, setScheduledReports] = useState([]);
+  const [scheduledReportFilter, setScheduledReportFilter] = useState({
+    search: "",
+    format: "all",
+    schedule_id: "all",
+  });
   const [reportFilters, setReportFilters] = useState({
     from: "",
     to: "",
@@ -2179,12 +2265,17 @@ function AppShell() {
   const [scheduleForm, setScheduleForm] = useState({
     name: "",
     enabled: true,
+    trigger_mode: "time",
     recurrence: "daily",
     hour: "08",
     minute: "00",
     day_of_week: "1",
     day_of_month: "1",
+    condition_logic: "all",
+    tag_conditions: [],
+    template_id: "",
     format: "csv",
+    deliver_email: true,
     recipients: "",
     filters: {
       from: "",
@@ -2531,6 +2622,7 @@ function AppShell() {
     reporting_setup: {
       filters: reportFilters,
       documents: reportDocuments,
+      templates: reportTemplates,
       schedules: scheduledReports
     },
     tags: {
@@ -2680,7 +2772,8 @@ function AppShell() {
       setReportFilters((prev) => normalizeReportFiltersShape(incoming, prev));
     }
     if (Array.isArray(reportingSetup.documents)) setReportDocuments(sanitizeReportDocuments(reportingSetup.documents));
-    if (Array.isArray(reportingSetup.schedules)) setScheduledReports(reportingSetup.schedules);
+    if (Array.isArray(reportingSetup.templates)) setReportTemplates(sanitizeReportTemplates(reportingSetup.templates));
+    if (Array.isArray(reportingSetup.schedules)) setScheduledReports(sanitizeScheduledReports(reportingSetup.schedules));
     if (tagsSetup.alarm_prefs && typeof tagsSetup.alarm_prefs === "object") setTagAlarmPrefs(tagsSetup.alarm_prefs);
     if (emailSetup && typeof emailSetup === "object") {
       if (emailSetup.settings && typeof emailSetup.settings === "object") {
@@ -3547,48 +3640,107 @@ function AppShell() {
       const mm = String(now.getMinutes()).padStart(2, "0");
       const dow = String(now.getDay());
       const dom = String(now.getDate());
+      const minuteSlot = now.toISOString().slice(0, 16);
+
+      const evaluateTimeTrigger = (s) => {
+        const timeMatch = String(s.hour || "00").padStart(2, "0") === hh && String(s.minute || "00").padStart(2, "0") === mm;
+        if (!timeMatch) return false;
+        if (s.recurrence === "weekly" && String(s.day_of_week || "1") !== dow) return false;
+        if (s.recurrence === "monthly" && String(s.day_of_month || "1") !== dom) return false;
+        return true;
+      };
+
+      const evaluateTagTrigger = (s) => {
+        const conds = Array.isArray(s.tag_conditions) ? s.tag_conditions.filter((c) => c?.enabled !== false) : [];
+        if (!conds.length) return false;
+        const matches = conds.map((cond) => {
+          const gid = String(cond.gateway_id || "");
+          const tag = String(cond.tag_name || "");
+          if (!gid || !tag) return false;
+          const key = `${gid}::${normalizeTagName(tag)}`;
+          const latest = liveTagValuesRef.current[key] || null;
+          if (!latest) return false;
+          const intervalMs = getGatewayIntervalMs(gid);
+          const ageMs = Date.now() - parseTimestampMs(latest.ts || "");
+          const staleMs = Math.max(5000, intervalMs * 4);
+          if (!Number.isFinite(ageMs) || ageMs > staleMs) return false;
+          const valueNum = Number(latest.value);
+          const threshold = Number(cond.value);
+          if (!Number.isFinite(valueNum) || !Number.isFinite(threshold)) return false;
+          return compareByOperator(valueNum, String(cond.operator || ">="), threshold);
+        });
+        if (!matches.length) return false;
+        return String(s.condition_logic || "all").toLowerCase() === "any"
+          ? matches.some(Boolean)
+          : matches.every(Boolean);
+      };
+
       for (const s of scheduledReports) {
         if (!s.enabled) continue;
-        const runKey = `${now.toISOString().slice(0, 16)}::${s.id}`;
-        if (s.__last_check_key === runKey) continue;
-        const timeMatch = String(s.hour || "00").padStart(2, "0") === hh && String(s.minute || "00").padStart(2, "0") === mm;
-        if (!timeMatch) continue;
-        if (s.recurrence === "weekly" && String(s.day_of_week || "1") !== dow) continue;
-        if (s.recurrence === "monthly" && String(s.day_of_month || "1") !== dom) continue;
-        const doc = createReportDocument(s.format || "csv", s.filters || null);
+        const triggerMode = ["time", "tag", "both"].includes(String(s.trigger_mode || "")) ? String(s.trigger_mode) : "time";
+        const timeMatched = evaluateTimeTrigger(s);
+        const tagMatched = evaluateTagTrigger(s);
+
+        let shouldRun = false;
+        if (triggerMode === "time") shouldRun = timeMatched;
+        else if (triggerMode === "tag") shouldRun = tagMatched;
+        else shouldRun = timeMatched && tagMatched;
+        if (!shouldRun) continue;
+
+        const runKey = `${minuteSlot}::${s.id}`;
+        if (triggerMode !== "tag" && s.__last_check_key === runKey) continue;
+        if (triggerMode === "tag" && s.__last_tag_trigger_key === runKey) continue;
+
+        const filters = buildScheduleFiltersSnapshot(String(s.template_id || "")) || s.filters || null;
+        const doc = createReportDocument(s.format || "csv", filters, {
+          schedule_id: s.id,
+          schedule_name: s.name,
+          template_id: s.template_id || "",
+          trigger_mode: triggerMode,
+          triggered_by: "scheduler",
+        });
         if (!doc) continue;
-        const recipients = parseEmailList(s.recipients || emailSettings.report_recipients);
-        if (recipients.length) {
-          try {
-            const context = {
-              name: s.name || "Report",
-              row_count: doc.row_count,
-              created_utc: doc.created_utc || tsNow(),
-            };
-            const subject = applyTemplate(emailSettings.report_subject || "[REPORT] {{name}}", context);
-            const html = applyTemplate(emailSettings.report_template || "", context);
-            await sendNotificationEmail({
-              ...buildEmailTransportPayload(emailSettings),
-              to: recipients,
-              subject,
-              html_body: html,
-              text_body: `Scheduled report ${context.name} generated with ${context.row_count} rows.`
-            });
-          } catch (err) {
-            addAppLog({ level: "error", category: "reporting", message: `Scheduled report email failed: ${String(err)}` });
+
+        if (s.deliver_email !== false) {
+          const recipients = parseEmailList(s.recipients || emailSettings.report_recipients);
+          if (recipients.length) {
+            try {
+              const context = {
+                name: s.name || "Report",
+                row_count: doc.row_count,
+                created_utc: doc.created_utc || tsNow(),
+              };
+              const subject = applyTemplate(emailSettings.report_subject || "[REPORT] {{name}}", context);
+              const html = applyTemplate(emailSettings.report_template || "", context);
+              await sendNotificationEmail({
+                ...buildEmailTransportPayload(emailSettings),
+                to: recipients,
+                subject,
+                html_body: html,
+                text_body: `Scheduled report ${context.name} generated with ${context.row_count} rows.`
+              });
+            } catch (err) {
+              addAppLog({ level: "error", category: "reporting", message: `Scheduled report email failed: ${String(err)}` });
+            }
           }
         }
+
         setScheduledReports((prev) =>
           prev.map((x) =>
             x.id === s.id
-              ? { ...x, last_run_utc: tsNow(), __last_check_key: runKey }
+              ? {
+                  ...x,
+                  last_run_utc: tsNow(),
+                  __last_check_key: runKey,
+                  __last_tag_trigger_key: runKey,
+                }
               : x
           )
         );
       }
-    }, 15000);
+    }, 10000);
     return () => clearInterval(timer);
-  }, [scheduledReports, emailSettings]);
+  }, [scheduledReports, emailSettings, reportTemplates, reportFilters]);
 
   useEffect(() => {
     if (!appStoreHydrated) return;
@@ -3651,6 +3803,7 @@ function AppShell() {
     alarms,
     reportFilters,
     reportDocuments,
+    reportTemplates,
     scheduledReports,
     tagAlarmPrefs,
     emailSettings,
@@ -10413,6 +10566,11 @@ function AppShell() {
   }, [reportFilters.selected_tags, reportFilterOptions.tags]);
 
   const safeReportDocuments = useMemo(() => sanitizeReportDocuments(reportDocuments), [reportDocuments]);
+  const safeReportTemplates = useMemo(() => sanitizeReportTemplates(reportTemplates), [reportTemplates]);
+  const activeTemplate = useMemo(
+    () => safeReportTemplates.find((t) => String(t.id) === String(selectedReportTemplateId)) || null,
+    [safeReportTemplates, selectedReportTemplateId]
+  );
 
   const reportPivotRows = useMemo(() => {
     const map = new Map();
@@ -10455,12 +10613,102 @@ function AppShell() {
     };
   }, [reportSelectedTags, reportFilters.tag_axes]);
 
+  const loadReportTemplateIntoFilters = (template) => {
+    if (!template || typeof template !== "object") return;
+    setReportFilters((prev) => normalizeReportFiltersShape(template.filters || {}, prev));
+    if (template?.id) setSelectedReportTemplateId(String(template.id));
+    setReportTemplateForm({
+      name: String(template.name || ""),
+      description: String(template.description || ""),
+    });
+    setReportSummaryText(`Template loaded: ${template.name || "Template"}`);
+  };
+
+  const saveReportTemplate = () => {
+    const name = String(reportTemplateForm.name || "").trim();
+    if (!name) {
+      setError("Template name is required.");
+      return;
+    }
+    const now = tsNow();
+    const existingId = String(selectedReportTemplateId || "");
+    const nextTemplate = {
+      id: existingId || crypto.randomUUID(),
+      name,
+      description: String(reportTemplateForm.description || "").trim(),
+      created_utc: existingId ? undefined : now,
+      updated_utc: now,
+      created_by: currentUser?.username || "system",
+      filters: normalizeReportFiltersShape(reportFilters, {}),
+    };
+    setReportTemplates((prev) => {
+      if (existingId) {
+        return prev.map((t) =>
+          String(t.id) === existingId
+            ? {
+                ...t,
+                ...nextTemplate,
+                created_utc: t.created_utc || now,
+              }
+            : t
+        );
+      }
+      return [nextTemplate, ...prev];
+    });
+    setSelectedReportTemplateId(String(nextTemplate.id));
+    setError("");
+  };
+
+  const createNewTemplateDraft = () => {
+    setSelectedReportTemplateId("");
+    setReportTemplateForm({
+      name: "",
+      description: "",
+    });
+  };
+
+  const removeReportTemplate = (templateId) => {
+    if (!templateId) return;
+    withConfirm("Delete Template", "Delete this report template?", () => {
+      setReportTemplates((prev) => prev.filter((t) => String(t.id) !== String(templateId)));
+      setScheduledReports((prev) =>
+        prev.map((s) => (String(s.template_id || "") === String(templateId) ? { ...s, template_id: "" } : s))
+      );
+      if (String(selectedReportTemplateId) === String(templateId)) {
+        createNewTemplateDraft();
+      }
+    });
+  };
+
+  const buildScheduleFiltersSnapshot = (templateId = "") => {
+    if (templateId) {
+      const found = safeReportTemplates.find((t) => String(t.id) === String(templateId));
+      if (found?.filters) return normalizeReportFiltersShape(found.filters, {});
+    }
+    return normalizeReportFiltersShape(reportFilters, {});
+  };
+
   const buildReportCsv = (pivotRows, tags) => {
     const header = ["timestamp_local", ...tags];
     const lines = [header.join(",")];
     for (const r of pivotRows) {
       const vals = [fmtTs(r.ts), ...tags.map((t) => formatStandardValue(r[t], 3))].map((v) => `"${String(v ?? "").replaceAll("\"", "\"\"")}"`);
       lines.push(vals.join(","));
+    }
+    return lines.join("\n");
+  };
+
+  const buildReportText = (pivotRows, tags, summary = "") => {
+    const header = ["timestamp_local", ...tags];
+    const lines = [];
+    lines.push("Trustnode Report");
+    lines.push(`Generated UTC: ${tsNow()}`);
+    if (summary) lines.push(`Summary: ${summary}`);
+    lines.push("");
+    lines.push(header.join("\t"));
+    for (const r of pivotRows) {
+      const vals = [fmtTs(r.ts), ...tags.map((t) => formatStandardValue(r[t], 3))];
+      lines.push(vals.join("\t"));
     }
     return lines.join("\n");
   };
@@ -10613,7 +10861,7 @@ function AppShell() {
     return rows;
   };
 
-  const createReportDocument = (format = "csv", customFilters = null) => {
+  const createReportDocument = (format = "csv", customFilters = null, options = {}) => {
     const f = customFilters || reportFilters;
     if (!(f.selected_gateway_ids || []).length) {
       setReportSummaryText("Select at least one gateway before generating a report.");
@@ -10639,11 +10887,15 @@ function AppShell() {
 
     const csvContent = buildReportCsv(pivot, tags);
     const summary = buildReportSummary(f, rows, tags);
+    const textContent = buildReportText(pivot, tags, summary);
+    const normalizedFormat = ["pdf", "csv", "txt", "json"].includes(String(format || "").toLowerCase())
+      ? String(format).toLowerCase()
+      : "csv";
     const doc = {
       id: crypto.randomUUID(),
       created_utc: tsNow(),
       generated_by: currentUser?.username || "system",
-      format,
+      format: normalizedFormat,
       filters: f,
       row_count: pivot.length,
       columns_count: tags.length + 1,
@@ -10655,25 +10907,36 @@ function AppShell() {
         chart_type: (f.report_chart_type === "bar") ? "bar" : "line"
       })),
       summary,
+      schedule_id: String(options.schedule_id || ""),
+      schedule_name: String(options.schedule_name || ""),
+      template_id: String(options.template_id || ""),
+      trigger_mode: String(options.trigger_mode || ""),
+      triggered_by: String(options.triggered_by || "manual"),
       storage: endpointMode === "cloud" ? "cloud_app_store" : "local_app_store",
       csv_content: csvContent,
+      text_content: textContent,
       preview_rows: pivot.slice(0, 1200),
     };
     const html = buildReportPreviewHtml(doc);
     doc.html_content = html;
-    doc.size_bytes = Number((csvContent.length + html.length) || 0);
-    setReportDocuments((prev) => [doc, ...prev].slice(0, 120));
+    doc.size_bytes = Number((csvContent.length + html.length + textContent.length) || 0);
+    setReportDocuments((prev) => [doc, ...prev].slice(0, 300));
     addAppLog({
       level: "info",
       category: "reporting",
-      message: `Report generated (${format.toUpperCase()}) with ${pivot.length} rows.`
+      message: `Report generated (${normalizedFormat.toUpperCase()}) with ${pivot.length} rows.`
     });
     return doc;
   };
 
   const downloadReportCsv = (doc) => {
     if (!doc) return;
-    downloadText(`trustnode_report_${String(doc.created_utc || "").replaceAll(/[: ]/g, "_")}.csv`, doc.csv_content || "", "text/csv;charset=utf-8");
+    const stamp = String(doc.created_utc || "").replaceAll(/[: ]/g, "_");
+    if (String(doc.format || "").toLowerCase() === "txt") {
+      downloadText(`trustnode_report_${stamp}.txt`, doc.text_content || "", "text/plain;charset=utf-8");
+      return;
+    }
+    downloadText(`trustnode_report_${stamp}.csv`, doc.csv_content || "", "text/csv;charset=utf-8");
   };
 
   const openReportPreview = (doc) => {
@@ -10698,24 +10961,23 @@ function AppShell() {
 
   const openScheduleCreate = () => {
     setEditingScheduleId(null);
+    const templateId = String(selectedReportTemplateId || "");
     setScheduleForm({
       name: "",
       enabled: true,
+      trigger_mode: "time",
       recurrence: "daily",
       hour: "08",
       minute: "00",
       day_of_week: "1",
       day_of_month: "1",
+      condition_logic: "all",
+      tag_conditions: [],
+      template_id: templateId,
       format: "csv",
+      deliver_email: true,
       recipients: emailSettings.report_recipients || "",
-      filters: {
-        from: reportFilters.from || "",
-        to: reportFilters.to || "",
-        selected_gateway_ids: [...(reportFilters.selected_gateway_ids || [])],
-        selected_tags: [...(reportFilters.selected_tags || [])],
-        batch: reportFilters.batch || "",
-        max_rows: Number(reportFilters.max_rows || 3000),
-      },
+      filters: buildScheduleFiltersSnapshot(templateId),
       last_run_utc: "",
       next_run_utc: ""
     });
@@ -10725,11 +10987,13 @@ function AppShell() {
   const saveScheduledReport = () => {
     if (!canEditPage("scheduled_reports")) return;
     if (!String(scheduleForm.name || "").trim()) return;
-    const next = {
+    const next = sanitizeScheduledReports([{
       ...scheduleForm,
       id: editingScheduleId || crypto.randomUUID(),
+      template_id: String(scheduleForm.template_id || ""),
+      filters: buildScheduleFiltersSnapshot(String(scheduleForm.template_id || "")),
       updated_utc: tsNow()
-    };
+    }])[0];
     setScheduledReports((prev) => {
       if (editingScheduleId) return prev.map((r) => (r.id === editingScheduleId ? next : r));
       return [next, ...prev];
@@ -10740,18 +11004,8 @@ function AppShell() {
 
   const openEditScheduledReport = (row) => {
     setEditingScheduleId(row.id);
-    setScheduleForm({
-      ...row,
-      filters: {
-        from: "",
-        to: "",
-        selected_gateway_ids: [],
-        selected_tags: [],
-        batch: "",
-        max_rows: 3000,
-        ...(row.filters || {}),
-      }
-    });
+    const normalized = sanitizeScheduledReports([row])[0];
+    setScheduleForm(normalized);
     setShowScheduleModal(true);
   };
 
@@ -10763,10 +11017,28 @@ function AppShell() {
   };
 
   const runScheduledReportNow = async (row) => {
-    const doc = createReportDocument(row.format || "csv", row.filters || null);
+    const filters = buildScheduleFiltersSnapshot(String(row.template_id || "")) || row.filters || null;
+    const doc = createReportDocument(row.format || "csv", filters, {
+      schedule_id: row.id,
+      schedule_name: row.name,
+      template_id: row.template_id || "",
+      trigger_mode: row.trigger_mode || "time",
+      triggered_by: "manual",
+    });
     if (!doc) return;
+    if (row.deliver_email === false) {
+      setScheduledReports((prev) =>
+        prev.map((x) => (x.id === row.id ? { ...x, last_run_utc: tsNow() } : x))
+      );
+      return;
+    }
     const recipients = parseEmailList(row.recipients || emailSettings.report_recipients);
-    if (!recipients.length) return;
+    if (!recipients.length) {
+      setScheduledReports((prev) =>
+        prev.map((x) => (x.id === row.id ? { ...x, last_run_utc: tsNow() } : x))
+      );
+      return;
+    }
     try {
       const context = {
         name: row.name || "Report",
@@ -10786,6 +11058,42 @@ function AppShell() {
     } catch (err) {
       addAppLog({ level: "error", category: "reporting", message: `Manual scheduled report send failed: ${String(err)}` });
     }
+  };
+
+  const addScheduleTagCondition = () => {
+    const defaultGateway = String(allGatewayOptions?.[0]?.id || "");
+    const gatewayTags = Array.isArray(triggerTagsByGateway?.[defaultGateway]) ? triggerTagsByGateway[defaultGateway] : [];
+    const defaultTag = String(gatewayTags?.[0] || "");
+    setScheduleForm((prev) => ({
+      ...prev,
+      tag_conditions: [
+        ...(Array.isArray(prev.tag_conditions) ? prev.tag_conditions : []),
+        {
+          id: crypto.randomUUID(),
+          gateway_id: defaultGateway,
+          tag_name: defaultTag,
+          operator: ">=",
+          value: "0",
+          enabled: true,
+        },
+      ],
+    }));
+  };
+
+  const updateScheduleTagCondition = (conditionId, patch) => {
+    setScheduleForm((prev) => ({
+      ...prev,
+      tag_conditions: (Array.isArray(prev.tag_conditions) ? prev.tag_conditions : []).map((c) =>
+        String(c.id) === String(conditionId) ? { ...c, ...patch } : c
+      ),
+    }));
+  };
+
+  const removeScheduleTagCondition = (conditionId) => {
+    setScheduleForm((prev) => ({
+      ...prev,
+      tag_conditions: (Array.isArray(prev.tag_conditions) ? prev.tag_conditions : []).filter((c) => String(c.id) !== String(conditionId)),
+    }));
   };
 
   const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -14376,15 +14684,22 @@ function AppShell() {
               <section className="card card-fill">
                 <div className="table scheduled-table">
                   <div className="thead">
-                    <span>Name</span><span>Recurrence</span><span>Time</span><span>Format</span><span>Recipients</span><span>Last Run</span><span>Status</span><span>Actions</span>
+                    <span>Name</span><span>Trigger</span><span>Template</span><span>Format</span><span>Email</span><span>Last Run</span><span>Status</span><span>Actions</span>
                   </div>
                   {scheduledReports.map((s) => (
                     <div key={s.id} className="trow">
                       <span>{s.name}</span>
-                      <span>{s.recurrence}</span>
-                      <span>{String(s.hour || "00").padStart(2, "0")}:{String(s.minute || "00").padStart(2, "0")}</span>
+                      <span>
+                        {String(s.trigger_mode || "time").toUpperCase()}
+                        {String(s.trigger_mode || "time") !== "tag"
+                          ? ` | ${s.recurrence} ${String(s.hour || "00").padStart(2, "0")}:${String(s.minute || "00").padStart(2, "0")}`
+                          : ""}
+                      </span>
+                      <span>{safeReportTemplates.find((t) => String(t.id) === String(s.template_id || ""))?.name || "-"}</span>
                       <span>{String(s.format || "csv").toUpperCase()}</span>
-                      <span title={s.recipients}>{s.recipients || "-"}</span>
+                      <span title={s.recipients}>
+                        {s.deliver_email === false ? "Disabled" : (s.recipients || emailSettings.report_recipients || "-")}
+                      </span>
                       <span>{s.last_run_utc || "-"}</span>
                       <span>
                         <span className={`status-pill ${s.enabled ? "status-online" : "status-offline"}`}>{s.enabled ? "ENABLED" : "DISABLED"}</span>
@@ -14396,6 +14711,77 @@ function AppShell() {
                       </span>
                     </div>
                   ))}
+                </div>
+              </section>
+              <section className="card card-fill">
+                <h4 className="card-title">Generated Reports</h4>
+                <div className="scheduled-report-filter-row">
+                  <label>
+                    Search
+                    <input
+                      value={scheduledReportFilter.search}
+                      onChange={(e) => setScheduledReportFilter((p) => ({ ...p, search: e.target.value }))}
+                      placeholder="Name, summary, schedule..."
+                    />
+                  </label>
+                  <label>
+                    Format
+                    <select
+                      value={scheduledReportFilter.format}
+                      onChange={(e) => setScheduledReportFilter((p) => ({ ...p, format: e.target.value }))}
+                    >
+                      <option value="all">All</option>
+                      <option value="pdf">PDF</option>
+                      <option value="csv">CSV</option>
+                      <option value="txt">TXT</option>
+                    </select>
+                  </label>
+                  <label>
+                    Schedule
+                    <select
+                      value={scheduledReportFilter.schedule_id}
+                      onChange={(e) => setScheduledReportFilter((p) => ({ ...p, schedule_id: e.target.value }))}
+                    >
+                      <option value="all">All</option>
+                      {scheduledReports.map((row) => (
+                        <option key={`sf-${row.id}`} value={row.id}>{row.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <div className="table reporting-docs-table">
+                  <div className="thead">
+                    <span>Created</span><span>Source</span><span>Summary</span><span>Actions</span>
+                  </div>
+                  {safeReportDocuments
+                    .filter((doc) => {
+                      const search = String(scheduledReportFilter.search || "").trim().toLowerCase();
+                      const format = String(scheduledReportFilter.format || "all");
+                      const scheduleId = String(scheduledReportFilter.schedule_id || "all");
+                      if (format !== "all" && String(doc.format || "").toLowerCase() !== format) return false;
+                      if (scheduleId !== "all" && String(doc.schedule_id || "") !== scheduleId) return false;
+                      if (!search) return true;
+                      const sourceText = [
+                        String(doc.schedule_name || ""),
+                        String(doc.summary || ""),
+                        String(doc.generated_by || ""),
+                        String(doc.format || ""),
+                      ].join(" ").toLowerCase();
+                      return sourceText.includes(search);
+                    })
+                    .map((doc) => (
+                      <div key={`scheduled-doc-${doc.id}`} className="trow">
+                        <span>{doc.created_utc ? fmtTs(doc.created_utc) : "-"}</span>
+                        <span>{doc.schedule_name || (doc.triggered_by === "scheduler" ? "Scheduler" : "Manual")}</span>
+                        <span className="db-cell" title={doc.summary}>{doc.summary}</span>
+                        <span className="row-actions">
+                          <button className="icon-btn table-action-btn" onClick={() => openReportPreview(doc)} title="Preview"><PreviewIcon /></button>
+                          <button className="icon-btn table-action-btn" onClick={() => downloadReportPdf(doc)} title="Download PDF"><PdfIcon /></button>
+                          <button className="icon-btn table-action-btn" onClick={() => downloadReportCsv(doc)} title="Download Data"><CsvIcon /></button>
+                          <button className="icon-btn table-action-btn danger" onClick={() => removeReportDocument(doc.id)} title="Delete"><DeleteIcon /></button>
+                        </span>
+                      </div>
+                    ))}
                 </div>
               </section>
             </>
@@ -16083,6 +16469,75 @@ function AppShell() {
                     </div>
                   </section>
 
+                  <section className="card">
+                    <h4 className="card-title">Report Templates</h4>
+                    <div className="report-template-grid">
+                      <label>
+                        Template
+                        <select
+                          value={selectedReportTemplateId}
+                          onChange={(e) => {
+                            const nextId = String(e.target.value || "");
+                            setSelectedReportTemplateId(nextId);
+                            const nextTpl = safeReportTemplates.find((t) => String(t.id) === nextId);
+                            if (nextTpl) {
+                              setReportTemplateForm({
+                                name: String(nextTpl.name || ""),
+                                description: String(nextTpl.description || ""),
+                              });
+                            }
+                          }}
+                        >
+                          <option value="">Create New Template</option>
+                          {safeReportTemplates.map((tpl) => (
+                            <option key={tpl.id} value={tpl.id}>{tpl.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Template Name
+                        <input
+                          value={reportTemplateForm.name}
+                          onChange={(e) => setReportTemplateForm((p) => ({ ...p, name: e.target.value }))}
+                          placeholder="e.g. Daily Energy Summary"
+                        />
+                      </label>
+                      <label className="report-template-description">
+                        Description
+                        <input
+                          value={reportTemplateForm.description}
+                          onChange={(e) => setReportTemplateForm((p) => ({ ...p, description: e.target.value }))}
+                          placeholder="Optional description"
+                        />
+                      </label>
+                    </div>
+                    <div className="row report-template-actions">
+                      <button className="btn btn-primary" onClick={saveReportTemplate}>
+                        {selectedReportTemplateId ? "Update Template" : "Save Template"}
+                      </button>
+                      <button
+                        className="btn btn-success"
+                        onClick={() => {
+                          if (!activeTemplate) return;
+                          loadReportTemplateIntoFilters(activeTemplate);
+                        }}
+                        disabled={!activeTemplate}
+                      >
+                        Load Template
+                      </button>
+                      <button className="btn btn-primary" onClick={createNewTemplateDraft}>
+                        New
+                      </button>
+                      <button
+                        className="btn btn-danger"
+                        onClick={() => removeReportTemplate(selectedReportTemplateId)}
+                        disabled={!selectedReportTemplateId}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </section>
+
                   <section className="card card-fill">
                     <h4 className="card-title">Generated Reports</h4>
                     <div className="table-scroll fill-scroll">
@@ -16098,7 +16553,7 @@ function AppShell() {
                             <span className="row-actions">
                               <button className="icon-btn table-action-btn" onClick={() => openReportPreview(doc)} title="Preview"><PreviewIcon /></button>
                               <button className="icon-btn table-action-btn" onClick={() => downloadReportPdf(doc)} title="Download PDF"><PdfIcon /></button>
-                              <button className="icon-btn table-action-btn" onClick={() => downloadReportCsv(doc)} title="Download CSV"><CsvIcon /></button>
+                              <button className="icon-btn table-action-btn" onClick={() => downloadReportCsv(doc)} title="Download Data"><CsvIcon /></button>
                               <button className="icon-btn table-action-btn danger" onClick={() => removeReportDocument(doc.id)} title="Delete"><DeleteIcon /></button>
                             </span>
                           </div>
@@ -17803,8 +18258,39 @@ function AppShell() {
                 <input value={scheduleForm.name} onChange={(e) => setScheduleForm((p) => ({ ...p, name: e.target.value }))} />
               </label>
               <label>
+                Report Template
+                <select
+                  value={scheduleForm.template_id || ""}
+                  onChange={(e) => {
+                    const nextTemplateId = String(e.target.value || "");
+                    setScheduleForm((p) => ({
+                      ...p,
+                      template_id: nextTemplateId,
+                      filters: buildScheduleFiltersSnapshot(nextTemplateId),
+                    }));
+                  }}
+                >
+                  <option value="">Use Current Reporting Filters</option>
+                  {safeReportTemplates.map((tpl) => (
+                    <option key={`sch-tpl-${tpl.id}`} value={tpl.id}>{tpl.name}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Trigger Mode
+                <select value={scheduleForm.trigger_mode} onChange={(e) => setScheduleForm((p) => ({ ...p, trigger_mode: e.target.value }))}>
+                  <option value="time">Time</option>
+                  <option value="tag">Tag Value</option>
+                  <option value="both">Time + Tag Value</option>
+                </select>
+              </label>
+              <label>
                 Recurrence
-                <select value={scheduleForm.recurrence} onChange={(e) => setScheduleForm((p) => ({ ...p, recurrence: e.target.value }))}>
+                <select
+                  value={scheduleForm.recurrence}
+                  onChange={(e) => setScheduleForm((p) => ({ ...p, recurrence: e.target.value }))}
+                  disabled={String(scheduleForm.trigger_mode || "time") === "tag"}
+                >
                   <option value="daily">Daily</option>
                   <option value="weekly">Weekly</option>
                   <option value="monthly">Monthly</option>
@@ -17812,34 +18298,138 @@ function AppShell() {
               </label>
               <label>
                 Hour
-                <input type="number" min="0" max="23" value={scheduleForm.hour} onChange={(e) => setScheduleForm((p) => ({ ...p, hour: String(e.target.value || "00").padStart(2, "0") }))} />
+                <input
+                  type="number"
+                  min="0"
+                  max="23"
+                  value={scheduleForm.hour}
+                  onChange={(e) => setScheduleForm((p) => ({ ...p, hour: String(e.target.value || "00").padStart(2, "0") }))}
+                  disabled={String(scheduleForm.trigger_mode || "time") === "tag"}
+                />
               </label>
               <label>
                 Minute
-                <input type="number" min="0" max="59" value={scheduleForm.minute} onChange={(e) => setScheduleForm((p) => ({ ...p, minute: String(e.target.value || "00").padStart(2, "0") }))} />
+                <input
+                  type="number"
+                  min="0"
+                  max="59"
+                  value={scheduleForm.minute}
+                  onChange={(e) => setScheduleForm((p) => ({ ...p, minute: String(e.target.value || "00").padStart(2, "0") }))}
+                  disabled={String(scheduleForm.trigger_mode || "time") === "tag"}
+                />
               </label>
-              {scheduleForm.recurrence === "weekly" ? (
+              {scheduleForm.recurrence === "weekly" && String(scheduleForm.trigger_mode || "time") !== "tag" ? (
                 <label>
                   Day of Week (0-6)
                   <input type="number" min="0" max="6" value={scheduleForm.day_of_week} onChange={(e) => setScheduleForm((p) => ({ ...p, day_of_week: e.target.value }))} />
                 </label>
               ) : null}
-              {scheduleForm.recurrence === "monthly" ? (
+              {scheduleForm.recurrence === "monthly" && String(scheduleForm.trigger_mode || "time") !== "tag" ? (
                 <label>
                   Day of Month (1-31)
                   <input type="number" min="1" max="31" value={scheduleForm.day_of_month} onChange={(e) => setScheduleForm((p) => ({ ...p, day_of_month: e.target.value }))} />
                 </label>
               ) : null}
+              {(String(scheduleForm.trigger_mode || "time") === "tag" || String(scheduleForm.trigger_mode || "time") === "both") ? (
+                <>
+                  <label>
+                    Condition Logic
+                    <select value={scheduleForm.condition_logic || "all"} onChange={(e) => setScheduleForm((p) => ({ ...p, condition_logic: e.target.value }))}>
+                      <option value="all">All conditions must be true (AND)</option>
+                      <option value="any">Any condition can be true (OR)</option>
+                    </select>
+                  </label>
+                  <div className="trigger-form-full-width">
+                    <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                      <strong>Tag Trigger Conditions</strong>
+                      <button className="btn btn-primary btn-sm" type="button" onClick={addScheduleTagCondition}>
+                        Add Condition
+                      </button>
+                    </div>
+                    <div className="scheduled-conditions-stack">
+                      {(Array.isArray(scheduleForm.tag_conditions) ? scheduleForm.tag_conditions : []).map((cond) => {
+                        const condGatewayId = String(cond.gateway_id || "");
+                        const gatewayTags = Array.isArray(triggerTagsByGateway?.[condGatewayId]) ? triggerTagsByGateway[condGatewayId] : [];
+                        return (
+                          <div key={cond.id} className="scheduled-condition-row">
+                            <select
+                              value={condGatewayId}
+                              onChange={(e) => {
+                                const nextGateway = String(e.target.value || "");
+                                const nextTags = Array.isArray(triggerTagsByGateway?.[nextGateway]) ? triggerTagsByGateway[nextGateway] : [];
+                                updateScheduleTagCondition(cond.id, {
+                                  gateway_id: nextGateway,
+                                  tag_name: nextTags.includes(cond.tag_name) ? cond.tag_name : String(nextTags[0] || ""),
+                                });
+                              }}
+                            >
+                              <option value="">Gateway</option>
+                              {allGatewayOptions.map((g) => (
+                                <option key={`sch-gw-${cond.id}-${g.id}`} value={g.id}>{g.name}</option>
+                              ))}
+                            </select>
+                            <select
+                              value={String(cond.tag_name || "")}
+                              onChange={(e) => updateScheduleTagCondition(cond.id, { tag_name: String(e.target.value || "") })}
+                            >
+                              <option value="">Tag</option>
+                              {gatewayTags.map((tag) => (
+                                <option key={`sch-tag-${cond.id}-${tag}`} value={tag}>{formatTagForDisplay(tag)}</option>
+                              ))}
+                            </select>
+                            <select
+                              value={String(cond.operator || ">=")}
+                              onChange={(e) => updateScheduleTagCondition(cond.id, { operator: String(e.target.value || ">=") })}
+                            >
+                              <option value=">=">{">="}</option>
+                              <option value=">">{">"}</option>
+                              <option value="<=">{"<="}</option>
+                              <option value="<">{"<"}</option>
+                              <option value="==">{"=="}</option>
+                              <option value="!=">{"!="}</option>
+                            </select>
+                            <input
+                              type="number"
+                              step="any"
+                              value={String(cond.value ?? "")}
+                              onChange={(e) => updateScheduleTagCondition(cond.id, { value: e.target.value })}
+                              placeholder="Threshold"
+                            />
+                            <button className="icon-btn table-action-btn danger" type="button" title="Delete condition" onClick={() => removeScheduleTagCondition(cond.id)}>
+                              <DeleteIcon />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>
+              ) : null}
               <label>
                 Format
                 <select value={scheduleForm.format} onChange={(e) => setScheduleForm((p) => ({ ...p, format: e.target.value }))}>
+                  <option value="pdf">PDF</option>
                   <option value="csv">CSV</option>
-                  <option value="json">Preview JSON</option>
+                  <option value="txt">TXT</option>
+                </select>
+              </label>
+              <label>
+                Send by Email
+                <select
+                  value={scheduleForm.deliver_email === false ? "no" : "yes"}
+                  onChange={(e) => setScheduleForm((p) => ({ ...p, deliver_email: e.target.value !== "no" }))}
+                >
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
                 </select>
               </label>
               <label>
                 Recipients (; separated)
-                <input value={scheduleForm.recipients} onChange={(e) => setScheduleForm((p) => ({ ...p, recipients: e.target.value }))} />
+                <input
+                  value={scheduleForm.recipients}
+                  onChange={(e) => setScheduleForm((p) => ({ ...p, recipients: e.target.value }))}
+                  disabled={scheduleForm.deliver_email === false}
+                />
               </label>
               <label className="remember-row trigger-enabled-row">
                 <input type="checkbox" checked={Boolean(scheduleForm.enabled)} onChange={(e) => setScheduleForm((p) => ({ ...p, enabled: e.target.checked }))} />

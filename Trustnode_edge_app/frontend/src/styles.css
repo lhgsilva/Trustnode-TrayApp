@@ -1825,6 +1825,21 @@ body {
   margin-top: 4px;
 }
 
+.report-template-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.report-template-description {
+  grid-column: span 1;
+}
+
+.report-template-actions {
+  margin-top: 8px;
+  gap: 8px;
+}
+
 .reporting-main-card {
   min-height: 0;
 }
@@ -1885,7 +1900,30 @@ body {
 
 .scheduled-table .thead,
 .scheduled-table .trow {
-  grid-template-columns: 1.2fr .8fr .7fr .6fr 1.4fr 1fr .8fr 150px;
+  grid-template-columns: 1fr 1.4fr 1fr .7fr 1.2fr .9fr .8fr 150px;
+}
+
+.scheduled-report-filter-row {
+  display: grid;
+  grid-template-columns: 1.5fr .7fr .9fr;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.trigger-form-full-width {
+  grid-column: 1 / -1;
+}
+
+.scheduled-conditions-stack {
+  display: grid;
+  gap: 6px;
+}
+
+.scheduled-condition-row {
+  display: grid;
+  grid-template-columns: 1fr 1.1fr 90px 110px 34px;
+  gap: 6px;
+  align-items: center;
 }
 
 .gateway-table .trow {
@@ -2732,6 +2770,12 @@ input[type="checkbox"] {
     grid-template-columns: 1fr;
   }
 
+  .report-template-grid,
+  .scheduled-report-filter-row,
+  .scheduled-condition-row {
+    grid-template-columns: 1fr;
+  }
+
   .db-scope-grid {
     grid-template-columns: 1fr;
   }
@@ -2827,6 +2871,12 @@ input[type="checkbox"] {
 
   .reporting-chart-wrap {
     height: 260px;
+  }
+
+  .report-template-grid,
+  .scheduled-report-filter-row,
+  .scheduled-condition-row {
+    grid-template-columns: 1fr;
   }
 
   .report-check-group {
