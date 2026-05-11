@@ -867,6 +867,16 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
     admin_password = str(payload.admin_password or "").strip() or "admin"
     try:
         proxied_row: dict[str, Any] | None = None
+        def _extract_scope_from_upstream(data: dict[str, Any] | None) -> tuple[str, str, str]:
+            d = data or {}
+            nested = d.get("row") if isinstance(d.get("row"), dict) else {}
+            tenant_val = str(d.get("tenant_id") or nested.get("tenant_id") or "").strip()
+            customer_val = str(d.get("customer_id") or nested.get("customer_id") or "").strip()
+            license_val = str(d.get("license_id") or nested.get("license_id") or "").strip()
+            if not license_val:
+                lic_obj = nested.get("license") if isinstance(nested.get("license"), dict) else {}
+                license_val = str(lic_obj.get("license_id") or "").strip()
+            return tenant_val, customer_val, license_val
         try:
             row = control_plane_store.build_edge_bootstrap_payload(
                 activation_code=payload.activation_code,
@@ -906,9 +916,10 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                     data = upstream.json() if upstream.text else {}
                     if isinstance(data, dict) and data.get("ok"):
                         proxied_row = dict(data)
+                        upstream_tenant_id, upstream_customer_id, upstream_license_id = _extract_scope_from_upstream(proxied_row)
                         row = {
-                            "tenant_id": str(data.get("tenant_id") or "default"),
-                            "customer_id": str(data.get("customer_id") or ""),
+                            "tenant_id": str(upstream_tenant_id or "default"),
+                            "customer_id": str(upstream_customer_id or ""),
                             "edge_id": str(data.get("edge_id") or payload.edge_id),
                             "edge_name": str(data.get("edge_name") or payload.edge_name or payload.edge_id),
                             "site": str(data.get("site") or payload.site or ""),
@@ -916,7 +927,7 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                             "equipment": str(data.get("equipment") or payload.equipment or ""),
                             "primary_domain": str(data.get("primary_domain") or ""),
                             "cloud_api_url": str(data.get("cloud_api_url") or cloud_url or ""),
-                            "license": {"license_id": str(data.get("license_id") or "")},
+                            "license": {"license_id": str(upstream_license_id or data.get("license_id") or "")},
                             "app_settings_patch": {},
                         }
                     else:
@@ -944,6 +955,7 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
         # Some legacy bootstrap paths can return incomplete customer linkage.
         resolved_customer_id = str(row.get("customer_id") or "").strip()
         resolved_license_id = str((row.get("license") or {}).get("license_id") or "").strip()
+        activation_row = control_plane_store.get_activation_code_row(activation_code=payload.activation_code) or {}
         if not resolved_customer_id or not resolved_license_id:
             try:
                 probe = control_plane_store.activate_edge_with_code(
@@ -959,7 +971,65 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                 resolved_license_id = resolved_license_id or str((probe.get("license") or {}).get("license_id") or "").strip()
             except Exception:
                 pass
-        tenant_id = normalize_tenant_id(str(row.get("tenant_id") or "default"))
+        if proxied_row is not None and cloud_url and (not resolved_customer_id or not resolved_license_id):
+            try:
+                upstream_bootstrap = requests.post(
+                    f"{cloud_url}/api/control-plane/edge-link/bootstrap",
+                    json={
+                        "activation_code": payload.activation_code,
+                        "edge_id": str(row.get("edge_id") or payload.edge_id or ""),
+                        "edge_name": str(row.get("edge_name") or payload.edge_name or ""),
+                        "site": str(row.get("site") or payload.site or ""),
+                        "area": str(row.get("area") or payload.area or ""),
+                        "equipment": str(row.get("equipment") or payload.equipment or ""),
+                    },
+                    headers={"Content-Type": "application/json"},
+                    timeout=20,
+                )
+                if 200 <= upstream_bootstrap.status_code < 300:
+                    b = upstream_bootstrap.json() if upstream_bootstrap.text else {}
+                    if isinstance(b, dict):
+                        b_row = b.get("row") if isinstance(b.get("row"), dict) else b
+                        resolved_customer_id = resolved_customer_id or str(b_row.get("customer_id") or "").strip()
+                        if not resolved_license_id:
+                            lic_obj = b_row.get("license") if isinstance(b_row.get("license"), dict) else {}
+                            resolved_license_id = str(
+                                b_row.get("license_id") or lic_obj.get("license_id") or ""
+                            ).strip()
+            except Exception:
+                pass
+        resolved_customer_id = resolved_customer_id or str(activation_row.get("customer_id") or "").strip()
+        resolved_license_id = resolved_license_id or str(activation_row.get("license_id") or "").strip()
+        tenant_id = normalize_tenant_id(str(row.get("tenant_id") or activation_row.get("tenant_id") or "default"))
+        # Last-mile scope recovery for legacy/incomplete activation records:
+        # derive customer from license mapping, or derive license from customer mapping.
+        if not resolved_customer_id and resolved_license_id:
+            try:
+                lic_rows = control_plane_store.list_licenses(tenant_id=tenant_id) or []
+                lic_match = next(
+                    (r for r in lic_rows if str(r.get("license_id") or "").strip() == resolved_license_id),
+                    None,
+                )
+                resolved_customer_id = str((lic_match or {}).get("customer_id") or "").strip()
+            except Exception:
+                pass
+        if resolved_customer_id and not resolved_license_id:
+            try:
+                lic = control_plane_store.get_license_for_customer(
+                    tenant_id=tenant_id,
+                    customer_id=resolved_customer_id,
+                ) or {}
+                resolved_license_id = str(lic.get("license_id") or "").strip()
+            except Exception:
+                pass
+        scope_incomplete = False
+        scope_warnings: list[str] = []
+        if not resolved_customer_id:
+            scope_incomplete = True
+            scope_warnings.append("customer_id_missing")
+        if not resolved_license_id:
+            scope_incomplete = True
+            scope_warnings.append("license_id_missing")
         # Create/refresh tenant admin in control-plane auth store.
         # This is mandatory for first login after activation.
         local_user_row = control_plane_store.upsert_user(
@@ -979,6 +1049,8 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
 
         # When activation was proxied to cloud control-plane, force cloud-side user upsert too.
         # This guarantees portal users list + hosted login can immediately authenticate.
+        cloud_user_sync_ok = True
+        cloud_user_sync_error = ""
         if proxied_row is not None and cloud_url:
             try:
                 upstream_user = requests.post(
@@ -1006,9 +1078,11 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                         detail = (upstream_user.json() or {}).get("detail")
                     except Exception:
                         detail = upstream_user.text
-                    raise ValueError(str(detail or f"cloud_user_upsert_failed_{upstream_user.status_code}"))
+                    cloud_user_sync_ok = False
+                    cloud_user_sync_error = str(detail or f"cloud_user_upsert_failed_{upstream_user.status_code}")
             except Exception as exc:
-                raise ValueError(f"activation_admin_user_create_failed_cloud:{exc}") from exc
+                cloud_user_sync_ok = False
+                cloud_user_sync_error = str(exc)
 
         # Materialize local bootstrap so first login works immediately.
         try:
@@ -1095,32 +1169,12 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             "site": str(row.get("site") or payload.site or ""),
             "area": str(row.get("area") or payload.area or ""),
             "equipment": str(row.get("equipment") or payload.equipment or ""),
+            "scope_incomplete": scope_incomplete,
+            "scope_warnings": scope_warnings,
+            "cloud_user_sync_ok": cloud_user_sync_ok,
+            "cloud_user_sync_error": cloud_user_sync_error,
         }
     except Exception as exc:
-        # Best-effort compatibility path: if user creation + activation succeeded but
-        # a downstream serialization mismatch happened, return success envelope.
-        try:
-            recovered = control_plane_store.authenticate_user_any_tenant(
-                username=admin_username,
-                password=admin_password,
-            )
-            if recovered:
-                rec_tenant = normalize_tenant_id(str(recovered.get("tenant_id") or "default"))
-                return {
-                    "ok": True,
-                    "tenant_id": rec_tenant,
-                    "edge_id": str(payload.edge_id or ""),
-                    "edge_name": str(payload.edge_name or payload.edge_id or ""),
-                    "customer_id": "",
-                    "license_id": "",
-                    "cloud_api_url": cloud_url,
-                    "primary_domain": "",
-                    "site": str(payload.site or ""),
-                    "area": str(payload.area or ""),
-                    "equipment": str(payload.equipment or ""),
-                }
-        except Exception:
-            pass
         control_plane_store.audit(
             actor_type="device",
             actor_id=str(payload.edge_id or "edge"),
@@ -1143,6 +1197,7 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
         # Ensure local auth store contains the edge admin for immediate login.
         control_plane_store.upsert_user(
             tenant_id=tenant_id,
+            customer_id=str(payload.customer_id or ""),
             username=admin_username,
             password=admin_password,
             role="admin",

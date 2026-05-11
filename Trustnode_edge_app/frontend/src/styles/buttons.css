@@ -1,0 +1,82 @@
+/* Button system: compact, action-colored, content-fit by default */
+.btn,
+.btn-sm,
+.icon-btn,
+.table-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: auto;
+  max-width: 100%;
+  white-space: nowrap;
+  min-height: 36px;
+  height: 36px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+
+.btn,
+.btn-primary {
+  background: var(--ok);
+  color: #ffffff;
+  border: 1px solid var(--ok);
+}
+
+.btn-success {
+  background: var(--ok);
+  color: #ffffff;
+  border: 1px solid var(--ok);
+}
+
+.btn-warning {
+  background: var(--warning);
+  color: #111111;
+  border: 1px solid var(--warning);
+}
+
+.btn-danger,
+.table-action-btn.danger {
+  background: var(--danger);
+  color: #ffffff;
+  border: 1px solid var(--danger);
+}
+
+.btn-secondary,
+.btn.btn-secondary,
+.table-action-btn {
+  background: var(--info);
+  color: #ffffff;
+  border: 1px solid var(--info);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--stroke);
+}
+
+.row .btn,
+.page-tools .btn,
+.reporting-actions-wide-row .btn,
+.db-actions .btn {
+  flex: 0 0 auto;
+  width: auto;
+}
+
+.btn-full,
+.row .btn-full,
+.btn.block {
+  width: 100%;
+  justify-content: center;
+}
+
+.btn:hover,
+.btn-primary:hover,
+.btn-success:hover,
+.btn-secondary:hover,
+.btn-warning:hover,
+.btn-danger:hover,
+.table-action-btn:hover {
+  filter: brightness(1.04);
+}

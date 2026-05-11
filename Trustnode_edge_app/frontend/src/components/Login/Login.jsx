@@ -24,6 +24,9 @@ export const Login = ({
 }) => {
   const [loginForm, setLoginForm] = useState({ username: "", password: "" });
   const [showLoginPassword, setShowLoginPassword] = useState(false);
+  const [showAdminPassword, setShowAdminPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [showForgotNewPassword, setShowForgotNewPassword] = useState(false);
   const [rememberWorkstation, setRememberWorkstation] = useState(true);
   const [loginError, setLoginError] = useState("");
   const [loginBusy, setLoginBusy] = useState(false);
@@ -40,15 +43,27 @@ export const Login = ({
     activation_code: "",
     admin_username: "admin",
     admin_password: "",
+    confirm_password: "",
   });
   const [edgeRegisterResult, setEdgeRegisterResult] = useState("");
   const [edgeRegisterBusy, setEdgeRegisterBusy] = useState(false);
 
-  const logoSrc = trustnodeLogo;
+  const logoSrc = React.useMemo(() => {
+    try {
+      const origin = typeof window !== "undefined" ? String(window.location?.origin || "") : "";
+      if (origin) return `${origin.replace(/\/+$/, "")}/assets/trustenode-002.png`;
+    } catch {}
+    return trustnodeLogo;
+  }, []);
 
   const [logoError, setLogoError] = React.useState(false);
 
   const handleLogoLoadError = (e) => {
+    const img = e?.currentTarget;
+    if (img && img.src && !img.src.includes("trustenode-002.png")) {
+      img.src = trustnodeLogo;
+      return;
+    }
     setLogoError(true);
   };
 
@@ -168,6 +183,7 @@ export const Login = ({
           activation_code: "",
           admin_username: "",
           admin_password: "",
+          confirm_password: "",
         });
         setLoginForm((prev) => ({
           ...prev,
@@ -253,7 +269,7 @@ export const Login = ({
 
         <div className="auth-tabs">
           <button
-            className={`auth-tab ${loginTab === "login" ? "active" : ""}`}
+            className={`auth-tab ${loginTab === "login" ? "active active-login" : ""}`}
             type="button"
             onClick={() => setLoginTab("login")}
           >
@@ -261,7 +277,7 @@ export const Login = ({
           </button>
           {showRegisterTab ? (
             <button
-              className={`auth-tab ${loginTab === "register" ? "active" : ""}`}
+              className={`auth-tab ${loginTab === "register" ? "active active-activate" : ""}`}
               type="button"
               onClick={openEdgeRegisterModal}
             >
@@ -272,11 +288,6 @@ export const Login = ({
 
         {loginTab === "register" && showRegisterTab ? (
           <>
-            <h3 className="auth-heading">Activate TrustNode Edge</h3>
-            <p className="auth-activate-subtitle">
-              Paste your activation code, then choose the administrator account you'll use to sign in to this Edge app.
-            </p>
-
             <label>
               <span>Activation code</span>
               <div className="input-wrapper">
@@ -333,7 +344,7 @@ export const Login = ({
 
             <label>
               <span>Admin password</span>
-              <div className="input-wrapper">
+              <div className="pw-input-wrap">
                 <div className="field-icon">
                   <svg viewBox="0 0 24 24" fill="none">
                     <rect x="3" y="11" width="18" height="10" rx="2" />
@@ -341,7 +352,7 @@ export const Login = ({
                   </svg>
                 </div>
                 <input
-                  type="password"
+                  type={showAdminPassword ? "text" : "password"}
                   placeholder="Set a password (8+ characters)"
                   value={edgeRegisterForm.admin_password}
                   onChange={(e) =>
@@ -351,12 +362,20 @@ export const Login = ({
                     }))
                   }
                 />
+                <button
+                  className="pw-icon-btn"
+                  onClick={() => setShowAdminPassword((v) => !v)}
+                  type="button"
+                  aria-label="Toggle admin password visibility"
+                >
+                  <EyeIcon open={showAdminPassword} />
+                </button>
               </div>
             </label>
 
             <label>
               <span>Confirm password</span>
-              <div className="input-wrapper">
+              <div className="pw-input-wrap">
                 <div className="field-icon">
                   <svg viewBox="0 0 24 24" fill="none">
                     <rect x="3" y="11" width="18" height="10" rx="2" />
@@ -364,9 +383,24 @@ export const Login = ({
                   </svg>
                 </div>
                 <input
-                  type="password"
+                  type={showConfirmPassword ? "text" : "password"}
                   placeholder="Re-enter the password"
+                  value={edgeRegisterForm.confirm_password}
+                  onChange={(e) =>
+                    setEdgeRegisterForm((p) => ({
+                      ...p,
+                      confirm_password: e.target.value,
+                    }))
+                  }
                 />
+                <button
+                  className="pw-icon-btn"
+                  onClick={() => setShowConfirmPassword((v) => !v)}
+                  type="button"
+                  aria-label="Toggle confirm password visibility"
+                >
+                  <EyeIcon open={showConfirmPassword} />
+                </button>
               </div>
             </label>
 
@@ -385,18 +419,11 @@ export const Login = ({
               onClick={submitEdgeRegister}
               disabled={edgeRegisterBusy || !canActivate}
             >
-              {edgeRegisterBusy ? "Activating..." : "Activate Edge app ->"}
+              {edgeRegisterBusy ? "Activating..." : "Activate Edge App"}
             </button>
           </>
         ) : (
           <>
-            <div className="auth-welcome">
-              <div className="auth-welcome-title">Welcome back</div>
-              <div className="auth-welcome-subtitle">
-                Sign in to access your fleet dashboard, acquisition pipelines and plant-wide insights.
-              </div>
-            </div>
-
             <label>
               <span>Username or email</span>
               <div className="input-wrapper">
@@ -503,16 +530,32 @@ export const Login = ({
                 </label>
                 <label>
                   <span>New Password</span>
-                  <input
-                    type="password"
-                    value={forgotForm.new_password}
-                    onChange={(e) =>
-                      setForgotForm((p) => ({
-                        ...p,
-                        new_password: e.target.value,
-                      }))
-                    }
-                  />
+                  <div className="pw-input-wrap">
+                    <div className="field-icon">
+                      <svg viewBox="0 0 24 24" fill="none">
+                        <rect x="3" y="11" width="18" height="10" rx="2" />
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                      </svg>
+                    </div>
+                    <input
+                      type={showForgotNewPassword ? "text" : "password"}
+                      value={forgotForm.new_password}
+                      onChange={(e) =>
+                        setForgotForm((p) => ({
+                          ...p,
+                          new_password: e.target.value,
+                        }))
+                      }
+                    />
+                    <button
+                      className="pw-icon-btn"
+                      onClick={() => setShowForgotNewPassword((v) => !v)}
+                      type="button"
+                      aria-label="Toggle new password visibility"
+                    >
+                      <EyeIcon open={showForgotNewPassword} />
+                    </button>
+                  </div>
                 </label>
                 <div className="row" style={{ gap: 8 }}>
                   <button
@@ -545,7 +588,7 @@ export const Login = ({
               onClick={submitLogin}
               disabled={loginBusy}
             >
-              {loginBusy ? "Signing in..." : loginActionLabel}
+              {loginBusy ? "Signing in..." : String(loginActionLabel || "Sign in").replace(/[-–—>]+/g, " ").trim()}
             </button>
           </>
         )}

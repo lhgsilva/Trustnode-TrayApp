@@ -1,0 +1,82 @@
+/* Navigation/sidebar theme propagation */
+.surface-local,
+.surface-portal,
+.surface-client {
+  --sidebar-border: var(--stroke);
+  --sidebar-soft: color-mix(in srgb, var(--sidebar) 85%, var(--card) 15%);
+  --sidebar-title: var(--muted);
+  --header-border: var(--stroke);
+  --header-surface: color-mix(in srgb, var(--card) 92%, var(--bg) 8%);
+  --header-surface-border: var(--stroke);
+}
+
+.surface-local .sidebar,
+.surface-portal .sidebar,
+.surface-client .sidebar {
+  background: var(--sidebar);
+}
+
+.surface-local .sidebar,
+.surface-portal .sidebar,
+.surface-client .sidebar {
+  color: var(--sidebar-text);
+}
+
+.surface-local .app-header,
+.surface-portal .app-header,
+.surface-client .app-header,
+.surface-local .window-bar-strip,
+.surface-portal .window-bar-strip,
+.surface-client .window-bar-strip {
+  background: var(--header);
+  color: var(--header-text);
+  border-bottom: 1px solid var(--header-border);
+}
+
+.nav-group-btn,
+.nav-item,
+.user-menu-btn,
+.user-dropdown button {
+  color: var(--sidebar-text);
+}
+
+.nav-group-btn:hover,
+.nav-item:hover,
+.user-menu-btn:hover,
+.user-dropdown button:hover {
+  background: var(--sidebar-soft);
+}
+
+/* Larger nav typography/vertical rhythm for readability */
+.nav-group-btn {
+  min-height: 40px;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-family: var(--font-ui);
+}
+
+.nav-item {
+  min-height: 40px;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-family: var(--font-ui);
+}
+
+.nav-subitem {
+  min-height: 42px;
+  font-size: 13px;
+  padding-left: 20px;
+  font-family: var(--font-ui);
+}
+
+.nav-item:hover {
+  background: var(--nav-hover-bg);
+  color: var(--nav-hover-text);
+  border-left: 3px solid var(--nav-hover-border);
+}
+
+.nav-item.active {
+  background: var(--nav-active-bg);
+  color: var(--nav-active-text);
+  border-left: 3px solid var(--nav-active-border);
+}

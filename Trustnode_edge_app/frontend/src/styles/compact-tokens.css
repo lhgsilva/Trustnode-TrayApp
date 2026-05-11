@@ -1,0 +1,151 @@
+/* Single source-of-truth design tokens (app + login + charts + tags) */
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+
+:root {
+  --brand: #1f3a5f;
+  --brand-strong: #0e8479;
+  --teal: #14a89a;
+  --ok: #14a89a;
+  --warning: #e0a050;
+  --danger: #e2585d;
+  --info: #6e8dd2;
+
+  --bg: #eceff3;
+  --card: #ffffff;
+  --card-2: #f6f8fa;
+  --surface: #eceff3;
+  --surface-elev: #ffffff;
+  --text: #0e1116;
+  --muted: #4a5566;
+  --soft: #6e7989;
+  --stroke: #e1e6ec;
+  --line: #e1e6ec;
+  --table-row: #f6f8fa;
+  --error-bg: #fee2e2;
+  --error-text: #7f1d1d;
+  --error-border: #fecaca;
+
+  --header: #eceff3;
+  --header-text: #0e1116;
+  --header-border: #d3dbe3;
+  --header-surface: #eceff3;
+  --header-surface-border: #d3dbe3;
+
+  --sidebar: #ffffff;
+  --sidebar-soft: #f6f8fa;
+  --sidebar-border: #d7dce5;
+  --sidebar-text: #0e1116;
+  --sidebar-title: #4a5566;
+  --nav-active-bg: #14a89a;
+  --nav-active-text: #ffffff;
+  --nav-hover-bg: #1f3a5f;
+  --nav-hover-text: #ffffff;
+  --nav-hover-border: #1f3a5f;
+  --nav-active-border: #14a89a;
+
+  --font-ui: "Manrope", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Consolas", "Courier New", monospace;
+
+  --font-xs: 11px;
+  --font-sm: 13px;
+  --font-md: 14px;
+  --font-lg: 20px;
+  --font-xl: 28px;
+
+  --space-1: 4px;
+  --space-2: 6px;
+  --space-3: 8px;
+  --space-4: 10px;
+  --space-5: 12px;
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+}
+
+[data-theme="dark"] {
+  --bg: #111111;
+  --card: #171717;
+  --card-2: #1f1f1f;
+  --surface: #111111;
+  --surface-elev: #171717;
+  --text: #f2f4f7;
+  --muted: #b6c0cc;
+  --soft: #8a98ab;
+  --stroke: #2a2a2a;
+  --line: #2a2a2a;
+  --table-row: #1f1f1f;
+  --error-bg: #5a1d20;
+  --error-text: #ffd7d9;
+  --error-border: #7f2d33;
+
+  --header: #111111;
+  --header-text: #f2f4f7;
+  --header-border: #2a2a2a;
+  --header-surface: #111111;
+  --header-surface-border: #2a2a2a;
+
+  --sidebar: #171717;
+  --sidebar-soft: #171717;
+  --sidebar-border: #2a2a2a;
+  --sidebar-text: #f2f4f7;
+  --sidebar-title: #8a98ab;
+  --nav-active-bg: #14a89a;
+  --nav-active-text: #f2f4f7;
+  --nav-hover-bg: #1f3a5f;
+  --nav-hover-text: #f2f4f7;
+  --nav-hover-border: #1f3a5f;
+  --nav-active-border: #14a89a;
+}
+
+body {
+  font-family: var(--font-ui);
+  background: var(--bg);
+  color: var(--text);
+}
+
+code,
+pre,
+.mono,
+.numeric,
+.stat-value,
+.kpi-value {
+  font-family: var(--font-mono);
+}
+
+.recharts-cartesian-axis-line,
+.recharts-cartesian-axis-tick-line {
+  stroke: var(--soft);
+}
+
+.recharts-cartesian-axis-tick-value {
+  fill: var(--soft);
+  font-family: var(--font-ui);
+  font-size: var(--font-xs);
+}
+
+.status-pill,
+.status-chip,
+.lock-tag {
+  font-family: var(--font-ui);
+}
+
+.content-scroll {
+  padding: var(--space-4);
+  gap: var(--space-3);
+}
+
+.card {
+  border-radius: 12px;
+  padding: var(--space-4);
+}
+
+.thead,
+.trow {
+  font-size: var(--font-sm);
+  line-height: 1.2;
+}
+
+.trow {
+  padding: 6px 8px;
+  margin: 0;
+}

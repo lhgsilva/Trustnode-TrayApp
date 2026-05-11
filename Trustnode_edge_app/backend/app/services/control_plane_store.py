@@ -54,6 +54,30 @@ class ControlPlaneStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _table_has_column(self, conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+        try:
+            rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            cols = {str(r[1]) for r in rows}
+            return column_name in cols
+        except Exception:
+            return False
+
+    def _ensure_cp_users_customer_column(self, conn: sqlite3.Connection) -> bool:
+        has_col = self._table_has_column(conn, "cp_users", "customer_id")
+        if not has_col:
+            try:
+                conn.execute("ALTER TABLE cp_users ADD COLUMN customer_id TEXT")
+                conn.commit()
+                has_col = True
+            except Exception:
+                has_col = self._table_has_column(conn, "cp_users", "customer_id")
+        if has_col:
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS ix_cp_users_tenant_customer ON cp_users(tenant_id, customer_id)")
+            except Exception:
+                pass
+        return has_col
+
     def _utc_now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
@@ -283,11 +307,7 @@ class ControlPlaneStore:
                     """
                 )
                 cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(cp_edge_activation_codes)").fetchall()}
-                user_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(cp_users)").fetchall()}
-                if "customer_id" not in user_cols:
-                    cur.execute("ALTER TABLE cp_users ADD COLUMN customer_id TEXT")
-                # Create this index only after customer_id exists on legacy DBs.
-                cur.execute("CREATE INDEX IF NOT EXISTS ix_cp_users_tenant_customer ON cp_users(tenant_id, customer_id)")
+                self._ensure_cp_users_customer_column(conn)
                 if "edge_id" not in cols:
                     cur.execute("ALTER TABLE cp_edge_activation_codes ADD COLUMN edge_id TEXT")
                 if "license_id" not in cols:
@@ -570,6 +590,7 @@ class ControlPlaneStore:
         now = self._utc_now()
         with self._lock:
             with self._connect() as conn:
+                has_customer_col = self._ensure_cp_users_customer_column(conn)
                 row = conn.execute("SELECT * FROM cp_users WHERE tenant_id=? AND username=?", (tid, uname)).fetchone()
                 if row:
                     updates = [
@@ -590,7 +611,7 @@ class ControlPlaneStore:
                         json.dumps(permissions or {}, separators=(",", ":"), sort_keys=True),
                         now,
                     ]
-                    if cid:
+                    if cid and has_customer_col:
                         updates.append("customer_id=?")
                         params.append(cid)
                     if password is not None and str(password) != "":
@@ -602,23 +623,41 @@ class ControlPlaneStore:
                         tuple(params),
                     )
                 else:
-                    conn.execute(
-                        "INSERT INTO cp_users(tenant_id, customer_id, username, password_hash, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            tid,
-                            cid,
-                            uname,
-                            self._hash_password(str(password or "ChangeMe123!")),
-                            str(role or "viewer"),
-                            str(status or "active"),
-                            str(email or ""),
-                            int(bool(mfa_enabled)),
-                            json.dumps(modules or [], separators=(",", ":")),
-                            json.dumps(permissions or {}, separators=(",", ":"), sort_keys=True),
-                            now,
-                            now,
-                        ),
-                    )
+                    if has_customer_col:
+                        conn.execute(
+                            "INSERT INTO cp_users(tenant_id, customer_id, username, password_hash, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                tid,
+                                cid,
+                                uname,
+                                self._hash_password(str(password or "ChangeMe123!")),
+                                str(role or "viewer"),
+                                str(status or "active"),
+                                str(email or ""),
+                                int(bool(mfa_enabled)),
+                                json.dumps(modules or [], separators=(",", ":")),
+                                json.dumps(permissions or {}, separators=(",", ":"), sort_keys=True),
+                                now,
+                                now,
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            "INSERT INTO cp_users(tenant_id, username, password_hash, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                tid,
+                                uname,
+                                self._hash_password(str(password or "ChangeMe123!")),
+                                str(role or "viewer"),
+                                str(status or "active"),
+                                str(email or ""),
+                                int(bool(mfa_enabled)),
+                                json.dumps(modules or [], separators=(",", ":")),
+                                json.dumps(permissions or {}, separators=(",", ":"), sort_keys=True),
+                                now,
+                                now,
+                            ),
+                        )
                 conn.commit()
                 out = conn.execute("SELECT * FROM cp_users WHERE tenant_id=? AND username=?", (tid, uname)).fetchone()
         return dict(out) if out else {}
@@ -627,10 +666,16 @@ class ControlPlaneStore:
         tid = normalize_tenant_id(tenant_id)
         with self._lock:
             with self._connect() as conn:
-                rows = conn.execute("SELECT id, tenant_id, customer_id, username, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc, last_login_utc FROM cp_users WHERE tenant_id=? ORDER BY username", (tid,)).fetchall()
+                has_customer_col = self._ensure_cp_users_customer_column(conn)
+                if has_customer_col:
+                    rows = conn.execute("SELECT id, tenant_id, customer_id, username, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc, last_login_utc FROM cp_users WHERE tenant_id=? ORDER BY username", (tid,)).fetchall()
+                else:
+                    rows = conn.execute("SELECT id, tenant_id, username, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc, last_login_utc FROM cp_users WHERE tenant_id=? ORDER BY username", (tid,)).fetchall()
         output: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
+            if "customer_id" not in d:
+                d["customer_id"] = ""
             d["modules"] = json.loads(d.get("modules_json") or "[]")
             d["permissions"] = json.loads(d.get("permissions_json") or "{}")
             d.pop("modules_json", None)
@@ -848,6 +893,16 @@ class ControlPlaneStore:
                 tid = normalize_tenant_id(str(r.get("tenant_id") or "default"))
                 cid = str(r.get("customer_id") or "").strip()
                 lid = str(r.get("license_id") or "").strip()
+                if not cid or not lid:
+                    try:
+                        meta = json.loads(str(r.get("metadata_json") or "{}"))
+                        if isinstance(meta, dict):
+                            if not cid:
+                                cid = str(meta.get("customer_id") or "").strip()
+                            if not lid:
+                                lid = str(meta.get("license_id") or "").strip()
+                    except Exception:
+                        pass
                 if cid and lid:
                     lic = conn.execute(
                         "SELECT status, end_utc, customer_id FROM cp_licenses WHERE tenant_id=? AND license_id=? LIMIT 1",
@@ -882,6 +937,27 @@ class ControlPlaneStore:
                 conn.commit()
                 edge = conn.execute("SELECT * FROM cp_edges WHERE edge_id=?", (str(edge_id or ""),)).fetchone()
         return dict(edge) if edge else {}
+
+    def get_activation_code_row(self, *, activation_code: str) -> dict[str, Any] | None:
+        code_norm = str(activation_code or "").strip()
+        code_compact = "".join(code_norm.split())
+        if not code_norm:
+            return None
+        code_hash = self._sha256(code_norm)
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute("SELECT rowid AS id, * FROM cp_edge_activation_codes WHERE code_hash=?", (code_hash,)).fetchone()
+                if not row and code_compact and code_compact != code_norm:
+                    row = conn.execute(
+                        "SELECT rowid AS id, * FROM cp_edge_activation_codes WHERE code_hash=?",
+                        (self._sha256(code_compact),),
+                    ).fetchone()
+                if not row:
+                    row = conn.execute(
+                        "SELECT rowid AS id, * FROM cp_edge_activation_codes WHERE activation_code IN (?, ?) LIMIT 1",
+                        (code_norm, code_compact or code_norm),
+                    ).fetchone()
+        return dict(row) if row else None
 
     def list_activation_codes(self, *, tenant_id: str, customer_id: str = "") -> list[dict[str, Any]]:
         tid = normalize_tenant_id(tenant_id)
@@ -1111,6 +1187,7 @@ class ControlPlaneStore:
             self.set_license_modules(license_id=str(license_row.get("license_id") or license_id), modules=defaults)
         user = self.upsert_user(
             tenant_id=tid,
+            customer_id=str(customer.get("customer_id") or customer_id),
             username=admin_username,
             password=admin_password,
             role="admin",

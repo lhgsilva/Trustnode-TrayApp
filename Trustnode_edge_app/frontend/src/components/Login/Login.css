@@ -1,17 +1,16 @@
 /* ============================================================
    TrustNode Login — brand tokens + dark/light themes
-   Brand: Navy #1F3A5F + Teal #14A89A accents
+   Brand: Navy #0169cc + Teal #0169cc accents
    ============================================================ */
 
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
 
 :root {
-  /* Brand */
-  --navy: #1F3A5F;
-  --navy-deep: #16314F;
-  --teal: #14A89A;
-  --teal-deep: #0E8479;
-  --teal-bright: #3CD2C2;
+  /* Brand (from central tokens) */
+  --navy: var(--brand);
+  --navy-deep: #162E4D;
+  --teal: var(--teal);
+  --teal-deep: var(--brand-strong);
+  --teal-bright: var(--teal);
 
   /* Greys (neutral spine) */
   --grey-950: #0B0E12;
@@ -28,46 +27,53 @@
   --grey-50: #F6F8FA;
 
   --radius: 18px;
-  --radius-sm: 10px;
-  font-family: 'Manrope', system-ui, sans-serif;
+  --radius-sm: var(--radius-md);
+  --auth-control-h: 40px;
+  --auth-space-logo-after: 16px;
+  --auth-space-tabs-after: 16px;
+  --auth-space-password-after: 16px;
+  --auth-space-before-submit: 14px;
+  --auth-font-main: 16px;
+  --auth-font-label: 12px;
+  font-family: var(--font-ui);
 }
 
 /* ============================================================
    DARK THEME — black/dark grey base
    ============================================================ */
 .theme-dark {
-  --bg-page: #2A3340;
-  --bg-elev: #0B0E12;
-  --bg-card: #000000;
-  --bg-card-edge: #2E3744;
-  --ink: #F2F4F7;
-  --ink-muted: #B6C0CC;
-  --ink-soft: #8A98AB;
-  --line: rgba(255, 255, 255, 0.08);
-  --line-strong: rgba(255, 255, 255, 0.16);
-  --field-bg: #2A3340;
-  --field-bg-focus: #313B49;
+  --bg-page: var(--bg);
+  --bg-elev: var(--card);
+  --bg-card: var(--card);
+  --bg-card-edge: var(--stroke);
+  --ink: var(--text);
+  --ink-muted: var(--muted);
+  --ink-soft: var(--soft);
+  --line: var(--line);
+  --line-strong: var(--stroke);
+  --field-bg: color-mix(in srgb, var(--card) 86%, #ffffff 14%);
+  --field-bg-focus: color-mix(in srgb, var(--card) 80%, #ffffff 20%);
   --accent: var(--teal);
   --accent-deep: var(--teal-deep);
   --accent-bright: var(--teal-bright);
-  --shadow-card: 0 30px 80px -20px rgba(0, 0, 0, 0.7), 0 8px 24px -8px rgba(0, 0, 0, 0.55);
+  --shadow-card: 0 22px 46px -20px rgba(0, 0, 0, 0.65), 0 8px 22px -10px rgba(0, 0, 0, 0.5);
 }
 
 /* ============================================================
    LIGHT THEME — white card on light grey page
    ============================================================ */
 .theme-light {
-  --bg-page: #ECEFF3;
-  --bg-elev: #FFFFFF;
-  --bg-card: #FFFFFF;
-  --bg-card-edge: #E1E6EC;
-  --ink: #0E1116;
-  --ink-muted: #4A5566;
-  --ink-soft: #6E7989;
-  --line: rgba(14, 17, 22, 0.08);
-  --line-strong: rgba(14, 17, 22, 0.16);
-  --field-bg: #F6F8FA;
-  --field-bg-focus: #FFFFFF;
+  --bg-page: var(--bg);
+  --bg-elev: var(--card);
+  --bg-card: var(--card);
+  --bg-card-edge: var(--stroke);
+  --ink: var(--text);
+  --ink-muted: var(--muted);
+  --ink-soft: var(--soft);
+  --line: var(--line);
+  --line-strong: var(--stroke);
+  --field-bg: color-mix(in srgb, var(--card) 78%, var(--bg) 22%);
+  --field-bg-focus: var(--card);
   --accent: var(--teal);
   --accent-deep: var(--teal-deep);
   --accent-bright: var(--teal);
@@ -76,17 +82,17 @@
 
 /* Default to dark theme if no class is set */
 :root {
-  --bg-page: #2A3340;
-  --bg-elev: #181D25;
-  --bg-card: #232A36;
-  --bg-card-edge: #2E3744;
-  --ink: #F2F4F7;
-  --ink-muted: #B6C0CC;
-  --ink-soft: #8A98AB;
+  --bg-page: #111111;
+  --bg-elev: #171717;
+  --bg-card: #171717;
+  --bg-card-edge: #2a2a2a;
+  --ink: #fcfcfc;
+  --ink-muted: #c7c7c7;
+  --ink-soft: #b3b3b3;
   --line: rgba(255, 255, 255, 0.08);
   --line-strong: rgba(255, 255, 255, 0.16);
-  --field-bg: #2A3340;
-  --field-bg-focus: #313B49;
+  --field-bg: #1f1f1f;
+  --field-bg-focus: #262626;
   --accent: var(--teal);
   --accent-deep: var(--teal-deep);
   --accent-bright: var(--teal-bright);
@@ -102,7 +108,7 @@
 html, body {
   background: var(--bg-page);
   color: var(--ink);
-  font-family: 'Manrope', system-ui, -apple-system, sans-serif;
+  font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
   transition: background-color 0.3s, color 0.3s;
 }
@@ -128,16 +134,16 @@ html, body {
   width: 100%;
   max-width: 480px;
   background: var(--bg-card);
-  border: 1px solid var(--line);
+  border: 1px solid var(--bg-card-edge);
   border-radius: 24px;
   padding: 24px 24px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   position: relative;
   box-shadow: var(--shadow-card);
-  backdrop-filter: blur(18px) saturate(140%);
-  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 
 .theme-toggle-btn {
@@ -169,15 +175,20 @@ html, body {
   flex-direction: column;
   align-items: center;
   gap: 4px;
-  margin-bottom: 0;
+  margin: 20px 0 24px 0;
   text-align: center;
 }
 
 .auth-logo {
   width: 300px;
   height: 104px;
-  object-fit: cover;
+  object-fit: contain;
   object-position: center;
+  image-rendering: -webkit-optimize-contrast;
+  image-rendering: high-quality;
+  filter: none;
+  opacity: 1;
+  transform: translateZ(0);
 }
 
 .auth-title {
@@ -190,20 +201,26 @@ html, body {
 .auth-tabs {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 4px;
-  padding: 4px;
-  background: var(--field-bg);
+  gap: 0;
+  padding: 0;
+  min-height: var(--auth-control-h);
+  height: var(--auth-control-h);
+  background: var(--bg-page);
   border-radius: 999px;
-  margin-bottom: 8px;
+  border: 1px solid var(--line-strong);
+  margin-bottom: var(--auth-space-tabs-after);
+  overflow: hidden;
 }
 
 .auth-tab {
   flex: 1;
-  padding: 10px 16px;
+  min-height: calc(var(--auth-control-h) - 2px);
+  height: calc(var(--auth-control-h) - 2px);
+  padding: 0 16px;
   border: none;
   background: transparent;
   color: var(--ink-soft);
-  font-size: 13px;
+  font-size: var(--auth-font-main);
   font-weight: 600;
   cursor: pointer;
   border-radius: 999px;
@@ -215,9 +232,19 @@ html, body {
 }
 
 .auth-tab.active {
-  background: linear-gradient(135deg, var(--teal-deep) 0%, var(--teal) 100%);
+  background: var(--ok);
   color: white;
-  box-shadow: 0 4px 12px rgba(20, 168, 154, 0.25);
+  box-shadow: 0 4px 12px rgba(20, 168, 154, 0.24);
+}
+
+.auth-tab.active-login {
+  background: var(--brand);
+  box-shadow: 0 4px 12px rgba(31, 58, 95, 0.28);
+}
+
+.auth-tab.active-activate {
+  background: var(--teal);
+  box-shadow: 0 4px 12px rgba(20, 168, 154, 0.24);
 }
 
 /* Headings */
@@ -260,24 +287,24 @@ label {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  margin-bottom: 10px;
-  font-size: 13px;
+  margin-bottom: 12px;
+  font-size: var(--auth-font-main);
 }
 
 .auth-card.activate-mode {
-  gap: 4px;
+  gap: 12px;
 }
 
 .auth-card.activate-mode label {
-  margin-bottom: 2px;
+  margin-bottom: 12px;
 }
 
 .auth-card.activate-mode > h3 {
-  margin-bottom: 2px;
+  margin-bottom: 6px;
 }
 
 .auth-card.activate-mode > p {
-  margin-bottom: 4px !important;
+  margin-bottom: 10px !important;
 }
 
 .auth-card.activate-mode > div {
@@ -286,7 +313,7 @@ label {
 }
 
 label span {
-  font-size: 10px;
+  font-size: var(--auth-font-label);
   font-weight: 700;
   color: var(--ink-muted);
   letter-spacing: 0.06em;
@@ -302,14 +329,14 @@ label > div {
 }
 
 .auth-field-help {
-  font-size: 10px;
+  font-size: var(--auth-font-label);
   color: var(--ink-soft);
   margin-top: 4px;
   line-height: 1.25;
 }
 
 .auth-section-label {
-  font-size: 10px;
+  font-size: var(--auth-font-label);
   color: var(--ink-muted);
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -326,7 +353,7 @@ label > div {
 }
 
 .pw-field-header span {
-  font-size: 10px;
+  font-size: var(--auth-font-label);
   font-weight: 700;
   color: var(--ink-muted);
   letter-spacing: 0.06em;
@@ -334,7 +361,7 @@ label > div {
 }
 
 .forgot-link {
-  font-size: 12px;
+  font-size: var(--auth-font-main);
   font-weight: 600;
   color: var(--accent);
   background: none;
@@ -361,14 +388,14 @@ select {
   padding: 8px 12px 8px 50px;
   border: 1px solid var(--line-strong);
   border-radius: 12px;
-  background: var(--field-bg);
+  background: var(--bg-page);
   color: var(--ink);
-  font-size: 12px;
+  font-size: var(--auth-font-main);
   line-height: 1.2;
   font-family: 'Manrope', inherit;
   font-weight: 400;
   transition: all 0.18s ease;
-  height: 36px;
+  height: var(--auth-control-h);
   text-indent: 0;
 }
 
@@ -386,7 +413,7 @@ select:focus {
   outline: none;
   border-color: var(--accent);
   background: var(--field-bg-focus);
-  box-shadow: 0 0 0 4px rgba(20, 168, 154, 0.18);
+  box-shadow: 0 0 0 4px rgba(1, 105, 204, 0.18);
 }
 
 /* Input icon wrapper */
@@ -422,7 +449,7 @@ select:focus {
 .pw-input-wrap input {
   position: relative;
   z-index: 1;
-  background: var(--field-bg) !important;
+  background: var(--bg-page) !important;
 }
 
 /* Ensure icon spacing applies even when input has no explicit type attribute */
@@ -449,8 +476,9 @@ label > div {
   right: 12px;
   top: 50%;
   transform: translateY(-50%);
-  background: none;
-  border: none;
+  background: color-mix(in srgb, var(--bg-page) 88%, var(--card) 12%);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
   color: var(--ink-soft);
   cursor: pointer;
   padding: 4px;
@@ -458,6 +486,7 @@ label > div {
   align-items: center;
   justify-content: center;
   transition: color 0.18s ease;
+  z-index: 4;
 }
 
 .pw-icon-btn:hover {
@@ -476,8 +505,8 @@ label > div {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 12px;
-  margin-bottom: 4px;
+  font-size: var(--auth-font-main);
+  margin-bottom: var(--auth-space-password-after);
   cursor: pointer;
 }
 
@@ -501,7 +530,7 @@ input[type="checkbox"] {
   border: none;
   border-radius: 12px;
   font-family: 'Manrope', inherit;
-  font-size: 13px;
+  font-size: var(--auth-font-main);
   font-weight: 600;
   cursor: pointer;
   transition: all 0.2s ease;
@@ -509,20 +538,22 @@ input[type="checkbox"] {
 
 .btn-primary {
   width: 100%;
-  background: linear-gradient(135deg, var(--navy) 0%, var(--teal-deep) 100%);
+  background: linear-gradient(90deg, var(--brand) 0%, var(--teal-deep) 100%);
+  border: 1px solid color-mix(in srgb, var(--teal-deep) 72%, #000000 28%);
   color: white;
   padding: 13px 16px;
-  min-height: 44px;
-  font-size: 14px;
+  min-height: var(--auth-control-h);
+  height: var(--auth-control-h);
+  font-size: var(--auth-font-main);
   font-weight: 700;
-  box-shadow: 0 12px 28px -14px rgba(31, 58, 95, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  box-shadow: 0 12px 28px -14px rgba(1, 105, 204, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.22);
   margin-bottom: 0;
 }
 
 .btn-primary:hover:not(:disabled) {
   transform: translateY(-1px);
   filter: brightness(1.06);
-  box-shadow: 0 16px 32px -12px rgba(20, 168, 154, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  box-shadow: 0 16px 32px -12px rgba(1, 105, 204, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.28);
 }
 
 .btn-primary:active:not(:disabled) {
@@ -535,23 +566,23 @@ input[type="checkbox"] {
 }
 
 .auth-submit {
-  margin-top: 2px;
+  margin-top: var(--auth-space-before-submit);
 }
 
 .theme-light .auth-welcome-title,
 .theme-light .auth-heading {
-  color: #1c2430 !important;
+  color: var(--ink) !important;
 }
 
 .theme-light .auth-welcome-subtitle,
 .theme-light .auth-activate-subtitle,
 .theme-light label span,
 .theme-light .remember-label {
-  color: #4f5f73 !important;
+  color: var(--ink-soft) !important;
 }
 
 .theme-light .forgot-link {
-  color: #0e8479 !important;
+  color: var(--accent-deep) !important;
 }
 
 .btn-ghost-link {
@@ -573,7 +604,7 @@ input[type="checkbox"] {
 
 /* Forgot password box */
 .auth-forgot-box {
-  background: rgba(20, 168, 154, 0.08);
+  background: rgba(1, 105, 204, 0.08);
   border: 1px solid var(--line-strong);
   border-radius: 12px;
   padding: 12px;
@@ -583,7 +614,7 @@ input[type="checkbox"] {
 }
 
 .theme-light .auth-forgot-box {
-  background: rgba(20, 168, 154, 0.04);
+  background: rgba(1, 105, 204, 0.04);
   border: 1px solid var(--line);
 }
 
@@ -594,7 +625,7 @@ input[type="checkbox"] {
 /* Messages */
 .error {
   background: rgba(226, 88, 93, 0.1);
-  color: #FF8A80;
+  color: #ffd7d9;
   padding: 11px 13px;
   border-radius: 10px;
   font-size: 12px;
@@ -604,16 +635,16 @@ input[type="checkbox"] {
 }
 
 .theme-light .error {
-  color: #E2585D;
+  color: #d1242f;
 }
 
 .lock-note {
-  background: rgba(20, 168, 154, 0.1);
+  background: rgba(1, 105, 204, 0.10);
   color: var(--accent-bright);
   padding: 11px 13px;
   border-radius: 10px;
   font-size: 12px;
-  border: 1px solid rgba(20, 168, 154, 0.25);
+  border: 1px solid rgba(1, 105, 204, 0.25);
   margin-bottom: 8px;
   line-height: 1.4;
 }
@@ -668,12 +699,131 @@ input[type="checkbox"] {
 .theme-light .auth-heading,
 .theme-light .auth-welcome-title,
 .theme-light .auth-title {
-  color: #1f2937;
+  color: var(--ink);
 }
 .theme-light .auth-welcome-subtitle,
 .theme-light .auth-activate-subtitle,
 .theme-light .auth-field-help,
 .theme-light label span {
-  color: #4b5563;
+  color: var(--ink-soft);
 }
 
+/* ============================================================
+   Compact Brand Overrides (Login/Activate)
+   ============================================================ */
+.login-container {
+  background: var(--bg-page);
+}
+
+.auth-card {
+  max-width: 460px;
+  padding: 18px 18px;
+  gap: 12px;
+  border-radius: 18px;
+  border: 1px solid var(--bg-card-edge);
+  background: var(--bg-card);
+}
+
+.auth-welcome-title,
+.auth-heading {
+  font-size: 14px;
+}
+
+.auth-welcome-subtitle,
+.auth-activate-subtitle,
+label span,
+.auth-field-help {
+  font-size: var(--auth-font-label);
+}
+
+input[type="text"],
+input[type="password"],
+input[type="email"],
+select {
+  height: var(--auth-control-h);
+  font-size: var(--auth-font-main);
+  border-radius: 10px;
+}
+
+.btn,
+.btn-primary {
+  min-height: var(--auth-control-h);
+  height: var(--auth-control-h);
+  font-size: 13px;
+  border-radius: 10px;
+  padding: 0 12px;
+  background: linear-gradient(90deg, var(--brand) 0%, var(--teal-deep) 100%);
+  border: 1px solid color-mix(in srgb, var(--teal-deep) 72%, #000000 28%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Force gradient action buttons on login/activate (override global button skins) */
+.login-container .btn-primary,
+.login-container .auth-submit {
+  background: linear-gradient(90deg, var(--brand) 0%, var(--teal-deep) 100%) !important;
+  border: 1px solid color-mix(in srgb, var(--teal-deep) 72%, #000000 28%) !important;
+  color: #ffffff !important;
+}
+
+.auth-tab {
+  min-height: var(--auth-control-h);
+  height: var(--auth-control-h);
+  padding: 0 12px;
+  font-size: var(--auth-font-main);
+}
+
+/* Enforce consistent control geometry and canvas backgrounds across all surfaces/tabs */
+.login-container .auth-tabs {
+  min-height: var(--auth-control-h) !important;
+  height: var(--auth-control-h) !important;
+}
+
+.login-container .auth-tab {
+  min-height: calc(var(--auth-control-h) - 2px) !important;
+  height: calc(var(--auth-control-h) - 2px) !important;
+  line-height: calc(var(--auth-control-h) - 2px) !important;
+}
+
+.login-container .input-wrapper input,
+.login-container .pw-input-wrap input,
+.login-container input[type="text"],
+.login-container input[type="password"],
+.login-container input[type="email"],
+.login-container select,
+.login-container .btn,
+.login-container .btn-primary {
+  min-height: var(--auth-control-h) !important;
+  height: var(--auth-control-h) !important;
+}
+
+.login-container input[type="text"],
+.login-container input[type="password"],
+.login-container input[type="email"],
+.login-container select {
+  font-size: var(--auth-font-main) !important;
+}
+
+.login-container .auth-tabs,
+.login-container .auth-tab:not(.active),
+.login-container .input-wrapper input,
+.login-container .pw-input-wrap input,
+.login-container input[type="text"],
+.login-container input[type="password"],
+.login-container input[type="email"],
+.login-container select {
+  background: var(--bg-page) !important;
+}
+
+.login-container.auth-surface-local .auth-card.activate-mode,
+.login-container.auth-surface-portal .auth-card.activate-mode {
+  gap: 12px !important;
+}
+
+.login-container .auth-submit {
+  font-size: 16px !important;
+  font-weight: 800 !important;
+  letter-spacing: 0.03em;
+  text-transform: none;
+}

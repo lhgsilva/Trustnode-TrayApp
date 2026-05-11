@@ -1,10 +1,14 @@
 /* Developer Portal surface-only styling.
-   Scope all rules with `.surface-portal` to avoid affecting local/client. */
+   Color tokens come from compact-tokens.css + Interface settings runtime overrides. */
 
-.surface-portal {
-  /* Reserved for portal-only overrides */
+.surface-portal .sidebar {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
-.surface-portal .app-header {
-  background: #141414;
+.surface-portal .portal-filter-block,
+.surface-portal .card,
+.surface-portal .control-plane-main .card {
+  background: var(--card);
+  border-color: var(--stroke);
 }

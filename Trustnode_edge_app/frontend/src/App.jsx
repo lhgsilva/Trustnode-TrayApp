@@ -118,7 +118,7 @@ function getUiStorageScope() {
 
 const UI_STORAGE_SCOPE = getUiStorageScope();
 const THEME_STORAGE_KEY = `trustnode_theme_${UI_STORAGE_SCOPE}`;
-const INTERFACE_THEME_PREFS_STORAGE_KEY = `trustnode_interface_theme_prefs_${UI_STORAGE_SCOPE}`;
+const INTERFACE_THEME_PREFS_STORAGE_KEY = `trustnode_interface_theme_prefs_v3_${UI_STORAGE_SCOPE}`;
 const CHART_PALETTE_STORAGE_KEY = `trustnode_chart_palette_${UI_STORAGE_SCOPE}`;
 const ACTIVE_PAGE_STORAGE_KEY = `trustnode_active_page_${UI_STORAGE_SCOPE}`;
 const TAG_MONITOR_CHART_TYPE_STORAGE_KEY = `trustnode_tag_monitor_chart_type_${UI_STORAGE_SCOPE}`;
@@ -236,52 +236,105 @@ const DEFAULT_DISPLAY_TIMEZONE = (() => {
 const DEFAULT_DISPLAY_TIMESTAMP_FORMAT = "dd/MM/yyyy HH:mm:ss";
 const DEFAULT_INTERFACE_THEME_PREFS = {
   light: {
-    bg: "#f3f3f3",
-    card: "#eceff3",
-    stroke: "#c5ccd6",
-    text: "#1f2328",
-    muted: "#5f6b7a",
-    table_row: "#e5eaf0",
-    brand: "#007acc",
-    ok: "#2ea043",
-    danger: "#d1242f",
-    header: "#2d2d30",
-    header_text: "#d4d4d4",
-    sidebar: "#252526",
-    sidebar_text: "#d4d4d4",
-    nav_active_bg: "#094771"
+    bg: "#eceff3",
+    card: "#ffffff",
+    card_2: "#f6f8fa",
+    stroke: "#e1e6ec",
+    line: "#e1e6ec",
+    surface: "#eceff3",
+    surface_elev: "#ffffff",
+    text: "#0e1116",
+    muted: "#4a5566",
+    soft: "#6e7989",
+    table_row: "#f6f8fa",
+    error_bg: "#fee2e2",
+    error_text: "#7f1d1d",
+    error_border: "#fecaca",
+    brand: "#1f3a5f",
+    brand_strong: "#0e8479",
+    teal: "#14a89a",
+    ok: "#0ea58a",
+    danger: "#c62833",
+    header: "#eceff3",
+    header_surface: "#eceff3",
+    header_border: "#d3dbe3",
+    header_surface_border: "#d3dbe3",
+    header_text: "#0e1116",
+    sidebar: "#ffffff",
+    sidebar_soft: "#f6f8fa",
+    sidebar_border: "#d7dce5",
+    sidebar_text: "#0e1116",
+    sidebar_title: "#4a5566",
+    nav_active_bg: "#14a89a",
+    nav_active_text: "#ffffff"
   },
   dark: {
-    bg: "#1e1e1e",
-    card: "#252526",
-    stroke: "#3c3c3c",
-    text: "#d4d4d4",
-    muted: "#9da0a6",
-    table_row: "#2a2d2e",
-    brand: "#007acc",
-    ok: "#2ea043",
-    danger: "#d1242f",
-    header: "#2d2d30",
-    header_text: "#d4d4d4",
-    sidebar: "#252526",
-    sidebar_text: "#d4d4d4",
-    nav_active_bg: "#094771"
+    bg: "#111111",
+    card: "#171717",
+    card_2: "#1f1f1f",
+    stroke: "#2a2a2a",
+    line: "#2a2a2a",
+    surface: "#111111",
+    surface_elev: "#171717",
+    text: "#f2f4f7",
+    muted: "#b3b3b3",
+    soft: "#8a98ab",
+    table_row: "#1f1f1f",
+    error_bg: "#5a1d20",
+    error_text: "#ffd7d9",
+    error_border: "#7f2d33",
+    brand: "#1f3a5f",
+    brand_strong: "#0e8479",
+    teal: "#14a89a",
+    ok: "#0ea58a",
+    danger: "#c62833",
+    header: "#111111",
+    header_surface: "#111111",
+    header_border: "#2a2a2a",
+    header_surface_border: "#2a2a2a",
+    header_text: "#f2f4f7",
+    sidebar: "#171717",
+    sidebar_soft: "#171717",
+    sidebar_border: "#2a2a2a",
+    sidebar_text: "#f2f4f7",
+    sidebar_title: "#8a98ab",
+    nav_active_bg: "#14a89a",
+    nav_active_text: "#f2f4f7"
   }
 };
+const FORCE_CODEX_THEME = true;
 const INTERFACE_THEME_TOKEN_FIELDS = [
   { key: "bg", label: "Background" },
   { key: "card", label: "Card" },
+  { key: "card_2", label: "Nested Card" },
   { key: "stroke", label: "Border" },
+  { key: "line", label: "Hairline" },
+  { key: "surface", label: "Surface Base" },
+  { key: "surface_elev", label: "Surface Elevated" },
   { key: "text", label: "Text" },
   { key: "muted", label: "Muted Text" },
+  { key: "soft", label: "Soft Text" },
+  { key: "table_row", label: "Table Row" },
+  { key: "error_bg", label: "Error Background" },
+  { key: "error_text", label: "Error Text" },
+  { key: "error_border", label: "Error Border" },
   { key: "brand", label: "Primary" },
+  { key: "brand_strong", label: "Primary Deep" },
+  { key: "teal", label: "Teal Accent" },
   { key: "ok", label: "Success" },
   { key: "danger", label: "Danger" },
   { key: "header", label: "Header Background" },
+  { key: "header_surface", label: "Header Surface" },
+  { key: "header_border", label: "Header Border" },
+  { key: "header_surface_border", label: "Header Surface Border" },
   { key: "header_text", label: "Header Text" },
   { key: "sidebar", label: "Sidebar Background" },
+  { key: "sidebar_soft", label: "Sidebar Hover" },
+  { key: "sidebar_border", label: "Sidebar Border" },
   { key: "sidebar_text", label: "Sidebar Text" },
-  { key: "nav_active_bg", label: "Nav Active" }
+  { key: "sidebar_title", label: "Sidebar Title" },
+  { key: "nav_active_bg", label: "Nav Active" },
+  { key: "nav_active_text", label: "Nav Active Text" }
 ];
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const GATEWAY_STATUS_POLL_MS_LOCAL = 2000;
@@ -1222,6 +1275,40 @@ function BellIcon() {
   );
 }
 
+function WindowMinIcon() {
+  return (
+    <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden>
+      <path d="M2 8h8" />
+    </svg>
+  );
+}
+
+function WindowMaxIcon() {
+  return (
+    <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.2" aria-hidden>
+      <rect x="2.2" y="2.2" width="7.6" height="7.6" rx="0.2" />
+    </svg>
+  );
+}
+
+function WindowRestoreIcon() {
+  return (
+    <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.2" aria-hidden>
+      <path d="M4 2.5h5.5V8" />
+      <rect x="2.5" y="4" width="5.5" height="5.5" rx="0.2" />
+    </svg>
+  );
+}
+
+function WindowCloseIcon() {
+  return (
+    <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden>
+      <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
+    </svg>
+  );
+}
+
+
 function EyeIcon({ open }) {
   if (open) {
     return (
@@ -1662,6 +1749,7 @@ function AppShell() {
     portal: true
   });
   const [theme, setTheme] = useState("light");
+  const [isWindowMaximized, setIsWindowMaximized] = useState(false);
   const [interfaceThemePrefs, setInterfaceThemePrefs] = useState(() => loadInterfaceThemePrefs());
   const [chartPalette, setChartPalette] = useState(() => loadChartPalette());
   const seriesColors = useMemo(
@@ -2536,7 +2624,7 @@ function AppShell() {
       isHostedWebClient
         ? appSettings.interface_theme_prefs_cloud || appSettings.interface_theme_prefs
         : appSettings.interface_theme_prefs_local || appSettings.interface_theme_prefs;
-    if (scopedThemePrefs && typeof scopedThemePrefs === "object") {
+    if (!FORCE_CODEX_THEME && scopedThemePrefs && typeof scopedThemePrefs === "object") {
       const merged = {
         light: { ...DEFAULT_INTERFACE_THEME_PREFS.light },
         dark: { ...DEFAULT_INTERFACE_THEME_PREFS.dark }
@@ -2550,6 +2638,11 @@ function AppShell() {
         }
       }
       setInterfaceThemePrefs(merged);
+    } else if (FORCE_CODEX_THEME) {
+      setInterfaceThemePrefs({
+        light: { ...DEFAULT_INTERFACE_THEME_PREFS.light },
+        dark: { ...DEFAULT_INTERFACE_THEME_PREFS.dark }
+      });
     }
     const scopedPalette =
       isHostedWebClient
@@ -2825,9 +2918,29 @@ function AppShell() {
     const modePrefs = interfaceThemePrefs?.[activeMode] || {};
     for (const [token, fallback] of Object.entries(DEFAULT_INTERFACE_THEME_PREFS[activeMode])) {
       const value = normalizeHexColor(modePrefs?.[token], fallback);
-      document.documentElement.style.setProperty(`--${token}`, value);
+      const cssToken = String(token).replace(/_/g, "-");
+      document.documentElement.style.setProperty(`--${cssToken}`, value);
     }
   }, [theme, interfaceThemePrefs]);
+
+  useEffect(() => {
+    if (!window?.windowControls?.isMaximized) return undefined;
+    let stopped = false;
+    const refresh = async () => {
+      try {
+        const maxed = await window.windowControls.isMaximized();
+        if (!stopped) setIsWindowMaximized(Boolean(maxed));
+      } catch {
+        // ignore
+      }
+    };
+    refresh();
+    const timer = setInterval(refresh, 500);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -7458,8 +7571,45 @@ function AppShell() {
     }
   };
 
+  const minimizeWindow = () => {
+    try {
+      window?.windowControls?.minimize?.();
+    } catch {}
+  };
+
+  const maximizeRestoreWindow = async () => {
+    try {
+      window?.windowControls?.maximize?.();
+      const maxed = await window?.windowControls?.isMaximized?.();
+      setIsWindowMaximized(Boolean(maxed));
+    } catch {}
+  };
+
+  const closeWindow = () => {
+    try {
+      window?.windowControls?.close?.();
+    } catch {}
+  };
+  const stopTopBarDrag = (event) => {
+    event.stopPropagation();
+  };
+
+  const hasDesktopWindowControls =
+    typeof window !== "undefined" &&
+    !!window.windowControls &&
+    typeof window.windowControls.minimize === "function";
+  const hasDesktopBackendOverrideForHeader =
+    typeof window !== "undefined" &&
+    Boolean(new URLSearchParams(window.location.search).get("backendUrl"));
+  const useDesktopFramelessHeader = isElectronRuntime || hasDesktopWindowControls;
   const toggleSection = (sectionId) => {
-    setExpandedSections((prev) => ({ ...prev, [sectionId]: !prev[sectionId] }));
+    setExpandedSections((prev) => {
+      const nextOpen = !prev[sectionId];
+      const next = {};
+      for (const key of Object.keys(prev)) next[key] = false;
+      next[sectionId] = nextOpen;
+      return next;
+    });
   };
 
   const handleNavClick = (page) => {
@@ -11728,31 +11878,63 @@ function AppShell() {
 
   if (!currentUser) {
     return (
-      <Login
-        currentUser={currentUser}
-        isHostedWebClient={isHostedWebClient}
-        edgeLinked={edgeLinked}
-        theme={theme}
-        toggleTheme={toggleTheme}
-        onLoginSuccess={setCurrentUser}
-      />
+      <div className={`shell surface-${isHostedWebClient ? "client" : "local"} ${useDesktopFramelessHeader ? "desktop-frameless-shell desktop-auth-view" : ""}`}>
+        {useDesktopFramelessHeader ? (
+          <div className="window-bar-strip">
+            <div className="window-bar-center-spacer" />
+            <div className="window-native-actions" onMouseDown={stopTopBarDrag}>
+              <button type="button" className="window-native-btn" onMouseDown={stopTopBarDrag} onClick={minimizeWindow} title="Minimize" aria-label="Minimize window"><WindowMinIcon /></button>
+              <button type="button" className="window-native-btn" onMouseDown={stopTopBarDrag} onClick={maximizeRestoreWindow} title={isWindowMaximized ? "Restore" : "Maximize"} aria-label={isWindowMaximized ? "Restore window" : "Maximize window"}>
+                {isWindowMaximized ? <WindowRestoreIcon /> : <WindowMaxIcon />}
+              </button>
+              <button type="button" className="window-native-btn window-native-btn-close" onMouseDown={stopTopBarDrag} onClick={closeWindow} title="Close" aria-label="Close window"><WindowCloseIcon /></button>
+            </div>
+          </div>
+        ) : null}
+        <div className="desktop-auth-content">
+          <Login
+            currentUser={currentUser}
+            isHostedWebClient={isHostedWebClient}
+            edgeLinked={edgeLinked}
+            theme={theme}
+            toggleTheme={toggleTheme}
+            onLoginSuccess={setCurrentUser}
+          />
+        </div>
+      </div>
     );
   }
 
   if (!config) {
     return (
-      <div className="loading">
-        <div className="loading-card">
-          <img src={logoSrc} alt="Trustnode" className="loading-logo" onError={handleLogoLoadError} />
-          <div className="loading-title">
-            {bootState === "waiting_backend"
-              ? "Waiting for backend service..."
-              : "Loading Trustnode Edge..."}
+      <div className={`shell surface-${isHostedWebClient ? "client" : "local"} ${useDesktopFramelessHeader ? "desktop-frameless-shell desktop-auth-view" : ""}`}>
+        {useDesktopFramelessHeader ? (
+          <div className="window-bar-strip">
+            <div className="window-bar-center-spacer" />
+            <div className="window-native-actions" onMouseDown={stopTopBarDrag}>
+              <button type="button" className="window-native-btn" onMouseDown={stopTopBarDrag} onClick={minimizeWindow} title="Minimize" aria-label="Minimize window"><WindowMinIcon /></button>
+              <button type="button" className="window-native-btn" onMouseDown={stopTopBarDrag} onClick={maximizeRestoreWindow} title={isWindowMaximized ? "Restore" : "Maximize"} aria-label={isWindowMaximized ? "Restore window" : "Maximize window"}>
+                {isWindowMaximized ? <WindowRestoreIcon /> : <WindowMaxIcon />}
+              </button>
+              <button type="button" className="window-native-btn window-native-btn-close" onMouseDown={stopTopBarDrag} onClick={closeWindow} title="Close" aria-label="Close window"><WindowCloseIcon /></button>
+            </div>
           </div>
-          <div className="loading-progress">
-            <div className="loading-progress-bar" />
+        ) : null}
+        <div className="desktop-auth-content">
+          <div className="loading">
+            <div className="loading-card">
+              <img src={logoSrc} alt="Trustnode" className="loading-logo" onError={handleLogoLoadError} />
+              <div className="loading-title">
+                {bootState === "waiting_backend"
+                  ? "Waiting for backend service..."
+                  : "Loading Trustnode Edge..."}
+              </div>
+              <div className="loading-progress">
+                <div className="loading-progress-bar" />
+              </div>
+              {error ? <div className="loading-error">{error}</div> : null}
+            </div>
           </div>
-          {error ? <div className="loading-error">{error}</div> : null}
         </div>
       </div>
     );
@@ -11762,18 +11944,34 @@ function AppShell() {
   const appSurface = isPortalOnly ? "portal" : (isHostedWebClient ? "client" : "local");
 
   return (
-    <div className={`shell surface-${appSurface}`}>
-      <header className={`app-header ${isPortalOnly ? "portal-header" : ""}`}>
+    <div className={`shell surface-${appSurface} ${useDesktopFramelessHeader ? "desktop-frameless-shell with-window-bar" : ""}`}>
+      {useDesktopFramelessHeader ? (
+        <div className="window-bar-strip">
+          <div className="window-bar-left-controls" onMouseDown={stopTopBarDrag}>
+            <button
+              type="button"
+              className="window-bar-menu-btn"
+              onMouseDown={stopTopBarDrag}
+              onClick={() => setSidebarCollapsed((v) => !v)}
+              aria-label="Toggle navigation"
+            >
+              <HamburgerIcon />
+            </button>
+          </div>
+          <div className="window-bar-center-spacer" />
+          <div className="window-native-actions" onMouseDown={stopTopBarDrag}>
+            <button type="button" className="window-native-btn" onMouseDown={stopTopBarDrag} onClick={minimizeWindow} title="Minimize" aria-label="Minimize window"><WindowMinIcon /></button>
+            <button type="button" className="window-native-btn" onMouseDown={stopTopBarDrag} onClick={maximizeRestoreWindow} title={isWindowMaximized ? "Restore" : "Maximize"} aria-label={isWindowMaximized ? "Restore window" : "Maximize window"}>
+              {isWindowMaximized ? <WindowRestoreIcon /> : <WindowMaxIcon />}
+            </button>
+            <button type="button" className="window-native-btn window-native-btn-close" onMouseDown={stopTopBarDrag} onClick={closeWindow} title="Close" aria-label="Close window"><WindowCloseIcon /></button>
+          </div>
+        </div>
+      ) : null}
+      <header className={`app-header ${isPortalOnly ? "portal-header" : ""} ${useDesktopFramelessHeader ? "desktop-titlebar" : ""}`}>
         <div className="header-left">
-          <button className="nav-toggle-btn" onClick={() => setSidebarCollapsed((v) => !v)} aria-label="Toggle navigation">
-            <HamburgerIcon />
-          </button>
           <div className="brand">
-            <img src={logoSrc} alt="Trustnode" className="brand-logo" onError={handleLogoLoadError} />
-            <div>
-              <div className="brand-title">Trustnode Edge</div>
-              <div className="brand-subtitle">Industrial Data Gateway</div>
-            </div>
+            <img src="/assets/trustenode-004.png" alt="Trustnode Edge" className="brand-full-logo" onError={handleLogoLoadError} />
           </div>
         </div>
         <div className="header-center">
@@ -17823,6 +18021,12 @@ function FolderIcon() {
 }
 
 function loadInterfaceThemePrefs() {
+  if (FORCE_CODEX_THEME) {
+    return {
+      light: { ...DEFAULT_INTERFACE_THEME_PREFS.light },
+      dark: { ...DEFAULT_INTERFACE_THEME_PREFS.dark }
+    };
+  }
   try {
     const raw = localStorage.getItem(INTERFACE_THEME_PREFS_STORAGE_KEY);
     const parsed = raw ? JSON.parse(raw) : null;

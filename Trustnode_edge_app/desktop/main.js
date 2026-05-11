@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Tray, nativeImage, dialog } = require("electron");
+const { app, BrowserWindow, Menu, Tray, nativeImage, dialog, ipcMain } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
@@ -85,6 +85,40 @@ const BACKEND_HEALTH_PATH = "/api/health";
 const UI_SOURCE_FILE = "ui-source.json";
 let currentBackendHost = BACKEND_HOST;
 let currentBackendPort = BACKEND_PORT;
+let currentOverlayTheme = "dark";
+
+function resolveOverlayPalette(mode) {
+  const m = String(mode || "").toLowerCase() === "light" ? "light" : "dark";
+  if (m === "light") {
+    return { mode: m, color: "#fcfcfc", symbolColor: "#111111", height: 32 };
+  }
+  return { mode: m, color: "#111111", symbolColor: "#fcfcfc", height: 32 };
+}
+
+function applyOverlayTheme(modeOrPalette) {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const palette =
+    modeOrPalette && typeof modeOrPalette === "object" && modeOrPalette.color
+      ? {
+          mode: String(modeOrPalette.mode || currentOverlayTheme || "dark"),
+          color: String(modeOrPalette.color),
+          symbolColor: String(modeOrPalette.symbolColor || "#fcfcfc"),
+          height: Number.isFinite(Number(modeOrPalette.height)) ? Number(modeOrPalette.height) : 32
+        }
+      : resolveOverlayPalette(modeOrPalette || currentOverlayTheme);
+  currentOverlayTheme = palette.mode === "light" ? "light" : "dark";
+  try {
+    mainWindow.setTitleBarOverlay({
+      color: palette.color,
+      symbolColor: palette.symbolColor,
+      height: Math.max(28, Math.min(40, Number(palette.height) || 32))
+    });
+    return true;
+  } catch (err) {
+    logBackend(`Failed to apply overlay theme: ${String(err)}`);
+    return false;
+  }
+}
 
 function logBackend(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
@@ -456,16 +490,23 @@ function createWindow() {
     height: 860,
     minWidth: 1024,
     minHeight: 680,
+    frame: false,
+    transparent: false,
+    backgroundColor: "#101216",
+    titleBarStyle: "hidden",
+    titleBarOverlay: false,
     icon: windowIconPath,
-    autoHideMenuBar: true,
+    autoHideMenuBar: false,
     show: false,
     webPreferences: {
       nodeIntegration: false,
-      contextIsolation: true
+      contextIsolation: true,
+      sandbox: false,
+      preload: path.join(__dirname, "preload.js")
     }
   });
 
-  mainWindow.setMenuBarVisibility(false);
+  mainWindow.setMenuBarVisibility(true);
 
   const backendUrl = `http://${currentBackendHost}:${currentBackendPort}`;
   const uiConfig = getUiSourceConfig();
@@ -518,7 +559,7 @@ function createWindow() {
   }
 
   mainWindow.once("ready-to-show", () => {
-    mainWindow.maximize();
+    applyOverlayTheme(currentOverlayTheme);
     mainWindow.show();
   });
 
@@ -542,6 +583,37 @@ function createWindow() {
         mainWindow.hide();
       }
     }
+  });
+
+  ipcMain.removeAllListeners("window:minimize");
+  ipcMain.removeAllListeners("window:maximize");
+  ipcMain.removeAllListeners("window:close");
+  ipcMain.removeAllListeners("window:is-maximized");
+  ipcMain.removeAllListeners("window:sync-titlebar-theme");
+
+  ipcMain.on("window:minimize", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.minimize();
+  });
+  ipcMain.on("window:maximize", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize();
+    } else {
+      mainWindow.maximize();
+    }
+  });
+  ipcMain.on("window:close", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.close();
+  });
+  ipcMain.handle("window:is-maximized", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    return mainWindow.isMaximized();
+  });
+  ipcMain.handle("window:sync-titlebar-theme", (_, payload = {}) => {
+    const mode = String(payload?.mode || currentOverlayTheme || "dark").toLowerCase() === "light" ? "light" : "dark";
+    return applyOverlayTheme(resolveOverlayPalette(mode));
   });
 }
 
@@ -571,10 +643,18 @@ function monitorBackendStartup() {
       }
       const logPath = path.join(app.getPath("userData"), "backend.log");
       const details = backendLogs.slice(-30).join("\n");
+      // Keep full diagnostics only in local log file; never expose traceback to end users.
+      logBackend(
+        `Backend unavailable after startup grace period (host=${currentBackendHost}:${currentBackendPort}, exitCode=${backendExitCode ?? "n/a"}). Recent logs:\n${details}`
+      );
       mainWindow.loadURL(
         "data:text/html;charset=utf-8," +
           encodeURIComponent(
-            `<html><body style="font-family:Segoe UI;padding:24px"><h2>Backend unavailable</h2><p>Host: ${currentBackendHost}:${currentBackendPort}</p><p>Exit code: ${backendExitCode ?? "n/a"}</p><p>Log file: ${logPath}</p><pre style="white-space:pre-wrap;background:#f3f4f6;padding:12px;border-radius:8px">${details}</pre></body></html>`
+            `<html><body style="font-family:Segoe UI;padding:24px;color:#111827;background:#fff">
+              <h2>Service temporarily unavailable</h2>
+              <p>TrustNode service is restarting. Please wait a few seconds and try again.</p>
+              <p>If this persists, restart the TrustNode application.</p>
+            </body></html>`
           )
       );
     });

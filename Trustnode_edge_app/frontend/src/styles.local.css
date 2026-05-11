@@ -1,6 +1,7 @@
 /* Local Edge App surface-only styling.
-   Scope all rules with `.surface-local` to avoid affecting portal/client. */
+   Color tokens come from compact-tokens.css + Interface settings runtime overrides. */
 
-.surface-local {
-  /* Reserved for local-only overrides */
+.surface-local .sidebar {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
