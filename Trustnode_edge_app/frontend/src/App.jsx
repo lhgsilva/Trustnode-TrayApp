@@ -1,6 +1,8 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Login } from "./components/Login/Login";
 import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
+import { ReportTemplateDesigner } from "./components/Reports/ReportTemplateDesigner";
+import { ScheduledReportsManager } from "./components/Reports/ScheduledReportsManager";
 import {
   getHealth,
   getBackendTarget,
@@ -25,6 +27,8 @@ import {
   getAppStoreLive,
   getAppStoreHistorian,
   getAppStoreHistorianRange,
+  getAppStoreHistorianStats,
+  getAppStoreHistorianRuleStats,
   getAppStoreLogs,
   getAppStoreInspector,
   getEdgeIngestDiagnostics,
@@ -97,8 +101,9 @@ import {
   issuePublicPasswordReset,
   applyPublicPasswordReset,
   provisionControlPlaneCustomerBundle,
+  pushSchedulerEmailSettings,
 } from "./api";
-import { Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { Area, AreaChart, Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 function getUiStorageScope() {
   try {
@@ -172,10 +177,11 @@ const NAV_SECTIONS = [
   },
   {
     id: "collection_monitoring",
-    title: "Collection and Monitoring",
+    title: "Gateway and Edge Control",
     items: ["Gateway Configuration", "Devices", "Tags", "Triggers and Limits"]
   },
-  { id: "notifications", title: "Notifications", items: ["Alarms", "Reporting", "Scheduled Reports"] },
+  { id: "reporting", title: "Reporting", items: ["Reports", "Scheduled Reports"] },
+  { id: "notifications", title: "Notifications", items: ["Alarms", "Email and Notifications"] },
   { id: "data_log", title: "Data History", items: ["Historian", "Logs"] },
   {
     id: "settings",
@@ -185,7 +191,7 @@ const NAV_SECTIONS = [
   {
     id: "administration",
     title: "Settings",
-    items: ["Edge", "Interface", "Users and Access Control", "Control Plane", "Email and Notifications"]
+    items: ["Edge", "Interface", "Users and Access Control"]
   }
 ];
 
@@ -200,6 +206,7 @@ function pageId(label) {
   if (label.toLowerCase() === "database overview") return "database";
   if (label.toLowerCase() === "historian") return "historian";
   if (label.toLowerCase() === "logs") return "logs";
+  if (label.toLowerCase() === "reports") return "reporting";
   return label.toLowerCase().replace(/\s+/g, "_");
 }
 
@@ -213,6 +220,7 @@ function pageTitle(page) {
   if (page === "website_and_env") return "Website and Environment";
   if (page === "email_and_notifications") return "Email and Notifications";
   if (page === "scheduled_reports") return "Scheduled Reports";
+  if (page === "reports") return "Reports";
   if (page === "power_overview") return "Power Overview";
   if (page === "power_configuration") return "Power Configuration";
   if (page === "edge") return "Edge";
@@ -787,9 +795,10 @@ function buildSmoothedSeries(points, renderNowMs, periodMs = 1000, enableSynthet
   return out;
 }
 
-function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000) {
+function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000, options = {}) {
   const incoming = Array.isArray(incomingRows) ? incomingRows : [];
   const prev = Array.isArray(prevRows) ? prevRows : [];
+  const allowBackfill = Boolean(options && options.allowBackfill);
   if (!incoming.length) return prev;
   const newestPrevByKey = new Map();
   for (const r of prev) {
@@ -802,14 +811,16 @@ function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000) {
       }
     }
   }
-  const filteredIncoming = incoming.filter((r) => {
-    const k = `${String(r?.gateway_id || "")}::${String(r?.tag || r?.tag_name || "")}`;
-    if (k.endsWith("::")) return true;
-    const ms = rowTsMs(r);
-    if (!Number.isFinite(ms)) return true;
-    const newestPrev = Number(newestPrevByKey.get(k) || -1);
-    return newestPrev < 0 || ms > newestPrev;
-  });
+  const filteredIncoming = allowBackfill
+    ? incoming
+    : incoming.filter((r) => {
+        const k = `${String(r?.gateway_id || "")}::${String(r?.tag || r?.tag_name || "")}`;
+        if (k.endsWith("::")) return true;
+        const ms = rowTsMs(r);
+        if (!Number.isFinite(ms)) return true;
+        const newestPrev = Number(newestPrevByKey.get(k) || -1);
+        return newestPrev < 0 || ms > newestPrev;
+      });
   if (!filteredIncoming.length) return prev;
   const newestIncomingMs = filteredIncoming.reduce((max, r) => {
     const ms = rowTsMs(r);
@@ -819,7 +830,7 @@ function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000) {
     const ms = rowTsMs(r);
     return Number.isFinite(ms) && ms > max ? ms : max;
   }, -1);
-  if (newestPrevMs > 0 && newestIncomingMs > 0 && newestIncomingMs < newestPrevMs - 1500) {
+  if (!allowBackfill && newestPrevMs > 0 && newestIncomingMs > 0 && newestIncomingMs < newestPrevMs - 1500) {
     return prev;
   }
   const merged = [];
@@ -848,7 +859,7 @@ function mergeHistorianRowsStable(incomingRows, prevRows, limit = 5000) {
   return merged.slice(0, limit);
 }
 
-function buildChronologicalSeries(rows, maxPoints = 120, minStepMs = 0) {
+function buildChronologicalSeries(rows, maxPoints = 120, minStepMs = 0, collapseBurst = false) {
   const src = Array.isArray(rows) ? rows : [];
   if (!src.length) return [];
   const items = src
@@ -866,11 +877,12 @@ function buildChronologicalSeries(rows, maxPoints = 120, minStepMs = 0) {
 
   const deduped = [];
   const minStep = Math.max(0, Number(minStepMs || 0));
+  const collapseWindowMs = collapseBurst ? Math.floor(minStep * 0.9) : 0;
   for (const item of items) {
     const prev = deduped[deduped.length - 1];
     if (prev && prev.ts_ms === item.ts_ms) {
       deduped[deduped.length - 1] = item;
-    } else if (prev && minStep > 0 && item.ts_ms - prev.ts_ms < Math.floor(minStep * 0.9)) {
+    } else if (prev && collapseWindowMs > 0 && item.ts_ms - prev.ts_ms < collapseWindowMs) {
       // Keep only one point per gateway interval bucket to avoid bursty cloud redraws.
       deduped[deduped.length - 1] = item;
     } else {
@@ -1143,6 +1155,8 @@ function normalizeReportFiltersShape(value, fallback = null) {
     to: String(src.to ?? base.to ?? ""),
     batch: String(src.batch ?? base.batch ?? ""),
     max_rows: Math.max(200, Number(src.max_rows ?? base.max_rows ?? 3000) || 3000),
+    aggregation_interval: String(src.aggregation_interval ?? base.aggregation_interval ?? "raw"),
+    aggregation_method: String(src.aggregation_method ?? base.aggregation_method ?? "none"),
     selected_gateway_ids: toStringArray(src.selected_gateway_ids ?? src.gatewayId ?? base.selected_gateway_ids),
     selected_tags: toStringArray(src.selected_tags ?? src.tag ?? base.selected_tags),
     tag_axes: toObjectMap(src.tag_axes ?? base.tag_axes),
@@ -1350,6 +1364,15 @@ function BellIcon() {
   );
 }
 
+function ReloadIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+      <polyline points="21 3 21 9 15 9" />
+    </svg>
+  );
+}
+
 function WindowMinIcon() {
   return (
     <svg viewBox="0 0 12 12" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" aria-hidden>
@@ -1523,9 +1546,10 @@ const PERMISSION_LABELS = {
 
 const PERMISSION_GROUPS = [
   { title: "Client Test Modules", items: ["dashboard", "power_overview", "historian", "client_module_alarms", "client_module_reporting", "client_module_interface"] },
-  { title: "Collection and Monitoring", items: ["devices", "tags", "triggers_and_limits", "gateway_configuration"] },
-  { title: "Operations", items: ["gateway_runtime_control", "alarms", "reporting", "scheduled_reports", "data_log"] },
-  { title: "Administration", items: ["interface", "database", "backup_and_retention", "control_plane", "email_and_notifications", "users_and_access_control"] },
+  { title: "Gateway and Edge Control", items: ["devices", "tags", "triggers_and_limits", "gateway_configuration", "gateway_runtime_control"] },
+  { title: "Reporting", items: ["reporting", "scheduled_reports"] },
+  { title: "Notifications", items: ["alarms", "email_and_notifications"] },
+  { title: "Administration", items: ["interface", "database", "backup_and_retention", "control_plane", "users_and_access_control", "data_log"] },
 ];
 
 const CLIENT_MODULE_DEFS = [
@@ -1568,6 +1592,17 @@ function userHasModuleForPage(user, page) {
   const modules = Array.isArray(user?.modules) ? user.modules : [];
   if (!modules.length) return true;
   return modules.includes(required);
+}
+
+function normalizeLicenseModuleKeys(modules) {
+  if (!Array.isArray(modules)) return [];
+  const keys = new Set();
+  for (const mod of modules) {
+    const key = String(mod?.module_key || mod?.key || "").trim().toLowerCase();
+    const enabled = mod?.enabled === undefined ? true : Boolean(mod?.enabled);
+    if (key && enabled) keys.add(key);
+  }
+  return Array.from(keys);
 }
 
 function parseForcedClientModules() {
@@ -1794,6 +1829,7 @@ function AppShell() {
   };
   const [status, setStatus] = useState(null);
   const [gatewayRuntimeStatuses, setGatewayRuntimeStatuses] = useState({});
+  const [gatewayRuntimeTransitions, setGatewayRuntimeTransitions] = useState({});
   const [config, setConfig] = useState(null);
   const [error, setError] = useState("");
   const [readings, setReadings] = useState([]);
@@ -1814,11 +1850,25 @@ function AppShell() {
   const [edgeLinkState, setEdgeLinkState] = useState({ state: "unknown", message: "Not checked" });
   const [endpointVersion, setEndpointVersion] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
-  const [activePage, setActivePage] = useState("dashboard");
+  const [activePage, setActivePage] = useState(() => {
+    try {
+      const saved = String(localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY) || "").trim().toLowerCase();
+      // "edge" is almost always the result of the license-guard auto-routing
+      // a previous session there — not a page the user wanted to land on at
+      // boot. Default to the dashboard instead; the guard will re-route them
+      // if the license is still invalid.
+      if (!saved || saved === "edge") return "dashboard";
+      return saved;
+    } catch {
+      return "dashboard";
+    }
+  });
+  const pageBootstrapGuardRef = useRef(true);
   const [expandedSections, setExpandedSections] = useState({
     overview: false,
     power_management: false,
     collection_monitoring: false,
+    reporting: false,
     notifications: false,
     data_log: false,
     settings: false,
@@ -2024,6 +2074,15 @@ function AppShell() {
   const [edgeProfileSaveResult, setEdgeProfileSaveResult] = useState("");
   const [edgeLicenseSnapshot, setEdgeLicenseSnapshot] = useState(null);
   const [edgeLicenseBusy, setEdgeLicenseBusy] = useState(false);
+  const [licenseGuardBlocked, setLicenseGuardBlocked] = useState(false);
+  const [licenseGuardMessage, setLicenseGuardMessage] = useState("");
+  const [licenseGuardLastCheckedUtc, setLicenseGuardLastCheckedUtc] = useState("");
+  const [licenseGuardShowActivation, setLicenseGuardShowActivation] = useState(false);
+  const [licenseGuardDismissed, setLicenseGuardDismissed] = useState(false);
+  const [licenseBannerHidden, setLicenseBannerHidden] = useState(false);
+  const [edgeActivationCodeInput, setEdgeActivationCodeInput] = useState("");
+  const [edgeActivationBusy, setEdgeActivationBusy] = useState(false);
+  const [edgeActivationResult, setEdgeActivationResult] = useState("");
   const [cloudSupabaseMode, setCloudSupabaseMode] = useState("auto");
   const [cloudSupabaseHasIpv4AddOn, setCloudSupabaseHasIpv4AddOn] = useState(true);
   const [cloudSupabaseApplyResult, setCloudSupabaseApplyResult] = useState("");
@@ -2490,7 +2549,10 @@ function AppShell() {
   const devicesRef = useRef([]);
   const dbConnectionsRef = useRef([]);
   const gatewayConfigsRef = useRef([]);
+  const dashboardHistorySeedRef = useRef(false);
   const gatewayRuntimeStatusesRef = useRef({});
+  const gatewayRuntimePrevRef = useRef({});
+  const gatewayRuntimeTransitionsRef = useRef({});
   const collectionTriggersRef = useRef([]);
   const triggerRulesRef = useRef([]);
   const triggerActiveStateRef = useRef({});
@@ -2501,10 +2563,14 @@ function AppShell() {
   const appStoreSaveTimerRef = useRef(null);
   const appStorePersistInFlightRef = useRef(false);
   const appStoreLastPersistSignatureRef = useRef("");
+  const dashboardDomainSaveTimerRef = useRef(null);
+  const dashboardDomainPersistInFlightRef = useRef(false);
+  const dashboardDomainLastPersistSignatureRef = useRef("");
   const liveTagValuesRef = useRef({});
   const powerConfigRef = useRef({});
   const cloudNewestLiveTsMsRef = useRef(0);
   const cloudLastApplyMsRef = useRef(0);
+  const gatewayDownPollCountersRef = useRef({});
   const cloudLastAcceptedTsByKeyRef = useRef(new Map());
   const cloudPollLogThrottleRef = useRef({ live: 0, aux: 0 });
   const powerHistoryLastFetchMsRef = useRef(0);
@@ -2619,6 +2685,12 @@ function AppShell() {
     alarms_setup: {
       alarms
     },
+    dashboard_configurations: {
+      widgets: dashboardWidgets,
+      mode: dashboardMode,
+      per_row: dashboardPerRow,
+      tag_colors: dashboardTagColors || {},
+    },
     reporting_setup: {
       filters: reportFilters,
       documents: reportDocuments,
@@ -2688,10 +2760,11 @@ function AppShell() {
     setLinkedCustomerId(String(appSettings.customer_id || ""));
     setLinkedLicenseId(String(appSettings.license_id || ""));
     const linkedFlag = Boolean(appSettings.edge_linked);
-    const linkedEdge = String(appSettings.edge_id || "").trim();
+    const linkedEdge = String(appSettings.edge_id || appSettings?.edge_profile?.edge_id || "").trim();
     const linkedTenant = String(appSettings.tenant_id || "").trim();
+    const linkedCustomer = String(appSettings.customer_id || "").trim();
     const linkedLicense = String(appSettings.license_id || "").trim();
-    const linked = linkedFlag || Boolean(linkedEdge && (linkedTenant || linkedLicense));
+    const linked = linkedFlag || Boolean(linkedEdge && (linkedTenant || linkedLicense || linkedCustomer));
     setEdgeLinked(linked);
     try {
       localStorage.setItem(EDGE_LINKED_STORAGE_KEY, linked ? "true" : "false");
@@ -2767,6 +2840,18 @@ function AppShell() {
     }
     if (Array.isArray(triggers.trigger_rules)) setTriggerRules(triggers.trigger_rules);
     if (Array.isArray(alarmsSetup.alarms)) setAlarms(alarmsSetup.alarms);
+    if (Array.isArray(dashboard.widgets)) setDashboardWidgets(dashboard.widgets);
+    if (dashboard.mode === "chart" || dashboard.mode === "kpi") setDashboardMode(dashboard.mode);
+    if (Number.isFinite(Number(dashboard.per_row))) {
+      setDashboardPerRow(Math.min(4, Math.max(1, Number(dashboard.per_row))));
+    }
+    if (dashboard.tag_colors && typeof dashboard.tag_colors === "object" && !Array.isArray(dashboard.tag_colors)) {
+      const normalized = {};
+      for (const [k, v] of Object.entries(dashboard.tag_colors)) {
+        normalized[String(k)] = normalizeHexColor(v, "#16a34a");
+      }
+      setDashboardTagColors(normalized);
+    }
     if (reportingSetup.filters && typeof reportingSetup.filters === "object") {
       const incoming = reportingSetup.filters || {};
       setReportFilters((prev) => normalizeReportFiltersShape(incoming, prev));
@@ -2888,7 +2973,37 @@ function AppShell() {
     for (const row of list || []) {
       if (row?.gateway_id) map[row.gateway_id] = row;
     }
-    setGatewayRuntimeStatuses(map);
+    setGatewayRuntimeStatuses((prev) => {
+      const next = { ...(prev || {}) };
+      const nowMs = Date.now();
+      const incomingIds = Object.keys(map || {});
+      for (const gid of incomingIds) {
+        const incoming = map[gid] || null;
+        if (!incoming) continue;
+        const current = next?.[gid] || null;
+        const lastWriteMs = parseTimestampMs(String(incoming?.db_last_write_utc || ""));
+        const lastCheckMs = parseTimestampMs(String(incoming?.last_check_utc || ""));
+        const hasFreshRuntimeSignal =
+          (Number.isFinite(lastWriteMs) && (nowMs - lastWriteMs) <= 20000) ||
+          (Number.isFinite(lastCheckMs) && (nowMs - lastCheckMs) <= 20000);
+        const incomingRunning = incoming?.running === true;
+        const currentRunning = current?.running === true;
+        if (incomingRunning) {
+          gatewayDownPollCountersRef.current[gid] = 0;
+          next[gid] = { ...current, ...incoming, gateway_id: gid, running: true };
+          continue;
+        }
+        const prevCount = Number(gatewayDownPollCountersRef.current[gid] || 0);
+        const downCount = prevCount + 1;
+        gatewayDownPollCountersRef.current[gid] = downCount;
+        if (currentRunning && (hasFreshRuntimeSignal || downCount < 3)) {
+          next[gid] = { ...current, ...incoming, gateway_id: gid, running: true };
+          continue;
+        }
+        next[gid] = { ...current, ...incoming, gateway_id: gid, running: false };
+      }
+      return next;
+    });
     return map;
   };
 
@@ -2924,20 +3039,14 @@ function AppShell() {
   }, []);
 
   useEffect(() => {
-    const savedPage = loadStringSetting(ACTIVE_PAGE_STORAGE_KEY, "");
     const path = String(window.location.pathname || "").toLowerCase();
-    if (savedPage) {
-      const mappedPage = savedPage === "database_overview" ? "database" : savedPage;
-      setActivePage(mappedPage);
-    } else {
-      if (path === "/portal" || path.startsWith("/portal/")) {
-        setActivePage("control_plane");
-      }
+    if (path === "/portal" || path.startsWith("/portal/")) {
+      setActivePage("control_plane");
     }
     const savedTrend = loadStringSetting(TREND_CHART_TYPE_STORAGE_KEY, "");
     if (savedTrend === "line" || savedTrend === "bar") setTrendChartType(savedTrend);
     const savedTagMonitor = loadStringSetting(TAG_MONITOR_CHART_TYPE_STORAGE_KEY, "");
-    if (savedTagMonitor === "line" || savedTagMonitor === "bar") setTagMonitorChartType(savedTagMonitor);
+    if (savedTagMonitor === "line" || savedTagMonitor === "bar" || savedTagMonitor === "area") setTagMonitorChartType(savedTagMonitor);
     try {
       const rawSidebar = localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY);
       if (rawSidebar === "true" || rawSidebar === "false") {
@@ -2951,12 +3060,15 @@ function AppShell() {
 
   useEffect(() => {
     let stopped = false;
+    let inFlight = false;
     if (isHostedWebClient && endpointMode === "cloud") {
       return () => {
         stopped = true;
       };
     }
     const refresh = async () => {
+      if (inFlight || stopped) return;
+      inFlight = true;
       try {
         const list = await getGatewayInstanceStatuses();
         if (stopped) return;
@@ -2964,10 +3076,60 @@ function AppShell() {
         for (const row of list || []) {
           if (row?.gateway_id) map[row.gateway_id] = row;
         }
-        setGatewayRuntimeStatuses(map);
+        setGatewayRuntimeStatuses((prev) => {
+          const next = { ...(prev || {}) };
+          const configuredGatewayIds = (gatewayConfigsRef.current || []).map((g) => String(g?.id || "")).filter(Boolean);
+          const incomingIds = Object.keys(map || {});
+          const allIds = Array.from(new Set([...configuredGatewayIds, ...incomingIds]));
+
+          for (const gid of allIds) {
+            const incoming = map?.[gid] || null;
+            const current = next?.[gid] || null;
+            if (!incoming) {
+              // Keep last known status when a poll omits one gateway row.
+              continue;
+            }
+
+            const nowMs = Date.now();
+            const lastWriteMs = parseTimestampMs(String(incoming?.db_last_write_utc || ""));
+            const lastCheckMs = parseTimestampMs(String(incoming?.last_check_utc || ""));
+            const hasFreshRuntimeSignal =
+              (Number.isFinite(lastWriteMs) && (nowMs - lastWriteMs) <= 20000) ||
+              (Number.isFinite(lastCheckMs) && (nowMs - lastCheckMs) <= 20000);
+
+            const incomingRunning = incoming?.running === true;
+            const currentRunning = current?.running === true;
+            if (incomingRunning) {
+              gatewayDownPollCountersRef.current[gid] = 0;
+              next[gid] = { ...current, ...incoming, gateway_id: gid, running: true };
+              continue;
+            }
+
+            // Debounce false transitions to avoid RUNNING/STOPPED flicker from transient polls.
+            const prevCount = Number(gatewayDownPollCountersRef.current[gid] || 0);
+            const downCount = prevCount + 1;
+            gatewayDownPollCountersRef.current[gid] = downCount;
+
+            if (currentRunning && (hasFreshRuntimeSignal || downCount < 3)) {
+              next[gid] = {
+                ...current,
+                ...incoming,
+                gateway_id: gid,
+                running: true,
+              };
+              continue;
+            }
+
+            next[gid] = { ...current, ...incoming, gateway_id: gid, running: false };
+          }
+
+          return next;
+        });
       } catch {
         // Keep last known runtime state to avoid false STOPPED/DB FAILS flicker
         // when a single status poll hits a transient timeout.
+      } finally {
+        inFlight = false;
       }
     };
     refresh();
@@ -3065,9 +3227,14 @@ function AppShell() {
 
   useEffect(() => {
     try {
+      // Don't persist the "edge" landing when it's just the license guard
+      // pushing the user there during boot. We rely on
+      // `preLicenseGuardPageRef` to restore the real page once the guard
+      // clears, so the next boot should pick up the user's actual preference.
+      if (licenseGuardBlocked && activePage === "edge") return;
       localStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, String(activePage || "dashboard"));
     } catch {}
-  }, [activePage]);
+  }, [activePage, licenseGuardBlocked]);
 
   useEffect(() => {
     try {
@@ -3123,6 +3290,7 @@ function AppShell() {
   }, []);
 
   useEffect(() => {
+    if (currentUser) return;
     let cancelled = false;
     const restoreAuthSession = async () => {
       try {
@@ -3144,6 +3312,19 @@ function AppShell() {
               : deriveModuleKeysFromPermissions(normalizePermissions(u.permissions || existingUser.permissions || {}, u.role || existingUser.role || "viewer"))),
         };
         setCurrentUser(matched);
+        pageBootstrapGuardRef.current = true;
+        if (!isPortalOnly) {
+          const savedPage = (() => {
+            try {
+              return String(localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY) || "").trim().toLowerCase();
+            } catch {
+              return "";
+            }
+          })();
+          // Avoid latching onto "edge" — that's usually a license-guard remnant
+          // from the previous session, not a deliberate landing page.
+          setActivePage((savedPage && savedPage !== "edge") ? savedPage : "dashboard");
+        }
         await refreshControlPlaneRuntimeContext();
         await refreshControlPlaneUsers(u?.tenant_id || currentTenantId || "default");
       } catch (_) {
@@ -3154,7 +3335,7 @@ function AppShell() {
     return () => {
       cancelled = true;
     };
-  }, [users]);
+  }, [users, currentUser, isPortalOnly, currentTenantId]);
 
   useEffect(() => {
     if (!currentUser) return;
@@ -3208,8 +3389,53 @@ function AppShell() {
   }, [dbConnections]);
 
   useEffect(() => {
-    gatewayRuntimeStatusesRef.current = gatewayRuntimeStatuses || {};
+    const nextMap = gatewayRuntimeStatuses || {};
+    gatewayRuntimeStatusesRef.current = nextMap;
+    const prevMap = gatewayRuntimePrevRef.current || {};
+    const transitions = { ...(gatewayRuntimeTransitionsRef.current || {}) };
+    let mutated = false;
+    const knownGatewayIds = new Set([
+      ...(gatewayConfigsRef.current || []).map((g) => String(g?.id || "")),
+      ...((powerConfigRef.current?.devices || []).map((d) => String(d?.id || ""))),
+    ]);
+    const gatewayIds = new Set([
+      ...Object.keys(prevMap || {}),
+      ...Object.keys(nextMap || {}),
+    ]);
+    const nowUtc = tsNow();
+    gatewayIds.forEach((gid) => {
+      if (!knownGatewayIds.has(String(gid || ""))) return;
+      const prev = prevMap?.[gid] || null;
+      const next = nextMap?.[gid] || null;
+      const prevRunning = typeof prev?.running === "boolean" ? Boolean(prev.running) : null;
+      const nextRunning = typeof next?.running === "boolean" ? Boolean(next.running) : null;
+      if (prevRunning === null || nextRunning === null || prevRunning === nextRunning) return;
+      const reason =
+        String(next?.last_error || "").trim() ||
+        String(next?.db_last_error || "").trim() ||
+        String(next?.collection_block_reason || "").trim() ||
+        (nextRunning ? "runtime_started" : "runtime_stopped");
+      const current = transitions[gid] || {};
+      transitions[gid] = {
+        transition_count: Number(current.transition_count || 0) + 1,
+        last_transition_utc: nowUtc,
+        from_running: prevRunning,
+        to_running: nextRunning,
+        reason,
+        interval_ms: Number(next?.interval_ms || prev?.interval_ms || 0),
+      };
+      mutated = true;
+    });
+    gatewayRuntimePrevRef.current = nextMap;
+    if (mutated) {
+      gatewayRuntimeTransitionsRef.current = transitions;
+      setGatewayRuntimeTransitions(transitions);
+    }
   }, [gatewayRuntimeStatuses]);
+
+  useEffect(() => {
+    gatewayRuntimeTransitionsRef.current = gatewayRuntimeTransitions || {};
+  }, [gatewayRuntimeTransitions]);
 
   useEffect(() => {
     tagAlarmPrefsRef.current = tagAlarmPrefs || {};
@@ -3217,7 +3443,40 @@ function AppShell() {
 
   useEffect(() => {
     emailSettingsRef.current = emailSettings || {};
-  }, [emailSettings]);
+    // Mirror the active email transport into the backend so the report
+    // scheduler daemon can deliver PDFs without waiting for the UI to be
+    // open. Debounced to avoid spamming the endpoint while the user types.
+    if (isHostedWebClient) return () => {};
+    const handle = setTimeout(() => {
+      try {
+        const transport = emailSettings?.transport === "php_http" ? "php_http" : "smtp";
+        const payload = {
+          transport,
+          smtp: {
+            host: emailSettings?.host || "",
+            port: Number(emailSettings?.port || 587),
+            username: emailSettings?.username || "",
+            password: emailSettings?.password || "",
+            sender_email: emailSettings?.sender_email || "",
+            sender_name: emailSettings?.sender_name || "Trustnode Edge",
+            use_tls: Boolean(emailSettings?.use_tls),
+            use_ssl: Boolean(emailSettings?.use_ssl),
+          },
+          php_mail: {
+            endpoint_url: emailSettings?.php_endpoint_url || "",
+            api_token: emailSettings?.php_api_token || "",
+            auth_header: emailSettings?.php_auth_header || "X-API-TOKEN",
+            timeout_ms: Number(emailSettings?.php_timeout_ms || 6000),
+            verify_tls: Boolean(emailSettings?.php_verify_tls ?? true),
+          },
+        };
+        pushSchedulerEmailSettings(payload).catch(() => {});
+      } catch (_) {
+        // Non-fatal; scheduler keeps last-known settings.
+      }
+    }, 1500);
+    return () => clearTimeout(handle);
+  }, [emailSettings, isHostedWebClient]);
 
   useEffect(() => {
     if (isHostedWebClient) return;
@@ -3471,6 +3730,31 @@ function AppShell() {
   }, [isHostedWebClient]);
 
   useEffect(() => {
+    if (!currentUser?.username) return;
+    let cancelled = false;
+    const refreshBootstrapAfterLogin = async () => {
+      try {
+        const res = await getAppStoreBootstrap();
+        if (cancelled) return;
+        if (res?.tenant_id) setCurrentTenantId(String(res.tenant_id));
+        if (res?.ok && res?.data && typeof res.data === "object") {
+          applyAppStorePayload(res.data);
+        }
+      } catch (_) {
+        // Keep existing in-memory state if bootstrap refresh fails.
+      }
+    };
+    refreshBootstrapAfterLogin();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser?.username]);
+
+  useEffect(() => {
+    dashboardHistorySeedRef.current = false;
+  }, [currentUser?.username]);
+
+  useEffect(() => {
     if (!(isHostedWebClient && endpointMode === "cloud")) return;
     let cancelled = false;
     let inFlight = false;
@@ -3518,7 +3802,7 @@ function AppShell() {
         ]);
         if (cancelled) return;
         if (histRes?.ok && Array.isArray(histRes.rows)) {
-          setDataLog(histRes.rows);
+          setDataLog((prev) => mergeHistorianRowsStable(histRes.rows, prev, 25000));
         }
         if (logRes?.ok && Array.isArray(logRes.rows)) {
           setAppLogs(logRes.rows);
@@ -3532,6 +3816,82 @@ function AppShell() {
       cancelled = true;
     };
   }, [appStoreHydrated, cloudEdgeApiFilter]);
+
+  useEffect(() => {
+    if (!appStoreHydrated || !currentUser) return;
+    if (dashboardHistorySeedRef.current) return;
+    if (!Array.isArray(dashboardWidgets) || !dashboardWidgets.length) return;
+
+    let cancelled = false;
+    const seedDashboardHistory = async () => {
+      try {
+        const dataWidgets = (Array.isArray(dashboardWidgets) ? dashboardWidgets : []).filter((w) => {
+          const t = String(w?.type || "");
+          return [
+            "line_chart",
+            "line_area_chart",
+            "bar_chart",
+            "pie_chart",
+            "meter_chart",
+            "table_list",
+            "value_kpi",
+            "text_kpi",
+          ].includes(t);
+        });
+        if (!dataWidgets.length) {
+          return;
+        }
+
+        const requests = [];
+        for (const w of dataWidgets) {
+          const cfg = w?.config || {};
+          const gateway = String(cfg?.gateway_id || w?.gateway_id || "").trim();
+          const tag = String(cfg?.tag_name || w?.tag_name || "").trim();
+          const limit = Math.max(300, Math.min(8000, Number(cfg?.readings_count || w?.readings_count || 120) * 8));
+          if (gateway && tag) requests.push({ gateway, tag, limit });
+          const computeRules = Array.isArray(cfg?.compute_rules) ? cfg.compute_rules : [];
+          for (const rule of computeRules) {
+            const rgw = String(rule?.gateway_id || "").trim();
+            const rtag = String(rule?.tag_name || "").trim();
+            if (rgw && rtag) requests.push({ gateway: rgw, tag: rtag, limit });
+          }
+        }
+
+        const uniqueReqs = Array.from(new Map(requests.map((r) => [`${r.gateway}::${r.tag}`, r])).values());
+        if (!uniqueReqs.length) {
+          return;
+        }
+
+        const results = await Promise.all(
+          uniqueReqs.map((req) =>
+            getAppStoreHistorianRange({
+              gateway: req.gateway,
+              tag: req.tag,
+              limit: req.limit,
+              offset: 0,
+              cloudEdge: cloudEdgeApiFilter,
+            }).catch(() => ({ ok: false, rows: [] }))
+          )
+        );
+        if (cancelled) return;
+
+        const mergedRows = [];
+        for (const res of results) {
+          if (res?.ok && Array.isArray(res.rows) && res.rows.length) mergedRows.push(...res.rows);
+        }
+        if (mergedRows.length) {
+          setDataLog((prev) => mergeHistorianRowsStable(mergedRows, prev, 25000, { allowBackfill: true }));
+        }
+      } finally {
+        if (!cancelled) dashboardHistorySeedRef.current = true;
+      }
+    };
+
+    seedDashboardHistory();
+    return () => {
+      cancelled = true;
+    };
+  }, [appStoreHydrated, currentUser, dashboardWidgets, cloudEdgeApiFilter]);
 
   useEffect(() => {
     if (!appStoreHydrated) return;
@@ -3805,11 +4165,56 @@ function AppShell() {
     reportDocuments,
     reportTemplates,
     scheduledReports,
+    dashboardWidgets,
+    dashboardMode,
+    dashboardPerRow,
+    dashboardTagColors,
     tagAlarmPrefs,
     emailSettings,
     emailProfiles,
     activeEmailProfileId
   ]);
+
+  useEffect(() => {
+    if (!appStoreHydrated) return;
+    if (dashboardDomainSaveTimerRef.current) {
+      clearTimeout(dashboardDomainSaveTimerRef.current);
+      dashboardDomainSaveTimerRef.current = null;
+    }
+    dashboardDomainSaveTimerRef.current = setTimeout(async () => {
+      if (dashboardDomainPersistInFlightRef.current) return;
+      const payload = {
+        widgets: Array.isArray(dashboardWidgets) ? dashboardWidgets : [],
+        mode: dashboardMode === "chart" ? "chart" : "kpi",
+        per_row: Math.min(4, Math.max(1, Number(dashboardPerRow || 2))),
+        tag_colors:
+          dashboardTagColors && typeof dashboardTagColors === "object" && !Array.isArray(dashboardTagColors)
+            ? dashboardTagColors
+            : {},
+      };
+      const signature = JSON.stringify(payload);
+      if (!dashboardDomainLastPersistSignatureRef.current) {
+        dashboardDomainLastPersistSignatureRef.current = signature;
+        return;
+      }
+      if (signature === dashboardDomainLastPersistSignatureRef.current) return;
+      dashboardDomainPersistInFlightRef.current = true;
+      try {
+        await saveAppStoreDomain("dashboard_configurations", payload, currentUser?.username || "system");
+        dashboardDomainLastPersistSignatureRef.current = signature;
+      } catch (_) {
+        // Keep UI responsive; bootstrap save loop remains fallback persistence path.
+      } finally {
+        dashboardDomainPersistInFlightRef.current = false;
+      }
+    }, 700);
+    return () => {
+      if (dashboardDomainSaveTimerRef.current) {
+        clearTimeout(dashboardDomainSaveTimerRef.current);
+        dashboardDomainSaveTimerRef.current = null;
+      }
+    };
+  }, [appStoreHydrated, currentUser, dashboardWidgets, dashboardMode, dashboardPerRow, dashboardTagColors]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -3862,6 +4267,8 @@ function AppShell() {
     const checkDevices = async () => {
       const current = devicesRef.current;
       if (running || !current.length) return;
+      const hasRunningGateway = Object.values(gatewayRuntimeStatusesRef.current || {}).some((s) => s?.running === true);
+      if (hasRunningGateway) return;
       running = true;
       try {
         const checks = await Promise.all(
@@ -4061,8 +4468,22 @@ function AppShell() {
 
   useEffect(() => {
     let cancelled = false;
+    const withTimeout = async (promise, ms, label) => {
+      let timer = null;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
     const initWithRetry = async () => {
       if (!currentUser) return;
+      let failedAttempts = 0;
       while (!cancelled) {
         try {
           let cfg = null;
@@ -4074,7 +4495,7 @@ function AppShell() {
             // Cloud UX must stay available even if PLC config endpoint is temporarily unhealthy.
             // Try deriving a safe fallback from bootstrap before showing blocking loader.
             try {
-              const boot = await getAppStoreBootstrap();
+              const boot = await withTimeout(getAppStoreBootstrap(), 15000, "getAppStoreBootstrap");
               const gwCfgs = Array.isArray(boot?.data?.gateway_configurations)
                 ? boot.data.gateway_configurations
                 : [];
@@ -4106,14 +4527,27 @@ function AppShell() {
           setConfig(cfg || { ...FALLBACK_PLC_CONFIG });
           setStatus(st || {});
           setBootState("ready");
+          failedAttempts = 0;
           if (!usedBootstrapFallback) {
             setError("");
           }
           return;
         } catch (e) {
           if (cancelled) return;
+          failedAttempts += 1;
           setBootState("waiting_backend");
           setError(`Waiting for backend... ${String(e)}`);
+          // Never block the full UI forever on startup.
+          // After repeated failures, enter degraded mode with safe defaults.
+          if (failedAttempts >= 6) {
+            setConfig({ ...FALLBACK_PLC_CONFIG });
+            setStatus({});
+            setBootState("degraded");
+            setError(
+              `Backend startup is delayed. UI opened in degraded mode and will keep retrying in background. Last error: ${String(e)}`
+            );
+            return;
+          }
           await new Promise((resolve) => setTimeout(resolve, 1200));
         }
       }
@@ -4191,6 +4625,30 @@ function AppShell() {
                   };
                 }
                 return next;
+              });
+              const latestTs = String(
+                data.readings.reduce((acc, r) => {
+                  const ts = String(r?.ts_utc || "");
+                  return ts > acc ? ts : acc;
+                }, "") || tsNow()
+              );
+              setGatewayRuntimeStatuses((prev) => {
+                const current = prev?.[gatewayId] || { gateway_id: gatewayId };
+                const increment = Math.max(0, Number(data.readings.length || 0));
+                return {
+                  ...(prev || {}),
+                  [gatewayId]: {
+                    ...current,
+                    gateway_id: gatewayId,
+                    running: true,
+                    last_error: null,
+                    db_last_error: null,
+                    db_pending_count: Number(current?.db_pending_count || 0),
+                    db_write_count: Number(current?.db_write_count || 0) + increment,
+                    last_check_utc: latestTs,
+                    db_last_write_utc: latestTs,
+                  },
+                };
               });
             }
             const collectionAllowed = data.collection_allowed !== false;
@@ -6001,9 +6459,24 @@ function AppShell() {
 
   const forcedClientModules = useMemo(() => parseForcedClientModules(), []);
   const forcedClientMode = forcedClientModules.size > 0;
+  const licensedModuleKeys = useMemo(
+    () => normalizeLicenseModuleKeys(edgeLicenseSnapshot?.license?.modules),
+    [edgeLicenseSnapshot?.license?.modules]
+  );
+  const isPageLicensed = useCallback(
+    (page) => {
+      const required = MODULE_KEY_BY_PAGE[page];
+      if (!required) return true;
+      if (!edgeLicenseSnapshot?.ok) return false;
+      if (!licensedModuleKeys.length) return false;
+      return licensedModuleKeys.includes(String(required || "").toLowerCase());
+    },
+    [edgeLicenseSnapshot?.ok, licensedModuleKeys]
+  );
 
   const hasClientModuleAccess = useCallback(
     (page) => {
+      if (!isPageLicensed(page)) return false;
       if (!userHasModuleForPage(currentUser, page)) return false;
       const perms = currentUser?.permissions || {};
       if (page === "dashboard") return Boolean(perms.dashboard ?? perms.data_log ?? true);
@@ -6014,7 +6487,7 @@ function AppShell() {
       if (page === "interface") return Boolean(perms.client_module_interface ?? perms.interface ?? false);
       return false;
     },
-    [currentUser]
+    [currentUser, isPageLicensed]
   );
 
   const canEditPage = (page) => {
@@ -6050,6 +6523,10 @@ function AppShell() {
   };
 
   const canOpenPage = (page) => {
+    if (page === "control_plane") return Boolean(isPortalOnly);
+    if (!isPageLicensed(page) && ["dashboard", "power_overview", "historian", "alarms", "reporting", "interface"].includes(page)) {
+      return false;
+    }
     if (forcedClientMode) {
       if (!CLIENT_MODULE_PAGE_SET.has(page)) return false;
       if (!forcedClientModules.has(page)) return false;
@@ -6149,6 +6626,16 @@ function AppShell() {
         domain = "";
       }
       map.set(cid, domain);
+    }
+    return map;
+  }, [cpCustomers]);
+
+  const customerNameById = useMemo(() => {
+    const map = new Map();
+    for (const row of Array.isArray(cpCustomers) ? cpCustomers : []) {
+      const cid = String(row?.customer_id || "").trim();
+      if (!cid) continue;
+      map.set(cid, String(row?.company_name || cid).trim() || cid);
     }
     return map;
   }, [cpCustomers]);
@@ -6280,11 +6767,26 @@ function AppShell() {
   useEffect(() => {
     if (!currentUser) return;
     if (isPortalOnly) return;
-    if (canOpenPage(activePage)) return;
+    if (!pageBootstrapGuardRef.current) return;
+    if (canOpenPage(activePage)) {
+      pageBootstrapGuardRef.current = false;
+      return;
+    }
     const fallbackCandidates = ["dashboard", "power_overview", "alarms", "reporting", "historian", "interface", "logs"];
     const fallback = fallbackCandidates.find((p) => canOpenPage(p));
-    if (fallback) setActivePage(fallback);
+    if (fallback) {
+      setActivePage(fallback);
+    }
+    pageBootstrapGuardRef.current = false;
   }, [activePage, canOpenPage, currentUser, isPortalOnly]);
+
+  useEffect(() => {
+    if (!currentUser) {
+      pageBootstrapGuardRef.current = true;
+      return;
+    }
+    pageBootstrapGuardRef.current = true;
+  }, [currentUser?.username]);
 
   useEffect(() => {
     if (!isPortalOnly) return;
@@ -6325,32 +6827,127 @@ function AppShell() {
     wsState,
   ]);
 
+  const LICENSE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+  const formatLicenseGuardReason = useCallback((reason) => {
+    const r = String(reason || "").trim();
+    if (r === "edge_not_found") return "Edge not found in control-plane. Verify edge identity and activation code.";
+    if (r === "edge_customer_missing") return "Edge is linked but customer scope is missing.";
+    if (r === "license_not_found") return "No active license found for this edge customer.";
+    if (r === "license_inactive") return "License is inactive.";
+    if (r === "license_expired") return "License is expired.";
+    if (!r) return "License validation failed.";
+    return r.replaceAll("_", " ");
+  }, []);
+
+  const runLicenseComplianceCheck = useCallback(async () => {
+    if (!currentUser || isHostedWebClient) return;
+    const edgeId = String(edgeProfile?.edge_id || "").trim();
+    const localLicense = edgeLicenseSnapshot?.license && typeof edgeLicenseSnapshot.license === "object"
+      ? edgeLicenseSnapshot.license
+      : {};
+    const localLicenseLooksActive = Boolean(
+      edgeLicenseSnapshot?.ok ||
+      (
+        String(localLicense?.status || "").trim().toLowerCase() === "active" &&
+        String(localLicense?.start_utc || "").trim() &&
+        String(localLicense?.end_utc || "").trim()
+      )
+    );
+    if (!edgeId) {
+      if (localLicenseLooksActive) {
+        setLicenseGuardBlocked(false);
+        setLicenseGuardMessage("License active");
+      } else {
+        setLicenseGuardBlocked(true);
+        setLicenseGuardMessage("Edge ID is missing. Please configure and activate this edge.");
+      }
+      setLicenseGuardLastCheckedUtc(tsNow());
+      return;
+    }
+    if (!edgeLinked) {
+      if (localLicenseLooksActive) {
+        setLicenseGuardBlocked(false);
+        setLicenseGuardMessage("License active");
+      } else {
+        setLicenseGuardBlocked(true);
+        setLicenseGuardMessage("This edge is not activated. Activate the license to use the software.");
+      }
+      setLicenseGuardLastCheckedUtc(tsNow());
+      // Do not return: still try cloud/local authoritative check in background to self-heal linkage.
+    }
+    try {
+      const out = await checkControlPlaneEdgeLicense(edgeId, currentTenantId || "default");
+      setEdgeLicenseSnapshot(out || null);
+      const reason = String(out?.reason || "");
+      if (!out?.ok) {
+        if (localLicenseLooksActive) {
+          // Keep app usable from persisted local state; cloud check will run again on schedule.
+          setLicenseGuardBlocked(false);
+          setLicenseGuardMessage("License active");
+        } else {
+          setLicenseGuardBlocked(true);
+          setLicenseGuardMessage(formatLicenseGuardReason(reason));
+        }
+      } else {
+        setLicenseGuardBlocked(false);
+        setLicenseGuardMessage("License active");
+      }
+      setLicenseGuardLastCheckedUtc(tsNow());
+    } catch {
+      if (localLicenseLooksActive) {
+        setLicenseGuardBlocked(false);
+        setLicenseGuardMessage("License active");
+      } else {
+        setLicenseGuardBlocked(true);
+        setLicenseGuardMessage("License check unavailable. Verify cloud connectivity and activation.");
+      }
+      setLicenseGuardLastCheckedUtc(tsNow());
+    }
+  }, [currentUser, isHostedWebClient, edgeProfile?.edge_id, currentTenantId, edgeLinked, formatLicenseGuardReason, edgeLicenseSnapshot]);
+
   useEffect(() => {
     if (!currentUser || isHostedWebClient) return;
-    const run = async () => {
-      try {
-        const edgeId = String(edgeProfile?.edge_id || "").trim();
-        if (!edgeId) return;
-        const key = `trustnode_edge_license_check_${edgeId}`;
-        const today = new Date().toISOString().slice(0, 10);
-        const last = String(localStorage.getItem(key) || "");
-        if (last === today) return;
-        const out = await checkControlPlaneEdgeLicense(edgeId, currentTenantId || "default");
-        setEdgeLicenseSnapshot(out || null);
-        localStorage.setItem(key, today);
-        if (!out?.ok) {
-          setError(`License check warning for edge '${edgeId}': ${String(out?.reason || "invalid_license")}`);
-        }
-      } catch {
-        // Keep local runtime working even if cloud check is unavailable.
-      }
-    };
-    run();
-    const timer = setInterval(run, 60 * 60 * 1000);
+    runLicenseComplianceCheck();
+    const timer = setInterval(runLicenseComplianceCheck, LICENSE_CHECK_INTERVAL_MS);
     return () => {
       clearInterval(timer);
     };
-  }, [currentUser, isHostedWebClient, edgeProfile?.edge_id, currentTenantId]);
+  }, [currentUser, isHostedWebClient, runLicenseComplianceCheck]);
+
+  // Remember the page the user was on before the license guard forced a jump
+  // to the "edge" activation screen, so we can put them back once the guard
+  // clears. Without this the user lands on Edge every boot, because the guard
+  // briefly trips during the initial license check before any cached license
+  // snapshot loads.
+  const preLicenseGuardPageRef = useRef("");
+  useEffect(() => {
+    if (!currentUser || isHostedWebClient) return;
+    if (!licenseGuardBlocked) return;
+    if (activePage !== "edge") {
+      preLicenseGuardPageRef.current = String(activePage || "");
+      setActivePage("edge");
+    }
+  }, [licenseGuardBlocked, currentUser, isHostedWebClient, activePage]);
+
+  useEffect(() => {
+    if (licenseGuardBlocked) return;
+    setLicenseGuardShowActivation(false);
+    setLicenseGuardDismissed(false);
+    // Guard cleared: restore the user's previously-selected page if we
+    // overrode it. We only restore if we're still parked on "edge" — the
+    // user may have deliberately navigated somewhere else in the meantime.
+    const previous = preLicenseGuardPageRef.current;
+    if (previous && previous !== "edge" && activePage === "edge") {
+      setActivePage(previous);
+    }
+    preLicenseGuardPageRef.current = "";
+  }, [licenseGuardBlocked]);
+
+  useEffect(() => {
+    if (!currentUser) {
+      setLicenseBannerHidden(false);
+    }
+  }, [currentUser]);
 
   useEffect(() => {
     const edgeId = String(cpActivationIssueForm.edge_id || "").trim();
@@ -6433,22 +7030,25 @@ function AppShell() {
 
     const gwStates = {};
     for (const g of gatewayConfigs) {
-      const runtimeStatus = gatewayRuntimeStatuses[g.id] || null;
+      const runtimeStatus = resolveGatewayRuntimeStatus(g);
       const running = Boolean(runtimeStatus?.running);
       const dbErr = String(runtimeStatus?.db_last_error || "").trim();
       const connErr = String(runtimeStatus?.last_error || "").trim();
       const label = running ? (dbErr || connErr ? "RUNNING_WITH_ERRORS" : "RUNNING") : "STOPPED";
       gwStates[g.id] = label;
       if (state.gateways[g.id] !== label) {
+        const prevLabel = String(state.gateways[g.id] || "unknown");
         const detail = dbErr || connErr;
+        const transition = gatewayRuntimeTransitionsRef.current?.[g.id] || null;
+        const reason = String(transition?.reason || detail || "").trim();
         addAppLog({
           level: label === "RUNNING" ? "info" : label === "STOPPED" ? "warning" : "error",
           category: "gateway",
           gateway_id: g.id,
           gateway_name: g.name || g.id,
-          message: detail
-            ? `Gateway ${g.name || g.id} status: ${label} | ${detail}`
-            : `Gateway ${g.name || g.id} status: ${label}`
+          message: reason
+            ? `Gateway ${g.name || g.id} transition: ${prevLabel} -> ${label} | ${reason}`
+            : `Gateway ${g.name || g.id} transition: ${prevLabel} -> ${label}`
         });
       }
       const gwErrKey = `${g.id}::conn`;
@@ -6503,7 +7103,7 @@ function AppShell() {
     if (nowMs - state.lastHeartbeatMs >= 30000) {
       const onlineDevices = devices.filter((d) => Boolean(d.ping_ok && (d.protocol_ok ?? d.port_ok))).length;
       const onlineDb = dbConnections.filter((d) => Boolean(d.connection_ok)).length;
-      const runningGw = gatewayConfigs.filter((g) => Boolean(gatewayRuntimeStatuses[g.id]?.running)).length;
+      const runningGw = gatewayConfigs.filter((g) => isGatewayRunning(g)).length;
       addAppLog({
         level: "info",
         category: "system",
@@ -6511,7 +7111,7 @@ function AppShell() {
       });
       state.lastHeartbeatMs = nowMs;
     }
-  }, [devices, dbConnections, gatewayConfigs, gatewayRuntimeStatuses, wsState, bootState]);
+  }, [devices, dbConnections, gatewayConfigs, gatewayRuntimeStatuses, wsState, bootState, resolveGatewayRuntimeStatus, isGatewayRunning]);
 
   const fmtTs = useCallback((value) => {
     return formatTimestampDisplay(value, displayTimeZone);
@@ -6637,6 +7237,8 @@ function AppShell() {
         return {
           id: String(d?.id || ""),
           name: String(d?.name || d?.id || "Power Meter"),
+          plc_ip: String(d?.ip || ""),
+          endpoint: String(d?.endpoint || d?.ip || ""),
           interval_ms: Number(d?.poll_interval_ms || 1000),
           gateway_type: "modbus_tcp_meter",
           tags: Object.keys(mergedMap || {}),
@@ -6731,18 +7333,82 @@ function AppShell() {
     else if (upperHit) label = "HIGH LIMIT";
     return { ok: !violated, label, valueText: String(valueNum), ageText: `${ageSec}s` };
   };
-  const getGatewayHealth = (gateway) => {
+  const hasFreshGatewayLiveSignal = useCallback((gateway) => {
+    if (!gateway) return false;
+    const gid = String(gateway?.id || "");
+    if (!gid) return false;
+    const intervalMs = Math.max(200, Number(gateway?.interval_ms || 1000));
+    const freshnessMs = Math.max(5000, intervalMs * 4);
+    const nowMs = Date.now();
+    const prefix = `${gid}::`;
+    for (const [key, val] of Object.entries(liveTagValuesRef.current || {})) {
+      if (!String(key || "").startsWith(prefix)) continue;
+      const tsMs = parseTimestampMs(String(val?.ts || ""));
+      if (Number.isFinite(tsMs) && nowMs - tsMs <= freshnessMs) return true;
+    }
+    return false;
+  }, []);
+  function resolveGatewayRuntimeStatus(gateway) {
+    if (!gateway) return null;
+    const gatewayId = String(gateway?.id || "");
+    const runtimeRows = Object.values(gatewayRuntimeStatusesView || gatewayRuntimeStatuses || {});
+    const byId = gatewayRuntimeStatusesView?.[gatewayId] || gatewayRuntimeStatuses?.[gatewayId] || null;
+
+    const targetType = String(gateway?.gateway_type || "").trim().toLowerCase();
+    const targetIp = String(gateway?.plc_ip || "").trim().toLowerCase();
+    const targetOpc = String(gateway?.opc_url || "").trim().toLowerCase();
+    const targetName = String(gateway?.name || "").trim().toLowerCase();
+
+    const runtimeScore = (row) => {
+      const running = row?.running === true ? 1000 : 0;
+      const tsMs = parseTimestampMs(String(row?.db_last_write_utc || ""));
+      const freshWrite = Number.isFinite(tsMs) && (Date.now() - tsMs) <= 15000 ? 100 : 0;
+      const noErrors = !String(row?.last_error || "").trim() && !String(row?.db_last_error || "").trim() ? 10 : 0;
+      return running + freshWrite + noErrors;
+    };
+    const pickBest = (rows) => {
+      if (!Array.isArray(rows) || !rows.length) return null;
+      return [...rows]
+        .sort((a, b) => runtimeScore(b) - runtimeScore(a))[0] || null;
+    };
+
+    const endpointMatches = runtimeRows.filter((row) => {
+      const rowType = String(row?.gateway_type || "").trim().toLowerCase();
+      if (rowType !== targetType) return false;
+      if (targetType === "siemens_opcua") {
+        return targetOpc && String(row?.opc_url || "").trim().toLowerCase() === targetOpc;
+      }
+      return targetIp && String(row?.plc_ip || "").trim().toLowerCase() === targetIp;
+    });
+
+    // Hard bind by configured gateway id when present.
+    // Borrowing runtime from another gateway on the same endpoint causes
+    // RUNNING/STOPPED and DB-write footer flicker.
+    if (byId) return byId;
+    if (endpointMatches.length) return pickBest(endpointMatches);
+
+    const nameMatches = runtimeRows.filter((row) => {
+      const rid = String(row?.gateway_id || "").trim().toLowerCase();
+      return targetName && rid === targetName;
+    });
+    return pickBest(nameMatches);
+  }
+
+const getGatewayHealth = (gateway) => {
     if (!gateway) return { ok: false, label: "Not Ready" };
-    const runtimeStatus = gatewayRuntimeStatusesView[gateway.id] || gatewayRuntimeStatuses[gateway.id] || null;
+    const runtimeStatus = resolveGatewayRuntimeStatus(gateway);
     if (runtimeStatus) {
       const rtErr = String(runtimeStatus.last_error || "").trim();
       const dbErr = String(runtimeStatus.db_last_error || "").trim();
       const lastWriteMs = new Date(String(runtimeStatus.db_last_write_utc || "")).getTime();
-      const hasFreshWrite = Number.isFinite(lastWriteMs) && (Date.now() - lastWriteMs) <= 15000;
+      const lastCheckMs = new Date(String(runtimeStatus.last_check_utc || "")).getTime();
+      const hasFreshWrite = Number.isFinite(lastWriteMs) && (Date.now() - lastWriteMs) <= 30000;
+      const hasFreshCheck = Number.isFinite(lastCheckMs) && (Date.now() - lastCheckMs) <= 30000;
       const pending = Number(runtimeStatus.db_pending_count || 0);
-      if (runtimeStatus.running === true) {
+      const liveFresh = hasFreshGatewayLiveSignal(gateway);
+      if (runtimeStatus.running === true || liveFresh || hasFreshWrite || hasFreshCheck) {
         if (rtErr) return { ok: false, label: "Device Fails" };
-        if (dbErr && !hasFreshWrite && pending > 0) return { ok: false, label: "DB Fails" };
+        if (dbErr && !hasFreshWrite && pending > 5) return { ok: false, label: "DB Fails" };
         return { ok: true, label: "Running" };
       }
       if (runtimeStatus.running === false && !rtErr && !dbErr) return { ok: false, label: "Stopped" };
@@ -6969,6 +7635,18 @@ function AppShell() {
     return gateway.plc_ip || "-";
   };
 
+  
+
+  const getGatewayIntervalRuntimeInfo = (gateway) => {
+    const configuredMs = Number(gateway?.interval_ms || 0);
+    // Use a single source of truth in UI: configured gateway interval.
+    // Runtime-probe interval can drift and should not be shown in footer.
+    return {
+      text: `${configuredMs > 0 ? configuredMs : 1000} ms`,
+      mismatch: false,
+    };
+  };
+
   const isFreshCloudTs = (tsValue, maxAgeMs = 12000) => {
     if (!tsValue) return false;
     const tsMs = parseTimestampMs(tsValue);
@@ -6980,7 +7658,7 @@ function AppShell() {
     if (!gateway?.database_id) return "No DB selected";
     const db = dbConnections.find((c) => c.id === gateway.database_id);
     const dbName = db?.name || "Unknown DB";
-    const runtimeStatus = gatewayRuntimeStatuses[gateway.id] || null;
+    const runtimeStatus = resolveGatewayRuntimeStatus(gateway);
     const writes = Number(runtimeStatus?.db_write_count || 0);
     const pending = Number(runtimeStatus?.db_pending_count || 0);
     const lastCheckUtc = String(runtimeStatus?.last_check_utc || "");
@@ -7303,24 +7981,43 @@ function AppShell() {
     );
   }, [gatewayRuntimeStatusesView, gatewayConfigsView, powerGatewayDescriptors]);
 
-  const isGatewayRunning = (gateway) => {
+  function isGatewayRunning(gateway) {
     if (!gateway) return false;
-    const runtimeStatus = gatewayRuntimeStatusesView[gateway.id];
-    if (runtimeStatus && typeof runtimeStatus.running === "boolean") return Boolean(runtimeStatus.running);
+    const runtimeStatus = resolveGatewayRuntimeStatus(gateway);
+    const nowMs = Date.now();
+    const lastWriteMs = parseTimestampMs(String(runtimeStatus?.db_last_write_utc || ""));
+    const lastCheckMs = parseTimestampMs(String(runtimeStatus?.last_check_utc || ""));
+    const hasFreshRuntimeWrite =
+      (Number.isFinite(lastWriteMs) && (nowMs - lastWriteMs) <= 45000) ||
+      (Number.isFinite(lastCheckMs) && (nowMs - lastCheckMs) <= 30000);
+    if (runtimeStatus && typeof runtimeStatus.running === "boolean") {
+      if (runtimeStatus.running === true) return true;
+      if (hasFreshRuntimeWrite) return true;
+      // If live points are still arriving for this gateway, keep UI state RUNNING.
+      if (hasFreshGatewayLiveSignal(gateway)) return true;
+      return false;
+    }
     if (isHostedWebClient && endpointMode === "cloud") {
       const lastCheckUtc = runtimeStatus?.last_check_utc || gateway?.last_check_utc || "";
       return isFreshCloudTs(lastCheckUtc, 15000);
     }
-    return false;
-  };
+    return hasFreshGatewayLiveSignal(gateway);
+  }
   const anyGatewayRunning = useMemo(
-    () => gatewayConfigsView.some((g) => Boolean(gatewayRuntimeStatusesView[g.id]?.running)),
-    [gatewayConfigsView, gatewayRuntimeStatusesView]
+    () => {
+      const merged = [
+        ...(gatewayConfigsView || []),
+        ...(powerGatewayDescriptors || []).filter(
+          (pg) => !(gatewayConfigsView || []).some((g) => String(g?.id || "") === String(pg?.id || ""))
+        ),
+      ];
+      return merged.some((g) => isGatewayRunning(g));
+    },
+    [gatewayConfigsView, powerGatewayDescriptors, isGatewayRunning]
   );
-  const contentBottomPad = useMemo(
-    () => (footerCollapsed ? 16 : Math.max(footerHeight + 18, 140)),
-    [footerCollapsed, footerHeight]
-  );
+  // Keep dashboard/content layout stable when gateway footer is expanded.
+  // Footer behaves as an overlay and should not reflow page content.
+  const contentBottomPad = 16;
 
   useEffect(() => {
     const readHeight = () => {
@@ -7522,7 +8219,7 @@ function AppShell() {
             String(r.gateway_id || "") === String(w.gateway_id || "") &&
             String(r.tag || r.tag_name || "") === String(w.tag_name || "")
         )
-      , Number(w.readings_count || 120), Number(gateway?.interval_ms || 1000));
+      , Number(w.readings_count || 120), Number(gateway?.interval_ms || 1000), endpointMode === "cloud");
       const lineSeries = buildSmoothedSeries(
         points,
         renderNowMs,
@@ -7564,7 +8261,100 @@ function AppShell() {
       };
     }).filter(Boolean);
     return items;
-  }, [dashboardWidgetsView, gatewayConfigsView, powerGatewayDescriptors, devicesView, dataLogView, renderNowMs, getDashboardTagColor]);
+  }, [dashboardWidgetsView, gatewayConfigsView, powerGatewayDescriptors, devicesView, dataLogView, renderNowMs, getDashboardTagColor, endpointMode]);
+
+  const dashboardWidgetLatencyById = useMemo(() => {
+    const out = {};
+    for (const item of dashboardItems || []) {
+      const lastTsMs = Number(item?.series?.[item.series.length - 1]?.ts_ms || 0);
+      if (!Number.isFinite(lastTsMs) || lastTsMs <= 0) continue;
+      const intervalMs = Number(item?.monitorRow?.period_ms || 0);
+      out[String(item.id || "")] = {
+        latency_ms: Math.max(0, Number(renderNowMs || Date.now()) - lastTsMs),
+        interval_ms: intervalMs,
+        stale: intervalMs > 0 ? Math.max(0, Number(renderNowMs || Date.now()) - lastTsMs) > intervalMs * 3 : false,
+        ts_ms: lastTsMs,
+      };
+    }
+    return out;
+  }, [dashboardItems, renderNowMs]);
+
+  const gatewayLiveDiagnostics = useMemo(() => {
+    const byGateway = {};
+    const rows = Array.isArray(dataLogView) ? dataLogView : [];
+    for (const g of gatewayConfigsView || []) {
+      const gid = String(g?.id || "").trim();
+      if (!gid) continue;
+      const runtime = gatewayRuntimeStatusesView?.[gid] || gatewayRuntimeStatuses?.[gid] || null;
+      let latestTsMs = Number.NaN;
+      for (const row of rows) {
+        if (String(row?.gateway_id || "") !== gid) continue;
+        const tsMs = rowTsMs(row);
+        if (!Number.isFinite(tsMs)) continue;
+        if (!Number.isFinite(latestTsMs) || tsMs > latestTsMs) latestTsMs = tsMs;
+      }
+      const latencyMs = Number.isFinite(latestTsMs) ? Math.max(0, Date.now() - latestTsMs) : null;
+      const configuredInterval = Number(g?.interval_ms || 0);
+      const runtimeInterval = Number(runtime?.interval_ms || 0);
+      byGateway[gid] = {
+        gateway_id: gid,
+        gateway_name: String(g?.name || gid),
+        running: Boolean(runtime?.running),
+        configured_interval_ms: configuredInterval,
+        runtime_interval_ms: runtimeInterval,
+        interval_mismatch:
+          configuredInterval > 0 &&
+          runtimeInterval > 0 &&
+          Math.abs(configuredInterval - runtimeInterval) > Math.max(25, configuredInterval * 0.05),
+        live_latency_ms: latencyMs,
+        transition_count: Number(gatewayRuntimeTransitions?.[gid]?.transition_count || 0),
+        last_transition_utc: String(gatewayRuntimeTransitions?.[gid]?.last_transition_utc || ""),
+        last_transition_reason: String(gatewayRuntimeTransitions?.[gid]?.reason || ""),
+        last_error: String(runtime?.last_error || ""),
+        db_last_error: String(runtime?.db_last_error || ""),
+      };
+    }
+    return Object.values(byGateway);
+  }, [dataLogView, gatewayConfigsView, gatewayRuntimeStatusesView, gatewayRuntimeStatuses, gatewayRuntimeTransitions]);
+
+  const dashboardDiagnosticsSummary = useMemo(() => {
+    const latencies = gatewayLiveDiagnostics
+      .map((row) => Number(row?.live_latency_ms))
+      .filter((v) => Number.isFinite(v));
+    const sorted = [...latencies].sort((a, b) => a - b);
+    const p95 = sorted.length ? sorted[Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * 0.95)))] : 0;
+    const p50 = sorted.length ? sorted[Math.max(0, Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * 0.5)))] : 0;
+    const flickerCount = gatewayLiveDiagnostics.reduce((acc, row) => acc + Number(row?.transition_count || 0), 0);
+    return {
+      ws_p95_ms: 0,
+      historian_p95_ms: Number(p95 || 0),
+      historian_p50_ms: Number(p50 || 0),
+      flicker_count: flickerCount,
+      gateways: gatewayLiveDiagnostics.length,
+    };
+  }, [gatewayLiveDiagnostics]);
+
+  const exportDashboardDiagnostics = useCallback(() => {
+    const payload = {
+      exported_at_utc: tsNow(),
+      mode: endpointMode,
+      summary: dashboardDiagnosticsSummary,
+      gateway_runtime_transitions: gatewayRuntimeTransitions,
+      gateways: gatewayLiveDiagnostics,
+      widgets: Object.entries(dashboardWidgetLatencyById || {}).map(([widgetId, row]) => ({
+        widget_id: widgetId,
+        latency_ms: Number(row?.latency_ms || 0),
+        interval_ms: Number(row?.interval_ms || 0),
+        stale: Boolean(row?.stale),
+        ts_ms: Number(row?.ts_ms || 0),
+      })),
+    };
+    downloadText(
+      `trustnode-dashboard-diagnostics-${Date.now()}.json`,
+      JSON.stringify(payload, null, 2),
+      "application/json;charset=utf-8"
+    );
+  }, [endpointMode, dashboardDiagnosticsSummary, gatewayRuntimeTransitions, gatewayLiveDiagnostics, dashboardWidgetLatencyById]);
 
   const tagMonitorSeries = useMemo(() => {
     if (!tagMonitorSelection) return [];
@@ -7575,7 +8365,7 @@ function AppShell() {
           String(r.tag || r.tag_name || "") === String(tagMonitorSelection.tag_name || "") &&
           (!r.gateway_id || String(r.gateway_id) === String(tagMonitorSelection.gateway_id || ""))
       )
-    , 120, Number(tagMonitorSelection?.period_ms || 1000));
+    , 120, Number(tagMonitorSelection?.period_ms || 1000), endpointMode === "cloud");
     return tagMonitorChartType === "bar"
       ? base
       : buildSmoothedSeries(
@@ -7584,7 +8374,7 @@ function AppShell() {
           Number(tagMonitorSelection?.period_ms || 1000),
           endpointMode !== "cloud"
         );
-  }, [dataLogView, tagMonitorSelection, tagMonitorChartType, renderNowMs]);
+  }, [dataLogView, tagMonitorSelection, tagMonitorChartType, renderNowMs, endpointMode]);
 
   const tagMonitorDomain = useMemo(() => {
     const prev = tagMonitorDomainRef.current;
@@ -7783,13 +8573,19 @@ function AppShell() {
   };
 
   const handleNavClick = (page) => {
+    pageBootstrapGuardRef.current = false;
+    if (licenseGuardBlocked && page !== "edge") {
+      setActivePage("edge");
+      return;
+    }
     if (!canOpenPage(page)) return;
     setActivePage(page);
   };
 
   const openTagMonitor = (row) => {
     setTagMonitorSelection(row);
-    setTagMonitorChartType("line");
+    const preferred = String(row?.chart_type || "line");
+    setTagMonitorChartType(preferred === "bar" ? "bar" : preferred === "area" ? "area" : "line");
     setShowTagMonitorModal(true);
   };
 
@@ -7973,7 +8769,7 @@ function AppShell() {
       return;
     }
     const gid = String(gateway.id || "");
-    if (gatewayRuntimeStatusesRef.current[gid]?.running) {
+    if (isGatewayRunning(gateway)) {
       setError("");
       return;
     }
@@ -8077,24 +8873,30 @@ function AppShell() {
   const stopGatewayProfile = async (gatewayId = selectedGateway?.id) => {
     if (!canControlGateways) return;
     if (!gatewayId) return;
+    const gateway = gatewayConfigs.find((g) => String(g.id || "") === String(gatewayId || "")) || null;
+    // Stop only the explicit configured gateway id.
+    // Alias-based stopping can terminate unrelated gateways that share endpoint traits.
+    const stopIds = [String(gatewayId || "").trim()].filter(Boolean);
     try {
-      await stopGatewayInstance(gatewayId);
-      markGatewayRunningState([gatewayId], false);
+      for (const stopId of stopIds) {
+        await stopGatewayInstance(stopId);
+      }
+      markGatewayRunningState(stopIds, false);
       setLiveTagValues((prev) => {
         const next = {};
-        const prefix = `${String(gatewayId)}::`;
         for (const [k, v] of Object.entries(prev || {})) {
-          if (!k.startsWith(prefix)) next[k] = v;
+          const keep = !stopIds.some((sid) => k.startsWith(`${String(sid)}::`));
+          if (keep) next[k] = v;
         }
         return next;
       });
       await refreshGatewayRuntimes();
-      const gw = gatewayConfigs.find((g) => g.id === gatewayId);
+      const gw = gateway;
       addAppLog({
         level: "info",
         category: "gateway",
-        gateway_id: gatewayId,
-        gateway_name: gw?.name || gatewayId,
+        gateway_id: String(gw?.id || gatewayId),
+        gateway_name: gw?.name || String(gatewayId),
         message: "Gateway stopped"
       });
       setError("");
@@ -8146,6 +8948,15 @@ function AppShell() {
   };
 
   useEffect(() => {
+    const autoRestartEnabledByEnv =
+      String(import.meta?.env?.VITE_TRUSTNODE_AUTO_RESTART_GATEWAYS_ON_CONFIG_CHANGE || "").toLowerCase() === "true";
+    const autoRestartEnabledByUi =
+      String((typeof window !== "undefined" && window.localStorage?.getItem("trustnode_auto_restart_gateways")) || "")
+        .toLowerCase() === "true";
+    // Default to OFF for runtime stability: silent config-sync updates can cause
+    // stop/start churn and visible footer flicker during live acquisition.
+    const autoRestartEnabled = false && autoRestartEnabledByEnv && autoRestartEnabledByUi;
+    if (!autoRestartEnabled) return;
     if (!appStoreHydrated) return;
     if (!currentUser) return;
     const canRestartGateways = Boolean(
@@ -8223,9 +9034,11 @@ function AppShell() {
     configRestartSignatureRef.current = signature;
     if (configRestartBusyRef.current) return;
 
-    const targetGateways = gatewayConfigs.filter((g) =>
-      Boolean(gatewayRuntimeStatusesRef.current[String(g.id || "")]?.running)
-    );
+    const targetGateways = gatewayConfigs.filter((g) => {
+      if (!isGatewayRunning(g)) return false;
+      const hasDb = String(g?.database_id || "").trim().length > 0;
+      return hasDb;
+    });
     if (!targetGateways.length) return;
 
     let cancelled = false;
@@ -8289,7 +9102,8 @@ function AppShell() {
     collectionTriggerMode,
     collectionTriggers,
     triggerRules,
-    gatewayRuntimeStatuses
+    gatewayRuntimeStatuses,
+    isGatewayRunning
   ]);
 
   const buildGatewayTxt = (gateway) => {
@@ -10487,9 +11301,9 @@ function AppShell() {
   };
 
   const aggregateReportingRows = (rows, filters) => {
-    const interval = String(filters?.aggregation_interval || "raw");
-    const method = String(filters?.aggregation_method || "avg");
-    if (interval === "raw") return rows;
+    const interval = String(filters?.aggregation_interval || "raw").toLowerCase();
+    const method = String(filters?.aggregation_method || "none").toLowerCase();
+    if (interval === "raw" || interval === "none" || !interval) return rows;
     const grouped = new Map();
     for (const r of rows || []) {
       const tsMs = parseTimestampMs(r?.ts);
@@ -10521,6 +11335,7 @@ function AppShell() {
       const vals = g.values;
       if (!vals.length) continue;
       let value = vals[vals.length - 1];
+      if (method === "none" || method === "last") value = vals[vals.length - 1];
       if (method === "sum") value = vals.reduce((a, n) => a + n, 0);
       else if (method === "min") value = Math.min(...vals);
       else if (method === "max") value = Math.max(...vals);
@@ -10538,14 +11353,14 @@ function AppShell() {
     return out;
   };
 
-  const getReportingRowsForFilters = (filters) => {
+  const filterReportingRowsClient = (rows, filters) => {
     const fromMs = filters?.from ? new Date(filters.from).getTime() : null;
     const toMs = filters?.to ? new Date(filters.to).getTime() : null;
     const batchNeedle = String(filters?.batch || "").trim().toLowerCase();
     const tagSet = new Set((filters?.selected_tags || []).map((x) => String(x)));
     const gwSet = new Set((filters?.selected_gateway_ids || []).map((x) => String(x)));
     const maxRows = Math.max(200, Number(filters?.max_rows || 3000));
-    const filtered = (dataLogView || [])
+    const filtered = (rows || [])
       .filter((r) => {
         const tsMs = new Date(r.ts).getTime();
         if (fromMs && Number.isFinite(fromMs) && tsMs < fromMs) return false;
@@ -10557,6 +11372,36 @@ function AppShell() {
       })
       .slice(0, maxRows);
     return aggregateReportingRows(filtered, filters);
+  };
+
+  const toIsoOrEmpty = (value) => {
+    const txt = String(value || "").trim();
+    if (!txt) return "";
+    const ms = Date.parse(txt);
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
+  };
+
+  const fetchReportingRowsForFilters = async (filters) => {
+    const maxRows = Math.max(200, Number(filters?.max_rows || 3000));
+    const fromUtc = toIsoOrEmpty(filters?.from);
+    const toUtc = toIsoOrEmpty(filters?.to);
+    try {
+      const historianResp = await getAppStoreHistorianRange({
+        fromUtc,
+        toUtc,
+        limit: Math.max(1000, Math.min(50000, maxRows * 8)),
+        offset: 0,
+        preferCloud: false,
+      });
+      const sourceRows = Array.isArray(historianResp?.rows) ? historianResp.rows : [];
+      return filterReportingRowsClient(sourceRows, filters);
+    } catch {
+      const historianResp = await getAppStoreHistorian({
+        limit: Math.max(1000, Math.min(50000, maxRows * 8)),
+      });
+      const sourceRows = Array.isArray(historianResp?.rows) ? historianResp.rows : [];
+      return filterReportingRowsClient(sourceRows, filters);
+    }
   };
 
   const reportSelectedTags = useMemo(() => {
@@ -10842,7 +11687,7 @@ function AppShell() {
     return `GW: ${g} | TAGS: ${t} | AGG: ${agg}/${interval} | ROWS: ${rows.length}`;
   };
 
-  const loadReportingData = (customFilters = null) => {
+  const loadReportingData = async (customFilters = null) => {
     const f = customFilters || reportFilters;
     if (!(f.selected_gateway_ids || []).length) {
       setReportLoadedRows([]);
@@ -10851,14 +11696,23 @@ function AppShell() {
       setReportPreviewDoc(null);
       return [];
     }
-    const rows = getReportingRowsForFilters(f);
-    const tags = (f.selected_tags?.length ? f.selected_tags : reportFilterOptions.tags.slice(0, 6));
-    setReportLoadedRows(rows);
-    setReportLoadedAt(tsNow());
-    setReportSummaryText(buildReportSummary(f, rows, tags));
-    setReportPreviewDoc(null);
-    addAppLog({ level: "info", category: "reporting", message: `Report data loaded: ${rows.length} rows.` });
-    return rows;
+    try {
+      const rows = await fetchReportingRowsForFilters(f);
+      const tags = (f.selected_tags?.length ? f.selected_tags : reportFilterOptions.tags.slice(0, 6));
+      setReportLoadedRows(rows);
+      setReportLoadedAt(tsNow());
+      setReportSummaryText(buildReportSummary(f, rows, tags));
+      setReportPreviewDoc(null);
+      addAppLog({ level: "info", category: "reporting", message: `Report data loaded: ${rows.length} rows.` });
+      return rows;
+    } catch (err) {
+      const msg = String(err?.message || err || "Failed to load reporting data");
+      setReportLoadedRows([]);
+      setReportLoadedAt("");
+      setReportSummaryText(msg);
+      addAppLog({ level: "error", category: "reporting", message: msg });
+      return [];
+    }
   };
 
   const createReportDocument = (format = "csv", customFilters = null, options = {}) => {
@@ -10867,7 +11721,11 @@ function AppShell() {
       setReportSummaryText("Select at least one gateway before generating a report.");
       return null;
     }
-    const rows = customFilters ? getReportingRowsForFilters(f) : (reportLoadedRows.length ? reportLoadedRows : loadReportingData(f));
+    const rows = customFilters ? filterReportingRowsClient(dataLogView || [], f) : reportLoadedRows;
+    if (!rows.length) {
+      setReportSummaryText("Load Data first to generate report.");
+      return null;
+    }
     const tags = (f.selected_tags?.length ? f.selected_tags : reportFilterOptions.tags.slice(0, 6));
     const pivot = (() => {
       const map = new Map();
@@ -12040,13 +12898,138 @@ function AppShell() {
 
   const refreshEdgeLicenseSnapshot = async () => {
     try {
-      const edgeId = String(edgeProfile?.edge_id || "").trim();
-      if (!edgeId) return;
       setEdgeLicenseBusy(true);
-      const out = await checkControlPlaneEdgeLicense(edgeId, currentTenantId || "default");
+      let bootstrapSettings = {};
+      try {
+        const boot = await getAppStoreBootstrap();
+        bootstrapSettings = (boot && typeof boot === "object" && boot.app_settings && typeof boot.app_settings === "object")
+          ? boot.app_settings
+          : {};
+      } catch {
+        bootstrapSettings = {};
+      }
+      const candidateEdgeIds = Array.from(
+        new Set(
+          [
+            String(bootstrapSettings?.edge_id || "").trim(),
+            String(bootstrapSettings?.edge_profile?.edge_id || "").trim(),
+            String(edgeProfile?.edge_id || "").trim(),
+            String(edgeLicenseSnapshot?.edge?.edge_id || "").trim(),
+          ].filter(Boolean)
+        )
+      );
+      if (!candidateEdgeIds.length) return;
+
+      let out = null;
+      for (const eid of candidateEdgeIds) {
+        try {
+          const probe = await checkControlPlaneEdgeLicense(eid, currentTenantId || "default");
+          if (!out) out = probe;
+          const hasUsefulLicense =
+            Boolean(probe?.ok) ||
+            (String(probe?.license?.start_utc || "").trim().length > 0) ||
+            (String(probe?.license?.end_utc || "").trim().length > 0) ||
+            (Array.isArray(probe?.license?.modules) && probe.license.modules.length > 0);
+          if (hasUsefulLicense && String(probe?.reason || "") !== "edge_customer_missing") {
+            out = probe;
+            break;
+          }
+        } catch {
+          // try next candidate
+        }
+      }
+      if (!out) return;
+
+      let resolvedTenant = String(out?.tenant_id || currentTenantId || "default").trim() || "default";
+      let resolvedLicenseId = String(out?.license?.license_id || linkedLicenseId || "").trim();
+      if (!resolvedLicenseId) {
+        resolvedLicenseId = String(bootstrapSettings?.license_id || "").trim();
+      }
+      const bootstrapTenantId = String(bootstrapSettings?.tenant_id || "").trim();
+      const missingLicenseDetails =
+        !String(out?.license?.start_utc || "").trim() ||
+        !String(out?.license?.end_utc || "").trim() ||
+        !Array.isArray(out?.license?.modules) ||
+        (Array.isArray(out?.license?.modules) && out.license.modules.length === 0);
+
+      if (resolvedLicenseId && missingLicenseDetails) {
+        try {
+          let licRow = null;
+          const tenantCandidates = Array.from(
+            new Set(
+              [
+                resolvedTenant,
+                String(currentTenantId || "").trim(),
+                String(tenantLoginRealm || "").trim(),
+                bootstrapTenantId,
+                "default",
+              ].filter(Boolean)
+            )
+          );
+          for (const t of tenantCandidates) {
+            const rowsRes = await getControlPlaneLicenses(t);
+            const rows = Array.isArray(rowsRes?.rows) ? rowsRes.rows : [];
+            const hit = rows.find((r) => String(r?.license_id || "").trim() === resolvedLicenseId);
+            if (hit) {
+              licRow = hit;
+              resolvedTenant = t;
+              break;
+            }
+          }
+          const modsRes = await getControlPlaneLicenseModules(resolvedLicenseId);
+          const modRows = Array.isArray(modsRes?.rows) ? modsRes.rows : [];
+          out = {
+            ...(out || {}),
+            tenant_id: resolvedTenant,
+            license: {
+              ...(out?.license || {}),
+              ...(licRow || {}),
+              license_id: resolvedLicenseId,
+              modules: modRows,
+            },
+          };
+          if (licRow && resolvedTenant && resolvedTenant !== String(currentTenantId || "").trim()) {
+            setCurrentTenantId(resolvedTenant);
+          }
+        } catch {
+          // keep primary snapshot even if enrichment fails
+        }
+      }
+
+      // Authoritative edge id comes from cloud/control-plane. Mirror it locally.
+      const authoritativeEdgeId = String(
+        out?.edge?.edge_id || out?.edge_id || bootstrapSettings?.edge_id || edgeProfile?.edge_id || ""
+      ).trim();
+      if (authoritativeEdgeId && authoritativeEdgeId !== String(edgeProfile?.edge_id || "").trim()) {
+        const nextProfile = {
+          edge_id: authoritativeEdgeId,
+          edge_name: String(out?.edge?.edge_name || edgeProfile?.edge_name || authoritativeEdgeId),
+          location: String(edgeProfile?.location || ""),
+          machine_group: String(edgeProfile?.machine_group || ""),
+          description: String(edgeProfile?.description || ""),
+        };
+        setEdgeProfile(nextProfile);
+        try {
+          await saveAppStoreDomain("app_settings", { edge_profile: nextProfile }, currentUser?.username || "system");
+          setEdgeProfileSaveResult(`Edge ID synchronized to control-plane value: ${authoritativeEdgeId}`);
+        } catch {
+          // runtime update already applied
+        }
+      }
+
       setEdgeLicenseSnapshot(out || null);
+      if (out?.ok) {
+        setLicenseGuardBlocked(false);
+        setLicenseGuardMessage("License active");
+      } else {
+        setLicenseGuardBlocked(true);
+        setLicenseGuardMessage(formatLicenseGuardReason(out?.reason || "license_invalid"));
+      }
+      setLicenseGuardLastCheckedUtc(tsNow());
     } catch {
-      // Keep current UI state if refresh fails.
+      setLicenseGuardBlocked(true);
+      setLicenseGuardMessage("License check unavailable. Verify cloud connectivity and activation.");
+      setLicenseGuardLastCheckedUtc(tsNow());
     } finally {
       setEdgeLicenseBusy(false);
     }
@@ -12073,13 +13056,114 @@ function AppShell() {
     }
   };
 
-  useEffect(() => {
-    if (!currentUser || isHostedWebClient) return;
-    if (activePage !== "edge") return;
-    refreshEdgeLicenseSnapshot();
-  }, [activePage, currentUser, isHostedWebClient, edgeProfile?.edge_id, currentTenantId]);
-
-
+  const activateEdgeFromSettings = async () => {
+    const activationCode = String(edgeActivationCodeInput || "").trim();
+    if (!activationCode) {
+      setEdgeActivationResult("Activation code is required.");
+      return;
+    }
+    setEdgeActivationBusy(true);
+    setEdgeActivationResult("");
+    try {
+      const currentUsername = String(currentUser?.username || "").trim();
+      const currentRole = String(currentUser?.role || "").trim().toLowerCase();
+      const matchedUser = (users || []).find((u) => String(u?.username || "").trim() === currentUsername);
+      const adminUsername = currentRole === "admin" ? (currentUsername || "admin") : "admin";
+      const adminPassword =
+        currentRole === "admin"
+          ? String(currentUser?.password || matchedUser?.password || "")
+          : "";
+      const applyRes = await registerControlPlaneEdgeLink({
+        activation_code: activationCode,
+        edge_id: String(edgeProfile?.edge_id || "").trim(),
+        edge_name: String(edgeProfile?.edge_name || "").trim(),
+        site: String(edgeProfile?.location || ""),
+        area: String(edgeProfile?.machine_group || ""),
+        equipment: "",
+        admin_username: adminUsername,
+        admin_password: adminPassword,
+      });
+      const resolvedRow = applyRes?.row || applyRes || {};
+      const resolvedEdgeId = String(resolvedRow?.edge_id || edgeProfile?.edge_id || "").trim();
+      const resolvedTenantId = String(resolvedRow?.tenant_id || applyRes?.tenant_id || currentTenantId || "default").trim() || "default";
+      if (resolvedTenantId && resolvedTenantId !== String(currentTenantId || "").trim()) {
+        setCurrentTenantId(resolvedTenantId);
+      }
+      if (resolvedEdgeId) {
+        const nextProfile = {
+          edge_id: resolvedEdgeId,
+          edge_name: String(resolvedRow?.edge_name || edgeProfile?.edge_name || resolvedEdgeId),
+          location: String(edgeProfile?.location || ""),
+          machine_group: String(edgeProfile?.machine_group || ""),
+          description: String(edgeProfile?.description || ""),
+        };
+        setEdgeProfile(nextProfile);
+        try {
+          await saveAppStoreDomain("app_settings", { edge_profile: nextProfile }, currentUser?.username || "system");
+          setEdgeProfileSaveResult(`Edge ID synchronized to activated value: ${resolvedEdgeId}`);
+        } catch {
+          // ignore persistence failure; runtime state still updated
+        }
+      }
+      const resolvedCustomerId = String(resolvedRow?.customer_id || applyRes?.customer_id || "").trim();
+      const resolvedLicenseId = String(resolvedRow?.license_id || applyRes?.license_id || "").trim();
+      if (resolvedCustomerId) setLinkedCustomerId(resolvedCustomerId);
+      if (resolvedLicenseId) setLinkedLicenseId(resolvedLicenseId);
+      setEdgeLinked(true);
+      try {
+        localStorage.setItem(EDGE_LINKED_STORAGE_KEY, "true");
+      } catch {
+        // ignore
+      }
+      const licenseOut = await checkControlPlaneEdgeLicense(resolvedEdgeId, resolvedTenantId);
+      setEdgeLicenseSnapshot(licenseOut || null);
+      setLicenseGuardLastCheckedUtc(tsNow());
+      if (licenseOut?.ok) {
+        setLicenseGuardBlocked(false);
+        setLicenseGuardShowActivation(false);
+        setLicenseGuardDismissed(true);
+        setLicenseGuardMessage("License active");
+        setEdgeActivationResult("Activation applied successfully.");
+      } else {
+        setLicenseGuardBlocked(true);
+        setLicenseGuardMessage(formatLicenseGuardReason(licenseOut?.reason || "license_invalid"));
+        setEdgeActivationResult(
+          `Activation applied, but license check still failed: ${formatLicenseGuardReason(licenseOut?.reason || "license_invalid")}`
+        );
+      }
+      setEdgeActivationCodeInput("");
+      await refreshControlPlaneRuntimeContext();
+      await refreshEdgeLicenseSnapshot();
+    } catch (err) {
+      const raw = String(err?.message || err || "");
+      if (raw.includes("activation_code_used")) {
+        try {
+          // Idempotent recovery: code already consumed, so re-read linked scope/license.
+          await refreshControlPlaneRuntimeContext();
+          await refreshEdgeLicenseSnapshot();
+          setLicenseGuardShowActivation(false);
+          setLicenseGuardDismissed(true);
+          setEdgeActivationResult("Activation code already used on this edge. License scope reloaded.");
+          return;
+        } catch {
+          // fall through to normal error message
+        }
+      }
+      const msg =
+        raw.includes("activation_code_not_found")
+          ? "Activation code not found. Verify the exact code and confirm it was issued in the cloud portal."
+          : raw.includes("activation_code_used")
+            ? "Activation code already used. Issue a new code or reuse the same bound edge."
+            : raw.includes("activation_code_expired")
+              ? "Activation code expired. Issue a new activation code."
+              : raw.includes("activation_scope_resolution_failed")
+                ? "Activation scope could not be resolved. Check tenant/customer/license linkage in portal."
+                : raw;
+      setEdgeActivationResult(`Activation failed: ${msg}`);
+    } finally {
+      setEdgeActivationBusy(false);
+    }
+  };
 
   const canManageUsers = Boolean(
     currentUser &&
@@ -12223,7 +13307,10 @@ function AppShell() {
             edgeLinked={edgeLinked}
             theme={theme}
             toggleTheme={toggleTheme}
-            onLoginSuccess={setCurrentUser}
+            onLoginSuccess={(user) => {
+              setCurrentUser(user);
+              setActivePage("dashboard");
+            }}
           />
         </div>
       </div>
@@ -12268,8 +13355,11 @@ function AppShell() {
   const renderLock = (page) => (!canEditPage(page) ? <span className="lock-tag">LOCK</span> : null);
   const appSurface = isPortalOnly ? "portal" : (isHostedWebClient ? "client" : "local");
 
+  const showTopLicenseBanner = !isPortalOnly && currentUser && !isHostedWebClient && !licenseBannerHidden;
   return (
-    <div className={`shell surface-${appSurface} ${useDesktopFramelessHeader ? "desktop-frameless-shell with-window-bar" : ""}`}>
+    <div
+      className={`shell surface-${appSurface} ${useDesktopFramelessHeader ? "desktop-frameless-shell with-window-bar" : ""} ${showTopLicenseBanner ? "with-license-banner" : ""}`}
+    >
       {useDesktopFramelessHeader ? (
         <div className="window-bar-strip">
           <div className="window-bar-left-controls" onMouseDown={stopTopBarDrag}>
@@ -12311,7 +13401,7 @@ function AppShell() {
           </div>
         </div>
         <div className="header-center">
-          {!isPortalOnly && (isHostedWebClient || endpointMode === "cloud") ? (
+          {!isPortalOnly && isHostedWebClient ? (
             <div className="header-cloud-controls">
               <span className="header-cloud-label">Edge</span>
               <select
@@ -12348,6 +13438,14 @@ function AppShell() {
             <BellIcon />
             {criticalAlarmCount > 0 ? <span className="notif-dot">{criticalAlarmCount}</span> : null}
           </button>
+          <button
+            className="icon-btn"
+            title="Reload app"
+            onClick={() => window.location.reload()}
+            aria-label="Reload app"
+          >
+            <ReloadIcon />
+          </button>
           <button className="icon-btn theme-btn" onClick={toggleTheme} title="Toggle light/dark mode">
             <ThemeIcon theme={theme} />
           </button>
@@ -12356,6 +13454,26 @@ function AppShell() {
           </button>
         </div>
       </header>
+      {showTopLicenseBanner ? (
+        <div className={`license-banner ${licenseGuardBlocked ? "license-banner-warning" : "license-banner-ok"}`}>
+          <span className="license-banner-pill">{licenseGuardBlocked ? "LICENSE REQUIRED" : "LICENSE ACTIVE"}</span>
+          <span className="license-banner-text">
+            {licenseGuardBlocked
+              ? licenseGuardMessage || "This edge must be activated with a valid license."
+              : `License valid${licenseGuardLastCheckedUtc ? ` | Checked: ${fmtTs(licenseGuardLastCheckedUtc)}` : ""}`}
+          </span>
+          <div className="license-banner-actions">
+            {licenseGuardBlocked ? (
+              <button className="btn btn-primary btn-sm" onClick={() => setActivePage("edge")}>
+                Activate License
+              </button>
+            ) : null}
+            <button className="btn btn-secondary btn-sm" onClick={() => setLicenseBannerHidden(true)}>
+              Hide
+            </button>
+          </div>
+        </div>
+      ) : null}
 
       <div className={`body ${sidebarCollapsed ? "sidebar-hidden" : ""}`}>
         <aside className={`sidebar ${sidebarCollapsed ? "hidden" : ""}`}>
@@ -12515,19 +13633,150 @@ function AppShell() {
               canEdit={canEditPage("dashboard")}
               widgets={dashboardWidgets}
               setWidgets={setDashboardWidgets}
+              dashboardMode={dashboardMode}
+              dashboardPerRow={dashboardPerRow}
+              dashboardTagColors={dashboardTagColors}
+              setDashboardMode={setDashboardMode}
+              setDashboardPerRow={setDashboardPerRow}
+              setDashboardTagColors={setDashboardTagColors}
               tagRows={tagRows}
               dataLogView={dataLogView}
               formatTagForDisplay={formatTagForDisplay}
               gatewayCatalog={allGatewayOptions}
               tagsByGateway={triggerTagsByGateway}
+              gatewayIntervalsById={Object.fromEntries(
+                (gatewayConfigsView || [])
+                  .map((g) => [String(g?.id || ""), Math.max(200, Number(g?.interval_ms || 1000))])
+                  .filter(([gid]) => gid)
+              )}
               showGridMeta={Boolean(isHostedWebClient || isPortalOnly)}
+              widgetLatencyById={dashboardWidgetLatencyById}
+              diagnosticsSummary={dashboardDiagnosticsSummary}
+              onExportDiagnostics={exportDashboardDiagnostics}
+              onOpenTagMonitor={(widget) => {
+                try {
+                  const cfg = widget?.config || {};
+                  const gatewayId = String(cfg.gateway_id || "");
+                  const tagName = String(cfg.tag_name || "");
+                  if (!gatewayId || !tagName) return;
+                  const gateway =
+                    gatewayConfigsView.find((g) => String(g?.id || "") === gatewayId) ||
+                    powerGatewayDescriptors.find((g) => String(g?.id || "") === gatewayId) ||
+                    null;
+                  const deviceName = String(
+                    devicesView.find((d) => String(d?.id || "") === String(gateway?.device_id || ""))?.name ||
+                      gateway?.name ||
+                      gatewayId
+                  );
+                  const widgetType = String(widget?.type || "");
+                  const preferredChart =
+                    widgetType === "bar_chart"
+                      ? "bar"
+                      : widgetType === "line_area_chart"
+                        ? "area"
+                        : "line";
+                  setTagMonitorSelection({
+                    key: `${gatewayId}::${tagName}`,
+                    tag_name: tagName,
+                    device_name: deviceName,
+                    gateway_id: gatewayId,
+                    gateway_name: String(gateway?.name || gatewayId),
+                    period_ms: Number(gateway?.interval_ms || 1000),
+                    readings_count: Number(cfg.readings_count || 120),
+                    chart_type: preferredChart,
+                    chart_interpolation: String(cfg.interpolation || "stepAfter"),
+                    last_ts: "",
+                  });
+                  setTagMonitorChartType(preferredChart);
+                  setShowTagMonitorModal(true);
+                } catch {}
+              }}
               fetchHistoricalRows={async ({ fromUtc, toUtc, limit = 12000 }) => {
+                const preferCloudReads = Boolean(isHostedWebClient && endpointMode === "cloud");
+                const edgeFilter = preferCloudReads ? cloudEdgeApiFilter : null;
                 const res = await getAppStoreHistorianRange({
                   fromUtc,
                   toUtc,
                   limit,
                   offset: 0,
-                  cloudEdge: cloudEdgeApiFilter,
+                  cloudEdge: edgeFilter,
+                  preferCloud: preferCloudReads,
+                });
+                return Array.isArray(res?.rows) ? res.rows : [];
+              }}
+              fetchWidgetRows={async ({ fromUtc, toUtc, limit = 2000, offset = 0, gateway = "", tag = "", timeoutMs, maxAttempts }) => {
+                const preferCloudReads = Boolean(isHostedWebClient && endpointMode === "cloud");
+                const edgeFilter = preferCloudReads ? cloudEdgeApiFilter : null;
+                const res = await getAppStoreHistorianRange({
+                  fromUtc,
+                  toUtc,
+                  limit,
+                  offset,
+                  gateway,
+                  tag,
+                  cloudEdge: edgeFilter,
+                  preferCloud: preferCloudReads,
+                  timeoutMs,
+                  maxAttempts,
+                });
+                const rows = Array.isArray(res?.rows) ? res.rows : [];
+                if (rows.length > 0 || !String(gateway || "").trim()) return rows;
+                // Fallback: some legacy widget configs store non-canonical gateway keys.
+                // Retry unscoped by gateway to avoid false-empty widgets.
+                const retry = await getAppStoreHistorianRange({
+                  fromUtc,
+                  toUtc,
+                  limit,
+                  offset,
+                  gateway: "",
+                  tag,
+                  cloudEdge: edgeFilter,
+                  preferCloud: preferCloudReads,
+                  timeoutMs,
+                  maxAttempts: 1,
+                });
+                return Array.isArray(retry?.rows) ? retry.rows : rows;
+              }}
+              fetchWidgetStats={async ({ fromUtc, toUtc, gateway = "", tag = "", timeoutMs, maxAttempts }) => {
+                const preferCloudReads = Boolean(isHostedWebClient && endpointMode === "cloud");
+                const edgeFilter = preferCloudReads ? cloudEdgeApiFilter : null;
+                const res = await getAppStoreHistorianStats({
+                  fromUtc,
+                  toUtc,
+                  gateway,
+                  tag,
+                  cloudEdge: edgeFilter,
+                  preferCloud: preferCloudReads,
+                  timeoutMs,
+                  maxAttempts,
+                });
+                const rows = Array.isArray(res?.rows) ? res.rows : [];
+                if (rows.length > 0 || !String(gateway || "").trim()) return rows;
+                // Fallback for stale gateway identifiers saved in widget configs.
+                const retry = await getAppStoreHistorianStats({
+                  fromUtc,
+                  toUtc,
+                  gateway: "",
+                  tag,
+                  cloudEdge: edgeFilter,
+                  preferCloud: preferCloudReads,
+                  timeoutMs,
+                  maxAttempts: 1,
+                });
+                return Array.isArray(retry?.rows) ? retry.rows : rows;
+              }}
+              fetchWidgetRuleStats={async ({ rules = [], fromUtc, toUtc, gateway = "", timeoutMs, maxAttempts }) => {
+                const preferCloudReads = Boolean(isHostedWebClient && endpointMode === "cloud");
+                const edgeFilter = preferCloudReads ? cloudEdgeApiFilter : null;
+                const res = await getAppStoreHistorianRuleStats({
+                  rules,
+                  fromUtc,
+                  toUtc,
+                  gateway,
+                  cloudEdge: edgeFilter,
+                  preferCloud: preferCloudReads,
+                  timeoutMs,
+                  maxAttempts,
                 });
                 return Array.isArray(res?.rows) ? res.rows : [];
               }}
@@ -12617,6 +13866,7 @@ function AppShell() {
                       </select>
                       <div className="power-chart-type-toggle" role="group" aria-label="Main chart type">
                         <button type="button" className={powerMainChartType === "line" ? "active" : ""} onClick={() => setPowerMainChartType("line")}>Line</button>
+                        <button type="button" className={powerMainChartType === "area" ? "active" : ""} onClick={() => setPowerMainChartType("area")}>Area</button>
                         <button type="button" className={powerMainChartType === "bar" ? "active" : ""} onClick={() => setPowerMainChartType("bar")}>Bar</button>
                       </div>
                     </div>
@@ -12667,15 +13917,45 @@ function AppShell() {
                                 />
                               ))}
                           </>
+                        ) : powerMainChartType === "area" ? (
+                          <>
+                            <Area
+                              type="stepAfter"
+                              dataKey="total"
+                              name="Total"
+                              stroke="#16a34a"
+                              fill="#16a34a"
+                              fillOpacity={0.16}
+                              strokeWidth={2}
+                              dot={false}
+                              isAnimationActive={false}
+                            />
+                            {(powerConfig?.devices || [])
+                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")))
+                              .map((d, idx) => (
+                                <Area
+                                  key={`pwr-area-${d.id}`}
+                                  type="stepAfter"
+                                  dataKey={String(d.id)}
+                                  name={String(d.name || d.id)}
+                                  stroke={getSeriesColor(idx)}
+                                  fill={getSeriesColor(idx)}
+                                  fillOpacity={0.1}
+                                  strokeWidth={1.6}
+                                  dot={false}
+                                  isAnimationActive={false}
+                                />
+                              ))}
+                          </>
                         ) : (
                           <>
-                            <Line type="monotone" dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={false} isAnimationActive={false} />
+                            <Line type="stepAfter" dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={false} isAnimationActive={false} />
                             {(powerConfig?.devices || [])
                               .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")))
                               .map((d, idx) => (
                                 <Line
                                   key={`pwr-line-${d.id}`}
-                                  type="monotone"
+                                  type="stepAfter"
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
                                   stroke={getSeriesColor(idx)}
@@ -12702,6 +13982,7 @@ function AppShell() {
                       </select>
                       <div className="power-chart-type-toggle" role="group" aria-label="Side chart type">
                         <button type="button" className={powerSideChartType === "line" ? "active" : ""} onClick={() => setPowerSideChartType("line")}>Line</button>
+                        <button type="button" className={powerSideChartType === "area" ? "active" : ""} onClick={() => setPowerSideChartType("area")}>Area</button>
                         <button type="button" className={powerSideChartType === "bar" ? "active" : ""} onClick={() => setPowerSideChartType("bar")}>Bar</button>
                       </div>
                     </div>
@@ -12741,6 +14022,44 @@ function AppShell() {
                             isAnimationActive={false}
                           />
                         </BarChart>
+                      ) : powerSideChartType === "area" ? (
+                        <AreaChart data={powerSideChartData.rows} margin={{ top: 10, right: 14, left: 8, bottom: 44 }}>
+                          <XAxis
+                            dataKey="ts"
+                            ticks={powerSideXAxisTicks}
+                            minTickGap={22}
+                            interval="preserveStartEnd"
+                            allowDuplicatedCategory={false}
+                            height={56}
+                            tickMargin={14}
+                            tickFormatter={formatPowerSideXAxisTick}
+                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                            axisLine={{ stroke: powerChartAxisColor }}
+                            tickLine={{ stroke: powerChartAxisColor }}
+                          />
+                          <YAxis
+                            width={64}
+                            domain={powerSideYDomain}
+                            ticks={buildYAxisTicks(powerSideYDomain, 0.5, 12)}
+                            tickFormatter={(v) => formatChartValue(v, 3)}
+                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                            axisLine={{ stroke: powerChartAxisColor }}
+                            tickLine={{ stroke: powerChartAxisColor }}
+                          />
+                          <Tooltip formatter={(v) => formatChartValue(v, 3)} />
+                          <Area
+                            key="pwr-side-area-total-kwh"
+                            type="stepAfter"
+                            dataKey="total_kwh"
+                            name="Total kWh"
+                            stroke={getSeriesColor(0)}
+                            fill={getSeriesColor(0)}
+                            fillOpacity={0.16}
+                            strokeWidth={2}
+                            dot={false}
+                            isAnimationActive={false}
+                          />
+                        </AreaChart>
                       ) : (
                         <LineChart data={powerSideChartData.rows} margin={{ top: 10, right: 14, left: 8, bottom: 44 }}>
                           <XAxis
@@ -12768,7 +14087,7 @@ function AppShell() {
                           <Tooltip formatter={(v) => formatChartValue(v, 3)} />
                           <Line
                             key="pwr-side-line-total-kwh"
-                            type="monotone"
+                            type="stepAfter"
                             dataKey="total_kwh"
                             name="Total kWh"
                             stroke={getSeriesColor(0)}
@@ -13148,10 +14467,11 @@ function AppShell() {
                   {gatewayConfigsView.map((g) => {
                     const dbName = dbConnections.find((db) => db.id === g.database_id)?.name || "-";
                     const deviceName = devices.find((d) => d.id === g.device_id)?.name || "-";
-                    const runtimeStatus = gatewayRuntimeStatuses[g.id] || null;
+                    const runtimeStatus = resolveGatewayRuntimeStatus(g);
                     const running = Boolean(runtimeStatus?.running);
                     const pending = Number(runtimeStatus?.db_pending_count || 0);
                     const writes = Number(runtimeStatus?.db_write_count || 0);
+                    const configuredIntervalMs = Number(g.interval_ms || 0);
                     const statusKey = runtimeStatus?.db_last_error ? "offline" : running ? "online" : "warning";
                     const statusText = running ? "RUNNING" : "STOPPED";
                     return (
@@ -13166,7 +14486,7 @@ function AppShell() {
                         <span>{g.gateway_type}</span>
                         <span>{g.gateway_type === "siemens_opcua" ? (g.opc_url || "-") : (g.plc_ip || "-")}</span>
                         <span>{dbName}</span>
-                        <span>{g.interval_ms} ms</span>
+                        <span>{`${configuredIntervalMs} ms`}</span>
                         <span>
                           <div className={`status-pill status-${statusKey}`}>{statusText}</div>
                           <div className="muted status-sub">
@@ -14212,6 +15532,31 @@ function AppShell() {
                   </button>
                 </div>
                 <div className="form-grid">
+                  <label className="form-span-2">
+                    Activation Code
+                    <input
+                      value={edgeActivationCodeInput}
+                      onChange={(e) => setEdgeActivationCodeInput(e.target.value)}
+                      placeholder="Paste activation code"
+                      disabled={!canEditPage("edge") || edgeActivationBusy}
+                    />
+                  </label>
+                </div>
+                <div className="row" style={{ marginTop: 8, gap: 8 }}>
+                  <button
+                    className="btn btn-primary"
+                    onClick={activateEdgeFromSettings}
+                    disabled={!canEditPage("edge") || edgeActivationBusy}
+                  >
+                    {edgeActivationBusy ? "Activating..." : "Activate License"}
+                  </button>
+                </div>
+                {edgeActivationResult ? (
+                  <div className={edgeActivationResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 8 }}>
+                    {edgeActivationResult}
+                  </div>
+                ) : null}
+                <div className="form-grid">
                   <label>
                     Status
                     <input value={String(edgeLicenseSnapshot?.license?.status || edgeLicenseSnapshot?.reason || "-")} disabled />
@@ -14228,6 +15573,10 @@ function AppShell() {
                     Activated Date
                     <input value={String(edgeLicenseSnapshot?.edge?.updated_utc || "-")} disabled />
                   </label>
+                  <label>
+                    Last Check
+                    <input value={String(licenseGuardLastCheckedUtc ? fmtTs(licenseGuardLastCheckedUtc) : "-")} disabled />
+                  </label>
                 </div>
                 <label>
                   Enabled Modules
@@ -14235,6 +15584,7 @@ function AppShell() {
                     rows={3}
                     disabled
                     value={(Array.isArray(edgeLicenseSnapshot?.license?.modules) ? edgeLicenseSnapshot.license.modules : [])
+                      .filter((m) => (m?.enabled === undefined ? true : Boolean(m?.enabled)))
                       .map((m) => String(m?.module_key || m?.key || "").trim())
                       .filter(Boolean)
                       .join(", ") || "-"}
@@ -14675,6 +16025,17 @@ function AppShell() {
 
           {activePage === "scheduled_reports" ? (
             <>
+              <ScheduledReportsManager
+                gatewayOptions={allGatewayOptions || []}
+                tagsByGateway={triggerTagsByGateway || {}}
+                emailSettings={buildEmailTransportPayload(emailSettings || {})}
+                formatTagForDisplay={formatTagForDisplay}
+                onNotify={(n) => {
+                  if (n?.type === "error") setError(String(n.message || ""));
+                }}
+              />
+              <details className="legacy-scheduled-reports-fallback">
+                <summary>Legacy: old schedule editor (read-only)</summary>
               <section className="page-tools">
                 <button className="btn btn-primary icon-text-btn" onClick={openScheduleCreate} disabled={!canEditPage("scheduled_reports")}>
                   <AddIcon />
@@ -14784,6 +16145,7 @@ function AppShell() {
                     ))}
                 </div>
               </section>
+              </details>
             </>
           ) : null}
 
@@ -15453,10 +16815,11 @@ function AppShell() {
                         {!cpWorkspaceCollapsed.users ? (
                         <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
                           <div className="table cp-workspace-table">
-                            <div className="thead"><span>User</span><span>Role</span><span>Status</span><span>Actions</span></div>
+                            <div className="thead"><span>User</span><span>Company</span><span>Role</span><span>Status</span><span>Actions</span></div>
                             {cpUsersFiltered.slice(0, 8).map((row, idx) => (
                               <div className="trow" key={`ws-user-${idx}`}>
                                 <span>{String(row?.username || "-")}</span>
+                                <span>{String(customerNameById.get(String(row?.customer_id || "").trim()) || (row?.customer_id ? String(row.customer_id) : "-"))}</span>
                                 <span>{String(row?.role || "-")}</span>
                                 <span>{String(row?.status || "-")}</span>
                                 <span className="row-actions">
@@ -15662,11 +17025,12 @@ function AppShell() {
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table cp-users-table">
-                          <div className="thead"><span><input type="checkbox" checked={cpUsersFiltered.length > 0 && cpUsersFiltered.every((row) => isCpRowSelected("users", row?.username))} onChange={(e) => setCpRowsSelectedAll("users", cpUsersFiltered, (row) => row?.username, e.target.checked)} /></span><span>Username</span><span>Role</span><span>Email</span><span>Status</span><span>MFA</span><span>Actions</span></div>
+                          <div className="thead"><span><input type="checkbox" checked={cpUsersFiltered.length > 0 && cpUsersFiltered.every((row) => isCpRowSelected("users", row?.username))} onChange={(e) => setCpRowsSelectedAll("users", cpUsersFiltered, (row) => row?.username, e.target.checked)} /></span><span>Username</span><span>Company</span><span>Role</span><span>Email</span><span>Status</span><span>MFA</span><span>Actions</span></div>
                           {(cpUsersFiltered || []).map((row, idx) => (
                             <div className="trow" key={`cp-user-${idx}`}>
                               <span><input type="checkbox" checked={isCpRowSelected("users", row?.username)} onChange={(e) => setCpRowSelected("users", row?.username, e.target.checked)} disabled={String(row?.username || "").toLowerCase() === "admin"} /></span>
                               <span>{String(row?.username || "-")}</span>
+                              <span>{String(customerNameById.get(String(row?.customer_id || "").trim()) || (row?.customer_id ? String(row.customer_id) : "-"))}</span>
                               <span>{String(row?.role || "-")}</span>
                               <span>{String(row?.email || "-")}</span>
                               <span>{String(row?.status || "-")}</span>
@@ -15676,7 +17040,7 @@ function AppShell() {
                               </span>
                             </div>
                           ))}
-                          {!cpUsersFiltered?.length ? <div className="trow"><span>-</span><span>-</span><span>No users found</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpUsersFiltered?.length ? <div className="trow"><span>-</span><span>-</span><span>-</span><span>No users found</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
                     </section>
@@ -16391,6 +17755,17 @@ function AppShell() {
 
           {activePage === "reporting" ? (
             <div className="page-fill single reporting-page-flat">
+              <ReportTemplateDesigner
+                gatewayOptions={allGatewayOptions || []}
+                tagsByGateway={triggerTagsByGateway || {}}
+                emailSettings={buildEmailTransportPayload(emailSettings || {})}
+                formatTagForDisplay={formatTagForDisplay}
+                onNotify={(n) => {
+                  if (n?.type === "error") setError(String(n.message || ""));
+                }}
+              />
+              <details className="legacy-reporting-fallback">
+                <summary>Legacy: ad-hoc filter-based reports</summary>
               <div className="reporting-workspace reporting-workspace-40-60">
                 <div className="reporting-left">
                   <section className="card">
@@ -16415,6 +17790,7 @@ function AppShell() {
                       <label>
                         Interval
                         <select value={reportFilters.aggregation_interval || "raw"} onChange={(e) => setReportFilters((p) => ({ ...p, aggregation_interval: e.target.value }))}>
+                          <option value="none">None</option>
                           <option value="raw">Raw</option>
                           <option value="second">Second</option>
                           <option value="minute">Minute</option>
@@ -16424,12 +17800,13 @@ function AppShell() {
                       </label>
                       <label>
                         Aggregation
-                        <select value={reportFilters.aggregation_method || "avg"} onChange={(e) => setReportFilters((p) => ({ ...p, aggregation_method: e.target.value }))}>
+                        <select value={reportFilters.aggregation_method || "none"} onChange={(e) => setReportFilters((p) => ({ ...p, aggregation_method: e.target.value }))}>
+                          <option value="none">None</option>
+                          <option value="last">LAST</option>
                           <option value="avg">AVG</option>
                           <option value="sum">SUM</option>
                           <option value="min">MIN</option>
                           <option value="max">MAX</option>
-                          <option value="last">LAST</option>
                         </select>
                       </label>
                     </div>
@@ -16615,6 +17992,7 @@ function AppShell() {
                   </section>
                 </div>
               </div>
+              </details>
             </div>
           ) : null}
           </div>
@@ -16625,9 +18003,15 @@ function AppShell() {
                 <div className="gateway-footer-head">
                   <span>Gateway Name</span><span>IP Address</span><span>Status</span><span>Interval</span><span>Database Writing Status</span><span>Actions</span>
                 </div>
-                {gatewayConfigsView.map((g) => {
+                {[
+                  ...(gatewayConfigsView || []),
+                  ...(powerGatewayDescriptors || []).filter(
+                    (pg) => !(gatewayConfigsView || []).some((g) => String(g?.id || "") === String(pg?.id || ""))
+                  ),
+                ].map((g) => {
                 const health = getGatewayHealth(g);
                 const running = isGatewayRunning(g);
+                const intervalInfo = getGatewayIntervalRuntimeInfo(g);
                 return (
                   <div key={`footer-${g.id}`} className="gateway-footer-row">
                     <span className="gateway-footer-cell" title={g.name}>{g.name}</span>
@@ -16638,7 +18022,11 @@ function AppShell() {
                         {running ? "RUNNING" : "STOPPED"}
                       </span>
                     </span>
-                    <span className="gateway-footer-cell">{Number(g.interval_ms || 0)} ms</span>
+                    <span className="gateway-footer-cell">
+                      <span className={intervalInfo.mismatch ? "gateway-interval-mismatch" : ""}>
+                        {intervalInfo.text}
+                      </span>
+                    </span>
                     <span className="gateway-footer-cell" title={getGatewayFooterDbWriting(g)}>{getGatewayFooterDbWriting(g)}</span>
                     <span className="row-actions gateway-footer-actions">
                       <button
@@ -16652,47 +18040,6 @@ function AppShell() {
                       <button
                         className={`icon-btn table-action-btn footer-action-btn ${running ? "icon-btn-stop" : ""}`}
                         onClick={() => stopGatewayProfile(g.id)}
-                        disabled={!canControlGateways || !running}
-                        title={!running ? "Gateway is stopped" : "Stop gateway"}
-                      >
-                        <StopIcon />
-                      </button>
-                    </span>
-                  </div>
-                );
-              })}
-              {(powerConfig?.devices || []).map((d) => {
-                const did = String(d?.id || "");
-                const st = powerDeviceStatuses[did] || {};
-                // Runtime state must come from backend status, not static config flag.
-                const running = Boolean(st?.running);
-                const connected = Boolean(st?.connected);
-                const powerText = formatMetricValue(Number(st?.active_power_w || st?.active_power_total_w || 0) / 1000.0, 3);
-                const pending = Number(st?.pending_count || st?.outbox_pending || 0);
-                return (
-                  <div key={`footer-power-${did}`} className="gateway-footer-row">
-                    <span className="gateway-footer-cell" title={String(d?.name || did)}>{String(d?.name || did)}</span>
-                    <span className="gateway-footer-cell" title={`${String(d?.ip || "-")}:${Number(d?.port || 502)}`}>{`${String(d?.ip || "-")}:${Number(d?.port || 502)}`}</span>
-                    <span className="gateway-footer-cell">
-                      <span className={`status-pill ${connected ? "status-online" : "status-warning"}`}>{connected ? "Connected" : "Device Fails"}</span>
-                      <span className={`status-pill ${running ? "status-online" : "status-offline"}`} style={{ marginLeft: 6 }}>
-                        {running ? "RUNNING" : "STOPPED"}
-                      </span>
-                    </span>
-                    <span className="gateway-footer-cell">{Number(d?.poll_interval_ms || 1000)} ms</span>
-                    <span className="gateway-footer-cell" title={`Power ${powerText} kW | Pending ${pending}`}>{`Power ${powerText} kW | Pending ${pending}`}</span>
-                    <span className="row-actions gateway-footer-actions">
-                      <button
-                        className={`icon-btn table-action-btn footer-action-btn ${running ? "" : "icon-btn-start"}`}
-                        onClick={() => setPowerDeviceRunning(did, true)}
-                        disabled={!canControlGateways || running}
-                        title={running ? "Gateway already running" : "Start gateway"}
-                      >
-                        <StartIcon />
-                      </button>
-                      <button
-                        className={`icon-btn table-action-btn footer-action-btn ${running ? "icon-btn-stop" : ""}`}
-                        onClick={() => setPowerDeviceRunning(did, false)}
                         disabled={!canControlGateways || !running}
                         title={!running ? "Gateway is stopped" : "Stop gateway"}
                       >
@@ -16718,6 +18065,84 @@ function AppShell() {
           ) : null}
         </main>
       </div>
+      {!isPortalOnly && currentUser && !isHostedWebClient && licenseGuardBlocked && !licenseGuardDismissed ? (
+        <div className="modal-backdrop license-guard-backdrop">
+          <div className="modal-card license-guard-modal">
+            <div className="license-guard-head">
+              <h3>License Activation Required</h3>
+              <div className="license-guard-head-actions">
+                <span className="license-banner-pill">LOCKED</span>
+                <button
+                  className="license-guard-close"
+                  type="button"
+                  aria-label="Close"
+                  title="Close"
+                  onClick={() => setLicenseGuardDismissed(true)}
+                  disabled={edgeActivationBusy}
+                >
+                  X
+                </button>
+              </div>
+            </div>
+            <p className="license-guard-message">
+              {licenseGuardMessage || "This edge app is not activated with a valid license. Activate to continue using the software."}
+            </p>
+            <div className="form-grid">
+              <label>
+                Last Check
+                <input value={String(licenseGuardLastCheckedUtc ? fmtTs(licenseGuardLastCheckedUtc) : "-")} disabled />
+              </label>
+            </div>
+            {licenseGuardShowActivation ? (
+              <div className="license-guard-activate">
+                <label>
+                  Activation Code
+                  <input
+                    value={edgeActivationCodeInput}
+                    onChange={(e) => setEdgeActivationCodeInput(e.target.value)}
+                    placeholder="Paste activation code"
+                    disabled={edgeActivationBusy}
+                  />
+                </label>
+                {edgeActivationResult ? (
+                  <div className={edgeActivationResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 8 }}>
+                    {edgeActivationResult}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+            <div className="modal-actions license-guard-actions">
+              {licenseGuardShowActivation ? (
+                <button
+                  className="btn btn-primary btn-sm"
+                  type="button"
+                  onClick={activateEdgeFromSettings}
+                  disabled={edgeActivationBusy}
+                >
+                  {edgeActivationBusy ? "Activating..." : "Confirm Activation"}
+                </button>
+              ) : null}
+              {!licenseGuardShowActivation ? (
+                <button className="btn btn-secondary btn-sm" type="button" onClick={runLicenseComplianceCheck} disabled={edgeActivationBusy}>
+                  Re-check License
+                </button>
+              ) : null}
+              <button
+                className="btn btn-primary btn-sm"
+                type="button"
+                onClick={() => {
+                  setActivePage("edge");
+                  setLicenseGuardShowActivation((v) => !v);
+                  setEdgeActivationResult("");
+                }}
+                disabled={edgeActivationBusy}
+              >
+                {licenseGuardShowActivation ? "Hide Activation" : "Activate"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {reportPreviewDoc ? (
         <div className="modal-backdrop">
           <div className="modal-card reporting-preview-modal">
@@ -16741,13 +18166,15 @@ function AppShell() {
             <div className="row trend-header-row">
               <h3>Tag Monitor</h3>
               <div className="row tag-monitor-header-actions">
-                <button
+                <select
                   className="btn btn-primary btn-sm"
-                  onClick={() => setTagMonitorChartType((t) => (t === "line" ? "bar" : "line"))}
-                  type="button"
+                  value={tagMonitorChartType}
+                  onChange={(e) => setTagMonitorChartType(String(e.target.value || "line"))}
                 >
-                  {tagMonitorChartType === "line" ? "Bar View" : "Line View"}
-                </button>
+                  <option value="line">Line View</option>
+                  <option value="area">Area View</option>
+                  <option value="bar">Bar View</option>
+                </select>
                 <button
                   className="modal-close-btn"
                   onClick={() => setShowTagMonitorModal(false)}
@@ -16811,8 +18238,40 @@ function AppShell() {
                       labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)}
                       formatter={(v) => formatChartValue(v, 3)}
                     />
-                    <Line isAnimationActive={false} type="linear" dataKey="value" stroke={tagMonitorColor} strokeWidth={2} dot={false} />
+                    <Line
+                      isAnimationActive={false}
+                      type={String(tagMonitorSelection?.chart_interpolation || "stepAfter")}
+                      dataKey="value"
+                      stroke={tagMonitorColor}
+                      strokeWidth={2}
+                      dot={false}
+                    />
                   </LineChart>
+                </ResponsiveContainer>
+              ) : tagMonitorChartType === "area" ? (
+                <ResponsiveContainer width="100%" height={260}>
+                  <AreaChart data={tagMonitorSeries} margin={{ top: 8, right: 18, left: 24, bottom: 8 }}>
+                    <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={tagMonitorXDomain} allowDataOverflow />
+                    <YAxis
+                      width={52}
+                      domain={tagMonitorDomain}
+                      ticks={buildYAxisTicks(tagMonitorDomain, 0.5, 12)}
+                      tickFormatter={(v) => formatChartValue(v, 3)}
+                    />
+                    <Tooltip
+                      labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)}
+                      formatter={(v) => formatChartValue(v, 3)}
+                    />
+                    <Area
+                      isAnimationActive={false}
+                      type={String(tagMonitorSelection?.chart_interpolation || "stepAfter")}
+                      dataKey="value"
+                      stroke={tagMonitorColor}
+                      fill={tagMonitorColor}
+                      fillOpacity={0.22}
+                      strokeWidth={2}
+                    />
+                  </AreaChart>
                 </ResponsiveContainer>
               ) : (
                 <ResponsiveContainer width="100%" height={260}>

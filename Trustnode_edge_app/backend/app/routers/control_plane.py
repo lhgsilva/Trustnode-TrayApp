@@ -114,6 +114,8 @@ class ActivationCodeApplyRequest(BaseModel):
     site: str = ""
     area: str = ""
     equipment: str = ""
+    admin_username: str = "admin"
+    admin_password: str = ""
 
 
 class ActivationCodeUpdateRequest(BaseModel):
@@ -138,6 +140,13 @@ class EdgeLocalFinalizeRequest(BaseModel):
     edge_name: str = ""
     customer_id: str = ""
     license_id: str = ""
+    license_status: str = "active"
+    license_plan_code: str = "standard"
+    license_start_utc: str = ""
+    license_end_utc: str = ""
+    license_max_edges: int = 0
+    license_max_users: int = 0
+    license_modules: list[dict[str, Any]] = Field(default_factory=list)
     cloud_api_url: str = ""
     primary_domain: str = ""
     admin_username: str = "admin"
@@ -821,8 +830,10 @@ def edge_link_bootstrap(payload: ActivationCodeApplyRequest, request: Request) -
     except Exception as exc:
         if "activation_code_not_found" in str(exc or "") and cloud_url and (not _is_same_origin_as_request(cloud_url, request)):
             try:
+                safe_admin_username = str(getattr(payload, "admin_username", "admin") or "admin").strip() or "admin"
+                safe_admin_password = str(getattr(payload, "admin_password", "") or "")
                 upstream = requests.post(
-                    f"{cloud_url}/api/control-plane/edge-link/register",
+                    f"{cloud_url}/api/control-plane/edge-link/bootstrap",
                     json={
                         "activation_code": payload.activation_code,
                         "edge_id": payload.edge_id,
@@ -830,17 +841,33 @@ def edge_link_bootstrap(payload: ActivationCodeApplyRequest, request: Request) -
                         "site": payload.site,
                         "area": payload.area,
                         "equipment": payload.equipment,
-                        "admin_username": payload.admin_username,
-                        "admin_password": payload.admin_password,
+                        "admin_username": safe_admin_username,
+                        "admin_password": safe_admin_password,
                     },
                     headers={"Content-Type": "application/json"},
                     timeout=20,
                 )
                 if 200 <= upstream.status_code < 300:
                     data = upstream.json()
+                    row = data.get("row") if isinstance(data, dict) and isinstance(data.get("row"), dict) else (data if isinstance(data, dict) else {})
+                    if isinstance(row, dict):
+                        tid = normalize_tenant_id(str(row.get("tenant_id") or "default"))
+                        eid = str(row.get("edge_id") or payload.edge_id or "").strip()
+                        if eid:
+                            control_plane_store.upsert_edge(
+                                tenant_id=tid,
+                                edge_id=eid,
+                                edge_name=str(row.get("edge_name") or payload.edge_name or eid),
+                                customer_id=str(row.get("customer_id") or "").strip(),
+                                site=str(row.get("site") or payload.site or ""),
+                                area=str(row.get("area") or payload.area or ""),
+                                equipment=str(row.get("equipment") or payload.equipment or ""),
+                                status="active",
+                                metadata={"activated_via": "code", "source": "cloud_bootstrap_proxy"},
+                            )
                     if isinstance(data, dict) and data.get("ok"):
-                        return data
-                    return {"ok": True, "row": data}
+                        return {"ok": True, "row": row}
+                    return {"ok": True, "row": row}
                 try:
                     detail = (upstream.json() or {}).get("detail")
                 except Exception:
@@ -917,6 +944,46 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                     if isinstance(data, dict) and data.get("ok"):
                         proxied_row = dict(data)
                         upstream_tenant_id, upstream_customer_id, upstream_license_id = _extract_scope_from_upstream(proxied_row)
+                        upstream_license_obj: dict[str, Any] = {"license_id": str(upstream_license_id or data.get("license_id") or "")}
+                        # Enrich proxied license payload with full cloud license details/modules so local finalize
+                        # can persist start/end and module entitlements immediately.
+                        try:
+                            if cloud_url and upstream_license_obj.get("license_id"):
+                                tenant_q = str(upstream_tenant_id or "default")
+                                auth = str(request.headers.get("Authorization") or "").strip()
+                                fwd_headers = {"Content-Type": "application/json"}
+                                if auth:
+                                    fwd_headers["Authorization"] = auth
+                                lic_res = requests.get(
+                                    f"{cloud_url}/api/control-plane/licenses?tenant_id={requests.utils.quote(tenant_q, safe='')}",
+                                    headers=fwd_headers,
+                                    timeout=15,
+                                )
+                                if 200 <= lic_res.status_code < 300:
+                                    rows = (lic_res.json() or {}).get("rows") if lic_res.text else []
+                                    if isinstance(rows, list):
+                                        hit = next(
+                                            (
+                                                r
+                                                for r in rows
+                                                if str((r or {}).get("license_id") or "").strip()
+                                                == str(upstream_license_obj.get("license_id") or "").strip()
+                                            ),
+                                            None,
+                                        )
+                                        if isinstance(hit, dict):
+                                            upstream_license_obj.update(hit)
+                                mod_res = requests.get(
+                                    f"{cloud_url}/api/control-plane/licenses/{requests.utils.quote(str(upstream_license_obj.get('license_id') or ''), safe='')}/modules",
+                                    headers=fwd_headers,
+                                    timeout=15,
+                                )
+                                if 200 <= mod_res.status_code < 300:
+                                    mod_rows = (mod_res.json() or {}).get("rows") if mod_res.text else []
+                                    if isinstance(mod_rows, list):
+                                        upstream_license_obj["modules"] = mod_rows
+                        except Exception:
+                            pass
                         row = {
                             "tenant_id": str(upstream_tenant_id or "default"),
                             "customer_id": str(upstream_customer_id or ""),
@@ -927,7 +994,7 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                             "equipment": str(data.get("equipment") or payload.equipment or ""),
                             "primary_domain": str(data.get("primary_domain") or ""),
                             "cloud_api_url": str(data.get("cloud_api_url") or cloud_url or ""),
-                            "license": {"license_id": str(upstream_license_id or data.get("license_id") or "")},
+                            "license": upstream_license_obj,
                             "app_settings_patch": {},
                         }
                     else:
@@ -1030,6 +1097,10 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
         if not resolved_license_id:
             scope_incomplete = True
             scope_warnings.append("license_id_missing")
+        if scope_incomplete:
+            raise ValueError(
+                "activation_scope_resolution_failed:" + ",".join(scope_warnings)
+            )
         # Create/refresh tenant admin in control-plane auth store.
         # This is mandatory for first login after activation.
         local_user_row = control_plane_store.upsert_user(
@@ -1046,6 +1117,8 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
         )
         if not local_user_row:
             raise ValueError("activation_admin_user_create_failed_local")
+        if str(local_user_row.get("customer_id") or "").strip() != resolved_customer_id:
+            raise ValueError("activation_admin_user_scope_mismatch")
 
         # When activation was proxied to cloud control-plane, force cloud-side user upsert too.
         # This guarantees portal users list + hosted login can immediately authenticate.
@@ -1157,6 +1230,15 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
             details={"edge_id": payload.edge_id, "admin_username": admin_username},
         )
+        response_license = dict(row.get("license") or {})
+        response_license_id = str(response_license.get("license_id") or resolved_license_id or "").strip()
+        local_modules = (
+            control_plane_store.list_license_modules(license_id=response_license_id)
+            if response_license_id
+            else []
+        )
+        existing_modules = response_license.get("modules") if isinstance(response_license.get("modules"), list) else []
+        response_license["modules"] = local_modules or existing_modules or []
         return {
             "ok": True,
             "tenant_id": tenant_id,
@@ -1164,6 +1246,7 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             "edge_name": str(row.get("edge_name") or payload.edge_name or payload.edge_id),
             "customer_id": resolved_customer_id,
             "license_id": resolved_license_id,
+            "license": response_license,
             "cloud_api_url": str(row.get("cloud_api_url") or ""),
             "primary_domain": str(row.get("primary_domain") or ""),
             "site": str(row.get("site") or payload.site or ""),
@@ -1175,6 +1258,128 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             "cloud_user_sync_error": cloud_user_sync_error,
         }
     except Exception as exc:
+        # Idempotent recovery: allow re-link using an already consumed activation code.
+        if "activation_code_used" in str(exc or ""):
+            try:
+                activation_row = control_plane_store.get_activation_code_row(activation_code=payload.activation_code) or {}
+                tenant_id = normalize_tenant_id(str(activation_row.get("tenant_id") or get_current_tenant()))
+                resolved_edge_id = str(activation_row.get("edge_id") or payload.edge_id or "").strip()
+                resolved_customer_id = str(activation_row.get("customer_id") or "").strip()
+                resolved_license_id = str(activation_row.get("license_id") or "").strip()
+                if not resolved_edge_id:
+                    raise ValueError("edge_id_missing_for_used_activation_code")
+
+                control_plane_store.upsert_edge(
+                    tenant_id=tenant_id,
+                    edge_id=resolved_edge_id,
+                    edge_name=str(activation_row.get("edge_name") or payload.edge_name or resolved_edge_id),
+                    customer_id=resolved_customer_id,
+                    site=str(payload.site or ""),
+                    area=str(payload.area or ""),
+                    equipment=str(payload.equipment or ""),
+                    status="active",
+                    metadata={"source": "activation_code_used_relink", "license_id": resolved_license_id},
+                )
+
+                # Cloud bootstrap is public (activation-code based) and can return authoritative
+                # license start/end/modules even when activation code has already been consumed.
+                try:
+                    cloud_url = _resolve_cloud_control_plane_base(request)
+                    if cloud_url and (not _is_same_origin_as_request(cloud_url, request)):
+                        b = requests.post(
+                            f"{cloud_url}/api/control-plane/edge-link/bootstrap",
+                            json={
+                                "activation_code": payload.activation_code,
+                                "edge_id": resolved_edge_id,
+                                "edge_name": str(activation_row.get("edge_name") or payload.edge_name or resolved_edge_id),
+                                "site": str(payload.site or ""),
+                                "area": str(payload.area or ""),
+                                "equipment": str(payload.equipment or ""),
+                            },
+                            headers={"Content-Type": "application/json"},
+                            timeout=20,
+                        )
+                        if 200 <= b.status_code < 300:
+                            data = b.json() if b.text else {}
+                            brow = data.get("row") if isinstance(data, dict) and isinstance(data.get("row"), dict) else (data if isinstance(data, dict) else {})
+                            lic_obj = brow.get("license") if isinstance(brow.get("license"), dict) else {}
+                            lic_id = str(lic_obj.get("license_id") or resolved_license_id or "").strip()
+                            if lic_id:
+                                control_plane_store.upsert_license(
+                                    tenant_id=tenant_id,
+                                    license_id=lic_id,
+                                    customer_id=resolved_customer_id,
+                                    plan_code=str(lic_obj.get("plan_code") or "standard"),
+                                    status=str(lic_obj.get("status") or "active"),
+                                    start_utc=str(lic_obj.get("start_utc") or ""),
+                                    end_utc=str(lic_obj.get("end_utc") or ""),
+                                    max_edges=max(0, int(lic_obj.get("max_edges") or 0)),
+                                    max_users=max(0, int(lic_obj.get("max_users") or 0)),
+                                    metadata={"source": "activation_code_used_relink_bootstrap"},
+                                )
+                                if isinstance(lic_obj.get("modules"), list):
+                                    control_plane_store.set_license_modules(
+                                        license_id=lic_id,
+                                        modules=list(lic_obj.get("modules") or []),
+                                    )
+                                resolved_license_id = lic_id
+                except Exception:
+                    pass
+
+                control_plane_store.upsert_user(
+                    tenant_id=tenant_id,
+                    customer_id=resolved_customer_id,
+                    username=admin_username,
+                    password=admin_password,
+                    role="admin",
+                    status="active",
+                    email="",
+                    mfa_enabled=False,
+                    modules=[],
+                    permissions={},
+                )
+
+                app_store.save_bootstrap(
+                    {
+                        "app_settings": {
+                            "tenant_login_realm": tenant_id,
+                            "tenant_id": tenant_id,
+                            "edge_id": resolved_edge_id,
+                            "edge_name": str(activation_row.get("edge_name") or payload.edge_name or resolved_edge_id),
+                            "customer_id": resolved_customer_id,
+                            "license_id": resolved_license_id,
+                            "edge_linked": True,
+                        },
+                        "users_access": {
+                            "current_user": admin_username,
+                        },
+                    },
+                    actor=f"edge_register_relink:{admin_username}",
+                )
+                telemetry_service.configure_from_bootstrap({"data": app_store.get_bootstrap(prefer_cloud_reads=False)})
+
+                lic_rows = control_plane_store.list_licenses(tenant_id=tenant_id) or []
+                lic = next((r for r in lic_rows if str(r.get("license_id") or "").strip() == resolved_license_id), {}) if resolved_license_id else {}
+                lic_modules = control_plane_store.list_license_modules(license_id=resolved_license_id) if resolved_license_id else []
+                license_payload = dict(lic or {})
+                license_payload.setdefault("license_id", resolved_license_id)
+                license_payload["modules"] = lic_modules
+
+                return {
+                    "ok": True,
+                    "tenant_id": tenant_id,
+                    "edge_id": resolved_edge_id,
+                    "edge_name": str(activation_row.get("edge_name") or payload.edge_name or resolved_edge_id),
+                    "customer_id": resolved_customer_id,
+                    "license_id": resolved_license_id,
+                    "license": license_payload,
+                    "scope_incomplete": False,
+                    "scope_warnings": [],
+                    "cloud_user_sync_ok": True,
+                    "cloud_user_sync_error": "",
+                }
+            except Exception:
+                pass
         control_plane_store.audit(
             actor_type="device",
             actor_id=str(payload.edge_id or "edge"),
@@ -1193,11 +1398,62 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
         tenant_id = normalize_tenant_id(str(payload.tenant_id or "default"))
         admin_username = str(payload.admin_username or "").strip() or "admin"
         admin_password = str(payload.admin_password or "").strip() or "admin"
+        edge_id = str(payload.edge_id or "").strip()
+        edge_name = str(payload.edge_name or payload.edge_id or "").strip() or edge_id
+        customer_id = str(payload.customer_id or "").strip()
+        license_id = str(payload.license_id or "").strip()
+        if not edge_id:
+            raise ValueError("edge_id_missing_for_local_finalize")
+        if not customer_id:
+            raise ValueError("customer_id_missing_for_local_finalize")
+        if not license_id:
+            raise ValueError("license_id_missing_for_local_finalize")
+
+        # Materialize local control-plane scope so license-check can validate immediately.
+        if customer_id:
+            control_plane_store.upsert_customer(
+                tenant_id=tenant_id,
+                customer_id=customer_id,
+                company_name=customer_id,
+                contact_email="",
+                status="active",
+                metadata={"source": "edge_local_finalize"},
+            )
+        if license_id:
+            control_plane_store.upsert_license(
+                tenant_id=tenant_id,
+                license_id=license_id,
+                customer_id=customer_id,
+                plan_code=str(payload.license_plan_code or "standard"),
+                status=str(payload.license_status or "active"),
+                start_utc=str(payload.license_start_utc or ""),
+                end_utc=str(payload.license_end_utc or ""),
+                max_edges=max(0, int(payload.license_max_edges or 0)),
+                max_users=max(0, int(payload.license_max_users or 0)),
+                metadata={"source": "edge_local_finalize"},
+            )
+            if payload.license_modules:
+                control_plane_store.set_license_modules(
+                    license_id=license_id,
+                    modules=list(payload.license_modules or []),
+                )
+        if edge_id:
+            control_plane_store.upsert_edge(
+                tenant_id=tenant_id,
+                edge_id=edge_id,
+                edge_name=edge_name,
+                customer_id=customer_id,
+                site="",
+                area="",
+                equipment="",
+                status="active",
+                metadata={"source": "edge_local_finalize", "license_id": license_id},
+            )
 
         # Ensure local auth store contains the edge admin for immediate login.
         control_plane_store.upsert_user(
             tenant_id=tenant_id,
-            customer_id=str(payload.customer_id or ""),
+            customer_id=customer_id,
             username=admin_username,
             password=admin_password,
             role="admin",
@@ -1207,6 +1463,57 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
             modules=[],
             permissions={},
         )
+
+        cloud_user_sync_ok = True
+        cloud_user_sync_error = ""
+        cloud_base = str(payload.cloud_api_url or "").strip().rstrip("/")
+        if cloud_base and customer_id:
+            try:
+                cloud_user = str(
+                    os.getenv("TRUSTNODE_CLOUD_AUTH_USER")
+                    or "admin"
+                ).strip()
+                cloud_pass = str(
+                    os.getenv("TRUSTNODE_CLOUD_AUTH_PASSWORD")
+                    or "admin"
+                ).strip()
+                token = ""
+                login_res = requests.post(
+                    f"{cloud_base}/api/auth/login",
+                    json={"username": cloud_user, "password": cloud_pass},
+                    timeout=15,
+                )
+                if 200 <= login_res.status_code < 300:
+                    body = login_res.json() if login_res.text else {}
+                    token = str(body.get("access_token") or body.get("token") or "").strip()
+                headers = {"Content-Type": "application/json"}
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                user_res = requests.post(
+                    f"{cloud_base}/api/control-plane/users?tenant_id={requests.utils.quote(tenant_id, safe='')}",
+                    json={
+                        "customer_id": customer_id,
+                        "username": admin_username,
+                        "password": admin_password,
+                        "role": "admin",
+                        "status": "active",
+                        "email": "",
+                        "mfa_enabled": False,
+                        "modules": [],
+                        "permissions": {},
+                    },
+                    headers=headers,
+                    timeout=20,
+                )
+                if user_res.status_code >= 400:
+                    cloud_user_sync_ok = False
+                    try:
+                        cloud_user_sync_error = str((user_res.json() or {}).get("detail") or user_res.text or "").strip()
+                    except Exception:
+                        cloud_user_sync_error = str(user_res.text or "").strip()
+            except Exception as exc:
+                cloud_user_sync_ok = False
+                cloud_user_sync_error = str(exc)
 
         existing = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
         users_access = existing.get("users_access") if isinstance(existing.get("users_access"), dict) else {}
@@ -1245,14 +1552,14 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
         app_settings = dict((existing.get("app_settings") if isinstance(existing, dict) else {}) or {})
         app_settings["tenant_login_realm"] = tenant_id
         app_settings["tenant_id"] = tenant_id
-        app_settings["edge_id"] = str(payload.edge_id or "")
-        app_settings["edge_name"] = str(payload.edge_name or payload.edge_id or "")
-        app_settings["customer_id"] = str(payload.customer_id or "")
-        app_settings["license_id"] = str(payload.license_id or "")
+        app_settings["edge_id"] = edge_id
+        app_settings["edge_name"] = edge_name
+        app_settings["customer_id"] = customer_id
+        app_settings["license_id"] = license_id
         app_settings["edge_linked"] = True
         app_settings["edge_profile"] = {
-            "edge_id": str(payload.edge_id or ""),
-            "edge_name": str(payload.edge_name or payload.edge_id or ""),
+            "edge_id": edge_id,
+            "edge_name": edge_name,
             "description": "",
             "location": "",
             "machine_group": "",
@@ -1273,7 +1580,13 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
             actor=f"edge_local_finalize:{admin_username}",
         )
         telemetry_service.configure_from_bootstrap({"data": app_store.get_bootstrap(prefer_cloud_reads=False)})
-        return {"ok": True, "tenant_id": tenant_id, "edge_id": str(payload.edge_id or "")}
+        return {
+            "ok": True,
+            "tenant_id": tenant_id,
+            "edge_id": edge_id,
+            "cloud_user_sync_ok": cloud_user_sync_ok,
+            "cloud_user_sync_error": cloud_user_sync_error,
+        }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1332,4 +1645,405 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
         app_settings = dict(bootstrap.get("app_settings") or {})
         check_edge_id = str(app_settings.get("edge_id") or "").strip()
     out = control_plane_store.check_edge_license(tenant_id=tid, edge_id=check_edge_id)
-    return {"ok": bool(out.get("ok")), "tenant_id": tid, "edge_id": check_edge_id, **out}
+    resolved_tenant = str(out.get("resolved_tenant_id") or tid)
+
+    # If local scope is stale/incomplete, hydrate from cloud control-plane authoritative source.
+    try:
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        app_settings = dict(bootstrap.get("app_settings") or {})
+        cloud_url = str(app_settings.get("cloud_url") or app_settings.get("cloud_api_url") or "").strip().rstrip("/")
+        should_try_cloud = bool(cloud_url and not _is_same_origin_as_request(cloud_url, request))
+        linked_license_id = str(app_settings.get("license_id") or "").strip()
+        linked_edge_id = str(app_settings.get("edge_id") or check_edge_id or "").strip()
+
+        # Local first-aid for legacy links: if edge is linked but customer scope is missing,
+        # recover customer from locally mirrored license row by linked license_id.
+        if str(out.get("reason") or "") == "edge_customer_missing" and linked_license_id and linked_edge_id:
+            tenant_candidates = []
+            for cand in [
+                str(app_settings.get("tenant_id") or "").strip(),
+                resolved_tenant,
+                tid,
+                "default",
+            ]:
+                c = normalize_tenant_id(str(cand or "default"))
+                if c and c not in tenant_candidates:
+                    tenant_candidates.append(c)
+            for cand_tenant in tenant_candidates:
+                try:
+                    lrows = control_plane_store.list_licenses(tenant_id=cand_tenant) or []
+                    lrow = next(
+                        (
+                            r for r in lrows
+                            if str((r or {}).get("license_id") or "").strip() == linked_license_id
+                        ),
+                        None,
+                    )
+                    c_customer = str((lrow or {}).get("customer_id") or "").strip()
+                    if not c_customer:
+                        continue
+                    edge_rows = control_plane_store.list_edges(tenant_id=cand_tenant) or []
+                    edge_match = next(
+                        (
+                            e for e in edge_rows
+                            if str((e or {}).get("edge_id") or "").strip() == linked_edge_id
+                        ),
+                        None,
+                    )
+                    control_plane_store.upsert_edge(
+                        tenant_id=cand_tenant,
+                        edge_id=linked_edge_id,
+                        edge_name=str((edge_match or {}).get("edge_name") or linked_edge_id),
+                        customer_id=c_customer,
+                        site=str((edge_match or {}).get("site") or ""),
+                        area=str((edge_match or {}).get("area") or ""),
+                        equipment=str((edge_match or {}).get("equipment") or ""),
+                        status=str((edge_match or {}).get("status") or "active"),
+                        metadata={
+                            "source": "edge_license_check_local_customer_recovery",
+                            "license_id": linked_license_id,
+                        },
+                    )
+                    out = control_plane_store.check_edge_license(tenant_id=cand_tenant, edge_id=linked_edge_id)
+                    resolved_tenant = str(out.get("resolved_tenant_id") or cand_tenant)
+                    if bool(out.get("ok")):
+                        break
+                except Exception:
+                    continue
+        local_license = dict(out.get("license") or {}) if isinstance(out.get("license"), dict) else {}
+        local_modules = local_license.get("modules") if isinstance(local_license, dict) else []
+        local_license_id = str(local_license.get("license_id") or linked_license_id or "").strip()
+        local_missing_details = (
+            (not bool(out.get("ok")))
+            or (not str(local_license.get("start_utc") or "").strip())
+            or (not str(local_license.get("end_utc") or "").strip())
+            or (not isinstance(local_modules, list))
+            or (isinstance(local_modules, list) and len(local_modules) == 0)
+        )
+        if should_try_cloud and local_missing_details:
+            fwd_headers: dict[str, str] = {}
+            auth = str(request.headers.get("authorization") or "").strip()
+            if auth:
+                fwd_headers["Authorization"] = auth
+            if resolved_tenant:
+                fwd_headers["X-Tenant-Id"] = resolved_tenant
+
+            def _cloud_get(url: str, *, timeout: int = 8) -> requests.Response:
+                # Try forwarded auth first.
+                resp = requests.get(url, timeout=timeout, headers=fwd_headers or None)
+                if resp.status_code != 401:
+                    return resp
+                # Local JWT may not match cloud JWT secret; obtain cloud token and retry.
+                try:
+                    cloud_user = str(
+                        os.getenv("TRUSTNODE_CLOUD_AUTH_USER")
+                        or app_settings.get("cloud_auth_user")
+                        or "admin"
+                    ).strip()
+                    cloud_pass = str(
+                        os.getenv("TRUSTNODE_CLOUD_AUTH_PASSWORD")
+                        or app_settings.get("cloud_auth_password")
+                        or "admin"
+                    ).strip()
+                    if not cloud_user or not cloud_pass:
+                        return resp
+                    login = requests.post(
+                        f"{cloud_url}/api/auth/login",
+                        json={"username": cloud_user, "password": cloud_pass},
+                        timeout=timeout,
+                    )
+                    if login.status_code >= 400:
+                        return resp
+                    body = login.json() if login.content else {}
+                    token = str(body.get("access_token") or body.get("token") or "").strip()
+                    if not token:
+                        return resp
+                    retry_headers = dict(fwd_headers or {})
+                    retry_headers["Authorization"] = f"Bearer {token}"
+                    return requests.get(url, timeout=timeout, headers=retry_headers)
+                except Exception:
+                    return resp
+
+            # First try the dedicated cloud license-check by edge_id.
+            params = []
+            if check_edge_id:
+                params.append(f"edge_id={requests.utils.quote(str(check_edge_id), safe='')}")
+            if resolved_tenant:
+                params.append(f"tenant_id={requests.utils.quote(str(resolved_tenant), safe='')}")
+            qs = f"?{'&'.join(params)}" if params else ""
+            url = f"{cloud_url}/api/control-plane/edge-link/license-check{qs}"
+            r = _cloud_get(url, timeout=8)
+            if r.status_code < 400:
+                cloud = r.json() if r.content else {}
+                if isinstance(cloud, dict):
+                    cloud_ok = bool(cloud.get("ok"))
+                    cloud_license = cloud.get("license") if isinstance(cloud.get("license"), dict) else {}
+                    cloud_modules = cloud_license.get("modules") if isinstance(cloud_license, dict) else []
+                    if cloud_ok or (isinstance(cloud_modules, list) and cloud_modules):
+                        # Mirror authoritative cloud license scope locally.
+                        c_tenant = normalize_tenant_id(str(cloud.get("tenant_id") or resolved_tenant or tid))
+                        c_edge = cloud.get("edge") if isinstance(cloud.get("edge"), dict) else {}
+                        c_edge_id = str(c_edge.get("edge_id") or check_edge_id or "").strip()
+                        c_customer = str(c_edge.get("customer_id") or "").strip()
+                        c_license_id = str(cloud_license.get("license_id") or "").strip()
+                        if c_customer:
+                            control_plane_store.upsert_customer(
+                                tenant_id=c_tenant,
+                                customer_id=c_customer,
+                                company_name=c_customer,
+                                contact_email="",
+                                status="active",
+                                metadata={"source": "cloud_license_check_hydrate"},
+                            )
+                        if c_license_id:
+                            control_plane_store.upsert_license(
+                                tenant_id=c_tenant,
+                                license_id=c_license_id,
+                                customer_id=c_customer,
+                                plan_code=str(cloud_license.get("plan_code") or "standard"),
+                                status=str(cloud_license.get("status") or "active"),
+                                start_utc=str(cloud_license.get("start_utc") or ""),
+                                end_utc=str(cloud_license.get("end_utc") or ""),
+                                max_edges=max(0, int(cloud_license.get("max_edges") or 0)),
+                                max_users=max(0, int(cloud_license.get("max_users") or 0)),
+                                metadata={"source": "cloud_license_check_hydrate"},
+                            )
+                            if isinstance(cloud_modules, list):
+                                control_plane_store.set_license_modules(
+                                    license_id=c_license_id,
+                                    modules=list(cloud_modules or []),
+                                )
+                        if c_edge_id:
+                            control_plane_store.upsert_edge(
+                                tenant_id=c_tenant,
+                                edge_id=c_edge_id,
+                                edge_name=str(c_edge.get("edge_name") or c_edge_id),
+                                customer_id=c_customer,
+                                site=str(c_edge.get("site") or ""),
+                                area=str(c_edge.get("area") or ""),
+                                equipment=str(c_edge.get("equipment") or ""),
+                                status=str(c_edge.get("status") or "active"),
+                                metadata={"source": "cloud_license_check_hydrate", "license_id": c_license_id},
+                            )
+                        out = control_plane_store.check_edge_license(tenant_id=c_tenant, edge_id=c_edge_id or check_edge_id)
+                        resolved_tenant = str(out.get("resolved_tenant_id") or c_tenant)
+
+            # Last-mile recovery for legacy scopes: if still missing details, hydrate directly
+            # from cloud license endpoints using known license_id from local state.
+            post_license = dict(out.get("license") or {}) if isinstance(out.get("license"), dict) else {}
+            post_modules = post_license.get("modules") if isinstance(post_license, dict) else []
+            still_missing = (
+                (not bool(out.get("ok")))
+                or (not str(post_license.get("start_utc") or "").strip())
+                or (not str(post_license.get("end_utc") or "").strip())
+                or (not isinstance(post_modules, list))
+                or (isinstance(post_modules, list) and len(post_modules) == 0)
+            )
+            recover_license_id = str(post_license.get("license_id") or local_license_id or "").strip()
+            if still_missing and recover_license_id:
+                lic_list_url = f"{cloud_url}/api/control-plane/licenses?tenant_id={requests.utils.quote(str(resolved_tenant or tid), safe='')}"
+                mod_url = f"{cloud_url}/api/control-plane/licenses/{requests.utils.quote(recover_license_id, safe='')}/modules"
+                lic_res = _cloud_get(lic_list_url, timeout=8)
+                mod_res = _cloud_get(mod_url, timeout=8)
+                if lic_res.status_code < 400:
+                    lic_payload = lic_res.json() if lic_res.content else {}
+                    rows = lic_payload.get("rows") if isinstance(lic_payload, dict) and isinstance(lic_payload.get("rows"), list) else []
+                    cloud_license = next(
+                        (
+                            r for r in rows
+                            if str((r or {}).get("license_id") or "").strip() == recover_license_id
+                        ),
+                        {},
+                    )
+                    cloud_modules = []
+                    if mod_res.status_code < 400:
+                        mod_payload = mod_res.json() if mod_res.content else {}
+                        if isinstance(mod_payload, dict) and isinstance(mod_payload.get("rows"), list):
+                            cloud_modules = list(mod_payload.get("rows") or [])
+                    if isinstance(cloud_license, dict) and cloud_license:
+                        c_tenant = normalize_tenant_id(str(cloud_license.get("tenant_id") or resolved_tenant or tid))
+                        c_customer = str(cloud_license.get("customer_id") or "").strip()
+                        if c_customer:
+                            control_plane_store.upsert_customer(
+                                tenant_id=c_tenant,
+                                customer_id=c_customer,
+                                company_name=c_customer,
+                                contact_email="",
+                                status="active",
+                                metadata={"source": "cloud_license_direct_hydrate"},
+                            )
+                        control_plane_store.upsert_license(
+                            tenant_id=c_tenant,
+                            license_id=str(cloud_license.get("license_id") or recover_license_id),
+                            customer_id=c_customer,
+                            plan_code=str(cloud_license.get("plan_code") or "standard"),
+                            status=str(cloud_license.get("status") or "active"),
+                            start_utc=str(cloud_license.get("start_utc") or ""),
+                            end_utc=str(cloud_license.get("end_utc") or ""),
+                            max_edges=max(0, int(cloud_license.get("max_edges") or 0)),
+                            max_users=max(0, int(cloud_license.get("max_users") or 0)),
+                            metadata={"source": "cloud_license_direct_hydrate"},
+                        )
+                        if isinstance(cloud_modules, list) and cloud_modules:
+                            control_plane_store.set_license_modules(
+                                license_id=str(cloud_license.get("license_id") or recover_license_id),
+                                modules=cloud_modules,
+                            )
+                        if check_edge_id and c_customer:
+                            try:
+                                existing_edge = control_plane_store.get_edge(tenant_id=c_tenant, edge_id=check_edge_id) or {}
+                                control_plane_store.upsert_edge(
+                                    tenant_id=c_tenant,
+                                    edge_id=check_edge_id,
+                                    edge_name=str(existing_edge.get("edge_name") or check_edge_id),
+                                    customer_id=c_customer,
+                                    site=str(existing_edge.get("site") or ""),
+                                    area=str(existing_edge.get("area") or ""),
+                                    equipment=str(existing_edge.get("equipment") or ""),
+                                    status=str(existing_edge.get("status") or "active"),
+                                    metadata={
+                                        **(existing_edge.get("metadata") if isinstance(existing_edge.get("metadata"), dict) else {}),
+                                        "license_id": str(cloud_license.get("license_id") or recover_license_id),
+                                        "source": "cloud_license_direct_hydrate",
+                                    },
+                                )
+                            except Exception:
+                                pass
+                        out = control_plane_store.check_edge_license(tenant_id=c_tenant, edge_id=check_edge_id)
+                        resolved_tenant = str(out.get("resolved_tenant_id") or c_tenant)
+    except Exception:
+        pass
+
+    # Secondary recovery path for legacy/partial links:
+    # resolve full license details by app_settings.license_id and persist locally.
+    try:
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        app_settings = dict(bootstrap.get("app_settings") or {})
+        linked_license_id = str(app_settings.get("license_id") or "").strip()
+        linked_edge_id = str(app_settings.get("edge_id") or check_edge_id or "").strip()
+        linked_tenant_id = normalize_tenant_id(str(app_settings.get("tenant_id") or resolved_tenant or tid))
+        if linked_license_id and (
+            not bool(out.get("ok"))
+            or not str((out.get("license") or {}).get("start_utc") if isinstance(out.get("license"), dict) else "").strip()
+            or not str((out.get("license") or {}).get("end_utc") if isinstance(out.get("license"), dict) else "").strip()
+            or not isinstance(((out.get("license") or {}) if isinstance(out.get("license"), dict) else {}).get("modules"), list)
+        ):
+            cloud_url = str(app_settings.get("cloud_url") or app_settings.get("cloud_api_url") or "").strip().rstrip("/")
+            if cloud_url and not _is_same_origin_as_request(cloud_url, request):
+                auth = str(request.headers.get("authorization") or "").strip()
+                fwd_headers: dict[str, str] = {"Content-Type": "application/json"}
+                if auth:
+                    fwd_headers["Authorization"] = auth
+                def _cloud_get_recover(url: str, *, timeout: int = 15) -> requests.Response:
+                    resp = requests.get(url, headers=fwd_headers, timeout=timeout)
+                    if resp.status_code != 401:
+                        return resp
+                    try:
+                        cloud_user = str(
+                            os.getenv("TRUSTNODE_CLOUD_AUTH_USER")
+                            or app_settings.get("cloud_auth_user")
+                            or "admin"
+                        ).strip()
+                        cloud_pass = str(
+                            os.getenv("TRUSTNODE_CLOUD_AUTH_PASSWORD")
+                            or app_settings.get("cloud_auth_password")
+                            or "admin"
+                        ).strip()
+                        if not cloud_user or not cloud_pass:
+                            return resp
+                        login = requests.post(
+                            f"{cloud_url}/api/auth/login",
+                            json={"username": cloud_user, "password": cloud_pass},
+                            timeout=timeout,
+                        )
+                        if login.status_code >= 400:
+                            return resp
+                        body = login.json() if login.content else {}
+                        token = str(body.get("access_token") or body.get("token") or "").strip()
+                        if not token:
+                            return resp
+                        rh = dict(fwd_headers)
+                        rh["Authorization"] = f"Bearer {token}"
+                        return requests.get(url, headers=rh, timeout=timeout)
+                    except Exception:
+                        return resp
+                tenant_candidates = []
+                for cand in [linked_tenant_id, resolved_tenant, tid, "default"]:
+                    c = normalize_tenant_id(str(cand or "default"))
+                    if c and c not in tenant_candidates:
+                        tenant_candidates.append(c)
+                cloud_license: dict[str, Any] | None = None
+                cloud_modules: list[dict[str, Any]] = []
+                hit_tenant = linked_tenant_id
+                for cand_tenant in tenant_candidates:
+                    lr = _cloud_get_recover(
+                        f"{cloud_url}/api/control-plane/licenses?tenant_id={requests.utils.quote(cand_tenant, safe='')}",
+                        timeout=15,
+                    )
+                    if not (200 <= lr.status_code < 300):
+                        continue
+                    rows = (lr.json() or {}).get("rows") if lr.text else []
+                    if not isinstance(rows, list):
+                        continue
+                    hit = next((r for r in rows if str((r or {}).get("license_id") or "").strip() == linked_license_id), None)
+                    if isinstance(hit, dict):
+                        cloud_license = dict(hit)
+                        hit_tenant = cand_tenant
+                        break
+                if cloud_license:
+                    mr = _cloud_get_recover(
+                        f"{cloud_url}/api/control-plane/licenses/{requests.utils.quote(linked_license_id, safe='')}/modules",
+                        timeout=15,
+                    )
+                    if 200 <= mr.status_code < 300:
+                        mrows = (mr.json() or {}).get("rows") if mr.text else []
+                        if isinstance(mrows, list):
+                            cloud_modules = list(mrows)
+                    resolved_customer = str(cloud_license.get("customer_id") or "").strip()
+                    control_plane_store.upsert_license(
+                        tenant_id=hit_tenant,
+                        license_id=linked_license_id,
+                        customer_id=resolved_customer,
+                        plan_code=str(cloud_license.get("plan_code") or "standard"),
+                        status=str(cloud_license.get("status") or "active"),
+                        start_utc=str(cloud_license.get("start_utc") or ""),
+                        end_utc=str(cloud_license.get("end_utc") or ""),
+                        max_edges=max(0, int(cloud_license.get("max_edges") or 0)),
+                        max_users=max(0, int(cloud_license.get("max_users") or 0)),
+                        metadata={"source": "edge_license_check_linked_license_recovery"},
+                    )
+                    if cloud_modules:
+                        control_plane_store.set_license_modules(
+                            license_id=linked_license_id,
+                            modules=cloud_modules,
+                        )
+                    if linked_edge_id:
+                        edge_rows = control_plane_store.list_edges(tenant_id=hit_tenant) or []
+                        edge_match = next((e for e in edge_rows if str(e.get("edge_id") or "").strip() == linked_edge_id), None)
+                        if edge_match:
+                            control_plane_store.upsert_edge(
+                                tenant_id=hit_tenant,
+                                edge_id=linked_edge_id,
+                                edge_name=str(edge_match.get("edge_name") or linked_edge_id),
+                                customer_id=resolved_customer or str(edge_match.get("customer_id") or "").strip(),
+                                site=str(edge_match.get("site") or ""),
+                                area=str(edge_match.get("area") or ""),
+                                equipment=str(edge_match.get("equipment") or ""),
+                                status=str(edge_match.get("status") or "active"),
+                                metadata={"source": "edge_license_check_linked_license_recovery", "license_id": linked_license_id},
+                            )
+                    out = control_plane_store.check_edge_license(tenant_id=hit_tenant, edge_id=linked_edge_id or check_edge_id)
+                    resolved_tenant = str(out.get("resolved_tenant_id") or hit_tenant)
+    except Exception:
+        pass
+
+    resolved_edge_id = str(
+        (
+            (out.get("edge") or {}).get("edge_id")
+            if isinstance(out.get("edge"), dict)
+            else ""
+        )
+        or check_edge_id
+        or ""
+    ).strip()
+    return {"ok": bool(out.get("ok")), "tenant_id": resolved_tenant, "edge_id": resolved_edge_id, **out}

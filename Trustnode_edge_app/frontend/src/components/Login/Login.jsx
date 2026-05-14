@@ -4,6 +4,7 @@ import {
   issuePublicPasswordReset,
   applyPublicPasswordReset,
   registerControlPlaneEdgeLink,
+  registerControlPlaneEdgeLinkLogin,
   getAuthMe,
 } from "../../api";
 import "./Login.css";
@@ -164,23 +165,43 @@ export const Login = ({
   };
 
   const submitEdgeRegister = async () => {
+    const activationCode = String(edgeRegisterForm.activation_code || "").trim();
+    const adminUsername = String(edgeRegisterForm.admin_username || "").trim();
+    const adminPassword = String(edgeRegisterForm.admin_password || "");
+    const confirmPassword = String(edgeRegisterForm.confirm_password || "");
+    if (!activationCode) {
+      setEdgeRegisterResult("Activation code is required.");
+      return;
+    }
+    if (!adminUsername) {
+      setEdgeRegisterResult("Admin login is required.");
+      return;
+    }
+    if (adminPassword.length < 8) {
+      setEdgeRegisterResult("Admin password must be at least 8 characters.");
+      return;
+    }
+    if (adminPassword !== confirmPassword) {
+      setEdgeRegisterResult("Confirm password must match admin password.");
+      return;
+    }
     setEdgeRegisterResult("Activating...");
     setEdgeRegisterBusy(true);
     try {
       const payload = {
-        activation_code: String(edgeRegisterForm.activation_code || "").trim(),
+        activation_code: activationCode,
         // Edge identity is resolved from the activation code binding in control-plane.
         edge_id: "",
         edge_name: "",
         site: "",
         area: "",
         equipment: "",
-        admin_username: String(edgeRegisterForm.admin_username || "").trim(),
-        admin_password: String(edgeRegisterForm.admin_password || ""),
+        admin_username: adminUsername,
+        admin_password: adminPassword,
       };
-      const result = await registerControlPlaneEdgeLink(payload);
+      const result = await registerControlPlaneEdgeLinkLogin(payload);
       if (result?.ok) {
-        setEdgeRegisterResult("Edge activated successfully. You can login now.");
+        setEdgeRegisterResult("Edge activated successfully. Admin user created for customer scope.");
         setEdgeRegisterForm({
           activation_code: "",
           admin_username: "",
@@ -210,7 +231,8 @@ export const Login = ({
     const code = String(edgeRegisterForm.activation_code || "").trim();
     const user = String(edgeRegisterForm.admin_username || "").trim();
     const pass = String(edgeRegisterForm.admin_password || "");
-    return code.length > 0 && user.length > 0 && pass.length > 0;
+    const confirm = String(edgeRegisterForm.confirm_password || "");
+    return code.length > 0 && user.length > 0 && pass.length >= 8 && pass === confirm;
   })();
 
   const openEdgeRegisterModal = () => {

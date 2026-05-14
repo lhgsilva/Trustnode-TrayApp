@@ -1,0 +1,589 @@
+"""Persistence layer for the reporting module.
+
+Owns CRUD over the SQLite tables `report_templates`, `scheduled_reports`,
+`generated_reports` introduced in `app_store.py`. Kept in its own module so
+the existing AppStore stays focused on historian / configuration concerns.
+
+The data shapes deliberately mirror the JSON the frontend already produces
+(see `App.jsx` `sanitizeReportTemplates` / `sanitizeScheduledReports`) so the
+Reporting and Scheduled Reports UIs don't need to be rewritten end-to-end —
+they only swap the persistence call from bootstrap-PUT to the new endpoints.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+from app.tenant import get_current_tenant
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def _resolve_db_path() -> Path:
+    base = os.environ.get("TRUSTNODE_DATA_DIR", "").strip()
+    if base:
+        return Path(base) / "trustnode_app_store.db"
+    return Path.home() / ".trustnode_edge" / "data" / "trustnode_app_store.db"
+
+
+def _resolve_reports_dir() -> Path:
+    base = os.environ.get("TRUSTNODE_DATA_DIR", "").strip()
+    if base:
+        out = Path(base) / "reports"
+    else:
+        out = Path.home() / ".trustnode_edge" / "data" / "reports"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+class ReportsStore:
+    """CRUD for templates, schedules, and generated report records.
+
+    Read methods do not hold a Python lock (SQLite WAL handles concurrent
+    readers). Writes briefly hold an internal lock so the upsert + audit row
+    pattern stays atomic across threads.
+    """
+
+    def __init__(self) -> None:
+        self.db_path = _resolve_db_path()
+        self.reports_dir = _resolve_reports_dir()
+        self._write_lock = threading.Lock()
+
+    # --- connection ---
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    # --- templates ---
+    def list_templates(self, tenant_id: str | None = None) -> list[dict[str, Any]]:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, name, description, definition_json, created_utc, updated_utc, created_by "
+                "FROM report_templates WHERE tenant_id = ? ORDER BY updated_utc DESC",
+                (tid,),
+            ).fetchall()
+        return [self._row_to_template(r) for r in rows]
+
+    def get_template(self, template_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, name, description, definition_json, created_utc, updated_utc, created_by "
+                "FROM report_templates WHERE tenant_id = ? AND id = ?",
+                (tid, str(template_id)),
+            ).fetchone()
+        return self._row_to_template(row) if row else None
+
+    def upsert_template(
+        self,
+        template: dict[str, Any],
+        tenant_id: str | None = None,
+        created_by: str | None = None,
+    ) -> dict[str, Any]:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        tpl_id = str(template.get("id") or "").strip() or _new_id("tpl")
+        name = str(template.get("name") or "").strip() or "Untitled report"
+        description = str(template.get("description") or "")
+        definition = template.get("definition") or template.get("sections") or template.get("filters") or {}
+        if isinstance(definition, list):
+            # Accept the simpler array-of-sections shape.
+            definition = {"sections": definition}
+        if not isinstance(definition, dict):
+            definition = {}
+        definition_json = json.dumps(definition, ensure_ascii=False, separators=(",", ":"))
+        now = _utc_now()
+        author = (created_by or "").strip() or None
+        with self._write_lock:
+            with self._connect() as conn:
+                existing = conn.execute(
+                    "SELECT id, created_utc FROM report_templates WHERE tenant_id = ? AND id = ?",
+                    (tid, tpl_id),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "UPDATE report_templates SET name = ?, description = ?, definition_json = ?, updated_utc = ? "
+                        "WHERE tenant_id = ? AND id = ?",
+                        (name, description, definition_json, now, tid, tpl_id),
+                    )
+                    created_utc = str(existing["created_utc"] or now)
+                else:
+                    conn.execute(
+                        "INSERT INTO report_templates (id, tenant_id, name, description, definition_json, "
+                        "created_utc, updated_utc, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (tpl_id, tid, name, description, definition_json, now, now, author),
+                    )
+                    created_utc = now
+                conn.commit()
+        return {
+            "id": tpl_id,
+            "name": name,
+            "description": description,
+            "definition": definition,
+            "created_utc": created_utc,
+            "updated_utc": now,
+            "created_by": author,
+        }
+
+    def delete_template(self, template_id: str, tenant_id: str | None = None) -> bool:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        with self._write_lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM report_templates WHERE tenant_id = ? AND id = ?",
+                    (tid, str(template_id)),
+                )
+                conn.commit()
+        return cur.rowcount > 0
+
+    @staticmethod
+    def _row_to_template(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if not row:
+            return None
+        try:
+            definition = json.loads(str(row["definition_json"] or "{}"))
+        except Exception:
+            definition = {}
+        return {
+            "id": str(row["id"]),
+            "name": str(row["name"] or ""),
+            "description": str(row["description"] or ""),
+            "definition": definition,
+            "created_utc": str(row["created_utc"] or ""),
+            "updated_utc": str(row["updated_utc"] or ""),
+            "created_by": str(row["created_by"] or "") or None,
+        }
+
+    # --- schedules ---
+    def list_schedules(self, tenant_id: str | None = None) -> list[dict[str, Any]]:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_reports WHERE tenant_id = ? ORDER BY updated_utc DESC",
+                (tid,),
+            ).fetchall()
+        return [self._row_to_schedule(r) for r in rows]
+
+    def list_enabled_schedules_all_tenants(self) -> list[dict[str, Any]]:
+        """Used by the scheduler daemon: enumerate every enabled schedule
+        across tenants in one pass (no tenant filter)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_reports WHERE enabled = 1"
+            ).fetchall()
+        return [self._row_to_schedule(r) for r in rows]
+
+    def get_schedule(self, schedule_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduled_reports WHERE tenant_id = ? AND id = ?",
+                (tid, str(schedule_id)),
+            ).fetchone()
+        return self._row_to_schedule(row) if row else None
+
+    def upsert_schedule(
+        self,
+        schedule: dict[str, Any],
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        sid = str(schedule.get("id") or "").strip() or _new_id("sch")
+        name = str(schedule.get("name") or "").strip() or "Untitled schedule"
+        template_id = str(schedule.get("template_id") or "").strip()
+        enabled = 1 if bool(schedule.get("enabled", True)) else 0
+        trigger_mode = str(schedule.get("trigger_mode") or "time").strip().lower()
+        if trigger_mode not in {"time", "tag", "both"}:
+            trigger_mode = "time"
+        recurrence = str(schedule.get("recurrence") or "daily").strip().lower()
+        if recurrence not in {"daily", "weekly", "monthly", "hourly"}:
+            recurrence = "daily"
+        hour = max(0, min(23, int(schedule.get("hour") if schedule.get("hour") is not None else 8)))
+        minute = max(0, min(59, int(schedule.get("minute") if schedule.get("minute") is not None else 0)))
+        dow = schedule.get("day_of_week")
+        dow = int(dow) if dow is not None and str(dow).strip() != "" else None
+        dom = schedule.get("day_of_month")
+        dom = int(dom) if dom is not None and str(dom).strip() != "" else None
+        tag_conditions = schedule.get("tag_conditions") or []
+        if not isinstance(tag_conditions, list):
+            tag_conditions = []
+        condition_logic = str(schedule.get("condition_logic") or "all").strip().lower()
+        if condition_logic not in {"all", "any"}:
+            condition_logic = "all"
+        deliver_email = 1 if bool(schedule.get("deliver_email", False)) else 0
+        recipients = schedule.get("recipients")
+        if isinstance(recipients, str):
+            recipients = [x.strip() for x in recipients.replace(",", ";").split(";") if x.strip()]
+        if not isinstance(recipients, list):
+            recipients = []
+        email_subject = str(schedule.get("email_subject") or "")
+        email_body = str(schedule.get("email_body") or "")
+        email_profile_id = str(schedule.get("email_profile_id") or "")
+        fmt = str(schedule.get("format") or "pdf").strip().lower()
+        if fmt not in {"pdf"}:
+            fmt = "pdf"
+        require_gateway_running = 1 if bool(schedule.get("require_gateway_running", False)) else 0
+        # Attachment flags: PDF defaults on (back-compat), CSV/TXT opt-in.
+        attach_pdf = 1 if bool(schedule.get("attach_pdf", True)) else 0
+        attach_csv = 1 if bool(schedule.get("attach_csv", False)) else 0
+        attach_txt = 1 if bool(schedule.get("attach_txt", False)) else 0
+        now = _utc_now()
+        with self._write_lock:
+            with self._connect() as conn:
+                existing = conn.execute(
+                    "SELECT id, created_utc, last_run_utc FROM scheduled_reports WHERE tenant_id = ? AND id = ?",
+                    (tid, sid),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE scheduled_reports SET
+                          name = ?, template_id = ?, enabled = ?, trigger_mode = ?,
+                          recurrence = ?, hour = ?, minute = ?, day_of_week = ?, day_of_month = ?,
+                          tag_conditions_json = ?, condition_logic = ?,
+                          deliver_email = ?, recipients_json = ?, email_subject = ?, email_body = ?,
+                          email_profile_id = ?, format = ?, require_gateway_running = ?,
+                          attach_pdf = ?, attach_csv = ?, attach_txt = ?,
+                          updated_utc = ?
+                        WHERE tenant_id = ? AND id = ?
+                        """,
+                        (
+                            name, template_id, enabled, trigger_mode,
+                            recurrence, hour, minute, dow, dom,
+                            json.dumps(tag_conditions, ensure_ascii=False),
+                            condition_logic, deliver_email,
+                            json.dumps(recipients, ensure_ascii=False),
+                            email_subject, email_body, email_profile_id, fmt,
+                            require_gateway_running,
+                            attach_pdf, attach_csv, attach_txt,
+                            now,
+                            tid, sid,
+                        ),
+                    )
+                    created_utc = str(existing["created_utc"] or now)
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO scheduled_reports (
+                          id, tenant_id, name, template_id, enabled, trigger_mode,
+                          recurrence, hour, minute, day_of_week, day_of_month,
+                          tag_conditions_json, condition_logic,
+                          deliver_email, recipients_json, email_subject, email_body,
+                          email_profile_id, format, require_gateway_running,
+                          attach_pdf, attach_csv, attach_txt,
+                          created_utc, updated_utc
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            sid, tid, name, template_id, enabled, trigger_mode,
+                            recurrence, hour, minute, dow, dom,
+                            json.dumps(tag_conditions, ensure_ascii=False),
+                            condition_logic, deliver_email,
+                            json.dumps(recipients, ensure_ascii=False),
+                            email_subject, email_body,
+                            email_profile_id, fmt, require_gateway_running,
+                            attach_pdf, attach_csv, attach_txt,
+                            now, now,
+                        ),
+                    )
+                    created_utc = now
+                conn.commit()
+        return self.get_schedule(sid, tenant_id=tid) or {}
+
+    def delete_schedule(self, schedule_id: str, tenant_id: str | None = None) -> bool:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        with self._write_lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "DELETE FROM scheduled_reports WHERE tenant_id = ? AND id = ?",
+                    (tid, str(schedule_id)),
+                )
+                conn.commit()
+        return cur.rowcount > 0
+
+    def mark_schedule_run(
+        self,
+        schedule_id: str,
+        last_run_utc: str,
+        status: str,
+        error: str | None = None,
+        next_run_utc: str | None = None,
+    ) -> None:
+        with self._write_lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE scheduled_reports SET last_run_utc = ?, next_run_utc = ?, "
+                    "last_status = ?, last_error = ? WHERE id = ?",
+                    (last_run_utc, next_run_utc, status, (error or None), str(schedule_id)),
+                )
+                conn.commit()
+
+    @staticmethod
+    def _row_to_schedule(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if not row:
+            return None
+        try:
+            tag_conditions = json.loads(str(row["tag_conditions_json"] or "[]"))
+        except Exception:
+            tag_conditions = []
+        try:
+            recipients = json.loads(str(row["recipients_json"] or "[]"))
+        except Exception:
+            recipients = []
+        return {
+            "id": str(row["id"]),
+            "tenant_id": str(row["tenant_id"] or "default"),
+            "name": str(row["name"] or ""),
+            "template_id": str(row["template_id"] or ""),
+            "enabled": bool(int(row["enabled"] or 0)),
+            "trigger_mode": str(row["trigger_mode"] or "time"),
+            "recurrence": str(row["recurrence"] or "daily"),
+            "hour": int(row["hour"] or 0),
+            "minute": int(row["minute"] or 0),
+            "day_of_week": (int(row["day_of_week"]) if row["day_of_week"] is not None else None),
+            "day_of_month": (int(row["day_of_month"]) if row["day_of_month"] is not None else None),
+            "tag_conditions": tag_conditions,
+            "condition_logic": str(row["condition_logic"] or "all"),
+            "deliver_email": bool(int(row["deliver_email"] or 0)),
+            "recipients": recipients,
+            "email_subject": str(row["email_subject"] or ""),
+            "email_body": str(row["email_body"] or ""),
+            "email_profile_id": str(row["email_profile_id"] or ""),
+            "format": str(row["format"] or "pdf"),
+            "require_gateway_running": bool(
+                int(row["require_gateway_running"] or 0)
+                if "require_gateway_running" in row.keys()
+                else 0
+            ),
+            # Attachments: PDF defaults on for existing rows, CSV/TXT off.
+            "attach_pdf": bool(
+                int(row["attach_pdf"] if "attach_pdf" in row.keys() and row["attach_pdf"] is not None else 1)
+            ),
+            "attach_csv": bool(
+                int(row["attach_csv"] if "attach_csv" in row.keys() and row["attach_csv"] is not None else 0)
+            ),
+            "attach_txt": bool(
+                int(row["attach_txt"] if "attach_txt" in row.keys() and row["attach_txt"] is not None else 0)
+            ),
+            "created_utc": str(row["created_utc"] or ""),
+            "updated_utc": str(row["updated_utc"] or ""),
+            "last_run_utc": str(row["last_run_utc"] or "") or None,
+            "next_run_utc": str(row["next_run_utc"] or "") or None,
+            "last_status": str(row["last_status"] or "") or None,
+            "last_error": str(row["last_error"] or "") or None,
+        }
+
+    # --- generated reports ---
+    def list_generated(
+        self,
+        tenant_id: str | None = None,
+        limit: int = 200,
+        schedule_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        lim = max(1, min(int(limit or 200), 2000))
+        with self._connect() as conn:
+            if schedule_id:
+                rows = conn.execute(
+                    "SELECT * FROM generated_reports WHERE tenant_id = ? AND schedule_id = ? "
+                    "ORDER BY created_utc DESC LIMIT ?",
+                    (tid, str(schedule_id), lim),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM generated_reports WHERE tenant_id = ? ORDER BY created_utc DESC LIMIT ?",
+                    (tid, lim),
+                ).fetchall()
+        return [self._row_to_generated(r) for r in rows]
+
+    def get_generated(self, generated_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM generated_reports WHERE tenant_id = ? AND id = ?",
+                (tid, str(generated_id)),
+            ).fetchone()
+        return self._row_to_generated(row) if row else None
+
+    def insert_generated(self, record: dict[str, Any]) -> dict[str, Any]:
+        tid = (record.get("tenant_id") or get_current_tenant() or "default").strip() or "default"
+        gid = str(record.get("id") or "").strip() or _new_id("rpt")
+        now = _utc_now()
+        with self._write_lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO generated_reports (
+                      id, tenant_id, template_id, template_name,
+                      schedule_id, schedule_name, triggered_by,
+                      file_path, file_name, file_bytes, file_sha256,
+                      created_utc, email_status, email_message, email_recipients_json, meta_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        gid, tid,
+                        str(record.get("template_id") or "") or None,
+                        str(record.get("template_name") or "") or None,
+                        str(record.get("schedule_id") or "") or None,
+                        str(record.get("schedule_name") or "") or None,
+                        str(record.get("triggered_by") or "manual"),
+                        str(record.get("file_path") or ""),
+                        str(record.get("file_name") or ""),
+                        int(record.get("file_bytes") or 0),
+                        str(record.get("file_sha256") or "") or None,
+                        str(record.get("created_utc") or now),
+                        str(record.get("email_status") or "") or None,
+                        str(record.get("email_message") or "") or None,
+                        json.dumps(record.get("email_recipients") or [], ensure_ascii=False),
+                        json.dumps(record.get("meta") or {}, ensure_ascii=False),
+                    ),
+                )
+                conn.commit()
+        return self.get_generated(gid, tenant_id=tid) or {}
+
+    def update_generated_email_status(
+        self,
+        generated_id: str,
+        status: str,
+        message: str | None = None,
+        recipients: list[str] | None = None,
+    ) -> None:
+        with self._write_lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE generated_reports SET email_status = ?, email_message = ?, email_recipients_json = ? "
+                    "WHERE id = ?",
+                    (
+                        status,
+                        message,
+                        json.dumps(recipients or [], ensure_ascii=False),
+                        str(generated_id),
+                    ),
+                )
+                conn.commit()
+
+    def delete_generated(self, generated_id: str, tenant_id: str | None = None) -> bool:
+        tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
+        record = self.get_generated(generated_id, tenant_id=tid)
+        if not record:
+            return False
+        with self._write_lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM generated_reports WHERE tenant_id = ? AND id = ?",
+                    (tid, str(generated_id)),
+                )
+                conn.commit()
+        # Best-effort file unlink.
+        try:
+            path = Path(record.get("file_path") or "")
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _row_to_generated(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if not row:
+            return None
+        try:
+            recipients = json.loads(str(row["email_recipients_json"] or "[]"))
+        except Exception:
+            recipients = []
+        try:
+            meta = json.loads(str(row["meta_json"] or "{}"))
+        except Exception:
+            meta = {}
+        return {
+            "id": str(row["id"]),
+            "tenant_id": str(row["tenant_id"] or "default"),
+            "template_id": str(row["template_id"] or "") or None,
+            "template_name": str(row["template_name"] or "") or None,
+            "schedule_id": str(row["schedule_id"] or "") or None,
+            "schedule_name": str(row["schedule_name"] or "") or None,
+            "triggered_by": str(row["triggered_by"] or "manual"),
+            "file_path": str(row["file_path"] or ""),
+            "file_name": str(row["file_name"] or ""),
+            "file_bytes": int(row["file_bytes"] or 0),
+            "file_sha256": str(row["file_sha256"] or "") or None,
+            "created_utc": str(row["created_utc"] or ""),
+            "email_status": str(row["email_status"] or "") or None,
+            "email_message": str(row["email_message"] or "") or None,
+            "email_recipients": recipients,
+            "meta": meta,
+        }
+
+    # --- migration helper ---
+    def migrate_from_bootstrap(self, bootstrap: dict[str, Any], tenant_id: str = "default") -> dict[str, int]:
+        """One-shot migration from the legacy `reporting_setup` JSON blob.
+
+        Called by AppStore on startup if any templates/schedules exist in the
+        config_documents store but are missing from the dedicated tables.
+        Returns counts so the boot path can log what moved.
+        """
+        moved_templates = 0
+        moved_schedules = 0
+        reporting = bootstrap.get("reporting_setup") if isinstance(bootstrap, dict) else None
+        if not isinstance(reporting, dict):
+            return {"templates": 0, "schedules": 0}
+        templates = reporting.get("templates") or []
+        if isinstance(templates, list):
+            for tpl in templates:
+                if not isinstance(tpl, dict) or not tpl.get("id"):
+                    continue
+                if self.get_template(str(tpl.get("id")), tenant_id=tenant_id):
+                    continue
+                self.upsert_template(
+                    {
+                        "id": tpl.get("id"),
+                        "name": tpl.get("name") or "Imported template",
+                        "description": tpl.get("description") or "",
+                        "definition": {"sections": [], "filters": tpl.get("filters") or {}},
+                    },
+                    tenant_id=tenant_id,
+                    created_by=str(tpl.get("created_by") or ""),
+                )
+                moved_templates += 1
+        schedules = reporting.get("schedules") or []
+        if isinstance(schedules, list):
+            for sch in schedules:
+                if not isinstance(sch, dict) or not sch.get("id"):
+                    continue
+                if self.get_schedule(str(sch.get("id")), tenant_id=tenant_id):
+                    continue
+                self.upsert_schedule(
+                    {
+                        "id": sch.get("id"),
+                        "name": sch.get("name") or "Imported schedule",
+                        "template_id": sch.get("template_id") or "",
+                        "enabled": bool(sch.get("enabled", True)),
+                        "trigger_mode": sch.get("trigger_mode") or "time",
+                        "recurrence": sch.get("recurrence") or "daily",
+                        "hour": sch.get("hour"),
+                        "minute": sch.get("minute"),
+                        "day_of_week": sch.get("day_of_week"),
+                        "day_of_month": sch.get("day_of_month"),
+                        "tag_conditions": sch.get("tag_conditions") or [],
+                        "condition_logic": sch.get("condition_logic") or "all",
+                        "deliver_email": bool(sch.get("deliver_email", False)),
+                        "recipients": sch.get("recipients") or [],
+                        "format": sch.get("format") or "pdf",
+                    },
+                    tenant_id=tenant_id,
+                )
+                moved_schedules += 1
+        return {"templates": moved_templates, "schedules": moved_schedules}

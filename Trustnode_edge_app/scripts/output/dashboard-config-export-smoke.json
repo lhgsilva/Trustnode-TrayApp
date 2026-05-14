@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "exported_at": "2026-05-13T23:08:56.066903+00:00",
+  "dashboard_configurations": {
+    "mode": "kpi",
+    "per_row": 2,
+    "tag_colors": {
+      "smoke-gw::smoke_tag": "#14a89a"
+    },
+    "widgets": [
+      {
+        "config": {
+          "gateway_id": "smoke-gw",
+          "interpolation": "stepAfter",
+          "readings_count": 120,
+          "tag_name": "smoke_tag"
+        },
+        "h": 4,
+        "id": "smoke-1778713736",
+        "title": "Smoke 1778713736",
+        "type": "line_chart",
+        "w": 6,
+        "x": 0,
+        "y": 0
+      }
+    ]
+  }
+}

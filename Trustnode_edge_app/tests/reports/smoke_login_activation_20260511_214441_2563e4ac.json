@@ -1,0 +1,208 @@
+{
+  "run_id": "20260511_214441_2563e4ac",
+  "started_utc": "2026-05-11T21:44:41.786962+00:00",
+  "base_url": "http://127.0.0.1:8000",
+  "tenant_id": "default",
+  "customer_id": "smk-login-cust-20260511_214441_2563e4ac",
+  "edge_id": "smk-login-edge-20260511_214441_2563e4ac",
+  "license_id": "smk-login-lic-20260511_214441_2563e4ac",
+  "edge_admin_user": "edgeadmin_3e5082",
+  "steps": [
+    {
+      "step": "admin_login",
+      "ok": true
+    }
+  ],
+  "ok": true,
+  "finished_utc": "2026-05-11T21:44:42.955554+00:00",
+  "assertions": {
+    "register_ok": true,
+    "finalize_ok": true,
+    "license_check_ok": true,
+    "license_id_match": true,
+    "license_start_present": true,
+    "license_end_present": true,
+    "license_modules_present": true,
+    "customer_linked": true,
+    "cloud_user_created": true,
+    "edge_admin_can_login": true
+  },
+  "activation_code": "bvTl_6P1lQuHRHLhCYS4zMTGYIqGaCUe",
+  "register": {
+    "ok": true,
+    "tenant_id": "default",
+    "edge_id": "smk-login-edge-20260511_214441_2563e4ac",
+    "edge_name": "SMK Login Edge 20260511_214441_2563e4ac",
+    "customer_id": "smk-login-cust-20260511_214441_2563e4ac",
+    "license_id": "smk-login-lic-20260511_214441_2563e4ac",
+    "license": {
+      "license_id": "smk-login-lic-20260511_214441_2563e4ac",
+      "plan_code": "standard",
+      "start_utc": "2026-05-11 21:44:41.853",
+      "end_utc": "2027-05-11 21:44:41.853",
+      "max_edges": 3,
+      "max_users": 10,
+      "status": "active",
+      "modules": [
+        {
+          "module_key": "alarms",
+          "enabled": true
+        },
+        {
+          "module_key": "dashboard",
+          "enabled": true
+        },
+        {
+          "module_key": "database",
+          "enabled": true
+        },
+        {
+          "module_key": "gateway_configuration",
+          "enabled": true
+        },
+        {
+          "module_key": "gateway_runtime_control",
+          "enabled": true
+        },
+        {
+          "module_key": "historian",
+          "enabled": true
+        },
+        {
+          "module_key": "interface",
+          "enabled": true
+        },
+        {
+          "module_key": "power_overview",
+          "enabled": true
+        },
+        {
+          "module_key": "reporting",
+          "enabled": true
+        },
+        {
+          "module_key": "tags",
+          "enabled": true
+        },
+        {
+          "module_key": "users_and_access_control",
+          "enabled": true
+        }
+      ]
+    },
+    "cloud_api_url": "https://trustnode.lsapps.app",
+    "primary_domain": "trustnode.lsapps.app",
+    "site": "Smoke Site",
+    "area": "Line A",
+    "equipment": "Smoke Eq",
+    "scope_incomplete": false,
+    "scope_warnings": [],
+    "cloud_user_sync_ok": true,
+    "cloud_user_sync_error": ""
+  },
+  "finalize": {
+    "ok": true,
+    "tenant_id": "default",
+    "edge_id": "smk-login-edge-20260511_214441_2563e4ac",
+    "cloud_user_sync_ok": true,
+    "cloud_user_sync_error": ""
+  },
+  "license_check": {
+    "ok": true,
+    "tenant_id": "default",
+    "edge_id": "smk-login-edge-20260511_214441_2563e4ac",
+    "edge": {
+      "edge_id": "smk-login-edge-20260511_214441_2563e4ac",
+      "tenant_id": "default",
+      "customer_id": "smk-login-cust-20260511_214441_2563e4ac",
+      "edge_name": "SMK Login Edge 20260511_214441_2563e4ac",
+      "site": "",
+      "area": "",
+      "equipment": "",
+      "status": "active",
+      "activation_code_hash": null,
+      "activated_utc": null,
+      "last_heartbeat_utc": null,
+      "heartbeat_payload_json": "{}",
+      "metadata_json": "{\"license_id\":\"smk-login-lic-20260511_214441_2563e4ac\",\"source\":\"edge_local_finalize\"}",
+      "created_utc": "2026-05-11 21:44:41.841",
+      "updated_utc": "2026-05-11 21:44:42.323"
+    },
+    "license": {
+      "license_id": "smk-login-lic-20260511_214441_2563e4ac",
+      "tenant_id": "default",
+      "customer_id": "smk-login-cust-20260511_214441_2563e4ac",
+      "plan_code": "standard",
+      "status": "active",
+      "start_utc": "2026-05-11 21:44:41.853",
+      "end_utc": "2027-05-11 21:44:41.853",
+      "max_edges": 3,
+      "max_users": 10,
+      "metadata_json": "{\"source\":\"edge_local_finalize\"}",
+      "created_utc": "2026-05-11 21:44:41.859",
+      "updated_utc": "2026-05-11 21:44:42.297",
+      "modules": [
+        {
+          "module_key": "alarms",
+          "enabled": true
+        },
+        {
+          "module_key": "dashboard",
+          "enabled": true
+        },
+        {
+          "module_key": "database",
+          "enabled": true
+        },
+        {
+          "module_key": "gateway_configuration",
+          "enabled": true
+        },
+        {
+          "module_key": "gateway_runtime_control",
+          "enabled": true
+        },
+        {
+          "module_key": "historian",
+          "enabled": true
+        },
+        {
+          "module_key": "interface",
+          "enabled": true
+        },
+        {
+          "module_key": "power_overview",
+          "enabled": true
+        },
+        {
+          "module_key": "reporting",
+          "enabled": true
+        },
+        {
+          "module_key": "tags",
+          "enabled": true
+        },
+        {
+          "module_key": "users_and_access_control",
+          "enabled": true
+        }
+      ]
+    },
+    "resolved_tenant_id": "default"
+  },
+  "cloud_user_row": {
+    "id": 8,
+    "tenant_id": "default",
+    "customer_id": "smk-login-cust-20260511_214441_2563e4ac",
+    "username": "edgeadmin_3e5082",
+    "role": "admin",
+    "status": "active",
+    "email": "",
+    "mfa_enabled": 0,
+    "created_utc": "2026-05-11 21:44:41.960",
+    "updated_utc": "2026-05-11 21:44:42.489",
+    "last_login_utc": null,
+    "modules": [],
+    "permissions": {}
+  }
+}

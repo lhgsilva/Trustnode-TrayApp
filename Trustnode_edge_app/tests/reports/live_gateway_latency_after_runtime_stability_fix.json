@@ -1,0 +1,58 @@
+{
+  "started_utc": "2026-05-12T11:17:52.351200+00:00",
+  "finished_utc": "2026-05-12T11:20:08.086496+00:00",
+  "base_url": "http://127.0.0.1:8000",
+  "gateway_id": "gw-1778540283647",
+  "tag_name": "SimREAL[3]",
+  "duration_seconds": 45,
+  "ws": {
+    "sample_count": 23,
+    "lag_ms": {
+      "avg": 39.6,
+      "p50": 39.64,
+      "p95": 44.25,
+      "max": 46.59
+    },
+    "interarrival_ms": {
+      "avg": 1925.66,
+      "p50": 2012.55,
+      "p95": 2029.33,
+      "max": 2029.77
+    },
+    "gateway_tag_counts": {
+      "::SimREAL[3]": 1,
+      "gw-1778540283647::SimREAL[3]": 23
+    }
+  },
+  "historian": {
+    "rows_seen": 23,
+    "lag_ms": {
+      "avg": 186.26,
+      "p50": 157.91,
+      "p95": 273.55,
+      "max": 777.62
+    }
+  },
+  "status": {
+    "status_samples": 45,
+    "transitions": {},
+    "last_state": {
+      "gw-1778540283647": true
+    }
+  },
+  "interval_truth": {
+    "configured_interval_ms_by_gateway": {},
+    "runtime_interval_ms_by_gateway": {
+      "gw-1778540283647": 2000
+    },
+    "mismatches": {}
+  },
+  "pass": {
+    "ws_has_samples": true,
+    "historian_has_rows": true,
+    "ws_p95_within_target": true,
+    "historian_p95_within_target": true,
+    "flicker_transitions_within_target": true,
+    "interval_truth_no_mismatch": true
+  }
+}

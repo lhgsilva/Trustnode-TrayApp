@@ -1,0 +1,55 @@
+{
+  "started_utc": "2026-05-12T23:47:15.943065+00:00",
+  "db_path": "C:\\Users\\User\\.trustnode_edge\\data\\trustnode_app_store.db",
+  "checks": [
+    {
+      "name": "time_filters",
+      "ok": true,
+      "details": {
+        "counts": {
+          "5m": 0,
+          "15m": 0,
+          "1h": 0,
+          "6h": 0,
+          "24h": 21929
+        },
+        "monotonic_non_decreasing": true,
+        "has_data_last_24h": true
+      }
+    },
+    {
+      "name": "grouping",
+      "ok": true,
+      "details": {
+        "raw_last_1h": 0,
+        "group_5s_last_1h": 0,
+        "group_1m_last_1h": 0
+      }
+    },
+    {
+      "name": "row_selection",
+      "ok": true,
+      "details": {
+        "all_rows_last_1h": 0,
+        "last_50_rows": 0,
+        "last_row_id_all": null,
+        "last_row_id_last_50": null
+      }
+    },
+    {
+      "name": "conditions",
+      "ok": false,
+      "details": {
+        "reason": "not_enough_rows_for_condition_testing",
+        "rows": 0
+      }
+    }
+  ],
+  "ok": false,
+  "seed": {
+    "gateway_id": "gw-1778540283647",
+    "tag_name": "SimREAL[3]",
+    "rows": 23184
+  },
+  "finished_utc": "2026-05-12T23:47:17.245380+00:00"
+}

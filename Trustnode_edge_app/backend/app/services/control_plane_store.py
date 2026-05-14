@@ -867,11 +867,38 @@ class ControlPlaneStore:
                     if status == "used":
                         code_edge_id = str(r.get("edge_id") or "").strip()
                         current_edge_id = str(edge_id or "").strip()
-                        # Idempotent re-apply for the same edge to avoid false failures after transient UI/network errors.
-                        if code_edge_id and current_edge_id and current_edge_id == code_edge_id:
-                            edge = conn.execute("SELECT * FROM cp_edges WHERE edge_id=?", (current_edge_id,)).fetchone()
-                            if edge:
-                                return dict(edge)
+                        # Idempotent re-apply for previously consumed code:
+                        # rehydrate bound edge/license scope instead of failing hard.
+                        tid = normalize_tenant_id(str(r.get("tenant_id") or "default"))
+                        cid = str(r.get("customer_id") or "").strip()
+                        lid = str(r.get("license_id") or "").strip()
+                        target_edge_id = code_edge_id or current_edge_id
+                        if not target_edge_id:
+                            raise ValueError("activation_code_used")
+                        edge_row = conn.execute(
+                            "SELECT * FROM cp_edges WHERE tenant_id=? AND edge_id=? LIMIT 1",
+                            (tid, target_edge_id),
+                        ).fetchone()
+                        if edge_row:
+                            return dict(edge_row)
+                        # Edge row may be missing locally after reset/unlink; rebuild minimal edge link.
+                        self.upsert_edge(
+                            tenant_id=tid,
+                            edge_id=target_edge_id,
+                            edge_name=str(r.get("edge_name") or edge_name or target_edge_id),
+                            customer_id=cid,
+                            site=site,
+                            area=area,
+                            equipment=equipment,
+                            status="active",
+                            metadata={"activated_via": "code_rehydrate", "license_id": lid},
+                        )
+                        rebuilt = conn.execute(
+                            "SELECT * FROM cp_edges WHERE tenant_id=? AND edge_id=? LIMIT 1",
+                            (tid, target_edge_id),
+                        ).fetchone()
+                        if rebuilt:
+                            return dict(rebuilt)
                         raise ValueError("activation_code_used")
                     if status == "revoked":
                         raise ValueError("activation_code_revoked")
@@ -1249,6 +1276,8 @@ class ControlPlaneStore:
             "license": {
                 "license_id": lic_id,
                 "plan_code": str(lic.get("plan_code") or ""),
+                "start_utc": str(lic.get("start_utc") or ""),
+                "end_utc": str(lic.get("end_utc") or ""),
                 "max_edges": int(lic.get("max_edges") or 0),
                 "max_users": int(lic.get("max_users") or 0),
                 "status": str(lic.get("status") or ""),
@@ -1278,21 +1307,61 @@ class ControlPlaneStore:
                     (tid, eid),
                 ).fetchone()
                 if not edge:
-                    return {"ok": False, "reason": "edge_not_found"}
+                    # Fallback: resolve by edge_id across tenants, then continue with resolved tenant scope.
+                    edge_any = conn.execute(
+                        "SELECT * FROM cp_edges WHERE edge_id=? LIMIT 1",
+                        (eid,),
+                    ).fetchone()
+                    if not edge_any:
+                        return {"ok": False, "reason": "edge_not_found"}
+                    edge = edge_any
+                    tid = normalize_tenant_id(str(dict(edge).get("tenant_id") or tid))
                 edge_row = dict(edge)
                 customer_id = str(edge_row.get("customer_id") or "").strip()
                 if not customer_id:
-                    return {"ok": False, "reason": "edge_customer_missing", "edge": edge_row}
+                    # Auto-recover missing customer scope from edge metadata->license_id.
+                    # This can happen after partial/local activation re-links.
+                    recovered_customer = ""
+                    try:
+                        meta_raw = edge_row.get("metadata_json")
+                        meta = json.loads(str(meta_raw or "{}")) if isinstance(meta_raw, str) else {}
+                        if isinstance(meta, dict):
+                            linked_license_id = str(meta.get("license_id") or "").strip()
+                            if linked_license_id:
+                                lic = conn.execute(
+                                    "SELECT customer_id FROM cp_licenses WHERE tenant_id=? AND license_id=? LIMIT 1",
+                                    (tid, linked_license_id),
+                                ).fetchone()
+                                if lic:
+                                    recovered_customer = str(dict(lic).get("customer_id") or "").strip()
+                    except Exception:
+                        recovered_customer = ""
+                    if recovered_customer:
+                        try:
+                            conn.execute(
+                                "UPDATE cp_edges SET customer_id=?, updated_utc=? WHERE tenant_id=? AND edge_id=?",
+                                (recovered_customer, now, tid, eid),
+                            )
+                            conn.commit()
+                            edge_row["customer_id"] = recovered_customer
+                            customer_id = recovered_customer
+                        except Exception:
+                            customer_id = ""
+                    if not customer_id:
+                        return {"ok": False, "reason": "edge_customer_missing", "edge": edge_row, "resolved_tenant_id": tid}
                 lic = self.get_license_for_customer(tenant_id=tid, customer_id=customer_id)
                 if not lic:
-                    return {"ok": False, "reason": "license_not_found", "edge": edge_row}
+                    return {"ok": False, "reason": "license_not_found", "edge": edge_row, "resolved_tenant_id": tid}
+                lic = dict(lic)
+                lid = str(lic.get("license_id") or "").strip()
+                lic["modules"] = self.list_license_modules(license_id=lid) if lid else []
                 status = str(lic.get("status") or "").strip().lower()
                 if status != "active":
-                    return {"ok": False, "reason": "license_inactive", "edge": edge_row, "license": lic}
+                    return {"ok": False, "reason": "license_inactive", "edge": edge_row, "license": lic, "resolved_tenant_id": tid}
                 end_utc = str(lic.get("end_utc") or "").strip()
                 if end_utc and self._is_expired_utc(end_utc, now):
-                    return {"ok": False, "reason": "license_expired", "edge": edge_row, "license": lic}
-                return {"ok": True, "edge": edge_row, "license": lic}
+                    return {"ok": False, "reason": "license_expired", "edge": edge_row, "license": lic, "resolved_tenant_id": tid}
+                return {"ok": True, "edge": edge_row, "license": lic, "resolved_tenant_id": tid}
 
 
 

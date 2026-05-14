@@ -1,0 +1,181 @@
+{
+  "run_id": "20260511_194206_a6acfb15",
+  "started_utc": "2026-05-11T19:42:06.485454+00:00",
+  "base_url": "http://127.0.0.1:8000",
+  "tenant_id": "default",
+  "customer_id": "smk-cust-20260511_194206_a6acfb15",
+  "edge_id": "smk-edge-20260511_194206_a6acfb15",
+  "license_id": "smk-lic-20260511_194206_a6acfb15",
+  "steps": [
+    {
+      "step": "login",
+      "ok": true
+    }
+  ],
+  "ok": true,
+  "assertions": {
+    "license_check_ok": true,
+    "license_id_match": true,
+    "start_present": true,
+    "end_present": true,
+    "modules_present": true,
+    "edge_customer_present": true
+  },
+  "finished_utc": "2026-05-11T19:42:06.996743+00:00",
+  "register": {
+    "ok": true,
+    "tenant_id": "default",
+    "edge_id": "smk-edge-20260511_194206_a6acfb15",
+    "edge_name": "SMK Edge 20260511_194206_a6acfb15",
+    "customer_id": "smk-cust-20260511_194206_a6acfb15",
+    "license_id": "smk-lic-20260511_194206_a6acfb15",
+    "license": {
+      "license_id": "smk-lic-20260511_194206_a6acfb15",
+      "plan_code": "standard",
+      "start_utc": "2026-05-11 19:42:06.555",
+      "end_utc": "2027-05-11 19:42:06.555",
+      "max_edges": 5,
+      "max_users": 25,
+      "status": "active",
+      "modules": [
+        {
+          "module_key": "alarms",
+          "enabled": true
+        },
+        {
+          "module_key": "dashboard",
+          "enabled": true
+        },
+        {
+          "module_key": "database",
+          "enabled": true
+        },
+        {
+          "module_key": "gateway_configuration",
+          "enabled": true
+        },
+        {
+          "module_key": "gateway_runtime_control",
+          "enabled": true
+        },
+        {
+          "module_key": "historian",
+          "enabled": true
+        },
+        {
+          "module_key": "interface",
+          "enabled": true
+        },
+        {
+          "module_key": "power_overview",
+          "enabled": true
+        },
+        {
+          "module_key": "reporting",
+          "enabled": true
+        },
+        {
+          "module_key": "tags",
+          "enabled": true
+        },
+        {
+          "module_key": "users_and_access_control",
+          "enabled": true
+        }
+      ]
+    },
+    "cloud_api_url": "https://trustnode.lsapps.app",
+    "primary_domain": "trustnode.lsapps.app",
+    "site": "Smoke Site",
+    "area": "Line A",
+    "equipment": "SMK",
+    "scope_incomplete": false,
+    "scope_warnings": [],
+    "cloud_user_sync_ok": true,
+    "cloud_user_sync_error": ""
+  },
+  "license_check": {
+    "ok": true,
+    "tenant_id": "default",
+    "edge_id": "smk-edge-20260511_194206_a6acfb15",
+    "edge": {
+      "edge_id": "smk-edge-20260511_194206_a6acfb15",
+      "tenant_id": "default",
+      "customer_id": "smk-cust-20260511_194206_a6acfb15",
+      "edge_name": "SMK Edge 20260511_194206_a6acfb15",
+      "site": "Smoke Site",
+      "area": "Line A",
+      "equipment": "SMK",
+      "status": "active",
+      "activation_code_hash": null,
+      "activated_utc": null,
+      "last_heartbeat_utc": null,
+      "heartbeat_payload_json": "{}",
+      "metadata_json": "{\"activated_via\":\"code\",\"license_id\":\"smk-lic-20260511_194206_a6acfb15\"}",
+      "created_utc": "2026-05-11 19:42:06.541",
+      "updated_utc": "2026-05-11 19:42:06.658"
+    },
+    "license": {
+      "license_id": "smk-lic-20260511_194206_a6acfb15",
+      "tenant_id": "default",
+      "customer_id": "smk-cust-20260511_194206_a6acfb15",
+      "plan_code": "standard",
+      "status": "active",
+      "start_utc": "2026-05-11 19:42:06.555",
+      "end_utc": "2027-05-11 19:42:06.555",
+      "max_edges": 5,
+      "max_users": 25,
+      "metadata_json": "{\"source\":\"smoke_test\"}",
+      "created_utc": "2026-05-11 19:42:06.565",
+      "updated_utc": "2026-05-11 19:42:06.565",
+      "modules": [
+        {
+          "module_key": "alarms",
+          "enabled": true
+        },
+        {
+          "module_key": "dashboard",
+          "enabled": true
+        },
+        {
+          "module_key": "database",
+          "enabled": true
+        },
+        {
+          "module_key": "gateway_configuration",
+          "enabled": true
+        },
+        {
+          "module_key": "gateway_runtime_control",
+          "enabled": true
+        },
+        {
+          "module_key": "historian",
+          "enabled": true
+        },
+        {
+          "module_key": "interface",
+          "enabled": true
+        },
+        {
+          "module_key": "power_overview",
+          "enabled": true
+        },
+        {
+          "module_key": "reporting",
+          "enabled": true
+        },
+        {
+          "module_key": "tags",
+          "enabled": true
+        },
+        {
+          "module_key": "users_and_access_control",
+          "enabled": true
+        }
+      ]
+    },
+    "resolved_tenant_id": "default"
+  },
+  "activation_code": "xZLb-VnSivtZ9HmoL-uiaeT2jJRwjKxu"
+}

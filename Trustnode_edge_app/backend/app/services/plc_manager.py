@@ -1824,6 +1824,14 @@ class PLCManager:
         self.workers[gateway_id] = w
         return w
 
+    @staticmethod
+    def _endpoint_key(config: GatewayConfig) -> tuple[str, str]:
+        gateway_type = str(getattr(config, "gateway_type", "") or "").strip().lower()
+        plc_ip = str(getattr(config, "plc_ip", "") or "").strip().lower()
+        opc_url = str(getattr(config, "opc_url", "") or "").strip().lower()
+        endpoint = opc_url if gateway_type == "siemens_opcua" else plc_ip
+        return gateway_type, endpoint
+
     async def start_gateway(
         self,
         gateway_id: str,
@@ -1831,6 +1839,19 @@ class PLCManager:
         db_sink: Dict[str, Any] | None,
         db_sinks: List[Dict[str, Any]] | None = None,
     ) -> None:
+        # Keep runtime deterministic: only one active worker per physical endpoint.
+        # Duplicate workers on the same PLC endpoint produce visible chart jitter/noise.
+        target_key = self._endpoint_key(config)
+        stale_workers: List[str] = []
+        for existing_id, existing_worker in list(self.workers.items()):
+            if existing_id == gateway_id:
+                continue
+            existing_key = self._endpoint_key(existing_worker.config)
+            if target_key[1] and existing_key == target_key:
+                stale_workers.append(existing_id)
+        for stale_id in stale_workers:
+            await self.stop_gateway(stale_id)
+
         w = self._get_or_create_worker(gateway_id, config, db_sink, db_sinks)
         self._refresh_global_triggers()
         self.active_gateway_id = gateway_id
@@ -1841,12 +1862,17 @@ class PLCManager:
         if not w:
             return
         await w.stop()
+        self.workers.pop(gateway_id, None)
+        if self.active_gateway_id == gateway_id:
+            self.active_gateway_id = ""
         self._clear_gateway_live_values(gateway_id)
         self._refresh_global_triggers()
 
     async def stop_all_gateways(self) -> None:
-        for w in list(self.workers.values()):
+        for gid, w in list(self.workers.items()):
             await w.stop()
+            self.workers.pop(gid, None)
+        self.active_gateway_id = ""
         self.global_live_values = {}
         self._refresh_global_triggers()
 

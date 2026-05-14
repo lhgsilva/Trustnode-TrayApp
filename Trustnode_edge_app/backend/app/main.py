@@ -19,7 +19,16 @@ from app.routers.notifications import router as notifications_router
 from app.routers.telemetry_v1 import router as telemetry_v1_router
 from app.routers.power import router as power_router
 from app.routers.control_plane import router as control_plane_router
-from app.state import plc_manager, app_store, telemetry_service, ingest_store, power_manager
+from app.routers.reports import router as reports_router
+from app.state import (
+    plc_manager,
+    app_store,
+    telemetry_service,
+    ingest_store,
+    power_manager,
+    reports_store,
+    report_scheduler,
+)
 from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
 
 app = FastAPI(title="Trustnode Edge API", version="0.1.0")
@@ -43,6 +52,7 @@ app.include_router(notifications_router)
 app.include_router(telemetry_v1_router)
 app.include_router(power_router)
 app.include_router(control_plane_router)
+app.include_router(reports_router)
 
 
 @app.on_event("startup")
@@ -59,6 +69,18 @@ async def startup_event() -> None:
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False)
         telemetry_service.configure_from_bootstrap({"data": bootstrap})
     except Exception:
+        bootstrap = None
+    # One-shot migration: lift templates/schedules out of the legacy
+    # `reporting_setup` JSON blob into the dedicated tables.
+    try:
+        if isinstance(bootstrap, dict):
+            reports_store.migrate_from_bootstrap(bootstrap, tenant_id="default")
+    except Exception:
+        pass
+    # Start the report scheduler daemon (15s tick, idle when no schedules).
+    try:
+        report_scheduler.start()
+    except Exception:
         pass
 
 
@@ -70,6 +92,7 @@ PUBLIC_PATHS = {
     "/api/control-plane/activation-code/apply",
     "/api/control-plane/edge-link/bootstrap",
     "/api/control-plane/edge-link/register",
+    "/api/control-plane/edge-link/local-finalize",
     "/api/control-plane/password-reset/public/issue",
     "/api/control-plane/password-reset/public/apply",
     "/api/v1/healthz",
@@ -296,6 +319,10 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    try:
+        report_scheduler.stop()
+    except Exception:
+        pass
     telemetry_service.shutdown()
     power_manager.shutdown()
     app_store.shutdown()

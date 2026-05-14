@@ -1,0 +1,51 @@
+{
+  "started_utc": "2026-05-12T10:16:22.563890+00:00",
+  "finished_utc": "2026-05-12T10:17:53.403534+00:00",
+  "base_url": "http://127.0.0.1:8000",
+  "gateway_id": "",
+  "tag_name": "",
+  "duration_seconds": 30,
+  "ws": {
+    "sample_count": 0,
+    "lag_ms": {
+      "avg": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "interarrival_ms": {
+      "avg": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "gateway_tag_counts": {}
+  },
+  "historian": {
+    "rows_seen": 1,
+    "lag_ms": {
+      "avg": 482367.55,
+      "p50": 482367.55,
+      "p95": 482367.55,
+      "max": 482367.55
+    }
+  },
+  "status": {
+    "status_samples": 30,
+    "transitions": {},
+    "last_state": {}
+  },
+  "interval_truth": {
+    "configured_interval_ms_by_gateway": {},
+    "runtime_interval_ms_by_gateway": {},
+    "mismatches": {}
+  },
+  "pass": {
+    "ws_has_samples": false,
+    "historian_has_rows": true,
+    "ws_p95_within_target": true,
+    "historian_p95_within_target": false,
+    "flicker_transitions_within_target": true,
+    "interval_truth_no_mismatch": true
+  }
+}

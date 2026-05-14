@@ -502,6 +502,10 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: false,
+      // `plugins: true` enables Chromium's built-in PDF viewer so report
+      // previews (<iframe src="blob:..."> with application/pdf) render inline.
+      // Without this flag Electron shows the raw JSON / 401 body instead.
+      plugins: true,
       preload: path.join(__dirname, "preload.js")
     }
   });

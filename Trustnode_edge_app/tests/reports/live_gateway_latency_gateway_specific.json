@@ -1,0 +1,48 @@
+{
+  "started_utc": "2026-05-12T09:22:01.534622+00:00",
+  "finished_utc": "2026-05-12T09:23:01.834231+00:00",
+  "base_url": "http://127.0.0.1:8000",
+  "gateway_id": "gw-1778540283647",
+  "tag_name": "SimREAL[3]",
+  "duration_seconds": 20,
+  "ws": {
+    "sample_count": 10,
+    "lag_ms": {
+      "avg": 40.82,
+      "p50": 41.39,
+      "p95": 53.15,
+      "max": 53.15
+    },
+    "interarrival_ms": {
+      "avg": 1954.79,
+      "p50": 1994.68,
+      "p95": 2044.68,
+      "max": 2044.68
+    },
+    "gateway_tag_counts": {
+      "::SimREAL[3]": 1,
+      "gw-1778540283647::SimREAL[3]": 10
+    }
+  },
+  "historian": {
+    "rows_seen": 11,
+    "lag_ms": {
+      "avg": 195.08,
+      "p50": 177.7,
+      "p95": 575.52,
+      "max": 575.52
+    }
+  },
+  "status": {
+    "status_samples": 20,
+    "transitions": {},
+    "last_state": {
+      "gw-1778540283647": true
+    }
+  },
+  "pass": {
+    "ws_has_samples": true,
+    "historian_has_rows": true,
+    "flicker_transitions_lt_3": true
+  }
+}

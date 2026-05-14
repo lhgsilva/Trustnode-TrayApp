@@ -1,5 +1,5 @@
-export const DASHBOARD_GRID_COLS = 10;
-export const DASHBOARD_GRID_ROWS = 10;
+export const DASHBOARD_GRID_COLS = 20;
+export const DASHBOARD_GRID_ROWS = 20;
 
 export const WIDGET_TYPES = [
   { key: "line_chart", label: "Line Chart", group: "Charts", defaultSize: { w: 5, h: 4 } },
@@ -10,7 +10,7 @@ export const WIDGET_TYPES = [
   { key: "text_kpi", label: "Text KPI (Tag)", group: "KPI", defaultSize: { w: 3, h: 2 } },
   { key: "value_kpi", label: "Value KPI (Tag)", group: "KPI", defaultSize: { w: 3, h: 2 } },
   { key: "fixed_text", label: "Fixed Text", group: "Content", defaultSize: { w: 4, h: 2 } },
-  { key: "divider", label: "Divider", group: "Layout", defaultSize: { w: 10, h: 1 } },
+  { key: "divider", label: "Divider", group: "Layout", defaultSize: { w: 20, h: 1 } },
   { key: "table_list", label: "Table List View", group: "Content", defaultSize: { w: 6, h: 4 } },
   { key: "image", label: "Pictures", group: "Media", defaultSize: { w: 4, h: 4 } },
   { key: "ip_camera", label: "IP Camera (Live Feed)", group: "Media", defaultSize: { w: 5, h: 4 } },

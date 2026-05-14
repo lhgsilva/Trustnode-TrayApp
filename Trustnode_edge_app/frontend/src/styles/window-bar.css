@@ -121,3 +121,20 @@
 .window-bar-actions .icon-btn:disabled {
   opacity: 0.45 !important;
 }
+
+[data-theme="light"] .window-bar-menu-btn,
+[data-theme="light"] .window-bar-actions .icon-btn {
+  background: #e8edf3;
+  border-color: #c9d3de;
+  color: #1f2a37;
+}
+
+[data-theme="light"] .window-bar-menu-btn:hover,
+[data-theme="light"] .window-bar-actions .icon-btn:hover {
+  background: #dde5ee;
+  border-color: #b8c5d4;
+}
+
+[data-theme="light"] .window-native-btn {
+  color: #1f2a37;
+}

@@ -7,6 +7,7 @@ import hashlib
 import secrets
 import time
 import socket
+import math
 from urllib.parse import quote_plus
 from datetime import timedelta
 from datetime import datetime, timezone
@@ -647,7 +648,19 @@ class AppStore:
     def _normalize_app_settings_payload(self, payload: Any, previous_payload: Any) -> Any:
         next_payload = payload if isinstance(payload, dict) else {}
         prev_payload = previous_payload if isinstance(previous_payload, dict) else {}
-        out = dict(next_payload)
+
+        # App settings writes are often partial patches from UI.
+        # Merge with previous payload to avoid dropping activation/link fields
+        # (edge_id/customer_id/license_id/tenant scope) on unrelated saves.
+        out: Dict[str, Any] = dict(prev_payload)
+        for key, value in dict(next_payload).items():
+            if isinstance(value, dict) and isinstance(out.get(key), dict):
+                merged_child = dict(out.get(key) or {})
+                merged_child.update(value)
+                out[key] = merged_child
+            else:
+                out[key] = value
+
         for key in ("cloud_url", "cloud_api_url", "endpoint_mode"):
             prev_val = prev_payload.get(key)
             next_val = out.get(key)
@@ -2350,6 +2363,16 @@ class AppStore:
                       version INTEGER NOT NULL DEFAULT 1,
                       updated_utc TEXT NOT NULL
                     );
+                    
+                    CREATE TABLE IF NOT EXISTS config_documents_scoped (
+                      scope_key TEXT NOT NULL,
+                      domain TEXT NOT NULL,
+                      payload_json TEXT NOT NULL,
+                      version INTEGER NOT NULL DEFAULT 1,
+                      updated_utc TEXT NOT NULL,
+                      PRIMARY KEY (scope_key, domain)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_cfg_scoped_scope ON config_documents_scoped(scope_key);
 
                     CREATE TABLE IF NOT EXISTS config_audit (
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2379,6 +2402,12 @@ class AppStore:
                     CREATE INDEX IF NOT EXISTS idx_hist_ts ON historian_readings(ts_utc DESC);
                     CREATE INDEX IF NOT EXISTS idx_hist_tag ON historian_readings(tag_name);
                     CREATE INDEX IF NOT EXISTS idx_hist_gateway ON historian_readings(gateway_id);
+                    -- Composite covering index for dashboard widget aggregations
+                    -- (rule-stats, stats, range queries scoped by tenant+gateway+tag+ts).
+                    CREATE INDEX IF NOT EXISTS idx_hist_tenant_gw_tag_ts
+                      ON historian_readings(tenant_id, gateway_id, tag_name, ts_utc DESC);
+                    CREATE INDEX IF NOT EXISTS idx_hist_tenant_tag_ts
+                      ON historian_readings(tenant_id, tag_name, ts_utc DESC);
 
                     CREATE TABLE IF NOT EXISTS app_logs (
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2515,6 +2544,83 @@ class AppStore:
                       secret TEXT NOT NULL,
                       updated_utc TEXT NOT NULL
                     );
+
+                    -- Reporting module: templates persist the saved configuration
+                    -- (sections + filters) that drives PDF generation. `definition_json`
+                    -- holds the ordered list of sections (header/text/kpi/chart/pie/table)
+                    -- each referencing the dashboard widget schema for queries.
+                    CREATE TABLE IF NOT EXISTS report_templates (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      name TEXT NOT NULL,
+                      description TEXT NULL,
+                      definition_json TEXT NOT NULL,
+                      created_utc TEXT NOT NULL,
+                      updated_utc TEXT NOT NULL,
+                      created_by TEXT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_report_templates_tenant ON report_templates(tenant_id);
+                    CREATE INDEX IF NOT EXISTS idx_report_templates_updated ON report_templates(updated_utc DESC);
+
+                    -- Schedules wrap a template with a trigger (time/tag/both) and
+                    -- delivery settings (email recipients, attach PDF).
+                    CREATE TABLE IF NOT EXISTS scheduled_reports (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      name TEXT NOT NULL,
+                      template_id TEXT NOT NULL,
+                      enabled INTEGER NOT NULL DEFAULT 1,
+                      trigger_mode TEXT NOT NULL DEFAULT 'time',
+                      recurrence TEXT NOT NULL DEFAULT 'daily',
+                      hour INTEGER NOT NULL DEFAULT 8,
+                      minute INTEGER NOT NULL DEFAULT 0,
+                      day_of_week INTEGER NULL,
+                      day_of_month INTEGER NULL,
+                      tag_conditions_json TEXT NOT NULL DEFAULT '[]',
+                      condition_logic TEXT NOT NULL DEFAULT 'all',
+                      deliver_email INTEGER NOT NULL DEFAULT 0,
+                      recipients_json TEXT NOT NULL DEFAULT '[]',
+                      email_subject TEXT NULL,
+                      email_body TEXT NULL,
+                      email_profile_id TEXT NULL,
+                      format TEXT NOT NULL DEFAULT 'pdf',
+                      attach_pdf INTEGER NOT NULL DEFAULT 1,
+                      attach_csv INTEGER NOT NULL DEFAULT 0,
+                      attach_txt INTEGER NOT NULL DEFAULT 0,
+                      require_gateway_running INTEGER NOT NULL DEFAULT 0,
+                      created_utc TEXT NOT NULL,
+                      updated_utc TEXT NOT NULL,
+                      last_run_utc TEXT NULL,
+                      next_run_utc TEXT NULL,
+                      last_status TEXT NULL,
+                      last_error TEXT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_scheduled_reports_tenant ON scheduled_reports(tenant_id, enabled);
+                    CREATE INDEX IF NOT EXISTS idx_scheduled_reports_next_run ON scheduled_reports(next_run_utc);
+
+                    -- One row per generated PDF. The actual file lives on disk at
+                    -- `<TRUSTNODE_DATA_DIR>/reports/<id>.pdf`. `email_status` records
+                    -- delivery state when a schedule asked for email.
+                    CREATE TABLE IF NOT EXISTS generated_reports (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      template_id TEXT NULL,
+                      template_name TEXT NULL,
+                      schedule_id TEXT NULL,
+                      schedule_name TEXT NULL,
+                      triggered_by TEXT NOT NULL DEFAULT 'manual',
+                      file_path TEXT NOT NULL,
+                      file_name TEXT NOT NULL,
+                      file_bytes INTEGER NOT NULL DEFAULT 0,
+                      file_sha256 TEXT NULL,
+                      created_utc TEXT NOT NULL,
+                      email_status TEXT NULL,
+                      email_message TEXT NULL,
+                      email_recipients_json TEXT NULL,
+                      meta_json TEXT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_generated_reports_tenant_created ON generated_reports(tenant_id, created_utc DESC);
+                    CREATE INDEX IF NOT EXISTS idx_generated_reports_schedule ON generated_reports(schedule_id, created_utc DESC);
                     """
                 )
                 hist_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(historian_readings)").fetchall()}
@@ -2523,7 +2629,24 @@ class AppStore:
                 log_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(app_logs)").fetchall()}
                 if "tenant_id" not in log_cols:
                     conn.execute('ALTER TABLE app_logs ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "default"')
+                # 2026-05-13: schedules grew an opt-in "only when a gateway is running" gate.
+                # Older DBs need the column added on the fly so the daemon and CRUD code
+                # don't crash on a missing field.
+                sched_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(scheduled_reports)").fetchall()}
+                if "require_gateway_running" not in sched_cols:
+                    conn.execute("ALTER TABLE scheduled_reports ADD COLUMN require_gateway_running INTEGER NOT NULL DEFAULT 0")
+                # 2026-05-14: schedules can attach multiple file types (PDF/CSV/TXT)
+                # to the scheduled email. Backfill defaults so old schedules keep
+                # delivering just the PDF as they always did.
+                if "attach_pdf" not in sched_cols:
+                    conn.execute("ALTER TABLE scheduled_reports ADD COLUMN attach_pdf INTEGER NOT NULL DEFAULT 1")
+                if "attach_csv" not in sched_cols:
+                    conn.execute("ALTER TABLE scheduled_reports ADD COLUMN attach_csv INTEGER NOT NULL DEFAULT 0")
+                if "attach_txt" not in sched_cols:
+                    conn.execute("ALTER TABLE scheduled_reports ADD COLUMN attach_txt INTEGER NOT NULL DEFAULT 0")
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_hist_tenant_ts ON historian_readings(tenant_id, ts_utc DESC)')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_hist_tenant_gwid_tag_ts ON historian_readings(tenant_id, gateway_id, tag_name, ts_utc DESC)')
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_hist_tenant_gwname_tag_ts ON historian_readings(tenant_id, gateway_name, tag_name, ts_utc DESC)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_tenant_ts ON app_logs(tenant_id, ts_utc DESC)')
                 now = self._utc_now()
                 conn.execute(
@@ -3107,6 +3230,30 @@ class AppStore:
             "tenant_id": tenant_id,
             "base_host": "trustnode.lsapps.app",
         }
+        return out
+
+    def get_bootstrap_scoped(self, scope_key: str, prefer_cloud_reads: bool | None = None) -> Dict[str, Any]:
+        skey = str(scope_key or "").strip()
+        if not skey:
+            return self.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
+        out = self.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT domain, payload_json FROM config_documents_scoped WHERE scope_key = ?",
+                    (skey,),
+                ).fetchall()
+        for row in rows:
+            domain = str(row["domain"] or "").strip()
+            if not domain:
+                continue
+            payload_text = str(row["payload_json"] or "null")
+            try:
+                out[domain] = json.loads(payload_text)
+            except Exception:
+                out[domain] = None
+        if isinstance(out.get("metadata"), dict):
+            out["metadata"]["scope_key"] = skey
         return out
 
     def _apply_live_config_overrides(self, bootstrap: Dict[str, Any]) -> Dict[str, Any]:
@@ -3991,12 +4138,91 @@ class AppStore:
         self._sync_wakeup_event.set()
         return {"domain": domain, "tenant_id": self._current_tenant_id(), "version": new_version, "updated_utc": now}
 
+    def upsert_domain_scoped(self, scope_key: str, domain: str, payload: Any, actor: str = "system") -> Dict[str, Any]:
+        skey = str(scope_key or "").strip()
+        if not skey:
+            return self.upsert_domain(domain, payload, actor=actor)
+        now = self._utc_now()
+        domain_name = str(domain or "").strip()
+        payload_to_store = payload
+        if domain_name == "users_access":
+            payload_to_store = self._normalize_users_access_payload(payload)
+        if domain_name in {
+            "metadata",
+            "devices",
+            "gateway_configurations",
+            "database_configurations",
+            "power_management_config",
+        }:
+            payload_to_store = self._strip_runtime_fields_for_config_sync(payload_to_store)
+        payload_json = self._canonical_json(payload_to_store)
+        with self._lock:
+            with self._connect() as conn:
+                prev = conn.execute(
+                    "SELECT version, payload_json, updated_utc FROM config_documents_scoped WHERE scope_key = ? AND domain = ?",
+                    (skey, domain_name),
+                ).fetchone()
+                old_version = int(prev["version"]) if prev else 0
+                prev_payload_json = ""
+                if prev:
+                    prev_raw = str(prev["payload_json"] or "")
+                    try:
+                        prev_payload_json = self._canonical_json(json.loads(prev_raw))
+                    except Exception:
+                        prev_payload_json = prev_raw
+                if prev and prev_payload_json == payload_json:
+                    return {
+                        "domain": domain_name,
+                        "scope_key": skey,
+                        "tenant_id": self._current_tenant_id(),
+                        "version": old_version,
+                        "updated_utc": str(prev["updated_utc"] or now),
+                        "unchanged": True,
+                    }
+                new_version = old_version + 1
+                conn.execute(
+                    """
+                    INSERT INTO config_documents_scoped(scope_key, domain, payload_json, version, updated_utc)
+                    VALUES(?, ?, ?, ?, ?)
+                    ON CONFLICT(scope_key, domain) DO UPDATE SET
+                      payload_json = excluded.payload_json,
+                      version = excluded.version,
+                      updated_utc = excluded.updated_utc
+                    """,
+                    (skey, domain_name, payload_json, new_version, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO config_audit(domain, actor, old_version, new_version, changed_utc)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (f"{domain_name}#{skey}", actor, old_version if old_version > 0 else None, new_version, now),
+                )
+        return {
+            "domain": domain_name,
+            "scope_key": skey,
+            "tenant_id": self._current_tenant_id(),
+            "version": new_version,
+            "updated_utc": now,
+        }
+
     def save_bootstrap(self, data: Dict[str, Any], actor: str = "system") -> Dict[str, Any]:
         versions: Dict[str, Any] = {}
         for domain, payload in data.items():
             if not isinstance(domain, str) or not domain.strip():
                 continue
             versions[domain] = self.upsert_domain(domain.strip(), payload, actor=actor)
+        return versions
+
+    def save_bootstrap_scoped(self, scope_key: str, data: Dict[str, Any], actor: str = "system") -> Dict[str, Any]:
+        skey = str(scope_key or "").strip()
+        if not skey:
+            return self.save_bootstrap(data=data, actor=actor)
+        versions: Dict[str, Any] = {}
+        for domain, payload in data.items():
+            if not isinstance(domain, str) or not domain.strip():
+                continue
+            versions[domain] = self.upsert_domain_scoped(skey, domain.strip(), payload, actor=actor)
         return versions
 
     def append_historian_rows(self, rows: list[dict[str, Any]]) -> int:
@@ -4153,7 +4379,10 @@ class AppStore:
         where = "WHERE tenant_id = :tenant"
         params: dict[str, Any] = {"tenant": tenant_id, "lim": fetch_lim}
         if gateway_txt:
-            where += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+            if gateway_txt.lower().startswith("gw-"):
+                where += " AND gateway_id = :gateway"
+            else:
+                where += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
             params["gateway"] = gateway_txt
         if device_txt:
             where += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
@@ -4161,19 +4390,19 @@ class AppStore:
         if tag_txt:
             where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
             params["tag_like"] = f"%{tag_txt}%"
-        with self._lock:
-            with self._connect() as conn:
-                rows = conn.execute(
-                    f"""
-                    SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                           tag_name, value, quality, quality_label
-                    FROM historian_readings
-                    {where}
-                    ORDER BY id DESC
-                    LIMIT :lim
-                    """,
-                    params,
-                ).fetchall()
+        # Read-only path: parallel readers via WAL, no global lock.
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                       tag_name, value, quality, quality_label
+                FROM historian_readings
+                {where}
+                ORDER BY id DESC
+                LIMIT :lim
+                """,
+                params,
+            ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
             out.append(
@@ -4231,35 +4460,84 @@ class AppStore:
                 return self._filter_rows_by_edge(cloud_rows, edge_filter)[:lim]
 
         where = "WHERE tenant_id = :tenant"
+        where_unscoped = "WHERE 1=1"
         params: dict[str, Any] = {"tenant": tenant_id, "lim": lim, "off": off}
+        params_unscoped: dict[str, Any] = {"lim": lim, "off": off}
         if gateway_txt:
-            where += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+            # Index-friendly: direct equality on gateway_id when caller passes a
+            # canonical gw-* id (the only form widgets emit). Falls back to OR
+            # over gateway_id/gateway_name for legacy/non-canonical names.
+            if gateway_txt.lower().startswith("gw-"):
+                where += " AND gateway_id = :gateway"
+                where_unscoped += " AND gateway_id = :gateway"
+            else:
+                where += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+                where_unscoped += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
             params["gateway"] = gateway_txt
+            params_unscoped["gateway"] = gateway_txt
         if device_txt:
             where += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
+            where_unscoped += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
             params["device_like"] = f"%{device_txt}%"
+            params_unscoped["device_like"] = f"%{device_txt}%"
         if tag_txt:
-            where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
-            params["tag_like"] = f"%{tag_txt}%"
+            if "%" in tag_txt or "_" in tag_txt:
+                where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+                where_unscoped += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+                params["tag_like"] = f"%{tag_txt}%"
+                params_unscoped["tag_like"] = f"%{tag_txt}%"
+            else:
+                # Index-friendly direct equality (case-sensitive). Tag names are
+                # stored exactly as configured, so this aligns with the composite
+                # historian indexes for O(log N) seeks.
+                where += " AND tag_name = :tag_exact"
+                where_unscoped += " AND tag_name = :tag_exact"
+                params["tag_exact"] = tag_txt
+                params_unscoped["tag_exact"] = tag_txt
         if from_txt:
             where += " AND ts_utc >= :from_utc"
+            where_unscoped += " AND ts_utc >= :from_utc"
             params["from_utc"] = from_txt
+            params_unscoped["from_utc"] = from_txt
         if to_txt:
             where += " AND ts_utc <= :to_utc"
+            where_unscoped += " AND ts_utc <= :to_utc"
             params["to_utc"] = to_txt
+            params_unscoped["to_utc"] = to_txt
 
-        with self._lock:
-            with self._connect() as conn:
+        # Read-only path: SQLite WAL allows concurrent readers without serializing.
+        # We deliberately do NOT acquire self._lock here so dashboard widgets and
+        # other queries can run in parallel instead of queueing on a single mutex.
+        with self._connect() as conn:
+            # ORDER BY ts_utc DESC alone matches idx_hist_tenant_gw_tag_ts so
+            # SQLite can stream the LIMIT N most recent rows in index order
+            # (no temp B-tree). The trailing `id DESC` tie-breaker was only
+            # meaningful for rows sharing an identical ts_utc — rare in
+            # practice and visually identical on the chart.
+            rows = conn.execute(
+                f"""
+                SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                       tag_name, value, quality, quality_label
+                FROM historian_readings
+                {where}
+                ORDER BY ts_utc DESC
+                LIMIT :lim OFFSET :off
+                """,
+                params,
+            ).fetchall()
+            if not rows:
+                # Fallback for legacy/unscoped rows: keep dashboard queries resilient
+                # after tenant migrations or historical data imported without tenant tags.
                 rows = conn.execute(
                     f"""
                     SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                            tag_name, value, quality, quality_label
                     FROM historian_readings
-                    {where}
-                    ORDER BY ts_utc DESC, id DESC
+                    {where_unscoped}
+                    ORDER BY ts_utc DESC
                     LIMIT :lim OFFSET :off
                     """,
-                    params,
+                    params_unscoped,
                 ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
@@ -4281,6 +4559,564 @@ class AppStore:
             )
         out = self._filter_rows_by_edge(out, edge_filter)
         return out[:lim]
+
+    def get_historian_stats(
+        self,
+        from_utc: str = "",
+        to_utc: str = "",
+        gateway: str = "",
+        device: str = "",
+        tag: str = "",
+        edge_id: str = "",
+        prefer_cloud_reads: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        edge_filter = self._normalize_edge_filter(edge_id)
+        tenant_id = self._current_tenant_id()
+        gateway_txt = str(gateway or "").strip()
+        device_txt = str(device or "").strip()
+        tag_txt = str(tag or "").strip()
+        from_txt = self._normalize_utc_filter(from_utc)
+        to_txt = self._normalize_utc_filter(to_utc)
+
+        prefer_cloud = self._prefer_cloud_reads() if prefer_cloud_reads is None else bool(prefer_cloud_reads)
+        if prefer_cloud:
+            cloud_stats = self._fetch_historian_stats_from_cloud(
+                gateway=gateway_txt,
+                device=device_txt,
+                tag=tag_txt,
+                from_utc=from_txt,
+                to_utc=to_txt,
+            )
+            if cloud_stats:
+                return cloud_stats
+
+        where = "WHERE tenant_id = :tenant"
+        where_unscoped = "WHERE 1=1"
+        params: dict[str, Any] = {"tenant": tenant_id}
+        params_unscoped: dict[str, Any] = {}
+        if gateway_txt:
+            # Index-friendly direct equality when caller passes a canonical gw-* id.
+            # Falls back to OR over both columns for legacy/non-canonical names.
+            if gateway_txt.lower().startswith("gw-"):
+                where += " AND gateway_id = :gateway"
+                where_unscoped += " AND gateway_id = :gateway"
+            else:
+                where += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+                where_unscoped += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+            params["gateway"] = gateway_txt
+            params_unscoped["gateway"] = gateway_txt
+        if device_txt:
+            where += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
+            where_unscoped += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
+            params["device_like"] = f"%{device_txt}%"
+            params_unscoped["device_like"] = f"%{device_txt}%"
+        if tag_txt:
+            if "%" in tag_txt or "_" in tag_txt:
+                where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+                where_unscoped += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+                params["tag_like"] = f"%{tag_txt}%"
+                params_unscoped["tag_like"] = f"%{tag_txt}%"
+            else:
+                # Index-friendly direct equality. Tag names are stored exactly as
+                # configured, so case-sensitive match aligns with the composite
+                # historian indexes (idx_hist_tenant_gw_tag_ts / idx_hist_tenant_tag_ts).
+                where += " AND tag_name = :tag_exact"
+                where_unscoped += " AND tag_name = :tag_exact"
+                params["tag_exact"] = tag_txt
+                params_unscoped["tag_exact"] = tag_txt
+        if from_txt:
+            where += " AND ts_utc >= :from_utc"
+            where_unscoped += " AND ts_utc >= :from_utc"
+            params["from_utc"] = from_txt
+            params_unscoped["from_utc"] = from_txt
+        if to_txt:
+            where += " AND ts_utc <= :to_utc"
+            where_unscoped += " AND ts_utc <= :to_utc"
+            params["to_utc"] = to_txt
+            params_unscoped["to_utc"] = to_txt
+
+        def _fetch_aggregates(conn: sqlite3.Connection, where_sql: str, params_sql: dict[str, Any]) -> list[sqlite3.Row]:
+            return conn.execute(
+                f"""
+                SELECT
+                  COALESCE(tag_name,'') AS tag_name,
+                  COUNT(*) AS row_count,
+                  SUM(COALESCE(value, 0)) AS sum_value,
+                  AVG(value) AS avg_value,
+                  MIN(value) AS min_value,
+                  MAX(value) AS max_value
+                FROM historian_readings
+                {where_sql}
+                GROUP BY tag_name
+                ORDER BY tag_name ASC
+                """,
+                params_sql,
+            ).fetchall()
+
+        def _fetch_latest_per_tag(
+            conn: sqlite3.Connection, tag_names: list[str], where_sql: str, params_sql: dict[str, Any]
+        ) -> dict[str, float]:
+            # Per-tag most recent value within the same filter window. One query per
+            # tag (small N — bounded by distinct tags returned in the aggregates).
+            # Avoids the ambiguity of a JOIN where outer/inner share unqualified
+            # column names in the dynamic WHERE clause.
+            latest_map: dict[str, float] = {}
+            for tag in tag_names:
+                if not tag:
+                    continue
+                local_where = where_sql + " AND COALESCE(tag_name,'') = :__latest_tag"
+                local_params = dict(params_sql)
+                local_params["__latest_tag"] = tag
+                row = conn.execute(
+                    f"""
+                    SELECT value
+                    FROM historian_readings
+                    {local_where}
+                    ORDER BY ts_utc DESC, id DESC
+                    LIMIT 1
+                    """,
+                    local_params,
+                ).fetchone()
+                try:
+                    if row is not None and row["value"] is not None:
+                        latest_map[tag] = float(row["value"])
+                except Exception:
+                    continue
+            return latest_map
+
+        # Read-only path: parallelize via WAL instead of serializing on self._lock.
+        with self._connect() as conn:
+            rows = _fetch_aggregates(conn, where, params)
+            if rows:
+                tags_for_latest = [str(r["tag_name"] or "") for r in rows if str(r["tag_name"] or "").strip()]
+                latest_by_tag = _fetch_latest_per_tag(conn, tags_for_latest, where, params)
+            else:
+                rows = _fetch_aggregates(conn, where_unscoped, params_unscoped)
+                tags_for_latest = [str(r["tag_name"] or "") for r in rows if str(r["tag_name"] or "").strip()]
+                latest_by_tag = _fetch_latest_per_tag(conn, tags_for_latest, where_unscoped, params_unscoped) if rows else {}
+        out = [
+            {
+                "tag": str(r["tag_name"] or ""),
+                "count": int(r["row_count"] or 0),
+                "sum": float(r["sum_value"] or 0.0),
+                "avg": float(r["avg_value"] or 0.0) if r["avg_value"] is not None else None,
+                "min": float(r["min_value"] or 0.0) if r["min_value"] is not None else None,
+                "max": float(r["max_value"] or 0.0) if r["max_value"] is not None else None,
+                "latest": latest_by_tag.get(str(r["tag_name"] or "")),
+            }
+            for r in rows
+            if str(r["tag_name"] or "").strip()
+        ]
+        return out
+
+    def get_historian_rule_stats(
+        self,
+        rules: list[dict[str, Any]] | None = None,
+        from_utc: str = "",
+        to_utc: str = "",
+        gateway: str = "",
+        edge_id: str = "",
+        prefer_cloud_reads: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        del edge_id  # rule stats are tenant-scoped historian aggregates
+        del prefer_cloud_reads  # local edge must remain local-source-of-truth for widget rules
+        tenant_id = self._current_tenant_id()
+        from_txt = self._normalize_utc_filter(from_utc)
+        to_txt = self._normalize_utc_filter(to_utc)
+        request_gateway = str(gateway or "").strip()
+        safe_rules = list(rules or [])[:64]
+        out: list[dict[str, Any]] = []
+
+        def _add_gateway_filter(where_sql: str, params_sql: dict[str, Any], gw: str) -> tuple[str, dict[str, Any]]:
+            gw_txt = str(gw or "").strip()
+            if not gw_txt:
+                return where_sql, params_sql
+            # Gateway ids in TrustNode are canonical `gw-*`; prefer exact id lookups
+            # to keep queries index-friendly and deterministic.
+            if gw_txt.lower().startswith("gw-"):
+                where_sql += " AND COALESCE(gateway_id,'') = :gateway_id"
+                params_sql["gateway_id"] = gw_txt
+            else:
+                where_sql += " AND (COALESCE(gateway_id,'') = :gateway_name OR COALESCE(gateway_name,'') = :gateway_name)"
+                params_sql["gateway_name"] = gw_txt
+            return where_sql, params_sql
+
+        def _add_operator_filter(
+            where_sql: str,
+            params_sql: dict[str, Any],
+            op_raw: str,
+            v1_raw: Any,
+            v2_raw: Any,
+        ) -> tuple[str, dict[str, Any]]:
+            op = str(op_raw or "any").strip().lower()
+            op = {
+                ">": "gt",
+                ">=": "gte",
+                "<": "lt",
+                "<=": "lte",
+                "=": "eq",
+                "==": "eq",
+                "!=": "ne",
+                "<>": "ne",
+            }.get(op, op)
+            if op in {"any", ""}:
+                return where_sql, params_sql
+
+            def _to_float(value: Any) -> float | None:
+                try:
+                    n = float(value)
+                    if math.isfinite(n):
+                        return n
+                except Exception:
+                    return None
+                return None
+
+            v1 = _to_float(v1_raw)
+            v2 = _to_float(v2_raw)
+            if op in {"eq", "ne", "lt", "lte", "gt", "gte"} and v1 is None:
+                # Invalid threshold means rule matches nothing.
+                where_sql += " AND 1=0"
+                return where_sql, params_sql
+            if op == "between" and (v1 is None or v2 is None):
+                where_sql += " AND 1=0"
+                return where_sql, params_sql
+
+            if op == "eq":
+                where_sql += " AND value = :rule_v1"
+                params_sql["rule_v1"] = v1
+            elif op == "ne":
+                where_sql += " AND value <> :rule_v1"
+                params_sql["rule_v1"] = v1
+            elif op == "lt":
+                where_sql += " AND value < :rule_v1"
+                params_sql["rule_v1"] = v1
+            elif op == "lte":
+                where_sql += " AND value <= :rule_v1"
+                params_sql["rule_v1"] = v1
+            elif op == "gt":
+                where_sql += " AND value > :rule_v1"
+                params_sql["rule_v1"] = v1
+            elif op == "gte":
+                where_sql += " AND value >= :rule_v1"
+                params_sql["rule_v1"] = v1
+            elif op == "between":
+                lo = min(v1, v2)
+                hi = max(v1, v2)
+                where_sql += " AND value >= :rule_v1 AND value <= :rule_v2"
+                params_sql["rule_v1"] = lo
+                params_sql["rule_v2"] = hi
+            return where_sql, params_sql
+
+        # Normalize each rule into a dict the SQL helper can consume in one pass.
+        # Grouping rules by (gateway, tag, from, to) lets us run a *single*
+        # multi-rule aggregate SQL per group, instead of one query per rule.
+        # That keeps total latency flat as rules are added — critical so the
+        # computed-pie refresh can keep up with a 1s gateway interval.
+        def _to_float(value: Any) -> float | None:
+            try:
+                n = float(value)
+                if math.isfinite(n):
+                    return n
+            except Exception:
+                return None
+            return None
+
+        op_alias = {
+            ">": "gt", ">=": "gte", "<": "lt", "<=": "lte",
+            "=": "eq", "==": "eq", "!=": "ne", "<>": "ne",
+        }
+
+        normalized: list[dict[str, Any]] = []
+        for idx, rule in enumerate(safe_rules):
+            tag_txt = str((rule or {}).get("tag_name") or "").strip()
+            rule_gateway = str((rule or {}).get("gateway_id") or "").strip() or request_gateway
+            op_raw = str((rule or {}).get("operator") or "any").strip().lower()
+            op = op_alias.get(op_raw, op_raw)
+            if op == "" or op not in {"any", "eq", "ne", "lt", "lte", "gt", "gte", "between"}:
+                op = "any"
+            aggregation = str((rule or {}).get("aggregation") or "count").strip().lower()
+            if aggregation not in {"count", "sum", "avg", "min", "max", "latest"}:
+                aggregation = "count"
+            normalized.append({
+                "idx": idx,
+                "id": str((rule or {}).get("id") or f"rule-{idx + 1}"),
+                "label": str((rule or {}).get("label") or f"Item {idx + 1}"),
+                "color": str((rule or {}).get("color") or "#14a89a"),
+                "tag_name": tag_txt,
+                "gateway_id": rule_gateway,
+                "operator": op,
+                "aggregation": aggregation,
+                "v1": _to_float((rule or {}).get("value1")),
+                "v2": _to_float((rule or {}).get("value2")),
+            })
+
+        # Group rules with the same base scope so each group's data is scanned once.
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for r in normalized:
+            key = (r["gateway_id"], r["tag_name"].lower())
+            groups.setdefault(key, []).append(r)
+
+        def _build_group_where(gw: str, tag: str, scoped: bool) -> tuple[str, dict[str, Any]]:
+            params_g: dict[str, Any] = {}
+            if scoped:
+                where_g = "WHERE tenant_id = :tenant"
+                params_g["tenant"] = tenant_id
+            else:
+                where_g = "WHERE 1=1"
+            gw_txt = (gw or "").strip()
+            if gw_txt:
+                # Direct equality (no COALESCE wrapper) so SQLite can use the
+                # composite index idx_hist_tenant_gw_tag_ts for a seek instead of
+                # a full index scan. Historian rows always populate gateway_id;
+                # the COALESCE fallback was only for legacy rows that no longer exist.
+                if gw_txt.lower().startswith("gw-"):
+                    where_g += " AND gateway_id = :gateway_id"
+                    params_g["gateway_id"] = gw_txt
+                else:
+                    # Non-canonical gateway names: keep the COALESCE/OR fallback
+                    # for backward compat. This path is rare and will still scan
+                    # via the secondary tag index.
+                    where_g += " AND (COALESCE(gateway_id,'') = :gateway_name OR COALESCE(gateway_name,'') = :gateway_name)"
+                    params_g["gateway_name"] = gw_txt
+            if tag:
+                # Direct equality (case-sensitive) on tag_name. TrustNode stores
+                # tag names exactly as the user typed them, so we don't need
+                # LOWER() wrapping — that wrapping disabled index usage and
+                # slowed every rule-stats query by ~4x.
+                where_g += " AND tag_name = :tag_exact"
+                params_g["tag_exact"] = tag
+            if from_txt:
+                where_g += " AND ts_utc >= :from_utc"
+                params_g["from_utc"] = from_txt
+            if to_txt:
+                where_g += " AND ts_utc <= :to_utc"
+                params_g["to_utc"] = to_txt
+            return where_g, params_g
+
+        def _rule_predicate(r: dict[str, Any], param_prefix: str) -> tuple[str, dict[str, Any]]:
+            op = r["operator"]
+            v1, v2 = r["v1"], r["v2"]
+            if op in {"any"}:
+                return "1=1", {}
+            if op in {"eq", "ne", "lt", "lte", "gt", "gte"} and v1 is None:
+                return "1=0", {}
+            if op == "between" and (v1 is None or v2 is None):
+                return "1=0", {}
+            key1 = f"{param_prefix}_v1"
+            key2 = f"{param_prefix}_v2"
+            if op == "eq":
+                return f"value = :{key1}", {key1: v1}
+            if op == "ne":
+                return f"value <> :{key1}", {key1: v1}
+            if op == "lt":
+                return f"value < :{key1}", {key1: v1}
+            if op == "lte":
+                return f"value <= :{key1}", {key1: v1}
+            if op == "gt":
+                return f"value > :{key1}", {key1: v1}
+            if op == "gte":
+                return f"value >= :{key1}", {key1: v1}
+            if op == "between":
+                lo, hi = min(v1, v2), max(v1, v2)
+                return f"value >= :{key1} AND value <= :{key2}", {key1: lo, key2: hi}
+            return "1=1", {}
+
+        # Read-only path: one connection for the whole batch, no global lock
+        # (SQLite WAL handles reader concurrency).
+        results_by_id: dict[str, dict[str, Any]] = {}
+        with self._connect() as conn:
+            if True:
+                for (gw, _tag_lower), group_rules in groups.items():
+                    base_tag = group_rules[0]["tag_name"]
+                    scoped_where, scoped_params = _build_group_where(gw, base_tag, scoped=True)
+                    select_exprs: list[str] = []
+                    extra_params: dict[str, Any] = {}
+                    for r in group_rules:
+                        prefix = f"r{r['idx']}"
+                        pred_sql, pred_params = _rule_predicate(r, prefix)
+                        extra_params.update(pred_params)
+                        select_exprs.extend([
+                            f"SUM(CASE WHEN {pred_sql} THEN 1 ELSE 0 END) AS {prefix}_cnt",
+                            f"SUM(CASE WHEN {pred_sql} THEN value ELSE 0 END) AS {prefix}_sum",
+                            f"AVG(CASE WHEN {pred_sql} THEN value END) AS {prefix}_avg",
+                            f"MIN(CASE WHEN {pred_sql} THEN value END) AS {prefix}_min",
+                            f"MAX(CASE WHEN {pred_sql} THEN value END) AS {prefix}_max",
+                        ])
+                    select_sql = ",\n                  ".join(select_exprs)
+                    row = conn.execute(
+                        f"""
+                        SELECT {select_sql}
+                        FROM historian_readings
+                        {scoped_where}
+                        """,
+                        {**scoped_params, **extra_params},
+                    ).fetchone()
+                    # If the scoped query returned zero rows for every rule in the
+                    # group, retry without the tenant predicate (preserves the
+                    # original backward-compat fallback semantics).
+                    if row is None or all(
+                        int((row[f"r{r['idx']}_cnt"] if row else 0) or 0) == 0 for r in group_rules
+                    ):
+                        unscoped_where, unscoped_params = _build_group_where(gw, base_tag, scoped=False)
+                        row = conn.execute(
+                            f"""
+                            SELECT {select_sql}
+                            FROM historian_readings
+                            {unscoped_where}
+                            """,
+                            {**unscoped_params, **extra_params},
+                        ).fetchone()
+                        active_where, active_params = unscoped_where, {**unscoped_params, **extra_params}
+                    else:
+                        active_where, active_params = scoped_where, {**scoped_params, **extra_params}
+
+                    # Latest per rule only when needed (rare in pie configs).
+                    latest_by_idx: dict[int, float | None] = {}
+                    for r in group_rules:
+                        if r["aggregation"] != "latest":
+                            continue
+                        prefix = f"r{r['idx']}"
+                        pred_sql, _ = _rule_predicate(r, prefix)
+                        if pred_sql == "1=0":
+                            latest_by_idx[r["idx"]] = None
+                            continue
+                        lrow = conn.execute(
+                            f"""
+                            SELECT value FROM historian_readings
+                            {active_where} AND ({pred_sql})
+                            ORDER BY ts_utc DESC, id DESC
+                            LIMIT 1
+                            """,
+                            active_params,
+                        ).fetchone()
+                        try:
+                            latest_by_idx[r["idx"]] = (
+                                float(lrow["value"]) if lrow is not None and lrow["value"] is not None else None
+                            )
+                        except Exception:
+                            latest_by_idx[r["idx"]] = None
+
+                    for r in group_rules:
+                        prefix = f"r{r['idx']}"
+                        row_count = int((row[f"{prefix}_cnt"] if row else 0) or 0)
+                        sum_value = float((row[f"{prefix}_sum"] if row else 0.0) or 0.0)
+                        avg_value = float(row[f"{prefix}_avg"]) if row and row[f"{prefix}_avg"] is not None else None
+                        min_value = float(row[f"{prefix}_min"]) if row and row[f"{prefix}_min"] is not None else None
+                        max_value = float(row[f"{prefix}_max"]) if row and row[f"{prefix}_max"] is not None else None
+                        latest_value = latest_by_idx.get(r["idx"])
+                        agg = r["aggregation"]
+                        if agg == "count":
+                            metric = float(row_count)
+                        elif agg == "sum":
+                            metric = sum_value
+                        elif agg == "avg":
+                            metric = float(avg_value if avg_value is not None else 0.0)
+                        elif agg == "min":
+                            metric = float(min_value if min_value is not None else 0.0)
+                        elif agg == "max":
+                            metric = float(max_value if max_value is not None else 0.0)
+                        else:
+                            metric = float(latest_value if latest_value is not None else 0.0)
+                        results_by_id[r["id"]] = {
+                            "id": r["id"],
+                            "label": r["label"],
+                            "value": metric,
+                            "color": r["color"],
+                            "tag_name": r["tag_name"],
+                            "gateway_id": r["gateway_id"],
+                            "aggregation": agg,
+                            "operator": r["operator"],
+                            "sample_count": row_count,
+                            "count": row_count,
+                            "sum": sum_value,
+                            "avg": avg_value,
+                            "min": min_value,
+                            "max": max_value,
+                            "latest": latest_value,
+                        }
+
+        # Preserve original rule order in the response.
+        return [results_by_id[r["id"]] for r in normalized if r["id"] in results_by_id]
+
+    def _fetch_historian_stats_from_cloud(
+        self,
+        gateway: str = "",
+        device: str = "",
+        tag: str = "",
+        from_utc: str = "",
+        to_utc: str = "",
+    ) -> list[dict[str, Any]]:
+        try:
+            cloud = self._resolve_active_cloud_database()
+        except Exception:
+            cloud = None
+        if not cloud:
+            return []
+        try:
+            from sqlalchemy import text  # type: ignore
+            schema = str(cloud.get("schema") or "public").strip() or "public"
+            tenant_id = self._current_tenant_id()
+            engine, key = self._get_or_create_cloud_engine(cloud, schema)
+            self._ensure_cloud_schema_once(engine, schema, key)
+
+            conditions = ["tenant_id = :tenant"]
+            params: dict[str, Any] = {"tenant": tenant_id}
+
+            gateway_txt = str(gateway or "").strip()
+            device_txt = str(device or "").strip()
+            tag_txt = str(tag or "").strip()
+            from_txt = self._normalize_utc_filter(from_utc)
+            to_txt = self._normalize_utc_filter(to_utc)
+
+            if gateway_txt:
+                conditions.append("(COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)")
+                params["gateway"] = gateway_txt
+            if device_txt:
+                conditions.append("LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)")
+                params["device_like"] = f"%{device_txt}%"
+            if tag_txt:
+                conditions.append("LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)")
+                params["tag_like"] = f"%{tag_txt}%"
+            if from_txt:
+                conditions.append("ts_utc >= :from_utc")
+                params["from_utc"] = from_txt
+            if to_txt:
+                conditions.append("ts_utc <= :to_utc")
+                params["to_utc"] = to_txt
+
+            where_sql = " AND ".join(conditions)
+            sql = text(
+                f"""
+                SELECT
+                  COALESCE(tag_name,'') AS tag_name,
+                  COUNT(*) AS row_count,
+                  SUM(COALESCE(value, 0)) AS sum_value,
+                  AVG(value) AS avg_value,
+                  MIN(value) AS min_value,
+                  MAX(value) AS max_value
+                FROM "{schema}"."historian_readings"
+                WHERE {where_sql}
+                GROUP BY tag_name
+                ORDER BY tag_name ASC
+                """
+            )
+            with engine.begin() as conn:
+                rows = conn.execute(sql, params).mappings().all()
+
+            return [
+                {
+                    "tag": str(r.get("tag_name") or ""),
+                    "count": int(r.get("row_count") or 0),
+                    "sum": float(r.get("sum_value") or 0.0),
+                    "avg": float(r.get("avg_value") or 0.0) if r.get("avg_value") is not None else None,
+                    "min": float(r.get("min_value") or 0.0) if r.get("min_value") is not None else None,
+                    "max": float(r.get("max_value") or 0.0) if r.get("max_value") is not None else None,
+                }
+                for r in rows
+                if str(r.get("tag_name") or "").strip()
+            ]
+        except Exception:
+            return []
 
     def get_live_rows(self, limit: int = 5000, prefer_cloud_reads: bool | None = None, edge_id: str = "") -> list[dict[str, Any]]:
         lim = max(100, min(int(limit or 5000), 50000))

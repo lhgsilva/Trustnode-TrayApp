@@ -1,6 +1,9 @@
+import base64
 import smtplib
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email import encoders
 from typing import Literal
 import requests
 
@@ -29,6 +32,12 @@ class PHPMailConfig(BaseModel):
     verify_tls: bool = True
 
 
+class EmailAttachment(BaseModel):
+    filename: str
+    content_b64: str
+    content_type: str = "application/octet-stream"
+
+
 class EmailRequest(BaseModel):
     transport: Literal["smtp", "php_http"] = "smtp"
     smtp: SMTPConfig
@@ -39,6 +48,7 @@ class EmailRequest(BaseModel):
     subject: str = "Trustnode Notification"
     html_body: str = ""
     text_body: str = ""
+    attachments: list[EmailAttachment] = Field(default_factory=list)
 
 
 class EmailResult(BaseModel):
@@ -58,7 +68,15 @@ class TestEmailRequest(BaseModel):
 def _build_message(payload: EmailRequest) -> MIMEMultipart:
     sender_name = (payload.smtp.sender_name or "Trustnode Edge").strip()
     sender_email = (payload.smtp.sender_email or payload.smtp.username or "").strip()
-    msg = MIMEMultipart("alternative")
+    # When attachments are present we use a `mixed` outer container with an
+    # `alternative` body section, otherwise plain `alternative` (text + html).
+    has_attachments = bool(payload.attachments)
+    if has_attachments:
+        msg = MIMEMultipart("mixed")
+        body_part = MIMEMultipart("alternative")
+    else:
+        msg = MIMEMultipart("alternative")
+        body_part = msg
     msg["From"] = f"{sender_name} <{sender_email}>" if sender_email else sender_name
     msg["To"] = ", ".join(payload.to)
     if payload.cc:
@@ -66,8 +84,23 @@ def _build_message(payload: EmailRequest) -> MIMEMultipart:
     msg["Subject"] = payload.subject or "Trustnode Notification"
     text_body = payload.text_body or "Trustnode notification."
     html_body = payload.html_body or f"<html><body><pre>{text_body}</pre></body></html>"
-    msg.attach(MIMEText(text_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    body_part.attach(MIMEText(text_body, "plain", "utf-8"))
+    body_part.attach(MIMEText(html_body, "html", "utf-8"))
+    if has_attachments:
+        msg.attach(body_part)
+        for att in payload.attachments:
+            try:
+                raw = base64.b64decode(att.content_b64 or "")
+            except Exception:
+                continue
+            ctype = str(att.content_type or "application/octet-stream").strip() or "application/octet-stream"
+            main, _, sub = ctype.partition("/")
+            part = MIMEBase(main or "application", sub or "octet-stream")
+            part.set_payload(raw)
+            encoders.encode_base64(part)
+            filename = str(att.filename or "attachment.bin").strip() or "attachment.bin"
+            part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+            msg.attach(part)
     return msg
 
 
@@ -126,6 +159,16 @@ def _send_email_php(payload: EmailRequest) -> EmailResult:
     html_body = (payload.html_body or "").strip()
     final_body = html_body if is_html else (plain_body or html_body or "Trustnode notification.")
 
+    attachments_payload = []
+    for att in (payload.attachments or []):
+        if not att.filename or not att.content_b64:
+            continue
+        attachments_payload.append({
+            "filename": att.filename,
+            "content_b64": att.content_b64,
+            "content_type": att.content_type or "application/octet-stream",
+        })
+
     body = {
         # Dolibarr/simple PHP style
         "to": recipients[0] if len(recipients) == 1 else ",".join(recipients),
@@ -144,6 +187,8 @@ def _send_email_php(payload: EmailRequest) -> EmailResult:
         "text_body": plain_body,
         "sender_email": sender_email,
         "sender_name": sender_name,
+        # File attachments (base64). PHP receiver decodes `content_b64`.
+        "attachments": attachments_payload,
     }
     try:
         resp = requests.post(
@@ -176,11 +221,21 @@ def _send_email_php(payload: EmailRequest) -> EmailResult:
         return EmailResult(ok=False, message=f"PHP mail send failed: {exc}", recipients=recipients)
 
 
-@router.post("/send", response_model=EmailResult)
-def send_email(payload: EmailRequest) -> EmailResult:
+def send_email_request(payload: EmailRequest) -> EmailResult:
+    """Programmatic email send for in-process callers (scheduler, etc.).
+
+    Picks the configured transport and returns the same `EmailResult` shape the
+    HTTP endpoint produces. Kept as a module-level helper so services can build
+    `EmailRequest` directly without going through the REST layer.
+    """
     if payload.transport == "php_http":
         return _send_email_php(payload)
     return _send_email(payload)
+
+
+@router.post("/send", response_model=EmailResult)
+def send_email(payload: EmailRequest) -> EmailResult:
+    return send_email_request(payload)
 
 
 @router.post("/test", response_model=EmailResult)

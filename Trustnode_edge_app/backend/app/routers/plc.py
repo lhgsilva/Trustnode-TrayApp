@@ -785,6 +785,25 @@ async def stop_all_gateway_runtime() -> dict[str, str | bool]:
 @router.get("/gateways/status")
 def list_gateway_runtime_status(request: Request) -> list[dict]:
     statuses = plc_manager.list_gateway_statuses()
+    try:
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        cfg_rows = bootstrap.get("gateway_configurations") if isinstance(bootstrap, dict) else []
+        allowed_ids = {
+            str(row.get("id") or "").strip()
+            for row in (cfg_rows or [])
+            if isinstance(row, dict) and str(row.get("id") or "").strip()
+        }
+        if allowed_ids:
+            statuses = [
+                row
+                for row in (statuses or [])
+                if str((row or {}).get("gateway_id") or "").strip() in allowed_ids
+            ]
+        # If local bootstrap rows are temporarily empty/unavailable, keep raw runtime
+        # statuses to avoid false STOPPED flicker in the local footer.
+    except Exception:
+        # Never fail status endpoint because of bootstrap filtering.
+        pass
     if statuses:
         return statuses
 

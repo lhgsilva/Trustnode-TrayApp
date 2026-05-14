@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ResponsiveContainer,
   LineChart,
@@ -11,6 +11,8 @@ import {
   Pie,
   Cell,
   Tooltip,
+  Sector,
+  CartesianGrid,
   XAxis,
   YAxis,
 } from "recharts";
@@ -19,11 +21,58 @@ import {
   evaluateComputedRules,
   getLatestTagRow,
   getTagSeries as getTagSeriesFiltered,
+  toTsMs,
 } from "./dashboardAnalytics";
+
+const LAST_WIDGET_DIRECT_STATS_CACHE = new Map();
+const LAST_WIDGET_RULE_STATS_CACHE = new Map();
+const LAST_WIDGET_ROWS_CACHE = new Map();
 
 function parseNumber(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+
+function parseBool(v, fallback = false) {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "string") {
+    const t = v.trim().toLowerCase();
+    if (t === "true") return true;
+    if (t === "false") return false;
+    if (t === "1" || t === "yes" || t === "y" || t === "on") return true;
+    if (t === "0" || t === "no" || t === "n" || t === "off") return false;
+  }
+  if (typeof v === "number") return v !== 0;
+  return fallback;
+}
+
+// Evaluate a small arithmetic expression with single-letter variables (a-z)
+// pulled from `env`. Used by the table_list "calculation" advanced columns.
+// Refuses anything that looks like JS access (dot, brackets, function calls,
+// or non-arithmetic words) so we don't expose globals or DOM APIs to widget
+// configuration.
+function evalSafeExpression(expr, env = {}) {
+  if (typeof expr !== "string" || !expr.trim()) return null;
+  if (/[\[\]\{\};]/.test(expr)) return null;
+  if (/\b(window|document|globalThis|Function|process|require|import|eval)\b/.test(expr)) return null;
+  // Allow letters a-z (vars), digits, dot (decimals), arithmetic, parens, ws.
+  if (!/^[\sa-zA-Z0-9_.+\-*/()%]+$/.test(expr)) return null;
+  const argNames = Object.keys(env);
+  const argValues = argNames.map((k) => (Number.isFinite(env[k]) ? env[k] : null));
+  // If any referenced single-letter variable in the expression is null/missing,
+  // bail to "-" rather than risk producing NaN that confuses charts.
+  for (const ch of expr.matchAll(/[a-zA-Z]/g)) {
+    const name = ch[0];
+    if (argNames.includes(name) && (env[name] === null || env[name] === undefined)) return null;
+  }
+  try {
+    // eslint-disable-next-line no-new-func
+    const fn = new Function(...argNames, `"use strict"; return (${expr});`);
+    const result = fn(...argValues);
+    return Number.isFinite(Number(result)) ? Number(result) : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 function renderEmpty(text = "No data") {
@@ -64,6 +113,148 @@ function getWidgetAccent(widget, fallback = "#14a89a") {
   return useCustomColor(widget) ? (widget?.color || fallback) : fallback;
 }
 
+function getChartInterpolation(widget) {
+  const raw = String(widget?.config?.interpolation || "stepAfter");
+  const allowed = new Set(["stepAfter", "linear", "monotone", "natural", "stepBefore"]);
+  return allowed.has(raw) ? raw : "stepAfter";
+}
+
+function normalizeRuleOperator(opRaw) {
+  const op = String(opRaw || "any").trim().toLowerCase();
+  const map = {
+    ">": "gt",
+    ">=": "gte",
+    "<": "lt",
+    "<=": "lte",
+    "==": "eq",
+    "=": "eq",
+    "!=": "ne",
+    "<>": "ne",
+    any: "any",
+    eq: "eq",
+    ne: "ne",
+    lt: "lt",
+    lte: "lte",
+    gt: "gt",
+    gte: "gte",
+    between: "between",
+  };
+  return map[op] || "any";
+}
+
+function bucketMsFromInterval(interval) {
+  const map = {
+    none: 0,
+    "1s": 1000,
+    "5s": 5000,
+    "10s": 10000,
+    "30s": 30000,
+    "1m": 60000,
+    "5m": 300000,
+    "15m": 900000,
+    "1h": 3600000,
+    "1d": 86400000,
+  };
+  return Number(map[String(interval || "none")] || 0);
+}
+
+function bucketRows(rows, interval) {
+  const bucketMs = bucketMsFromInterval(interval);
+  if (!bucketMs) return Array.isArray(rows) ? rows : [];
+  const grouped = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const ts = toTsMs(r?.ts || r?.ts_utc);
+    if (!Number.isFinite(ts)) continue;
+    const key = Math.floor(ts / bucketMs) * bucketMs;
+    grouped.set(key, r);
+  }
+  return Array.from(grouped.values()).sort(
+    (a, b) => toTsMs(a?.ts || a?.ts_utc) - toTsMs(b?.ts || b?.ts_utc)
+  );
+}
+
+function toLocalInputMs(value) {
+  const dt = new Date(String(value || ""));
+  return Number.isFinite(dt.getTime()) ? dt.getTime() : Number.NaN;
+}
+
+function resolvePresetWindowMs(preset) {
+  const map = {
+    "5m": 5 * 60 * 1000,
+    "15m": 15 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+    "6h": 6 * 60 * 60 * 1000,
+    "24h": 24 * 60 * 60 * 1000,
+    "7d": 7 * 24 * 60 * 60 * 1000,
+    "30d": 30 * 24 * 60 * 60 * 1000,
+  };
+  return Number(map[String(preset || "none")] || 0);
+}
+
+function toIsoUtc(value) {
+  const txt = String(value || "").trim();
+  if (!txt) return "";
+  const d = new Date(txt);
+  return Number.isFinite(d.getTime()) ? d.toISOString() : "";
+}
+
+function resolveTimeFilterRange(cfg) {
+  const preset = String(cfg?.query_time_filter_preset || "none");
+  if (preset === "none") return null;
+  if (preset === "custom") {
+    const fromUtc = toIsoUtc(cfg?.query_time_filter_from);
+    const toUtc = toIsoUtc(cfg?.query_time_filter_to);
+    if (!fromUtc && !toUtc) return null;
+    return { fromUtc, toUtc };
+  }
+  const windowMs = resolvePresetWindowMs(preset);
+  if (!windowMs) return null;
+  // Stabilize preset windows to avoid re-query storms on every re-render.
+  // Short windows roll every 10s; long windows roll every 60s.
+  const quantumMs = windowMs >= 60 * 60 * 1000 ? 60 * 1000 : 10 * 1000;
+  const anchorMs = Math.floor(Date.now() / quantumMs) * quantumMs;
+  const to = new Date(anchorMs);
+  const from = new Date(anchorMs - windowMs);
+  return { fromUtc: from.toISOString(), toUtc: to.toISOString() };
+}
+
+function applyWidgetTimeFilter(rows, cfg) {
+  const src = Array.isArray(rows) ? rows : [];
+  if (!src.length) return src;
+  const preset = String(cfg?.query_time_filter_preset || "none");
+  if (preset === "none") return src;
+  const rowTsMs = (r) => toTsMs(r?.ts || r?.ts_utc || r?.created_utc || "");
+  const latestRowMs = src.reduce((acc, r) => {
+    const ts = rowTsMs(r);
+    return Number.isFinite(ts) && ts > acc ? ts : acc;
+  }, Number.NaN);
+  // Preset windows should be stable even when streams are paused or clock-skewed:
+  // anchor to latest dataset timestamp whenever available.
+  const anchorMs = Number.isFinite(latestRowMs) ? latestRowMs : Date.now();
+  let fromMs = Number.NaN;
+  let toMs = Number.NaN;
+  if (preset === "custom") {
+    fromMs = toLocalInputMs(cfg?.query_time_filter_from);
+    toMs = toLocalInputMs(cfg?.query_time_filter_to);
+  } else {
+    const windowMs = resolvePresetWindowMs(preset);
+    if (windowMs > 0) fromMs = anchorMs - windowMs;
+    toMs = anchorMs;
+  }
+  const filtered = src.filter((r) => {
+    const ts = rowTsMs(r);
+    if (!Number.isFinite(ts)) return false;
+    if (Number.isFinite(fromMs) && ts < fromMs) return false;
+    if (Number.isFinite(toMs) && ts > toMs) return false;
+    return true;
+  });
+  if (filtered.length) return filtered;
+  // Safety fallback: if rows exist but timestamps are partially malformed,
+  // keep a small recent tail instead of showing a hard-empty widget.
+  if (preset !== "custom") return src.slice(-Math.max(1, Math.min(200, src.length)));
+  return filtered;
+}
+
 function getPiePalette(widget) {
   if (!useCustomColor(widget)) {
     return ["#14a89a", "#0e8479", "#3cd2c2", "#1f3a5f", "#6e8dd2", "#e0a050", "#e2585d", "#a78bfa"];
@@ -81,136 +272,1331 @@ function getPiePalette(widget) {
   ];
 }
 
+function buildXAxisProps(series) {
+  const sample = Array.isArray(series) ? series.length : 0;
+  if (!sample) return { dataKey: "idx" };
+  return {
+    dataKey: "idx",
+    tickFormatter: (idx) => {
+      const hit = series.find((p) => p?.idx === idx);
+      const ts = String(hit?.ts || "");
+      if (!ts) return String(idx);
+      const t = ts.includes("T") ? ts.split("T")[1] : ts.split(" ")[1];
+      return String(t || ts).slice(0, 8);
+    },
+    minTickGap: 18,
+    tick: { fill: "var(--ink-soft, #8a98ab)", fontSize: 11 },
+    axisLine: { stroke: "var(--line, rgba(255,255,255,0.07))" },
+    tickLine: false,
+    height: 18,
+  };
+}
+
+const yAxisProps = {
+  tick: { fill: "var(--ink-soft, #8a98ab)", fontSize: 11 },
+  tickFormatter: (v) => {
+    const n = Number(v);
+    return Number.isFinite(n)
+      ? n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      : "";
+  },
+  axisLine: { stroke: "var(--line, rgba(255,255,255,0.07))" },
+  tickLine: false,
+  width: 58,
+};
+
+function buildAutoYDomain(series) {
+  const values = (Array.isArray(series) ? series : [])
+    .map((p) => Number(p?.value))
+    .filter((n) => Number.isFinite(n));
+  if (!values.length) return ["auto", "auto"];
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  if (min === max) {
+    const pad = Math.max(Math.abs(min || 1) * 0.05, 0.5);
+    return [min - pad, max + pad];
+  }
+  const span = max - min;
+  const pad = Math.max(span * 0.1, 0.25);
+  return [min - pad, max + pad];
+}
+
+function formatByPreset(value, preset = "auto") {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "-";
+  switch (String(preset || "auto")) {
+    case "int":
+      return n.toFixed(0);
+    case "2dp":
+      return n.toFixed(2);
+    case "3dp":
+      return n.toFixed(3);
+    case "scientific":
+      return n.toExponential(2);
+    case "auto":
+    default:
+      return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
+  }
+}
+
+const chartTooltipProps = {
+  contentStyle: {
+    background: "var(--bg-card, #111827)",
+    border: "1px solid var(--stroke, rgba(255,255,255,0.14))",
+    borderRadius: 8,
+    color: "var(--ink, #f2f4f7)",
+  },
+  labelStyle: { color: "var(--ink, #f2f4f7)", fontWeight: 600 },
+  itemStyle: { color: "var(--ink, #f2f4f7)" },
+};
+
+function renderActiveDonutShape(props) {
+  const {
+    cx,
+    cy,
+    innerRadius,
+    outerRadius,
+    startAngle,
+    endAngle,
+    fill,
+  } = props || {};
+  return (
+    <g>
+      <Sector
+        cx={cx}
+        cy={cy}
+        innerRadius={innerRadius}
+        outerRadius={Number(outerRadius || 0) + 6}
+        startAngle={startAngle}
+        endAngle={endAngle}
+        fill={fill}
+      />
+    </g>
+  );
+}
+
+function computeWidgetTextScale(widget, minPx, maxPx) {
+  const baseScale = Number(widget?.config?.text_font_scale);
+  const scale = Number.isFinite(baseScale) ? baseScale : 1;
+  const w = Number(widget?.w || 4);
+  const h = Number(widget?.h || 3);
+  const areaFactor = Math.max(0.75, Math.min(1.65, Math.sqrt(Math.max(1, (w * h) / 12))));
+  return Math.max(minPx, Math.min(maxPx, Math.round(maxPx * scale * areaFactor)));
+}
+
+function parseLegendLayout(v, fallback = "side") {
+  const t = String(v || "").trim().toLowerCase();
+  if (!t) return fallback;
+  return t.includes("bottom") ? "bottom" : "side";
+}
+
+function sanitizePieHiddenMap(prevMap, pieData) {
+  const validKeys = new Set((Array.isArray(pieData) ? pieData : []).map((i) => String(i?.name || "")));
+  const next = {};
+  for (const [k, v] of Object.entries(prevMap || {})) {
+    if (validKeys.has(String(k)) && Boolean(v)) next[String(k)] = true;
+  }
+  const visibleCount = (Array.isArray(pieData) ? pieData : []).filter((item) => !next[String(item?.name || "")]).length;
+  if (visibleCount > 0 || !validKeys.size) return next;
+  const first = String((Array.isArray(pieData) ? pieData[0] : null)?.name || "");
+  if (first) delete next[first];
+  return next;
+}
+
+function computeMeterRanges(widget, value) {
+  const rules = Array.isArray(widget?.config?.compute_rules) ? widget.config.compute_rules : [];
+  const parsed = [];
+  for (let idx = 0; idx < rules.length; idx += 1) {
+    const r = rules[idx] || {};
+    const op = normalizeRuleOperator(r?.operator || "between");
+    const v1 = Number(r?.value1);
+    const v2 = Number(r?.value2);
+    let min = Number.NaN;
+    let max = Number.NaN;
+    if (op === "between") {
+      if (Number.isFinite(v1) && Number.isFinite(v2)) {
+        min = Math.min(v1, v2);
+        max = Math.max(v1, v2);
+      }
+    } else if (op === "lt" || op === "lte") {
+      if (Number.isFinite(v1)) {
+        min = Number.NEGATIVE_INFINITY;
+        max = v1;
+      }
+    } else if (op === "gt" || op === "gte") {
+      if (Number.isFinite(v1)) {
+        min = v1;
+        max = Number.POSITIVE_INFINITY;
+      }
+    } else if (op === "eq") {
+      if (Number.isFinite(v1)) {
+        min = v1 - 0.5;
+        max = v1 + 0.5;
+      }
+    }
+    if (!Number.isFinite(min) && !Number.isFinite(max)) continue;
+    parsed.push({
+      id: String(r?.id || `range-${idx}`),
+      label: String(r?.label || `Range ${idx + 1}`),
+      color: String(r?.color || "#14a89a"),
+      min,
+      max,
+    });
+  }
+  if (!parsed.length) {
+    const v = Number.isFinite(Number(value)) ? Number(value) : 0;
+    const floor = Math.floor((v - 10) / 10) * 10;
+    const ceil = Math.ceil((v + 10) / 10) * 10;
+    const span = Math.max(10, ceil - floor);
+    const a = floor;
+    const b = floor + span * 0.6;
+    const c = floor + span * 0.85;
+    return [
+      { id: "low", label: "Low", color: "#22c55e", min: a, max: b },
+      { id: "normal", label: "Normal", color: "#14a89a", min: b, max: c },
+      { id: "high", label: "High", color: "#e2585d", min: c, max: ceil },
+    ];
+  }
+  const finiteMins = parsed.map((r) => r.min).filter((n) => Number.isFinite(n));
+  const finiteMaxs = parsed.map((r) => r.max).filter((n) => Number.isFinite(n));
+  const cur = Number(value);
+  const baseMin = finiteMins.length ? Math.min(...finiteMins) : (Number.isFinite(cur) ? cur - 10 : 0);
+  const baseMax = finiteMaxs.length ? Math.max(...finiteMaxs) : (Number.isFinite(cur) ? cur + 10 : 100);
+  const domainMin = Math.min(baseMin, Number.isFinite(cur) ? cur : baseMin);
+  const domainMax = Math.max(baseMax, Number.isFinite(cur) ? cur : baseMax);
+  return parsed
+    .map((r) => ({
+      ...r,
+      min: Number.isFinite(r.min) ? r.min : domainMin,
+      max: Number.isFinite(r.max) ? r.max : domainMax,
+    }))
+    .sort((a, b) => a.min - b.min);
+}
+
+function renderPieSliceLabelFactory({ showCount, showPercent }) {
+  return function renderPieSliceLabel(payload = {}) {
+    const {
+      cx,
+      cy,
+      midAngle,
+      outerRadius,
+      percent,
+      value,
+      name,
+      fill,
+    } = payload;
+    const RADIAN = Math.PI / 180;
+    const r = Number(outerRadius || 0) + 16;
+    const x = Number(cx || 0) + r * Math.cos(-midAngle * RADIAN);
+    const y = Number(cy || 0) + r * Math.sin(-midAngle * RADIAN);
+    const anchor = x > Number(cx || 0) ? "start" : "end";
+    const labelName = String(name || "").trim();
+    const valText = showCount ? Number(value || 0).toFixed(2) : "";
+    const pctText = showPercent ? `${((Number(percent || 0) || 0) * 100).toFixed(1)}%` : "";
+    const lines = [labelName, valText, pctText].filter(Boolean);
+    if (!lines.length) return null;
+    return (
+      <text x={x} y={y} textAnchor={anchor} dominantBaseline="central">
+        {lines.map((line, i) => (
+          <tspan
+            key={`${labelName || "slice"}-${i}`}
+            x={x}
+            dy={i === 0 ? 0 : 13}
+            className={`dashboard-pie-label-line${i + 1}`}
+            fill={fill}
+          >
+            {line}
+          </tspan>
+        ))}
+      </text>
+    );
+  };
+}
+
 export function DashboardWidgetCard({
   widget,
   dataLogView,
   tagRows,
   tagRowsByGateway,
   formatTagForDisplay,
+  gatewayIntervalsById = {},
+  fetchWidgetRows,
+  fetchWidgetStats,
+  fetchWidgetRuleStats,
 }) {
   const cfg = widget?.config || {};
   const gatewayId = cfg.gateway_id || "";
+  const resolvedGatewayId = useMemo(() => {
+    const raw = String(gatewayId || "").trim();
+    if (!raw) return "";
+    if (Object.prototype.hasOwnProperty.call(tagRowsByGateway || {}, raw)) return raw;
+    // Backward-compat: old widgets may store gateway_name instead of gateway_id.
+    for (const [gid, rows] of Object.entries(tagRowsByGateway || {})) {
+      const sampleName = String(rows?.[0]?.gateway_name || "").trim();
+      if (sampleName && sampleName === raw) return String(gid || "").trim();
+    }
+    return raw;
+  }, [gatewayId, tagRowsByGateway]);
   const tagName = cfg.tag_name || "";
   const dataSourceType = String(cfg.data_source_type || "tag_direct");
+  const computedCapable = ["pie_chart", "meter_chart", "table_list", "fixed_text", "value_kpi", "text_kpi"].includes(String(widget?.type || ""));
+  const normalizedDataSourceType = computedCapable ? dataSourceType : "tag_direct";
   const rules = Array.isArray(cfg.compute_rules) ? cfg.compute_rules : [];
-
-  const latest = useMemo(() => getLatestTagRow(dataLogView, gatewayId, tagName), [dataLogView, gatewayId, tagName]);
-  const series = useMemo(
-    () => getTagSeriesFiltered(dataLogView, gatewayId, tagName, cfg.readings_count || 120),
-    [dataLogView, gatewayId, tagName, cfg.readings_count]
+  const effectiveDataSourceType =
+    normalizedDataSourceType === "computed" && (!Array.isArray(rules) || rules.length === 0)
+      ? "tag_direct"
+      : normalizedDataSourceType;
+  const rulesDepKey = useMemo(
+    () =>
+      JSON.stringify(
+        (Array.isArray(rules) ? rules : []).map((r) => ({
+          id: String(r?.id || ""),
+          label: String(r?.label || ""),
+          gateway_id: String(r?.gateway_id || ""),
+          tag_name: String(r?.tag_name || ""),
+          operator: String(r?.operator || "any"),
+          value1: r?.value1 ?? "",
+          value2: r?.value2 ?? "",
+          aggregation: String(r?.aggregation || "count"),
+          color: String(r?.color || ""),
+        }))
+      ),
+    [rules]
   );
-  const computedItems = useMemo(() => evaluateComputedRules(dataLogView, rules), [dataLogView, rules]);
+  const [serverQueryRows, setServerQueryRows] = useState(null);
+  const [lastGoodServerQueryRows, setLastGoodServerQueryRows] = useState(null);
+  const [serverQueryError, setServerQueryError] = useState("");
+  const [serverQueryStats, setServerQueryStats] = useState(null);
+  const [lastGoodServerQueryStats, setLastGoodServerQueryStats] = useState(() => {
+    const wid = String(widget?.id || "");
+    return LAST_WIDGET_DIRECT_STATS_CACHE.get(wid) || null;
+  });
+  const [serverQueryStatsError, setServerQueryStatsError] = useState("");
+  const [serverQueryRowsLoading, setServerQueryRowsLoading] = useState(false);
+  const [serverQueryStatsLoading, setServerQueryStatsLoading] = useState(false);
+  const [serverRuleStats, setServerRuleStats] = useState(null);
+  const [lastGoodServerRuleStats, setLastGoodServerRuleStats] = useState(() => {
+    const wid = String(widget?.id || "");
+    return LAST_WIDGET_RULE_STATS_CACHE.get(wid) || null;
+  });
+  const [serverRuleStatsError, setServerRuleStatsError] = useState("");
+  const [serverRuleStatsLoading, setServerRuleStatsLoading] = useState(false);
+  const [queryRefreshTick, setQueryRefreshTick] = useState(0);
+  // The widget heartbeat follows the configured gateway poll interval so the
+  // dashboard refresh cadence matches the rate at which fresh PLC samples land
+  // in the historian. Falls back to 1000ms when no gateway is selected/known.
+  const gatewayIntervalMs = useMemo(() => {
+    const raw = Number(gatewayIntervalsById?.[String(resolvedGatewayId || "")] || 0);
+    return Number.isFinite(raw) && raw > 0 ? Math.max(200, raw) : 1000;
+  }, [gatewayIntervalsById, resolvedGatewayId]);
+  // All widget refreshes fire on every gateway cycle (1:1 cadence). The in-flight
+  // guards downstream skip a new request whenever a previous one is still running,
+  // so this never stampedes the backend — it just keeps the UI in lockstep with
+  // the PLC poll rate the user configured.
+  const refreshTickFast = useMemo(() => Number(queryRefreshTick || 0), [queryRefreshTick]);
+  const refreshTickMedium = refreshTickFast;
+  const refreshTickSlow = refreshTickFast;
+  const refreshTickPaginated = refreshTickFast;
+  const queryRowsReqKeyRef = useRef("");
+  const queryStatsReqKeyRef = useRef("");
+  const ruleStatsReqKeyRef = useRef("");
+  // In-flight guards: prevent stampede when SQL latency > refresh tick.
+  // A new tick fires another effect run; without the guard we'd cancel
+  // the still-running request and never see its rows in state.
+  const queryRowsInFlightRef = useRef(false);
+  const queryStatsInFlightRef = useRef(false);
+  const ruleStatsInFlightRef = useRef(false);
+  const fetchWidgetRowsRef = useRef(fetchWidgetRows);
+  const fetchWidgetStatsRef = useRef(fetchWidgetStats);
+  const fetchWidgetRuleStatsRef = useRef(fetchWidgetRuleStats);
+  const widgetType = String(widget?.type || "");
+  const cfgReadingsCount = Number(cfg?.readings_count || 120);
+  const cfgRowSelection = String(cfg?.query_row_selection || "all");
+  const cfgRowLimit = Number(cfg?.query_row_limit || 200);
+  const cfgGroupInterval = String(cfg?.query_group_interval || "none");
+  const cfgResultAggregation = String(cfg?.query_result_aggregation || "count");
+  const cfgRuleLogic = String(cfg?.query_rule_logic || "any");
+  const cfgTimePreset = String(cfg?.query_time_filter_preset || "none");
+  const cfgTimeFrom = String(cfg?.query_time_filter_from || "");
+  const cfgTimeTo = String(cfg?.query_time_filter_to || "");
+
+  useEffect(() => {
+    fetchWidgetRowsRef.current = fetchWidgetRows;
+  }, [fetchWidgetRows]);
+  useEffect(() => {
+    fetchWidgetStatsRef.current = fetchWidgetStats;
+  }, [fetchWidgetStats]);
+  useEffect(() => {
+    fetchWidgetRuleStatsRef.current = fetchWidgetRuleStats;
+  }, [fetchWidgetRuleStats]);
+
+  useEffect(() => {
+    // Heartbeat cadence matches the gateway's configured poll interval. When the
+    // gateway changes (or interval is reconfigured) we restart the timer so the
+    // widget tracks the new cadence without waiting for the previous tick.
+    const timer = setInterval(() => {
+      setQueryRefreshTick((v) => v + 1);
+    }, gatewayIntervalMs);
+    return () => clearInterval(timer);
+  }, [gatewayIntervalMs]);
+
+  // Safety guard: never leave widget sections in perpetual loading if an in-flight
+  // request was cancelled by a rapid parent re-render.
+  useEffect(() => {
+    if (!serverQueryRowsLoading) return () => {};
+    const t = setTimeout(() => setServerQueryRowsLoading(false), 25000);
+    return () => clearTimeout(t);
+  }, [serverQueryRowsLoading]);
+  useEffect(() => {
+    if (!serverQueryStatsLoading) return () => {};
+    const t = setTimeout(() => setServerQueryStatsLoading(false), 25000);
+    return () => clearTimeout(t);
+  }, [serverQueryStatsLoading]);
+  useEffect(() => {
+    if (!serverRuleStatsLoading) return () => {};
+    const t = setTimeout(() => setServerRuleStatsLoading(false), 25000);
+    return () => clearTimeout(t);
+  }, [serverRuleStatsLoading]);
+
+  useEffect(() => {
+    const range = resolveTimeFilterRange(cfg);
+    // No-time-filter must still query historian DB (from/to empty),
+    // otherwise widgets fall back to in-memory live buffer and counts drift.
+    const canQuery = typeof fetchWidgetRowsRef.current === "function";
+    const isComputedPie = widgetType === "pie_chart" && String(effectiveDataSourceType || "tag_direct") === "computed";
+    const isDirectPie = widgetType === "pie_chart" && String(effectiveDataSourceType || "tag_direct") === "tag_direct";
+    if (!canQuery) {
+      setServerQueryRows(null);
+      setLastGoodServerQueryRows(null);
+      setServerQueryError("");
+      setServerQueryRowsLoading(false);
+      queryRowsReqKeyRef.current = "";
+      return () => {};
+    }
+    // Direct pie widgets read from historian stats endpoint; avoid heavy full-row scans.
+    if (isDirectPie && typeof fetchWidgetStatsRef.current === "function") {
+      setServerQueryRows([]);
+      setServerQueryError("");
+      setServerQueryRowsLoading(false);
+      queryRowsReqKeyRef.current = "";
+      return () => {};
+    }
+    if (isComputedPie && typeof fetchWidgetRuleStatsRef.current === "function") {
+      setServerQueryRows([]);
+      setServerQueryError("");
+      setServerQueryRowsLoading(false);
+      queryRowsReqKeyRef.current = "";
+      return () => {};
+    }
+    const isTrendWidget = ["line_chart", "line_area_chart", "bar_chart", "table_list"].includes(widgetType);
+    const shouldPaginateAll = Boolean(
+      cfgRowSelection === "all" &&
+      (
+        (isComputedPie && typeof fetchWidgetRuleStatsRef.current !== "function") ||
+        isDirectPie
+      )
+    );
+    const rowSelection =
+      isTrendWidget && cfgRowSelection === "all"
+        ? "last_n"
+        : cfgRowSelection;
+    const requestedLimit = isTrendWidget
+      ? Math.max(cfgRowLimit, cfgReadingsCount * 4, 400)
+      : cfgRowLimit;
+    // Params-only key (no tick). Polling re-fires won't cancel an in-flight fetch
+    // when SQL latency exceeds the refresh interval.
+    const paramsKey = JSON.stringify({
+      gatewayId: String(resolvedGatewayId || ""),
+      tagName: String(tagName || ""),
+      fromUtc: String(range?.fromUtc || ""),
+      toUtc: String(range?.toUtc || ""),
+      rowSel: rowSelection,
+      rowLimit: requestedLimit,
+      reads: cfgReadingsCount,
+      grp: cfgGroupInterval,
+      agg: cfgResultAggregation,
+      logic: cfgRuleLogic,
+      tf: cfgTimePreset,
+      tfFrom: cfgTimeFrom,
+      tfTo: cfgTimeTo,
+    });
+    const paramsChanged = paramsKey !== queryRowsReqKeyRef.current;
+    if (!paramsChanged && queryRowsInFlightRef.current) {
+      return () => {};
+    }
+    queryRowsReqKeyRef.current = paramsKey;
+    queryRowsInFlightRef.current = true;
+    const chartReads = cfgReadingsCount;
+    const rowTagFilter =
+      isComputedPie
+        ? (() => {
+            const ruleTags = Array.from(
+              new Set(
+                (Array.isArray(rules) ? rules : [])
+                  .map((r) => String(r?.tag_name || "").trim())
+                  .filter(Boolean)
+              )
+            );
+            if (ruleTags.length === 1) return ruleTags[0];
+            if (ruleTags.length === 0) return String(tagName || "");
+            return "";
+          })()
+        : String(tagName || "");
+    const wideScanLimit =
+      rowSelection === "all"
+        ? 5000
+        : Math.max(requestedLimit, chartReads * 8);
+    const limit = shouldPaginateAll
+      ? Math.max(1000, Math.min(5000, Math.max(requestedLimit, chartReads * 10, 2000)))
+      : Math.max(50, Math.min(5000, wideScanLimit));
+    setServerQueryError("");
+    setServerQueryRowsLoading(true);
+    (async () => {
+      try {
+        let rows = [];
+        if (!shouldPaginateAll) {
+          rows = await fetchWidgetRowsRef.current({
+            fromUtc: range?.fromUtc || "",
+            toUtc: range?.toUtc || "",
+            limit,
+            offset: 0,
+            gateway: String(resolvedGatewayId || ""),
+            tag: rowTagFilter,
+            timeoutMs: 12000,
+            maxAttempts: 2,
+          });
+          const safeFirst = Array.isArray(rows) ? rows : [];
+          // Backward-compat fallback: some saved widgets may carry stale gateway ids.
+          // If scoped fetch returns empty, retry by tag-only scope.
+          if (safeFirst.length === 0 && String(resolvedGatewayId || "").trim()) {
+            rows = await fetchWidgetRowsRef.current({
+              fromUtc: range?.fromUtc || "",
+              toUtc: range?.toUtc || "",
+              limit,
+              offset: 0,
+              gateway: "",
+              tag: rowTagFilter,
+              timeoutMs: 12000,
+              maxAttempts: 2,
+            });
+          }
+        } else {
+          const all = [];
+          let offset = 0;
+          // Keep correctness first for computed rules:
+          // paginate until exhaustion with a high safety cap.
+          const maxRows = rowSelection === "all"
+            ? 1000000
+            : Math.max(5000, Math.min(250000, requestedLimit * 50 || 50000));
+          while (offset < maxRows) {
+            const page = await fetchWidgetRowsRef.current({
+              fromUtc: range?.fromUtc || "",
+              toUtc: range?.toUtc || "",
+              limit,
+              offset,
+              gateway: String(resolvedGatewayId || ""),
+              tag: rowTagFilter,
+              timeoutMs: 12000,
+              maxAttempts: 2,
+            });
+            let pageRows = Array.isArray(page) ? page : [];
+            if (
+              pageRows.length === 0 &&
+              offset === 0 &&
+              String(resolvedGatewayId || "").trim()
+            ) {
+              const fallbackPage = await fetchWidgetRowsRef.current({
+                fromUtc: range?.fromUtc || "",
+                toUtc: range?.toUtc || "",
+                limit,
+                offset,
+                gateway: "",
+                tag: rowTagFilter,
+                timeoutMs: 12000,
+                maxAttempts: 2,
+              });
+              pageRows = Array.isArray(fallbackPage) ? fallbackPage : [];
+            }
+            all.push(...pageRows);
+            if (queryRowsReqKeyRef.current !== paramsKey || pageRows.length < limit) break;
+            offset += limit;
+            if (all.length >= maxRows) break;
+          }
+          rows = all.length > maxRows ? all.slice(0, maxRows) : all;
+        }
+        if (queryRowsReqKeyRef.current !== paramsKey) return;
+        const safeRows = Array.isArray(rows) ? rows : [];
+        setServerQueryRows(safeRows);
+        if (safeRows.length > 0) {
+          setLastGoodServerQueryRows(safeRows);
+          const wid = String(widget?.id || "");
+          if (wid) LAST_WIDGET_ROWS_CACHE.set(wid, safeRows);
+        }
+        setServerQueryError("");
+      } catch (err) {
+        if (queryRowsReqKeyRef.current !== paramsKey) return;
+        setServerQueryError(String(err?.message || err || "widget_sql_query_failed"));
+      } finally {
+        queryRowsInFlightRef.current = false;
+        setServerQueryRowsLoading(false);
+      }
+    })();
+    return () => {
+      // No-op: polling re-fires deliberately don't cancel in-flight queries.
+    };
+  }, [
+    resolvedGatewayId,
+    tagName,
+    widgetType,
+    dataSourceType,
+    cfgReadingsCount,
+    cfgRowSelection,
+    cfgRowLimit,
+    cfgGroupInterval,
+    cfgResultAggregation,
+    cfgRuleLogic,
+    cfgTimePreset,
+    cfgTimeFrom,
+    cfgTimeTo,
+    rulesDepKey,
+    refreshTickFast,
+    refreshTickMedium,
+    refreshTickPaginated,
+  ]);
+
+  useEffect(() => {
+    const isPieDirect = widgetType === "pie_chart" && String(effectiveDataSourceType || "tag_direct") === "tag_direct";
+    const canQuery = typeof fetchWidgetStatsRef.current === "function";
+    if (!isPieDirect || !canQuery) {
+      setServerQueryStats(null);
+      setLastGoodServerQueryStats(null);
+      setServerQueryStatsError("");
+      setServerQueryStatsLoading(false);
+      queryStatsReqKeyRef.current = "";
+      return () => {};
+    }
+    const range = resolveTimeFilterRange(cfg);
+    // Params-only key (no tick) so polling never cancels an in-flight request.
+    const paramsKey = JSON.stringify({
+      widgetId: String(widget?.id || ""),
+      gatewayId: String(resolvedGatewayId || ""),
+      tagName: String(tagName || ""),
+      fromUtc: String(range?.fromUtc || ""),
+      toUtc: String(range?.toUtc || ""),
+      grp: cfgGroupInterval,
+      agg: String(cfgResultAggregation || "count"),
+      sel: cfgRowSelection,
+      lim: cfgRowLimit,
+      tf: cfgTimePreset,
+      tfFrom: cfgTimeFrom,
+      tfTo: cfgTimeTo,
+    });
+    const paramsChanged = paramsKey !== queryStatsReqKeyRef.current;
+    if (!paramsChanged && queryStatsInFlightRef.current) {
+      return () => {};
+    }
+    queryStatsReqKeyRef.current = paramsKey;
+    queryStatsInFlightRef.current = true;
+    setServerQueryStatsError("");
+    setServerQueryStatsLoading(true);
+    (async () => {
+      try {
+        let rows = await fetchWidgetStatsRef.current({
+          fromUtc: range?.fromUtc || "",
+          toUtc: range?.toUtc || "",
+          gateway: String(resolvedGatewayId || ""),
+          tag: String(tagName || ""),
+          timeoutMs: 12000,
+          maxAttempts: 2,
+        });
+        const safeFirst = Array.isArray(rows) ? rows : [];
+        if (safeFirst.length === 0 && String(resolvedGatewayId || "").trim()) {
+          rows = await fetchWidgetStatsRef.current({
+            fromUtc: range?.fromUtc || "",
+            toUtc: range?.toUtc || "",
+            gateway: "",
+            tag: String(tagName || ""),
+            timeoutMs: 12000,
+            maxAttempts: 2,
+          });
+        }
+        if (queryStatsReqKeyRef.current !== paramsKey) return;
+        const safeRows = Array.isArray(rows) ? rows : [];
+        setServerQueryStats(safeRows);
+        if (safeRows.length > 0) {
+          setLastGoodServerQueryStats(safeRows);
+          const wid = String(widget?.id || "");
+          if (wid) LAST_WIDGET_DIRECT_STATS_CACHE.set(wid, safeRows);
+        }
+        setServerQueryStatsError("");
+      } catch (err) {
+        if (queryStatsReqKeyRef.current !== paramsKey) return;
+        setServerQueryStatsError(String(err?.message || err || "widget_sql_stats_query_failed"));
+      } finally {
+        queryStatsInFlightRef.current = false;
+        setServerQueryStatsLoading(false);
+      }
+    })();
+    return () => {
+      // No-op: polling re-fires intentionally don't cancel in-flight queries.
+    };
+  }, [
+    widget?.id,
+    dataSourceType,
+    resolvedGatewayId,
+    tagName,
+    widgetType,
+    cfgGroupInterval,
+    cfgResultAggregation,
+    cfgRowSelection,
+    cfgRowLimit,
+    cfgTimePreset,
+    cfgTimeFrom,
+    cfgTimeTo,
+    refreshTickMedium,
+  ]);
+
+  useEffect(() => {
+    const isComputedPie = widgetType === "pie_chart" && String(effectiveDataSourceType || "tag_direct") === "computed";
+    const canQuery = typeof fetchWidgetRuleStatsRef.current === "function";
+    if (!isComputedPie || !canQuery) {
+      setServerRuleStats(null);
+      setLastGoodServerRuleStats(null);
+      setServerRuleStatsError("");
+      setServerRuleStatsLoading(false);
+      ruleStatsReqKeyRef.current = "";
+      return () => {};
+    }
+    const range = resolveTimeFilterRange(cfg);
+    // Compute "params key" — excludes the refresh tick on purpose. The tick
+    // only drives polling; if params haven't changed and a request is already
+    // in flight we let it finish instead of cancelling and re-firing.
+    const paramsKey = JSON.stringify({
+      widgetId: String(widget?.id || ""),
+      gatewayId: String(resolvedGatewayId || ""),
+      fromUtc: String(range?.fromUtc || ""),
+      toUtc: String(range?.toUtc || ""),
+      rowSel: cfgRowSelection,
+      rowLimit: cfgRowLimit,
+      grp: cfgGroupInterval,
+      agg: cfgResultAggregation,
+      logic: cfgRuleLogic,
+      tf: cfgTimePreset,
+      tfFrom: cfgTimeFrom,
+      tfTo: cfgTimeTo,
+      rules: Array.isArray(rules)
+        ? rules.map((r) => ({
+            id: String(r?.id || ""),
+            label: String(r?.label || ""),
+            gateway_id: String(r?.gateway_id || ""),
+            tag_name: String(r?.tag_name || ""),
+            operator: String(r?.operator || "any"),
+            value1: r?.value1 ?? "",
+            value2: r?.value2 ?? "",
+            aggregation: String(r?.aggregation || "count"),
+          }))
+        : [],
+    });
+    const paramsChanged = paramsKey !== ruleStatsReqKeyRef.current;
+    // Skip starting a new fetch when a previous request with the same params
+    // is still running — avoids cancellation stampede when SQL is slow.
+    if (!paramsChanged && ruleStatsInFlightRef.current) {
+      return () => {};
+    }
+    ruleStatsReqKeyRef.current = paramsKey;
+    ruleStatsInFlightRef.current = true;
+    setServerRuleStatsError("");
+    setServerRuleStatsLoading(true);
+    (async () => {
+      try {
+        const normalizedRules = (Array.isArray(rules) ? rules : []).map((r) => ({
+          ...r,
+          operator: normalizeRuleOperator(r?.operator),
+        }));
+        const rows = await fetchWidgetRuleStatsRef.current({
+          rules: normalizedRules,
+          fromUtc: range?.fromUtc || "",
+          toUtc: range?.toUtc || "",
+          gateway: String(resolvedGatewayId || ""),
+          timeoutMs: 12000,
+          maxAttempts: 2,
+        });
+        // Stale-response check: if widget params changed while we were waiting
+        // (e.g. user picked a new time range), this result is now invalid.
+        if (ruleStatsReqKeyRef.current !== paramsKey) return;
+        const safeRows = Array.isArray(rows) ? rows : [];
+        setServerRuleStats(safeRows);
+        if (safeRows.length > 0) {
+          setLastGoodServerRuleStats(safeRows);
+          const wid = String(widget?.id || "");
+          if (wid) LAST_WIDGET_RULE_STATS_CACHE.set(wid, safeRows);
+        }
+        setServerRuleStatsError("");
+      } catch (err) {
+        if (ruleStatsReqKeyRef.current !== paramsKey) return;
+        setServerRuleStatsError(String(err?.message || err || "widget_sql_rule_stats_query_failed"));
+      } finally {
+        ruleStatsInFlightRef.current = false;
+        setServerRuleStatsLoading(false);
+      }
+    })();
+    return () => {
+      // No-op cleanup: we deliberately do NOT cancel the in-flight fetch on
+      // re-render. Stale responses are filtered by the paramsKey check above.
+    };
+  }, [
+    widget?.id,
+    dataSourceType,
+    resolvedGatewayId,
+    widgetType,
+    cfgGroupInterval,
+    cfgResultAggregation,
+    cfgRowSelection,
+    cfgRowLimit,
+    cfgRuleLogic,
+    cfgTimePreset,
+    cfgTimeFrom,
+    cfgTimeTo,
+    rulesDepKey,
+    refreshTickMedium,
+  ]);
+
+  const effectiveRows = useMemo(() => {
+    const hasHistorianFetcher = typeof fetchWidgetRowsRef.current === "function";
+    if (!hasHistorianFetcher) return Array.isArray(dataLogView) ? dataLogView : [];
+    if (Array.isArray(serverQueryRows) && !serverQueryError) {
+      return serverQueryRows;
+    }
+    if (Array.isArray(lastGoodServerQueryRows) && lastGoodServerQueryRows.length > 0) {
+      return lastGoodServerQueryRows;
+    }
+    const wid = String(widget?.id || "");
+    if (wid && Array.isArray(LAST_WIDGET_ROWS_CACHE.get(wid))) {
+      return LAST_WIDGET_ROWS_CACHE.get(wid);
+    }
+    // Deterministic behavior: when historian query fetchers exist, do not mix with in-memory
+    // stream fallback because that can collapse counts across widgets/tags.
+    return [];
+  }, [serverQueryRows, serverQueryError, lastGoodServerQueryRows, dataLogView, widget?.id]);
+
+  const directScopedRows = useMemo(
+    () => {
+      const strict = effectiveRows
+        .filter((r) => (!resolvedGatewayId || String(r?.gateway_id || "") === String(resolvedGatewayId)))
+        .filter((r) => (!tagName || String(r?.tag || r?.tag_name || "") === String(tagName)));
+      if (strict.length > 0) return strict;
+      // Backward-compat fallback: if saved gateway ids drifted, keep chart usable by tag scope.
+      if (tagName) {
+        return effectiveRows.filter((r) => String(r?.tag || r?.tag_name || "") === String(tagName));
+      }
+      return strict;
+    },
+    [effectiveRows, resolvedGatewayId, tagName]
+  );
+  const directScopedRowsTimeFiltered = useMemo(
+    () => applyWidgetTimeFilter(directScopedRows, cfg),
+    [directScopedRows, cfgTimePreset, cfgTimeFrom, cfgTimeTo]
+  );
+  const computedRowsTimeFiltered = useMemo(
+    () => applyWidgetTimeFilter(effectiveRows, cfg),
+    [effectiveRows, cfgTimePreset, cfgTimeFrom, cfgTimeTo]
+  );
+
+  const latest = useMemo(
+    () => getLatestTagRow(directScopedRowsTimeFiltered, resolvedGatewayId, tagName),
+    [directScopedRowsTimeFiltered, resolvedGatewayId, tagName]
+  );
+  const series = useMemo(
+    () => getTagSeriesFiltered(directScopedRowsTimeFiltered, resolvedGatewayId, tagName, cfgReadingsCount),
+    [directScopedRowsTimeFiltered, resolvedGatewayId, tagName, cfgReadingsCount]
+  );
+  const computedItems = useMemo(
+    () => evaluateComputedRules(computedRowsTimeFiltered, rules),
+    [computedRowsTimeFiltered, rulesDepKey]
+  );
+  const queryOptions = useMemo(
+    () => ({
+      group_interval: cfgGroupInterval,
+      result_aggregation: cfgResultAggregation,
+      row_selection: cfgRowSelection,
+      row_limit: cfgRowLimit,
+      rule_logic: cfgRuleLogic,
+    }),
+    [cfgGroupInterval, cfgResultAggregation, cfgRowSelection, cfgRowLimit, cfgRuleLogic]
+  );
+  const computedItemsWithQuery = useMemo(() => {
+    const chosenRuleStats =
+      Array.isArray(serverRuleStats) && serverRuleStats.length > 0
+        ? serverRuleStats
+        : Array.isArray(lastGoodServerRuleStats) && lastGoodServerRuleStats.length > 0
+          ? lastGoodServerRuleStats
+          : [];
+    if (chosenRuleStats.length > 0) {
+      return chosenRuleStats.map((row, idx) => ({
+        id: String(row?.id || `rule-${idx + 1}`),
+        label: String(row?.label || `Item ${idx + 1}`),
+        value: Number.isFinite(Number(row?.value)) ? Number(row.value) : 0,
+        color: String(row?.color || "#14a89a"),
+        gateway_id: String(row?.gateway_id || ""),
+        tag_name: String(row?.tag_name || ""),
+        aggregation: String(row?.aggregation || "count"),
+        operator: String(row?.operator || "any"),
+        sample_count: Number.isFinite(Number(row?.sample_count)) ? Number(row.sample_count) : 0,
+      }));
+    }
+    // Keep UI live: while backend rule-stats is loading/slow, compute from currently available rows.
+    return evaluateComputedRules(computedRowsTimeFiltered, rules, queryOptions);
+  }, [serverRuleStats, lastGoodServerRuleStats, computedRowsTimeFiltered, rulesDepKey, queryOptions]);
   const displayTag = formatTagForDisplay ? formatTagForDisplay(tagName) : tagName;
+  const yDomain = useMemo(() => buildAutoYDomain(series), [series]);
+  const chartMargin = { top: 4, right: 8, left: 0, bottom: 0 };
+  const interpolation = getChartInterpolation(widget);
+  const chartValueFormat = String(cfg.chart_value_format || "auto");
+  const showChartLegend = cfg.chart_show_legend === true;
+  const showPointLabels = cfg.chart_show_point_labels === true;
+  const [pieHiddenNames, setPieHiddenNames] = useState({});
+  const [pieActiveIndex, setPieActiveIndex] = useState(-1);
+  const [pieTooltipActive, setPieTooltipActive] = useState(false);
+  const hasDirectStats =
+    (Array.isArray(serverQueryStats) && serverQueryStats.length > 0) ||
+    (Array.isArray(lastGoodServerQueryStats) && lastGoodServerQueryStats.length > 0);
+  const hasRuleStats =
+    (Array.isArray(serverRuleStats) && serverRuleStats.length > 0) ||
+    (Array.isArray(lastGoodServerRuleStats) && lastGoodServerRuleStats.length > 0);
+  const pieIsInitialLoading =
+    effectiveDataSourceType === "computed"
+      ? (serverRuleStatsLoading && !hasRuleStats && computedRowsTimeFiltered.length === 0)
+      : (serverQueryStatsLoading && !hasDirectStats && directScopedRowsTimeFiltered.length === 0);
+  const pieLoadError = effectiveDataSourceType === "computed" ? serverRuleStatsError : serverQueryStatsError;
+  // Trend widgets (line/area/bar) show a transient "Loading..." while the historian
+  // range fetch is in flight, instead of immediately flashing "No points".
+  const trendIsInitialLoading =
+    serverQueryRowsLoading
+    && (!Array.isArray(serverQueryRows) || serverQueryRows.length === 0)
+    && (!Array.isArray(lastGoodServerQueryRows) || lastGoodServerQueryRows.length === 0);
+  useEffect(() => {
+    setPieHiddenNames({});
+    setPieActiveIndex(-1);
+    setPieTooltipActive(false);
+  }, [widget?.id]);
+  const yAxisPresetProps = useMemo(
+    () => ({
+      ...yAxisProps,
+      tickFormatter: (v) => formatByPreset(v, chartValueFormat),
+    }),
+    [chartValueFormat]
+  );
 
   switch (widget.type) {
     case "line_chart":
     case "line_area_chart":
       return (
-        <div className="dashboard-widget-block">
+        <div className="dashboard-widget-block dashboard-widget-block-chart">
           {series.length ? (
             <div className="dashboard-widget-chart">
               {widget.type === "line_area_chart" ? (
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={series}>
-                    <XAxis dataKey="idx" hide />
-                    <YAxis hide />
+                  <AreaChart data={series} margin={chartMargin}>
+                    <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                    <XAxis {...buildXAxisProps(series)} />
+                    <YAxis {...yAxisPresetProps} domain={yDomain} />
                     <Tooltip
-                      formatter={(v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(3) : "-")}
+                      {...chartTooltipProps}
+                      formatter={(v) => formatByPreset(v, chartValueFormat)}
                       labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
                     />
+                    {showChartLegend ? <Legend /> : null}
                     <Area
-                      type="monotone"
+                      type={interpolation}
                       dataKey="value"
+                      name={displayTag || "Value"}
                       stroke={getWidgetAccent(widget, "#14a89a")}
                       fill={rgbaFromHex(getWidgetAccent(widget, "#14a89a"), 0.24)}
                       strokeWidth={2}
+                      label={showPointLabels ? { fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : false}
+                      isAnimationActive={false}
                     />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : (
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={series}>
-                    <XAxis dataKey="idx" hide />
-                    <YAxis hide />
+                  <LineChart data={series} margin={chartMargin}>
+                    <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                    <XAxis {...buildXAxisProps(series)} />
+                    <YAxis {...yAxisPresetProps} domain={yDomain} />
                     <Tooltip
-                      formatter={(v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(3) : "-")}
+                      {...chartTooltipProps}
+                      formatter={(v) => formatByPreset(v, chartValueFormat)}
                       labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
                     />
-                    <Line type="monotone" dataKey="value" stroke={getWidgetAccent(widget, "#14a89a")} strokeWidth={2} dot={false} />
+                    {showChartLegend ? <Legend /> : null}
+                    <Line
+                      type={interpolation}
+                      dataKey="value"
+                      name={displayTag || "Value"}
+                      stroke={getWidgetAccent(widget, "#14a89a")}
+                      strokeWidth={2}
+                      dot={false}
+                      label={showPointLabels ? { fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : false}
+                      isAnimationActive={false}
+                    />
                   </LineChart>
                 </ResponsiveContainer>
               )}
             </div>
-          ) : renderEmpty("No points")}
-          <div className="dashboard-widget-foot">{displayTag}</div>
+          ) : trendIsInitialLoading ? renderEmpty("Loading...") : renderEmpty("No points")}
         </div>
       );
     case "bar_chart":
       return (
-        <div className="dashboard-widget-block">
+        <div className="dashboard-widget-block dashboard-widget-block-chart">
           {series.length ? (
             <div className="dashboard-widget-chart">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={series}>
-                  <XAxis dataKey="idx" hide />
-                  <YAxis hide />
+                <BarChart data={series} margin={chartMargin}>
+                  <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                  <XAxis {...buildXAxisProps(series)} />
+                  <YAxis {...yAxisPresetProps} domain={yDomain} />
                   <Tooltip
-                    formatter={(v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(3) : "-")}
+                    {...chartTooltipProps}
+                    formatter={(v) => formatByPreset(v, chartValueFormat)}
                     labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
                   />
-                  <Bar dataKey="value" fill={getWidgetAccent(widget, "#1f3a5f")} />
+                  {showChartLegend ? <Legend /> : null}
+                  <Bar
+                    dataKey="value"
+                    name={displayTag || "Value"}
+                    label={showPointLabels ? { fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : false}
+                    fill={getWidgetAccent(widget, "#1f3a5f")}
+                  />
                 </BarChart>
               </ResponsiveContainer>
             </div>
-          ) : renderEmpty("No points")}
-          <div className="dashboard-widget-foot">{displayTag}</div>
+          ) : trendIsInitialLoading ? renderEmpty("Loading...") : renderEmpty("No points")}
         </div>
       );
     case "pie_chart": {
-      const gatewayRows = (tagRowsByGateway?.[String(gatewayId)] || []).slice(0, 8);
-      const pieData = dataSourceType === "computed"
-        ? computedItems
-            .map((it) => ({ name: it.label, value: Math.abs(Number(it.value)) || 0, color: it.color }))
-            .filter((r) => r.value > 0)
-        : gatewayRows
-            .map((r) => ({
-              name: formatTagForDisplay ? formatTagForDisplay(r.tag_name) : r.tag_name,
-              value: Math.abs(Number(r.last_value)) || 0,
-            }))
-            .filter((r) => r.value > 0);
+      const showLegend = parseBool(cfg.pie_show_legend, true);
+      const showLabels = parseBool(cfg.pie_show_labels, true);
+      const showCount = parseBool(cfg.pie_show_count, true);
+      const showPercent = parseBool(cfg.pie_show_percent, true);
+      const pieLegendLayout = String(cfg.pie_legend_layout || "side") === "bottom" ? "bottom" : "side";
       const palette = getPiePalette(widget);
+      const directRowsGrouped = bucketRows(directScopedRowsTimeFiltered, String(cfg.query_group_interval || "none"));
+      const directRowsSelected = String(cfg.query_row_selection || "all") === "last_n"
+        ? directRowsGrouped.slice(-Math.max(1, Number(cfg.query_row_limit || 200)))
+        : directRowsGrouped;
+      const localDirectStats = (() => {
+        const byTag = new Map();
+        for (const row of directRowsSelected) {
+          const nm = String(row?.tag || row?.tag_name || "").trim();
+          if (!nm) continue;
+          const raw = Number(row?.value);
+          const v = Number.isFinite(raw) ? raw : null;
+          const acc = byTag.get(nm) || {
+            name: nm,
+            count: 0,
+            sum: 0,
+            min: Number.POSITIVE_INFINITY,
+            max: Number.NEGATIVE_INFINITY,
+            latest: null,
+          };
+          acc.count += 1;
+          if (v !== null) {
+            acc.sum += v;
+            if (v < acc.min) acc.min = v;
+            if (v > acc.max) acc.max = v;
+            acc.latest = v;
+          }
+          byTag.set(nm, acc);
+        }
+        return Array.from(byTag.values()).map((s) => ({
+          name: s.name,
+          count: s.count,
+          sum: s.sum,
+          avg: s.count > 0 ? s.sum / s.count : 0,
+          min: Number.isFinite(s.min) ? s.min : 0,
+          max: Number.isFinite(s.max) ? s.max : 0,
+          latest: Number.isFinite(Number(s.latest)) ? Number(s.latest) : 0,
+        }));
+      })();
+      const pieData = effectiveDataSourceType === "computed"
+        ? (() => {
+            // Keep all configured rule groups visible (including zero-value groups)
+            // so legend stays stable and users can see "no matches" instead of a vanishing slice.
+            const mapped = computedItemsWithQuery.map((it, idx) => {
+              const rawColor = String(it?.color || "").trim();
+              const resolvedColor =
+                /^#([0-9a-fA-F]{6})$/.test(rawColor) ? rawColor : palette[idx % palette.length];
+              const numericValue = Number(it.value);
+              return {
+                name: String(it.label || `Item ${idx + 1}`),
+                value: Number.isFinite(numericValue) ? Math.abs(numericValue) : 0,
+                color: resolvedColor,
+              };
+            });
+            const uniqueColors = new Set(mapped.map((m) => String(m.color || "").toLowerCase()));
+            if (mapped.length > 1 && uniqueColors.size <= 1) {
+              return mapped.map((m, idx) => ({ ...m, color: palette[idx % palette.length] }));
+            }
+            return mapped;
+          })()
+        : (() => {
+            const agg = String(cfg.query_result_aggregation || "count");
+            const effectiveStats =
+              Array.isArray(serverQueryStats) && serverQueryStats.length > 0
+                ? serverQueryStats
+                : Array.isArray(lastGoodServerQueryStats) && lastGoodServerQueryStats.length > 0
+                  ? lastGoodServerQueryStats
+                  : [];
+            if (!effectiveStats.length && !localDirectStats.length) return [];
+            const exactTag = String(tagName || "").trim().toLowerCase();
+            // Direct-pie reads aggregate values from the historian stats endpoint.
+            // For "latest" we prefer the historian-reported `max(ts_utc)` value
+            // (delivered as `latest` in the stats row) and fall back to the live
+            // row buffer only if the backend omitted it.
+            const latestByTag = new Map();
+            for (const row of directRowsSelected) {
+              const nm = String(row?.tag || row?.tag_name || "").trim();
+              if (!nm) continue;
+              const raw = Number(row?.value);
+              const v = Number.isFinite(raw) ? raw : null;
+              if (v !== null) latestByTag.set(nm, v);
+            }
+            const directStats = effectiveStats.length
+              ? effectiveStats
+                  .filter((r) => {
+                    const nm = String(r?.tag || "").trim().toLowerCase();
+                    return !exactTag || nm === exactTag;
+                  })
+                  .map((r) => {
+                    const tag = String(r?.tag || "").trim();
+                    const serverLatest = Number(r?.latest);
+                    const fallbackLatest = Number(latestByTag.get(tag));
+                    const latest = Number.isFinite(serverLatest)
+                      ? serverLatest
+                      : Number.isFinite(fallbackLatest)
+                        ? fallbackLatest
+                        : 0;
+                    return {
+                      name: tag,
+                      count: Number(r?.count || 0),
+                      sum: Number(r?.sum || 0),
+                      avg: Number.isFinite(Number(r?.avg)) ? Number(r?.avg) : 0,
+                      min: Number.isFinite(Number(r?.min)) ? Number(r?.min) : 0,
+                      max: Number.isFinite(Number(r?.max)) ? Number(r?.max) : 0,
+                      latest,
+                    };
+                  })
+              : localDirectStats
+                  .filter((r) => {
+                    const nm = String(r?.name || "").trim().toLowerCase();
+                    return !exactTag || nm === exactTag;
+                  });
+            return directStats
+              .map((s) => {
+                let out = 0;
+                if (agg === "count") out = s.count;
+                else if (agg === "sum") out = s.sum;
+                else if (agg === "avg") out = s.avg;
+                else if (agg === "min") out = s.min;
+                else if (agg === "max") out = s.max;
+                else if (agg === "latest") out = s.latest;
+                const numeric = Number(out);
+                return {
+                  name: formatTagForDisplay ? formatTagForDisplay(s.name) : s.name,
+                  value: Number.isFinite(numeric) ? Math.abs(numeric) : 0,
+                };
+              })
+              .slice(0, 8);
+          })();
+      const visiblePieData = pieData.filter((item) => !pieHiddenNames[String(item.name || "")]);
+      const total = visiblePieData.reduce((sum, item) => sum + Number(item.value || 0), 0);
+      // Recharts cannot render a Pie when all values are zero; supply a uniform
+      // visual fallback so zero-state groups still appear in the ring. The legend
+      // continues to display the real values (zeros included).
+      const renderPieData = total > 0
+        ? visiblePieData
+        : visiblePieData.map((item) => ({ ...item, value: 1 }));
+      const compact = Number(widget?.w || 0) <= 3 || Number(widget?.h || 0) <= 3;
+      const innerRadius = compact ? "50%" : "58%";
+      const outerRadius = compact ? "84%" : "94%";
+      const centerTotal = Number.isFinite(total) ? total.toFixed(total >= 1000 ? 0 : 2) : "0";
+      const legendRows = pieData.map((item, idx) => {
+        const raw = Number(item?.value || 0);
+        const pct = total > 0 ? (raw / total) * 100 : 0;
+        const label = String(item?.name || `Item ${idx + 1}`);
+        const valueText = showCount ? raw.toFixed(2) : "";
+        const percentText = showPercent ? `${pct.toFixed(1)}%` : "";
+        const hidden = Boolean(pieHiddenNames[String(item?.name || "")]);
+        return {
+          key: String(item?.name || idx),
+          hidden,
+          label,
+          valueText,
+          percentText,
+          color: item?.color || palette[idx % palette.length],
+          pct,
+        };
+      });
+      const toggleLegendRow = (name) => {
+        const key = String(name || "");
+        setPieHiddenNames((prev) => {
+          const draft = { ...(prev || {}), [key]: !prev?.[key] };
+          return sanitizePieHiddenMap(draft, pieData);
+        });
+        setPieActiveIndex(-1);
+      };
       return (
         <div className="dashboard-widget-block">
-          {pieData.length ? (
-            <div className="dashboard-widget-chart">
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie data={pieData} dataKey="value" nameKey="name" innerRadius={40} outerRadius={70}>
-                    {pieData.map((entry, idx) => (
-                      <Cell key={`${entry.name}-${idx}`} fill={entry.color || palette[idx % palette.length]} />
-                    ))}
-                  </Pie>
-                  <Tooltip formatter={(v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(2) : "-")} />
-                </PieChart>
-              </ResponsiveContainer>
+          {pieIsInitialLoading && !pieData.length && !pieLoadError ? (
+            renderEmpty("Loading values...")
+          ) : pieLoadError && !pieData.length ? (
+            renderEmpty("No values")
+          ) : pieData.length ? (
+            <div className={`dashboard-widget-chart dashboard-donut-wrap ${compact ? "compact" : ""} ${pieLegendLayout === "bottom" ? "legend-bottom" : "legend-side"} ${showLegend ? "" : "no-legend"}`}>
+              <div className="dashboard-donut-canvas">
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart onMouseLeave={() => { setPieActiveIndex(-1); setPieTooltipActive(false); }}>
+                    <Pie
+                      data={renderPieData}
+                      dataKey="value"
+                      nameKey="name"
+                      innerRadius={innerRadius}
+                      outerRadius={outerRadius}
+                      paddingAngle={1}
+                      label={false}
+                      labelLine={false}
+                      activeIndex={pieActiveIndex}
+                      activeShape={renderActiveDonutShape}
+                      onMouseEnter={(_, idx) => { setPieActiveIndex(idx); setPieTooltipActive(true); }}
+                      onMouseLeave={() => { setPieActiveIndex(-1); setPieTooltipActive(false); }}
+                      onClick={(entry) => toggleLegendRow(String(entry?.name || ""))}
+                      stroke="none"
+                      isAnimationActive={false}
+                    >
+                      {renderPieData.map((entry, idx) => (
+                        <Cell key={`${entry.name}-${idx}`} fill={entry.color || palette[idx % palette.length]} />
+                      ))}
+                    </Pie>
+                    <text
+                      x="50%"
+                      y="48%"
+                      textAnchor="middle"
+                      className="dashboard-donut-center-value"
+                    >
+                      {centerTotal}
+                    </text>
+                    <text
+                      x="50%"
+                      y="58%"
+                      textAnchor="middle"
+                      className="dashboard-donut-center-label"
+                    >
+                      Total
+                    </text>
+                    <Tooltip
+                      {...chartTooltipProps}
+                      active={pieTooltipActive}
+                      formatter={(_, name) => {
+                        const match = visiblePieData.find((item) => String(item?.name || "") === String(name || ""));
+                        const real = Number(match?.value);
+                        return Number.isFinite(real) ? real.toFixed(2) : "-";
+                      }}
+                    />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+              {showLegend ? (
+                <div className="dashboard-donut-meta">
+                  {pieLegendLayout === "side" ? (
+                    <div
+                      className="dashboard-donut-side-list"
+                      style={{ gridTemplateRows: `repeat(${Math.max(1, legendRows.length)}, minmax(0, 1fr))` }}
+                    >
+                      {legendRows.map((row) => (
+                        <button
+                          type="button"
+                          key={`side-${row.key}`}
+                          className={`dashboard-donut-side-row ${row.hidden ? "is-hidden" : ""}`}
+                          onClick={() => toggleLegendRow(row.key)}
+                          title={row.hidden ? "Show this slice" : "Hide this slice"}
+                        >
+                          <span className="dashboard-donut-side-text">
+                            {showPercent ? <span className="dashboard-donut-strip-line percent">{row.percentText}</span> : null}
+                            {showCount ? <span className="dashboard-donut-strip-line value">{row.valueText}</span> : null}
+                            {showLabels ? <span className="dashboard-donut-strip-line label">{row.label}</span> : null}
+                          </span>
+                          <span className="dashboard-donut-side-bar-wrap">
+                            <span className="dashboard-donut-side-bar" style={{ background: row.color }} />
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <>
+                      <div className="dashboard-donut-strip-labels">
+                        <div
+                          className="dashboard-donut-strip-label-grid"
+                          style={{ gridTemplateColumns: `repeat(${Math.max(1, legendRows.length)}, minmax(0, 1fr))` }}
+                        >
+                        {legendRows.map((row) => (
+                          <button
+                            type="button"
+                            key={`lbl-${row.key}`}
+                            className={`dashboard-donut-strip-col ${row.hidden ? "is-hidden" : ""}`}
+                            onClick={() => toggleLegendRow(row.key)}
+                            title={row.hidden ? "Show this slice" : "Hide this slice"}
+                          >
+                            {showPercent ? <span className="dashboard-donut-strip-line percent">{row.percentText}</span> : null}
+                            {showCount ? <span className="dashboard-donut-strip-line value">{row.valueText}</span> : null}
+                            {showLabels ? <span className="dashboard-donut-strip-line label">{row.label}</span> : null}
+                          </button>
+                        ))}
+                        </div>
+                      </div>
+                      <div className="dashboard-donut-segment-strip" aria-hidden>
+                        {legendRows.map((row) => (
+                          <span
+                            key={`seg-${row.key}`}
+                            className={`dashboard-donut-segment ${row.hidden ? "is-hidden" : ""}`}
+                            style={{ background: row.color }}
+                          />
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              ) : null}
             </div>
           ) : renderEmpty("No values")}
         </div>
       );
     }
     case "meter_chart": {
-      const value = dataSourceType === "computed"
-        ? parseNumber(computedItems[0]?.value)
+      const value = effectiveDataSourceType === "computed"
+        ? parseNumber(computedItemsWithQuery[0]?.value)
         : parseNumber(latest?.last_value);
-      const pct = Math.max(0, Math.min(100, Number(value ?? 0)));
-      const accent = getWidgetAccent(widget, "#0e8479");
-      const gaugeData = [
-        { name: "value", value: pct, fill: accent },
-        { name: "remaining", value: Math.max(0, 100 - pct), fill: "var(--card-2, #232a36)" },
-      ];
+      const ranges = computeMeterRanges(widget, value);
+      const domainMin = ranges.length ? Math.min(...ranges.map((r) => Number(r.min))) : 0;
+      const domainMax = ranges.length ? Math.max(...ranges.map((r) => Number(r.max))) : 100;
+      const meterLegendLayout = parseLegendLayout(cfg?.meter_legend_layout, "side");
+      const showMeterLegend = parseBool(cfg?.meter_show_legend, true);
+      const gaugeData = ranges
+        .map((r) => ({
+          name: r.label,
+          color: r.color,
+          value: Math.max(0, Number(r.max) - Number(r.min)),
+        }))
+        .filter((r) => Number.isFinite(r.value) && r.value > 0);
+      const current = Number.isFinite(Number(value)) ? Number(value) : Number.NaN;
+      const currentPct = Number.isFinite(current)
+        ? ((Math.max(domainMin, Math.min(domainMax, current)) - domainMin) / Math.max(1e-9, (domainMax - domainMin))) * 100
+        : Number.NaN;
+      const pointerDeg = Number.isFinite(currentPct) ? (Math.max(0, Math.min(100, currentPct)) * 180) / 100 - 90 : -90;
       return (
-        <div className="dashboard-widget-block">
-          <div className="dashboard-meter-gauge-wrap">
+        <div className={`dashboard-widget-block dashboard-widget-block-chart dashboard-meter-wrap ${meterLegendLayout === "bottom" ? "legend-bottom" : "legend-side"} ${showMeterLegend ? "" : "no-legend"}`}>
+          <div className="dashboard-meter-gauge-wrap dashboard-widget-chart">
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie
@@ -219,53 +1605,110 @@ export function DashboardWidgetCard({
                   startAngle={180}
                   endAngle={0}
                   cx="50%"
-                  cy="84%"
-                  innerRadius="62%"
-                  outerRadius="90%"
+                  cy="70%"
+                  innerRadius="64%"
+                  outerRadius="98%"
                   stroke="none"
-                  paddingAngle={0}
+                  paddingAngle={0.8}
                   isAnimationActive={false}
                 >
                   {gaugeData.map((entry, idx) => (
-                    <Cell key={`meter-seg-${idx}`} fill={entry.fill} />
+                    <Cell key={`meter-seg-${idx}`} fill={entry.color} />
                   ))}
                 </Pie>
               </PieChart>
             </ResponsiveContainer>
+            <div className="dashboard-meter-pointer-wrap" aria-hidden>
+              <div className="dashboard-meter-pointer" style={{ transform: `translate(-50%, 0) rotate(${pointerDeg}deg)` }} />
+              <div className="dashboard-meter-pointer-cap" />
+            </div>
+            <div className="dashboard-meter-caption">
+              <div className="dashboard-meter-caption-value">{value === null ? "-" : value.toFixed(2)}</div>
+              <div className="dashboard-meter-caption-pct">{Number.isFinite(currentPct) ? `${currentPct.toFixed(1)}%` : "-"}</div>
+            </div>
           </div>
-          <div className="dashboard-meter-value">{value === null ? "-" : value.toFixed(2)}</div>
-          <div className="dashboard-widget-foot">{displayTag}</div>
+          {showMeterLegend ? (
+            <div className="dashboard-donut-meta">
+              {meterLegendLayout === "side" ? (
+                <div
+                  className="dashboard-donut-side-list"
+                  style={{ gridTemplateRows: `repeat(${Math.max(1, ranges.length)}, minmax(0, 1fr))` }}
+                >
+                  {ranges.map((row) => (
+                    <div key={`meter-row-${row.id}`} className="dashboard-donut-side-row">
+                      <span className="dashboard-donut-side-text">
+                        <span className="dashboard-donut-strip-line percent">{row.label}</span>
+                        <span className="dashboard-donut-strip-line value">{Number(row.min).toFixed(1)} - {Number(row.max).toFixed(1)}</span>
+                      </span>
+                      <span className="dashboard-donut-side-bar-wrap">
+                        <span className="dashboard-donut-side-bar" style={{ background: row.color }} />
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <>
+                  <div className="dashboard-donut-strip-labels">
+                    <div
+                      className="dashboard-donut-strip-label-grid"
+                      style={{ gridTemplateColumns: `repeat(${Math.max(1, ranges.length)}, minmax(0, 1fr))` }}
+                    >
+                      {ranges.map((row) => (
+                        <div key={`meter-lbl-${row.id}`} className="dashboard-donut-strip-col">
+                          <span className="dashboard-donut-strip-line percent">{row.label}</span>
+                          <span className="dashboard-donut-strip-line value">{Number(row.min).toFixed(1)} - {Number(row.max).toFixed(1)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="dashboard-donut-segment-strip" aria-hidden>
+                    {ranges.map((row) => (
+                      <span key={`meter-seg-strip-${row.id}`} className="dashboard-donut-segment" style={{ background: row.color }} />
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          ) : null}
         </div>
       );
     }
     case "text_kpi":
+      {
+        const textSize = computeWidgetTextScale(widget, 14, 34);
       return (
         <div className="dashboard-widget-block">
-          <div className="dashboard-kpi-text">{displayTag || "-"}</div>
-          <div className="dashboard-widget-foot">{latest?.last_ts || "-"}</div>
+          <div className="dashboard-kpi-text" style={{ fontSize: `${textSize}px` }}>{displayTag || "-"}</div>
         </div>
       );
+      }
     case "value_kpi": {
-      const value = dataSourceType === "computed"
-        ? parseNumber(computedItems[0]?.value)
+      const value = effectiveDataSourceType === "computed"
+        ? parseNumber(computedItemsWithQuery[0]?.value)
         : parseNumber(latest?.last_value);
+      const valueSize = computeWidgetTextScale(widget, 18, 46);
       return (
         <div className="dashboard-widget-block">
-          <div className="dashboard-kpi-value" style={{ color: getWidgetAccent(widget, "#14a89a") }}>
+          <div
+            className="dashboard-kpi-value"
+            style={{ color: getWidgetAccent(widget, "#14a89a"), fontSize: `${valueSize}px` }}
+          >
             {value === null ? "-" : value.toFixed(3)}
           </div>
-          <div className="dashboard-widget-foot">{displayTag}</div>
         </div>
       );
     }
     case "fixed_text":
+      {
+        const fixedSize = computeWidgetTextScale(widget, 12, 30);
       return (
         <div className="dashboard-widget-block">
-          <div className="dashboard-fixed-text">
-            {dataSourceType === "computed" ? (buildFixedText(cfg.text || "", computedItems) || cfg.text || "-") : (cfg.text || "-")}
+          <div className="dashboard-fixed-text" style={{ fontSize: `${fixedSize}px` }}>
+            {effectiveDataSourceType === "computed" ? (buildFixedText(cfg.text || "", computedItemsWithQuery) || cfg.text || "-") : (cfg.text || "-")}
           </div>
         </div>
       );
+      }
     case "divider":
       return (
         <div className="dashboard-divider-block">
@@ -273,9 +1716,204 @@ export function DashboardWidgetCard({
         </div>
       );
     case "table_list": {
-      const rows = dataSourceType === "computed"
-        ? computedItems.slice(0, Math.max(1, Number(cfg.list_limit || 8)))
-        : (tagRowsByGateway?.[String(gatewayId)] || []).slice(0, Math.max(1, Number(cfg.list_limit || 8)));
+      const tableColumns = Array.isArray(cfg.query_table_columns) && cfg.query_table_columns.length
+        ? cfg.query_table_columns
+        : ["ts", "tag", "value"];
+      const tableFilterTags = Array.isArray(cfg.table_filter_tags)
+        ? cfg.table_filter_tags.map((t) => String(t || "").trim()).filter(Boolean)
+        : [];
+      const tableFilterTagSet = new Set(tableFilterTags);
+      const whereConditions = Array.isArray(cfg.query_where_conditions)
+        ? cfg.query_where_conditions.filter((c) => c && c.tag && c.operator && c.enabled !== false)
+        : [];
+      const advancedColumns = Array.isArray(cfg.query_advanced_columns)
+        ? cfg.query_advanced_columns.filter((c) => c && c.id && c.source)
+        : [];
+
+      // All historian rows in scope for this widget (already filtered by gateway/tag
+      // upstream). For advanced mode we use the raw scoped rows (not the filtered
+      // ones), because each column independently picks its tag.
+      const baseRows = Array.isArray(effectiveRows) ? effectiveRows : [];
+
+      // ---- where-condition evaluation ------------------------------------
+      // A bucket of rows (one time bucket) passes if every condition has at
+      // least one matching row inside that bucket.
+      const cmpOp = (val, op, t1, t2) => {
+        const a = Number(val);
+        const v1 = Number(t1);
+        const v2 = Number(t2);
+        if (!Number.isFinite(a)) return false;
+        switch (op) {
+          case "eq": return Number.isFinite(v1) && a === v1;
+          case "ne": return Number.isFinite(v1) && a !== v1;
+          case "lt": return Number.isFinite(v1) && a < v1;
+          case "lte": return Number.isFinite(v1) && a <= v1;
+          case "gt": return Number.isFinite(v1) && a > v1;
+          case "gte": return Number.isFinite(v1) && a >= v1;
+          case "between":
+            if (!Number.isFinite(v1) || !Number.isFinite(v2)) return false;
+            { const lo = Math.min(v1, v2), hi = Math.max(v1, v2); return a >= lo && a <= hi; }
+          default: return false;
+        }
+      };
+
+      // ---- ADVANCED COLUMNS PATH -----------------------------------------
+      if (advancedColumns.length > 0 && effectiveDataSourceType !== "computed") {
+        // Bucket all base rows by time bucket (interval), then pick last N buckets.
+        const bucketInterval = String(cfg.query_group_interval || "none");
+        const buckets = (() => {
+          const map = new Map();
+          for (const r of baseRows) {
+            const ts = toTsMs(r?.ts || r?.ts_utc);
+            if (!Number.isFinite(ts)) continue;
+            const tag = String(r?.tag || r?.tag_name || "").trim();
+            if (tableFilterTagSet.size && !tableFilterTagSet.has(tag)) {
+              // tag filter only restricts the tag column data, NOT the where lookups
+              // — but we keep it broad here so where conditions can reference other tags.
+              // We'll re-filter when reading the per-column tag below.
+            }
+            // Bucket key: ms truncated to the chosen interval (or per-sample if "none").
+            let bucketMs = 0;
+            if (bucketInterval === "none") bucketMs = ts;
+            else {
+              const intervalSeconds = {
+                "1s": 1, "5s": 5, "10s": 10, "30s": 30,
+                "1m": 60, "5m": 300, "15m": 900,
+                "1h": 3600, "1d": 86400,
+              }[bucketInterval];
+              if (!intervalSeconds) bucketMs = ts;
+              else bucketMs = Math.floor(ts / (intervalSeconds * 1000)) * intervalSeconds * 1000;
+            }
+            const arr = map.get(bucketMs);
+            if (arr) arr.push(r);
+            else map.set(bucketMs, [r]);
+          }
+          return Array.from(map.entries()).sort((a, b) => a[0] - b[0]);
+        })();
+
+        // Filter buckets by where conditions.
+        const matchingBuckets = buckets.filter(([_bucketMs, rowsInBucket]) => {
+          if (whereConditions.length === 0) return true;
+          return whereConditions.every((cond) => {
+            const t = String(cond.tag || "").trim();
+            if (!t) return true;
+            // most-recent row of this tag in the bucket
+            const candidates = rowsInBucket.filter((r) => String(r?.tag || r?.tag_name || "").trim() === t);
+            if (!candidates.length) return false;
+            const newest = candidates.reduce((acc, r) => {
+              const ts = toTsMs(r?.ts || r?.ts_utc);
+              return (!acc || ts > toTsMs(acc?.ts || acc?.ts_utc)) ? r : acc;
+            }, null);
+            return cmpOp(newest?.value, cond.operator, cond.value, cond.value2);
+          });
+        });
+
+        // Take the last N buckets (most-recent at the bottom).
+        const rowLimit = Math.max(1, Number(cfg.list_limit || cfg.query_row_limit || 8));
+        const visibleBuckets = matchingBuckets.slice(-rowLimit);
+
+        const numeric = (v) => {
+          const n = Number(v);
+          return Number.isFinite(n) ? n : null;
+        };
+        const aggregate = (rowsForTag, op) => {
+          const vals = rowsForTag.map((r) => numeric(r?.value)).filter((v) => v !== null);
+          if (!vals.length) return null;
+          switch (op) {
+            case "first": return vals[0];
+            case "last": return vals[vals.length - 1];
+            case "avg": return vals.reduce((a, b) => a + b, 0) / vals.length;
+            case "min": return Math.min(...vals);
+            case "max": return Math.max(...vals);
+            case "sum": return vals.reduce((a, b) => a + b, 0);
+            case "count": return vals.length;
+            default: return vals[vals.length - 1];
+          }
+        };
+
+        // Build display rows.
+        const displayRows = visibleBuckets.map(([bucketMs, rowsInBucket]) => {
+          // first pass: tag/ts columns
+          const cellValues = {};
+          for (const col of advancedColumns) {
+            if (col.source === "ts") {
+              const sample = rowsInBucket[rowsInBucket.length - 1];
+              cellValues[col.id] = sample?.ts || new Date(bucketMs).toISOString();
+            } else if (col.source === "tag") {
+              const t = String(col.tag || "").trim();
+              const sorted = rowsInBucket
+                .filter((r) => String(r?.tag || r?.tag_name || "").trim() === t)
+                .sort((a, b) => toTsMs(a?.ts || a?.ts_utc) - toTsMs(b?.ts || b?.ts_utc));
+              cellValues[col.id] = aggregate(sorted, String(col.aggregation || "last"));
+            }
+          }
+          // second pass: calc columns (a, b, c... map to tag columns by order)
+          const tagOrCalcCols = advancedColumns.filter((c) => c.source !== "ts");
+          for (const col of advancedColumns) {
+            if (col.source !== "calc") continue;
+            const env = {};
+            tagOrCalcCols.forEach((c, i) => {
+              if (i >= 26) return;
+              env[String.fromCharCode(97 + i)] = numeric(cellValues[c.id]);
+            });
+            const expr = String(col.expression || "").trim();
+            cellValues[col.id] = expr ? evalSafeExpression(expr, env) : null;
+          }
+          return { bucketMs, cellValues };
+        });
+
+        return (
+          <div className="dashboard-widget-block">
+            {displayRows.length ? (
+              <div className="dashboard-table-mini-wrap">
+                <table className="dashboard-table-mini">
+                  <thead>
+                    <tr>
+                      {advancedColumns.map((col) => (
+                        <th key={col.id}>{col.header || (col.source === "ts" ? "Timestamp" : col.tag || "Column")}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {displayRows.map((row, idx) => (
+                      <tr key={`${row.bucketMs}-${idx}`}>
+                        {advancedColumns.map((col) => {
+                          const cell = row.cellValues[col.id];
+                          if (col.source === "ts") {
+                            return <td key={`${idx}-${col.id}`}>{String(cell || "-")}</td>;
+                          }
+                          const n = Number(cell);
+                          return (
+                            <td key={`${idx}-${col.id}`}>
+                              {Number.isFinite(n) ? n.toFixed(3) : "-"}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : renderEmpty("No rows match the configured conditions")}
+          </div>
+        );
+      }
+
+      // ---- LEGACY PATH (simple columns) ----------------------------------
+      const directRowsRaw = (Array.isArray(directScopedRowsTimeFiltered) ? directScopedRowsTimeFiltered : [])
+        .filter((row) => {
+          if (!tableFilterTagSet.size) return true;
+          const rowTag = String(row?.tag || row?.tag_name || "").trim();
+          return tableFilterTagSet.has(rowTag);
+        })
+        .sort((a, b) => toTsMs(a?.ts || a?.ts_utc) - toTsMs(b?.ts || b?.ts_utc));
+      const directRowsGrouped = bucketRows(directRowsRaw, String(cfg.query_group_interval || "none"));
+      const directRowsSelected = String(cfg.query_row_selection || "all") === "last_n"
+        ? directRowsGrouped.slice(-Math.max(1, Number(cfg.query_row_limit || cfg.list_limit || 8)))
+        : directRowsGrouped;
+      const rows = effectiveDataSourceType === "computed"
+        ? computedItemsWithQuery.slice(0, Math.max(1, Number(cfg.list_limit || 8)))
+        : directRowsSelected.slice(-Math.max(1, Number(cfg.list_limit || 8)));
       return (
         <div className="dashboard-widget-block">
           {rows.length ? (
@@ -283,22 +1921,29 @@ export function DashboardWidgetCard({
               <table className="dashboard-table-mini">
                 <thead>
                   <tr>
-                    <th>{dataSourceType === "computed" ? "Label" : "Tag"}</th>
-                    <th>Value</th>
+                    {effectiveDataSourceType === "computed"
+                      ? (<><th>Label</th><th>Value</th></>)
+                      : tableColumns.map((col) => (
+                          <th key={col}>{col === "ts" ? "Timestamp" : col === "gateway" ? "Gateway" : col === "tag" ? "Tag" : "Value"}</th>
+                        ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {dataSourceType === "computed"
+                  {effectiveDataSourceType === "computed"
                     ? rows.map((r) => (
                         <tr key={`${r.id}`}>
                           <td>{r.label}</td>
                           <td>{Number.isFinite(Number(r.value)) ? Number(r.value).toFixed(3) : "-"}</td>
                         </tr>
                       ))
-                    : rows.map((r) => (
-                        <tr key={`${r.gateway_id}-${r.tag_name}`}>
-                          <td>{formatTagForDisplay ? formatTagForDisplay(r.tag_name) : r.tag_name}</td>
-                          <td>{r.last_value ?? "-"}</td>
+                    : rows.map((r, idx) => (
+                        <tr key={`${r.gateway_id || "gw"}-${r.tag_name || r.tag || "tag"}-${idx}`}>
+                          {tableColumns.map((col) => {
+                            if (col === "ts") return <td key={`${idx}-ts`}>{String(r?.ts || "-")}</td>;
+                            if (col === "gateway") return <td key={`${idx}-gw`}>{String(r?.gateway_name || r?.gateway_id || "-")}</td>;
+                            if (col === "tag") return <td key={`${idx}-tag`}>{formatTagForDisplay ? formatTagForDisplay(r?.tag || r?.tag_name || "-") : String(r?.tag || r?.tag_name || "-")}</td>;
+                            return <td key={`${idx}-value`}>{Number.isFinite(Number(r?.value)) ? Number(r.value).toFixed(3) : "-"}</td>;
+                          })}
                         </tr>
                       ))}
                 </tbody>

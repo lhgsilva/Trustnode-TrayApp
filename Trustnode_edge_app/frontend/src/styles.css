@@ -145,6 +145,14 @@ body {
   grid-template-rows: 28px 64px 1fr;
 }
 
+.shell.with-license-banner {
+  grid-template-rows: 64px auto 1fr;
+}
+
+.shell.with-window-bar.with-license-banner {
+  grid-template-rows: 28px 64px auto 1fr;
+}
+
 .desktop-frameless-shell {
   border-radius: 0;
   border: 0;
@@ -372,6 +380,17 @@ body {
 
 .icon-btn:active {
   transform: translateY(1px);
+}
+
+[data-theme="light"] .app-header .icon-btn {
+  background: #e8edf3;
+  border-color: #c9d3de;
+  color: #1f2a37;
+}
+
+[data-theme="light"] .app-header .icon-btn:hover {
+  background: #dde5ee;
+  border-color: #b8c5d4;
 }
 
 .icon-btn-start {
@@ -889,6 +908,11 @@ body {
   transform: translateY(0);
 }
 
+[data-theme="light"] .gateway-footer {
+  background: #ffffff;
+  border-top-color: var(--stroke);
+}
+
 .gateway-footer.collapsed {
   max-height: 0;
   opacity: 0;
@@ -937,12 +961,21 @@ body {
   padding: 6px 8px;
 }
 
+[data-theme="light"] .gateway-footer-row {
+  background: #ffffff;
+}
+
 .gateway-footer-cell {
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 12px;
+}
+
+.gateway-interval-mismatch {
+  color: var(--warn, #e0a050);
+  font-weight: 700;
 }
 
 .gateway-footer-actions {
@@ -1701,6 +1734,15 @@ body {
   min-height: 0;
 }
 
+/* Reporting cards stay responsive and can be manually resized on desktop. */
+.reporting-left > .card,
+.reporting-right > .card {
+  min-width: 280px;
+  min-height: 220px;
+  resize: both;
+  overflow: auto;
+}
+
 .reporting-filter-grid {
   display: grid;
   grid-template-columns: 1.2fr 1.2fr .8fr 1fr;
@@ -1857,6 +1899,13 @@ body {
   align-items: stretch;
   min-height: 0;
   margin-top: 10px;
+}
+
+@media (max-width: 1280px) {
+  .reporting-left > .card,
+  .reporting-right > .card {
+    resize: none;
+  }
 }
 
 .reporting-chart-wrap {
@@ -2254,6 +2303,11 @@ textarea {
   width: 100%;
 }
 
+select option {
+  background: var(--card);
+  color: var(--text);
+}
+
 textarea {
   resize: vertical;
   min-height: 92px;
@@ -2407,6 +2461,138 @@ input[type="checkbox"] {
   border-radius: 10px;
 }
 
+.license-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--stroke);
+  background: var(--card);
+}
+
+.license-banner-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
+  border-radius: 999px;
+  padding: 0 10px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.license-banner-text {
+  flex: 1 1 340px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.license-banner-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+.license-banner-actions .btn {
+  flex: 0 0 auto;
+  width: auto;
+}
+
+.license-banner-warning {
+  border-bottom-color: rgba(210, 69, 73, 0.5);
+  background: color-mix(in srgb, var(--card) 84%, #7f1d1d 16%);
+}
+
+.license-banner-warning .license-banner-pill {
+  background: #e2555d;
+  color: #ffffff;
+}
+
+.license-banner-ok {
+  border-bottom-color: rgba(20, 168, 154, 0.35);
+}
+
+.license-banner-ok .license-banner-pill {
+  background: #14a89a;
+  color: #ffffff;
+}
+
+.license-guard-backdrop {
+  z-index: 110;
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.license-guard-modal {
+  width: min(560px, 94vw);
+  border-radius: 16px;
+  padding: 18px;
+}
+
+.license-guard-message {
+  margin: 4px 0 12px;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.license-guard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.license-guard-head h3 {
+  margin: 0;
+}
+
+.license-guard-head-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.license-guard-close {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--stroke);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.license-guard-close:hover {
+  background: color-mix(in srgb, var(--card) 75%, var(--brand) 25%);
+}
+
+.license-guard-activate {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--stroke);
+}
+
+.license-guard-actions {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+}
+
+.license-guard-actions .btn {
+  white-space: nowrap;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;
@@ -2425,6 +2611,22 @@ input[type="checkbox"] {
   padding: 16px;
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
+}
+
+.modal-card input,
+.modal-card select,
+.modal-card textarea {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+}
+
+.modal-card input:focus,
+.modal-card select:focus,
+.modal-card textarea:focus {
+  outline: none;
+  border-color: var(--teal);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--teal) 22%, transparent 78%);
 }
 
 .db-modal-card {
@@ -2447,7 +2649,7 @@ input[type="checkbox"] {
   width: min(1180px, 98vw);
   max-height: 96vh;
   overflow: hidden;
-  background: #f3f4f6;
+  background: var(--card);
   padding: 14px;
 }
 
@@ -2463,27 +2665,16 @@ input[type="checkbox"] {
   margin-top: 4px;
   padding: 6px 4px 2px;
   border-radius: 10px;
-  background: transparent;
+  background: var(--card-2);
   height: 280px;
 }
 
 .tag-monitor-modal input,
 .tag-monitor-modal select,
 .tag-monitor-modal textarea {
-  background: #ffffff;
-  color: #111827;
-}
-
-[data-theme="dark"] .tag-monitor-modal {
-  background: #262c36;
-}
-
-[data-theme="dark"] .tag-monitor-modal input,
-[data-theme="dark"] .tag-monitor-modal select,
-[data-theme="dark"] .tag-monitor-modal textarea {
-  background: #303846;
-  color: #e5e7eb;
-  border-color: #4a5568;
+  background: var(--bg);
+  color: var(--text);
+  border-color: var(--stroke);
 }
 
 .modal-card h3 {
@@ -3454,3 +3645,951 @@ textarea {
   padding: var(--space-4);
 }
 
+/* ---------------------------------------------------------------------------
+ * Reporting module — template designer + scheduled reports manager
+ * --------------------------------------------------------------------------- */
+.report-designer {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.report-designer-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+  background: var(--bg-card, #ffffff);
+  border: 1px solid var(--stroke, #e5e7eb);
+  border-radius: 10px;
+  padding: 12px 16px;
+}
+.report-designer-pickrow { display: flex; align-items: flex-end; gap: 10px; }
+.report-designer-pickrow label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-soft, #6b7280); }
+.report-designer-pickrow select { min-width: 240px; }
+.report-designer-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.report-designer-grid {
+  display: grid;
+  grid-template-columns: minmax(420px, 1fr) minmax(420px, 1.2fr);
+  gap: 16px;
+  align-items: flex-start;
+}
+@media (max-width: 1100px) {
+  .report-designer-grid { grid-template-columns: 1fr; }
+}
+.report-designer-config {
+  background: var(--bg-card, #ffffff);
+  border: 1px solid var(--stroke, #e5e7eb);
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.report-designer-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.report-designer-meta label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-soft, #6b7280); }
+.report-sections-list { display: flex; flex-direction: column; gap: 10px; }
+.report-sections-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line, #e5e7eb);
+}
+.report-section-editor {
+  border: 1px solid var(--stroke, #e5e7eb);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--bg, #f9fafb);
+}
+.report-section-editor-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.report-section-type-pill {
+  background: rgba(20, 168, 154, 0.16);
+  color: #065f46;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.report-section-editor-tools { display: flex; gap: 4px; }
+.report-section-form { display: flex; flex-direction: column; gap: 8px; }
+.report-section-form label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--ink-soft, #6b7280); }
+.report-section-form label input,
+.report-section-form label select,
+.report-section-form label textarea { font-size: 13px; }
+.report-section-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+.report-section-caption { font-size: 12px; color: var(--ink-soft, #6b7280); margin: 0; }
+.report-kpi-list { display: flex; flex-direction: column; gap: 6px; }
+.report-kpi-item {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr 0.8fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.report-rules-list { display: flex; flex-direction: column; gap: 6px; }
+.report-rule-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 0.7fr 0.7fr 0.7fr 0.8fr 36px auto;
+  gap: 6px;
+  align-items: center;
+}
+.report-sections-empty {
+  text-align: center;
+  color: var(--ink-soft, #6b7280);
+  padding: 24px 0;
+  margin: 0;
+}
+.report-designer-preview {
+  background: var(--bg-card, #ffffff);
+  border: 1px solid var(--stroke, #e5e7eb);
+  border-radius: 10px;
+  padding: 12px 14px;
+  min-height: 520px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.report-designer-preview-head { display: flex; justify-content: space-between; align-items: center; }
+.report-preview-frame {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 520px;
+  border: 1px solid var(--stroke, #e5e7eb);
+  border-radius: 6px;
+  background: #f3f4f6;
+}
+.report-preview-empty {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: var(--ink-soft, #6b7280);
+  padding: 40px 16px;
+  border: 1px dashed var(--stroke, #cbd5e1);
+  border-radius: 6px;
+}
+.report-preview-error {
+  color: #b91c1c;
+  font-size: 12px;
+  margin: 0;
+}
+
+/* Scheduled reports manager — uses the app theme tokens for both modes */
+.scheduled-reports-page {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.scheduled-reports-card,
+.generated-reports-card {
+  width: 100%;
+}
+.scheduled-reports-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 320px) 1fr;
+  gap: 14px;
+  align-items: stretch;
+}
+@media (max-width: 1100px) {
+  .scheduled-reports-grid { grid-template-columns: 1fr; }
+}
+.scheduled-reports-list {
+  background: var(--card_2, var(--bg));
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 12px;
+  color: var(--text);
+}
+.scheduled-reports-list-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.schedule-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.schedule-list-row { padding: 0; }
+.schedule-list-btn {
+  width: 100%;
+  text-align: left;
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  color: var(--text);
+}
+.schedule-list-row.active .schedule-list-btn,
+.schedule-list-btn:hover {
+  background: var(--card);
+  border-color: var(--teal);
+  box-shadow: 0 0 0 2px rgba(20, 168, 154, 0.18);
+}
+.schedule-list-name { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; }
+.schedule-list-meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.schedule-dot { display: inline-block; width: 8px; height: 8px; border-radius: 999px; background: #cbd5e1; }
+.schedule-dot.on { background: var(--ok); }
+.schedule-dot.off { background: #f59e0b; }
+.scheduled-reports-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 14px;
+  color: var(--text);
+}
+.scheduled-reports-editor-title {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.schedule-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  align-items: flex-end;
+}
+.schedule-form-grid label,
+.schedule-fieldset label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.schedule-fieldset {
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--card_2, var(--bg));
+}
+.schedule-fieldset legend {
+  padding: 0 6px;
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+/* Attachment-row inside the schedule editor / generated-report email modal */
+.schedule-attachments-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 6px 0;
+}
+.schedule-attachments-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.schedule-email-dialog {
+  width: min(520px, 92vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.schedule-email-dialog h3 {
+  margin: 0;
+  color: var(--text);
+}
+.schedule-email-dialog label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.schedule-email-dialog input {
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.schedule-email-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.gateway-live-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border-radius: 999px;
+  border: 1px solid var(--stroke);
+  background: var(--card_2, var(--bg));
+  color: var(--muted);
+}
+.gateway-live-badge.is-running {
+  background: rgba(20, 168, 154, 0.18);
+  color: var(--brand-strong, #0e8479);
+  border-color: rgba(20, 168, 154, 0.36);
+}
+.gateway-live-badge.is-stopped {
+  background: rgba(220, 38, 38, 0.10);
+  color: #b91c1c;
+  border-color: rgba(220, 38, 38, 0.32);
+}
+[data-theme="dark"] .gateway-live-badge.is-stopped {
+  color: #fca5a5;
+}
+
+.tag-condition-list { display: flex; flex-direction: column; gap: 6px; }
+.tag-condition-row {
+  display: grid;
+  grid-template-columns: 32px minmax(120px, 1fr) minmax(120px, 1fr) 0.7fr 0.8fr 36px;
+  gap: 6px;
+  align-items: center;
+}
+@media (max-width: 800px) {
+  .tag-condition-row { grid-template-columns: 1fr 1fr; }
+}
+.scheduled-reports-actions { display: flex; gap: 8px; flex-wrap: wrap; padding-top: 4px; }
+.checkbox-row { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+.muted { color: var(--muted); font-size: 12px; }
+.muted.warning { color: #b45309; }
+
+/* Generated reports — own card, logo top-right, icon-only action column */
+.generated-reports-filter {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.generated-reports-filter select {
+  min-width: 180px;
+}
+.generated-reports-logo {
+  height: 36px;
+  width: auto;
+  max-width: 130px;
+  object-fit: contain;
+  /* Keep brand mark crisp in both themes; subtle drop-shadow on dark for separation */
+  filter: drop-shadow(0 0 0 transparent);
+}
+[data-theme="dark"] .generated-reports-logo {
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.6));
+}
+.generated-reports-tablewrap {
+  overflow-x: auto;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--card);
+}
+.generated-reports-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  color: var(--text);
+}
+.generated-reports-table th,
+.generated-reports-table td {
+  text-align: left;
+  border-bottom: 1px solid var(--stroke);
+  padding: 10px 12px;
+  vertical-align: middle;
+}
+.generated-reports-table th {
+  background: var(--card_2, var(--bg));
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  border-bottom-color: var(--stroke);
+}
+.generated-reports-table tr:last-child td {
+  border-bottom: none;
+}
+.generated-reports-table tr:hover td {
+  background: var(--card_2, var(--bg));
+}
+.generated-reports-action-col {
+  width: 168px;
+  white-space: nowrap;
+}
+.generated-reports-actions-row {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+.icon-btn {
+  background: transparent;
+  border: 1px solid var(--stroke);
+  padding: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.icon-btn:hover {
+  background: var(--card_2, var(--bg));
+  border-color: var(--teal);
+  color: var(--brand-strong);
+}
+.icon-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.icon-btn-danger { color: var(--danger); }
+.icon-btn-danger:hover {
+  background: var(--error-bg);
+  color: var(--error-text);
+  border-color: var(--error-border);
+}
+.legacy-reporting-fallback,
+.legacy-scheduled-reports-fallback {
+  margin-top: 18px;
+  border-top: 1px solid var(--line, #e5e7eb);
+  padding-top: 10px;
+}
+.legacy-reporting-fallback summary,
+.legacy-scheduled-reports-fallback summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--ink-soft, #6b7280);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ---------------------------------------------------------------------------
+ * NEW Reporting designer (tn-* prefix) — uses app theme tokens for light/dark
+ * --------------------------------------------------------------------------- */
+.tn-report-designer {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.tn-collapsible-card {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  overflow: hidden;
+  transition: box-shadow 120ms ease;
+}
+.tn-collapsible-card:hover {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+[data-theme="dark"] .tn-collapsible-card:hover {
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+.tn-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  /* Use the secondary card surface so the head is a subtle inset against the
+     card body — works in both light (#f6f8fa) and dark (#1f1f1f) modes. */
+  background: var(--card_2, var(--bg));
+  border-bottom: 1px solid var(--stroke);
+}
+.tn-collapsible-card.is-collapsed .tn-card-head {
+  border-bottom-color: transparent;
+}
+.tn-card-head-toggle {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  padding: 4px 0;
+  color: var(--text);
+}
+.tn-card-head-toggle:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.tn-caret {
+  color: var(--teal);
+  font-size: 12px;
+  transition: transform 120ms ease;
+}
+.tn-caret.right { transform: rotate(-90deg); }
+.tn-card-head-text { display: flex; flex-direction: column; gap: 2px; }
+.tn-card-title { font-weight: 600; font-size: 14px; color: var(--text); }
+.tn-card-subtitle { font-size: 11px; color: var(--muted); }
+.tn-card-head-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.tn-card-body { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+
+.tn-report-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.tn-report-meta-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) minmax(220px, 2fr);
+  gap: 12px;
+}
+@media (max-width: 900px) {
+  .tn-report-meta-row { grid-template-columns: 1fr; }
+}
+.tn-report-meta-row label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.tn-report-meta-row input,
+.tn-report-meta-row select { font-size: 13px; }
+
+.tn-section-editor {
+  background: var(--card_2, var(--bg));
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  /* Tightened vertical padding so sections take less space and the user can
+     scan more of them at once on the left pane. */
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* Critical for the split-pane layout: without min-width:0 a child with a
+     long select option or label can blow out the grid track and push content
+     into the right pane, causing the visual overlap. */
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
+}
+.tn-section-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 2px;
+}
+.tn-section-pill {
+  background: rgba(20, 168, 154, 0.16);
+  color: var(--brand-strong);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+.tn-section-editor-tools { display: flex; gap: 4px; }
+.tn-section-form { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.tn-section-caption { font-size: 12px; color: var(--muted); margin: 0; }
+
+.tn-section-form label,
+.tn-fieldset label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  /* Allow truncation inside grids so a long select doesn't blow the track. */
+  min-width: 0;
+}
+.tn-section-form input,
+.tn-section-form select,
+.tn-section-form textarea,
+.tn-fieldset input,
+.tn-fieldset select {
+  font-size: 13px;
+  color: var(--text);
+  /* Light mode = bright white card, dark mode = slate. The token already
+     switches per theme via the global :root / [data-theme=dark] rules. */
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  padding: 5px 8px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.tn-section-form textarea,
+.tn-fieldset textarea {
+  resize: vertical;
+  min-height: 60px;
+}
+.tn-section-form input:focus,
+.tn-section-form select:focus,
+.tn-section-form textarea:focus,
+.tn-fieldset input:focus,
+.tn-fieldset select:focus {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+.tn-section-form input[type="color"] {
+  height: 30px;
+  padding: 2px;
+  cursor: pointer;
+  width: 36px;
+  min-width: 36px;
+}
+
+.tn-row { display: grid; gap: 6px 10px; min-width: 0; }
+.tn-row-2 { grid-template-columns: 1fr 1fr; }
+.tn-row-3 { grid-template-columns: 1fr 1fr 1fr; }
+.tn-row-4 { grid-template-columns: repeat(4, 1fr); }
+.tn-row-tight { gap: 4px 6px; flex-wrap: wrap; }
+@media (max-width: 700px) {
+  .tn-row-2, .tn-row-3, .tn-row-4 { grid-template-columns: 1fr; }
+}
+
+/* The KPI/series/rule/limit/column rows inside section editors must also
+   honour min-width so a long tag name doesn't widen the row past the card. */
+.tn-kpi-row,
+.tn-series-row,
+.tn-rule-row,
+.tn-limit-row,
+.tn-column-row {
+  min-width: 0;
+}
+.tn-kpi-row > *,
+.tn-series-row > *,
+.tn-rule-row > *,
+.tn-limit-row > *,
+.tn-column-row > * {
+  min-width: 0;
+}
+
+.tn-checkbox,
+.tn-checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text);
+}
+.tn-fieldset {
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 0;
+  background: var(--card);
+}
+.tn-fieldset legend {
+  padding: 0 6px;
+  font-weight: 700;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tn-kpi-list, .tn-rules-list { display: flex; flex-direction: column; gap: 6px; }
+.tn-kpi-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr 0.8fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.tn-rule-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 0.6fr 0.6fr 0.6fr 0.7fr 36px auto;
+  gap: 6px;
+  align-items: center;
+}
+.tn-series-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr 0.7fr 0.9fr 36px 0.7fr 0.6fr 0.6fr auto;
+  gap: 6px;
+  align-items: center;
+}
+@media (max-width: 1100px) {
+  .tn-series-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.tn-limit-row {
+  display: grid;
+  grid-template-columns: 1fr 0.7fr 0.7fr 36px 0.6fr auto;
+  gap: 6px;
+  align-items: center;
+}
+.tn-column-row {
+  display: grid;
+  grid-template-columns: 0.9fr 1fr 1fr 1fr 0.8fr 0.6fr 30px 30px 30px;
+  gap: 6px;
+  align-items: center;
+}
+@media (max-width: 1100px) {
+  .tn-column-row, .tn-rule-row, .tn-limit-row { grid-template-columns: 1fr 1fr; }
+}
+
+.tn-chart-preview { display: flex; flex-direction: column; gap: 8px; }
+.tn-chart-preview-canvas {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+.tn-pdf-preview-frame {
+  width: 100%;
+  min-height: 580px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.tn-pdf-preview-fallback {
+  padding: 14px;
+  text-align: center;
+}
+
+/* Split-pane layout for the Reporting page (left builder / right PDF preview).
+   `--tn-split-left` is driven by the React drag handler so we don't fight
+   re-renders during the mouse move. The divider is keyboard-focusable. */
+.tn-report-designer-split {
+  height: calc(100vh - 220px);
+  min-height: 520px;
+}
+.tn-split-pane {
+  display: grid;
+  grid-template-columns: var(--tn-split-left, 40%) 8px 1fr;
+  height: 100%;
+  width: 100%;
+  align-items: stretch;
+}
+.tn-split-side {
+  min-width: 0;
+  /* Vertical scroll only; horizontal stays clipped to keep wide selects
+     from spilling into the divider/right pane. */
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-right: 6px;
+  box-sizing: border-box;
+}
+.tn-split-right {
+  padding-right: 0;
+  padding-left: 6px;
+}
+.tn-split-side .tn-collapsible-card {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+.tn-split-side .tn-card-body {
+  min-width: 0;
+}
+.tn-split-divider {
+  background: var(--stroke);
+  cursor: col-resize;
+  position: relative;
+  border-radius: 4px;
+  transition: background 100ms ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.tn-split-divider:hover,
+.tn-split-divider:focus-visible {
+  background: var(--teal);
+  outline: none;
+}
+.tn-split-divider-grip {
+  color: var(--card);
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1;
+  pointer-events: none;
+  opacity: 0.85;
+}
+[data-theme="dark"] .tn-split-divider-grip { color: var(--text); }
+.tn-split-right .tn-collapsible-card,
+.tn-split-right .tn-pdf-preview-frame {
+  height: 100%;
+}
+.tn-split-right .tn-collapsible-card { display: flex; flex-direction: column; }
+.tn-split-right .tn-collapsible-card .tn-card-body {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+}
+.tn-split-right .tn-pdf-preview-frame {
+  flex: 1 1 auto;
+  min-height: 320px;
+}
+@media (max-width: 880px) {
+  /* On narrow screens collapse to a vertical stack so the preview still
+     follows the builder without overlapping it. */
+  .tn-report-designer-split { height: auto; }
+  .tn-split-pane {
+    display: flex;
+    flex-direction: column;
+    height: auto;
+  }
+  .tn-split-divider { display: none; }
+  .tn-split-side { padding: 0; overflow: visible; }
+}
+
+.tn-data-card { display: flex; flex-direction: column; gap: 10px; }
+.tn-data-card-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.tn-data-card-tools { display: flex; gap: 6px; }
+.tn-data-card-tablewrap {
+  overflow-x: auto;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+}
+.tn-data-card-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.tn-data-card-table th,
+.tn-data-card-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--stroke);
+  color: var(--text);
+}
+.tn-data-card-table thead th {
+  background: var(--bg);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  position: sticky;
+  top: 0;
+}
+
+.muted { color: var(--muted); font-size: 12px; margin: 0; }
+.muted.small { font-size: 11px; }
+.error-text { color: var(--error-text); font-size: 12px; }
+.icon-btn { background: transparent; border: 1px solid transparent; padding: 4px 8px; border-radius: 4px; cursor: pointer; color: var(--text); }
+.icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.icon-btn-danger { color: var(--danger); }
+.icon-btn-danger:hover { background: var(--error-bg); }
+.btn-link { background: transparent; border: none; padding: 4px 6px; color: var(--brand-strong); cursor: pointer; font-weight: 600; }
+.btn-link:hover { text-decoration: underline; }
+
+[data-theme="dark"] .tn-section-pill {
+  background: rgba(60, 210, 194, 0.18);
+  color: #67e8f9;
+}
+[data-theme="dark"] .tn-card-head { background: var(--card_2, #1f1f1f); }
+
+/* ---------------------------------------------------------------------------
+ * Reporting + Scheduled Reports — unified form field appearance
+ * Both pages must use the *card* surface for fields (matches the surrounding
+ * card colour in BOTH light and dark themes) and a single canonical height
+ * so editors line up visually across the page.
+ *
+ * The selectors target the two page roots so we don't disturb form fields on
+ * other pages (Login, Email Config, etc.) that intentionally use --bg.
+ * --------------------------------------------------------------------------- */
+.tn-report-designer input,
+.tn-report-designer select,
+.tn-report-designer textarea,
+.scheduled-reports-page input,
+.scheduled-reports-page select,
+.scheduled-reports-page textarea {
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  font-size: 13px;
+  /* Standard control height: 32px (2 * 6px padding + 1px border + ~18px text). */
+  padding: 6px 10px;
+  height: 32px;
+  line-height: 1.25;
+  box-shadow: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.tn-report-designer input[type="color"],
+.scheduled-reports-page input[type="color"] {
+  /* color picker needs a touch more padding to render the swatch nicely */
+  padding: 2px;
+  width: 36px;
+  min-width: 36px;
+  height: 32px;
+  cursor: pointer;
+}
+.tn-report-designer input[type="checkbox"],
+.scheduled-reports-page input[type="checkbox"] {
+  width: 16px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0;
+}
+.tn-report-designer textarea,
+.scheduled-reports-page textarea {
+  height: auto;
+  min-height: 84px;
+  resize: vertical;
+}
+.tn-report-designer input:focus,
+.tn-report-designer select:focus,
+.tn-report-designer textarea:focus,
+.scheduled-reports-page input:focus,
+.scheduled-reports-page select:focus,
+.scheduled-reports-page textarea:focus {
+  outline: none;
+  border-color: var(--teal);
+  box-shadow: 0 0 0 3px rgba(20, 168, 154, 0.18);
+}
+.tn-report-designer select option,
+.scheduled-reports-page select option {
+  background: var(--card);
+  color: var(--text);
+}
+.tn-report-designer input::placeholder,
+.tn-report-designer textarea::placeholder,
+.scheduled-reports-page input::placeholder,
+.scheduled-reports-page textarea::placeholder {
+  color: var(--muted);
+  opacity: 0.7;
+}
+/* Buttons in these pages also share the same height so they line up with inputs */
+.tn-report-designer .btn,
+.scheduled-reports-page .btn {
+  height: 32px;
+  padding: 0 14px;
+  line-height: 30px;
+  border-radius: 8px;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.tn-report-designer .btn-link,
+.scheduled-reports-page .btn-link {
+  height: auto;
+  padding: 0;
+  line-height: 1.3;
+}
+.tn-report-designer .icon-btn,
+.scheduled-reports-page .icon-btn {
+  height: 32px;
+  width: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}

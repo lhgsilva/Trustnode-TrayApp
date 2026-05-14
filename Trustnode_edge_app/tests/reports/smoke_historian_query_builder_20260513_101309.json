@@ -1,0 +1,74 @@
+{
+  "started_utc": "2026-05-13T10:13:09.610494+00:00",
+  "db_path": "C:\\Users\\User\\.trustnode_edge\\data\\trustnode_app_store.db",
+  "checks": [
+    {
+      "name": "time_filters",
+      "ok": true,
+      "details": {
+        "counts": {
+          "5m": 0,
+          "15m": 0,
+          "1h": 0,
+          "6h": 11,
+          "24h": 11537
+        },
+        "monotonic_non_decreasing": true,
+        "has_data_last_1h": false,
+        "has_data_last_24h": true
+      }
+    },
+    {
+      "name": "grouping",
+      "ok": true,
+      "details": {
+        "raw_last_1h": 0,
+        "group_1s_last_1h": 0,
+        "group_5s_last_1h": 0,
+        "group_1m_last_1h": 0
+      }
+    },
+    {
+      "name": "row_selection",
+      "ok": true,
+      "details": {
+        "all_rows_last_1h": 0,
+        "last_50_sql": 0,
+        "tail_match": true,
+        "last_row_id_all": null,
+        "last_row_id_last_50": null
+      }
+    },
+    {
+      "name": "conditions",
+      "ok": true,
+      "details": {
+        "rows": 11537,
+        "min": 112.0,
+        "max": 159.0399932861328,
+        "median": 134.39999389648438,
+        "low_threshold": 127.52319778442383,
+        "high_threshold": 143.04639556884766,
+        "counts": {
+          "gt": 5723,
+          "gte": 6137,
+          "lt": 5400,
+          "lte": 5814,
+          "between": 3872,
+          "eq": 414,
+          "ne": 11123
+        }
+      }
+    }
+  ],
+  "ok": true,
+  "seed": {
+    "gateway_id": "gw-1778540283647",
+    "tag_name": "SimREAL[2]",
+    "rows": 11,
+    "min_ts": "2026-05-13 09:09:41.692",
+    "max_ts": "2026-05-13 09:09:58.443",
+    "generated_utc": "2026-05-13 10:13:09"
+  },
+  "finished_utc": "2026-05-13T10:13:10.478406+00:00"
+}

@@ -11,4 +11,5 @@ pycomm3==1.2.14
 pylogix==1.0.3
 python-snap7==2.0.2
 pymodbus==3.6.9
+reportlab==4.2.5
 pytest==8.4.2

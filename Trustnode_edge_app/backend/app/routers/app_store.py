@@ -9,6 +9,55 @@ from app.tenant import get_current_tenant
 router = APIRouter(prefix="/api/app-store", tags=["app-store"])
 
 
+def _normalize_host_header(request: Request) -> str:
+    raw = str(request.headers.get("host") or "").strip().lower()
+    if not raw:
+        return ""
+    # IPv6 bracketed: [::1]:8000
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end > 0:
+            return raw[1:end]
+    # host:port
+    if ":" in raw:
+        left, right = raw.rsplit(":", 1)
+        if right.isdigit():
+            return left
+    return raw
+
+
+def _resolve_prefer_cloud_reads(request: Request, prefer_cloud: str = "") -> bool:
+    forced = str(prefer_cloud or "").strip().lower()
+    if forced in {"1", "true", "yes", "on"}:
+        return True
+    if forced in {"0", "false", "no", "off"}:
+        return False
+    host = _normalize_host_header(request)
+    return bool(host and host not in {"localhost", "127.0.0.1", "::1"})
+
+
+def _build_scope_key(request: Request, bootstrap_hint: Dict[str, Any] | None = None) -> str:
+    payload = getattr(request.state, "user_payload", {}) or {}
+    username = str(payload.get("sub") or "").strip().lower()
+    tenant_id = str(payload.get("tenant_id") or get_current_tenant() or "default").strip().lower()
+    bootstrap = bootstrap_hint if isinstance(bootstrap_hint, dict) else {}
+    if not bootstrap:
+        try:
+            bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        except Exception:
+            bootstrap = {}
+    app_settings = bootstrap.get("app_settings") if isinstance(bootstrap.get("app_settings"), dict) else {}
+    edge_profile = app_settings.get("edge_profile") if isinstance(app_settings.get("edge_profile"), dict) else {}
+    edge_id = str(edge_profile.get("edge_id") or "").strip().lower()
+    customer_id = (
+        str(edge_profile.get("linked_customer_id") or "").strip().lower()
+        or str(bootstrap.get("customer_id") or "").strip().lower()
+    )
+    if not username or not edge_id:
+        return ""
+    return f"{tenant_id}|{customer_id or '-'}|{edge_id}|{username}"
+
+
 class DomainSaveRequest(BaseModel):
     domain: str
     payload: Any
@@ -22,6 +71,15 @@ class BootstrapSaveRequest(BaseModel):
 
 class AppendRowsRequest(BaseModel):
     rows: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class HistorianRuleStatsRequest(BaseModel):
+    rules: list[dict[str, Any]] = Field(default_factory=list)
+    from_utc: str = ""
+    to_utc: str = ""
+    gateway: str = ""
+    edge_id: str = ""
+    prefer_cloud: str = ""
 
 
 class RetentionPolicyPayload(BaseModel):
@@ -89,23 +147,36 @@ def get_bootstrap(request: Request) -> dict:
     # Bootstrap configuration must be served from local app-store authority
     # to keep cloud client UI consistent and avoid stale/slow cloud-read drift.
     prefer_cloud_reads = False
+    scope_key = _build_scope_key(request)
+    data = app_store.get_bootstrap_scoped(scope_key, prefer_cloud_reads=prefer_cloud_reads) if scope_key else app_store.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
-        "data": app_store.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads),
+        "scope_key": scope_key,
+        "data": data,
     }
 
 
 @router.put("/bootstrap")
-def save_bootstrap(payload: BootstrapSaveRequest) -> dict:
-    versions = app_store.save_bootstrap(payload.data, actor=payload.actor)
-    return {"ok": True, "tenant_id": get_current_tenant(), "versions": versions}
+def save_bootstrap(payload: BootstrapSaveRequest, request: Request) -> dict:
+    scope_key = _build_scope_key(request, payload.data if isinstance(payload.data, dict) else None)
+    versions = (
+        app_store.save_bootstrap_scoped(scope_key, payload.data, actor=payload.actor)
+        if scope_key
+        else app_store.save_bootstrap(payload.data, actor=payload.actor)
+    )
+    return {"ok": True, "tenant_id": get_current_tenant(), "scope_key": scope_key, "versions": versions}
 
 
 @router.put("/domain")
-def save_domain(payload: DomainSaveRequest) -> dict:
-    result = app_store.upsert_domain(payload.domain, payload.payload, actor=payload.actor)
-    return {"ok": True, "tenant_id": get_current_tenant(), "result": result}
+def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
+    scope_key = _build_scope_key(request)
+    result = (
+        app_store.upsert_domain_scoped(scope_key, payload.domain, payload.payload, actor=payload.actor)
+        if scope_key
+        else app_store.upsert_domain(payload.domain, payload.payload, actor=payload.actor)
+    )
+    return {"ok": True, "tenant_id": get_current_tenant(), "scope_key": scope_key, "result": result}
 
 
 @router.post("/append/historian")
@@ -128,9 +199,9 @@ def get_historian(
     device: str = "",
     tag: str = "",
     edge_id: str = "",
+    prefer_cloud: str = "",
 ) -> dict:
-    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
-    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    prefer_cloud_reads = _resolve_prefer_cloud_reads(request, prefer_cloud=prefer_cloud)
     # Protect cloud API from expensive oversized scans under high fan-out clients.
     safe_limit = max(50, min(int(limit or 1000), 1000 if prefer_cloud_reads else 5000))
     return {
@@ -158,9 +229,9 @@ def get_historian_range(
     device: str = "",
     tag: str = "",
     edge_id: str = "",
+    prefer_cloud: str = "",
 ) -> dict:
-    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
-    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    prefer_cloud_reads = _resolve_prefer_cloud_reads(request, prefer_cloud=prefer_cloud)
     safe_limit = max(50, min(int(limit or 5000), 10000 if prefer_cloud_reads else 50000))
     safe_offset = max(0, int(offset or 0))
     return {
@@ -180,10 +251,56 @@ def get_historian_range(
     }
 
 
+@router.get("/historian/stats")
+def get_historian_stats(
+    request: Request,
+    from_utc: str = "",
+    to_utc: str = "",
+    gateway: str = "",
+    device: str = "",
+    tag: str = "",
+    edge_id: str = "",
+    prefer_cloud: str = "",
+) -> dict:
+    prefer_cloud_reads = _resolve_prefer_cloud_reads(request, prefer_cloud=prefer_cloud)
+    return {
+        "ok": True,
+        "tenant_id": get_current_tenant(),
+        "rows": app_store.get_historian_stats(
+            from_utc=from_utc,
+            to_utc=to_utc,
+            gateway=gateway,
+            device=device,
+            tag=tag,
+            edge_id=edge_id,
+            prefer_cloud_reads=prefer_cloud_reads,
+        ),
+    }
+
+
+@router.post("/historian/rule-stats")
+def get_historian_rule_stats(
+    payload: HistorianRuleStatsRequest,
+    request: Request,
+) -> dict:
+    prefer_cloud_reads = _resolve_prefer_cloud_reads(request, prefer_cloud=payload.prefer_cloud)
+    return {
+        "ok": True,
+        "tenant_id": get_current_tenant(),
+        "rows": app_store.get_historian_rule_stats(
+            rules=payload.rules,
+            from_utc=payload.from_utc,
+            to_utc=payload.to_utc,
+            gateway=payload.gateway,
+            edge_id=payload.edge_id,
+            prefer_cloud_reads=prefer_cloud_reads,
+        ),
+    }
+
+
 @router.get("/live")
 def get_live(request: Request, limit: int = 5000, edge_id: str = "") -> dict:
-    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
-    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    prefer_cloud_reads = _resolve_prefer_cloud_reads(request)
     safe_limit = max(50, min(int(limit or 5000), 800 if prefer_cloud_reads else 5000))
     return {
         "ok": True,
@@ -194,8 +311,7 @@ def get_live(request: Request, limit: int = 5000, edge_id: str = "") -> dict:
 
 @router.get("/logs")
 def get_logs(request: Request, limit: int = 2000, edge_id: str = "") -> dict:
-    host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
-    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    prefer_cloud_reads = _resolve_prefer_cloud_reads(request)
     safe_limit = max(50, min(int(limit or 2000), 1000 if prefer_cloud_reads else 5000))
     return {
         "ok": True,

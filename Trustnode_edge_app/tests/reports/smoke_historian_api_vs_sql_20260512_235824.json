@@ -1,0 +1,114 @@
+{
+  "started_utc": "2026-05-12T23:58:24.936432+00:00",
+  "db_path": "C:\\Users\\User\\.trustnode_edge\\data\\trustnode_app_store.db",
+  "api_base": "http://127.0.0.1:8001",
+  "checks": [
+    {
+      "name": "api_vs_sql_time_filters",
+      "ok": true,
+      "details": {
+        "5m": {
+          "from_utc": "2026-05-12 23:53:25",
+          "to_utc": "2026-05-12 23:58:25",
+          "api_count": 0,
+          "sql_count": 0,
+          "same_count": true,
+          "same_first_row": true,
+          "same_last_row": true
+        },
+        "15m": {
+          "from_utc": "2026-05-12 23:43:25",
+          "to_utc": "2026-05-12 23:58:25",
+          "api_count": 149,
+          "sql_count": 149,
+          "same_count": true,
+          "same_first_row": true,
+          "same_last_row": true
+        },
+        "1h": {
+          "from_utc": "2026-05-12 22:58:25",
+          "to_utc": "2026-05-12 23:58:25",
+          "api_count": 2834,
+          "sql_count": 2834,
+          "same_count": true,
+          "same_first_row": true,
+          "same_last_row": true
+        },
+        "6h": {
+          "from_utc": "2026-05-12 17:58:25",
+          "to_utc": "2026-05-12 23:58:25",
+          "api_count": 7151,
+          "sql_count": 7151,
+          "same_count": true,
+          "same_first_row": true,
+          "same_last_row": true
+        }
+      }
+    },
+    {
+      "name": "api_limit_offset",
+      "ok": true,
+      "details": {
+        "full_count": 7151,
+        "page0_count": 50,
+        "page1_count": 50,
+        "page0_matches_full_slice": true,
+        "page1_matches_full_slice": true
+      }
+    },
+    {
+      "name": "api_vs_sql_grouping_conditions",
+      "ok": true,
+      "details": {
+        "rows": {
+          "api": 2834,
+          "sql": 2834
+        },
+        "buckets": {
+          "api": {
+            "1s": 2823,
+            "5s": 570,
+            "1m": 48
+          },
+          "sql": {
+            "1s": 2823,
+            "5s": 570,
+            "1m": 48
+          }
+        },
+        "pivot": 134.39999389648438,
+        "conditions": {
+          "api": {
+            "gt": 1413,
+            "gte": 1514,
+            "lt": 1320,
+            "lte": 1421,
+            "eq": 101,
+            "ne": 2733
+          },
+          "sql": {
+            "gt": 1413,
+            "gte": 1514,
+            "lt": 1320,
+            "lte": 1421,
+            "eq": 101,
+            "ne": 2733
+          }
+        }
+      }
+    }
+  ],
+  "ok": true,
+  "seed": {
+    "gateway_id": "gw-1778540283647",
+    "tag_name": "SimREAL[2]",
+    "rows": 2835,
+    "min_ts": "2026-05-12 22:58:24.569",
+    "max_ts": "2026-05-12 23:45:53.868"
+  },
+  "auth": {
+    "user": "admin",
+    "token_len": 805
+  },
+  "finished_utc": "2026-05-12T23:58:26.214717+00:00"
+}
