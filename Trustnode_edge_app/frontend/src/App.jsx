@@ -104,7 +104,7 @@ import {
   provisionControlPlaneCustomerBundle,
   pushSchedulerEmailSettings,
 } from "./api";
-import { Area, AreaChart, Bar, BarChart, ComposedChart, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { Area, AreaChart, Bar, BarChart, CartesianGrid, ComposedChart, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 function getUiStorageScope() {
   try {
@@ -8660,6 +8660,109 @@ const getGatewayHealth = (gateway) => {
   );
   const tagMonitorXDomain = useMemo(() => [1, Math.max(20, Number(tagMonitorSelection?.readings_count || 120)) + 1], [tagMonitorSelection]);
 
+  // Multi-series support for the Tag Monitor. When a chart widget was opened
+  // with >1 series (primary + extras), we build a merged index-keyed dataset
+  // shaped like [{ idx, ts, v_s0, v_s1, ... }] so a single ComposedChart can
+  // render every series — same styling as the dashboard chart widget.
+  //
+  // Axis resolution: each series carries an axis hint ('left' | 'right') that
+  // we honour, but we also auto-assign sensible defaults — if every series
+  // shares the same unit, force everything to the left axis; if units differ,
+  // use the first declared 'right' (or the second distinct unit) as the
+  // secondary axis.
+  const tagMonitorResolvedSeries = useMemo(() => {
+    const raw = Array.isArray(tagMonitorSelection?.series) && tagMonitorSelection.series.length
+      ? tagMonitorSelection.series
+      : (tagMonitorSelection ? [{
+          id: "s0",
+          tag_name: tagMonitorSelection.tag_name,
+          gateway_id: tagMonitorSelection.gateway_id,
+          gateway_name: tagMonitorSelection.gateway_name,
+          device_name: tagMonitorSelection.device_name,
+          label: tagMonitorSelection.tag_name,
+          color: "",
+          axis: "left",
+          unit: "",
+          suffix: "",
+          chart_interpolation: tagMonitorSelection.chart_interpolation || "stepAfter",
+        }] : []);
+    // Auto axis: keep declared sides if multiple units exist, else collapse.
+    const units = new Set(raw.map((s) => String(s.unit || "").trim()));
+    const collapse = units.size <= 1;
+    return raw.map((s, idx) => ({
+      ...s,
+      axis: collapse ? "left" : (s.axis === "right" ? "right" : "left"),
+      color: s.color || getDashboardTagColor(s.gateway_id || "", s.tag_name || "", idx === 0 ? "#16a34a" : ""),
+    }));
+  }, [tagMonitorSelection, getDashboardTagColor]);
+
+  const tagMonitorMultiSeries = useMemo(() => {
+    const seriesDefs = tagMonitorResolvedSeries;
+    if (!seriesDefs.length) return [];
+    // Build a per-series chronological list (same logic as the single-series
+    // memo above), then merge by index. Index 1..N keeps the X-axis stable
+    // even when series have different sample counts.
+    const perSeries = seriesDefs.map((s) =>
+      buildChronologicalSeries(
+        dataLogView.filter(
+          (r) =>
+            String(r.tag || r.tag_name || "") === String(s.tag_name || "") &&
+            (!r.gateway_id || String(r.gateway_id) === String(s.gateway_id || ""))
+        ),
+        Number(tagMonitorSelection?.readings_count || 120),
+        Number(tagMonitorSelection?.period_ms || 1000),
+        endpointMode === "cloud",
+      )
+    );
+    if (perSeries.every((arr) => !arr.length)) return [];
+    const maxLen = perSeries.reduce((m, arr) => Math.max(m, arr.length), 0);
+    const merged = [];
+    for (let i = 0; i < maxLen; i += 1) {
+      const row = { idx: i + 1, ts: "" };
+      for (let j = 0; j < seriesDefs.length; j += 1) {
+        const pt = perSeries[j][i];
+        if (pt) {
+          if (!row.ts) row.ts = pt.ts || "";
+          row[`v_${seriesDefs[j].id}`] = pt.value === undefined || pt.value === null ? null : Number(pt.value);
+        } else {
+          row[`v_${seriesDefs[j].id}`] = null;
+        }
+      }
+      merged.push(row);
+    }
+    return merged;
+  }, [tagMonitorResolvedSeries, dataLogView, tagMonitorSelection?.readings_count, tagMonitorSelection?.period_ms, endpointMode]);
+
+  const tagMonitorHasRightAxis = useMemo(
+    () => tagMonitorResolvedSeries.some((s) => s.axis === "right"),
+    [tagMonitorResolvedSeries]
+  );
+
+  // Per-axis Y domains so two unit families don't crush each other.
+  const tagMonitorDomains = useMemo(() => {
+    const result = { left: [0, 1], right: [0, 1] };
+    if (!tagMonitorMultiSeries.length || !tagMonitorResolvedSeries.length) return result;
+    for (const axis of ["left", "right"]) {
+      const seriesOnAxis = tagMonitorResolvedSeries.filter((s) => s.axis === axis);
+      if (!seriesOnAxis.length) continue;
+      const values = [];
+      for (const row of tagMonitorMultiSeries) {
+        for (const s of seriesOnAxis) {
+          const v = Number(row[`v_${s.id}`]);
+          if (Number.isFinite(v)) values.push(v);
+        }
+      }
+      if (values.length) {
+        const lo = Math.min(...values);
+        const hi = Math.max(...values);
+        const span = hi - lo;
+        const pad = span > 0 ? span * 0.08 : Math.max(0.5, Math.abs(hi || 1) * 0.05);
+        result[axis] = [lo - pad, hi + pad];
+      }
+    }
+    return result;
+  }, [tagMonitorMultiSeries, tagMonitorResolvedSeries]);
+
   const tagMonitorLatest = useMemo(() => {
     if (!tagMonitorSelection) return null;
     return dataLogView.find(
@@ -13983,41 +14086,11 @@ const getGatewayHealth = (gateway) => {
               onOpenTagMonitor={(widget) => {
                 try {
                   const cfg = widget?.config || {};
-                  // Resolve the tag to monitor. Prefer the widget's primary
-                  // tag; fall back to the first configured extra series so
-                  // operators can still open the monitor on a chart that
-                  // only has extras (e.g. dual-axis with no primary tag).
-                  let gatewayId = String(cfg.gateway_id || "").trim();
-                  let tagName = String(cfg.tag_name || "").trim();
-                  if (!tagName && Array.isArray(cfg.series_extra) && cfg.series_extra.length) {
-                    const firstWithTag = cfg.series_extra.find((s) => String(s?.tag_name || "").trim());
-                    if (firstWithTag) {
-                      tagName = String(firstWithTag.tag_name || "").trim();
-                      gatewayId = String(firstWithTag.gateway_id || gatewayId || "").trim();
-                    }
-                  }
-                  if (!tagName) {
-                    setError("Pick a tag for this widget before opening the tag monitor.");
-                    return;
-                  }
-                  if (!gatewayId) {
-                    // Fall back to the first known gateway that owns this tag.
-                    const fallbackGw = (gatewayConfigsView || []).find((g) => (g?.tags || []).includes(tagName));
-                    if (fallbackGw) gatewayId = String(fallbackGw.id || "");
-                  }
-                  if (!gatewayId) {
-                    setError("Could not resolve a gateway for this tag. Edit the widget and set a gateway.");
-                    return;
-                  }
-                  const gateway =
-                    gatewayConfigsView.find((g) => String(g?.id || "") === gatewayId) ||
-                    powerGatewayDescriptors.find((g) => String(g?.id || "") === gatewayId) ||
-                    null;
-                  const deviceName = String(
-                    devicesView.find((d) => String(d?.id || "") === String(gateway?.device_id || ""))?.name ||
-                      gateway?.name ||
-                      gatewayId
-                  );
+                  // Build the list of series we want the monitor to plot.
+                  // We always include the widget's primary tag (if set) and
+                  // every configured extra series, so dual-axis / multi-tag
+                  // widgets bring all their data into the monitor instead of
+                  // just the first tag.
                   const widgetType = String(widget?.type || "");
                   const preferredChart =
                     widgetType === "bar_chart"
@@ -14025,17 +14098,105 @@ const getGatewayHealth = (gateway) => {
                       : widgetType === "line_area_chart"
                         ? "area"
                         : "line";
+
+                  const resolveGwForTag = (gid, tag) => {
+                    if (gid) return gid;
+                    const fb = (gatewayConfigsView || []).find((g) => (g?.tags || []).includes(tag));
+                    return fb ? String(fb.id || "") : "";
+                  };
+
+                  const buildEntry = (sid, gatewayId, tagName, axis, color, label, unit, suffix, interp) => {
+                    const gw =
+                      gatewayConfigsView.find((g) => String(g?.id || "") === gatewayId) ||
+                      powerGatewayDescriptors.find((g) => String(g?.id || "") === gatewayId) ||
+                      null;
+                    const devName = String(
+                      devicesView.find((d) => String(d?.id || "") === String(gw?.device_id || ""))?.name ||
+                        gw?.name ||
+                        gatewayId
+                    );
+                    return {
+                      id: sid,
+                      tag_name: tagName,
+                      gateway_id: gatewayId,
+                      gateway_name: String(gw?.name || gatewayId),
+                      device_name: devName,
+                      label: String(label || tagName),
+                      color: String(color || ""),
+                      axis: axis === "right" ? "right" : "left",
+                      unit: String(unit || ""),
+                      suffix: String(suffix || ""),
+                      chart_interpolation: String(interp || "stepAfter"),
+                    };
+                  };
+
+                  const seriesOut = [];
+                  const primaryTag = String(cfg.tag_name || "").trim();
+                  let primaryGw = String(cfg.gateway_id || "").trim();
+                  if (primaryTag) {
+                    primaryGw = resolveGwForTag(primaryGw, primaryTag);
+                    if (primaryGw) {
+                      seriesOut.push(buildEntry(
+                        "s0",
+                        primaryGw,
+                        primaryTag,
+                        "left",
+                        cfg.primary_color || "",
+                        cfg.primary_label || primaryTag,
+                        cfg.primary_unit || "",
+                        cfg.primary_suffix || "",
+                        cfg.interpolation || "stepAfter",
+                      ));
+                    }
+                  }
+                  if (Array.isArray(cfg.series_extra)) {
+                    cfg.series_extra.forEach((s, idx) => {
+                      const t = String(s?.tag_name || "").trim();
+                      if (!t) return;
+                      // Skip limit-only rows; they're horizontal references,
+                      // not real data series, and the monitor has no use for
+                      // them.
+                      if (String(s?.chart_type || "").toLowerCase() === "limit") return;
+                      const gid = resolveGwForTag(String(s?.gateway_id || primaryGw || "").trim(), t);
+                      if (!gid) return;
+                      seriesOut.push(buildEntry(
+                        String(s?.id || `s${idx + 1}`),
+                        gid,
+                        t,
+                        s?.axis,
+                        s?.color || "",
+                        s?.label || t,
+                        s?.unit || "",
+                        s?.suffix || "",
+                        cfg.interpolation || "stepAfter",
+                      ));
+                    });
+                  }
+
+                  if (!seriesOut.length) {
+                    setError("Pick a tag for this widget before opening the tag monitor.");
+                    return;
+                  }
+
+                  // Backward-compat: the modal still uses the top-level
+                  // tag_name / gateway_id fields for its KPI strip + form
+                  // labels. Point them at series[0] so single-series widgets
+                  // behave identically to before.
+                  const head = seriesOut[0];
                   setTagMonitorSelection({
-                    key: `${gatewayId}::${tagName}`,
-                    tag_name: tagName,
-                    device_name: deviceName,
-                    gateway_id: gatewayId,
-                    gateway_name: String(gateway?.name || gatewayId),
-                    period_ms: Number(gateway?.interval_ms || 1000),
+                    key: `${head.gateway_id}::${head.tag_name}`,
+                    tag_name: head.tag_name,
+                    device_name: head.device_name,
+                    gateway_id: head.gateway_id,
+                    gateway_name: head.gateway_name,
+                    period_ms: Number(((gatewayConfigsView.find((g) => String(g?.id || "") === head.gateway_id) ||
+                      powerGatewayDescriptors.find((g) => String(g?.id || "") === head.gateway_id))?.interval_ms) || 1000),
                     readings_count: Number(cfg.readings_count || 120),
                     chart_type: preferredChart,
                     chart_interpolation: String(cfg.interpolation || "stepAfter"),
                     last_ts: "",
+                    series: seriesOut,
+                    widget_kind: widgetType,
                   });
                   setTagMonitorChartType(preferredChart);
                   setShowTagMonitorModal(true);
@@ -14231,6 +14392,10 @@ const getGatewayHealth = (gateway) => {
                   <div className="chart-wrap">
                     <ResponsiveContainer width="100%" height={320}>
                       <ComposedChart data={powerMainChartData.rows} margin={{ top: 10, right: 20, left: 10, bottom: 44 }}>
+                        {/* Same grid/legend styling as the dashboard chart widget
+                            so Power Overview charts visually match the rest of
+                            the app. */}
+                        <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
                         <XAxis
                           dataKey="ts"
                           ticks={powerMainXAxisTicks}
@@ -14254,6 +14419,7 @@ const getGatewayHealth = (gateway) => {
                           tickLine={{ stroke: powerChartAxisColor }}
                         />
                         <Tooltip formatter={(v) => formatChartValue(v, 3)} />
+                        <Legend wrapperStyle={{ fontSize: 11 }} />
                         {powerMainChartType === "bar" ? (
                           <>
                             <Bar dataKey="total" name="Total" fill="#16a34a" isAnimationActive={false} />
@@ -14340,32 +14506,43 @@ const getGatewayHealth = (gateway) => {
                     </div>
                   </div>
                   <div className="chart-wrap">
+                    {/* Single ComposedChart so the side chart shares its
+                        styling (grid, legend, axis tokens) with the main
+                        Power Overview chart and the dashboard chart widget.
+                        Previously this was three separate <BarChart> /
+                        <AreaChart> / <LineChart> blocks duplicating the same
+                        XAxis / YAxis / Tooltip props. */}
                     <ResponsiveContainer width="100%" height={320}>
-                      {powerSideChartType === "bar" ? (
-                        <BarChart data={powerSideChartData.rows} margin={{ top: 10, right: 14, left: 8, bottom: 44 }}>
-                          <XAxis
-                            dataKey="ts"
-                            ticks={powerSideXAxisTicks}
-                            minTickGap={22}
-                            interval="preserveStartEnd"
-                            allowDuplicatedCategory={false}
-                            height={56}
-                            tickMargin={14}
-                            tickFormatter={formatPowerSideXAxisTick}
-                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
-                            axisLine={{ stroke: powerChartAxisColor }}
-                            tickLine={{ stroke: powerChartAxisColor }}
-                          />
-                          <YAxis
-                            width={64}
-                            domain={powerSideYDomain}
-                            ticks={buildYAxisTicks(powerSideYDomain, 0.5, 12)}
-                            tickFormatter={(v) => formatChartValue(v, 3)}
-                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
-                            axisLine={{ stroke: powerChartAxisColor }}
-                            tickLine={{ stroke: powerChartAxisColor }}
-                          />
-                          <Tooltip formatter={(v) => formatChartValue(v, 3)} />
+                      <ComposedChart
+                        data={powerSideChartData.rows}
+                        margin={{ top: 10, right: 14, left: 8, bottom: 44 }}
+                      >
+                        <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                        <XAxis
+                          dataKey="ts"
+                          ticks={powerSideXAxisTicks}
+                          minTickGap={22}
+                          interval="preserveStartEnd"
+                          allowDuplicatedCategory={false}
+                          height={56}
+                          tickMargin={14}
+                          tickFormatter={formatPowerSideXAxisTick}
+                          tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                          axisLine={{ stroke: powerChartAxisColor }}
+                          tickLine={{ stroke: powerChartAxisColor }}
+                        />
+                        <YAxis
+                          width={64}
+                          domain={powerSideYDomain}
+                          ticks={buildYAxisTicks(powerSideYDomain, 0.5, 12)}
+                          tickFormatter={(v) => formatChartValue(v, 3)}
+                          tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                          axisLine={{ stroke: powerChartAxisColor }}
+                          tickLine={{ stroke: powerChartAxisColor }}
+                        />
+                        <Tooltip formatter={(v) => formatChartValue(v, 3)} />
+                        <Legend wrapperStyle={{ fontSize: 11 }} />
+                        {powerSideChartType === "bar" ? (
                           <Bar
                             key="pwr-side-bar-total-kwh"
                             dataKey="total_kwh"
@@ -14373,32 +14550,7 @@ const getGatewayHealth = (gateway) => {
                             fill={getSeriesColor(0)}
                             isAnimationActive={false}
                           />
-                        </BarChart>
-                      ) : powerSideChartType === "area" ? (
-                        <AreaChart data={powerSideChartData.rows} margin={{ top: 10, right: 14, left: 8, bottom: 44 }}>
-                          <XAxis
-                            dataKey="ts"
-                            ticks={powerSideXAxisTicks}
-                            minTickGap={22}
-                            interval="preserveStartEnd"
-                            allowDuplicatedCategory={false}
-                            height={56}
-                            tickMargin={14}
-                            tickFormatter={formatPowerSideXAxisTick}
-                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
-                            axisLine={{ stroke: powerChartAxisColor }}
-                            tickLine={{ stroke: powerChartAxisColor }}
-                          />
-                          <YAxis
-                            width={64}
-                            domain={powerSideYDomain}
-                            ticks={buildYAxisTicks(powerSideYDomain, 0.5, 12)}
-                            tickFormatter={(v) => formatChartValue(v, 3)}
-                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
-                            axisLine={{ stroke: powerChartAxisColor }}
-                            tickLine={{ stroke: powerChartAxisColor }}
-                          />
-                          <Tooltip formatter={(v) => formatChartValue(v, 3)} />
+                        ) : powerSideChartType === "area" ? (
                           <Area
                             key="pwr-side-area-total-kwh"
                             type="stepAfter"
@@ -14411,32 +14563,7 @@ const getGatewayHealth = (gateway) => {
                             dot={false}
                             isAnimationActive={false}
                           />
-                        </AreaChart>
-                      ) : (
-                        <LineChart data={powerSideChartData.rows} margin={{ top: 10, right: 14, left: 8, bottom: 44 }}>
-                          <XAxis
-                            dataKey="ts"
-                            ticks={powerSideXAxisTicks}
-                            minTickGap={22}
-                            interval="preserveStartEnd"
-                            allowDuplicatedCategory={false}
-                            height={56}
-                            tickMargin={14}
-                            tickFormatter={formatPowerSideXAxisTick}
-                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
-                            axisLine={{ stroke: powerChartAxisColor }}
-                            tickLine={{ stroke: powerChartAxisColor }}
-                          />
-                          <YAxis
-                            width={64}
-                            domain={powerSideYDomain}
-                            ticks={buildYAxisTicks(powerSideYDomain, 0.5, 12)}
-                            tickFormatter={(v) => formatChartValue(v, 3)}
-                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
-                            axisLine={{ stroke: powerChartAxisColor }}
-                            tickLine={{ stroke: powerChartAxisColor }}
-                          />
-                          <Tooltip formatter={(v) => formatChartValue(v, 3)} />
+                        ) : (
                           <Line
                             key="pwr-side-line-total-kwh"
                             type="stepAfter"
@@ -14447,8 +14574,8 @@ const getGatewayHealth = (gateway) => {
                             dot={false}
                             isAnimationActive={false}
                           />
-                        </LineChart>
-                      )}
+                        )}
+                      </ComposedChart>
                     </ResponsiveContainer>
                   </div>
                 </article>
@@ -18657,7 +18784,8 @@ const getGatewayHealth = (gateway) => {
               <span>Avg: {tagMonitorKpi.avg}</span>
               <span>Min: {tagMonitorKpi.min}</span>
               <span>Max: {tagMonitorKpi.max}</span>
-              <span>Points: {tagMonitorSeries.length}</span>
+              <span>Points: {tagMonitorMultiSeries.length}</span>
+              <span>Series: {tagMonitorResolvedSeries.length}</span>
               <span>
                 <span className={`status-pill ${freshnessBadgeClass(tagMonitorKpi.freshness?.level)}`}>
                   {tagMonitorKpi.freshness?.label || "-"}
@@ -18665,73 +18793,102 @@ const getGatewayHealth = (gateway) => {
               </span>
             </div>
             <div className="chart-wrap">
-              {tagMonitorChartType === "line" ? (
-                <ResponsiveContainer width="100%" height={260}>
-                  <LineChart data={tagMonitorSeries} margin={{ top: 8, right: 18, left: 24, bottom: 8 }}>
-                    <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={tagMonitorXDomain} allowDataOverflow />
+              <ResponsiveContainer width="100%" height={280}>
+                <ComposedChart
+                  data={tagMonitorMultiSeries}
+                  margin={{ top: 8, right: tagMonitorHasRightAxis ? 56 : 18, left: 24, bottom: 8 }}
+                  barCategoryGap={tagMonitorChartType === "bar" ? "24%" : undefined}
+                >
+                  <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                  <XAxis
+                    dataKey="idx"
+                    type="number"
+                    domain={tagMonitorXDomain}
+                    allowDataOverflow
+                    tickFormatter={(v) => tagMonitorMultiSeries.find((h) => h.idx === v)?.ts || ""}
+                  />
+                  <YAxis
+                    yAxisId="left"
+                    width={52}
+                    domain={tagMonitorDomains.left}
+                    ticks={buildYAxisTicks(tagMonitorDomains.left, 0.5, 12)}
+                    tickFormatter={(v) => formatChartValue(v, 3)}
+                  />
+                  {tagMonitorHasRightAxis ? (
                     <YAxis
+                      yAxisId="right"
+                      orientation="right"
                       width={52}
-                      domain={tagMonitorDomain}
-                      ticks={buildYAxisTicks(tagMonitorDomain, 0.5, 12)}
+                      domain={tagMonitorDomains.right}
+                      ticks={buildYAxisTicks(tagMonitorDomains.right, 0.5, 12)}
                       tickFormatter={(v) => formatChartValue(v, 3)}
                     />
-                    <Tooltip
-                      labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)}
-                      formatter={(v) => formatChartValue(v, 3)}
-                    />
-                    <Line
-                      isAnimationActive={false}
-                      type={String(tagMonitorSelection?.chart_interpolation || "stepAfter")}
-                      dataKey="value"
-                      stroke={tagMonitorColor}
-                      strokeWidth={2}
-                      dot={false}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              ) : tagMonitorChartType === "area" ? (
-                <ResponsiveContainer width="100%" height={260}>
-                  <AreaChart data={tagMonitorSeries} margin={{ top: 8, right: 18, left: 24, bottom: 8 }}>
-                    <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={tagMonitorXDomain} allowDataOverflow />
-                    <YAxis
-                      width={52}
-                      domain={tagMonitorDomain}
-                      ticks={buildYAxisTicks(tagMonitorDomain, 0.5, 12)}
-                      tickFormatter={(v) => formatChartValue(v, 3)}
-                    />
-                    <Tooltip
-                      labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)}
-                      formatter={(v) => formatChartValue(v, 3)}
-                    />
-                    <Area
-                      isAnimationActive={false}
-                      type={String(tagMonitorSelection?.chart_interpolation || "stepAfter")}
-                      dataKey="value"
-                      stroke={tagMonitorColor}
-                      fill={tagMonitorColor}
-                      fillOpacity={0.22}
-                      strokeWidth={2}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              ) : (
-                <ResponsiveContainer width="100%" height={260}>
-                  <BarChart data={tagMonitorSeries} margin={{ top: 8, right: 18, left: 30, bottom: 8 }} barCategoryGap="24%">
-                    <XAxis dataKey="idx" type="number" tickFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || ""} domain={tagMonitorXDomain} allowDataOverflow />
-                    <YAxis
-                      width={60}
-                      domain={tagMonitorDomain}
-                      ticks={buildYAxisTicks(tagMonitorDomain, 0.5, 12)}
-                      tickFormatter={(v) => formatChartValue(v, 3)}
-                    />
-                    <Tooltip
-                      labelFormatter={(v) => tagMonitorSeries.find((h) => h.idx === v)?.ts || String(v)}
-                      formatter={(v) => formatChartValue(v, 3)}
-                    />
-                    <Bar isAnimationActive={false} dataKey="value" fill={tagMonitorColor} maxBarSize={22} />
-                  </BarChart>
-                </ResponsiveContainer>
-              )}
+                  ) : null}
+                  <Tooltip
+                    labelFormatter={(v) => tagMonitorMultiSeries.find((h) => h.idx === v)?.ts || String(v)}
+                    formatter={(v, _name, ctx) => {
+                      const sid = String(ctx?.dataKey || "").replace(/^v_/, "");
+                      const def = tagMonitorResolvedSeries.find((s) => s.id === sid);
+                      const u = def?.unit ? ` ${def.unit}` : "";
+                      return [`${formatChartValue(v, 3)}${u}`, def?.label || sid];
+                    }}
+                  />
+                  {tagMonitorResolvedSeries.length > 1 ? (
+                    <Legend wrapperStyle={{ fontSize: 11 }} />
+                  ) : null}
+                  {tagMonitorResolvedSeries.map((s) => {
+                    const dataKey = `v_${s.id}`;
+                    const stroke = s.color || "#16a34a";
+                    const axisId = s.axis === "right" ? "right" : "left";
+                    const interp = s.chart_interpolation || "stepAfter";
+                    const seriesLabel = s.label || s.tag_name;
+                    if (tagMonitorChartType === "bar") {
+                      return (
+                        <Bar
+                          key={s.id}
+                          isAnimationActive={false}
+                          dataKey={dataKey}
+                          name={seriesLabel}
+                          yAxisId={axisId}
+                          fill={stroke}
+                          maxBarSize={22}
+                        />
+                      );
+                    }
+                    if (tagMonitorChartType === "area") {
+                      return (
+                        <Area
+                          key={s.id}
+                          isAnimationActive={false}
+                          type={interp}
+                          dataKey={dataKey}
+                          name={seriesLabel}
+                          yAxisId={axisId}
+                          stroke={stroke}
+                          fill={stroke}
+                          fillOpacity={0.22}
+                          strokeWidth={2}
+                          connectNulls
+                        />
+                      );
+                    }
+                    return (
+                      <Line
+                        key={s.id}
+                        isAnimationActive={false}
+                        type={interp}
+                        dataKey={dataKey}
+                        name={seriesLabel}
+                        yAxisId={axisId}
+                        stroke={stroke}
+                        strokeWidth={2}
+                        dot={false}
+                        connectNulls
+                      />
+                    );
+                  })}
+                </ComposedChart>
+              </ResponsiveContainer>
             </div>
           </div>
         </div>
