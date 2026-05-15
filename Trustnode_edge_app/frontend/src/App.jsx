@@ -1562,6 +1562,25 @@ const CLIENT_MODULE_DEFS = [
   { page: "interface", key: "client_module_interface", label: "Interface" },
 ];
 
+// Pages that should never appear in the single-file client view, regardless
+// of the JWT role. These configure runtime things on the local edge box
+// (devices, gateways, host DB, frontend source) which are not safe or
+// meaningful to manage from the customer-facing web portal. Everything
+// else (dashboards, reports, alarms, users, scheduling) is permitted and
+// gated by the user's permissions exactly like the desktop UI.
+const CLIENT_VIEW_BLOCKED_PAGES = new Set([
+  "devices",
+  "gateway_configuration",
+  "gateway_runtime_control",
+  "database",
+  "database_overview",
+  "database_inspector",
+  "backup_and_retention",
+  "website_and_env",
+  "frontend_source",
+  "edge",
+]);
+
 const CLIENT_MODULE_PAGE_SET = new Set(CLIENT_MODULE_DEFS.map((m) => m.page));
 const CLIENT_MODULE_PERMISSION_BY_PAGE = CLIENT_MODULE_DEFS.reduce((acc, item) => {
   acc[item.page] = item.key;
@@ -6582,13 +6601,13 @@ function AppShell() {
     if (!isPageLicensed(page) && ["dashboard", "power_overview", "historian", "alarms", "reporting", "interface"].includes(page)) {
       return false;
     }
-    // Single-file customer portal build: restrict to client-facing modules
-    // (dashboard / power / historian / alarms / reporting / interface),
-    // gated by per-user permissions just like a role="client" login.
-    if (isClientView) {
-      if (!CLIENT_MODULE_PAGE_SET.has(page)) return false;
-      return hasClientModuleAccess(page);
-    }
+    // Single-file customer portal build: block ONLY edge-runtime config
+    // pages that don't make sense to expose to the web (gateway runtime
+    // and host-level settings still live on the local edge). Every other
+    // page is gated by the user's JWT role + permissions exactly as the
+    // desktop app does — admins can create dashboards/templates/users
+    // from the cloud view, clients see only what their admin enabled.
+    if (isClientView && CLIENT_VIEW_BLOCKED_PAGES.has(page)) return false;
     if (forcedClientMode) {
       if (!CLIENT_MODULE_PAGE_SET.has(page)) return false;
       if (!forcedClientModules.has(page)) return false;

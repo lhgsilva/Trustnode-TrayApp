@@ -39,7 +39,12 @@ try {
     & $npmCmd install
     if ($LASTEXITCODE -ne 0) { throw "Frontend dependency install failed." }
 
-    $env:VITE_TRUSTNODE_READONLY = "true"
+    # Note: readonly mode is intentionally OFF so customer-admin / master
+    # users can save dashboards, reports, users, etc. through the cloud
+    # view. The CLIENT_VIEW flag blocks edge-runtime config pages; per-
+    # user JWT permissions still gate every write. Set readonly only if
+    # you want a strictly view-only build.
+    $env:VITE_TRUSTNODE_READONLY = "false"
     $env:VITE_TRUSTNODE_CLIENT_VIEW = "true"
     $env:VITE_TRUSTNODE_FORCE_CLOUD_URL = $CloudApiUrl
 
