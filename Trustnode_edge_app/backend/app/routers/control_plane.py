@@ -429,15 +429,31 @@ def delete_license_post(request: Request, license_id: str, tenant_id: str | None
     return delete_license(request=request, license_id=license_id, tenant_id=tenant_id)
 
 
+def _require_license_tenant_match(request: Request, license_id: str, *, require_admin_write: bool = False) -> str:
+    """Bind a license_id to the caller's tenant.
+
+    Resolves the license's owning tenant and forces _scoped_tenant() to use
+    it, so a customer admin cannot read or modify licenses that belong to
+    another tenant by guessing the license_id. Global admin (tenant=default,
+    role=admin) is still allowed cross-tenant via _scoped_tenant() below.
+    A missing license is treated as 404 so we don't reveal id existence to
+    other tenants via the 403 timing channel.
+    """
+    license_tenant = control_plane_store.get_license_tenant(license_id=license_id)
+    if not license_tenant:
+        raise HTTPException(status_code=404, detail="License not found")
+    return _scoped_tenant(request, license_tenant, require_admin_write=require_admin_write)
+
+
 @router.get("/licenses/{license_id}/modules")
 def list_license_modules(request: Request, license_id: str) -> dict[str, Any]:
-    _require_auth_payload(request)
+    _require_license_tenant_match(request, license_id)
     return {"ok": True, "license_id": license_id, "rows": control_plane_store.list_license_modules(license_id=license_id)}
 
 
 @router.put("/licenses/{license_id}/modules")
 def set_license_modules(request: Request, license_id: str, payload: LicenseModulesRequest) -> dict[str, Any]:
-    tid = _scoped_tenant(request, None, require_admin_write=True)
+    tid = _require_license_tenant_match(request, license_id, require_admin_write=True)
     out = {"ok": True, **control_plane_store.set_license_modules(license_id=license_id, modules=payload.modules)}
     _audit(request, tenant_id=tid, action="license.modules.set", outcome="ok", details={"license_id": license_id})
     return out

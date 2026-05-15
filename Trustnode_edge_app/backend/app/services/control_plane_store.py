@@ -581,6 +581,18 @@ class ControlPlaneStore:
                 rows = conn.execute("SELECT module_key, enabled FROM cp_license_modules WHERE license_id=? ORDER BY module_key", (lid,)).fetchall()
         return [{"module_key": r[0], "enabled": bool(r[1])} for r in rows]
 
+    def get_license_tenant(self, *, license_id: str) -> str | None:
+        """Resolve the tenant_id that owns this license_id, or None if unknown."""
+        lid = str(license_id or "").strip()
+        if not lid:
+            return None
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute("SELECT tenant_id FROM cp_licenses WHERE license_id=? LIMIT 1", (lid,)).fetchone()
+        if not row:
+            return None
+        return normalize_tenant_id(str(row[0] or ""))
+
     def upsert_user(self, *, tenant_id: str, customer_id: str = "", username: str, password: str | None = None, role: str = "viewer", status: str = "active", email: str = "", mfa_enabled: bool = False, modules: list[str] | None = None, permissions: dict[str, Any] | None = None) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
         uname = str(username or "").strip()
