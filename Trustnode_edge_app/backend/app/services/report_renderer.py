@@ -636,11 +636,14 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
         return
 
     # Aggregate numeric values per axis for range computation.
+    # _fetch_multi_series returns 3-tuples (ts, value, value_text) — the third
+    # element carries the original string for text-typed tags. Charts only
+    # care about the numeric value column.
     left_values: list[float] = []
     right_values: list[float] = []
     max_len = 0
     for meta, pts in zip(series_meta, aligned):
-        nums = [v for (_t, v) in pts if v is not None and math.isfinite(v)]
+        nums = [p[1] for p in pts if p[1] is not None and math.isfinite(p[1])]
         max_len = max(max_len, len(pts))
         if meta.get("axis") == "right":
             right_values.extend(nums)
@@ -755,7 +758,10 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
         axis = "right" if meta.get("axis") == "right" else "left"
         kind = meta.get("chart_type") or chart_kind_default
         coords = []
-        for i, (_t, v) in enumerate(pts):
+        # Iterate over 3-tuples (ts, value, value_text); the chart ignores
+        # value_text and skips rows where the numeric value is missing.
+        for i, point in enumerate(pts):
+            v = point[1]
             if v is None or not math.isfinite(v):
                 continue
             coords.append((_x(i), _y(v, axis)))
