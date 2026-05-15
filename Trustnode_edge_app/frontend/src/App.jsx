@@ -8699,43 +8699,42 @@ const getGatewayHealth = (gateway) => {
   const tagMonitorMultiSeries = useMemo(() => {
     const seriesDefs = tagMonitorResolvedSeries;
     if (!seriesDefs.length) return [];
-    // Build a per-series chronological list (same as the legacy single-series
-    // builder above), then BUCKET timestamps into the densest series' median
-    // sample spacing. Two-gateway charts produce samples that almost never
-    // share the same ms, so a naive ts-keyed merge yields one-series-per-tick
-    // rows that look like the other series has gaps. Bucketing collapses
-    // close samples into the same row so every tick has values for every
-    // series. Last sample wins inside the bucket (same rule as the dashboard
+    // Read the raw historian rows directly from dataLogView. We deliberately
+    // do NOT route through buildChronologicalSeries here — that helper
+    // returns ts already formatted as "HH:MM:SS" via formatTimeDisplay,
+    // which is unparseable back into epoch ms, breaking the bucket merge.
+    //
+    // Two-gateway charts produce samples that almost never share the same
+    // ms, so a naive ts-keyed merge yields one-series-per-tick rows that
+    // look like the other series has gaps. Bucketing collapses close
+    // samples into the same row so every tick has values for every series.
+    // Last sample wins inside the bucket (same rule as the dashboard
     // widget's multiSeriesData).
-    const perSeries = seriesDefs.map((s) =>
-      buildChronologicalSeries(
-        dataLogView.filter(
-          (r) =>
-            String(r.tag || r.tag_name || "") === String(s.tag_name || "") &&
-            (!r.gateway_id || String(r.gateway_id) === String(s.gateway_id || ""))
-        ),
-        Number(tagMonitorSelection?.readings_count || 120),
-        Number(tagMonitorSelection?.period_ms || 1000),
-        endpointMode === "cloud",
+    const perSeriesRaw = seriesDefs.map((s) =>
+      (dataLogView || []).filter(
+        (r) =>
+          String(r.tag || r.tag_name || "") === String(s.tag_name || "") &&
+          (!r.gateway_id || String(r.gateway_id) === String(s.gateway_id || ""))
       )
     );
-    if (perSeries.every((arr) => !arr.length)) return [];
+    if (perSeriesRaw.every((arr) => !arr.length)) return [];
 
-    const tsToMs = (raw) => {
-      const t = String(raw || "");
-      if (!t) return NaN;
-      const ms = Date.parse(t);
-      if (Number.isFinite(ms)) return ms;
-      const iso = t.includes("T") ? t : t.replace(" ", "T");
-      const ms2 = Date.parse(iso);
-      return Number.isFinite(ms2) ? ms2 : NaN;
-    };
-
-    // Project to (tsMs, value) pairs, dropping rows we can't time-stamp.
-    const projected = perSeries.map((arr) =>
+    // Project to (tsMs, isoTs, value) triples, dropping rows we can't
+    // time-stamp. rowTsMs / parseTimestampMs handle the full historian
+    // ts format (ISO with optional space-instead-of-T, optional Z).
+    const projected = perSeriesRaw.map((arr) =>
       (arr || [])
-        .map((p) => ({ tsMs: tsToMs(p.ts), ts: p.ts, value: p.value }))
+        .map((r) => {
+          const ms = rowTsMs(r);
+          const v = Number(r?.value);
+          return {
+            tsMs: ms,
+            ts: String(r?.ts || r?.ts_utc || ""),
+            value: Number.isFinite(v) ? v : null,
+          };
+        })
         .filter((p) => Number.isFinite(p.tsMs))
+        .sort((a, b) => a.tsMs - b.tsMs)
     );
 
     // Bucket size = median delta of the densest series, clamped.
@@ -8766,14 +8765,12 @@ const getGatewayHealth = (gateway) => {
         let row = tsMap.get(bk);
         if (!row) {
           row = { tsMs: bk, ts: p.ts || new Date(bk).toISOString() };
-          // Initialise every series to null so undefined access is consistent.
           for (let k = 0; k < seriesDefs.length; k += 1) {
             row[`v_${seriesDefs[k].id}`] = null;
           }
           tsMap.set(bk, row);
         }
         row[key] = p.value === undefined || p.value === null ? null : Number(p.value);
-        // Prefer the latest human-readable ts within the bucket.
         if (p.ts) row.ts = p.ts;
       }
     }
@@ -8781,8 +8778,14 @@ const getGatewayHealth = (gateway) => {
     const ordered = Array.from(tsMap.values()).sort((a, b) => a.tsMs - b.tsMs);
     const reads = Math.max(20, Number(tagMonitorSelection?.readings_count || 120));
     const trimmed = ordered.length > reads ? ordered.slice(-reads) : ordered;
-    return trimmed.map((row, i) => ({ ...row, idx: i + 1 }));
-  }, [tagMonitorResolvedSeries, dataLogView, tagMonitorSelection?.readings_count, tagMonitorSelection?.period_ms, endpointMode]);
+    // Format ts for the X-axis tooltip the way the rest of the app shows
+    // historian timestamps (HH:MM:SS in user TZ).
+    return trimmed.map((row, i) => ({
+      ...row,
+      idx: i + 1,
+      ts: formatTimeDisplay(row.ts || new Date(row.tsMs).toISOString(), DEFAULT_DISPLAY_TIMEZONE) || row.ts,
+    }));
+  }, [tagMonitorResolvedSeries, dataLogView, tagMonitorSelection?.readings_count, tagMonitorSelection?.period_ms]);
 
   const tagMonitorHasRightAxis = useMemo(
     () => tagMonitorResolvedSeries.some((s) => s.axis === "right"),
