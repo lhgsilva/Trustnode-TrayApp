@@ -18428,15 +18428,29 @@ const getGatewayHealth = (gateway) => {
                 const health = getGatewayHealth(g);
                 const running = isGatewayRunning(g);
                 const intervalInfo = getGatewayIntervalRuntimeInfo(g);
+                // ONE pill, derived from the same two signals as before. We
+                // used to render two pills (health + RUNNING/STOPPED) which
+                // could disagree for 30–45s after a start/stop because the
+                // two helpers use different freshness windows. The new pill
+                // resolves the ambiguity:
+                //   - error labels from health (Device Fails / DB Fails / …)
+                //     always win, so failure states are visible.
+                //   - otherwise show RUNNING when the gateway is actively
+                //     producing data OR runtime reports running=true,
+                //     STOPPED when neither is true.
+                const statusLabel = !health.ok && health.label
+                  && health.label !== "Stopped" && health.label !== "Running"
+                  ? health.label
+                  : (running ? "Running" : "Stopped");
+                const statusClass = !health.ok && statusLabel !== "Running" && statusLabel !== "Stopped"
+                  ? "status-warning"
+                  : (running ? "status-online" : "status-offline");
                 return (
                   <div key={`footer-${g.id}`} className="gateway-footer-row">
                     <span className="gateway-footer-cell" title={g.name}>{g.name}</span>
                     <span className="gateway-footer-cell" title={getGatewayFooterAddress(g)}>{getGatewayFooterAddress(g)}</span>
                     <span className="gateway-footer-cell">
-                      <span className={`status-pill ${health.ok ? "status-online" : "status-warning"}`}>{health.label}</span>
-                      <span className={`status-pill ${running ? "status-online" : "status-offline"}`} style={{ marginLeft: 6 }}>
-                        {running ? "RUNNING" : "STOPPED"}
-                      </span>
+                      <span className={`status-pill ${statusClass}`}>{statusLabel}</span>
                     </span>
                     <span className="gateway-footer-cell">
                       <span className={intervalInfo.mismatch ? "gateway-interval-mismatch" : ""}>
