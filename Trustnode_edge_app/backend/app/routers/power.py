@@ -1,8 +1,13 @@
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-from fastapi import APIRouter, Request
+import logging
+import traceback
+
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 from app.state import app_store, power_manager
 
@@ -40,7 +45,17 @@ def get_power_profiles() -> dict:
 
 @router.put("/config")
 def set_power_config(payload: PowerConfigPayload) -> dict:
-    cfg = power_manager.update_config(payload.model_dump(), actor="admin")
+    try:
+        cfg = power_manager.update_config(payload.model_dump(), actor="admin")
+    except (ValueError, TypeError) as exc:
+        # Field-level validation in power_manager (e.g. a non-numeric port or
+        # register address) surfaces here. Return the *reason* so the UI can
+        # tell the operator WHICH field is wrong instead of a generic 500.
+        logger.warning("Power config update rejected: %s", exc)
+        raise HTTPException(status_code=400, detail=f"Invalid power configuration: {exc}") from exc
+    except Exception as exc:
+        logger.error("Power config update crashed: %s\n%s", exc, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Power configuration save failed: {exc}") from exc
     return {"ok": True, "config": cfg}
 
 

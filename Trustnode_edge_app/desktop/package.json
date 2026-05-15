@@ -2,8 +2,11 @@
   "name": "trustnode-desktop",
   "version": "0.1.0",
   "private": false,
-  "description": "Trustnode Edge desktop tray app",
-  "author": "Trustnode",
+  "description": "TrustNode Edge — industrial data collection & dashboards",
+  "author": {
+    "name": "TrustNode",
+    "email": "support@trustnode.io"
+  },
   "main": "main.js",
   "scripts": {
     "dev:ui": "npm --prefix ../frontend run dev",
@@ -25,7 +28,8 @@
   },
   "build": {
     "appId": "com.trustnode.edge",
-    "productName": "Trustnode",
+    "productName": "TrustNode",
+    "copyright": "Copyright © 2026 TrustNode",
     "directories": {
       "output": "dist"
     },
@@ -44,8 +48,9 @@
         "to": "frontend/dist"
       },
       {
-        "from": "../backend/dist/trustnode-service.exe",
-        "to": "backend/trustnode-service.exe"
+        "from": "../backend/dist/trustnode-service",
+        "to": "backend",
+        "filter": ["**/*"]
       },
       {
         "from": "assets/trustnode_logo.ico",
@@ -53,9 +58,14 @@
       }
     ],
     "win": {
-      "executableName": "Trustnode",
+      "executableName": "TrustNode",
       "icon": "assets/trustnode_logo.ico",
       "signAndEditExecutable": false,
+      "verifyUpdateCodeSignature": false,
+      "rfc3161TimeStampServer": "http://timestamp.digicert.com",
+      "legalTrademarks": "TrustNode",
+      "publisherName": "TrustNode",
+      "fileAssociations": [],
       "target": [
         {
           "target": "nsis",
@@ -71,10 +81,22 @@
         }
       ]
     },
+    "portable": {
+      "artifactName": "TrustNode-${version}-portable.exe"
+    },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "assets/trustnode_logo.ico",
+      "uninstallerIcon": "assets/trustnode_logo.ico",
+      "installerHeaderIcon": "assets/trustnode_logo.ico",
+      "shortcutName": "TrustNode",
+      "uninstallDisplayName": "TrustNode",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "menuCategory": "TrustNode",
+      "artifactName": "TrustNode-Setup-${version}.exe"
     }
   }
 }

@@ -101,10 +101,29 @@ export function getTagSeries(rows, gatewayId, tagName, readingsCount = 120) {
 }
 
 export function getLatestTagRow(rows, gatewayId, tagName) {
+  // String-typed tags don't survive getTagSeries' numeric filter, so we
+  // separately look up the most recent raw row to recover value_text.
+  const src = Array.isArray(rows) ? rows : [];
+  const gwNeedle = norm(gatewayId);
+  const tagNeedle = norm(tagName);
+  const byTag = src.filter((r) => norm(r?.tag || r?.tag_name || "") === tagNeedle);
+  const strict = byTag.filter((r) => norm(r?.gateway_id || "") === gwNeedle);
+  const pool = strict.length > 1 ? strict : byTag;
+  const sorted = [...pool].sort(
+    (a, b) => toTsMs(a?.ts || a?.ts_utc) - toTsMs(b?.ts || b?.ts_utc)
+  );
+  const lastRaw = sorted[sorted.length - 1];
   const series = getTagSeries(rows, gatewayId, tagName, 5000);
-  if (!series.length) return null;
-  const last = series[series.length - 1];
-  return { last_value: last.value, last_ts: last.ts };
+  const lastNumeric = series.length ? series[series.length - 1] : null;
+  if (!lastNumeric && !lastRaw) return null;
+  const lastText = lastRaw && (lastRaw.value_text != null && lastRaw.value_text !== "")
+    ? String(lastRaw.value_text)
+    : null;
+  return {
+    last_value: lastNumeric ? lastNumeric.value : null,
+    last_value_text: lastText,
+    last_ts: lastNumeric ? lastNumeric.ts : String(lastRaw?.ts || lastRaw?.ts_utc || ""),
+  };
 }
 
 function ruleMatch(value, op, v1, v2) {

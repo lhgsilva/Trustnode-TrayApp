@@ -7,12 +7,15 @@ import {
   Area,
   BarChart,
   Bar,
+  ComposedChart,
+  Legend,
   PieChart,
   Pie,
   Cell,
   Tooltip,
   Sector,
   CartesianGrid,
+  ReferenceLine,
   XAxis,
   YAxis,
 } from "recharts";
@@ -523,7 +526,56 @@ export function DashboardWidgetCard({
   fetchWidgetRows,
   fetchWidgetStats,
   fetchWidgetRuleStats,
+  historicalMode = false,
+  onHistoricalPan = null,
 }) {
+  // Drag-to-scroll: when the dashboard is in Historical mode, the chart
+  // gets a "grab" cursor. Pressing and dragging horizontally pans the shared
+  // window. The drag uses window-level listeners so Recharts' own SVG
+  // pointer handling (tooltips, hover) doesn't swallow the events.
+  const panDragStartXRef = useRef(null);
+  const panAccumDxRef = useRef(0);
+  const PAN_THRESHOLD_PX = 40;
+  const isPannableChart = ["line_chart", "line_area_chart", "bar_chart"].includes(String(widget?.type || ""));
+  const panEnabled = isPannableChart && typeof onHistoricalPan === "function" && historicalMode === true;
+
+  const onPanPointerDown = (e) => {
+    if (!panEnabled) return;
+    if (e.button !== undefined && e.button !== 0) return;
+    panDragStartXRef.current = e.clientX;
+    panAccumDxRef.current = 0;
+    // Stop Recharts (or any child) from starting its own gesture so the
+    // window-level listeners reliably see the rest of the drag.
+    try { e.preventDefault(); } catch (_) {}
+    try { e.stopPropagation(); } catch (_) {}
+
+    // Use BOTH mouse and pointer events so we cover every browser/touch case.
+    const onWinMove = (ev) => {
+      if (panDragStartXRef.current === null) return;
+      const newDx = ev.clientX - panDragStartXRef.current;
+      const delta = newDx - panAccumDxRef.current;
+      if (Math.abs(delta) >= PAN_THRESHOLD_PX) {
+        onHistoricalPan(delta > 0 ? 1 : -1);
+        panAccumDxRef.current = newDx;
+      }
+    };
+    const onWinUp = () => {
+      panDragStartXRef.current = null;
+      panAccumDxRef.current = 0;
+      window.removeEventListener("pointermove", onWinMove);
+      window.removeEventListener("pointerup", onWinUp);
+      window.removeEventListener("pointercancel", onWinUp);
+      window.removeEventListener("mousemove", onWinMove);
+      window.removeEventListener("mouseup", onWinUp);
+    };
+    window.addEventListener("pointermove", onWinMove);
+    window.addEventListener("pointerup", onWinUp);
+    window.addEventListener("pointercancel", onWinUp);
+    window.addEventListener("mousemove", onWinMove);
+    window.addEventListener("mouseup", onWinUp);
+  };
+  const onPanPointerMove = () => {};
+  const onPanPointerUp = () => {};
   const cfg = widget?.config || {};
   const gatewayId = cfg.gateway_id || "";
   const resolvedGatewayId = useMemo(() => {
@@ -1110,6 +1162,272 @@ export function DashboardWidgetCard({
     () => getTagSeriesFiltered(directScopedRowsTimeFiltered, resolvedGatewayId, tagName, cfgReadingsCount),
     [directScopedRowsTimeFiltered, resolvedGatewayId, tagName, cfgReadingsCount]
   );
+
+  // -------- multi-series support --------------------------------------------
+  // Additional series for trend charts. Each extra entry is rendered alongside
+  // the primary tag using ComposedChart so users can overlay e.g. temperature
+  // (left, °C) with pressure (right, bar). Single-series widgets continue to
+  // work — extraSeriesDefs is empty for them.
+  // All non-primary series, regardless of kind (data trace or limit line).
+  const allExtraSeries = useMemo(() => {
+    const isChartWidget = ["line_chart", "line_area_chart", "bar_chart"].includes(widgetType);
+    if (!isChartWidget) return [];
+    const raw = Array.isArray(cfg?.series_extra) ? cfg.series_extra : [];
+    return raw
+      .map((s, idx) => ({
+        id: String(s?.id || `s${idx + 1}`),
+        gateway_id: String(s?.gateway_id || resolvedGatewayId || ""),
+        tag_name: String(s?.tag_name || "").trim(),
+        label: String(s?.label || "").trim(),
+        color: String(s?.color || ""),
+        axis: String(s?.axis || "left").toLowerCase() === "right" ? "right" : "left",
+        chart_type: String(s?.chart_type || "").toLowerCase(),
+        unit: String(s?.unit || "").trim(),
+        suffix: String(s?.suffix || "").trim(),
+        multiplier: Number(s?.multiplier ?? 1) || 1,
+        offset: Number(s?.offset ?? 0) || 0,
+        limit_value: s?.limit_value === undefined || s?.limit_value === null ? "" : String(s.limit_value),
+        // Per-series style overrides (added 2026-05-14). Each row can carry
+        // its own line thickness, dot marker, bar width, bar pattern, and
+        // limit line dash style.
+        line_width: Number.isFinite(Number(s?.line_width)) ? Number(s.line_width) : null,
+        line_dot: String(s?.line_dot || ""),
+        bar_width: Number.isFinite(Number(s?.bar_width)) ? Number(s.bar_width) : null,
+        bar_pattern: String(s?.bar_pattern || ""),
+        limit_dash: String(s?.limit_dash || ""),
+      }));
+  }, [cfg?.series_extra, widgetType, resolvedGatewayId]);
+
+  // Data series: rows that produce a time-aligned trace on the chart.
+  // Limit lines are filtered OUT here so the multi-series merge never tries
+  // to fetch historian rows for them.
+  const extraSeriesDefs = useMemo(
+    () => allExtraSeries.filter((s) => s.chart_type !== "limit" && s.tag_name),
+    [allExtraSeries]
+  );
+
+  // Limit rows: rendered as horizontal ReferenceLines. They can either pin
+  // to a constant `limit_value` or follow the latest sample of a tag.
+  const limitLineDefs = useMemo(
+    () => allExtraSeries.filter((s) => s.chart_type === "limit"),
+    [allExtraSeries]
+  );
+
+  // Server-fetched rows for each extra series, keyed by series id.
+  const [extraSeriesServerRowsByDef, setExtraSeriesServerRowsByDef] = useState({});
+
+  useEffect(() => {
+    if (!extraSeriesDefs.length) {
+      setExtraSeriesServerRowsByDef({});
+      return;
+    }
+    const fetcher = fetchWidgetRowsRef.current;
+    if (typeof fetcher !== "function") return;
+    let cancelled = false;
+    const localRange = resolveTimeFilterRange(cfg);
+    const fetchAll = async () => {
+      const next = {};
+      const reads = Math.max(50, Math.min(5000, Number(cfgReadingsCount || 120) * 8));
+      for (const def of extraSeriesDefs) {
+        try {
+          let rows = await fetcher({
+            fromUtc: localRange?.fromUtc || "",
+            toUtc: localRange?.toUtc || "",
+            limit: reads,
+            offset: 0,
+            gateway: String(def.gateway_id || resolvedGatewayId || ""),
+            tag: def.tag_name,
+            timeoutMs: 12000,
+            maxAttempts: 1,
+          });
+          if (!Array.isArray(rows) || rows.length === 0) {
+            // Fallback: drop gateway scope (handles tags emitted under a
+            // different gateway_id alias).
+            rows = await fetcher({
+              fromUtc: localRange?.fromUtc || "",
+              toUtc: localRange?.toUtc || "",
+              limit: reads,
+              offset: 0,
+              gateway: "",
+              tag: def.tag_name,
+              timeoutMs: 12000,
+              maxAttempts: 1,
+            });
+          }
+          if (cancelled) return;
+          next[def.id] = Array.isArray(rows) ? rows : [];
+        } catch {
+          next[def.id] = [];
+        }
+      }
+      if (!cancelled) setExtraSeriesServerRowsByDef(next);
+    };
+    fetchAll();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    JSON.stringify(extraSeriesDefs.map((d) => `${d.gateway_id}::${d.tag_name}`)),
+    refreshTickFast,
+    cfgTimePreset,
+    cfgTimeFrom,
+    cfgTimeTo,
+    cfgReadingsCount,
+  ]);
+
+  // Combined source: prefer the server-fetched historian rows; fall back to
+  // the live broadcast (dataLogView) so freshly-emitted samples appear
+  // between fetches.
+  const extraSeriesRowsByDef = useMemo(() => {
+    if (!extraSeriesDefs.length) return {};
+    const liveRows = Array.isArray(dataLogView) ? dataLogView : [];
+    const out = {};
+    for (const def of extraSeriesDefs) {
+      const targetGw = String(def.gateway_id || "").trim();
+      const targetTag = def.tag_name;
+      const filteredLive = liveRows.filter((r) => {
+        const tag = String(r?.tag || r?.tag_name || "").trim();
+        if (tag !== targetTag) return false;
+        if (!targetGw) return true;
+        return String(r?.gateway_id || "").trim() === targetGw;
+      });
+      const fromServer = Array.isArray(extraSeriesServerRowsByDef[def.id]) ? extraSeriesServerRowsByDef[def.id] : [];
+      // De-duplicate by ts+tag so live additions augment the server batch
+      // instead of producing twin entries.
+      const seen = new Set();
+      const merged = [];
+      for (const r of [...fromServer, ...filteredLive]) {
+        const k = `${String(r?.ts || r?.ts_utc || "")}|${String(r?.tag || r?.tag_name || "")}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        merged.push(r);
+      }
+      out[def.id] = applyWidgetTimeFilter(merged, cfg);
+    }
+    return out;
+  }, [extraSeriesDefs, extraSeriesServerRowsByDef, dataLogView, cfgTimePreset, cfgTimeFrom, cfgTimeTo]);
+
+  // Build a combined dataset on the **union of all sample timestamps** from
+  // every series. Each timestamp becomes one row; series that don't have a
+  // sample at that ts get null at that position (recharts skips nulls when
+  // connectNulls is on). This is the most robust approach — it guarantees
+  // every actual sample point is drawn for every series regardless of
+  // primary length or sample cadence mismatch.
+  // Resolve each limit line to a concrete numeric value. Constant values use
+  // `limit_value` directly; tag-bound limits read the most recent sample of
+  // that tag from the live broadcast. Declared BEFORE multiSeriesData so
+  // the latter can reference resolvedLimitLines.length without TDZ.
+  const resolvedLimitLines = useMemo(() => {
+    if (!limitLineDefs.length) return [];
+    const liveRows = Array.isArray(dataLogView) ? dataLogView : [];
+    return limitLineDefs.map((def) => {
+      let value = Number.NaN;
+      const constant = Number(def.limit_value);
+      if (Number.isFinite(constant) && String(def.limit_value).trim() !== "") {
+        value = constant * (def.multiplier || 1) + (def.offset || 0);
+      } else if (def.tag_name) {
+        const targetTag = def.tag_name;
+        const targetGw = String(def.gateway_id || "").trim();
+        let latestTs = -Infinity;
+        let latestVal = null;
+        for (const r of liveRows) {
+          if (String(r?.tag || r?.tag_name || "").trim() !== targetTag) continue;
+          if (targetGw && String(r?.gateway_id || "").trim() !== targetGw) continue;
+          const ms = Date.parse(String(r?.ts || r?.ts_utc || "").replace(" ", "T"));
+          if (Number.isFinite(ms) && ms > latestTs) {
+            latestTs = ms;
+            latestVal = r?.value;
+          }
+        }
+        const numericLatest = Number(latestVal);
+        if (Number.isFinite(numericLatest)) {
+          value = numericLatest * (def.multiplier || 1) + (def.offset || 0);
+        }
+      }
+      return { ...def, resolved_value: value };
+    });
+  }, [limitLineDefs, dataLogView]);
+
+  const multiSeriesData = useMemo(() => {
+    // When only limit lines are configured (no extra data series) we still
+    // want to draw the ComposedChart so the limit shows up — fall back to
+    // the primary series points so the X axis has a timeline.
+    if (!extraSeriesDefs.length) {
+      if (!resolvedLimitLines.length) return [];
+      return series.map((p, i) => ({ idx: i + 1, ts: p.ts || "", value: p.value ?? null }));
+    }
+    const primary = series; // [{idx, ts, value}] oldest-first
+    const reads = Math.max(10, Number(cfgReadingsCount || 120));
+
+    const tsToMs = (raw) => {
+      const t = String(raw || "");
+      if (!t) return NaN;
+      const ms = Date.parse(t);
+      if (Number.isFinite(ms)) return ms;
+      const iso = t.includes("T") ? t : t.replace(" ", "T");
+      const ms2 = Date.parse(iso);
+      return Number.isFinite(ms2) ? ms2 : NaN;
+    };
+
+    const primaryPts = primary
+      .map((p) => ({ ts: p.ts, tsMs: tsToMs(p.ts), value: p.value }))
+      .filter((p) => Number.isFinite(p.tsMs));
+
+    const extrasPts = extraSeriesDefs.map((def) => {
+      // The rows in extraSeriesRowsByDef are already pre-filtered to this
+      // series' tag (in the fetch effect + the merge memo). Re-filtering via
+      // getTagSeries can drop rows when the historian's gateway_id alias
+      // differs from the saved series gateway_id. Going straight to the
+      // rows is more permissive and matches what the user expects.
+      const rows = Array.isArray(extraSeriesRowsByDef[def.id]) ? extraSeriesRowsByDef[def.id] : [];
+      const sorted = rows
+        .map((r) => {
+          const raw = Number(r?.value);
+          const numeric = Number.isFinite(raw) ? raw : null;
+          return {
+            ts: String(r?.ts || r?.ts_utc || ""),
+            tsMs: tsToMs(r?.ts || r?.ts_utc),
+            value: numeric === null ? null : numeric * def.multiplier + def.offset,
+          };
+        })
+        .filter((p) => Number.isFinite(p.tsMs))
+        .sort((a, b) => a.tsMs - b.tsMs);
+      const sliced = sorted.length > reads ? sorted.slice(-reads) : sorted;
+      return sliced;
+    });
+
+    // Merge sort all timestamps into a unique ascending list.
+    const tsMap = new Map(); // tsMs -> row template
+    for (const p of primaryPts) {
+      tsMap.set(p.tsMs, { ts: p.ts, tsMs: p.tsMs, value: p.value });
+    }
+    for (let j = 0; j < extrasPts.length; j += 1) {
+      const def = extraSeriesDefs[j];
+      for (const p of extrasPts[j]) {
+        const existing = tsMap.get(p.tsMs);
+        if (existing) {
+          existing[`s_${def.id}`] = p.value;
+        } else {
+          const row = { ts: p.ts, tsMs: p.tsMs, value: null };
+          row[`s_${def.id}`] = p.value;
+          tsMap.set(p.tsMs, row);
+        }
+      }
+    }
+    const ordered = Array.from(tsMap.values()).sort((a, b) => a.tsMs - b.tsMs);
+    // Trim to the most recent N points so the chart doesn't grow unbounded.
+    const limit = Math.max(60, reads);
+    const trimmed = ordered.length > limit ? ordered.slice(-limit) : ordered;
+    return trimmed.map((row, i) => ({ ...row, idx: i + 1 }));
+  }, [series, extraSeriesDefs, extraSeriesRowsByDef, cfgReadingsCount, resolvedLimitLines.length]);
+
+  const hasMultiSeries = extraSeriesDefs.length > 0 || resolvedLimitLines.length > 0;
+  const anyRightAxis =
+    (extraSeriesDefs.some((d) => d.axis === "right"))
+    || resolvedLimitLines.some((d) => d.axis === "right");
+  const primaryAxisLabel = String(cfg?.y_axis_label || cfg?.primary_unit || "");
+  const rightAxisLabel = String(cfg?.y_axis_right_label || "");
   const computedItems = useMemo(
     () => evaluateComputedRules(computedRowsTimeFiltered, rules),
     [computedRowsTimeFiltered, rulesDepKey]
@@ -1190,91 +1508,417 @@ export function DashboardWidgetCard({
   switch (widget.type) {
     case "line_chart":
     case "line_area_chart":
+    case "bar_chart": {
+      // Multi-series-aware renderer. When `series_extra` is configured we draw
+      // every series on a ComposedChart so primary + extras can coexist with
+      // independent axes / chart types. Single-series widgets still flow
+      // through the simpler LineChart/AreaChart/BarChart for parity with
+      // earlier behaviour.
+      const widgetKind = widget.type;
+      const primaryColor = getWidgetAccent(widget, widgetKind === "bar_chart" ? "#1f3a5f" : "#14a89a");
+      const primaryUnit = String(cfg?.primary_unit || "");
+      const primarySuffix = String(cfg?.primary_suffix || "");
+      const primaryLabel = (displayTag || "Value") + (primaryUnit ? ` [${primaryUnit}]` : "");
+      const primaryKind =
+        widgetKind === "bar_chart" ? "bar" : widgetKind === "line_area_chart" ? "area" : "line";
+      // Style options: thickness, dot markers (line/area), bar opacity.
+      const styleLineWidth = Math.max(1, Math.min(8, Number(cfg?.chart_line_width) || 2));
+      const dotPreset = String(cfg?.chart_line_dot || "none");
+      const dotSizeByPreset = { none: 0, small: 2, medium: 4, large: 6 };
+      const dotForLine = (color) => {
+        const r = dotSizeByPreset[dotPreset] || 0;
+        if (!r) return false;
+        return { r, fill: color, stroke: color, strokeWidth: 0 };
+      };
+      const activeDotForLine = (color) => {
+        const r = (dotSizeByPreset[dotPreset] || 0) + 2;
+        return { r: Math.max(3, r), fill: color, stroke: "#ffffff", strokeWidth: 1 };
+      };
+      const barOpacity = Math.max(0.1, Math.min(1, Number(cfg?.chart_bar_opacity ?? 100) / 100));
+      const barWidthPx = Math.max(0, Math.min(120, Number(cfg?.chart_bar_width ?? 0)));
+      const barSizeProp = barWidthPx > 0 ? { barSize: barWidthPx } : {};
+      const barPatternId = `tn-bar-pattern-${String(widget?.id || "w").replace(/[^a-z0-9]/gi, "")}`;
+      const barPatternKind = String(cfg?.chart_bar_pattern || "solid");
+      const renderBarPattern = (fillColor) => {
+        if (barPatternKind === "solid") return null;
+        // Inline SVG <defs> with a small repeating pattern. The Bar fill
+        // points to url(#...) so each chart instance has its own pattern.
+        const stroke = fillColor;
+        if (barPatternKind === "stripes-diag") {
+          return (
+            <defs>
+              <pattern id={barPatternId} patternUnits="userSpaceOnUse" width="8" height="8" patternTransform="rotate(45)">
+                <rect width="4" height="8" fill={stroke} opacity={barOpacity} />
+              </pattern>
+            </defs>
+          );
+        }
+        if (barPatternKind === "stripes-vert") {
+          return (
+            <defs>
+              <pattern id={barPatternId} patternUnits="userSpaceOnUse" width="6" height="8">
+                <rect width="3" height="8" fill={stroke} opacity={barOpacity} />
+              </pattern>
+            </defs>
+          );
+        }
+        if (barPatternKind === "dots") {
+          return (
+            <defs>
+              <pattern id={barPatternId} patternUnits="userSpaceOnUse" width="6" height="6">
+                <circle cx="3" cy="3" r="1.5" fill={stroke} opacity={barOpacity} />
+              </pattern>
+            </defs>
+          );
+        }
+        return null;
+      };
+      const barFillFor = (color) => (barPatternKind === "solid" ? color : `url(#${barPatternId})`);
+      const fmtValueByUnit = (v, unit, suffix) => {
+        const base = formatByPreset(v, chartValueFormat);
+        const u = unit ? ` ${unit}` : "";
+        const s = suffix ? ` ${suffix}` : "";
+        return `${base}${u}${s}`;
+      };
+
+      if (!hasMultiSeries) {
+        // Original single-series fast path.
+        return (
+          <div
+            className={`dashboard-widget-block dashboard-widget-block-chart ${panEnabled ? "is-pannable" : ""}`}
+            onPointerDown={onPanPointerDown}
+            onMouseDown={onPanPointerDown}
+            onPointerMove={onPanPointerMove}
+            onPointerUp={onPanPointerUp}
+            onPointerCancel={onPanPointerUp}
+            title={panEnabled ? "Drag horizontally to pan back/forward through history" : undefined}>
+            {series.length ? (
+              <div className="dashboard-widget-chart">
+                {widgetKind === "line_area_chart" ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={series} margin={chartMargin}>
+                      <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                      <XAxis {...buildXAxisProps(series)} />
+                      <YAxis {...yAxisPresetProps} domain={yDomain} />
+                      <Tooltip
+                        {...chartTooltipProps}
+                        formatter={(v) => fmtValueByUnit(v, primaryUnit, primarySuffix)}
+                        labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
+                      />
+                      {showChartLegend ? <Legend /> : null}
+                      <Area
+                        type={interpolation}
+                        dataKey="value"
+                        name={primaryLabel}
+                        stroke={primaryColor}
+                        fill={rgbaFromHex(primaryColor, 0.24)}
+                        strokeWidth={styleLineWidth}
+                        dot={dotForLine(primaryColor)}
+                        activeDot={activeDotForLine(primaryColor)}
+                        label={showPointLabels ? { fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : false}
+                        isAnimationActive={false}
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : widgetKind === "bar_chart" ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={series} margin={chartMargin}>
+                      {renderBarPattern(primaryColor)}
+                      <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                      <XAxis {...buildXAxisProps(series)} />
+                      <YAxis {...yAxisPresetProps} domain={yDomain} />
+                      <Tooltip
+                        {...chartTooltipProps}
+                        formatter={(v) => fmtValueByUnit(v, primaryUnit, primarySuffix)}
+                        labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
+                      />
+                      {showChartLegend ? <Legend /> : null}
+                      <Bar
+                        dataKey="value"
+                        name={primaryLabel}
+                        label={showPointLabels ? { fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : false}
+                        fill={barFillFor(primaryColor)}
+                        fillOpacity={barPatternKind === "solid" ? barOpacity : 1}
+                        stroke={primaryColor}
+                        strokeWidth={barPatternKind === "solid" ? 0 : 1}
+                        {...barSizeProp}
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={series} margin={chartMargin}>
+                      <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                      <XAxis {...buildXAxisProps(series)} />
+                      <YAxis {...yAxisPresetProps} domain={yDomain} />
+                      <Tooltip
+                        {...chartTooltipProps}
+                        formatter={(v) => fmtValueByUnit(v, primaryUnit, primarySuffix)}
+                        labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
+                      />
+                      {showChartLegend ? <Legend /> : null}
+                      <Line
+                        type={interpolation}
+                        dataKey="value"
+                        name={primaryLabel}
+                        stroke={primaryColor}
+                        strokeWidth={styleLineWidth}
+                        dot={dotForLine(primaryColor)}
+                        activeDot={activeDotForLine(primaryColor)}
+                        label={showPointLabels ? { fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : false}
+                        isAnimationActive={false}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                )}
+              </div>
+            ) : trendIsInitialLoading ? renderEmpty("Loading...") : renderEmpty("No points")}
+          </div>
+        );
+      }
+
+      // ---- Multi-series ComposedChart ---------------------------------------
+      const data = multiSeriesData;
+      const dataNonEmpty = data.length > 0;
+      // Debug aid: count how many points each series has in the combined
+      // dataset. Surfaced as a hidden HTML attribute so we can inspect via
+      // the browser inspector if a series still ends up invisible.
+      const seriesPointCounts = (() => {
+        const counts = { value: 0 };
+        for (const def of extraSeriesDefs) counts[`s_${def.id}`] = 0;
+        for (const row of data) {
+          for (const k of Object.keys(counts)) {
+            if (row[k] !== null && row[k] !== undefined) counts[k] += 1;
+          }
+        }
+        return counts;
+      })();
+      const tooltipLabelFmt = (v) => data.find((p) => p.idx === v)?.ts || String(v);
+      const seriesDescriptors = [
+        {
+          id: "_primary",
+          dataKey: "value",
+          kind: primaryKind,
+          name: primaryLabel,
+          color: primaryColor,
+          axis: "left",
+          unit: primaryUnit,
+          suffix: primarySuffix,
+          // Primary inherits the widget-wide style defaults (since the
+          // editor has no per-row entry for the primary trace).
+          line_width: styleLineWidth,
+          line_dot: dotPreset,
+          bar_width: barWidthPx,
+          bar_pattern: barPatternKind,
+          bar_opacity: barOpacity,
+        },
+        ...extraSeriesDefs.map((def, idx) => {
+          const fallbackPalette = ["#f97316", "#3b82f6", "#a855f7", "#dc2626", "#10b981", "#f59e0b"];
+          // Per-series style overrides. Fall back to the widget defaults
+          // when the row was created before this feature shipped (so old
+          // saved widgets keep looking the same).
+          return {
+            id: def.id,
+            dataKey: `s_${def.id}`,
+            kind: def.chart_type || primaryKind,
+            name: (def.label || def.tag_name) + (def.unit ? ` [${def.unit}]` : ""),
+            color: def.color || fallbackPalette[idx % fallbackPalette.length],
+            axis: def.axis,
+            unit: def.unit,
+            suffix: def.suffix,
+            line_width: Number.isFinite(Number(def.line_width)) ? Number(def.line_width) : styleLineWidth,
+            line_dot: ["none", "small", "medium", "large"].includes(String(def.line_dot || ""))
+              ? String(def.line_dot)
+              : dotPreset,
+            bar_width: Number.isFinite(Number(def.bar_width)) ? Number(def.bar_width) : barWidthPx,
+            bar_pattern: ["solid", "stripes-diag", "stripes-vert", "dots"].includes(String(def.bar_pattern || ""))
+              ? String(def.bar_pattern)
+              : barPatternKind,
+            bar_opacity: barOpacity,
+          };
+        }),
+      ];
+      const formatterByKey = {};
+      for (const s of seriesDescriptors) {
+        formatterByKey[s.name] = { unit: s.unit, suffix: s.suffix };
+      }
+
       return (
-        <div className="dashboard-widget-block dashboard-widget-block-chart">
-          {series.length ? (
-            <div className="dashboard-widget-chart">
-              {widget.type === "line_area_chart" ? (
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={series} margin={chartMargin}>
-                    <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                    <XAxis {...buildXAxisProps(series)} />
-                    <YAxis {...yAxisPresetProps} domain={yDomain} />
-                    <Tooltip
-                      {...chartTooltipProps}
-                      formatter={(v) => formatByPreset(v, chartValueFormat)}
-                      labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
-                    />
-                    {showChartLegend ? <Legend /> : null}
-                    <Area
-                      type={interpolation}
-                      dataKey="value"
-                      name={displayTag || "Value"}
-                      stroke={getWidgetAccent(widget, "#14a89a")}
-                      fill={rgbaFromHex(getWidgetAccent(widget, "#14a89a"), 0.24)}
-                      strokeWidth={2}
-                      label={showPointLabels ? { fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : false}
-                      isAnimationActive={false}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              ) : (
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={series} margin={chartMargin}>
-                    <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                    <XAxis {...buildXAxisProps(series)} />
-                    <YAxis {...yAxisPresetProps} domain={yDomain} />
-                    <Tooltip
-                      {...chartTooltipProps}
-                      formatter={(v) => formatByPreset(v, chartValueFormat)}
-                      labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
-                    />
-                    {showChartLegend ? <Legend /> : null}
-                    <Line
-                      type={interpolation}
-                      dataKey="value"
-                      name={displayTag || "Value"}
-                      stroke={getWidgetAccent(widget, "#14a89a")}
-                      strokeWidth={2}
-                      dot={false}
-                      label={showPointLabels ? { fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : false}
-                      isAnimationActive={false}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              )}
-            </div>
-          ) : trendIsInitialLoading ? renderEmpty("Loading...") : renderEmpty("No points")}
-        </div>
-      );
-    case "bar_chart":
-      return (
-        <div className="dashboard-widget-block dashboard-widget-block-chart">
-          {series.length ? (
+        <div
+          className={`dashboard-widget-block dashboard-widget-block-chart ${panEnabled ? "is-pannable" : ""}`}
+          data-series-points={JSON.stringify(seriesPointCounts)}
+          data-series-rows={data.length}
+          onPointerDown={onPanPointerDown}
+          onPointerMove={onPanPointerMove}
+          onPointerUp={onPanPointerUp}
+          onPointerCancel={onPanPointerUp}
+          title={panEnabled ? "Drag horizontally to pan back/forward through history" : undefined}
+        >
+          {dataNonEmpty ? (
             <div className="dashboard-widget-chart">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={series} margin={chartMargin}>
+                <ComposedChart data={data} margin={{ ...chartMargin, right: anyRightAxis ? 32 : chartMargin.right }}>
+                  {renderBarPattern(primaryColor)}
                   <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                  <XAxis {...buildXAxisProps(series)} />
-                  <YAxis {...yAxisPresetProps} domain={yDomain} />
+                  <XAxis {...buildXAxisProps(data)} />
+                  <YAxis
+                    yAxisId="left"
+                    {...yAxisPresetProps}
+                    domain={yDomain}
+                    label={primaryAxisLabel ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined}
+                  />
+                  {anyRightAxis ? (
+                    <YAxis
+                      yAxisId="right"
+                      orientation="right"
+                      {...yAxisPresetProps}
+                      label={rightAxisLabel ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined}
+                    />
+                  ) : null}
                   <Tooltip
                     {...chartTooltipProps}
-                    formatter={(v) => formatByPreset(v, chartValueFormat)}
-                    labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
+                    formatter={(v, name) => {
+                      const meta = formatterByKey[name] || {};
+                      return fmtValueByUnit(v, meta.unit || "", meta.suffix || "");
+                    }}
+                    labelFormatter={tooltipLabelFmt}
                   />
                   {showChartLegend ? <Legend /> : null}
-                  <Bar
-                    dataKey="value"
-                    name={displayTag || "Value"}
-                    label={showPointLabels ? { fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : false}
-                    fill={getWidgetAccent(widget, "#1f3a5f")}
-                  />
-                </BarChart>
+                  {seriesDescriptors.map((s) => {
+                    const yId = s.axis === "right" ? "right" : "left";
+                    // Per-series style: each series carries its own thickness/
+                    // dot/bar-width/pattern (with fallback to widget defaults).
+                    const seriesStrokeWidth = Math.max(1, Math.min(8, Number(s.line_width) || styleLineWidth));
+                    const seriesDotPreset = String(s.line_dot || dotPreset);
+                    const seriesDotSize = ({ none: 0, small: 2, medium: 4, large: 6 })[seriesDotPreset] || 0;
+                    const seriesDot = seriesDotSize
+                      ? { r: seriesDotSize, fill: s.color, stroke: s.color, strokeWidth: 0 }
+                      : false;
+                    const seriesActiveDot = { r: Math.max(3, seriesDotSize + 2), fill: s.color, stroke: "#fff", strokeWidth: 1 };
+                    const seriesBarWidth = Number.isFinite(Number(s.bar_width)) ? Number(s.bar_width) : barWidthPx;
+                    const seriesBarPattern = String(s.bar_pattern || barPatternKind);
+                    const seriesBarPatternId = seriesBarPattern === "solid"
+                      ? null
+                      : `${barPatternId}-${String(s.id).replace(/[^a-z0-9]/gi, "")}`;
+                    const seriesBarSizeProp = seriesBarWidth > 0 ? { barSize: seriesBarWidth } : {};
+                    const renderSeriesBarPattern = () => {
+                      if (!seriesBarPatternId) return null;
+                      if (seriesBarPattern === "stripes-diag") {
+                        return (
+                          <defs key={`def-${s.id}`}>
+                            <pattern id={seriesBarPatternId} patternUnits="userSpaceOnUse" width="8" height="8" patternTransform="rotate(45)">
+                              <rect width="4" height="8" fill={s.color} opacity={barOpacity} />
+                            </pattern>
+                          </defs>
+                        );
+                      }
+                      if (seriesBarPattern === "stripes-vert") {
+                        return (
+                          <defs key={`def-${s.id}`}>
+                            <pattern id={seriesBarPatternId} patternUnits="userSpaceOnUse" width="6" height="8">
+                              <rect width="3" height="8" fill={s.color} opacity={barOpacity} />
+                            </pattern>
+                          </defs>
+                        );
+                      }
+                      if (seriesBarPattern === "dots") {
+                        return (
+                          <defs key={`def-${s.id}`}>
+                            <pattern id={seriesBarPatternId} patternUnits="userSpaceOnUse" width="6" height="6">
+                              <circle cx="3" cy="3" r="1.5" fill={s.color} opacity={barOpacity} />
+                            </pattern>
+                          </defs>
+                        );
+                      }
+                      return null;
+                    };
+                    if (s.kind === "bar") {
+                      return (
+                        <React.Fragment key={s.id}>
+                          {renderSeriesBarPattern()}
+                          <Bar
+                            dataKey={s.dataKey}
+                            name={s.name}
+                            yAxisId={yId}
+                            fill={seriesBarPatternId ? `url(#${seriesBarPatternId})` : s.color}
+                            fillOpacity={seriesBarPatternId ? 1 : barOpacity}
+                            stroke={s.color}
+                            strokeWidth={seriesBarPatternId ? 1 : 0}
+                            isAnimationActive={false}
+                            {...seriesBarSizeProp}
+                          />
+                        </React.Fragment>
+                      );
+                    }
+                    if (s.kind === "area") {
+                      return (
+                        <Area
+                          key={s.id}
+                          type={interpolation}
+                          dataKey={s.dataKey}
+                          name={s.name}
+                          yAxisId={yId}
+                          stroke={s.color}
+                          fill={rgbaFromHex(s.color, 0.2)}
+                          strokeWidth={seriesStrokeWidth}
+                          dot={seriesDot}
+                          activeDot={seriesActiveDot}
+                          isAnimationActive={false}
+                          connectNulls
+                        />
+                      );
+                    }
+                    return (
+                      <Line
+                        key={s.id}
+                        type={interpolation}
+                        dataKey={s.dataKey}
+                        name={s.name}
+                        yAxisId={yId}
+                        stroke={s.color}
+                        strokeWidth={seriesStrokeWidth}
+                        dot={seriesDot}
+                        activeDot={seriesActiveDot}
+                        isAnimationActive={false}
+                        connectNulls
+                      />
+                    );
+                  })}
+                  {resolvedLimitLines.map((ll) => {
+                    if (!Number.isFinite(ll.resolved_value)) return null;
+                    const yId = ll.axis === "right" ? "right" : "left";
+                    const label = ll.label || (ll.tag_name ? `${ll.tag_name} limit` : "Limit");
+                    const dashByStyle = {
+                      solid: "0",
+                      dashed: "4 4",
+                      dotted: "1 4",
+                    };
+                    const dashArray = dashByStyle[String(ll.limit_dash || "dashed")] || "4 4";
+                    return (
+                      <ReferenceLine
+                        key={`limit-${ll.id}`}
+                        y={ll.resolved_value}
+                        yAxisId={yId}
+                        stroke={ll.color || "#dc2626"}
+                        strokeDasharray={dashArray}
+                        strokeWidth={1.5}
+                        ifOverflow="extendDomain"
+                        label={{
+                          value: `${label}: ${ll.resolved_value}`,
+                          position: "insideTopRight",
+                          fill: ll.color || "#dc2626",
+                          fontSize: 11,
+                        }}
+                      />
+                    );
+                  })}
+                </ComposedChart>
               </ResponsiveContainer>
             </div>
           ) : trendIsInitialLoading ? renderEmpty("Loading...") : renderEmpty("No points")}
         </div>
       );
+    }
     case "pie_chart": {
       const showLegend = parseBool(cfg.pie_show_legend, true);
       const showLabels = parseBool(cfg.pie_show_labels, true);
@@ -1683,10 +2327,31 @@ export function DashboardWidgetCard({
       );
       }
     case "value_kpi": {
-      const value = effectiveDataSourceType === "computed"
+      const isComputed = effectiveDataSourceType === "computed";
+      const value = isComputed
         ? parseNumber(computedItemsWithQuery[0]?.value)
         : parseNumber(latest?.last_value);
+      // Text-typed tags carry their original string in last_value_text. When
+      // there is no usable numeric value but we do have text, render the text
+      // (operators want to see e.g. "Run", "Idle", "Fault-23" — not "-").
+      const textValue = !isComputed && (value === null || value === undefined)
+        ? (latest?.last_value_text || null)
+        : null;
       const valueSize = computeWidgetTextScale(widget, 18, 46);
+      const textSize = computeWidgetTextScale(widget, 12, 30);
+      if (textValue !== null) {
+        return (
+          <div className="dashboard-widget-block">
+            <div
+              className="dashboard-kpi-value dashboard-kpi-text-value"
+              style={{ color: getWidgetAccent(widget, "#14a89a"), fontSize: `${textSize}px` }}
+              title={textValue}
+            >
+              {textValue || "-"}
+            </div>
+          </div>
+        );
+      }
       return (
         <div className="dashboard-widget-block">
           <div
@@ -1942,6 +2607,11 @@ export function DashboardWidgetCard({
                             if (col === "ts") return <td key={`${idx}-ts`}>{String(r?.ts || "-")}</td>;
                             if (col === "gateway") return <td key={`${idx}-gw`}>{String(r?.gateway_name || r?.gateway_id || "-")}</td>;
                             if (col === "tag") return <td key={`${idx}-tag`}>{formatTagForDisplay ? formatTagForDisplay(r?.tag || r?.tag_name || "-") : String(r?.tag || r?.tag_name || "-")}</td>;
+                            // String-typed tags expose value_text; show that when present, otherwise the numeric value.
+                            const txt = r?.value_text;
+                            if (txt !== null && txt !== undefined && txt !== "") {
+                              return <td key={`${idx}-value`} title={String(txt)}>{String(txt)}</td>;
+                            }
                             return <td key={`${idx}-value`}>{Number.isFinite(Number(r?.value)) ? Number(r.value).toFixed(3) : "-"}</td>;
                           })}
                         </tr>

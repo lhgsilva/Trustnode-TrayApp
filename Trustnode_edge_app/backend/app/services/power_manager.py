@@ -85,6 +85,11 @@ DEFAULT_DEVICE: dict[str, Any] = {
     "registers": DEFAULT_REGISTERS,
     "register_scales": {k: 1.0 for k in DEFAULT_REGISTERS.keys()},
     "include_raw_tags": False,
+    # Optional database connection id — matches PLC gateway behaviour. The
+    # local app-store historian is ALWAYS written (so the dashboard and
+    # reports stay live); this picks ADDITIONAL sinks (CSV/TXT/SQLite/etc.)
+    # to mirror the data into, exactly like the PLC db_sinks pipeline.
+    "database_id": "",
 }
 
 
@@ -162,6 +167,22 @@ class PowerManager:
         base = self._deep_copy(DEFAULT_DEVICE)
         if not isinstance(raw, dict):
             return base
+        def _to_int(v: Any, fallback: int) -> int:
+            try:
+                if v is None or v == "":
+                    return int(fallback)
+                return int(float(v))
+            except Exception:
+                return int(fallback)
+
+        def _to_float(v: Any, fallback: float) -> float:
+            try:
+                if v is None or v == "":
+                    return float(fallback)
+                return float(v)
+            except Exception:
+                return float(fallback)
+
         base["id"] = str(raw.get("id") or base["id"]).strip() or base["id"]
         base["name"] = str(raw.get("name") or base["name"]).strip() or base["id"]
         base["description"] = str(raw.get("description") or "")
@@ -169,9 +190,9 @@ class PowerManager:
         base["type"] = str(raw.get("type") or raw.get("protocol") or "modbus_tcp").strip().lower() or "modbus_tcp"
         base["protocol"] = base["type"]
         base["ip"] = str(raw.get("ip") or base["ip"]).strip() or base["ip"]
-        base["port"] = int(raw.get("port") or base["port"])
-        base["unit_id"] = int(raw.get("unit_id") or base["unit_id"])
-        base["poll_interval_ms"] = max(250, int(raw.get("poll_interval_ms") or base["poll_interval_ms"]))
+        base["port"] = _to_int(raw.get("port"), base["port"])
+        base["unit_id"] = _to_int(raw.get("unit_id"), base["unit_id"])
+        base["poll_interval_ms"] = max(250, _to_int(raw.get("poll_interval_ms"), base["poll_interval_ms"]))
         mode = str(raw.get("electrical_mode") or raw.get("wiring_type") or base["electrical_mode"]).strip().lower()
         if mode in {"three_phase_3w", "three_phase_4w"}:
             mode = "three_phase"
@@ -185,22 +206,22 @@ class PowerManager:
         base["wiring_type"] = mode
         base["voltage_connected"] = bool(raw.get("voltage_connected", True))
         base["ct_connected"] = bool(raw.get("ct_connected", True))
-        base["ct_primary"] = float(raw.get("ct_primary") or base["ct_primary"])
-        base["ct_secondary"] = max(0.0001, float(raw.get("ct_secondary") or base["ct_secondary"]))
-        base["vt_primary"] = float(raw.get("vt_primary") or base["vt_primary"])
-        base["vt_secondary"] = max(0.0001, float(raw.get("vt_secondary") or base["vt_secondary"]))
+        base["ct_primary"] = _to_float(raw.get("ct_primary"), base["ct_primary"])
+        base["ct_secondary"] = max(0.0001, _to_float(raw.get("ct_secondary"), base["ct_secondary"]))
+        base["vt_primary"] = _to_float(raw.get("vt_primary"), base["vt_primary"])
+        base["vt_secondary"] = max(0.0001, _to_float(raw.get("vt_secondary"), base["vt_secondary"]))
         base["use_custom_registers"] = bool(raw.get("use_custom_registers", False))
         resolved_registers = dict(REGISTER_PROFILES.get(base["register_profile"], DEFAULT_REGISTERS))
         regs = raw.get("registers")
         if isinstance(regs, dict):
             merged = dict(resolved_registers)
             for k, v in regs.items():
-                if v is None:
+                if v is None or v == "":
                     continue
                 key = str(k or "").strip()
                 if not key:
                     continue
-                merged[key] = int(v)
+                merged[key] = _to_int(v, merged.get(key, 0))
             resolved_registers = merged
             if raw.get("use_custom_registers") is None:
                 base["use_custom_registers"] = True
@@ -211,10 +232,13 @@ class PowerManager:
         raw_scales = raw.get("register_scales") if isinstance(raw, dict) else None
         if isinstance(raw_scales, dict):
             for k in resolved_registers.keys():
-                parsed = float(raw_scales.get(k) or 1.0)
+                parsed = _to_float(raw_scales.get(k), 1.0)
                 scale_map[k] = parsed if parsed != 0 else 1.0
         base["register_scales"] = scale_map
         base["include_raw_tags"] = bool(raw.get("include_raw_tags", base.get("include_raw_tags", False)))
+        # Carry through the chosen database connection id. Empty string means
+        # "local app-store only" (the default).
+        base["database_id"] = str(raw.get("database_id") or "").strip()
         return base
 
     def _normalize_config(self, raw: Any) -> dict[str, Any]:
@@ -250,14 +274,22 @@ class PowerManager:
                     continue
                 seen.add(d["id"])
                 devices.append(d)
-        if not devices:
+        # Only seed the example meter when the caller didn't pass a `devices`
+        # key at all (first-run / migration). If the caller explicitly sent
+        # an empty list (deletion of the last device) honor that — re-adding
+        # DEFAULT_DEVICE here made it impossible for operators to either
+        # remove the seeded "power_meter_01" or replace it with their own
+        # meter on a different IP.
+        if "devices" not in (raw or {}) and not devices:
             devices = [self._deep_copy(DEFAULT_DEVICE)]
         base["devices"] = devices
         requested_selected = str(raw.get("selected_device_id") or "").strip()
         if requested_selected and any(str(d.get("id")) == requested_selected for d in devices):
             base["selected_device_id"] = requested_selected
-        else:
+        elif devices:
             base["selected_device_id"] = str(devices[0]["id"])
+        else:
+            base["selected_device_id"] = ""
         return base
 
     def _force_stopped_config(self, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -646,6 +678,188 @@ class PowerManager:
                 except Exception:
                     self._dropped_rows += len(batch)
                 time.sleep(0.05)
+            # Side-channel fan-out to extra sinks chosen per device (CSV/TXT
+            # mirrors etc.). Best-effort: never blocks or fails the local
+            # historian write.
+            try:
+                self._fan_out_rows_to_device_sinks(batch)
+            except Exception:
+                pass
+
+    def _lookup_db_connection(self, db_id: str) -> dict[str, Any] | None:
+        if not db_id:
+            return None
+        try:
+            boot = self._app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+            rows = boot.get("database_configurations")
+            if not isinstance(rows, list):
+                return None
+            for r in rows:
+                if isinstance(r, dict) and str(r.get("id") or "") == str(db_id):
+                    return r
+        except Exception:
+            return None
+        return None
+
+    def _fan_out_rows_to_device_sinks(self, batch: list[dict[str, Any]]) -> None:
+        """Mirror power-meter rows to per-device extra sinks (CSV/TXT/SQLite).
+
+        The local app-store historian remains the source of truth — this just
+        adds optional side-channel writes so operators can ship the same data
+        to a file path or an external SQLite for downstream tooling. Mirrors
+        the PLC gateway fan-out behaviour so the UX is consistent.
+        """
+        if not batch:
+            return
+        # Group rows by device → look up the device's database_id once.
+        rows_by_device: dict[str, list[dict[str, Any]]] = {}
+        for row in batch:
+            did = str((row or {}).get("gateway_id") or "")
+            if not did:
+                continue
+            rows_by_device.setdefault(did, []).append(row)
+        if not rows_by_device:
+            return
+        cfg = self.get_config() or {}
+        devices = {str(d.get("id") or ""): d for d in (cfg.get("devices") or []) if isinstance(d, dict)}
+        for did, rows in rows_by_device.items():
+            device = devices.get(did) or {}
+            db_id = str(device.get("database_id") or "").strip()
+            if not db_id:
+                continue
+            sink = self._lookup_db_connection(db_id)
+            if not sink:
+                continue
+            engine = str(sink.get("engine") or "").strip().lower()
+            try:
+                if engine == "csv_file":
+                    self._sink_write_csv(sink, rows)
+                elif engine == "txt_file":
+                    self._sink_write_txt(sink, rows)
+                elif engine == "sqlite":
+                    self._sink_write_sqlite(sink, rows)
+                # Other engines (postgres/mysql/...) are not handled by the
+                # side-channel yet; the local app-store still has the data
+                # and can be synced upstream via the regular cloud pipeline.
+            except Exception:
+                pass
+
+    def _utc_str_to_local_iso(self, ts: str) -> str:
+        raw = str(ts or "").strip()
+        if not raw:
+            return ""
+        cand = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                parsed = datetime.strptime(cand.split("+", 1)[0], fmt)
+                return parsed.replace(tzinfo=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            except Exception:
+                continue
+        try:
+            return datetime.fromisoformat(cand).astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        except Exception:
+            return raw
+
+    def _sink_write_csv(self, sink: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+        import csv as _csv
+
+        file_path = str(sink.get("file_path") or "").strip()
+        if not file_path:
+            return
+        new_file = not os.path.exists(file_path) or os.path.getsize(file_path) == 0
+        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+        with open(file_path, "a", encoding="utf-8", newline="") as f:
+            writer = _csv.writer(f)
+            if new_file:
+                writer.writerow(["ts_local", "ts_utc", "gateway_id", "gateway_name", "tag_name", "value", "quality", "quality_label", "source"])
+            for r in rows:
+                ts_utc = str(r.get("ts_utc") or "")
+                writer.writerow([
+                    self._utc_str_to_local_iso(ts_utc),
+                    ts_utc,
+                    str(r.get("gateway_id") or ""),
+                    str(r.get("gateway_name") or ""),
+                    str(r.get("tag_name") or ""),
+                    r.get("value"),
+                    r.get("quality"),
+                    str(r.get("quality_label") or ""),
+                    str(r.get("source") or ""),
+                ])
+
+    def _sink_write_txt(self, sink: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+        file_path = str(sink.get("file_path") or "").strip()
+        if not file_path:
+            return
+        os.makedirs(os.path.dirname(file_path) or ".", exist_ok=True)
+        with open(file_path, "a", encoding="utf-8") as f:
+            for r in rows:
+                ts_utc = str(r.get("ts_utc") or "")
+                f.write(
+                    f"{self._utc_str_to_local_iso(ts_utc)}|{ts_utc}|"
+                    f"{r.get('gateway_id', '')}|{r.get('gateway_name', '')}|"
+                    f"{r.get('tag_name', '')}|{r.get('value')}|{r.get('quality')}|"
+                    f"{r.get('quality_label', '')}|{r.get('source', '')}\n"
+                )
+
+    def _sink_write_sqlite(self, sink: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+        try:
+            from sqlalchemy import create_engine, text  # type: ignore
+        except Exception:
+            return
+        sqlite_path = str(sink.get("sqlite_path") or "").strip()
+        if not sqlite_path:
+            return
+        table = str(sink.get("table") or "power_readings").strip() or "power_readings"
+        url = f"sqlite:///{sqlite_path}"
+        try:
+            os.makedirs(os.path.dirname(sqlite_path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        engine = create_engine(url, pool_pre_ping=True)
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS "{table}" (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      ts_utc TEXT NOT NULL,
+                      gateway_id TEXT NULL,
+                      gateway_name TEXT NULL,
+                      tag_name TEXT NOT NULL,
+                      value REAL NULL,
+                      quality INTEGER NULL,
+                      quality_label TEXT NULL,
+                      source TEXT NULL
+                    )
+                    """
+                ))
+                conn.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{table}"
+                        (ts_utc, gateway_id, gateway_name, tag_name, value, quality, quality_label, source)
+                        VALUES (:ts_utc, :gateway_id, :gateway_name, :tag_name, :value, :quality, :quality_label, :source)
+                        """
+                    ),
+                    [
+                        {
+                            "ts_utc": r.get("ts_utc"),
+                            "gateway_id": r.get("gateway_id"),
+                            "gateway_name": r.get("gateway_name"),
+                            "tag_name": r.get("tag_name"),
+                            "value": r.get("value"),
+                            "quality": r.get("quality"),
+                            "quality_label": r.get("quality_label"),
+                            "source": r.get("source"),
+                        }
+                        for r in rows
+                    ],
+                )
+        finally:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
 
     def _run_device_loop(self, device_id: str, stop_evt: threading.Event) -> None:
         next_due = time.monotonic()

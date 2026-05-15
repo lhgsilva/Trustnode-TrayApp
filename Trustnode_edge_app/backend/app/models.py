@@ -22,7 +22,13 @@ class GatewayConfig(BaseModel):
 class GatewayReading(BaseModel):
     ts_utc: str
     tag_name: str
+    # For numeric tags this carries the float value. For string-typed tags
+    # (PLC text registers, smart-meter strings, OPC-UA String/ByteString) we
+    # store the original text in `value_text` and set `value` to NaN-equivalent
+    # 0.0 so existing numeric consumers don't crash; downstream code should
+    # branch on `value_text is not None` to render text-first.
     value: float
+    value_text: str | None = None
     quality: int = 192
     quality_label: str = "GOOD"
     source: str

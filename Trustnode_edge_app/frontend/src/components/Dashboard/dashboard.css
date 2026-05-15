@@ -755,8 +755,37 @@
 /* Widened query builder for the table_list widget, which needs room for
    advanced columns + where conditions. The body becomes a vertically scrollable
    stack of compact fieldsets. */
-.dashboard-query-modal-wide {
-  width: min(1080px, 96vw);
+/* These selectors stack class names to beat global `.modal-card { width:
+   min(430px, 96vw) }` regardless of import order. */
+.modal-card.dashboard-query-modal-wide {
+  width: min(1080px, 96vw) !important;
+  max-width: none;
+}
+/* Series & axes editor needs more horizontal room so each series fits on one
+   row with all its columns visible at once. */
+.modal-card.dashboard-series-modal-wide {
+  width: min(1600px, 98vw) !important;
+  max-width: none;
+}
+
+/* Drag-to-scroll feedback: open-hand cursor when hovering a pannable chart
+   in historical mode; grabbing while the user is actually dragging. We force
+   the cursor through to every descendant (including Recharts' SVG) so the
+   visual cue doesn't disappear once the mouse is over the chart canvas. */
+.dashboard-widget-block-chart.is-pannable,
+.dashboard-widget-block-chart.is-pannable * {
+  cursor: grab !important;
+  touch-action: pan-y;
+}
+.dashboard-widget-block-chart.is-pannable:active,
+.dashboard-widget-block-chart.is-pannable:active * {
+  cursor: grabbing !important;
+}
+
+/* Limit-line row: subtle accent on the configured threshold row so it stands
+   out from regular data series in the editor. */
+.dashboard-series-row-limit {
+  background: rgba(220, 38, 38, 0.06);
 }
 .dashboard-query-modal-wide .dashboard-query-sections {
   display: flex;
@@ -765,6 +794,66 @@
   max-height: min(70vh, 720px);
   overflow-y: auto;
   padding-right: 4px;
+}
+
+/* One-row-per-series table. Columns are sized to fit gateway / tag / label /
+   axis / type / unit / suffix / color / remove on a single horizontal line. */
+.dashboard-series-table {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+.dashboard-series-table-head,
+.dashboard-series-table-row {
+  display: grid;
+  grid-template-columns:
+    minmax(120px, 1fr)     /* Gateway   */
+    minmax(140px, 1.2fr)   /* Tag       */
+    minmax(110px, 1fr)     /* Label     */
+    90px                   /* Axis      */
+    96px                   /* Type      */
+    72px                   /* Unit      */
+    72px                   /* Suffix    */
+    80px                   /* Size A    */
+    110px                  /* Size B    */
+    52px                   /* Color     */
+    36px;                  /* Remove    */
+  gap: 6px;
+  align-items: center;
+}
+.dashboard-series-table-head {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted, #94a3b8);
+  padding: 4px 4px 2px;
+  border-bottom: 1px solid var(--stroke, rgba(255,255,255,0.08));
+}
+.dashboard-series-table-row {
+  padding: 4px;
+  border-radius: 6px;
+}
+.dashboard-series-table-row:hover {
+  background: var(--card_2, rgba(255,255,255,0.03));
+}
+.dashboard-series-table-row > select,
+.dashboard-series-table-row > input {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  font-size: 12px;
+  background: var(--card, transparent);
+  color: var(--text, inherit);
+  border: 1px solid var(--stroke, rgba(255,255,255,0.12));
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.dashboard-series-table-row > input[type="color"] {
+  padding: 2px;
+  height: 30px;
+  cursor: pointer;
 }
 .dashboard-query-fieldset {
   border: 1px solid var(--stroke);
@@ -1153,4 +1242,86 @@
 .dashboard-widget-action-icon.danger:hover {
   border-color: var(--danger);
   color: var(--danger);
+}
+
+/* Profile carousel: toggle + interval row inside the cog modal. The slide
+   switch uses pure CSS to avoid pulling in a UI library. */
+.dashboard-carousel-row {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--stroke, rgba(255,255,255,0.08));
+}
+.dashboard-carousel-interval {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text, inherit);
+}
+.dashboard-carousel-interval input {
+  width: 70px;
+  padding: 4px 8px;
+  font-size: 12px;
+  background: var(--card, transparent);
+  color: var(--text, inherit);
+  border: 1px solid var(--stroke, rgba(255,255,255,0.12));
+  border-radius: 6px;
+}
+
+/* Slide toggle (lightweight, no library). Adapt to the app's theme tokens
+   so the on-state uses --teal in both light and dark mode. */
+.tn-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 13px;
+  font-weight: 600;
+}
+.tn-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.tn-switch-track {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  background: var(--card_2, rgba(255,255,255,0.08));
+  border: 1px solid var(--stroke, rgba(255,255,255,0.16));
+  border-radius: 999px;
+  transition: background 120ms ease, border-color 120ms ease;
+  flex-shrink: 0;
+}
+.tn-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  background: #d4d4d8;
+  border-radius: 50%;
+  transition: transform 120ms ease, background 120ms ease;
+}
+.tn-switch input:checked + .tn-switch-track {
+  background: var(--teal, #14a89a);
+  border-color: var(--teal, #14a89a);
+}
+.tn-switch input:checked + .tn-switch-track .tn-switch-thumb {
+  transform: translateX(16px);
+  background: #ffffff;
+}
+.tn-switch input:disabled + .tn-switch-track {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.tn-switch-label {
+  white-space: nowrap;
 }

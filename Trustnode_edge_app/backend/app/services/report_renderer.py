@@ -26,9 +26,45 @@ import hashlib
 import io
 import math
 import os
+import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+
+def _utc_str_to_local_iso(ts_utc: str) -> str:
+    """Convert a historian ts_utc string to the operator's local ISO string.
+
+    Mirror of the helper in plc_manager.py so reports + exports show the
+    timestamp the operator actually experienced, not raw UTC.
+    """
+    raw = str(ts_utc or "").strip()
+    if not raw:
+        return ""
+    cand = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
+    parsed: datetime | None = None
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
+        try:
+            parsed = datetime.strptime(cand.split("+", 1)[0], fmt)
+            break
+        except Exception:
+            continue
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(cand)
+        except Exception:
+            return raw
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    except Exception:
+        return raw
 from typing import Any
 
 from reportlab.lib import colors
@@ -157,17 +193,20 @@ def _normalize_series_list(section: dict[str, Any]) -> list[dict[str, Any]]:
     }]
 
 
-def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tuple[list[dict[str, Any]], list[list[tuple[str, float | None]]]]:
+def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tuple[list[dict[str, Any]], list[list[tuple[str, float | None, str | None]]]]:
     """Fetch each series independently then align by index.
 
     Returns:
       series_meta: list of normalized series dicts (length N)
-      aligned: list of N lists; each inner list is [(ts, value), ...] oldest-first
+      aligned: list of N lists; each inner list is [(ts, value, value_text), ...] oldest-first.
+        For numeric tags value_text is None; for string tags value is None and
+        value_text carries the original text. Charts ignore value_text; data
+        tables prefer value_text when set so operators see the actual string.
     """
     from_utc, to_utc = _resolve_time_range(section.get("time_range"))
     limit = max(20, min(int(section.get("readings_count") or default_limit), 5000))
     series_meta = _normalize_series_list(section)
-    aligned: list[list[tuple[str, float | None]]] = []
+    aligned: list[list[tuple[str, float | None, str | None]]] = []
     for s in series_meta:
         gw = (s.get("gateway_id") or "").strip()
         tag = (s.get("tag_name") or "").strip()
@@ -186,20 +225,27 @@ def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tu
         rows = list(reversed(rows or []))
         mult = float(s.get("multiplier") or 1.0)
         off = float(s.get("offset") or 0.0)
-        points: list[tuple[str, float | None]] = []
+        points: list[tuple[str, float | None, str | None]] = []
         for r in rows:
             try:
                 raw = r.get("value")
                 val = (float(raw) * mult + off) if raw is not None else None
             except Exception:
                 val = None
-            points.append((str(r.get("ts") or ""), val))
+            text_raw = r.get("value_text")
+            text_val = str(text_raw) if (text_raw is not None and text_raw != "") else None
+            points.append((str(r.get("ts") or ""), val, text_val))
         aligned.append(points)
     return series_meta, aligned
 
 
-def _fetch_kpi_value(item: dict[str, Any]) -> tuple[float | None, int]:
-    """Return (value, sample_count) for a single KPI cell."""
+def _fetch_kpi_value(item: dict[str, Any]) -> tuple[float | None, int, str | None]:
+    """Return (value, sample_count, text_value) for a single KPI cell.
+
+    For numeric tags `text_value` is None and `value` holds the aggregate.
+    For string-typed tags `value` is None and `text_value` carries the most
+    recent text reading; the KPI cell renders the text directly.
+    """
     rule = {
         "id": item.get("id") or uuid.uuid4().hex,
         "label": item.get("label") or "",
@@ -212,11 +258,34 @@ def _fetch_kpi_value(item: dict[str, Any]) -> tuple[float | None, int]:
         "color": item.get("color") or "#14a89a",
     }
     rows = _app_store().get_historian_rule_stats(rules=[rule], gateway=rule["gateway_id"], prefer_cloud_reads=False)
-    if not rows:
-        return (None, 0)
-    row = rows[0] or {}
-    v = row.get("value")
-    return (float(v) if v is not None else None, int(row.get("count") or 0))
+    numeric_val: float | None = None
+    sample_count = 0
+    if rows:
+        row = rows[0] or {}
+        v = row.get("value")
+        try:
+            numeric_val = float(v) if v is not None else None
+        except Exception:
+            numeric_val = None
+        sample_count = int(row.get("count") or 0)
+    if numeric_val is not None:
+        return (numeric_val, sample_count, None)
+    # Text-tag fallback: look up the most recent text value via the historian
+    # range query. If none, return None so the KPI cell renders "-".
+    try:
+        rows_text = _app_store().get_historian_rows_range(
+            gateway=rule["gateway_id"],
+            tag=rule["tag_name"],
+            limit=1,
+            prefer_cloud_reads=False,
+        )
+    except Exception:
+        rows_text = []
+    if rows_text:
+        text_value = rows_text[0].get("value_text") or None
+        if text_value:
+            return (None, sample_count or 1, str(text_value))
+    return (numeric_val, sample_count, None)
 
 
 def _fetch_pie_data(section: dict[str, Any]) -> list[tuple[str, float, str]]:
@@ -348,6 +417,30 @@ def _resolve_logo_path() -> Path | None:
     candidates: list[Path] = []
     if env_path:
         candidates.append(Path(env_path))
+    # PyInstaller frozen path: assets are extracted under sys._MEIPASS at runtime.
+    # The spec embeds branding/ via the datas list, and we also keep a flat copy
+    # at the bundle root for backward compatibility.
+    frozen_base = getattr(sys, "_MEIPASS", None)
+    if frozen_base:
+        frozen_root = Path(frozen_base)
+        candidates.extend([
+            frozen_root / "branding" / "trustenode-004.png",
+            frozen_root / "branding" / "trustnode_logo.png",
+            frozen_root / "trustenode-004.png",
+            frozen_root / "trustnode_logo.png",
+        ])
+    # Onedir frozen path: assets live next to the executable.
+    if getattr(sys, "frozen", False):
+        try:
+            exe_dir = Path(sys.executable).resolve().parent
+            candidates.extend([
+                exe_dir / "branding" / "trustenode-004.png",
+                exe_dir / "branding" / "trustnode_logo.png",
+                exe_dir / "trustenode-004.png",
+                exe_dir / "trustnode_logo.png",
+            ])
+        except Exception:
+            pass
     # backend/app/services/report_renderer.py -> 3 parents up -> Trustnode_edge_app/
     here = Path(__file__).resolve()
     edge_app_root = here.parents[3] if len(here.parents) >= 4 else None
@@ -480,9 +573,18 @@ def _section_kpi_grid(section: dict[str, Any], styles, story: list) -> None:
     row: list = []
     cols = max(1, min(int(section.get("columns") or 4), 6))
     for item in items:
-        value, sample_count = _fetch_kpi_value(item)
+        value, sample_count, text_val = _fetch_kpi_value(item)
         label = str(item.get("label") or item.get("tag_name") or "")
-        value_text = "-" if value is None else (f"{value:.2f}" if abs(value) < 1000 else f"{value:.0f}")
+        if text_val:
+            # Text-typed tag: show the latest string verbatim. Trim long
+            # values so they fit a KPI cell — full text stays in the data
+            # table sections if needed.
+            display = text_val if len(text_val) <= 24 else text_val[:23] + "…"
+            value_text = display
+        elif value is None:
+            value_text = "-"
+        else:
+            value_text = (f"{value:.2f}" if abs(value) < 1000 else f"{value:.0f}")
         cell = [
             Paragraph(value_text, styles["kpi_value"]),
             Paragraph(label, styles["kpi_label"]),
@@ -838,7 +940,10 @@ def build_chart_section_rows(section: dict[str, Any]) -> tuple[list[str], list[l
     series_meta, aligned = _fetch_multi_series(section)
     if not series_meta or all(not pts for pts in aligned):
         return [], []
-    header = ["Timestamp"]
+    # Two leading columns: human-friendly local time + the raw UTC. Tools
+    # downstream (Excel, BI imports) can keep using ts_utc as the canonical
+    # timeline while operators reading the file see their wall-clock time.
+    header = ["Timestamp (local)", "Timestamp (UTC)"]
     for s in series_meta:
         label = (s.get("label") or s.get("tag_name") or "Value").strip()
         unit = (s.get("unit") or "").strip()
@@ -847,7 +952,9 @@ def build_chart_section_rows(section: dict[str, Any]) -> tuple[list[str], list[l
     timeline = aligned[longest]
     body: list[list[Any]] = []
     for i in range(len(timeline)):
-        row: list[Any] = [str(timeline[i][0] or "")[:23]]
+        ts_utc_raw = str(timeline[i][0] or "")
+        ts_local = _utc_str_to_local_iso(ts_utc_raw)[:23]
+        row: list[Any] = [ts_local, ts_utc_raw[:23]]
         for j, _meta in enumerate(series_meta):
             pts = aligned[j]
             if i < len(pts):
@@ -1021,7 +1128,10 @@ def _build_data_table_rows(section: dict[str, Any]) -> tuple[list[str], list[lis
             key = str(col.get("key") or "").lower()
             if key == "ts":
                 ts_val = timeline[i][0]
-                cells.append(str(ts_val or "")[:23])
+                # Reports should show the operator's local time. We still
+                # accept ts_utc as the source of truth in the historian.
+                local = _utc_str_to_local_iso(str(ts_val or ""))
+                cells.append(local[:23] if local else str(ts_val or "")[:23])
                 continue
             if key in ("tag", "gateway", "quality"):
                 # The original historian row isn't carried into the aligned
@@ -1043,7 +1153,13 @@ def _build_data_table_rows(section: dict[str, Any]) -> tuple[list[str], list[lis
                 if i >= len(pts):
                     cells.append("-")
                     continue
-                cells.append(_fmt(pts[i][1], col.get("format"), col.get("unit")))
+                # Prefer the text value when present (string-typed tag).
+                point = pts[i]
+                text_val = point[2] if len(point) > 2 else None
+                if text_val:
+                    cells.append(str(text_val))
+                else:
+                    cells.append(_fmt(point[1], col.get("format"), col.get("unit")))
                 continue
             if key == "calc":
                 expr = str(col.get("expr") or "")

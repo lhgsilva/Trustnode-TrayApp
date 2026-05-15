@@ -14,11 +14,23 @@ let backendExitCode = null;
 const backendLogs = [];
 let ownsBackendProcess = false;
 let backendMonitorTimer = null;
-const APP_DISPLAY_NAME = "Trustnode";
-const APP_WINDOW_TITLE = "Trustnode";
+const APP_DISPLAY_NAME = "TrustNode";
+const APP_WINDOW_TITLE = "TrustNode";
 const BACKEND_EXE_NAME = "trustnode-service.exe";
 const LEGACY_USER_DATA_DIR = "trustnode-edge-desktop";
 const PREVIOUS_USER_DATA_DIRS = ["trustnode-desktop"];
+
+// Override the app name BEFORE the single-instance request so any Windows
+// shell prompts (jump list, "More info" prompts, OS dialogs) show TrustNode
+// instead of the default "Electron". Setting it on the app instance alone
+// is not enough — process.title also drives the right-click context menu
+// label on Windows for the running process.
+try { app.setName(APP_DISPLAY_NAME); } catch (_) {}
+try { if (process && process.title) process.title = APP_DISPLAY_NAME; } catch (_) {}
+if (process.platform === "win32") {
+  try { app.setAppUserModelId("com.trustnode.edge"); } catch (_) {}
+}
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
 if (!gotSingleInstanceLock) {
@@ -86,6 +98,38 @@ const UI_SOURCE_FILE = "ui-source.json";
 let currentBackendHost = BACKEND_HOST;
 let currentBackendPort = BACKEND_PORT;
 let currentOverlayTheme = "dark";
+
+// Pin the backend's writable data dir to a predictable per-user location so the
+// portable / installed builds behave identically on a fresh Windows profile.
+// IMPORTANT: existing installs already store data under ~/.trustnode_edge/data
+// (the backend's historical default). If that dir exists and is populated we
+// must keep using it — switching paths would orphan the historian DB, license
+// state, gateway configs and dashboards.
+function resolveBackendDataDir() {
+  if (process.env.TRUSTNODE_DATA_DIR) return process.env.TRUSTNODE_DATA_DIR;
+  const legacyDir = path.join(app.getPath("home"), ".trustnode_edge", "data");
+  try {
+    if (fs.existsSync(legacyDir)) {
+      const entries = fs.readdirSync(legacyDir);
+      if (entries.length > 0) return legacyDir;
+    }
+  } catch (_) {}
+  if (process.platform === "win32") {
+    const localAppData = process.env.LOCALAPPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Local");
+    if (localAppData) return path.join(localAppData, "TrustNode", "data");
+  }
+  return legacyDir;
+}
+
+function ensureBackendDataDir(dir) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    return true;
+  } catch (err) {
+    logBackend(`Failed to create backend data dir ${dir}: ${String(err)}`);
+    return false;
+  }
+}
 
 function resolveOverlayPalette(mode) {
   const m = String(mode || "").toLowerCase() === "light" ? "light" : "dark";
@@ -346,16 +390,21 @@ async function startBackend() {
   backendExited = false;
   backendExitCode = null;
 
+  const dataDir = resolveBackendDataDir();
+  ensureBackendDataDir(dataDir);
+  const sharedEnv = {
+    ...process.env,
+    TRUSTNODE_HOST: currentBackendHost,
+    TRUSTNODE_PORT: String(currentBackendPort),
+    TRUSTNODE_DATA_DIR: dataDir
+  };
+
   if (process.env.TRUSTNODE_BACKEND_CMD) {
     backendProc = spawn(process.env.TRUSTNODE_BACKEND_CMD, {
       shell: true,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
-      env: {
-        ...process.env,
-        TRUSTNODE_HOST: currentBackendHost,
-        TRUSTNODE_PORT: String(currentBackendPort)
-      }
+      env: sharedEnv
     });
   } else if (app.isPackaged) {
     const backendExe = path.join(process.resourcesPath, "backend", BACKEND_EXE_NAME);
@@ -367,11 +416,7 @@ async function startBackend() {
       cwd: path.dirname(backendExe),
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        TRUSTNODE_HOST: currentBackendHost,
-        TRUSTNODE_PORT: String(currentBackendPort)
-      }
+      env: sharedEnv
     });
   } else {
     const backendCwd = path.resolve(__dirname, "../backend");
@@ -379,11 +424,7 @@ async function startBackend() {
       cwd: backendCwd,
       shell: true,
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        TRUSTNODE_HOST: currentBackendHost,
-        TRUSTNODE_PORT: String(currentBackendPort)
-      }
+      env: sharedEnv
     });
   }
   ownsBackendProcess = true;
@@ -619,6 +660,26 @@ function createWindow() {
     const mode = String(payload?.mode || currentOverlayTheme || "dark").toLowerCase() === "light" ? "light" : "dark";
     return applyOverlayTheme(resolveOverlayPalette(mode));
   });
+
+  ipcMain.removeHandler("dialog:pick-folder");
+  ipcMain.handle("dialog:pick-folder", async (_event, options = {}) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return null;
+    try {
+      const defaultPath = String(options?.defaultPath || "").trim() || undefined;
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: String(options?.title || "Choose a folder"),
+        properties: ["openDirectory", "createDirectory"],
+        defaultPath,
+        buttonLabel: String(options?.buttonLabel || "Select folder")
+      });
+      if (result.canceled) return null;
+      const picked = Array.isArray(result.filePaths) ? result.filePaths[0] : null;
+      return picked ? String(picked) : null;
+    } catch (err) {
+      logBackend(`Folder picker failed: ${String(err)}`);
+      return null;
+    }
+  });
 }
 
 function monitorBackendStartup() {
@@ -627,7 +688,10 @@ function monitorBackendStartup() {
   // to stabilize (or restart once) after process spawn. Keep polling first,
   // and only show an error page if it stays unhealthy for an extended period.
   const startedAt = Date.now();
-  const maxWaitMs = 35000;
+  // First-launch onedir extraction + AV scanning on a fresh Windows machine
+  // can take well over a minute. 90s gives the backend room to stabilize
+  // before we paint a failure page.
+  const maxWaitMs = 90000;
   const pollMs = 2000;
   const timer = setInterval(() => {
     if (!mainWindow || !mainWindow.webContents || mainWindow.isDestroyed()) {
@@ -651,15 +715,27 @@ function monitorBackendStartup() {
       logBackend(
         `Backend unavailable after startup grace period (host=${currentBackendHost}:${currentBackendPort}, exitCode=${backendExitCode ?? "n/a"}). Recent logs:\n${details}`
       );
+      const tailLines = backendLogs.slice(-15).join("\n");
+      const safeTail = tailLines
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      const failurePage = `<html><body style="font-family:Segoe UI;padding:24px;color:#111827;background:#fff">
+            <h2>TrustNode service did not start</h2>
+            <p>The local backend at <code>http://${currentBackendHost}:${currentBackendPort}</code> is not responding.</p>
+            <p><strong>Common causes on a fresh machine:</strong></p>
+            <ul>
+              <li>Windows SmartScreen or antivirus blocked <code>trustnode-service.exe</code>. Allow it and relaunch.</li>
+              <li>First-launch extraction is slow — wait 30s and reopen the app.</li>
+              <li>Another process is holding port ${currentBackendPort}.</li>
+            </ul>
+            <p>Full log: <code>${path.join(app.getPath("userData"), "backend.log").replace(/\\/g, "\\\\")}</code></p>
+            <details><summary>Recent backend output</summary>
+              <pre style="background:#f3f4f6;padding:12px;border-radius:6px;white-space:pre-wrap;font-size:12px">${safeTail || "(no output captured)"}</pre>
+            </details>
+          </body></html>`;
       mainWindow.loadURL(
-        "data:text/html;charset=utf-8," +
-          encodeURIComponent(
-            `<html><body style="font-family:Segoe UI;padding:24px;color:#111827;background:#fff">
-              <h2>Service temporarily unavailable</h2>
-              <p>TrustNode service is restarting. Please wait a few seconds and try again.</p>
-              <p>If this persists, restart the TrustNode application.</p>
-            </body></html>`
-          )
+        "data:text/html;charset=utf-8," + encodeURIComponent(failurePage)
       );
     });
   }, pollMs);
@@ -746,7 +822,10 @@ function createTray() {
 app.whenReady().then(async () => {
   app.setName(APP_DISPLAY_NAME);
   if (process.platform === "win32") {
-    app.setAppUserModelId("com.trustnode.app");
+    // Keep the AppUserModelId aligned with electron-builder's appId so the
+    // shortcut and the running process share an identity (otherwise Windows
+    // shows the tray icon as a separate "Electron" app in the start menu).
+    app.setAppUserModelId("com.trustnode.edge");
     // Avoid killing backend images on startup by default.
     // On some machines this creates startup races where UI loads before a stable API.
     const killOnStart = String(process.env.TRUSTNODE_KILL_STALE_BACKEND_ON_START || "0").toLowerCase();

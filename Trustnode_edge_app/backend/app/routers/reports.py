@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import io
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +82,100 @@ def delete_template(template_id: str) -> dict[str, Any]:
     if not ok:
         raise HTTPException(status_code=404, detail="Template not found")
     return {"ok": True}
+
+
+# Portable bundle format shared by export/import so users can move templates
+# between TrustNode edges. Keep this stable; bump `bundle_version` if you
+# make breaking changes to the schema.
+_BUNDLE_VERSION = 1
+_BUNDLE_KIND = "trustnode.report-template-bundle"
+
+
+@router.get("/templates/{template_id}/export")
+def export_template(template_id: str) -> dict[str, Any]:
+    tpl = reports_store.get_template(template_id)
+    if not tpl:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {
+        "kind": _BUNDLE_KIND,
+        "bundle_version": _BUNDLE_VERSION,
+        "exported_utc": datetime.now(timezone.utc).isoformat(),
+        "templates": [
+            {
+                "name": tpl.get("name"),
+                "description": tpl.get("description"),
+                "definition": tpl.get("definition") or {},
+            }
+        ],
+    }
+
+
+@router.get("/templates-export-all")
+def export_all_templates() -> dict[str, Any]:
+    rows = reports_store.list_templates()
+    return {
+        "kind": _BUNDLE_KIND,
+        "bundle_version": _BUNDLE_VERSION,
+        "templates": [
+            {
+                "name": r.get("name"),
+                "description": r.get("description"),
+                "definition": r.get("definition") or {},
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.post("/templates/import")
+def import_templates(
+    payload: dict[str, Any] = Body(...),
+    request: Request = None,
+) -> dict[str, Any]:
+    """Accept a bundle (or a single template) and persist it as new template(s).
+
+    Behavior:
+      * Always allocates new IDs so an imported template never clobbers an
+        existing one on the target edge.
+      * If a template with the same name already exists, the imported copy is
+        renamed with a numeric suffix to keep both.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be an object")
+
+    items: list[dict[str, Any]] = []
+    # Accept either a bundle ({templates: [...]}) or a single template
+    # ({name, definition}) for convenience.
+    if isinstance(payload.get("templates"), list):
+        for entry in payload["templates"]:
+            if isinstance(entry, dict):
+                items.append(entry)
+    elif payload.get("name") or payload.get("definition"):
+        items.append(payload)
+    else:
+        raise HTTPException(status_code=400, detail="No templates found in payload")
+
+    existing_names = {str(r.get("name") or "").strip().lower() for r in reports_store.list_templates()}
+    created_by = _username_from_request(request) if request else None
+    imported: list[dict[str, Any]] = []
+    for entry in items:
+        raw_name = str(entry.get("name") or "Untitled report").strip() or "Untitled report"
+        name = raw_name
+        suffix = 2
+        while name.lower() in existing_names:
+            name = f"{raw_name} ({suffix})"
+            suffix += 1
+        existing_names.add(name.lower())
+        saved = reports_store.upsert_template(
+            {
+                "name": name,
+                "description": str(entry.get("description") or ""),
+                "definition": entry.get("definition") or {},
+            },
+            created_by=created_by,
+        )
+        imported.append(saved)
+    return {"ok": True, "imported": imported, "count": len(imported)}
 
 
 # --------------------------------------------------------------------------- #

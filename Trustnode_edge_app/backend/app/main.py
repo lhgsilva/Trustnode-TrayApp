@@ -20,6 +20,7 @@ from app.routers.telemetry_v1 import router as telemetry_v1_router
 from app.routers.power import router as power_router
 from app.routers.control_plane import router as control_plane_router
 from app.routers.reports import router as reports_router
+from app.routers.cloud_live import router as cloud_live_router
 from app.state import (
     plc_manager,
     app_store,
@@ -32,6 +33,91 @@ from app.state import (
 from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
 
 app = FastAPI(title="Trustnode Edge API", version="0.1.0")
+
+
+class CloudLiveAuthMiddleware:
+    """Pure ASGI middleware that handles auth for the SSE stream.
+
+    Starlette's `BaseHTTPMiddleware` (used by `@app.middleware("http")`)
+    materializes the response before returning, which breaks SSE
+    streams ("RuntimeError: No response returned."). This pure ASGI
+    middleware checks auth for /api/cloud-live/ paths and forwards
+    everything else to the next ASGI app — which is the FastAPI app
+    *with* the regular BaseHTTPMiddleware still running for non-SSE
+    routes.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        # Token can come from Authorization: Bearer OR ?token= query
+        # (EventSource cannot set custom headers). The cloud-live router
+        # then reads `get_current_tenant()` to scope rows.
+        headers = {k.decode("latin1").lower(): v.decode("latin1") for k, v in scope.get("headers") or []}
+        token = ""
+        authz = headers.get("authorization", "")
+        if authz.lower().startswith("bearer "):
+            token = authz.split(" ", 1)[1].strip()
+        if not token:
+            qs = scope.get("query_string") or b""
+            try:
+                from urllib.parse import parse_qs
+                token = (parse_qs(qs.decode("latin1")).get("token") or [""])[0].strip()
+            except Exception:
+                token = ""
+        if not token:
+            await send({"type": "http.response.start", "status": 401, "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": b'{"detail":"Authentication required"}'})
+            return
+        try:
+            payload = decode_access_token(token)
+        except Exception as exc:
+            body = ('{"detail":"Invalid token: ' + str(exc).replace('"', "'") + '"}').encode("utf-8")
+            await send({"type": "http.response.start", "status": 401, "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        # Tenant resolution mirrors the http middleware below: host header
+        # tenant must match the token tenant unless host resolves to default.
+        try:
+            host_tenant = resolve_request_tenant(_FakeRequest(scope))
+        except Exception:
+            host_tenant = "default"
+        token_tenant = str(payload.get("tenant_id") or "").strip()
+        if token_tenant:
+            normalized = set_current_tenant(token_tenant)
+            if host_tenant and host_tenant != "default" and normalized != host_tenant:
+                await send({"type": "http.response.start", "status": 403, "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": b'{"detail":"Token tenant mismatch"}'})
+                return
+        elif host_tenant:
+            set_current_tenant(host_tenant)
+        # Stash payload onto scope so the endpoint can read it if needed.
+        scope.setdefault("state", {})["user_payload"] = payload
+        return await self.app(scope, receive, send)
+
+
+class _FakeRequest:
+    """Minimal stand-in for `Request` that satisfies resolve_request_tenant."""
+
+    def __init__(self, scope):
+        self._scope = scope
+
+    @property
+    def headers(self):
+        out = {}
+        for k, v in self._scope.get("headers") or []:
+            out[k.decode("latin1").lower()] = v.decode("latin1")
+        return out
+
+    @property
+    def url(self):
+        from urllib.parse import urlparse
+        path = self._scope.get("path") or "/"
+        return urlparse(path)
+
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
@@ -53,6 +139,19 @@ app.include_router(telemetry_v1_router)
 app.include_router(power_router)
 app.include_router(control_plane_router)
 app.include_router(reports_router)
+
+# The cloud-live SSE endpoint lives in a SEPARATE FastAPI app so it does
+# NOT inherit the main app's BaseHTTPMiddleware (which buffers responses
+# and breaks `StreamingResponse` with "No response returned"). A top-level
+# ASGI dispatcher (see bottom of file) routes /api/cloud-live/* directly
+# into this sub-app, bypassing the main app's middleware chain entirely.
+from fastapi import APIRouter as _APIRouter
+from app.routers.cloud_live import cloud_live_stream as _cloud_live_stream_handler
+_cloud_live_app = FastAPI(title="TrustNode Cloud Live", openapi_url=None, docs_url=None, redoc_url=None)
+_cloud_live_inner_router = _APIRouter()
+_cloud_live_inner_router.add_api_route("/stream", _cloud_live_stream_handler, methods=["GET"])
+_cloud_live_app.include_router(_cloud_live_inner_router)
+_cloud_live_app.add_middleware(CloudLiveAuthMiddleware)
 
 
 @app.on_event("startup")
@@ -120,6 +219,10 @@ async def auth_middleware(request: Request, call_next):
     if method == "OPTIONS":
         return _apply_no_cache_headers(await call_next(request))
     if not path.startswith("/api/"):
+        return await call_next(request)
+    # /api/cloud-live/* is handled by the pure-ASGI CloudLiveAuthMiddleware
+    # above (BaseHTTPMiddleware can't stream SSE).
+    if path.startswith("/api/cloud-live/"):
         return await call_next(request)
     # v1 telemetry endpoints use explicit auth inside router handlers
     # (device tokens for ingest, user tokens for query/admin).
@@ -326,3 +429,34 @@ async def on_shutdown() -> None:
     telemetry_service.shutdown()
     power_manager.shutdown()
     app_store.shutdown()
+
+
+_main_app = app
+
+
+class _AsgiDispatcher:
+    """Top-level ASGI dispatcher that splits /api/cloud-live/* off the main
+    app's middleware chain so SSE can stream without being buffered by
+    BaseHTTPMiddleware. All other traffic — including the lifespan
+    protocol — flows through the original FastAPI app unchanged.
+    """
+
+    def __init__(self, main, cloud_live):
+        self._main = main
+        self._cloud_live = cloud_live
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            path = str(scope.get("path") or "")
+            if path.startswith("/api/cloud-live/"):
+                sub_scope = dict(scope)
+                sub_scope["path"] = path[len("/api/cloud-live"):] or "/"
+                raw_path = scope.get("raw_path")
+                if isinstance(raw_path, (bytes, bytearray)):
+                    sub_scope["raw_path"] = bytes(raw_path)[len(b"/api/cloud-live"):] or b"/"
+                sub_scope["root_path"] = (scope.get("root_path") or "") + "/api/cloud-live"
+                return await self._cloud_live(sub_scope, receive, send)
+        return await self._main(scope, receive, send)
+
+
+app = _AsgiDispatcher(_main_app, _cloud_live_app)

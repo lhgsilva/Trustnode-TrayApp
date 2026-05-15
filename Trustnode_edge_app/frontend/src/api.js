@@ -1224,7 +1224,26 @@ export async function updatePowerConfig(payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   });
-  if (!res.ok) throw new Error("Power config update failed");
+  if (!res.ok) {
+    // Surface the backend reason so operators can see WHICH field rejected
+    // (Pydantic / power_manager normalization errors land here). Without this
+    // detail the UI just shows "Power config update failed" and the user
+    // has no idea what to fix.
+    let detail = "";
+    try {
+      const body = await res.clone().text();
+      try {
+        const j = JSON.parse(body);
+        detail = String(j?.detail || j?.message || body || "");
+      } catch {
+        detail = body;
+      }
+    } catch {
+      // body unreadable — fall through with generic message
+    }
+    const msg = `Power config update failed (HTTP ${res.status})${detail ? `: ${detail.slice(0, 400)}` : ""}`;
+    throw new Error(msg);
+  }
   return res.json();
 }
 
@@ -2036,6 +2055,30 @@ export async function deleteReportTemplate(templateId) {
     method: "DELETE",
   });
   await ensureOk(res, "Delete report template failed");
+  return res.json();
+}
+
+export async function exportReportTemplate(templateId) {
+  const res = await fetchWithTimeout(
+    `${_reportApiBase()}/api/reports/templates/${encodeURIComponent(templateId)}/export`
+  );
+  await ensureOk(res, "Export report template failed");
+  return res.json();
+}
+
+export async function exportAllReportTemplates() {
+  const res = await fetchWithTimeout(`${_reportApiBase()}/api/reports/templates-export-all`);
+  await ensureOk(res, "Export report templates failed");
+  return res.json();
+}
+
+export async function importReportTemplates(bundle) {
+  const res = await fetchWithTimeout(`${_reportApiBase()}/api/reports/templates/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(bundle || {}),
+  });
+  await ensureOk(res, "Import report templates failed");
   return res.json();
 }
 

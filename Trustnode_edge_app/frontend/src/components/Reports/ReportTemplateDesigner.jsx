@@ -18,10 +18,13 @@ import {
 import {
   deleteReportTemplate,
   downloadGeneratedReportBlob,
+  exportAllReportTemplates,
+  exportReportTemplate,
   exportSectionCsv,
   exportSectionTxt,
   getAppStoreHistorianRange,
   getGeneratedReportFileUrl,
+  importReportTemplates,
   listReportTemplates,
   renderReportPreview,
   saveReportTemplate,
@@ -134,6 +137,133 @@ function toUtcFilterText(preset, fromUtc, toUtc) {
 // ---------------------------------------------------------------------------
 // default section factory
 // ---------------------------------------------------------------------------
+// Preset starter templates so users can begin from a sensible skeleton
+// instead of an empty draft. They map gateway_id / tag_name to "" so the
+// operator can pick concrete tags in the section editor before saving.
+function makePresetTemplate(presetKey) {
+  switch (presetKey) {
+    case "daily_summary":
+      return {
+        name: "Daily production summary",
+        description: "Header + KPI grid + 24h trend + recent samples table",
+        sections: [
+          { ...defaultSection("header"), title: "Daily Production Summary", subtitle: "Last 24 hours" },
+          {
+            ...defaultSection("kpi_grid"),
+            title: "Key indicators",
+            columns: 4,
+            items: [
+              { id: makeId("kpi"), label: "Total count", gateway_id: "", tag_name: "", aggregation: "sum", operator: "any" },
+              { id: makeId("kpi"), label: "Average", gateway_id: "", tag_name: "", aggregation: "avg", operator: "any" },
+              { id: makeId("kpi"), label: "Peak", gateway_id: "", tag_name: "", aggregation: "max", operator: "any" },
+              { id: makeId("kpi"), label: "Min", gateway_id: "", tag_name: "", aggregation: "min", operator: "any" },
+            ],
+          },
+          { ...defaultSection("line_chart"), title: "24h trend", time_range: { preset: "24h" } },
+          { ...defaultSection("table"), title: "Recent samples", time_range: { preset: "1h" }, row_limit: 50 },
+        ],
+      };
+    case "energy_consumption":
+      return {
+        name: "Energy consumption",
+        description: "Energy/power overview with dual-axis chart and totals",
+        sections: [
+          { ...defaultSection("header"), title: "Energy Consumption Report", subtitle: "Power / Current / Voltage" },
+          {
+            ...defaultSection("kpi_grid"),
+            title: "Totals",
+            columns: 3,
+            items: [
+              { id: makeId("kpi"), label: "kWh consumed", gateway_id: "", tag_name: "", aggregation: "sum", operator: "any" },
+              { id: makeId("kpi"), label: "Avg load (kW)", gateway_id: "", tag_name: "", aggregation: "avg", operator: "any" },
+              { id: makeId("kpi"), label: "Peak load (kW)", gateway_id: "", tag_name: "", aggregation: "max", operator: "any" },
+            ],
+          },
+          {
+            ...defaultSection("line_chart"),
+            title: "Power vs current (dual axis)",
+            time_range: { preset: "24h" },
+            y_axis_label: "Power",
+            y_axis_unit: "kW",
+            y_axis_right_label: "Current",
+            y_axis_right_unit: "A",
+            series: [
+              { id: makeId("ser"), label: "Power", gateway_id: "", tag_name: "", color: "#3b82f6", axis: "left", chart_type: "line", unit: "kW", multiplier: 1, offset: 0 },
+              { id: makeId("ser"), label: "Current", gateway_id: "", tag_name: "", color: "#f97316", axis: "right", chart_type: "line", unit: "A", multiplier: 1, offset: 0 },
+            ],
+          },
+        ],
+      };
+    case "alarm_overview":
+      return {
+        name: "Alarm overview",
+        description: "Pie distribution + recent triggered alarms table",
+        sections: [
+          { ...defaultSection("header"), title: "Alarm Overview", subtitle: "Last 24 hours" },
+          {
+            ...defaultSection("pie_chart"),
+            title: "Alarm distribution",
+            data_source_type: "computed",
+            time_range: { preset: "24h" },
+            compute_rules: [
+              { id: makeId("rule"), label: "Critical", gateway_id: "", tag_name: "", operator: "eq", value1: 3, value2: "", aggregation: "count", color: "#dc2626" },
+              { id: makeId("rule"), label: "Warning", gateway_id: "", tag_name: "", operator: "eq", value1: 2, value2: "", aggregation: "count", color: "#f59e0b" },
+              { id: makeId("rule"), label: "Info", gateway_id: "", tag_name: "", operator: "eq", value1: 1, value2: "", aggregation: "count", color: "#10b981" },
+            ],
+          },
+          { ...defaultSection("table"), title: "Triggered alarms", time_range: { preset: "24h" }, row_limit: 100 },
+        ],
+      };
+    case "tag_audit":
+      return {
+        name: "Tag audit",
+        description: "Compact text-led report focused on a single tag",
+        sections: [
+          { ...defaultSection("header"), title: "Tag Audit", subtitle: "Single-tag investigation" },
+          { ...defaultSection("text"), title: "Notes", text: "Use this section to document why this audit was generated and any actions taken." },
+          { ...defaultSection("line_chart"), title: "Tag trend (24h)", time_range: { preset: "24h" } },
+          { ...defaultSection("table"), title: "Last 200 samples", time_range: { preset: "none" }, row_limit: 200 },
+        ],
+      };
+    case "shift_summary":
+      return {
+        name: "Shift summary",
+        description: "8h window with totals, trend, and samples",
+        sections: [
+          { ...defaultSection("header"), title: "Shift Summary", subtitle: "Last 8 hours" },
+          {
+            ...defaultSection("kpi_grid"),
+            title: "Shift totals",
+            columns: 4,
+            items: [
+              { id: makeId("kpi"), label: "Good parts", gateway_id: "", tag_name: "", aggregation: "sum", operator: "any" },
+              { id: makeId("kpi"), label: "Reject parts", gateway_id: "", tag_name: "", aggregation: "sum", operator: "any" },
+              { id: makeId("kpi"), label: "Avg cycle time", gateway_id: "", tag_name: "", aggregation: "avg", operator: "any" },
+              { id: makeId("kpi"), label: "Downtime events", gateway_id: "", tag_name: "", aggregation: "count", operator: "eq" },
+            ],
+          },
+          { ...defaultSection("bar_chart"), title: "Per-hour counts", time_range: { preset: "6h" } },
+        ],
+      };
+    case "blank":
+    default:
+      return {
+        name: "New report",
+        description: "",
+        sections: [defaultSection("header")],
+      };
+  }
+}
+
+const TEMPLATE_PRESETS = [
+  { value: "blank", label: "Blank" },
+  { value: "daily_summary", label: "Daily production summary" },
+  { value: "energy_consumption", label: "Energy consumption" },
+  { value: "alarm_overview", label: "Alarm overview" },
+  { value: "tag_audit", label: "Tag audit (single tag)" },
+  { value: "shift_summary", label: "Shift summary (8h)" },
+];
+
 function defaultSection(type) {
   switch (type) {
     case "header":
@@ -366,7 +496,7 @@ function SplitPane({ storageKey, defaultLeftPct = 40, minLeft = 280, minRight = 
   );
 }
 
-function CollapsibleCard({ id, title, subtitle, defaultOpen = true, headerRight, children }) {
+function CollapsibleCard({ id, title, subtitle, defaultOpen = true, headerRight, children, className = "" }) {
   const storageKey = id ? `tn_report_card_${id}` : null;
   const [open, setOpen] = useState(() => {
     if (!storageKey) return defaultOpen;
@@ -384,7 +514,7 @@ function CollapsibleCard({ id, title, subtitle, defaultOpen = true, headerRight,
     } catch (_) {}
   }, [open, storageKey]);
   return (
-    <section className={`tn-collapsible-card ${open ? "is-open" : "is-collapsed"}`}>
+    <section className={`tn-collapsible-card ${open ? "is-open" : "is-collapsed"} ${className}`.trim()}>
       <header className="tn-card-head">
         <button type="button" className="tn-card-head-toggle" onClick={() => setOpen((v) => !v)}>
           <span className={`tn-caret ${open ? "down" : "right"}`} aria-hidden>▾</span>
@@ -1479,19 +1609,14 @@ export function ReportTemplateDesigner({
     });
   };
 
-  const startNew = () => {
+  const startNew = (presetKey = "blank") => {
+    const preset = makePresetTemplate(presetKey);
     setSelectedId("");
     setDraft({
       id: "",
-      name: "New report",
-      description: "",
-      definition: {
-        sections: [
-          defaultSection("header"),
-          defaultSection("kpi_grid"),
-          defaultSection("line_chart"),
-        ],
-      },
+      name: preset.name || "New report",
+      description: preset.description || "",
+      definition: { sections: Array.isArray(preset.sections) ? preset.sections : [] },
     });
   };
 
@@ -1529,6 +1654,104 @@ export function ReportTemplateDesigner({
       onNotify({ type: "success", message: "Template deleted" });
     } catch (e) {
       onNotify({ type: "error", message: `Delete failed: ${e?.message || e}` });
+    }
+  };
+
+  // ----- export / import bundles -----------------------------------------
+  const importInputRef = useRef(null);
+
+  const _downloadJson = (bundle, suggestedName) => {
+    try {
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const safeName = String(suggestedName || "trustnode-report-templates")
+        .replace(/[^A-Za-z0-9_.-]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .slice(0, 80) || "trustnode-report-templates";
+      a.download = `${safeName}.tnreport.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => { try { URL.revokeObjectURL(url); } catch (_) {} }, 250);
+    } catch (e) {
+      onNotify({ type: "error", message: `Could not save file: ${e?.message || e}` });
+    }
+  };
+
+  const handleExportCurrent = async () => {
+    if (!draft.id) {
+      // Unsaved draft — export from local state so users can move work between PCs
+      // without forcing a save first.
+      _downloadJson(
+        {
+          kind: "trustnode.report-template-bundle",
+          bundle_version: 1,
+          templates: [
+            {
+              name: draft.name,
+              description: draft.description,
+              definition: draft.definition || { sections: [] },
+            },
+          ],
+        },
+        draft.name || "report-template"
+      );
+      return;
+    }
+    try {
+      const bundle = await exportReportTemplate(draft.id);
+      _downloadJson(bundle, draft.name || "report-template");
+    } catch (e) {
+      onNotify({ type: "error", message: `Export failed: ${e?.message || e}` });
+    }
+  };
+
+  const handleExportAll = async () => {
+    try {
+      const bundle = await exportAllReportTemplates();
+      _downloadJson(bundle, "trustnode-report-templates");
+    } catch (e) {
+      onNotify({ type: "error", message: `Export failed: ${e?.message || e}` });
+    }
+  };
+
+  const handleImportClick = () => {
+    if (importInputRef.current) importInputRef.current.click();
+  };
+
+  const handleImportFile = async (event) => {
+    const file = event.target.files && event.target.files[0];
+    // Clear the input so re-selecting the same file still fires onChange.
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const res = await importReportTemplates(data);
+      const count = Number(res?.count || 0);
+      onNotify({
+        type: "success",
+        message: count > 0 ? `Imported ${count} template${count === 1 ? "" : "s"}` : "No templates imported",
+      });
+      const list = await refreshTemplates();
+      const first = Array.isArray(res?.imported) && res.imported[0];
+      if (first && first.id) {
+        // Load the first imported template into the editor for convenience.
+        const found = list.find((t) => String(t.id) === String(first.id));
+        if (found) {
+          setSelectedId(found.id);
+          setDraft({
+            id: found.id,
+            name: found.name || "",
+            description: found.description || "",
+            definition: { sections: Array.isArray(found?.definition?.sections) ? found.definition.sections : [] },
+          });
+        }
+      }
+    } catch (e) {
+      onNotify({ type: "error", message: `Import failed: ${e?.message || e}` });
     }
   };
 
@@ -1661,6 +1884,37 @@ export function ReportTemplateDesigner({
             <button type="button" className="btn btn-secondary" onClick={handleDownloadPdf} disabled={previewState.rendering}>
               Download PDF
             </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={handleExportCurrent}
+              title="Export this template to a portable .tnreport.json file"
+            >
+              Export
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={handleExportAll}
+              title="Export all templates as a bundle"
+            >
+              Export all
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={handleImportClick}
+              title="Import a .tnreport.json bundle from another edge"
+            >
+              Import
+            </button>
+            <input
+              ref={importInputRef}
+              type="file"
+              accept="application/json,.json,.tnreport.json"
+              style={{ display: "none" }}
+              onChange={handleImportFile}
+            />
             {draft.id ? (
               <button type="button" className="btn btn-danger" onClick={handleDelete}>Delete</button>
             ) : null}
@@ -1673,13 +1927,28 @@ export function ReportTemplateDesigner({
               value={selectedId}
               onChange={(e) => {
                 const next = e.target.value;
-                if (next === "__new__") startNew();
+                if (next === "__new__") startNew("blank");
                 else if (next) loadTemplate(next);
               }}
             >
               <option value="">Select a template…</option>
               <option value="__new__">+ New template</option>
               {templates.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </select>
+          </label>
+          <label>Start from preset
+            <select
+              value=""
+              onChange={(e) => {
+                const key = e.target.value;
+                if (!key) return;
+                startNew(key);
+                e.target.value = "";
+              }}
+              title="Seed a new draft from a built-in template"
+            >
+              <option value="">+ Use preset…</option>
+              {TEMPLATE_PRESETS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
             </select>
           </label>
           <label>Template name<input value={draft.name} onChange={(e) => setDraft((p) => ({ ...p, name: e.target.value }))} /></label>
@@ -1689,6 +1958,7 @@ export function ReportTemplateDesigner({
 
       <CollapsibleCard
         id="report-sections"
+        className="tn-sections-card"
         title="Sections"
         subtitle={`${sections.length} configured`}
         defaultOpen

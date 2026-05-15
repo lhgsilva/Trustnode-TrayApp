@@ -68,6 +68,7 @@ jobs:
           cp Trustnode_edge_app/client_page_tests/client_test_db.php Trustnode_edge_app/web_cloud_readonly/client/client_test_db.php
           cp Trustnode_edge_app/client_page_tests/portal_single_page.html Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.html
           cp Trustnode_edge_app/client_page_tests/portal_single_page.php Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.php
+          cp Trustnode_edge_app/client_page_tests/client_portal_lite.html Trustnode_edge_app/web_cloud_readonly/client/client_portal_lite.html
 
       - name: Validate web bundle wiring
         run: |
@@ -78,6 +79,7 @@ jobs:
           test -f Trustnode_edge_app/web_cloud_readonly/client/client_test_db_php.html
           test -f Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.html
           test -f Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.php
+          test -f Trustnode_edge_app/web_cloud_readonly/client/client_portal_lite.html
           js_file="$(grep -o 'assets/index-[^"]*\.js' Trustnode_edge_app/web_cloud_readonly/index.html | head -n1)"
           test -n "$js_file"
           test -f "Trustnode_edge_app/web_cloud_readonly/$js_file"
@@ -208,6 +210,12 @@ jobs:
               journalctl -u ${{ env.BACKEND_SERVICE }} -n 120 --no-pager || true
               exit 1
             fi
+            # cloud-live SSE endpoint must exist (returns 401 unauth, never 404).
+            sse_code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/cloud-live/stream || true)"
+            if [ "$sse_code" != "401" ]; then
+              echo "Unexpected /api/cloud-live/stream status: $sse_code (expected 401)"
+              exit 1
+            fi
             # Ensure /client/*.php executes via php-fpm (never served as source)
             if ! command -v php-fpm >/dev/null 2>&1; then
               if command -v dnf >/dev/null 2>&1; then
@@ -321,6 +329,12 @@ jobs:
               echo "Backend did not become healthy on :8000"
               systemctl status ${{ env.BACKEND_SERVICE }} --no-pager || true
               journalctl -u ${{ env.BACKEND_SERVICE }} -n 120 --no-pager || true
+              exit 1
+            fi
+            # cloud-live SSE endpoint must exist (returns 401 unauth, never 404).
+            sse_code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/cloud-live/stream || true)"
+            if [ "$sse_code" != "401" ]; then
+              echo "Unexpected /api/cloud-live/stream status: $sse_code (expected 401)"
               exit 1
             fi
 

@@ -2348,9 +2348,69 @@ class AppStore:
             )
             return 0
 
+    def _pre_migrate_tenant_columns(self, conn) -> None:
+        """Add tenant_id to legacy tables before the schema script's indexes run.
+
+        On the first launch of a newer build against an older app-store DB the
+        executescript below creates CREATE INDEX statements that reference
+        tenant_id on historian_readings / app_logs. SQLite's
+        CREATE TABLE IF NOT EXISTS is a no-op when the table already exists, so
+        the column never gets added inside the script — the index then fails
+        with "no such column: tenant_id" and the entire backend aborts at
+        startup. Run the ALTERs up front when the legacy tables exist without
+        the column.
+        """
+        def _table_exists(name: str) -> bool:
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (name,),
+            ).fetchone()
+            return row is not None
+
+        def _column_exists(table: str, column: str) -> bool:
+            for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall():
+                try:
+                    if str(row["name"]) == column:
+                        return True
+                except Exception:
+                    if column in tuple(row):
+                        return True
+            return False
+
+        for table in ("historian_readings", "app_logs"):
+            if _table_exists(table) and not _column_exists(table, "tenant_id"):
+                try:
+                    conn.execute(
+                        f'ALTER TABLE {table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "default"'
+                    )
+                except Exception:
+                    # Older SQLite builds disallow NOT NULL ADD COLUMN in
+                    # some edge cases; fall back to nullable + backfill.
+                    try:
+                        conn.execute(f'ALTER TABLE {table} ADD COLUMN tenant_id TEXT')
+                        conn.execute(f"UPDATE {table} SET tenant_id='default' WHERE tenant_id IS NULL")
+                    except Exception:
+                        pass
+
+        # 2026-05-14: support string-typed tags (PLC text registers, OPC
+        # String/ByteString, smart-meter strings). The numeric `value` column
+        # stays for backward compat; text values go into `value_text`.
+        if _table_exists("historian_readings") and not _column_exists("historian_readings", "value_text"):
+            try:
+                conn.execute("ALTER TABLE historian_readings ADD COLUMN value_text TEXT NULL")
+            except Exception:
+                pass
+
     def _ensure_schema(self) -> None:
         with self._lock:
             with self._connect() as conn:
+                # Pre-migrate columns that the executescript below references in
+                # its CREATE INDEX statements. CREATE TABLE IF NOT EXISTS skips
+                # column additions on pre-existing tables, so when an older DB
+                # is opened the indexes would otherwise crash with
+                # "no such column: tenant_id". Run these ALTERs first so the
+                # whole executescript can assume tenant_id is always present.
+                self._pre_migrate_tenant_columns(conn)
                 conn.executescript(
                     """
                     PRAGMA journal_mode=WAL;
@@ -2394,6 +2454,7 @@ class AppStore:
                       database_name TEXT NULL,
                       tag_name TEXT NOT NULL,
                       value REAL NULL,
+                      value_text TEXT NULL,
                       quality INTEGER NULL,
                       quality_label TEXT NULL,
                       source TEXT NULL,
@@ -4240,6 +4301,8 @@ class AppStore:
             database_name = str(r.get("database_name") or "")
             tag_name = str(r.get("tag_name") or r.get("tag") or "")
             value = float(r.get("value")) if r.get("value") is not None else None
+            value_text_raw = r.get("value_text")
+            value_text = str(value_text_raw) if value_text_raw is not None and value_text_raw != "" else None
             quality = int(r.get("quality")) if r.get("quality") is not None else None
             quality_label = str(r.get("quality_label") or "")
             source = str(r.get("source") or "")
@@ -4254,6 +4317,7 @@ class AppStore:
                     database_name,
                     tag_name,
                     value,
+                    value_text,
                     quality,
                     quality_label,
                     source,
@@ -4273,6 +4337,7 @@ class AppStore:
                         "plc_ip": plc_ip,
                         "database_name": database_name,
                         "value": value,
+                        "value_text": value_text,
                         "quality": quality,
                         "quality_label": quality_label,
                         "updated_utc": now,
@@ -4286,8 +4351,8 @@ class AppStore:
                 conn.executemany(
                     """
                     INSERT INTO historian_readings
-                    (tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, value_text, quality, quality_label, source, created_utc)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     safe_rows,
                 )
@@ -4395,7 +4460,7 @@ class AppStore:
             rows = conn.execute(
                 f"""
                 SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                       tag_name, value, quality, quality_label
+                       tag_name, value, value_text, quality, quality_label
                 FROM historian_readings
                 {where}
                 ORDER BY id DESC
@@ -4417,6 +4482,7 @@ class AppStore:
                     "database_name": r["database_name"] or "",
                     "tag": r["tag_name"] or "",
                     "value": r["value"],
+                    "value_text": r["value_text"] if "value_text" in r.keys() else None,
                     "quality": r["quality"],
                     "quality_label": r["quality_label"] or "",
                 }
@@ -4517,7 +4583,7 @@ class AppStore:
             rows = conn.execute(
                 f"""
                 SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                       tag_name, value, quality, quality_label
+                       tag_name, value, value_text, quality, quality_label
                 FROM historian_readings
                 {where}
                 ORDER BY ts_utc DESC
@@ -4553,6 +4619,7 @@ class AppStore:
                     "database_name": r["database_name"] or "",
                     "tag": r["tag_name"] or "",
                     "value": r["value"],
+                    "value_text": r["value_text"] if "value_text" in r.keys() else None,
                     "quality": r["quality"],
                     "quality_label": r["quality_label"] or "",
                 }

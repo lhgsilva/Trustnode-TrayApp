@@ -196,6 +196,59 @@ export function normalizeWidgets(rawWidgets) {
         table_filter_tags: Array.isArray(raw?.config?.table_filter_tags)
           ? raw.config.table_filter_tags.map((t) => String(t || "")).filter(Boolean)
           : [],
+        // Advanced table-builder + multi-series chart fields. These were
+        // previously dropped here, causing series_extra (and primary unit /
+        // axis labels) to vanish on every dashboard reflow / drag / save.
+        query_where_conditions: Array.isArray(raw?.config?.query_where_conditions)
+          ? raw.config.query_where_conditions
+          : [],
+        query_advanced_columns: Array.isArray(raw?.config?.query_advanced_columns)
+          ? raw.config.query_advanced_columns
+          : [],
+        series_extra: Array.isArray(raw?.config?.series_extra)
+          ? raw.config.series_extra
+              .filter((s) => s && typeof s === "object")
+              .map((s) => ({
+                id: String(s.id || ""),
+                gateway_id: String(s.gateway_id || ""),
+                tag_name: String(s.tag_name || ""),
+                label: String(s.label || ""),
+                color: String(s.color || ""),
+                axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
+                chart_type: String(s.chart_type || ""),
+                unit: String(s.unit || ""),
+                suffix: String(s.suffix || ""),
+                multiplier: Number(s.multiplier ?? 1) || 1,
+                offset: Number(s.offset ?? 0) || 0,
+                limit_value: s.limit_value === undefined || s.limit_value === null ? "" : String(s.limit_value),
+                line_width: clamp(s.line_width ?? 2, 1, 8),
+                line_dot: ["none", "small", "medium", "large"].includes(String(s.line_dot || ""))
+                  ? String(s.line_dot)
+                  : "none",
+                bar_width: clamp(s.bar_width ?? 0, 0, 120),
+                bar_pattern: ["solid", "stripes-diag", "stripes-vert", "dots"].includes(String(s.bar_pattern || ""))
+                  ? String(s.bar_pattern)
+                  : "solid",
+                limit_dash: ["dashed", "solid", "dotted"].includes(String(s.limit_dash || ""))
+                  ? String(s.limit_dash)
+                  : "dashed",
+              }))
+          : [],
+        primary_unit: String(raw?.config?.primary_unit || ""),
+        primary_suffix: String(raw?.config?.primary_suffix || ""),
+        y_axis_label: String(raw?.config?.y_axis_label || ""),
+        y_axis_right_label: String(raw?.config?.y_axis_right_label || ""),
+        chart_line_width: clamp(raw?.config?.chart_line_width ?? 2, 1, 8),
+        chart_line_dot: ["none", "small", "medium", "large"].includes(String(raw?.config?.chart_line_dot || ""))
+          ? String(raw?.config?.chart_line_dot)
+          : "none",
+        chart_bar_opacity: clamp(raw?.config?.chart_bar_opacity ?? 100, 10, 100),
+        chart_bar_pattern: ["solid", "stripes-diag", "stripes-vert", "dots"].includes(String(raw?.config?.chart_bar_pattern || ""))
+          ? String(raw?.config?.chart_bar_pattern)
+          : "solid",
+        chart_bar_width: clamp(raw?.config?.chart_bar_width ?? 0, 0, 120),
+        meter_show_legend: raw?.config?.meter_show_legend !== false,
+        meter_legend_layout: String(raw?.config?.meter_legend_layout || "side") === "bottom" ? "bottom" : "side",
       },
     });
   }

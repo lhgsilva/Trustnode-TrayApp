@@ -1851,17 +1851,13 @@ function AppShell() {
   const [endpointVersion, setEndpointVersion] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [activePage, setActivePage] = useState(() => {
-    try {
-      const saved = String(localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY) || "").trim().toLowerCase();
-      // "edge" is almost always the result of the license-guard auto-routing
-      // a previous session there — not a page the user wanted to land on at
-      // boot. Default to the dashboard instead; the guard will re-route them
-      // if the license is still invalid.
-      if (!saved || saved === "edge") return "dashboard";
-      return saved;
-    } catch {
-      return "dashboard";
-    }
+    // The app always boots into the Dashboard so operators see live data
+    // immediately. Previously we restored whichever page the user closed on,
+    // which made support harder (every screenshot started on a different
+    // page) and frequently dumped people on the Edge / Control-plane page
+    // after a license recheck. The license guard still re-routes when the
+    // license is invalid; otherwise dashboard is the right home base.
+    return "dashboard";
   });
   const pageBootstrapGuardRef = useRef(true);
   const [expandedSections, setExpandedSections] = useState({
@@ -3314,16 +3310,11 @@ function AppShell() {
         setCurrentUser(matched);
         pageBootstrapGuardRef.current = true;
         if (!isPortalOnly) {
-          const savedPage = (() => {
-            try {
-              return String(localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY) || "").trim().toLowerCase();
-            } catch {
-              return "";
-            }
-          })();
-          // Avoid latching onto "edge" — that's usually a license-guard remnant
-          // from the previous session, not a deliberate landing page.
-          setActivePage((savedPage && savedPage !== "edge") ? savedPage : "dashboard");
+          // Always land on Dashboard on app boot regardless of where the
+          // last session ended. Previous behavior restored the saved page,
+          // which often dropped operators on Logs / Edge / control plane.
+          // The license guard still re-routes when needed.
+          setActivePage("dashboard");
         }
         await refreshControlPlaneRuntimeContext();
         await refreshControlPlaneUsers(u?.tenant_id || currentTenantId || "default");
@@ -6219,57 +6210,114 @@ function AppShell() {
     setShowPowerDeviceModal(true);
   };
 
-  const savePowerDevice = () => {
+  const savePowerDevice = async () => {
     const nextId = String(powerDeviceForm.id || "").trim();
     if (!nextId) {
       setPowerResult("Device ID is required.");
       return;
     }
-    setPowerConfig((prev) => {
-      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
-      const existingIndex = prevDevices.findIndex((d) => String(d?.id || "") === String(editingPowerDeviceId || nextId));
-      const nextDevice = {
-        ...powerDeviceForm,
-        id: nextId,
-        name: String(powerDeviceForm.name || nextId),
-        description: String(powerDeviceForm.description || powerDeviceForm.machine_description || ""),
-        machine_description: String(powerDeviceForm.machine_description || powerDeviceForm.description || ""),
-        site: String(powerDeviceForm.site || ""),
-        area: String(powerDeviceForm.area || ""),
-        equipment: String(powerDeviceForm.equipment || ""),
-        type: "modbus_tcp",
-        protocol: "modbus_tcp",
-        electrical_mode: String(powerDeviceForm.electrical_mode || "single_phase"),
-        wiring_type: String(powerDeviceForm.electrical_mode || "single_phase"),
-        register_profile: String(powerDeviceForm.register_profile || POWER_PROFILE_DEFAULTS.single_phase),
-        use_custom_registers: Boolean(powerDeviceForm.use_custom_registers),
-        register_scales: buildRegisterScaleMap(powerDeviceForm.registers || {}, powerDeviceForm.register_scales || {}),
-        min_active_power_kw: powerDeviceForm.min_active_power_kw === "" ? "" : Number(powerDeviceForm.min_active_power_kw || 0),
-        max_active_power_kw: powerDeviceForm.max_active_power_kw === "" ? "" : Number(powerDeviceForm.max_active_power_kw || 0),
-      };
-      const devices = [...prevDevices];
-      if (existingIndex >= 0) devices[existingIndex] = nextDevice;
-      else devices.push(nextDevice);
-      const selected = String(prev?.selected_device_id || "");
-      return {
-        ...(prev || {}),
-        devices,
-        selected_device_id: selected || nextId,
-      };
-    });
+    // Build the next powerConfig locally, then push it to the backend so the
+    // edit is durable. Previously this only mutated local state and relied
+    // on the user clicking a separate "Save Configuration" later — operators
+    // reported that IP changes "didn't stick" because they expected OK to
+    // persist.
+    const prev = powerConfigRef.current || powerConfig || {};
+    const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+    const existingIndex = prevDevices.findIndex(
+      (d) => String(d?.id || "") === String(editingPowerDeviceId || nextId)
+    );
+    const nextDevice = {
+      ...powerDeviceForm,
+      id: nextId,
+      name: String(powerDeviceForm.name || nextId),
+      description: String(powerDeviceForm.description || powerDeviceForm.machine_description || ""),
+      machine_description: String(powerDeviceForm.machine_description || powerDeviceForm.description || ""),
+      site: String(powerDeviceForm.site || ""),
+      area: String(powerDeviceForm.area || ""),
+      equipment: String(powerDeviceForm.equipment || ""),
+      type: "modbus_tcp",
+      protocol: "modbus_tcp",
+      electrical_mode: String(powerDeviceForm.electrical_mode || "single_phase"),
+      wiring_type: String(powerDeviceForm.electrical_mode || "single_phase"),
+      register_profile: String(powerDeviceForm.register_profile || POWER_PROFILE_DEFAULTS.single_phase),
+      use_custom_registers: Boolean(powerDeviceForm.use_custom_registers),
+      register_scales: buildRegisterScaleMap(powerDeviceForm.registers || {}, powerDeviceForm.register_scales || {}),
+      min_active_power_kw: powerDeviceForm.min_active_power_kw === "" ? "" : Number(powerDeviceForm.min_active_power_kw || 0),
+      max_active_power_kw: powerDeviceForm.max_active_power_kw === "" ? "" : Number(powerDeviceForm.max_active_power_kw || 0),
+    };
+    const devices = [...prevDevices];
+    if (existingIndex >= 0) devices[existingIndex] = nextDevice;
+    else devices.push(nextDevice);
+    const selected = String(prev?.selected_device_id || "");
+    const nextConfig = {
+      ...(prev || {}),
+      devices,
+      selected_device_id: selected || nextId,
+    };
+    // Update local state for instant UI feedback…
+    setPowerConfig(nextConfig);
+    // …then persist to the backend so the change survives a reload.
+    setPowerBusy(true);
+    try {
+      const res = await updatePowerConfig(nextConfig);
+      if (res?.ok && res?.config) {
+        const cfg = res.config;
+        const cfgDevices = Array.isArray(cfg.devices) ? cfg.devices : [];
+        setPowerConfig({
+          ...cfg,
+          devices: cfgDevices.map((d) => {
+            const registers = d?.registers && typeof d.registers === "object" ? d.registers : {};
+            return {
+              ...(d || {}),
+              registers,
+              register_scales: buildRegisterScaleMap(registers, d?.register_scales || {}),
+            };
+          }),
+        });
+      }
+      setPowerResult(`Meter "${nextDevice.name || nextDevice.id}" saved.`);
+    } catch (err) {
+      setPowerResult(`Save meter failed: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
     setShowPowerDeviceModal(false);
   };
 
-  const removePowerDevice = (deviceId) => {
+  const removePowerDevice = async (deviceId) => {
     const did = String(deviceId || "");
-    setPowerConfig((prev) => {
-      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
-      const devices = prevDevices.filter((d) => String(d?.id || "") !== did);
-      const selected = String(prev?.selected_device_id || "");
-      const nextSelected =
-        selected === did ? String(devices[0]?.id || "") : selected;
-      return { ...(prev || {}), devices, selected_device_id: nextSelected };
-    });
+    if (!did) return;
+    const prev = powerConfigRef.current || powerConfig || {};
+    const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+    const devices = prevDevices.filter((d) => String(d?.id || "") !== did);
+    const selected = String(prev?.selected_device_id || "");
+    const nextSelected = selected === did ? String(devices[0]?.id || "") : selected;
+    const nextConfig = { ...(prev || {}), devices, selected_device_id: nextSelected };
+    setPowerConfig(nextConfig);
+    setPowerBusy(true);
+    try {
+      const res = await updatePowerConfig(nextConfig);
+      if (res?.ok && res?.config) {
+        const cfg = res.config;
+        const cfgDevices = Array.isArray(cfg.devices) ? cfg.devices : [];
+        setPowerConfig({
+          ...cfg,
+          devices: cfgDevices.map((d) => {
+            const registers = d?.registers && typeof d.registers === "object" ? d.registers : {};
+            return {
+              ...(d || {}),
+              registers,
+              register_scales: buildRegisterScaleMap(registers, d?.register_scales || {}),
+            };
+          }),
+        });
+      }
+      setPowerResult(`Meter "${did}" removed.`);
+    } catch (err) {
+      setPowerResult(`Remove meter failed: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
   };
 
   const setPowerDeviceField = (field, value) => {
@@ -6502,7 +6550,12 @@ function AppShell() {
           : page === "power_overview"
             ? "power_overview"
             : page === "power_configuration"
-              ? "database"
+              // Configuration of meters/gateways follows the Power Overview
+              // permission so a user who can see the module can also set it
+              // up. Previously this fell through to the database permission,
+              // which meant operators with Power Overview but without DB
+              // access could view their meters but never add or edit them.
+              ? "power_overview"
           : page === "database_overview"
             ? "database"
             : page === "database_inspector"
@@ -6768,16 +6821,18 @@ function AppShell() {
     if (!currentUser) return;
     if (isPortalOnly) return;
     if (!pageBootstrapGuardRef.current) return;
-    if (canOpenPage(activePage)) {
+    // Always prefer Dashboard. The previous logic fell back to "logs" when
+    // canOpenPage("dashboard") briefly returned false during the license
+    // check, which is why operators were landing on Logs on first boot.
+    if (activePage !== "dashboard") {
+      setActivePage("dashboard");
+    }
+    // Keep the guard set until the license actually settles — that way if a
+    // late license check kicks the user to Edge or another page, we still
+    // re-route them back to Dashboard once the license clears.
+    if (canOpenPage("dashboard") || canOpenPage(activePage)) {
       pageBootstrapGuardRef.current = false;
-      return;
     }
-    const fallbackCandidates = ["dashboard", "power_overview", "alarms", "reporting", "historian", "interface", "logs"];
-    const fallback = fallbackCandidates.find((p) => canOpenPage(p));
-    if (fallback) {
-      setActivePage(fallback);
-    }
-    pageBootstrapGuardRef.current = false;
   }, [activePage, canOpenPage, currentUser, isPortalOnly]);
 
   useEffect(() => {
@@ -7407,7 +7462,14 @@ const getGatewayHealth = (gateway) => {
       const pending = Number(runtimeStatus.db_pending_count || 0);
       const liveFresh = hasFreshGatewayLiveSignal(gateway);
       if (runtimeStatus.running === true || liveFresh || hasFreshWrite || hasFreshCheck) {
-        if (rtErr) return { ok: false, label: "Device Fails" };
+        // Only surface "Device Fails" when the runtime is *currently* failing
+        // — a stale last_error left over from a previous run, or a transient
+        // first-cycle handshake error, should not flag a healthy gateway as
+        // failed. Treat the device as failing only when there's no fresh
+        // write/check/live signal AND an error string is set.
+        if (rtErr && !liveFresh && !hasFreshWrite && !hasFreshCheck) {
+          return { ok: false, label: "Device Fails" };
+        }
         if (dbErr && !hasFreshWrite && pending > 5) return { ok: false, label: "DB Fails" };
         return { ok: true, label: "Running" };
       }
@@ -7655,6 +7717,20 @@ const getGatewayHealth = (gateway) => {
   };
 
   const getGatewayFooterDbWriting = (gateway) => {
+    // Power-meter "gateways" don't use a PLC DB sink — power_manager writes
+    // straight to the local app-store historian (and optionally mirrors to
+    // an additional sink chosen on the meter form). Surface that explicitly
+    // so the footer doesn't claim "No DB selected" while data IS flowing
+    // into the historian behind the scenes.
+    if (gateway?.power_meter === true || String(gateway?.gateway_type || "") === "modbus_tcp_meter") {
+      const did = String(gateway?.id || "");
+      const st = powerDeviceStatuses?.[did] || {};
+      const baseSink = "Local SQLite (default)";
+      const extraSinkId = String((powerConfig?.devices || []).find((d) => String(d?.id || "") === did)?.database_id || "");
+      const extraDb = extraSinkId ? (dbConnections.find((c) => String(c.id || "") === extraSinkId)?.name || "") : "";
+      const writing = st?.connected ? "LIVE" : (st?.last_error ? "ERROR" : "IDLE");
+      return extraDb ? `${baseSink} + ${extraDb} | ${writing}` : `${baseSink} | ${writing}`;
+    }
     if (!gateway?.database_id) return "No DB selected";
     const db = dbConnections.find((c) => c.id === gateway.database_id);
     const dbName = db?.name || "Unknown DB";
@@ -7983,6 +8059,17 @@ const getGatewayHealth = (gateway) => {
 
   function isGatewayRunning(gateway) {
     if (!gateway) return false;
+    // Power meters: source-of-truth is power_manager's per-device status.
+    if (gateway?.power_meter === true || String(gateway?.gateway_type || "") === "modbus_tcp_meter") {
+      const did = String(gateway?.id || "");
+      const st = powerDeviceStatuses?.[did] || {};
+      // Treat the meter as "running" when power_manager is actively polling
+      // (enabled) — connection status (st.connected) reflects whether the
+      // Modbus link is up, which can be transient and shouldn't flip the
+      // RUNNING/STOPPED pill in the footer.
+      const device = (powerConfig?.devices || []).find((d) => String(d?.id || "") === did);
+      return Boolean(st?.enabled ?? device?.enabled);
+    }
     const runtimeStatus = resolveGatewayRuntimeStatus(gateway);
     const nowMs = Date.now();
     const lastWriteMs = parseTimestampMs(String(runtimeStatus?.db_last_write_utc || ""));
@@ -8773,6 +8860,20 @@ const getGatewayHealth = (gateway) => {
       setError("");
       return;
     }
+    // Power-meter "gateways" run inside power_manager (Modbus TCP polling
+    // loop), not the PLC manager. Route them through the dedicated power
+    // toggle so the operator sees the same Start/Stop behaviour as a PLC
+    // gateway without going through the PLC start payload (which would
+    // demand a database_id and fail).
+    if (gateway.power_meter === true || String(gateway.gateway_type || "") === "modbus_tcp_meter") {
+      try {
+        await setPowerDeviceRunning(gid, true);
+        setError("");
+      } catch (err) {
+        setError(`Start meter failed: ${String(err?.message || err)}`);
+      }
+      return;
+    }
     const db = dbConnections.find((c) => c.id === gateway.database_id);
     const activeGatewayTriggers = collectionTriggers.filter((t) => t.enabled !== false);
     let payload;
@@ -8782,9 +8883,26 @@ const getGatewayHealth = (gateway) => {
       setError(String(e));
       return;
     }
+    // Optimistically flip the footer to RUNNING right away so the buttons feel
+    // responsive. The backend `start_gateway` returns as soon as the worker
+    // task is scheduled, but the in-flight HTTP + follow-up refresh can still
+    // take ~1s on a slow PLC handshake. The actual runtime status arrives via
+    // the existing periodic poll loop.
+    markGatewayRunningState([gateway.id], true);
+    // Clear any stale error from a previous run so the UI doesn't paint a
+    // false "Device Fails" between the click and the first successful cycle.
+    setGatewayRuntimeStatuses((prev) => {
+      const cur = prev?.[gateway.id] || null;
+      if (!cur) return prev;
+      return {
+        ...prev,
+        [gateway.id]: { ...cur, last_error: null, db_last_error: null, running: true },
+      };
+    });
     try {
       const res = await startGatewayInstance(payload);
       if (!res?.started) {
+        markGatewayRunningState([gateway.id], false);
         setError(res?.message || "Failed to start gateway");
         addAppLog({
           level: "error",
@@ -8795,8 +8913,8 @@ const getGatewayHealth = (gateway) => {
         });
         return;
       }
-      markGatewayRunningState([gateway.id], true);
-      await refreshGatewayRuntimes();
+      // Refresh in the background; do not block the click.
+      refreshGatewayRuntimes().catch(() => {});
       addAppLog({
         level: "info",
         category: "gateway",
@@ -8874,23 +8992,38 @@ const getGatewayHealth = (gateway) => {
     if (!canControlGateways) return;
     if (!gatewayId) return;
     const gateway = gatewayConfigs.find((g) => String(g.id || "") === String(gatewayId || "")) || null;
+    // Power-meter gateways: route through power_manager (mirror of the
+    // start handler). PLC stop API doesn't know about them and would 404 /
+    // do nothing.
+    const powerDevice = (powerConfig?.devices || []).find((d) => String(d?.id || "") === String(gatewayId || ""));
+    if (!gateway && powerDevice) {
+      try {
+        await setPowerDeviceRunning(String(gatewayId), false);
+        setError("");
+      } catch (err) {
+        setError(`Stop meter failed: ${String(err?.message || err)}`);
+      }
+      return;
+    }
     // Stop only the explicit configured gateway id.
     // Alias-based stopping can terminate unrelated gateways that share endpoint traits.
     const stopIds = [String(gatewayId || "").trim()].filter(Boolean);
+    // Optimistic flip first so the footer button feels instant. If the stop
+    // RPC fails we restore the running state in the catch.
+    markGatewayRunningState(stopIds, false);
+    setLiveTagValues((prev) => {
+      const next = {};
+      for (const [k, v] of Object.entries(prev || {})) {
+        const keep = !stopIds.some((sid) => k.startsWith(`${String(sid)}::`));
+        if (keep) next[k] = v;
+      }
+      return next;
+    });
     try {
       for (const stopId of stopIds) {
         await stopGatewayInstance(stopId);
       }
-      markGatewayRunningState(stopIds, false);
-      setLiveTagValues((prev) => {
-        const next = {};
-        for (const [k, v] of Object.entries(prev || {})) {
-          const keep = !stopIds.some((sid) => k.startsWith(`${String(sid)}::`));
-          if (keep) next[k] = v;
-        }
-        return next;
-      });
-      await refreshGatewayRuntimes();
+      refreshGatewayRuntimes().catch(() => {});
       const gw = gateway;
       addAppLog({
         level: "info",
@@ -8901,6 +9034,9 @@ const getGatewayHealth = (gateway) => {
       });
       setError("");
     } catch (err) {
+      // Stop RPC failed — revert the optimistic flip so the UI reflects reality.
+      markGatewayRunningState(stopIds, true);
+      refreshGatewayRuntimes().catch(() => {});
       setError(`Stop gateway failed: ${String(err)}`);
       addAppLog({
         level: "error",
@@ -9654,7 +9790,18 @@ const getGatewayHealth = (gateway) => {
   };
 
   const selectAllDiscoveredTags = () => {
-    setGatewaySelectedTags(gatewayDiscoveredTags.slice());
+    // When a search filter is active, "Select all" picks only the visible
+    // (filtered) tags — otherwise an empty/false-positive search would hide
+    // tags but still get them selected behind the user's back.
+    const q = String(gatewayBrowseSearch || "").trim().toLowerCase();
+    const source = gatewayDiscoveredTags;
+    const visible = q
+      ? source.filter((tag) => String(tag).toLowerCase().includes(q))
+      : source;
+    setGatewaySelectedTags((prev) => {
+      const merged = new Set([...(prev || []), ...visible]);
+      return Array.from(merged);
+    });
   };
 
   const clearSelectedDiscoveredTags = () => {
@@ -13656,9 +13803,32 @@ const getGatewayHealth = (gateway) => {
               onOpenTagMonitor={(widget) => {
                 try {
                   const cfg = widget?.config || {};
-                  const gatewayId = String(cfg.gateway_id || "");
-                  const tagName = String(cfg.tag_name || "");
-                  if (!gatewayId || !tagName) return;
+                  // Resolve the tag to monitor. Prefer the widget's primary
+                  // tag; fall back to the first configured extra series so
+                  // operators can still open the monitor on a chart that
+                  // only has extras (e.g. dual-axis with no primary tag).
+                  let gatewayId = String(cfg.gateway_id || "").trim();
+                  let tagName = String(cfg.tag_name || "").trim();
+                  if (!tagName && Array.isArray(cfg.series_extra) && cfg.series_extra.length) {
+                    const firstWithTag = cfg.series_extra.find((s) => String(s?.tag_name || "").trim());
+                    if (firstWithTag) {
+                      tagName = String(firstWithTag.tag_name || "").trim();
+                      gatewayId = String(firstWithTag.gateway_id || gatewayId || "").trim();
+                    }
+                  }
+                  if (!tagName) {
+                    setError("Pick a tag for this widget before opening the tag monitor.");
+                    return;
+                  }
+                  if (!gatewayId) {
+                    // Fall back to the first known gateway that owns this tag.
+                    const fallbackGw = (gatewayConfigsView || []).find((g) => (g?.tags || []).includes(tagName));
+                    if (fallbackGw) gatewayId = String(fallbackGw.id || "");
+                  }
+                  if (!gatewayId) {
+                    setError("Could not resolve a gateway for this tag. Edit the widget and set a gateway.");
+                    return;
+                  }
                   const gateway =
                     gatewayConfigsView.find((g) => String(g?.id || "") === gatewayId) ||
                     powerGatewayDescriptors.find((g) => String(g?.id || "") === gatewayId) ||
@@ -13689,7 +13859,9 @@ const getGatewayHealth = (gateway) => {
                   });
                   setTagMonitorChartType(preferredChart);
                   setShowTagMonitorModal(true);
-                } catch {}
+                } catch (err) {
+                  setError(`Open tag monitor failed: ${String(err?.message || err)}`);
+                }
               }}
               fetchHistoricalRows={async ({ fromUtc, toUtc, limit = 12000 }) => {
                 const preferCloudReads = Boolean(isHostedWebClient && endpointMode === "cloud");
@@ -14183,11 +14355,11 @@ const getGatewayHealth = (gateway) => {
                     </label>
                   </div>
                   <div className="db-card-top-actions">
-                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddPowerDevice} disabled={!canEditPage("database")}>
+                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddPowerDevice} disabled={!canEditPage("power_configuration")}>
                       <AddIcon />
                       <span>Add</span>
                     </button>
-                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("database")}>Save</button>
+                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save</button>
                     <button className="btn btn-primary btn-sm" onClick={runPowerConnectionTest} disabled={powerBusy}>Test Connection</button>
                   </div>
                 </div>
@@ -14383,7 +14555,7 @@ const getGatewayHealth = (gateway) => {
                   </>
                 )}
                 <div className="row" style={{ marginTop: 16, gap: 8 }}>
-                  <button className="btn btn-success" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("database")}>Save Configuration</button>
+                  <button className="btn btn-success" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save Configuration</button>
                   <button className="btn btn-primary" onClick={runPowerConnectionTest} disabled={powerBusy}>Test Selected Meter</button>
                 </div>
                 {powerResult ? <div className="info-note" style={{ marginTop: 10 }}>{powerResult}</div> : null}
@@ -14464,6 +14636,70 @@ const getGatewayHealth = (gateway) => {
                   <div className="thead">
                     <span>Name</span><span>Device</span><span>Protocol</span><span>Address</span><span>Database</span><span>Interval</span><span>Status</span><span>Tags</span><span>Actions</span>
                   </div>
+                  {/* Power meter gateways appear in the same combined list as PLC
+                      gateways so operators can see every active data source at
+                      a glance. They are read-only here — clicking Edit jumps
+                      to Power Configuration where the meter-specific settings
+                      live (registers, wiring, CT/VT ratios, etc.). */}
+                  {(Array.isArray(powerConfig?.devices) ? powerConfig.devices : []).map((d) => {
+                    const did = String(d?.id || "");
+                    const dbName = (dbConnections.find((db) => String(db.id || "") === String(d?.database_id || ""))?.name)
+                      || "Local SQLite (default)";
+                    const st = powerDeviceStatuses?.[did] || {};
+                    const running = Boolean(st?.connected) || d?.enabled !== false;
+                    const configuredIntervalMs = Number(d?.poll_interval_ms || 1000);
+                    const statusKey = st?.last_error ? "offline" : running ? "online" : "warning";
+                    const statusText = st?.last_error ? "ERROR" : running ? "RUNNING" : "STOPPED";
+                    const tags = Object.keys(d?.registers || {}).filter((k) => !String(k).endsWith("_raw"));
+                    return (
+                      <div key={`gw-power-row-${did}`} className="trow">
+                        <span>{String(d?.name || did)} <small className="muted">(power)</small></span>
+                        <span>{did}</span>
+                        <span>modbus_tcp</span>
+                        <span>{`${String(d?.ip || "-")}:${Number(d?.port || 502)}`}</span>
+                        <span>{dbName}</span>
+                        <span>{`${configuredIntervalMs} ms`}</span>
+                        <span>
+                          <div className={`status-pill status-${statusKey}`}>{statusText}</div>
+                          <div className="muted status-sub">{String(st?.last_error || "").slice(0, 40)}</div>
+                        </span>
+                        <span className="tags-stack">
+                          {tags.length ? tags.map((tag) => <div key={`gw-power-tag-${did}-${tag}`}>{tag}</div>) : <div>-</div>}
+                        </span>
+                        <span className="row-actions">
+                          <button
+                            className="icon-btn table-action-btn"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setActivePage("power_configuration");
+                              setPowerConfig((prev) => ({ ...(prev || {}), selected_device_id: did }));
+                              openEditPowerDevice(d);
+                            }}
+                            disabled={!canEditPage("power_configuration")}
+                            title="Open in Power Configuration to edit"
+                          >
+                            <EditIcon />
+                          </button>
+                          <button
+                            className={`icon-btn table-action-btn ${running ? "icon-btn-stop" : "icon-btn-start"}`}
+                            onClick={(e) => { e.stopPropagation(); setPowerDeviceRunning(did, !running); }}
+                            disabled={!canControlGateways}
+                            title={running ? "Stop meter" : "Start meter"}
+                          >
+                            {running ? <StopIcon /> : <StartIcon />}
+                          </button>
+                          <button
+                            className="icon-btn table-action-btn danger"
+                            onClick={(e) => { e.stopPropagation(); removePowerDevice(did); }}
+                            disabled={!canDeleteRecords}
+                            title="Delete meter"
+                          >
+                            <DeleteIcon />
+                          </button>
+                        </span>
+                      </div>
+                    );
+                  })}
                   {gatewayConfigsView.map((g) => {
                     const dbName = dbConnections.find((db) => db.id === g.database_id)?.name || "-";
                     const deviceName = devices.find((d) => d.id === g.device_id)?.name || "-";
@@ -15725,7 +15961,7 @@ const getGatewayHealth = (gateway) => {
               <section className="card">
                 <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
                   <h3 style={{ marginTop: 0, marginBottom: 8 }}>Power Meter Gateways</h3>
-                  <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddPowerDevice} disabled={!canEditPage("database")}>
+                  <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddPowerDevice} disabled={!canEditPage("power_configuration")}>
                     <AddIcon />
                     <span>Add Meter Gateway</span>
                   </button>
@@ -15764,7 +16000,7 @@ const getGatewayHealth = (gateway) => {
                               setPowerConfig((prev) => ({ ...(prev || {}), selected_device_id: did }));
                               openEditPowerDevice(d);
                             }}
-                            disabled={!canEditPage("database")}
+                            disabled={!canEditPage("power_configuration")}
                             title="Edit meter gateway"
                           >
                             <EditIcon />
@@ -18371,11 +18607,47 @@ const getGatewayHealth = (gateway) => {
                   value={gatewayForm.database_id}
                   onChange={(e) => setGatewayForm({ ...gatewayForm, database_id: e.target.value })}
                   disabled={!canEditPage("gateway_configuration")}
+                  title="Where the gateway will log historian readings. Local SQLite is always available; external engines (Postgres / MySQL / file sinks) appear once configured on the Database page."
                 >
-                  <option value="">Select database</option>
-                  {dbConnections.map((db) => (
-                    <option key={db.id} value={db.id}>{db.name}</option>
-                  ))}
+                  <option value="">Select database…</option>
+                  {(() => {
+                    // Group by engine so the picker scales when many DBs exist
+                    // (Local SQLite at top, then engines, then file sinks).
+                    const groups = [
+                      { label: "Local SQLite (recommended)", engines: ["sqlite"] },
+                      { label: "PostgreSQL", engines: ["postgres", "postgresql"] },
+                      { label: "MySQL / MariaDB", engines: ["mysql", "mariadb"] },
+                      { label: "SQL Server", engines: ["mssql", "sqlserver"] },
+                      { label: "File sinks (CSV / TXT)", engines: ["csv_file", "txt_file"] },
+                    ];
+                    const used = new Set();
+                    const nodes = [];
+                    for (const g of groups) {
+                      const rows = (dbConnections || []).filter((db) => g.engines.includes(String(db.engine || "").toLowerCase()));
+                      if (!rows.length) continue;
+                      nodes.push(
+                        <optgroup key={g.label} label={g.label}>
+                          {rows.map((db) => {
+                            used.add(String(db.id || ""));
+                            const tail = db.sqlite_path ? ` — ${db.sqlite_path}` : db.host ? ` — ${db.host}${db.port ? `:${db.port}` : ""}` : "";
+                            return <option key={db.id} value={db.id}>{db.name}{tail}</option>;
+                          })}
+                        </optgroup>
+                      );
+                    }
+                    // Catch-all for any engine we didn't explicitly group.
+                    const others = (dbConnections || []).filter((db) => !used.has(String(db.id || "")));
+                    if (others.length) {
+                      nodes.push(
+                        <optgroup key="_other" label="Other">
+                          {others.map((db) => (
+                            <option key={db.id} value={db.id}>{db.name}{db.engine ? ` [${db.engine}]` : ""}</option>
+                          ))}
+                        </optgroup>
+                      );
+                    }
+                    return nodes;
+                  })()}
                 </select>
               </label>
               <label>
@@ -18470,14 +18742,16 @@ const getGatewayHealth = (gateway) => {
                         {`Total: ${gatewayOpcNodeSummary.total} | Objects: ${gatewayOpcNodeSummary.objects} | Variables: ${gatewayOpcNodeSummary.variables} | Methods: ${gatewayOpcNodeSummary.methods}`}
                       </div>
                     ) : null}
-                    {gatewayForm.gateway_type === "siemens_opcua" ? (
-                      <input
-                        className="gateway-browse-search"
-                        placeholder="Search OPC-UA tags (name/path/node id)"
-                        value={gatewayBrowseSearch}
-                        onChange={(e) => setGatewayBrowseSearch(e.target.value)}
-                      />
-                    ) : null}
+                    <input
+                      className="gateway-browse-search"
+                      placeholder={
+                        gatewayForm.gateway_type === "siemens_opcua"
+                          ? "Search OPC-UA tags (name / path / node id)"
+                          : "Search tags by name…"
+                      }
+                      value={gatewayBrowseSearch}
+                      onChange={(e) => setGatewayBrowseSearch(e.target.value)}
+                    />
                     <div className="row">
                       <button type="button" className="btn btn-primary btn-sm" onClick={selectAllDiscoveredTags}>
                         Select All
@@ -18535,16 +18809,29 @@ const getGatewayHealth = (gateway) => {
                             </label>
                           );
                         })
-                      : gatewayDiscoveredTags.map((tag) => (
-                          <label key={tag} className="discovered-tag-item">
-                            <input
-                              type="checkbox"
-                              checked={gatewaySelectedTags.includes(tag)}
-                              onChange={() => toggleGatewayDiscoveredTag(tag)}
-                            />
-                            <span>{tag}</span>
-                          </label>
-                        ))}
+                      : (() => {
+                          const q = String(gatewayBrowseSearch || "").trim().toLowerCase();
+                          const filtered = q
+                            ? gatewayDiscoveredTags.filter((tag) => String(tag).toLowerCase().includes(q))
+                            : gatewayDiscoveredTags;
+                          if (gatewayDiscoveredTags.length && !filtered.length) {
+                            return (
+                              <p className="muted" style={{ padding: "8px 12px" }}>
+                                No tags match “{gatewayBrowseSearch}”.
+                              </p>
+                            );
+                          }
+                          return filtered.map((tag) => (
+                            <label key={tag} className="discovered-tag-item">
+                              <input
+                                type="checkbox"
+                                checked={gatewaySelectedTags.includes(tag)}
+                                onChange={() => toggleGatewayDiscoveredTag(tag)}
+                              />
+                              <span>{tag}</span>
+                            </label>
+                          ));
+                        })()}
                   </div>
                 </div>
               ) : null}
@@ -18988,28 +19275,56 @@ const getGatewayHealth = (gateway) => {
                           <button
                             type="button"
                             className="icon-btn table-action-btn"
-                            title="Pick file destination"
-                            onClick={() => fileSinkPickerRef.current?.click()}
+                            title="Pick a folder. The connection name + extension is appended; you can still edit the result before saving."
+                            onClick={async () => {
+                              // Use the native Electron folder picker via the
+                              // preload bridge. The browser <input type=file>
+                              // strips the absolute path so it could never
+                              // produce a usable destination — that's what
+                              // the user was hitting before this rewrite.
+                              try {
+                                const ext = dbForm.engine === "csv_file" ? ".csv" : ".txt";
+                                const safeName = String(dbForm.name || "trustnode_log")
+                                  .replace(/[^A-Za-z0-9_.-]+/g, "_")
+                                  .replace(/^_+|_+$/g, "")
+                                  .slice(0, 60) || "trustnode_log";
+                                // Seed the dialog with the directory the user
+                                // is already using so they land in a familiar
+                                // place — falls back to the system default.
+                                const current = String(dbForm.file_path || "").trim();
+                                const defaultPath = current
+                                  ? current.replace(/[\\/][^\\/]*$/, "")
+                                  : "";
+                                let chosen = null;
+                                if (window.trustnodeDialogs?.pickFolder) {
+                                  chosen = await window.trustnodeDialogs.pickFolder({
+                                    title: "Choose a destination folder",
+                                    defaultPath: defaultPath || undefined,
+                                  });
+                                } else {
+                                  // Browser fallback: prompt with current value.
+                                  chosen = window.prompt(
+                                    "Destination folder",
+                                    defaultPath || ""
+                                  );
+                                }
+                                if (!chosen) return; // user cancelled — keep existing field
+                                const sep = chosen.includes("\\") ? "\\" : "/";
+                                const trimmed = chosen.replace(/[\\/]+$/, "");
+                                const next = `${trimmed}${sep}${safeName}${ext}`;
+                                setDbForm((prev) => ({ ...(prev || {}), file_path: next }));
+                              } catch (err) {
+                                setError(`Folder picker failed: ${String(err?.message || err)}`);
+                              }
+                            }}
                             disabled={!canEditPage("database")}
                           >
                             <FolderIcon />
                           </button>
-                          <input
-                            ref={fileSinkPickerRef}
-                            type="file"
-                            style={{ display: "none" }}
-                            accept={dbForm.engine === "csv_file" ? ".csv,text/csv" : ".txt,text/plain"}
-                            onChange={(e) => {
-                              const f = e?.target?.files?.[0];
-                              if (!f) return;
-                              const chosen = String(f?.path || f?.name || "").trim();
-                              if (chosen) setDbForm((prev) => ({ ...(prev || {}), file_path: chosen }));
-                              try {
-                                e.target.value = "";
-                              } catch {}
-                            }}
-                          />
                         </div>
+                        <small className="muted">
+                          Click the folder icon to choose a directory — the file name is generated from this connection's name and extension. You can still edit the final path before saving.
+                        </small>
                       </label>
                     </div>
                   </section>
@@ -19360,6 +19675,51 @@ const getGatewayHealth = (gateway) => {
               <label><span>Port</span><input type="number" value={powerDeviceForm.port} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, port: Number(e.target.value || 502) })} /></label>
               <label><span>Unit ID</span><input type="number" value={powerDeviceForm.unit_id} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, unit_id: Number(e.target.value || 1) })} /></label>
               <label><span>Polling Interval (ms)</span><input type="number" value={powerDeviceForm.poll_interval_ms} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, poll_interval_ms: Number(e.target.value || 1000) })} /></label>
+              <label>
+                <span>Database Connection (optional)</span>
+                <select
+                  value={powerDeviceForm.database_id || ""}
+                  onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, database_id: e.target.value })}
+                  title="Local SQLite historian always stores meter readings. Pick an extra connection to mirror the data to a file or external DB, just like a PLC gateway."
+                >
+                  <option value="">Local SQLite (default — always written)</option>
+                  {(() => {
+                    const groups = [
+                      { label: "PostgreSQL", engines: ["postgres", "postgresql"] },
+                      { label: "MySQL / MariaDB", engines: ["mysql", "mariadb"] },
+                      { label: "SQL Server", engines: ["mssql", "sqlserver"] },
+                      { label: "Local SQLite (extra)", engines: ["sqlite"] },
+                      { label: "File sinks (CSV / TXT)", engines: ["csv_file", "txt_file"] },
+                    ];
+                    const used = new Set();
+                    const nodes = [];
+                    for (const g of groups) {
+                      const rows = (dbConnections || []).filter((db) => g.engines.includes(String(db.engine || "").toLowerCase()));
+                      if (!rows.length) continue;
+                      nodes.push(
+                        <optgroup key={g.label} label={g.label}>
+                          {rows.map((db) => {
+                            used.add(String(db.id || ""));
+                            const tail = db.sqlite_path ? ` — ${db.sqlite_path}` : db.host ? ` — ${db.host}${db.port ? `:${db.port}` : ""}` : "";
+                            return <option key={db.id} value={db.id}>{db.name}{tail}</option>;
+                          })}
+                        </optgroup>
+                      );
+                    }
+                    const others = (dbConnections || []).filter((db) => !used.has(String(db.id || "")));
+                    if (others.length) {
+                      nodes.push(
+                        <optgroup key="_other" label="Other">
+                          {others.map((db) => (
+                            <option key={db.id} value={db.id}>{db.name}{db.engine ? ` [${db.engine}]` : ""}</option>
+                          ))}
+                        </optgroup>
+                      );
+                    }
+                    return nodes;
+                  })()}
+                </select>
+              </label>
               <label><span>Meter Mode</span><select value={powerDeviceForm.electrical_mode || "single_phase"} onChange={(e) => {
                 const nextMode = e.target.value;
                 const nextProfile = powerProfiles?.mode_defaults?.[nextMode] || POWER_PROFILE_DEFAULTS[nextMode] || POWER_PROFILE_DEFAULTS.single_phase;

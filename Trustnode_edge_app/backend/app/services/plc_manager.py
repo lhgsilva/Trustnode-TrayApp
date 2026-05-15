@@ -12,6 +12,43 @@ from app.opcua_utils import resolve_requested_nodes, split_requested_identifiers
 from app.tenant import normalize_tenant_id
 
 
+def _utc_str_to_local_iso(ts_utc: str) -> str:
+    """Convert a UTC timestamp string into the operator's local ISO string.
+
+    Accepts the formats this codebase emits ("YYYY-MM-DD HH:MM:SS.fff" and
+    ISO 8601 with optional "Z"/+00:00). Returns the original string if it
+    cannot be parsed so callers always get *something* in the column —
+    silently dropping the cell would be worse than printing the UTC value.
+    """
+    raw = str(ts_utc or "").strip()
+    if not raw:
+        return ""
+    cand = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
+    parsed: datetime | None = None
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
+        try:
+            parsed = datetime.strptime(cand.split("+", 1)[0], fmt)
+            break
+        except Exception:
+            continue
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(cand)
+        except Exception:
+            return raw
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    except Exception:
+        return raw
+
+
 class GatewayWorker:
     def __init__(
         self,
@@ -43,6 +80,15 @@ class GatewayWorker:
         self.db_pending_count = 0
         self.collection_blocked = False
         self.collection_block_reason: str | None = None
+        # Monotonic timestamp captured each time the worker is (re)started.
+        # During the first few seconds after start, transient PLC-handshake
+        # errors are common and self-recover on the next cycle; we suppress
+        # them so the dashboard doesn't paint "Device Fails" for a healthy
+        # gateway during normal warm-up.
+        self._startup_started_monotonic = 0.0
+        self._startup_grace_seconds = float(
+            os.environ.get("TRUSTNODE_STARTUP_GRACE_SECONDS", "8.0") or "8.0"
+        )
         self._remote_flush_inflight = False
         self._remote_flush_lock = threading.Lock()
         self._remote_last_flush_started_monotonic = 0.0
@@ -124,7 +170,16 @@ class GatewayWorker:
         if self.running:
             return
         self.running = True
+        # Clear errors and counters from the previous run so the UI doesn't
+        # paint a stale "Device Fails" / "DB Fails" badge between this start
+        # and the first successful read cycle. The startup_started_monotonic
+        # marker lets `_run_loop` suppress transient first-cycle errors for a
+        # short grace window (slow PLC handshakes / first OPC session setup).
         self.last_error = None
+        self.db_last_error = None
+        self.collection_blocked = False
+        self.collection_block_reason = None
+        self._startup_started_monotonic = time.monotonic()
         self._task = asyncio.create_task(self._run_loop(emit_event))
 
     async def stop(self) -> None:
@@ -227,10 +282,19 @@ class GatewayWorker:
                     # Execute off-loop to avoid delaying other gateways/API calls.
                     await asyncio.to_thread(self._persist_readings, readings)
             except Exception as exc:
-                self.last_error = str(exc)
+                err_text = str(exc)
+                # Suppress transient handshake errors during the post-start
+                # grace window: many PLC drivers fail the very first read while
+                # the session is being negotiated, then recover on the next
+                # cycle. Surfacing the error immediately produces a misleading
+                # "Device Fails" label even though the gateway is healthy.
+                started_at = self._startup_started_monotonic or 0.0
+                in_grace = started_at > 0 and (time.monotonic() - started_at) < self._startup_grace_seconds
+                if not in_grace:
+                    self.last_error = err_text
                 # Do not keep stale values visible when a read cycle fails.
                 self.latest_readings = []
-                await emit_event({"type": "error", "gateway_id": self.gateway_id, "message": self.last_error})
+                await emit_event({"type": "error", "gateway_id": self.gateway_id, "message": err_text})
             target_s = max(self.config.interval_ms / 1000.0, 0.1)
             elapsed_s = max(0.0, time.monotonic() - cycle_started)
             await asyncio.sleep(max(0.01, target_s - elapsed_s))
@@ -312,6 +376,32 @@ class GatewayWorker:
         if gateway_type == "siemens_snap7":
             return self._read_from_snap7()
         raise RuntimeError(f"Gateway type '{self.config.gateway_type}' is not implemented for real-time reads.")
+
+    def _coerce_value(self, raw: Any, tag_name: str) -> tuple[float, str | None]:
+        """Return (numeric_value, text_value).
+
+        Numeric tags return (float, None). String-typed tags (PLC text
+        registers, OPC-UA String/ByteString, smart-meter strings) return
+        (0.0, text). The caller writes both columns; downstream views render
+        text-first when text_value is set.
+        """
+        if raw is None:
+            raise RuntimeError(f"Tag '{tag_name}' returned null value.")
+        if isinstance(raw, bool):
+            return (1.0 if raw else 0.0, None)
+        if isinstance(raw, (int, float)):
+            return (float(raw), None)
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                txt = bytes(raw).decode("utf-8", errors="replace")
+            except Exception:
+                txt = repr(raw)
+            return (0.0, txt)
+        text = str(raw).strip()
+        try:
+            return (float(text), None)
+        except Exception:
+            return (0.0, text)
 
     def _coerce_value_to_float(self, raw: Any, tag_name: str) -> float:
         if raw is None:
@@ -401,13 +491,14 @@ class GatewayWorker:
                     status = str(getattr(res, "error", None) or getattr(res, "status", "") or "")
                     if status:
                         raise RuntimeError(f"read failed for '{requested_tag}': {status}")
-                    value = self._coerce_value_to_float(getattr(res, "value", None), requested_tag or "<unknown>")
+                    value, value_text = self._coerce_value(getattr(res, "value", None), requested_tag or "<unknown>")
                     quality, quality_label = self._normalize_quality(self.config.gateway_type, raw_quality=192)
                     out.append(
                         GatewayReading(
                             ts_utc=ts,
                             tag_name=requested_tag,
                             value=value,
+                            value_text=value_text,
                             quality=quality,
                             quality_label=quality_label,
                             source=self.config.gateway_type,
@@ -466,13 +557,14 @@ class GatewayWorker:
                     status_ok = status.strip().lower() in ("success", "ok", "0")
                     if not status_ok:
                         raise RuntimeError(f"read failed for '{tag}': {status}")
-                    value = self._coerce_value_to_float(getattr(res, "Value", None), tag)
+                    value, value_text = self._coerce_value(getattr(res, "Value", None), tag)
                     quality, quality_label = self._normalize_quality(self.config.gateway_type, raw_quality=192)
                     out.append(
                         GatewayReading(
                             ts_utc=ts,
                             tag_name=tag,
                             value=value,
+                            value_text=value_text,
                             quality=quality,
                             quality_label=quality_label,
                             source=self.config.gateway_type,
@@ -674,11 +766,19 @@ class GatewayWorker:
                         self.config.gateway_type,
                         raw_status=status_name
                     )
+                    if value is None:
+                        num_val, txt_val = 0.0, None
+                    else:
+                        try:
+                            num_val, txt_val = self._coerce_value(value, requested_tag)
+                        except Exception:
+                            num_val, txt_val = 0.0, str(value)
                     out.append(
                         GatewayReading(
                             ts_utc=ts,
                             tag_name=requested_tag,
-                            value=float(value) if value is not None else 0.0,
+                            value=num_val,
+                            value_text=txt_val,
                             quality=quality,
                             quality_label=quality_label,
                             source=self.config.gateway_type,
@@ -1050,9 +1150,21 @@ class GatewayWorker:
             with open(file_path, "a", encoding="utf-8", newline="") as f:
                 writer = csv.writer(f)
                 if write_header:
-                    writer.writerow(["ts_utc", "tag_name", "value", "quality", "quality_label", "source", "site", "area", "equipment"])
+                    writer.writerow(["ts_local", "ts_utc", "tag_name", "value", "value_text", "quality", "quality_label", "source", "site", "area", "equipment"])
                 for r in readings:
-                    writer.writerow([r.ts_utc, r.tag_name, r.value, r.quality, r.quality_label, r.source, r.site, r.area, r.equipment])
+                    writer.writerow([
+                        _utc_str_to_local_iso(r.ts_utc),
+                        r.ts_utc,
+                        r.tag_name,
+                        r.value,
+                        getattr(r, "value_text", "") or "",
+                        r.quality,
+                        r.quality_label,
+                        r.source,
+                        r.site,
+                        r.area,
+                        r.equipment,
+                    ])
             return True
         except Exception:
             return False
@@ -1062,9 +1174,10 @@ class GatewayWorker:
             file_path = self._resolve_output_file_path((sink or {}).get("file_path") or "", "trustnode_log.txt")
             with open(file_path, "a", encoding="utf-8") as f:
                 for r in readings:
+                    txt = getattr(r, "value_text", "") or ""
                     f.write(
-                        f"{r.ts_utc}|{r.tag_name}|{r.value}|{r.quality}|{r.quality_label}|"
-                        f"{r.source}|{r.site}|{r.area}|{r.equipment}\n"
+                        f"{_utc_str_to_local_iso(r.ts_utc)}|{r.ts_utc}|{r.tag_name}|{r.value}|{txt}|"
+                        f"{r.quality}|{r.quality_label}|{r.source}|{r.site}|{r.area}|{r.equipment}\n"
                     )
             return True
         except Exception:
@@ -1220,9 +1333,21 @@ class GatewayWorker:
             with open(file_path, "a", encoding="utf-8", newline="") as f:
                 writer = csv.writer(f)
                 if write_header:
-                    writer.writerow(["ts_utc", "tag_name", "value", "quality", "quality_label", "source", "site", "area", "equipment"])
+                    writer.writerow(["ts_local", "ts_utc", "tag_name", "value", "value_text", "quality", "quality_label", "source", "site", "area", "equipment"])
                 for r in readings:
-                    writer.writerow([r.ts_utc, r.tag_name, r.value, r.quality, r.quality_label, r.source, r.site, r.area, r.equipment])
+                    writer.writerow([
+                        _utc_str_to_local_iso(r.ts_utc),
+                        r.ts_utc,
+                        r.tag_name,
+                        r.value,
+                        getattr(r, "value_text", "") or "",
+                        r.quality,
+                        r.quality_label,
+                        r.source,
+                        r.site,
+                        r.area,
+                        r.equipment,
+                    ])
             self._mark_db_write_success(len(readings))
             return True
         except Exception as exc:
@@ -1234,9 +1359,10 @@ class GatewayWorker:
             file_path = self._resolve_output_file_path((self.db_sink or {}).get("file_path") or "", "trustnode_log.txt")
             with open(file_path, "a", encoding="utf-8") as f:
                 for r in readings:
+                    txt = getattr(r, "value_text", "") or ""
                     f.write(
-                        f"{r.ts_utc}|{r.tag_name}|{r.value}|{r.quality}|{r.quality_label}|"
-                        f"{r.source}|{r.site}|{r.area}|{r.equipment}\n"
+                        f"{_utc_str_to_local_iso(r.ts_utc)}|{r.ts_utc}|{r.tag_name}|{r.value}|{txt}|"
+                        f"{r.quality}|{r.quality_label}|{r.source}|{r.site}|{r.area}|{r.equipment}\n"
                     )
             self._mark_db_write_success(len(readings))
             return True
@@ -1777,6 +1903,7 @@ class PLCManager:
                             "database_name": db_name,
                             "tag_name": tag_name,
                             "value": r.get("value"),
+                            "value_text": r.get("value_text"),
                             "quality": r.get("quality"),
                             "quality_label": str(r.get("quality_label") or ""),
                         }

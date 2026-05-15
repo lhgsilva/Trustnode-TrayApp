@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DashboardWidgetCard } from "./DashboardWidgets";
 import {
   DASHBOARD_GRID_COLS,
@@ -14,6 +14,30 @@ import "./dashboard.css";
 const TYPE_GROUPS = ["Charts", "KPI", "Content", "Layout", "Media"];
 const DASHBOARD_TIME_MODE_KEY = "trustnode_dashboard_time_mode";
 const DASHBOARD_TIME_RANGE_KEY = "trustnode_dashboard_time_range";
+const DASHBOARD_PROFILES_KEY = "trustnode_dashboard_profiles";
+const DASHBOARD_ACTIVE_PROFILE_KEY = "trustnode_dashboard_active_profile";
+const DASHBOARD_CAROUSEL_ENABLED_KEY = "trustnode_dashboard_carousel_enabled";
+const DASHBOARD_CAROUSEL_INTERVAL_KEY = "trustnode_dashboard_carousel_interval_seconds";
+
+function loadProfilesFromStorage() {
+  try {
+    const raw = localStorage.getItem(DASHBOARD_PROFILES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((p) => p && typeof p === "object" && typeof p.name === "string" && p.name.trim());
+  } catch {
+    return [];
+  }
+}
+
+function saveProfilesToStorage(profiles) {
+  try {
+    localStorage.setItem(DASHBOARD_PROFILES_KEY, JSON.stringify(Array.isArray(profiles) ? profiles : []));
+  } catch {
+    // Storage failures are non-fatal; the in-memory list keeps working.
+  }
+}
 const RULE_OPERATORS = [
   { value: "any", label: "Any" },
   { value: "eq", label: "=" },
@@ -484,6 +508,226 @@ export function DashboardDesigner({
   const [dashboardTimeMode, setDashboardTimeMode] = useState("live");
   const [dashboardFrom, setDashboardFrom] = useState("");
   const [dashboardTo, setDashboardTo] = useState("");
+  // ------------------------------------------------------------------------
+  // Dashboard profiles: named snapshots of the current layout (widgets +
+  // grid mode / cols + tag colors). Stored client-side in localStorage so
+  // they survive reloads and follow the user's machine. Each profile is
+  // independent — switching profiles fully replaces the active dashboard.
+  // ------------------------------------------------------------------------
+  const [profiles, setProfiles] = useState(() => loadProfilesFromStorage());
+  const [activeProfileName, setActiveProfileName] = useState(() => {
+    try {
+      return String(localStorage.getItem(DASHBOARD_ACTIVE_PROFILE_KEY) || "");
+    } catch {
+      return "";
+    }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(DASHBOARD_ACTIVE_PROFILE_KEY, activeProfileName || ""); } catch {}
+  }, [activeProfileName]);
+
+  // Carousel mode: when enabled the dashboard cycles through every saved
+  // profile on a timer. Useful for control-room TVs where you want to see
+  // every shift / area in rotation without anyone manually clicking.
+  const [carouselEnabled, setCarouselEnabled] = useState(() => {
+    try { return localStorage.getItem(DASHBOARD_CAROUSEL_ENABLED_KEY) === "1"; } catch { return false; }
+  });
+  const [carouselIntervalSec, setCarouselIntervalSec] = useState(() => {
+    try {
+      const raw = Number(localStorage.getItem(DASHBOARD_CAROUSEL_INTERVAL_KEY) || 0);
+      return Number.isFinite(raw) && raw >= 5 ? raw : 30;
+    } catch { return 30; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(DASHBOARD_CAROUSEL_ENABLED_KEY, carouselEnabled ? "1" : "0"); } catch {}
+  }, [carouselEnabled]);
+  useEffect(() => {
+    try { localStorage.setItem(DASHBOARD_CAROUSEL_INTERVAL_KEY, String(carouselIntervalSec)); } catch {}
+  }, [carouselIntervalSec]);
+
+  const persistProfiles = useCallback((next) => {
+    setProfiles(next);
+    saveProfilesToStorage(next);
+  }, []);
+
+  const captureCurrentProfilePayload = useCallback((name) => ({
+    name: String(name || "").trim(),
+    saved_utc: new Date().toISOString(),
+    widgets: Array.isArray(widgets) ? widgets : [],
+    mode: dashboardMode,
+    per_row: dashboardPerRow,
+    tag_colors: dashboardTagColors || {},
+  }), [widgets, dashboardMode, dashboardPerRow, dashboardTagColors]);
+
+  const applyProfilePayload = useCallback((payload) => {
+    if (!payload || typeof payload !== "object") return;
+    if (Array.isArray(payload.widgets)) {
+      setWidgets(compactWidgets(normalizeWidgets(payload.widgets)));
+    }
+    if (typeof payload.mode === "string" && setDashboardMode) setDashboardMode(payload.mode);
+    if (Number.isFinite(Number(payload.per_row)) && setDashboardPerRow) {
+      setDashboardPerRow(Number(payload.per_row));
+    }
+    if (payload.tag_colors && typeof payload.tag_colors === "object" && setDashboardTagColors) {
+      setDashboardTagColors(payload.tag_colors);
+    }
+  }, [setWidgets, setDashboardMode, setDashboardPerRow, setDashboardTagColors]);
+
+  const handleLoadProfile = useCallback((name) => {
+    const cleanName = String(name || "").trim();
+    if (!cleanName) {
+      setActiveProfileName("");
+      return;
+    }
+    const found = profiles.find((p) => p.name === cleanName);
+    if (!found) return;
+    applyProfilePayload(found);
+    setActiveProfileName(cleanName);
+  }, [profiles, applyProfilePayload]);
+
+  // Electron's BrowserWindow disables window.prompt() — that's why the
+  // original "Save as…" flow appeared to do nothing (prompt returned null
+  // silently and we bailed out). Replace it with a tiny in-app prompt modal
+  // controlled by these two state slots.
+  const [profilePromptOpen, setProfilePromptOpen] = useState(false);
+  const [profilePromptName, setProfilePromptName] = useState("");
+  const profilePromptResolveRef = useRef(null);
+  const askProfileName = useCallback((suggested = "") => {
+    return new Promise((resolve) => {
+      profilePromptResolveRef.current = resolve;
+      setProfilePromptName(String(suggested || ""));
+      setProfilePromptOpen(true);
+    });
+  }, []);
+  const finishProfilePrompt = useCallback((value) => {
+    setProfilePromptOpen(false);
+    const fn = profilePromptResolveRef.current;
+    profilePromptResolveRef.current = null;
+    if (fn) fn(value);
+  }, []);
+
+  const handleSaveAsProfile = useCallback(async () => {
+    const suggested = activeProfileName || "";
+    const rawName = await askProfileName(suggested);
+    const name = String(rawName || "").trim();
+    if (!name) return;
+    const existing = profiles.find((p) => p.name === name);
+    if (existing) {
+      // window.confirm works in Electron but to keep behavior consistent
+      // with the new in-app prompt, use it only as a backstop. If the user
+      // dismisses, abort.
+      let proceed = true;
+      try { proceed = window.confirm(`Overwrite existing profile "${name}"?`); } catch { proceed = true; }
+      if (!proceed) return;
+    }
+    const payload = captureCurrentProfilePayload(name);
+    const next = existing
+      ? profiles.map((p) => (p.name === name ? payload : p))
+      : [...profiles, payload];
+    persistProfiles(next);
+    setActiveProfileName(name);
+  }, [activeProfileName, profiles, captureCurrentProfilePayload, persistProfiles, askProfileName]);
+
+  const handleSaveProfile = useCallback(() => {
+    const name = activeProfileName;
+    if (!name) {
+      handleSaveAsProfile();
+      return;
+    }
+    const payload = captureCurrentProfilePayload(name);
+    const exists = profiles.some((p) => p.name === name);
+    const next = exists ? profiles.map((p) => (p.name === name ? payload : p)) : [...profiles, payload];
+    persistProfiles(next);
+  }, [activeProfileName, profiles, captureCurrentProfilePayload, persistProfiles, handleSaveAsProfile]);
+
+  /**
+   * Pan the dashboard's historical window left (older) or right (newer) by a
+   * number of *windows*. Used by chart drag-to-scroll: a drag on any chart
+   * shifts the shared dashboard from/to so every widget pans in lockstep.
+   *
+   * Behavior:
+   *   - Only fires when in Historical time mode.
+   *   - When no explicit from/to is set yet, the function snaps to "now" and
+   *     scrolls back by one window (default 30 minutes) so the first drag
+   *     immediately produces a visible historical view.
+   *   - One drag = one window shift; the window width is preserved.
+   */
+  const panHistoricalWindow = useCallback((direction) => {
+    const step = Math.sign(Number(direction) || 0);
+    if (step === 0) return;
+    if (dashboardTimeMode !== "historical") return;
+    const dtLocalToMs = (s) => {
+      const t = String(s || "").trim();
+      if (!t) return NaN;
+      const ms = Date.parse(t);
+      return Number.isFinite(ms) ? ms : NaN;
+    };
+    const msToDtLocal = (ms) => {
+      const d = new Date(ms);
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    };
+    let fromMs = dtLocalToMs(dashboardFrom);
+    let toMs = dtLocalToMs(dashboardTo);
+    const defaultSpan = 30 * 60 * 1000; // 30 minutes
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) {
+      const now = Date.now();
+      toMs = now;
+      fromMs = now - defaultSpan;
+    }
+    const span = Math.max(60 * 1000, toMs - fromMs);
+    // Drag right (positive direction) → go BACK in time (operator pulls past
+    // history toward them). Drag left → go forward.
+    const shift = span * step * -1;
+    fromMs += shift;
+    toMs += shift;
+    setDashboardFrom(msToDtLocal(fromMs));
+    setDashboardTo(msToDtLocal(toMs));
+  }, [dashboardTimeMode, dashboardFrom, dashboardTo, setDashboardFrom, setDashboardTo]);
+
+  const handleDeleteProfile = useCallback(() => {
+    const name = activeProfileName;
+    if (!name) return;
+    let proceed = true;
+    try { proceed = window.confirm(`Delete profile "${name}"? This cannot be undone.`); } catch { proceed = true; }
+    if (!proceed) return;
+    persistProfiles(profiles.filter((p) => p.name !== name));
+    setActiveProfileName("");
+  }, [activeProfileName, profiles, persistProfiles]);
+
+  // Carousel driver: when enabled, advance to the next profile every N
+  // seconds. Quiet when fewer than two profiles are configured (nothing to
+  // rotate to) or when the user toggles it off. Pauses if the page is
+  // hidden / minimized to avoid wasted re-renders on a TV that's off.
+  useEffect(() => {
+    if (!carouselEnabled) return;
+    if (!Array.isArray(profiles) || profiles.length < 2) return;
+    const intervalMs = Math.max(5, Number(carouselIntervalSec) || 30) * 1000;
+    let cancelled = false;
+    const tick = () => {
+      if (cancelled) return;
+      if (typeof document !== "undefined" && document.hidden) return; // pause when offscreen
+      // Compute the next profile name from the current active one each tick
+      // (don't capture activeProfileName at effect-mount time, otherwise
+      // changing it from carousel wouldn't advance further).
+      let currentName = "";
+      try { currentName = String(localStorage.getItem(DASHBOARD_ACTIVE_PROFILE_KEY) || ""); } catch {}
+      const idx = profiles.findIndex((p) => p.name === currentName);
+      const nextIdx = idx < 0 ? 0 : (idx + 1) % profiles.length;
+      const next = profiles[nextIdx];
+      if (next && next.name && next.name !== currentName) {
+        // Reuse the normal load path so the layout, mode, columns and tag
+        // colors all swap exactly as if the operator picked the profile.
+        applyProfilePayload(next);
+        setActiveProfileName(next.name);
+      }
+    };
+    const timer = setInterval(tick, intervalMs);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [carouselEnabled, carouselIntervalSec, profiles, applyProfilePayload]);
   const [historicalRows, setHistoricalRows] = useState([]);
   const [historicalRangeKey, setHistoricalRangeKey] = useState("");
   const [historicalLoading, setHistoricalLoading] = useState(false);
@@ -781,6 +1025,18 @@ export function DashboardDesigner({
         query_advanced_columns: Array.isArray(widget?.config?.query_advanced_columns)
           ? widget.config.query_advanced_columns
           : [],
+        series_extra: Array.isArray(widget?.config?.series_extra)
+          ? widget.config.series_extra
+          : [],
+        primary_unit: String(widget?.config?.primary_unit || ""),
+        primary_suffix: String(widget?.config?.primary_suffix || ""),
+        y_axis_label: String(widget?.config?.y_axis_label || ""),
+        y_axis_right_label: String(widget?.config?.y_axis_right_label || ""),
+        chart_line_width: clamp(widget?.config?.chart_line_width ?? 2, 1, 8),
+        chart_line_dot: String(widget?.config?.chart_line_dot || "none"),
+        chart_bar_opacity: clamp(widget?.config?.chart_bar_opacity ?? 100, 10, 100),
+        chart_bar_pattern: String(widget?.config?.chart_bar_pattern || "solid"),
+        chart_bar_width: clamp(widget?.config?.chart_bar_width ?? 0, 0, 120),
       },
     });
     setTab("config");
@@ -790,6 +1046,84 @@ export function DashboardDesigner({
   const removeWidget = (id) => {
     if (!canEdit) return;
     setWidgets((prev) => normalizeWidgets(prev).filter((w) => w.id !== id));
+  };
+
+  /**
+   * Clone an existing widget with all its config (tag, axes, series_extra,
+   * colors, query options). Asks the operator for an optional replacement
+   * primary tag — leaving it blank keeps the same tag so they can change it
+   * later from the widget editor. The new widget lands in the first free
+   * grid slot to avoid overlapping the original.
+   */
+  const duplicateWidget = (id) => {
+    if (!canEdit) return;
+    const source = normalizeWidgets(widgets).find((w) => String(w.id) === String(id));
+    if (!source) return;
+
+    const currentTag = String(source?.config?.tag_name || "");
+    const promptMsg = currentTag
+      ? `Duplicate "${source.title || source.type}".\n\nReplacement tag (leave blank to keep "${currentTag}"; you can also change it later):`
+      : `Duplicate "${source.title || source.type}".\n\nTag for the copy (optional — leave blank to set later):`;
+    let replacementTag;
+    try {
+      replacementTag = window.prompt(promptMsg, "");
+    } catch {
+      replacementTag = "";
+    }
+    if (replacementTag === null) return; // user cancelled
+    const nextTag = String(replacementTag || "").trim() || currentTag;
+
+    const meta = getWidgetMeta(source.type);
+    const sourceTitle = String(source.title || meta.label || "Widget");
+    const newTitle = sourceTitle.toLowerCase().endsWith("(copy)")
+      ? sourceTitle
+      : `${sourceTitle} (copy)`;
+
+    const cloned = {
+      ...source,
+      id: newWidgetId(),
+      title: newTitle,
+      // Deep-ish copy of the config so future edits to the copy don't mutate
+      // the source's series_extra / compute_rules / table columns arrays.
+      config: {
+        ...(source.config || {}),
+        tag_name: nextTag,
+        series_extra: Array.isArray(source?.config?.series_extra)
+          ? source.config.series_extra.map((s) => ({
+              ...(s || {}),
+              id: `s${Date.now().toString(36)}${Math.floor(Math.random() * 1000)}`,
+            }))
+          : [],
+        compute_rules: Array.isArray(source?.config?.compute_rules)
+          ? source.config.compute_rules.map((r) => ({ ...(r || {}) }))
+          : [],
+        query_table_columns: Array.isArray(source?.config?.query_table_columns)
+          ? [...source.config.query_table_columns]
+          : ["ts", "tag", "value"],
+        table_filter_tags: Array.isArray(source?.config?.table_filter_tags)
+          ? [...source.config.table_filter_tags]
+          : [],
+        query_where_conditions: Array.isArray(source?.config?.query_where_conditions)
+          ? source.config.query_where_conditions.map((r) => ({ ...(r || {}) }))
+          : [],
+        query_advanced_columns: Array.isArray(source?.config?.query_advanced_columns)
+          ? source.config.query_advanced_columns.map((r) => ({ ...(r || {}) }))
+          : [],
+      },
+      // Drop the saved position so findFirstFreeSpot places the copy where
+      // it won't overlap the original.
+      x: null,
+      y: null,
+    };
+
+    setWidgets((prev) => {
+      const list = normalizeWidgets(prev);
+      const placed = {
+        ...cloned,
+        ...findFirstFreeSpot({ w: cloned.w, h: cloned.h }, list),
+      };
+      return compactWidgets([...list, placed]);
+    });
   };
 
   const applyCurrentFormConfigToEditingWidget = () => {
@@ -887,6 +1221,55 @@ export function DashboardDesigner({
         query_advanced_columns: Array.isArray(form?.config?.query_advanced_columns)
           ? form.config.query_advanced_columns
           : [],
+        // Multi-series + axis configuration for trend charts. Persisted so
+        // saved widgets keep their secondary series across reloads.
+        series_extra: Array.isArray(form?.config?.series_extra)
+          ? form.config.series_extra
+              .filter((s) => s && typeof s === "object")
+              .map((s) => ({
+                id: String(s.id || ""),
+                gateway_id: String(s.gateway_id || ""),
+                tag_name: String(s.tag_name || ""),
+                label: String(s.label || ""),
+                color: String(s.color || ""),
+                axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
+                chart_type: String(s.chart_type || ""),
+                unit: String(s.unit || ""),
+                suffix: String(s.suffix || ""),
+                multiplier: Number(s.multiplier ?? 1) || 1,
+                offset: Number(s.offset ?? 0) || 0,
+                limit_value: s.limit_value === undefined || s.limit_value === null ? "" : String(s.limit_value),
+                // Per-series style. Each row carries its own thickness /
+                // dot / bar-width / pattern so multi-series charts can
+                // have, say, a thick solid trend line plus a thin dotted
+                // overlay. Empty / out-of-range values fall back to the
+                // widget-wide defaults at render time.
+                line_width: clamp(s.line_width ?? 2, 1, 8),
+                line_dot: ["none", "small", "medium", "large"].includes(String(s.line_dot || ""))
+                  ? String(s.line_dot)
+                  : "none",
+                bar_width: clamp(s.bar_width ?? 0, 0, 120),
+                bar_pattern: ["solid", "stripes-diag", "stripes-vert", "dots"].includes(String(s.bar_pattern || ""))
+                  ? String(s.bar_pattern)
+                  : "solid",
+                limit_dash: ["dashed", "solid", "dotted"].includes(String(s.limit_dash || ""))
+                  ? String(s.limit_dash)
+                  : "dashed",
+              }))
+          : [],
+        primary_unit: String(form?.config?.primary_unit || ""),
+        primary_suffix: String(form?.config?.primary_suffix || ""),
+        y_axis_label: String(form?.config?.y_axis_label || ""),
+        y_axis_right_label: String(form?.config?.y_axis_right_label || ""),
+        chart_line_width: clamp(form?.config?.chart_line_width ?? 2, 1, 8),
+        chart_line_dot: ["none", "small", "medium", "large"].includes(String(form?.config?.chart_line_dot || ""))
+          ? String(form?.config?.chart_line_dot)
+          : "none",
+        chart_bar_opacity: clamp(form?.config?.chart_bar_opacity ?? 100, 10, 100),
+        chart_bar_pattern: ["solid", "stripes-diag", "stripes-vert", "dots"].includes(String(form?.config?.chart_bar_pattern || ""))
+          ? String(form?.config?.chart_bar_pattern)
+          : "solid",
+        chart_bar_width: clamp(form?.config?.chart_bar_width ?? 0, 0, 120),
       },
     };
     const others = next.filter((w) => w.id !== candidate.id);
@@ -900,12 +1283,47 @@ export function DashboardDesigner({
     setEditingId(null);
   };
 
-  const onDragStart = (id) => setDraggingId(id);
+  // While dragging, we only TRACK the cursor's grid cell (in a ref so it
+  // doesn't trigger renders). The actual reflow happens once on drop. This
+  // eliminates the visual "two widgets on top of each other" flicker that
+  // came from re-running the collision pass 60 times a second mid-drag.
+  const dragHoverCellRef = useRef(null);
+  const dragHoverTargetIdRef = useRef("");
+
+  const onDragStart = (id) => {
+    dragHoverCellRef.current = null;
+    dragHoverTargetIdRef.current = "";
+    setDraggingId(id);
+  };
+
   const onDragOverWidget = (targetId) => {
     if (!canEdit || !draggingId || draggingId === targetId) return;
-    setWidgets((prev) => compactWidgets(reflowWidgetsForMove(normalizeWidgets(prev), draggingId, targetId)));
+    dragHoverTargetIdRef.current = String(targetId || "");
   };
+
   const onDropOn = () => {
+    if (!canEdit || !draggingId) {
+      setDraggingId("");
+      return;
+    }
+    const draggedId = draggingId;
+    // Prefer the cursor's grid coordinate (set by onGridDragOver) since it
+    // honors the exact drop position. Fall back to the last hovered widget
+    // for keyboard / fallback drops without grid coords.
+    const cell = dragHoverCellRef.current;
+    const targetId = dragHoverTargetIdRef.current;
+    setWidgets((prev) => {
+      const base = normalizeWidgets(prev);
+      if (cell) {
+        return compactWidgets(reflowWidgetsForMoveToPoint(base, draggedId, cell.x, cell.y));
+      }
+      if (targetId) {
+        return compactWidgets(reflowWidgetsForMove(base, draggedId, targetId));
+      }
+      return base;
+    });
+    dragHoverCellRef.current = null;
+    dragHoverTargetIdRef.current = "";
     setDraggingId("");
   };
 
@@ -917,7 +1335,7 @@ export function DashboardDesigner({
     const cellH = rect.height / DASHBOARD_GRID_ROWS;
     const x = clamp(Math.floor((e.clientX - rect.left) / Math.max(1, cellW)), 0, DASHBOARD_GRID_COLS - 1);
     const y = clamp(Math.floor((e.clientY - rect.top) / Math.max(1, cellH)), 0, DASHBOARD_GRID_ROWS - 1);
-    setWidgets((prev) => compactWidgets(reflowWidgetsForMoveToPoint(normalizeWidgets(prev), draggingId, x, y)));
+    dragHoverCellRef.current = { x, y };
   };
 
   const onResizeStart = (e, widget) => {
@@ -1093,11 +1511,16 @@ export function DashboardDesigner({
             className="dashboard-toolbar-icon-btn"
             onClick={() => setConfigModalOpen(true)}
             disabled={!canEdit}
-            title="Dashboard configuration"
+            title="Dashboard configuration, profiles & export"
             aria-label="Dashboard configuration"
           >
             <CogIcon />
           </button>
+          {activeProfileName ? (
+            <span className="dashboard-active-profile-chip" title={`Active profile: ${activeProfileName}`}>
+              {activeProfileName}
+            </span>
+          ) : null}
         </div>
         <div className="dashboard-tools-right">
           <div className="dashboard-mode-pills">
@@ -1118,8 +1541,28 @@ export function DashboardDesigner({
           </div>
           {dashboardTimeMode === "historical" ? (
             <div className="dashboard-range-controls">
+              <button
+                type="button"
+                className="dashboard-pill"
+                onClick={() => panHistoricalWindow(1)}
+                title="Pan one window back (older)"
+                aria-label="Pan back"
+                style={{ padding: "4px 10px" }}
+              >
+                ←
+              </button>
               <input type="datetime-local" value={dashboardFrom} onChange={(e) => setDashboardFrom(e.target.value)} />
               <input type="datetime-local" value={dashboardTo} onChange={(e) => setDashboardTo(e.target.value)} />
+              <button
+                type="button"
+                className="dashboard-pill"
+                onClick={() => panHistoricalWindow(-1)}
+                title="Pan one window forward (newer)"
+                aria-label="Pan forward"
+                style={{ padding: "4px 10px" }}
+              >
+                →
+              </button>
             </div>
           ) : null}
           {showGridMeta && dashboardTimeMode === "historical" ? (
@@ -1145,7 +1588,7 @@ export function DashboardDesigner({
         {normalizedWidgets.map((widget) => (
           <article
             key={widget.id}
-            className="card dashboard-widget-shell"
+            className={`card dashboard-widget-shell ${draggingId === widget.id ? "is-dragging" : ""}`}
             style={{
               gridColumn: `${widget.x + 1} / span ${widget.w}`,
               gridRow: `${widget.y + 1} / span ${widget.h}`,
@@ -1229,6 +1672,18 @@ export function DashboardDesigner({
                         </button>
                         <button
                           type="button"
+                          className="dashboard-widget-action-icon"
+                          onClick={() => {
+                            duplicateWidget(widget.id);
+                            setMenuWidgetId("");
+                          }}
+                          title="Duplicate (asks for a new tag, blank keeps the same)"
+                          aria-label="Duplicate widget"
+                        >
+                          <DuplicateIcon />
+                        </button>
+                        <button
+                          type="button"
                           className="dashboard-widget-action-icon danger"
                           onClick={() => {
                             removeWidget(widget.id);
@@ -1255,6 +1710,8 @@ export function DashboardDesigner({
               fetchWidgetRows={fetchWidgetRows}
               fetchWidgetStats={fetchWidgetStats}
               fetchWidgetRuleStats={fetchWidgetRuleStats}
+              historicalMode={dashboardTimeMode === "historical"}
+              onHistoricalPan={panHistoricalWindow}
             />
             {canEdit ? (
               <button
@@ -1479,6 +1936,31 @@ export function DashboardDesigner({
                     </button>
                   </div>
                 ) : null}
+                {/* Trend widgets (line/area/bar) don't use the full Data Query
+                    Builder, but they DO need access to the multi-series and
+                    dual-axis editor that lives inside it. Surface a direct
+                    button here so the option isn't hidden behind a modal
+                    that's named for a different workflow. */}
+                {["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? (
+                  <div className="dashboard-full-row">
+                    <button
+                      type="button"
+                      className="dashboard-type-btn"
+                      onClick={() => setQueryModalOpen(true)}
+                      title="Plot multiple tags on the same chart with their own units and axes"
+                    >
+                      Series & Axes (multi-tag, dual axis, units)
+                    </button>
+                    {Array.isArray(form.config?.series_extra) && form.config.series_extra.length ? (
+                      <div className="muted" style={{ marginTop: 4, fontSize: 12 }}>
+                        {form.config.series_extra.length} extra series configured.
+                        {form.config.series_extra.some((s) => String(s?.axis || "left").toLowerCase() === "right")
+                          ? " Right axis active."
+                          : ""}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
                 {["text_kpi", "value_kpi", "fixed_text"].includes(form.type) ? (
                   <label>
                     Text scale
@@ -1605,40 +2087,142 @@ export function DashboardDesigner({
         <div className="modal-backdrop">
           <div className="modal-card dashboard-config-modal">
             <h3>Dashboard Configuration</h3>
-            <div className="dashboard-config-actions">
-              <button
-                type="button"
-                className="dashboard-config-action-btn"
-                onClick={exportDashboardConfig}
-                title="Download current dashboard configuration"
-                aria-label="Download current dashboard configuration"
-              >
-                <DownloadIcon />
-                <span>Export JSON</span>
-              </button>
-              <button
-                type="button"
-                className="dashboard-config-action-btn"
-                onClick={() => importInputRef.current?.click()}
-                title="Select a dashboard configuration file"
-                aria-label="Select a dashboard configuration file"
-              >
-                <UploadIcon />
-                <span>Select JSON</span>
-              </button>
-              <input
-                ref={importInputRef}
-                type="file"
-                accept="application/json,.json"
-                className="dashboard-hidden-input"
-                onChange={onImportDashboardConfig}
-              />
-            </div>
-            <div className="dashboard-config-note">
-              {pendingImportWidgets
-                ? `Ready to load: ${pendingImportName}`
-                : "Select a JSON file first, then confirm load."}
-            </div>
+
+            <section className="dashboard-config-section">
+              <h4>Profiles</h4>
+              <p className="dashboard-config-hint">
+                Profiles save the current widgets, grid mode, columns and tag colors under a name. Switch between them at any time — loading a profile fully replaces the active dashboard.
+              </p>
+              <div className="dashboard-profile-group">
+                <select
+                  className="dashboard-profile-select"
+                  value={activeProfileName}
+                  onChange={(e) => handleLoadProfile(e.target.value)}
+                  aria-label="Load dashboard profile"
+                >
+                  <option value="">Default (unsaved)</option>
+                  {profiles.map((p) => (
+                    <option key={p.name} value={p.name}>{p.name}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="dashboard-profile-btn"
+                  onClick={handleSaveProfile}
+                  disabled={!canEdit}
+                  title={activeProfileName ? `Save changes to "${activeProfileName}"` : "Save current layout as a new profile"}
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  className="dashboard-profile-btn"
+                  onClick={handleSaveAsProfile}
+                  disabled={!canEdit}
+                  title="Save the current layout as a new named profile"
+                >
+                  Save as…
+                </button>
+                <button
+                  type="button"
+                  className="dashboard-profile-btn dashboard-profile-btn-danger"
+                  onClick={handleDeleteProfile}
+                  disabled={!canEdit || !activeProfileName}
+                  title={activeProfileName ? `Delete profile "${activeProfileName}"` : "No profile loaded"}
+                >
+                  Delete
+                </button>
+              </div>
+              <div className="dashboard-config-meta">
+                {activeProfileName
+                  ? `Active profile: ${activeProfileName} — ${profiles.length} profile${profiles.length === 1 ? "" : "s"} saved`
+                  : `${profiles.length} profile${profiles.length === 1 ? "" : "s"} saved`}
+              </div>
+
+              {/* Carousel mode: auto-rotate through every saved profile on a
+                  timer. Designed for control-room TVs where the operator
+                  wants to see every shift / area dashboard in rotation. */}
+              <div className="dashboard-carousel-row">
+                <label className="tn-switch" title="Auto-cycle through every saved profile">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(carouselEnabled)}
+                    onChange={(e) => setCarouselEnabled(e.target.checked)}
+                    disabled={profiles.length < 2}
+                  />
+                  <span className="tn-switch-track" aria-hidden>
+                    <span className="tn-switch-thumb" />
+                  </span>
+                  <span className="tn-switch-label">Carousel mode</span>
+                </label>
+                <label className="dashboard-carousel-interval">
+                  <span>Switch every</span>
+                  <input
+                    type="number"
+                    min="5"
+                    max="3600"
+                    step="5"
+                    value={Number(carouselIntervalSec) || 30}
+                    onChange={(e) => {
+                      const v = Number(e.target.value || 30);
+                      setCarouselIntervalSec(Math.max(5, Math.min(3600, Number.isFinite(v) ? v : 30)));
+                    }}
+                  />
+                  <span>seconds</span>
+                </label>
+              </div>
+              {profiles.length < 2 ? (
+                <div className="dashboard-config-meta" style={{ color: "var(--muted, #94a3b8)" }}>
+                  Save at least two profiles to enable carousel mode.
+                </div>
+              ) : carouselEnabled ? (
+                <div className="dashboard-config-meta" style={{ color: "var(--teal, #14a89a)" }}>
+                  Carousel running — switching profile every {Number(carouselIntervalSec) || 30}s.
+                </div>
+              ) : null}
+            </section>
+
+            <section className="dashboard-config-section">
+              <h4>Export / Import (JSON)</h4>
+              <p className="dashboard-config-hint">
+                Move a dashboard between TrustNode installations as a JSON file. Useful for templates, backups, or onboarding a new edge.
+              </p>
+              <div className="dashboard-config-actions">
+                <button
+                  type="button"
+                  className="dashboard-config-action-btn"
+                  onClick={exportDashboardConfig}
+                  title="Download current dashboard configuration"
+                  aria-label="Download current dashboard configuration"
+                >
+                  <DownloadIcon />
+                  <span>Export JSON</span>
+                </button>
+                <button
+                  type="button"
+                  className="dashboard-config-action-btn"
+                  onClick={() => importInputRef.current?.click()}
+                  title="Select a dashboard configuration file"
+                  aria-label="Select a dashboard configuration file"
+                >
+                  <UploadIcon />
+                  <span>Select JSON</span>
+                </button>
+                <input
+                  ref={importInputRef}
+                  type="file"
+                  accept="application/json,.json"
+                  className="dashboard-hidden-input"
+                  onChange={onImportDashboardConfig}
+                />
+              </div>
+              <div className="dashboard-config-note">
+                {pendingImportWidgets
+                  ? `Ready to load: ${pendingImportName}`
+                  : "Select a JSON file first, then confirm load."}
+              </div>
+            </section>
+
             <div className="row modal-actions">
               <button className="btn btn-primary" onClick={confirmLoadDashboardConfig} disabled={!pendingImportWidgets}>
                 Confirm Load
@@ -1658,10 +2242,58 @@ export function DashboardDesigner({
         </div>
       ) : null}
 
+      {profilePromptOpen ? (
+        <div className="modal-backdrop" style={{ zIndex: 60 }}>
+          <div className="modal-card" style={{ width: "min(420px, 92vw)" }}>
+            <h3 style={{ marginTop: 0 }}>Profile name</h3>
+            <p className="dashboard-config-hint">
+              Save the current dashboard layout (widgets, grid mode, columns, tag colors) under this name.
+            </p>
+            <input
+              autoFocus
+              value={profilePromptName}
+              onChange={(e) => setProfilePromptName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  finishProfilePrompt(profilePromptName);
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  finishProfilePrompt("");
+                }
+              }}
+              placeholder="e.g. Production overview"
+              style={{ width: "100%", padding: "8px 10px", fontSize: 14, marginTop: 4 }}
+            />
+            <div className="row modal-actions" style={{ marginTop: 14, justifyContent: "flex-end", gap: 8 }}>
+              <button
+                type="button"
+                className="btn btn-danger"
+                onClick={() => finishProfilePrompt("")}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => finishProfilePrompt(profilePromptName)}
+                disabled={!String(profilePromptName || "").trim()}
+              >
+                Save profile
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {queryModalOpen ? (
         <div className="modal-backdrop">
-          <div className="modal-card dashboard-widget-modal dashboard-query-modal dashboard-query-modal-wide">
-            <h3>Widget Data Query Builder</h3>
+          <div className={`modal-card dashboard-widget-modal dashboard-query-modal dashboard-query-modal-wide ${["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? "dashboard-series-modal-wide" : ""}`}>
+            <h3>
+              {["line_chart", "line_area_chart", "bar_chart"].includes(form.type)
+                ? "Series, Axes & Data Query"
+                : "Widget Data Query Builder"}
+            </h3>
             <div className="dashboard-query-sections">
               <fieldset className="dashboard-query-fieldset">
                 <legend>Time &amp; rows</legend>
@@ -1899,6 +2531,395 @@ export function DashboardDesigner({
                         <span>{opt.label}</span>
                       </label>
                     ))}
+                  </div>
+                </fieldset>
+              ) : null}
+              {["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? (
+                <fieldset className="dashboard-query-fieldset">
+                  <legend>Series & axes</legend>
+                  <p className="dashboard-query-hint">
+                    Plot multiple tags on the same chart. Each series can have its own unit, axis (left / right), chart style and color.
+                  </p>
+                  <div className="dashboard-query-grid">
+                    <label className="dashboard-query-field">
+                      <span>Primary unit</span>
+                      <input
+                        value={form.config.primary_unit || ""}
+                        placeholder="e.g. °C"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, primary_unit: e.target.value } }))}
+                      />
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>Primary suffix</span>
+                      <input
+                        value={form.config.primary_suffix || ""}
+                        placeholder="optional"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, primary_suffix: e.target.value } }))}
+                      />
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>Left axis label</span>
+                      <input
+                        value={form.config.y_axis_label || ""}
+                        placeholder="optional"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_axis_label: e.target.value } }))}
+                      />
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>Right axis label</span>
+                      <input
+                        value={form.config.y_axis_right_label || ""}
+                        placeholder="optional"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_axis_right_label: e.target.value } }))}
+                      />
+                    </label>
+                  </div>
+                  {/* Per-widget styling: line thickness, dot marker, bar fill / width.
+                      Placed inside the Series & Axes fieldset (instead of the
+                      separate Chart Display section above) so operators see
+                      it without scrolling up through the modal. */}
+                  {["line_chart", "line_area_chart"].includes(form.type) ? (
+                    <div className="dashboard-query-grid" style={{ marginTop: 6 }}>
+                      <label className="dashboard-query-field">
+                        <span>Line thickness (1–8 px)</span>
+                        <input
+                          type="number"
+                          min="1"
+                          max="8"
+                          step="1"
+                          value={Number(form.config?.chart_line_width || 2)}
+                          onChange={(e) =>
+                            setForm((p) => ({
+                              ...p,
+                              config: { ...p.config, chart_line_width: clamp(e.target.value, 1, 8) },
+                            }))
+                          }
+                        />
+                      </label>
+                      <label className="dashboard-query-field">
+                        <span>Dot marker</span>
+                        <select
+                          value={String(form.config?.chart_line_dot || "none")}
+                          onChange={(e) =>
+                            setForm((p) => ({
+                              ...p,
+                              config: { ...p.config, chart_line_dot: e.target.value },
+                            }))
+                          }
+                        >
+                          <option value="none">No markers</option>
+                          <option value="small">Small dots</option>
+                          <option value="medium">Medium dots</option>
+                          <option value="large">Large dots</option>
+                        </select>
+                      </label>
+                    </div>
+                  ) : null}
+                  {form.type === "bar_chart" ? (
+                    <div className="dashboard-query-grid" style={{ marginTop: 6 }}>
+                      <label className="dashboard-query-field">
+                        <span>Bar width (px, 0 = auto)</span>
+                        <input
+                          type="number"
+                          min="0"
+                          max="120"
+                          step="1"
+                          value={Number(form.config?.chart_bar_width ?? 0)}
+                          onChange={(e) =>
+                            setForm((p) => ({
+                              ...p,
+                              config: { ...p.config, chart_bar_width: clamp(e.target.value, 0, 120) },
+                            }))
+                          }
+                        />
+                      </label>
+                      <label className="dashboard-query-field">
+                        <span>Bar fill opacity (%)</span>
+                        <input
+                          type="number"
+                          min="10"
+                          max="100"
+                          step="5"
+                          value={Number(form.config?.chart_bar_opacity ?? 100)}
+                          onChange={(e) =>
+                            setForm((p) => ({
+                              ...p,
+                              config: { ...p.config, chart_bar_opacity: clamp(e.target.value, 10, 100) },
+                            }))
+                          }
+                        />
+                      </label>
+                      <label className="dashboard-query-field">
+                        <span>Bar pattern / fill</span>
+                        <select
+                          value={String(form.config?.chart_bar_pattern || "solid")}
+                          onChange={(e) =>
+                            setForm((p) => ({
+                              ...p,
+                              config: { ...p.config, chart_bar_pattern: e.target.value },
+                            }))
+                          }
+                        >
+                          <option value="solid">Solid</option>
+                          <option value="stripes-diag">Diagonal stripes</option>
+                          <option value="stripes-vert">Vertical stripes</option>
+                          <option value="dots">Dotted</option>
+                        </select>
+                      </label>
+                    </div>
+                  ) : null}
+                  {(Array.isArray(form.config.series_extra) && form.config.series_extra.length > 0) ? (
+                    <div className="dashboard-series-table">
+                      <div className="dashboard-series-table-head">
+                        <span>Gateway</span>
+                        <span>Tag</span>
+                        <span>Label</span>
+                        <span>Axis</span>
+                        <span>Type</span>
+                        <span>Unit</span>
+                        <span>Suffix</span>
+                        <span>Size</span>
+                        <span>Style</span>
+                        <span>Color</span>
+                        <span></span>
+                      </div>
+                      {form.config.series_extra.map((row, idx) => {
+                        const allowedTags = (gatewayOptions.find((g) => String(g.id) === String(row.gateway_id || form.config.gateway_id))?.tags) || [];
+                        const update = (patch) => setForm((p) => {
+                          const list = Array.isArray(p.config.series_extra) ? [...p.config.series_extra] : [];
+                          list[idx] = { ...(list[idx] || {}), ...patch };
+                          return { ...p, config: { ...p.config, series_extra: list } };
+                        });
+                        const remove = () => setForm((p) => {
+                          const list = Array.isArray(p.config.series_extra) ? [...p.config.series_extra] : [];
+                          list.splice(idx, 1);
+                          return { ...p, config: { ...p.config, series_extra: list } };
+                        });
+                        const isLimit = String(row.chart_type || "").toLowerCase() === "limit";
+                        return (
+                          <div key={row.id || idx} className={`dashboard-series-table-row ${isLimit ? "dashboard-series-row-limit" : ""}`}>
+                            <select
+                              value={row.gateway_id || form.config.gateway_id || ""}
+                              onChange={(e) => update({ gateway_id: e.target.value, tag_name: "" })}
+                              title="Gateway"
+                              disabled={isLimit && !row.tag_name}
+                            >
+                              <option value="">(same as primary)</option>
+                              {gatewayOptions.map((g) => (
+                                <option key={g.id} value={g.id}>{g.name || g.id}</option>
+                              ))}
+                            </select>
+                            {isLimit ? (
+                              <input
+                                type="number"
+                                step="any"
+                                value={row.limit_value ?? ""}
+                                placeholder="constant value"
+                                onChange={(e) => update({ limit_value: e.target.value })}
+                                title="Threshold value drawn as a horizontal line"
+                              />
+                            ) : (
+                              <select
+                                value={row.tag_name || ""}
+                                onChange={(e) => update({ tag_name: e.target.value })}
+                                title="Tag"
+                              >
+                                <option value="">Select tag</option>
+                                {allowedTags.map((tag) => (
+                                  <option key={tag} value={tag}>
+                                    {formatTagForDisplay ? formatTagForDisplay(tag) : tag}
+                                  </option>
+                                ))}
+                              </select>
+                            )}
+                            <input
+                              value={row.label || ""}
+                              placeholder={isLimit ? "Label (e.g. Max Pressure)" : "(tag name)"}
+                              onChange={(e) => update({ label: e.target.value })}
+                              title="Label"
+                            />
+                            <select
+                              value={row.axis || "left"}
+                              onChange={(e) => update({ axis: e.target.value === "right" ? "right" : "left" })}
+                              title="Axis"
+                            >
+                              <option value="left">Left</option>
+                              <option value="right">Right</option>
+                            </select>
+                            <select
+                              value={row.chart_type || ""}
+                              onChange={(e) => update({ chart_type: e.target.value })}
+                              title="Chart type"
+                            >
+                              <option value="">(widget)</option>
+                              <option value="line">Line</option>
+                              <option value="area">Area</option>
+                              <option value="bar">Bar</option>
+                              <option value="limit">Limit line</option>
+                            </select>
+                            <input
+                              value={row.unit || ""}
+                              placeholder={isLimit ? "(optional)" : "e.g. bar"}
+                              onChange={(e) => update({ unit: e.target.value })}
+                              title="Unit"
+                              disabled={isLimit}
+                            />
+                            <input
+                              value={row.suffix || ""}
+                              placeholder=""
+                              onChange={(e) => update({ suffix: e.target.value })}
+                              title="Suffix"
+                              disabled={isLimit}
+                            />
+                            {/* Size cell: per-series thickness for line/area,
+                                bar width for bar, ignored for limit lines. */}
+                            {(() => {
+                              const effectiveKind = (row.chart_type || "").toLowerCase()
+                                || (form.type === "bar_chart" ? "bar"
+                                  : form.type === "line_area_chart" ? "area" : "line");
+                              if (isLimit) {
+                                return <input value="" disabled title="Not applicable for limit lines" />;
+                              }
+                              if (effectiveKind === "bar") {
+                                return (
+                                  <input
+                                    type="number"
+                                    min="0"
+                                    max="120"
+                                    step="1"
+                                    value={Number(row.bar_width ?? 0)}
+                                    onChange={(e) => update({ bar_width: clamp(e.target.value, 0, 120) })}
+                                    title="Bar width (px, 0 = auto)"
+                                  />
+                                );
+                              }
+                              return (
+                                <input
+                                  type="number"
+                                  min="1"
+                                  max="8"
+                                  step="1"
+                                  value={Number(row.line_width ?? 2)}
+                                  onChange={(e) => update({ line_width: clamp(e.target.value, 1, 8) })}
+                                  title="Line thickness (1–8 px)"
+                                />
+                              );
+                            })()}
+                            {/* Style cell: dot marker for line/area, fill
+                                pattern for bar. */}
+                            {(() => {
+                              const effectiveKind = (row.chart_type || "").toLowerCase()
+                                || (form.type === "bar_chart" ? "bar"
+                                  : form.type === "line_area_chart" ? "area" : "line");
+                              if (isLimit) {
+                                return (
+                                  <select
+                                    value={String(row.limit_dash || "dashed")}
+                                    onChange={(e) => update({ limit_dash: e.target.value })}
+                                    title="Limit line style"
+                                  >
+                                    <option value="dashed">Dashed</option>
+                                    <option value="solid">Solid</option>
+                                    <option value="dotted">Dotted</option>
+                                  </select>
+                                );
+                              }
+                              if (effectiveKind === "bar") {
+                                return (
+                                  <select
+                                    value={String(row.bar_pattern || "solid")}
+                                    onChange={(e) => update({ bar_pattern: e.target.value })}
+                                    title="Bar fill pattern"
+                                  >
+                                    <option value="solid">Solid</option>
+                                    <option value="stripes-diag">Diagonal</option>
+                                    <option value="stripes-vert">Vertical</option>
+                                    <option value="dots">Dotted</option>
+                                  </select>
+                                );
+                              }
+                              return (
+                                <select
+                                  value={String(row.line_dot || "none")}
+                                  onChange={(e) => update({ line_dot: e.target.value })}
+                                  title="Dot marker"
+                                >
+                                  <option value="none">No dots</option>
+                                  <option value="small">Small dots</option>
+                                  <option value="medium">Medium dots</option>
+                                  <option value="large">Large dots</option>
+                                </select>
+                              );
+                            })()}
+                            <input
+                              type="color"
+                              value={row.color || (isLimit ? "#dc2626" : "#f97316")}
+                              onChange={(e) => update({ color: e.target.value })}
+                              title="Color"
+                            />
+                            <button
+                              type="button"
+                              className="icon-btn table-action-btn danger"
+                              onClick={remove}
+                              title="Remove this series"
+                              aria-label="Remove series"
+                            >
+                              <TrashIcon />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                  <div className="row" style={{ gap: 8 }}>
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      onClick={() => setForm((p) => {
+                        const list = Array.isArray(p.config.series_extra) ? [...p.config.series_extra] : [];
+                        list.push({
+                          id: `s${Date.now().toString(36)}${Math.floor(Math.random() * 1000)}`,
+                          gateway_id: "",
+                          tag_name: "",
+                          label: "",
+                          color: ["#f97316", "#3b82f6", "#a855f7", "#dc2626", "#10b981", "#f59e0b"][list.length % 6],
+                          axis: "right",
+                          chart_type: "",
+                          unit: "",
+                          suffix: "",
+                          multiplier: 1,
+                          offset: 0,
+                        });
+                        return { ...p, config: { ...p.config, series_extra: list } };
+                      })}
+                    >
+                      + Add series
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      title="Add a horizontal threshold drawn across the chart at a constant value"
+                      onClick={() => setForm((p) => {
+                        const list = Array.isArray(p.config.series_extra) ? [...p.config.series_extra] : [];
+                        list.push({
+                          id: `s${Date.now().toString(36)}${Math.floor(Math.random() * 1000)}`,
+                          gateway_id: "",
+                          tag_name: "",
+                          label: "Limit",
+                          color: "#dc2626",
+                          axis: "left",
+                          chart_type: "limit",
+                          unit: "",
+                          suffix: "",
+                          multiplier: 1,
+                          offset: 0,
+                          limit_value: "",
+                        });
+                        return { ...p, config: { ...p.config, series_extra: list } };
+                      })}
+                    >
+                      + Add limit line
+                    </button>
                   </div>
                 </fieldset>
               ) : null}
@@ -2212,6 +3233,15 @@ function TrashIcon() {
       <path d="M19 6l-1 14H6L5 6" />
       <path d="M10 11v6M14 11v6" />
       <path d="M9 6V4h6v2" />
+    </svg>
+  );
+}
+
+function DuplicateIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="9" y="9" width="11" height="11" rx="2" />
+      <path d="M5 15V6a2 2 0 0 1 2-2h9" />
     </svg>
   );
 }

@@ -1164,6 +1164,100 @@ body {
   flex-wrap: wrap;
 }
 
+/* Dashboard profile selector: compact pill group that sits in the left
+   toolbar slot alongside Add widget / Cog. The select + tiny buttons share
+   the existing toolbar height so the row stays a single visual line. */
+.dashboard-profile-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 6px;
+  padding: 2px 6px;
+  background: var(--card_2, rgba(255,255,255,0.04));
+  border: 1px solid var(--stroke, rgba(255,255,255,0.08));
+  border-radius: 8px;
+  box-sizing: border-box;
+}
+.dashboard-profile-select {
+  min-width: 160px;
+  max-width: 220px;
+  padding: 4px 8px;
+  background: var(--card, transparent);
+  color: var(--text, inherit);
+  border: 1px solid var(--stroke, rgba(255,255,255,0.12));
+  border-radius: 6px;
+  font-size: 12px;
+}
+.dashboard-profile-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text, inherit);
+  background: var(--card, transparent);
+  border: 1px solid var(--stroke, rgba(255,255,255,0.12));
+  border-radius: 6px;
+  cursor: pointer;
+}
+.dashboard-profile-btn:hover:not(:disabled) {
+  border-color: var(--teal, #14a89a);
+  color: var(--teal, #14a89a);
+}
+.dashboard-profile-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.dashboard-profile-btn-danger:hover:not(:disabled) {
+  border-color: #dc2626;
+  color: #dc2626;
+}
+/* Visual feedback while a widget is being dragged. We don't visually move
+   the widget (the browser already shows a ghost drag image) — we just dim
+   the source slot so the operator sees what they're moving. The actual
+   layout reflow happens once on drop, eliminating mid-drag overlap. */
+.dashboard-widget-shell.is-dragging {
+  opacity: 0.35;
+  outline: 2px dashed var(--teal, #14a89a);
+  outline-offset: -2px;
+}
+
+/* Compact chip shown next to the gear when a named profile is active so the
+   operator always knows which view they're looking at. */
+.dashboard-active-profile-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--teal, #14a89a);
+  background: rgba(20, 168, 154, 0.12);
+  border: 1px solid var(--teal, #14a89a);
+  border-radius: 999px;
+  white-space: nowrap;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Layout for the cog modal sections. */
+.dashboard-config-section {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--stroke, rgba(255,255,255,0.08));
+}
+.dashboard-config-section:first-of-type { border-top: 0; padding-top: 0; }
+.dashboard-config-section h4 { margin: 0 0 6px; font-size: 14px; }
+.dashboard-config-hint {
+  margin: 0 0 10px;
+  color: var(--muted, #94a3b8);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.dashboard-config-meta {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted, #94a3b8);
+}
+
 .dashboard-per-row-label {
   display: inline-flex;
   align-items: center;
@@ -1701,11 +1795,18 @@ body {
 }
 
 .reporting-page-flat {
-  display: grid;
-  grid-template-columns: 1fr;
+  /* Use flex so the designer grows to fill remaining height and the legacy
+     <details> fallback stays at its intrinsic size. With a grid 1fr the
+     designer and the legacy details would share the single row, cropping
+     the designer when the fallback opens. */
+  display: flex;
+  flex-direction: column;
   gap: 12px;
   min-height: 0;
+  height: 100%;
 }
+.reporting-page-flat > .tn-report-designer { flex: 1 1 auto; min-height: 0; }
+.reporting-page-flat > .legacy-reporting-fallback { flex: 0 0 auto; }
 
 .card-title {
   margin: 0 0 8px;
@@ -4088,6 +4189,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  min-height: 0;
 }
 
 .tn-collapsible-card {
@@ -4357,8 +4459,13 @@ textarea {
    `--tn-split-left` is driven by the React drag handler so we don't fight
    re-renders during the mouse move. The divider is keyboard-focusable. */
 .tn-report-designer-split {
-  height: calc(100vh - 220px);
-  min-height: 520px;
+  /* Fill the available height inside `.page-fill.single` so the inner side
+     panels (and only the side panels) handle their own scroll. Using a fixed
+     `calc(100vh - …)` is fragile because the topbar/sidebars vary in height;
+     here we just consume what the parent grid row gives us. */
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
 }
 .tn-split-pane {
   display: grid;
@@ -4369,15 +4476,35 @@ textarea {
 }
 .tn-split-side {
   min-width: 0;
-  /* Vertical scroll only; horizontal stays clipped to keep wide selects
-     from spilling into the divider/right pane. */
-  overflow-y: auto;
-  overflow-x: hidden;
+  /* The side itself does NOT scroll — individual flex children decide whether
+     they're intrinsic-height (Report builder card) or fill+scroll-internally
+     (Sections card). This keeps the toolbar always visible on screen. */
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 12px;
   padding-right: 6px;
   box-sizing: border-box;
+  height: 100%;
+}
+/* Sections card grows to fill the remaining vertical space, and its own
+   body becomes the scroll surface. The header (with "+ Add section") stays
+   pinned at the top of the card while the section list scrolls below it. */
+.tn-split-side .tn-sections-card {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.tn-split-side .tn-sections-card > .tn-card-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+/* Every other card on the left side keeps its intrinsic height. */
+.tn-split-side > .tn-collapsible-card:not(.tn-sections-card) {
+  flex: 0 0 auto;
 }
 .tn-split-right {
   padding-right: 0;
