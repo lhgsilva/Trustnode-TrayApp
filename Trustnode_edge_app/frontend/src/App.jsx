@@ -1831,9 +1831,154 @@ function buildDefaultUsers() {
   ];
 }
 
+// Width breakpoint below which the client-view portal switches to a mobile
+// bottom-nav layout. 768px matches the common tablet-portrait threshold so
+// phones and small tablets get the app-style layout; iPad landscape and up
+// keep the desktop sidebar.
+const CLIENT_VIEW_MOBILE_BREAKPOINT_PX = 768;
+
+function useViewportIsMobile(breakpointPx) {
+  const initial = typeof window !== "undefined"
+    ? window.innerWidth <= breakpointPx
+    : false;
+  const [isMobile, setIsMobile] = useState(initial);
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const mq = window.matchMedia(`(max-width: ${breakpointPx}px)`);
+    const handler = (e) => setIsMobile(e.matches);
+    setIsMobile(mq.matches);
+    if (mq.addEventListener) {
+      mq.addEventListener("change", handler);
+      return () => mq.removeEventListener("change", handler);
+    }
+    // Safari < 14
+    mq.addListener(handler);
+    return () => mq.removeListener(handler);
+  }, [breakpointPx]);
+  return isMobile;
+}
+
+// Max number of icons we show in the mobile bottom nav before collapsing the
+// rest under a "More" sheet. 5 = 4 module icons + a sheet trigger, matching
+// iOS / Android conventions.
+const CLIENT_VIEW_MOBILE_NAV_MAX = 4;
+
+function ClientMobileNav({ items, activePage, onPick, currentUser, onLogout }) {
+  const [moreOpen, setMoreOpen] = useState(false);
+  const visible = items.slice(0, CLIENT_VIEW_MOBILE_NAV_MAX);
+  const overflow = items.slice(CLIENT_VIEW_MOBILE_NAV_MAX);
+  const showMoreButton = overflow.length > 0 || true; // also doubles as user/logout entry
+
+  return (
+    <>
+      <nav className="client-mobile-nav" role="navigation" aria-label="Customer portal">
+        {visible.map((it) => {
+          const active = activePage === it.page;
+          return (
+            <button
+              key={`cmn-${it.page}`}
+              type="button"
+              className={`cmn-tab ${active ? "active" : ""}`}
+              onClick={() => onPick(it.page)}
+              aria-current={active ? "page" : undefined}
+              aria-label={it.label}
+            >
+              <span className="cmn-tab-icon" aria-hidden="true">
+                <MenuIcon page={it.page} />
+              </span>
+              <span className="cmn-tab-label">{it.label}</span>
+            </button>
+          );
+        })}
+        {showMoreButton ? (
+          <button
+            type="button"
+            className={`cmn-tab cmn-tab-more ${moreOpen ? "active" : ""}`}
+            onClick={() => setMoreOpen((v) => !v)}
+            aria-haspopup="dialog"
+            aria-expanded={moreOpen}
+            aria-label="More menu"
+          >
+            <span className="cmn-tab-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor">
+                <circle cx="6" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="18" cy="12" r="2" />
+              </svg>
+            </span>
+            <span className="cmn-tab-label">More</span>
+          </button>
+        ) : null}
+      </nav>
+
+      {moreOpen ? (
+        <>
+          <div
+            className="cmn-sheet-scrim"
+            onClick={() => setMoreOpen(false)}
+            aria-hidden="true"
+          />
+          <div className="cmn-sheet" role="dialog" aria-label="More menu">
+            <div className="cmn-sheet-handle" aria-hidden="true" />
+            <div className="cmn-sheet-user">
+              <div className="cmn-sheet-user-line user">{currentUser?.username || "—"}</div>
+              <div className="cmn-sheet-user-line role">{currentUser?.role || ""}</div>
+            </div>
+            <div className="cmn-sheet-list">
+              {overflow.map((it) => (
+                <button
+                  key={`cms-${it.page}`}
+                  type="button"
+                  className={`cmn-sheet-item ${activePage === it.page ? "active" : ""}`}
+                  onClick={() => { onPick(it.page); setMoreOpen(false); }}
+                >
+                  <span className="cmn-sheet-icon" aria-hidden="true">
+                    <MenuIcon page={it.page} />
+                  </span>
+                  <span>{it.label}</span>
+                </button>
+              ))}
+            </div>
+            <div className="cmn-sheet-footer">
+              <button
+                type="button"
+                className="cmn-sheet-logout"
+                onClick={() => { setMoreOpen(false); onLogout?.(); }}
+              >
+                Sign out
+              </button>
+            </div>
+          </div>
+        </>
+      ) : null}
+    </>
+  );
+}
+
 function AppShell() {
   const isReadonlyCloudMode = isForcedReadonlyCloudMode();
   const isClientView = isClientViewMode();
+  // Track viewport width so the customer client-view can switch to a
+  // mobile-app-style bottom nav. NEVER affects the desktop edge app —
+  // ClientMobileNav only renders when isClientView is true.
+  const isMobileViewport = useViewportIsMobile(CLIENT_VIEW_MOBILE_BREAKPOINT_PX);
+  const useMobileLayout = isClientView && isMobileViewport;
+
+  // Mark <body> with surface-client / client-view-mobile classes so CSS in
+  // styles.client.css can hide the desktop sidebar/header and lay out the
+  // mobile bottom nav. We only touch the body when running as the client
+  // view build so the local edge desktop UI is untouched.
+  useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    const body = document.body;
+    if (!body) return undefined;
+    const surfaceAdded = isClientView && !body.classList.contains("surface-client");
+    if (isClientView) body.classList.add("surface-client");
+    if (useMobileLayout) body.classList.add("client-view-mobile");
+    else body.classList.remove("client-view-mobile");
+    return () => {
+      if (surfaceAdded) body.classList.remove("surface-client");
+      body.classList.remove("client-view-mobile");
+    };
+  }, [isClientView, useMobileLayout]);
   const browserProtocol = String(window.location.protocol || "").toLowerCase();
   const browserHost = String(window.location.hostname || "").toLowerCase();
   const isLocalHost = browserHost === "localhost" || browserHost === "127.0.0.1" || browserHost === "::1";
@@ -18329,6 +18474,17 @@ const getGatewayHealth = (gateway) => {
           ) : null}
         </main>
       </div>
+      {useMobileLayout && currentUser ? (
+        <ClientMobileNav
+          items={CLIENT_MODULE_DEFS
+            .filter((m) => canOpenPage(m.page))
+            .map((m) => ({ page: m.page, label: m.label }))}
+          activePage={activePage}
+          onPick={(p) => handleNavClick(p)}
+          currentUser={currentUser}
+          onLogout={logout}
+        />
+      ) : null}
       {!isPortalOnly && currentUser && !isHostedWebClient && licenseGuardBlocked && !licenseGuardDismissed ? (
         <div className="modal-backdrop license-guard-backdrop">
           <div className="modal-card license-guard-modal">
