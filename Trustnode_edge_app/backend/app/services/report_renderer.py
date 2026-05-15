@@ -157,40 +157,248 @@ def _normalize_series_list(section: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the section's series list (multi-tag charts). For backward compat
     the single (gateway_id, tag_name, color, axis) attributes on the section
     are treated as series[0] when no series array is provided.
+
+    Each series may carry these optional analytics fields:
+      aggregation: one of avg/min/max/last/sum/count/median (None = raw points)
+      operator:    one of any/eq/ne/lt/lte/gt/gte/between (value filter)
+      value1, value2: numeric thresholds used by the operator above
+
+    Aggregation is interpreted against the section-level `bucket` (e.g. "1h").
+    With bucket="raw" (default), aggregation collapses the WHOLE series to a
+    single point; with a bucket set, samples are grouped per bucket and the
+    aggregation reduces each bucket to one value.
     """
     series_list = section.get("series")
+    out_list: list[dict[str, Any]] = []
     if isinstance(series_list, list) and series_list:
-        out = []
         for s in series_list:
             if not isinstance(s, dict):
                 continue
-            out.append({
-                "id": str(s.get("id") or uuid.uuid4().hex[:8]),
-                "label": str(s.get("label") or s.get("tag_name") or ""),
-                "gateway_id": str(s.get("gateway_id") or section.get("gateway_id") or ""),
-                "tag_name": str(s.get("tag_name") or ""),
-                "color": str(s.get("color") or "").strip() or None,
-                "axis": "right" if str(s.get("axis") or "left").lower() == "right" else "left",
-                "chart_type": str(s.get("chart_type") or "").lower() or None,
-                "unit": str(s.get("unit") or ""),
-                "multiplier": float(s.get("multiplier") if s.get("multiplier") is not None else 1.0),
-                "offset": float(s.get("offset") if s.get("offset") is not None else 0.0),
-            })
-        if out:
-            return out
-    # Single-series fallback
-    return [{
-        "id": "s0",
-        "label": str(section.get("series_label") or section.get("tag_name") or ""),
-        "gateway_id": str(section.get("gateway_id") or ""),
-        "tag_name": str(section.get("tag_name") or ""),
-        "color": None,
-        "axis": "left",
-        "chart_type": None,
-        "unit": str(section.get("unit") or ""),
-        "multiplier": 1.0,
-        "offset": 0.0,
-    }]
+            out_list.append(_normalize_one_series(s, section))
+    if out_list:
+        return out_list
+    # Single-series fallback so legacy templates (no series array) still render.
+    return [
+        _normalize_one_series(
+            {
+                "id": "s0",
+                "label": section.get("series_label") or section.get("tag_name") or "",
+                "gateway_id": section.get("gateway_id") or "",
+                "tag_name": section.get("tag_name") or "",
+                "unit": section.get("unit") or "",
+            },
+            section,
+        )
+    ]
+
+
+def _normalize_one_series(s: dict[str, Any], section: dict[str, Any]) -> dict[str, Any]:
+    operator = str(s.get("operator") or "any").strip().lower()
+    if operator not in {"any", "eq", "ne", "lt", "lte", "gt", "gte", "between"}:
+        operator = "any"
+    aggregation = str(s.get("aggregation") or "").strip().lower()
+    if aggregation not in {"", "avg", "min", "max", "last", "sum", "count", "median"}:
+        aggregation = ""
+
+    def _to_num(v: Any) -> float | None:
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    return {
+        "id": str(s.get("id") or uuid.uuid4().hex[:8]),
+        "label": str(s.get("label") or s.get("tag_name") or ""),
+        "gateway_id": str(s.get("gateway_id") or section.get("gateway_id") or ""),
+        "tag_name": str(s.get("tag_name") or ""),
+        "color": (str(s.get("color") or "").strip() or None),
+        "axis": "right" if str(s.get("axis") or "left").lower() == "right" else "left",
+        "chart_type": str(s.get("chart_type") or "").lower() or None,
+        "unit": str(s.get("unit") or section.get("unit") or ""),
+        "multiplier": float(s.get("multiplier") if s.get("multiplier") is not None else 1.0),
+        "offset": float(s.get("offset") if s.get("offset") is not None else 0.0),
+        "aggregation": aggregation,
+        "operator": operator,
+        "value1": _to_num(s.get("value1")),
+        "value2": _to_num(s.get("value2")),
+    }
+
+
+# Bucket strings → seconds. "raw" / "" means "no bucketing".
+_BUCKET_SECONDS: dict[str, int] = {
+    "raw": 0,
+    "1s": 1,
+    "10s": 10,
+    "30s": 30,
+    "1m": 60,
+    "5m": 5 * 60,
+    "15m": 15 * 60,
+    "30m": 30 * 60,
+    "1h": 3600,
+    "4h": 4 * 3600,
+    "12h": 12 * 3600,
+    "1d": 86400,
+}
+
+
+def _bucket_seconds(section: dict[str, Any]) -> int:
+    raw = str(section.get("bucket") or "raw").strip().lower()
+    return int(_BUCKET_SECONDS.get(raw, 0))
+
+
+def _passes_value_filter(value: float | None, op: str, v1: float | None, v2: float | None) -> bool:
+    """Apply the legacy reporting value-predicate to a single numeric sample.
+
+    Operator semantics match get_historian_rule_stats:
+      any         always true
+      eq/ne       value == / != v1
+      lt/lte      value < / <= v1
+      gt/gte      value > / >= v1
+      between     min(v1,v2) <= value <= max(v1,v2)
+
+    A None value never passes any filter except "any".
+    """
+    if op == "any":
+        return True
+    if value is None or not math.isfinite(value):
+        return False
+    if op in {"eq", "ne", "lt", "lte", "gt", "gte"} and v1 is None:
+        return False
+    if op == "between" and (v1 is None or v2 is None):
+        return False
+    if op == "eq":
+        return value == v1
+    if op == "ne":
+        return value != v1
+    if op == "lt":
+        return value < v1
+    if op == "lte":
+        return value <= v1
+    if op == "gt":
+        return value > v1
+    if op == "gte":
+        return value >= v1
+    if op == "between":
+        lo, hi = (v1, v2) if (v1 <= v2) else (v2, v1)  # type: ignore[operator]
+        return lo <= value <= hi
+    return True
+
+
+def _reduce_bucket(values: list[float], how: str) -> float | None:
+    """Reduce a list of finite floats to a single value per the named op."""
+    if not values:
+        return None
+    how = (how or "").lower()
+    if how == "avg":
+        return sum(values) / len(values)
+    if how == "min":
+        return min(values)
+    if how == "max":
+        return max(values)
+    if how == "sum":
+        return sum(values)
+    if how == "count":
+        return float(len(values))
+    if how == "median":
+        s = sorted(values)
+        mid = len(s) // 2
+        return s[mid] if len(s) % 2 == 1 else (s[mid - 1] + s[mid]) / 2.0
+    # "last" or unknown -> last sample by input order
+    return values[-1]
+
+
+def _utc_to_epoch_seconds(ts_raw: str) -> int:
+    """Parse a historian ts string to integer epoch seconds.
+
+    Accepts ISO with optional timezone or naive UTC strings. Falls back to 0
+    when the input can't be parsed (caller treats 0 as 'unknown bucket').
+    """
+    if not ts_raw:
+        return 0
+    try:
+        from datetime import datetime, timezone
+        txt = ts_raw.replace("Z", "+00:00")
+        if " " in txt and "T" not in txt:
+            txt = txt.replace(" ", "T")
+        dt = datetime.fromisoformat(txt)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
+
+def _apply_series_analytics(
+    points: list[tuple[str, float | None, str | None]],
+    series: dict[str, Any],
+    bucket_seconds: int,
+) -> list[tuple[str, float | None, str | None]]:
+    """Apply the per-series value filter then the bucket+aggregation reduction.
+
+    points: oldest-first 3-tuples (ts_utc, value, value_text).
+    Returns a list with the same 3-tuple shape so downstream chart / table
+    code can keep iterating the way it does today.
+
+    If the series carries no operator/aggregation tweaks, the input is
+    returned unchanged.
+    """
+    op = str(series.get("operator") or "any")
+    v1 = series.get("value1")
+    v2 = series.get("value2")
+    agg = str(series.get("aggregation") or "")
+    if op == "any" and bucket_seconds <= 0 and not agg:
+        return points
+
+    # 1) value filter — drops rows that don't satisfy the predicate.
+    filtered: list[tuple[str, float | None, str | None]] = []
+    for p in points:
+        v = p[1]
+        if _passes_value_filter(v, op, v1, v2):
+            filtered.append(p)
+
+    if not filtered:
+        return []
+
+    # 2) bucket + aggregation. With bucket=0 and a named aggregation, collapse
+    # the whole series to a single sample (timestamp = last sample's ts).
+    if not agg and bucket_seconds <= 0:
+        return filtered
+
+    if bucket_seconds <= 0:
+        nums = [float(p[1]) for p in filtered if p[1] is not None and math.isfinite(p[1])]
+        reduced = _reduce_bucket(nums, agg)
+        last_ts = filtered[-1][0]
+        return [(last_ts, reduced, None)]
+
+    # Group samples into fixed-width epoch buckets, then reduce.
+    buckets: dict[int, list[float]] = {}
+    bucket_first_ts: dict[int, str] = {}
+    for p in filtered:
+        v = p[1]
+        if v is None or not math.isfinite(v):
+            continue
+        epoch = _utc_to_epoch_seconds(p[0])
+        if epoch <= 0:
+            continue
+        bk = (epoch // bucket_seconds) * bucket_seconds
+        buckets.setdefault(bk, []).append(float(v))
+        bucket_first_ts.setdefault(bk, p[0])
+
+    if not buckets:
+        return []
+
+    out: list[tuple[str, float | None, str | None]] = []
+    for bk in sorted(buckets.keys()):
+        values = buckets[bk]
+        reduced = _reduce_bucket(values, agg or "avg")
+        # Use the bucket start as the canonical ts so the chart's X axis lines
+        # up cleanly. Format mirrors historian output: "YYYY-MM-DDTHH:MM:SSZ".
+        from datetime import datetime, timezone
+        bk_ts = datetime.fromtimestamp(bk, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out.append((bk_ts, reduced, None))
+    return out
 
 
 def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tuple[list[dict[str, Any]], list[list[tuple[str, float | None, str | None]]]]:
@@ -206,6 +414,7 @@ def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tu
     from_utc, to_utc = _resolve_time_range(section.get("time_range"))
     limit = max(20, min(int(section.get("readings_count") or default_limit), 5000))
     series_meta = _normalize_series_list(section)
+    bucket_secs = _bucket_seconds(section)
     aligned: list[list[tuple[str, float | None, str | None]]] = []
     for s in series_meta:
         gw = (s.get("gateway_id") or "").strip()
@@ -235,6 +444,9 @@ def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tu
             text_raw = r.get("value_text")
             text_val = str(text_raw) if (text_raw is not None and text_raw != "") else None
             points.append((str(r.get("ts") or ""), val, text_val))
+        # Apply per-series value filter + section bucket + aggregation.
+        # When the series has no analytics tweaks this is a no-op.
+        points = _apply_series_analytics(points, s, bucket_secs)
         aligned.append(points)
     return series_meta, aligned
 

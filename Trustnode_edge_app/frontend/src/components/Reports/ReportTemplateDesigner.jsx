@@ -93,6 +93,47 @@ const SERIES_CHART_KINDS = [
   { value: "bar", label: "Bar" },
 ];
 
+// Section-level time-bucket sizes for chart aggregation. "raw" keeps every
+// sample (current behaviour). Anything else groups samples into fixed
+// epoch-aligned buckets and applies each series' aggregation.
+const BUCKET_SIZES = [
+  { value: "raw", label: "Raw samples" },
+  { value: "1m",  label: "1 minute" },
+  { value: "5m",  label: "5 minutes" },
+  { value: "15m", label: "15 minutes" },
+  { value: "30m", label: "30 minutes" },
+  { value: "1h",  label: "1 hour" },
+  { value: "4h",  label: "4 hours" },
+  { value: "12h", label: "12 hours" },
+  { value: "1d",  label: "1 day" },
+];
+
+// Per-series aggregation choices. Empty string = no aggregation (each raw
+// sample plotted as today). Names match the backend's _reduce_bucket() map.
+const SERIES_AGGREGATIONS = [
+  { value: "",       label: "None (plot raw)" },
+  { value: "avg",    label: "Average" },
+  { value: "min",    label: "Minimum" },
+  { value: "max",    label: "Maximum" },
+  { value: "last",   label: "Last" },
+  { value: "sum",    label: "Sum" },
+  { value: "count",  label: "Count" },
+  { value: "median", label: "Median" },
+];
+
+// Value-predicate operators, matching the legacy reporting + the backend's
+// _passes_value_filter() switch.
+const SERIES_FILTER_OPS = [
+  { value: "any",     label: "Any value" },
+  { value: "eq",      label: "Equals (=)" },
+  { value: "ne",      label: "Not equal (≠)" },
+  { value: "gt",      label: "Greater than (>)" },
+  { value: "gte",     label: "≥ (greater or equal)" },
+  { value: "lt",      label: "Less than (<)" },
+  { value: "lte",     label: "≤ (less or equal)" },
+  { value: "between", label: "Between (inclusive)" },
+];
+
 const COLUMN_KINDS = [
   { value: "ts", label: "Timestamp" },
   { value: "tag", label: "Tag name" },
@@ -1261,56 +1302,129 @@ function SectionEditor({
                 </div>
               ) : null}
             </div>
+            {/* Section-level bucket size. "Raw samples" keeps the current
+                behaviour (every historian point is plotted as a chart point).
+                Anything else groups samples into fixed-width buckets and each
+                series reduces its bucket via its own aggregation choice. */}
+            <div className="tn-row tn-row-2">
+              <label>Bucket (group samples)
+                <select
+                  value={section.bucket || "raw"}
+                  onChange={(e) => onChange({ bucket: e.target.value })}
+                  title="Group raw samples into time buckets before aggregating per series"
+                >
+                  {BUCKET_SIZES.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
+                </select>
+              </label>
+              <div className="tn-help-text">
+                Pick a bucket size to summarise samples per minute / hour / day. Each series below
+                chooses its own aggregation (avg, max, min, last…) which is applied <em>inside</em> the bucket.
+              </div>
+            </div>
           </CollapsibleCard>
 
           <CollapsibleCard id={`${section.id}-series`} title="Data series" subtitle={`${(section.series || []).length} configured`}>
-            {(section.series || []).map((s, idx) => (
-              <div key={s.id} className="tn-series-row">
-                <input
-                  value={s.label || ""}
-                  placeholder={`Series ${idx + 1} label`}
-                  onChange={(e) => updateSeries(s.id, { label: e.target.value })}
-                />
-                <select value={s.gateway_id || ""} onChange={(e) => updateSeries(s.id, { gateway_id: e.target.value, tag_name: "" })}>
-                  <option value="">Gateway...</option>
-                  {gatewayOptions.map((g) => <option key={g.id} value={g.id}>{g.name || g.id}</option>)}
-                </select>
-                <select value={s.tag_name || ""} onChange={(e) => updateSeries(s.id, { tag_name: e.target.value })}>
-                  <option value="">Tag...</option>
-                  {tagList(s.gateway_id).map((t) => <option key={t} value={t}>{formatTagForDisplay(t)}</option>)}
-                </select>
-                {isChart ? (
-                  <>
-                    <select value={s.axis || "left"} onChange={(e) => updateSeries(s.id, { axis: e.target.value })} title="Axis">
-                      <option value="left">Left</option>
-                      <option value="right">Right</option>
+            {(section.series || []).map((s, idx) => {
+              const op = s.operator || "any";
+              const needsV2 = op === "between";
+              const showV1 = op !== "any";
+              return (
+                <div key={s.id} className="tn-series-block">
+                  <div className="tn-series-row">
+                    <input
+                      value={s.label || ""}
+                      placeholder={`Series ${idx + 1} label`}
+                      onChange={(e) => updateSeries(s.id, { label: e.target.value })}
+                    />
+                    <select value={s.gateway_id || ""} onChange={(e) => updateSeries(s.id, { gateway_id: e.target.value, tag_name: "" })}>
+                      <option value="">Gateway...</option>
+                      {gatewayOptions.map((g) => <option key={g.id} value={g.id}>{g.name || g.id}</option>)}
                     </select>
-                    <select value={s.chart_type || ""} onChange={(e) => updateSeries(s.id, { chart_type: e.target.value })} title="Chart kind">
-                      {SERIES_CHART_KINDS.map((k) => <option key={k.value} value={k.value}>{k.label}</option>)}
+                    <select value={s.tag_name || ""} onChange={(e) => updateSeries(s.id, { tag_name: e.target.value })}>
+                      <option value="">Tag...</option>
+                      {tagList(s.gateway_id).map((t) => <option key={t} value={t}>{formatTagForDisplay(t)}</option>)}
                     </select>
-                  </>
-                ) : null}
-                <input type="color" value={s.color || pickColor(idx)} onChange={(e) => updateSeries(s.id, { color: e.target.value })} title="Series color" />
-                <input
-                  type="text" placeholder="Unit"
-                  value={s.unit || ""}
-                  onChange={(e) => updateSeries(s.id, { unit: e.target.value })}
-                />
-                <input
-                  type="number" step="any" placeholder="× mult."
-                  value={s.multiplier ?? 1}
-                  onChange={(e) => updateSeries(s.id, { multiplier: Number(e.target.value) })}
-                  title="Multiplier applied before plotting"
-                />
-                <input
-                  type="number" step="any" placeholder="+ offset"
-                  value={s.offset ?? 0}
-                  onChange={(e) => updateSeries(s.id, { offset: Number(e.target.value) })}
-                  title="Offset added after multiplication"
-                />
-                <button type="button" className="icon-btn icon-btn-danger" onClick={() => removeSeries(s.id)}>×</button>
-              </div>
-            ))}
+                    {isChart ? (
+                      <>
+                        <select value={s.axis || "left"} onChange={(e) => updateSeries(s.id, { axis: e.target.value })} title="Axis">
+                          <option value="left">Left</option>
+                          <option value="right">Right</option>
+                        </select>
+                        <select value={s.chart_type || ""} onChange={(e) => updateSeries(s.id, { chart_type: e.target.value })} title="Chart kind">
+                          {SERIES_CHART_KINDS.map((k) => <option key={k.value} value={k.value}>{k.label}</option>)}
+                        </select>
+                      </>
+                    ) : null}
+                    <input type="color" value={s.color || pickColor(idx)} onChange={(e) => updateSeries(s.id, { color: e.target.value })} title="Series color" />
+                    <input
+                      type="text" placeholder="Unit"
+                      value={s.unit || ""}
+                      onChange={(e) => updateSeries(s.id, { unit: e.target.value })}
+                    />
+                    <input
+                      type="number" step="any" placeholder="× mult."
+                      value={s.multiplier ?? 1}
+                      onChange={(e) => updateSeries(s.id, { multiplier: Number(e.target.value) })}
+                      title="Multiplier applied before plotting"
+                    />
+                    <input
+                      type="number" step="any" placeholder="+ offset"
+                      value={s.offset ?? 0}
+                      onChange={(e) => updateSeries(s.id, { offset: Number(e.target.value) })}
+                      title="Offset added after multiplication"
+                    />
+                    <button type="button" className="icon-btn icon-btn-danger" onClick={() => removeSeries(s.id)}>×</button>
+                  </div>
+                  {/* Analytics row: per-series aggregation + value-predicate
+                      filter. Kept on its own line so the main row above does
+                      not become unreadable. With the section bucket set to
+                      "Raw samples" and aggregation = None the filter still
+                      applies (rows that fail the predicate are dropped). */}
+                  <div className="tn-series-row tn-series-row-analytics">
+                    <label className="tn-inline-label" title="How to reduce samples inside a bucket. Used together with the section's Bucket setting.">
+                      Aggregation
+                      <select
+                        value={s.aggregation || ""}
+                        onChange={(e) => updateSeries(s.id, { aggregation: e.target.value })}
+                      >
+                        {SERIES_AGGREGATIONS.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
+                      </select>
+                    </label>
+                    <label className="tn-inline-label" title="Drop samples that fail this value predicate before bucketing.">
+                      Filter
+                      <select
+                        value={op}
+                        onChange={(e) => updateSeries(s.id, { operator: e.target.value })}
+                      >
+                        {SERIES_FILTER_OPS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                      </select>
+                    </label>
+                    {showV1 ? (
+                      <label className="tn-inline-label">
+                        {needsV2 ? "Lower" : "Value"}
+                        <input
+                          type="number" step="any"
+                          value={s.value1 ?? ""}
+                          placeholder={needsV2 ? "min" : "value"}
+                          onChange={(e) => updateSeries(s.id, { value1: e.target.value === "" ? null : Number(e.target.value) })}
+                        />
+                      </label>
+                    ) : null}
+                    {needsV2 ? (
+                      <label className="tn-inline-label">
+                        Upper
+                        <input
+                          type="number" step="any"
+                          value={s.value2 ?? ""}
+                          placeholder="max"
+                          onChange={(e) => updateSeries(s.id, { value2: e.target.value === "" ? null : Number(e.target.value) })}
+                        />
+                      </label>
+                    ) : null}
+                  </div>
+                </div>
+              );
+            })}
             <button type="button" className="btn btn-link" onClick={addSeries}>+ Add series</button>
           </CollapsibleCard>
 
