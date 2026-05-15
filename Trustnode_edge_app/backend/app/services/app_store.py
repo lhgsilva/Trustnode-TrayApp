@@ -119,8 +119,12 @@ class AppStore:
         self._live_fast_pending_latest: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._local_live_latest_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._data_sync_tick = 0
-        self._cloud_live_cache_rows: list[dict[str, Any]] = []
-        self._cloud_live_cache_updated_utc = ""
+        # IMPORTANT: cache MUST be keyed by tenant_id. Previously it was a
+        # single shared list, so the cloud cache loop populated it under
+        # one tenant context and every other tenant's HTTP read returned
+        # those rows (with their own tenant_id stamped on the response).
+        self._cloud_live_cache_rows_by_tenant: dict[str, list[dict[str, Any]]] = {}
+        self._cloud_live_cache_updated_utc_by_tenant: dict[str, str] = {}
         self._cloud_live_cache_limit = max(
             200,
             min(5000, int(os.environ.get("TRUSTNODE_CLOUD_LIVE_CACHE_LIMIT", "1200") or "1200")),
@@ -1160,9 +1164,14 @@ class AppStore:
                     if not rows:
                         rows = self._fetch_live_rows_from_cloud(self._cloud_live_cache_limit)
                     if rows:
+                        # The background loop runs under whichever tenant
+                        # context was active when it last ticked. Cache the
+                        # rows under that tenant key so we never serve them
+                        # to a different tenant's API call.
+                        cache_tenant = self._current_tenant_id() or "default"
                         with self._cloud_live_cache_lock:
-                            self._cloud_live_cache_rows = rows
-                            self._cloud_live_cache_updated_utc = self._utc_now()
+                            self._cloud_live_cache_rows_by_tenant[cache_tenant] = rows
+                            self._cloud_live_cache_updated_utc_by_tenant[cache_tenant] = self._utc_now()
             except Exception:
                 pass
             self._stop_event.wait(timeout=self._cloud_live_cache_interval_seconds)
@@ -1236,18 +1245,17 @@ class AppStore:
                 except Exception:
                     pass
                 def _fetch_rows_with_freshness_fallback(table_name: str, fetch_limit: int) -> list[Any]:
-                    scoped_rows: list[Any] = []
-                    unscoped_rows: list[Any] = []
-                    base_sql = f"""
-                        SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                               tag_name, value, quality, quality_label
-                        FROM "{schema}"."{table_name}"
-                    """
+                    # IMPORTANT: tenant-scoped reads only. The previous fallback to an
+                    # unscoped query leaked other tenants' rows whenever the caller's
+                    # tenant happened to have no live_latest entries yet (the route
+                    # then relabeled the rows as the caller's tenant_id).
                     try:
-                        scoped_rows = conn.execute(
+                        return conn.execute(
                             text(
-                                base_sql
-                                + """
+                                f"""
+                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                                       tag_name, value, quality, quality_label
+                                FROM "{schema}"."{table_name}"
                                 WHERE tenant_id = :tenant
                                 ORDER BY ts_utc DESC
                                 LIMIT :lim
@@ -1256,23 +1264,7 @@ class AppStore:
                             {"tenant": tenant_id, "lim": fetch_limit},
                         ).fetchall()
                     except Exception:
-                        scoped_rows = []
-                    try:
-                        unscoped_rows = conn.execute(
-                            text(
-                                base_sql
-                                + """
-                                ORDER BY ts_utc DESC
-                                LIMIT :lim
-                                """
-                            ),
-                            {"lim": fetch_limit},
-                        ).fetchall()
-                    except Exception:
-                        unscoped_rows = []
-                    if scoped_rows:
-                        return scoped_rows
-                    return unscoped_rows
+                        return []
 
                 live_rows = _fetch_rows_with_freshness_fallback("live_latest", lim)
                 sample_limit = min(max(lim * 4, 500), 4000)
@@ -1368,27 +1360,21 @@ class AppStore:
         from_txt = self._normalize_utc_filter(from_utc)
         to_txt = self._normalize_utc_filter(to_utc)
         filters_sql = ""
-        filters_sql_unscoped = ""
         params: dict[str, Any] = {"lim": lim, "off": off, "tenant": tenant_id}
         if gateway_txt:
             filters_sql += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
-            filters_sql_unscoped += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
             params["gateway"] = gateway_txt
         if device_txt:
             filters_sql += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
-            filters_sql_unscoped += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
             params["device_like"] = f"%{device_txt}%"
         if tag_txt:
             filters_sql += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
-            filters_sql_unscoped += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
             params["tag_like"] = f"%{tag_txt}%"
         if from_txt:
             filters_sql += " AND ts_utc >= :from_utc"
-            filters_sql_unscoped += " AND ts_utc >= :from_utc"
             params["from_utc"] = from_txt
         if to_txt:
             filters_sql += " AND ts_utc <= :to_utc"
-            filters_sql_unscoped += " AND ts_utc <= :to_utc"
             params["to_utc"] = to_txt
         try:
             engine, _ = self._get_or_create_cloud_engine(cloud, schema)
@@ -1449,10 +1435,11 @@ class AppStore:
                         return 0
 
                 def _fetch_rows_with_freshness_fallback(table_name: str) -> list[Any]:
-                    scoped_rows: list[Any] = []
-                    unscoped_rows: list[Any] = []
+                    # IMPORTANT: tenant-scoped reads only. The previous fallback to an
+                    # unscoped query leaked other tenants' historian rows whenever the
+                    # caller's tenant had no rows yet on a given table.
                     try:
-                        scoped_rows = conn.execute(
+                        return conn.execute(
                             text(
                                 f"""
                                 SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
@@ -1467,27 +1454,7 @@ class AppStore:
                             params,
                         ).fetchall()
                     except Exception:
-                        scoped_rows = []
-                    try:
-                        unscoped_rows = conn.execute(
-                            text(
-                                f"""
-                                SELECT ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                                       tag_name, value, quality, quality_label
-                                FROM "{schema}"."{table_name}"
-                                WHERE 1=1{filters_sql_unscoped}
-                                ORDER BY ts_utc DESC
-                                LIMIT :lim
-                                OFFSET :off
-                                """
-                            ),
-                            {k: v for k, v in params.items() if k != "tenant"},
-                        ).fetchall()
-                    except Exception:
-                        unscoped_rows = []
-                    if scoped_rows:
-                        return scoped_rows
-                    return unscoped_rows
+                        return []
 
                 hist_rows = _fetch_rows_with_freshness_fallback("historian_readings")
                 plc_rows = _fetch_rows_with_freshness_fallback("plc_readings")
@@ -3500,6 +3467,25 @@ class AppStore:
             return True
         return False
 
+    def _filter_rows_by_tenant(self, rows: list[dict[str, Any]], tenant_id: str) -> list[dict[str, Any]]:
+        """Drop any row whose tenant_id doesn't match the caller's tenant.
+
+        Belt-and-braces against bugs in upstream fetchers — even if a code
+        path forgets to scope its SQL query (or pulls from a shared cache),
+        this filter ensures the route never returns another tenant's data.
+        Rows missing tenant_id are kept (legacy local-only data); explicit
+        mismatches are dropped.
+        """
+        tid = str(tenant_id or "").strip().lower()
+        if not tid:
+            return rows
+        out: list[dict[str, Any]] = []
+        for row in rows or []:
+            row_tenant = str((row or {}).get("tenant_id") or "").strip().lower()
+            if not row_tenant or row_tenant == tid:
+                out.append(row)
+        return out
+
     def _filter_rows_by_edge(self, rows: list[dict[str, Any]], edge_id: str) -> list[dict[str, Any]]:
         edge_filter = self._normalize_edge_filter(edge_id)
         if not edge_filter:
@@ -5231,9 +5217,12 @@ class AppStore:
             return list(out_latest.values())
 
         if prefer_cloud:
+            # Tenant-scoped cache lookup — never serve another tenant's
+            # cached live rows even if the underlying caller is the same
+            # process. _filter_rows_by_tenant below is belt-and-braces.
             with self._cloud_live_cache_lock:
-                cached_rows = list(self._cloud_live_cache_rows)
-                cache_updated = str(self._cloud_live_cache_updated_utc or "")
+                cached_rows = list(self._cloud_live_cache_rows_by_tenant.get(tenant_id) or [])
+                cache_updated = str(self._cloud_live_cache_updated_utc_by_tenant.get(tenant_id) or "")
             if cached_rows and cache_updated:
                 try:
                     cached_dt = datetime.fromisoformat(cache_updated.replace("Z", "+00:00"))
@@ -5243,13 +5232,13 @@ class AppStore:
                 except Exception:
                     age_ms = 999999
                 if age_ms <= int(max(1200, self._cloud_live_cache_interval_seconds * 2500)):
-                    return self._filter_rows_by_edge(cached_rows, edge_filter)[:lim]
+                    return self._filter_rows_by_tenant(self._filter_rows_by_edge(cached_rows, edge_filter), tenant_id)[:lim]
             cloud_live_fast = self._fetch_live_rows_from_cloud_fast(fetch_lim)
             if cloud_live_fast:
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 newest_fast_ms = max((_row_ts_ms(r) for r in cloud_live_fast), default=0)
                 if newest_fast_ms > 0 and max(0, now_ms - newest_fast_ms) <= int(self._live_source_max_stale_ms):
-                    return self._filter_rows_by_edge(cloud_live_fast, edge_filter)[:lim]
+                    return self._filter_rows_by_tenant(self._filter_rows_by_edge(cloud_live_fast, edge_filter), tenant_id)[:lim]
             cloud_live = self._fetch_live_rows_from_cloud(fetch_lim)
             if cloud_live:
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -5257,7 +5246,7 @@ class AppStore:
                 live_age_ms = max(0, now_ms - latest_live_ms) if latest_live_ms > 0 else 999999
                 # Fast path: avoid expensive historian reads on every live request.
                 if live_age_ms <= int(max(1500, self._live_source_max_stale_ms)):
-                    return self._filter_rows_by_edge(cloud_live, edge_filter)[:lim]
+                    return self._filter_rows_by_tenant(self._filter_rows_by_edge(cloud_live, edge_filter), tenant_id)[:lim]
                 cloud_hist = self._fetch_historian_rows_from_cloud(min(max(fetch_lim * 2, 500), 1500))
                 if cloud_hist:
                     latest_hist_ms = max((_row_ts_ms(r) for r in cloud_hist), default=0)
@@ -5266,15 +5255,15 @@ class AppStore:
                     if latest_hist_ms > 0 and latest_hist_ms > latest_live_ms + 1500:
                         hist_live = _latest_per_gateway_tag(cloud_hist, fetch_lim)
                         if hist_live:
-                            return self._filter_rows_by_edge(hist_live, edge_filter)[:lim]
-                return self._filter_rows_by_edge(cloud_live, edge_filter)[:lim]
+                            return self._filter_rows_by_tenant(self._filter_rows_by_edge(hist_live, edge_filter), tenant_id)[:lim]
+                return self._filter_rows_by_tenant(self._filter_rows_by_edge(cloud_live, edge_filter), tenant_id)[:lim]
             cloud_hist = self._fetch_historian_rows_from_cloud(min(max(fetch_lim * 2, 500), 1500))
             if cloud_live:
-                return self._filter_rows_by_edge(cloud_live, edge_filter)[:lim]
+                return self._filter_rows_by_tenant(self._filter_rows_by_edge(cloud_live, edge_filter), tenant_id)[:lim]
             if cloud_hist:
                 hist_live = _latest_per_gateway_tag(cloud_hist, fetch_lim)
                 if hist_live:
-                    return self._filter_rows_by_edge(hist_live, edge_filter)[:lim]
+                    return self._filter_rows_by_tenant(self._filter_rows_by_edge(hist_live, edge_filter), tenant_id)[:lim]
 
         # Local fast path: serve latest-per-tag rows from in-memory cache first.
         with self._lock:
