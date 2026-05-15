@@ -6681,11 +6681,18 @@ function AppShell() {
     (page) => {
       const required = MODULE_KEY_BY_PAGE[page];
       if (!required) return true;
+      // In the customer cloud portal there is no local edge running; the
+      // license check is enforced on the cloud backend by the JWT scope
+      // and by per-tenant control-plane data. The local edgeLicenseSnapshot
+      // is only meaningful inside the desktop edge app. Treat all licensed
+      // pages as permitted for cloud-portal users; the underlying API
+      // calls remain the authoritative gate.
+      if (isClientView) return true;
       if (!edgeLicenseSnapshot?.ok) return false;
       if (!licensedModuleKeys.length) return false;
       return licensedModuleKeys.includes(String(required || "").toLowerCase());
     },
-    [edgeLicenseSnapshot?.ok, licensedModuleKeys]
+    [isClientView, edgeLicenseSnapshot?.ok, licensedModuleKeys]
   );
 
   const hasClientModuleAccess = useCallback(

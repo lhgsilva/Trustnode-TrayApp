@@ -79,16 +79,19 @@ function clientViewHtmlAugment() {
       // Best-effort service-worker registration. We DO NOT bundle a
       // service-worker script (the single-file build can't host one),
       // but if the operator deploys this file under a path that ALSO
-      // serves a sw.js next to it, the browser will register it for
-      // offline caching. If no sw.js is served, the fetch fails
-      // silently and the page keeps working as a regular web app.
+      // serves a sw.js next to it WITH the correct JS content-type,
+      // the browser will register it for offline caching.
+      //
+      // Most SPAs (including ours) serve a fallback HTML for missing
+      // paths. We MUST detect that case and skip registration, otherwise
+      // the browser logs a "MIME type ('text/html')" error and confuses
+      // operators. We check both the HTTP status AND the content-type.
       const swInline = `
         <script>
         (function(){
           try {
             var nav = window.navigator || {};
             if (!('serviceWorker' in nav)) return;
-            // Skip on file:// and inside Electron.
             var proto = String(window.location.protocol||'').toLowerCase();
             var ua = String(nav.userAgent||'');
             if (proto !== 'https:' && proto !== 'http:') return;
@@ -96,16 +99,14 @@ function clientViewHtmlAugment() {
             var hereDir = window.location.pathname.replace(/[^\\/]*$/, '');
             var swUrl = hereDir + 'sw.js';
             fetch(swUrl, { method: 'HEAD' }).then(function(r){
-              if (r && r.ok) {
-                nav.serviceWorker.register(swUrl, { scope: hereDir }).catch(function(){});
-              }
+              if (!r || !r.ok) return;
+              var ct = String(r.headers.get('content-type') || '').toLowerCase();
+              if (ct.indexOf('javascript') < 0) return;
+              nav.serviceWorker.register(swUrl, { scope: hereDir }).catch(function(){});
             }).catch(function(){});
           } catch (_) { /* noop */ }
         })();
         </script>`;
-      out = out.replace(/<\\\/body>/i, swInline + "</body>");
-      // The previous replace uses an escaped slash so the string literal
-      // survives Vite's HTML parsing. Make sure both variants are covered:
       out = out.replace(/<\/body>/i, swInline + "</body>");
       return out;
     },
