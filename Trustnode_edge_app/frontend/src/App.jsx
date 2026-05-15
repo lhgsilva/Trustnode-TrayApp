@@ -8699,9 +8699,14 @@ const getGatewayHealth = (gateway) => {
   const tagMonitorMultiSeries = useMemo(() => {
     const seriesDefs = tagMonitorResolvedSeries;
     if (!seriesDefs.length) return [];
-    // Build a per-series chronological list (same logic as the single-series
-    // memo above), then merge by index. Index 1..N keeps the X-axis stable
-    // even when series have different sample counts.
+    // Build a per-series chronological list (same as the legacy single-series
+    // builder above), then BUCKET timestamps into the densest series' median
+    // sample spacing. Two-gateway charts produce samples that almost never
+    // share the same ms, so a naive ts-keyed merge yields one-series-per-tick
+    // rows that look like the other series has gaps. Bucketing collapses
+    // close samples into the same row so every tick has values for every
+    // series. Last sample wins inside the bucket (same rule as the dashboard
+    // widget's multiSeriesData).
     const perSeries = seriesDefs.map((s) =>
       buildChronologicalSeries(
         dataLogView.filter(
@@ -8715,22 +8720,68 @@ const getGatewayHealth = (gateway) => {
       )
     );
     if (perSeries.every((arr) => !arr.length)) return [];
-    const maxLen = perSeries.reduce((m, arr) => Math.max(m, arr.length), 0);
-    const merged = [];
-    for (let i = 0; i < maxLen; i += 1) {
-      const row = { idx: i + 1, ts: "" };
-      for (let j = 0; j < seriesDefs.length; j += 1) {
-        const pt = perSeries[j][i];
-        if (pt) {
-          if (!row.ts) row.ts = pt.ts || "";
-          row[`v_${seriesDefs[j].id}`] = pt.value === undefined || pt.value === null ? null : Number(pt.value);
-        } else {
-          row[`v_${seriesDefs[j].id}`] = null;
-        }
+
+    const tsToMs = (raw) => {
+      const t = String(raw || "");
+      if (!t) return NaN;
+      const ms = Date.parse(t);
+      if (Number.isFinite(ms)) return ms;
+      const iso = t.includes("T") ? t : t.replace(" ", "T");
+      const ms2 = Date.parse(iso);
+      return Number.isFinite(ms2) ? ms2 : NaN;
+    };
+
+    // Project to (tsMs, value) pairs, dropping rows we can't time-stamp.
+    const projected = perSeries.map((arr) =>
+      (arr || [])
+        .map((p) => ({ tsMs: tsToMs(p.ts), ts: p.ts, value: p.value }))
+        .filter((p) => Number.isFinite(p.tsMs))
+    );
+
+    // Bucket size = median delta of the densest series, clamped.
+    let densest = projected[0] || [];
+    for (const a of projected) if (a.length > densest.length) densest = a;
+    let bucketMs = 1000;
+    if (densest.length >= 3) {
+      const deltas = [];
+      for (let k = 1; k < densest.length; k += 1) {
+        const d = densest[k].tsMs - densest[k - 1].tsMs;
+        if (Number.isFinite(d) && d > 0) deltas.push(d);
       }
-      merged.push(row);
+      if (deltas.length) {
+        deltas.sort((a, b) => a - b);
+        bucketMs = Math.max(200, Math.min(60000, deltas[Math.floor(deltas.length / 2)]));
+      }
+    } else {
+      const period = Number(tagMonitorSelection?.period_ms || 1000);
+      if (Number.isFinite(period) && period > 0) bucketMs = Math.max(200, Math.min(60000, period));
     }
-    return merged;
+    const bucketKey = (tsMs) => Math.floor(tsMs / bucketMs) * bucketMs;
+
+    const tsMap = new Map();
+    for (let j = 0; j < seriesDefs.length; j += 1) {
+      const key = `v_${seriesDefs[j].id}`;
+      for (const p of projected[j] || []) {
+        const bk = bucketKey(p.tsMs);
+        let row = tsMap.get(bk);
+        if (!row) {
+          row = { tsMs: bk, ts: p.ts || new Date(bk).toISOString() };
+          // Initialise every series to null so undefined access is consistent.
+          for (let k = 0; k < seriesDefs.length; k += 1) {
+            row[`v_${seriesDefs[k].id}`] = null;
+          }
+          tsMap.set(bk, row);
+        }
+        row[key] = p.value === undefined || p.value === null ? null : Number(p.value);
+        // Prefer the latest human-readable ts within the bucket.
+        if (p.ts) row.ts = p.ts;
+      }
+    }
+
+    const ordered = Array.from(tsMap.values()).sort((a, b) => a.tsMs - b.tsMs);
+    const reads = Math.max(20, Number(tagMonitorSelection?.readings_count || 120));
+    const trimmed = ordered.length > reads ? ordered.slice(-reads) : ordered;
+    return trimmed.map((row, i) => ({ ...row, idx: i + 1 }));
   }, [tagMonitorResolvedSeries, dataLogView, tagMonitorSelection?.readings_count, tagMonitorSelection?.period_ms, endpointMode]);
 
   const tagMonitorHasRightAxis = useMemo(

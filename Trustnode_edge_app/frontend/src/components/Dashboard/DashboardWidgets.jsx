@@ -1397,22 +1397,74 @@ export function DashboardWidgetCard({
       return sliced;
     });
 
-    // Merge sort all timestamps into a unique ascending list.
-    const tsMap = new Map(); // tsMs -> row template
+    // ─── Bucketed multi-series merge ──────────────────────────────────────
+    // When series come from different gateways the raw timestamps almost
+    // never line up to the millisecond. A naive "set on ts, null elsewhere"
+    // merge produces a chart that alternates one series per X tick and
+    // shows visible gaps in the others. To avoid that we bucket all
+    // samples into a small time window (the median sample spacing of the
+    // densest series, clamped to a sensible range). Each bucket keeps the
+    // LAST sample per series — the standard historian display rule.
+    //
+    // Effect: every bucket row now has a value for every series whose
+    // gateway produced any sample inside that bucket, so both lines are
+    // drawn at every X tick with no jittered gaps.
+
+    const allPtsByDef = [primaryPts, ...extrasPts];
+
+    const estimateBucketMs = (ptsArrays) => {
+      // Use the median delta between consecutive samples of the densest
+      // series as the bucket size. Median is robust to outliers (PLC
+      // restarts, brief stalls). Falls back to 1000ms when there's not
+      // enough data.
+      let bestArr = ptsArrays[0] || [];
+      for (const a of ptsArrays) if (a.length > bestArr.length) bestArr = a;
+      if (bestArr.length < 3) return 1000;
+      const deltas = [];
+      for (let k = 1; k < bestArr.length; k += 1) {
+        const d = bestArr[k].tsMs - bestArr[k - 1].tsMs;
+        if (Number.isFinite(d) && d > 0) deltas.push(d);
+      }
+      if (!deltas.length) return 1000;
+      deltas.sort((a, b) => a - b);
+      const median = deltas[Math.floor(deltas.length / 2)];
+      // Clamp so we don't bucket too aggressively (which would erase real
+      // sub-second jitter) nor too coarsely (long PLC pauses shouldn't
+      // collapse 10 minutes of samples into one point).
+      return Math.max(200, Math.min(60000, median));
+    };
+
+    const bucketMs = estimateBucketMs(allPtsByDef);
+    const bucketKey = (tsMs) => Math.floor(tsMs / bucketMs) * bucketMs;
+
+    // tsMap key = bucket start; row keeps "last sample wins" per series so
+    // dashboards reflect the most recent value at each bucket boundary.
+    const tsMap = new Map();
+    const getOrInitRow = (bk, fallbackTs) => {
+      let row = tsMap.get(bk);
+      if (!row) {
+        row = { ts: fallbackTs || new Date(bk).toISOString(), tsMs: bk, value: null };
+        tsMap.set(bk, row);
+      }
+      return row;
+    };
+    // primary
     for (const p of primaryPts) {
-      tsMap.set(p.tsMs, { ts: p.ts, tsMs: p.tsMs, value: p.value });
+      const bk = bucketKey(p.tsMs);
+      const row = getOrInitRow(bk, p.ts);
+      // last-write wins (primaryPts is already chronological asc)
+      row.value = p.value;
+      row.ts = p.ts || row.ts;
     }
+    // extras
     for (let j = 0; j < extrasPts.length; j += 1) {
       const def = extraSeriesDefs[j];
+      const key = `s_${def.id}`;
       for (const p of extrasPts[j]) {
-        const existing = tsMap.get(p.tsMs);
-        if (existing) {
-          existing[`s_${def.id}`] = p.value;
-        } else {
-          const row = { ts: p.ts, tsMs: p.tsMs, value: null };
-          row[`s_${def.id}`] = p.value;
-          tsMap.set(p.tsMs, row);
-        }
+        const bk = bucketKey(p.tsMs);
+        const row = getOrInitRow(bk, p.ts);
+        row[key] = p.value;
+        // Don't overwrite a primary-derived ts here; keep it human-friendly.
       }
     }
     const ordered = Array.from(tsMap.values()).sort((a, b) => a.tsMs - b.tsMs);
