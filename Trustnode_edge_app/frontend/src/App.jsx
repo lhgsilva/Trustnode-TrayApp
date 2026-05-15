@@ -53,6 +53,7 @@ import {
   getAuthMe,
   clearAuthToken,
   isForcedReadonlyCloudMode,
+  isClientViewMode,
   setBackendTarget,
   testNotificationEmail,
   startGatewayInstance,
@@ -1813,6 +1814,7 @@ function buildDefaultUsers() {
 
 function AppShell() {
   const isReadonlyCloudMode = isForcedReadonlyCloudMode();
+  const isClientView = isClientViewMode();
   const browserProtocol = String(window.location.protocol || "").toLowerCase();
   const browserHost = String(window.location.hostname || "").toLowerCase();
   const isLocalHost = browserHost === "localhost" || browserHost === "127.0.0.1" || browserHost === "::1";
@@ -6579,6 +6581,13 @@ function AppShell() {
     if (page === "control_plane") return Boolean(isPortalOnly);
     if (!isPageLicensed(page) && ["dashboard", "power_overview", "historian", "alarms", "reporting", "interface"].includes(page)) {
       return false;
+    }
+    // Single-file customer portal build: restrict to client-facing modules
+    // (dashboard / power / historian / alarms / reporting / interface),
+    // gated by per-user permissions just like a role="client" login.
+    if (isClientView) {
+      if (!CLIENT_MODULE_PAGE_SET.has(page)) return false;
+      return hasClientModuleAccess(page);
     }
     if (forcedClientMode) {
       if (!CLIENT_MODULE_PAGE_SET.has(page)) return false;

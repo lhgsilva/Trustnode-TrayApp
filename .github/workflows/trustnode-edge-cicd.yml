@@ -58,6 +58,13 @@ jobs:
           if (-not $cloudApi) { $cloudApi = "https://trustnode.lsapps.app" }
           pwsh -NoProfile -ExecutionPolicy Bypass -File "./Trustnode_edge_app/scripts/build-web-cloud-readonly.ps1" -CloudApiUrl $cloudApi -BasePath "/"
 
+      - name: Build single-file client view
+        shell: pwsh
+        run: |
+          $cloudApi = "${{ secrets.TRUSTNODE_CLOUD_API_URL }}"
+          if (-not $cloudApi) { $cloudApi = "https://trustnode.lsapps.app" }
+          pwsh -NoProfile -ExecutionPolicy Bypass -File "./Trustnode_edge_app/scripts/build-client-view-singlefile.ps1" -CloudApiUrl $cloudApi
+
       - name: Add client test pages
         run: |
           mkdir -p Trustnode_edge_app/web_cloud_readonly/client
@@ -68,7 +75,7 @@ jobs:
           cp Trustnode_edge_app/client_page_tests/client_test_db.php Trustnode_edge_app/web_cloud_readonly/client/client_test_db.php
           cp Trustnode_edge_app/client_page_tests/portal_single_page.html Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.html
           cp Trustnode_edge_app/client_page_tests/portal_single_page.php Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.php
-          cp Trustnode_edge_app/client_page_tests/client_portal_lite.html Trustnode_edge_app/web_cloud_readonly/client/client_portal_lite.html
+          cp Trustnode_edge_app/client_page_tests/client_view.html Trustnode_edge_app/web_cloud_readonly/client/client_view.html
 
       - name: Validate web bundle wiring
         run: |
@@ -79,11 +86,14 @@ jobs:
           test -f Trustnode_edge_app/web_cloud_readonly/client/client_test_db_php.html
           test -f Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.html
           test -f Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.php
-          test -f Trustnode_edge_app/web_cloud_readonly/client/client_portal_lite.html
+          test -f Trustnode_edge_app/web_cloud_readonly/client/client_view.html
           js_file="$(grep -o 'assets/index-[^"]*\.js' Trustnode_edge_app/web_cloud_readonly/index.html | head -n1)"
           test -n "$js_file"
           test -f "Trustnode_edge_app/web_cloud_readonly/$js_file"
           grep -q "/api/app-store/live" "Trustnode_edge_app/web_cloud_readonly/$js_file"
+          # Single-file client view sanity: file is non-trivial size and has the inlined script tag.
+          test "$(wc -c < Trustnode_edge_app/web_cloud_readonly/client/client_view.html)" -gt 200000
+          grep -q "trustnode_auth_token" Trustnode_edge_app/web_cloud_readonly/client/client_view.html
 
       - name: Upload web artifact
         uses: actions/upload-artifact@v4

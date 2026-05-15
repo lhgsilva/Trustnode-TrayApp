@@ -10,6 +10,7 @@ const CONTROL_PLANE_FALLBACK_URL = normalizeBaseUrl(
   import.meta.env.VITE_TRUSTNODE_CONTROL_PLANE_URL || "https://trustnode.lsapps.app"
 );
 const FORCE_READONLY = String(import.meta.env.VITE_TRUSTNODE_READONLY || "").toLowerCase() === "true";
+const FORCE_CLIENT_VIEW = String(import.meta.env.VITE_TRUSTNODE_CLIENT_VIEW || "").toLowerCase() === "true";
 
 function normalizeBaseUrl(raw) {
   if (!raw) return "";
@@ -93,6 +94,13 @@ function withNoCache(url) {
 
 export function isForcedReadonlyCloudMode() {
   return Boolean(FORCE_CLOUD_URL && FORCE_READONLY);
+}
+
+// Single-file customer portal build: hide admin-only menus regardless of
+// the JWT permissions (defense-in-depth — backend RLS + JWT remain the
+// real enforcement). Toggled at build time via VITE_TRUSTNODE_CLIENT_VIEW.
+export function isClientViewMode() {
+  return FORCE_CLIENT_VIEW;
 }
 
 export function getWsStreamUrl() {
