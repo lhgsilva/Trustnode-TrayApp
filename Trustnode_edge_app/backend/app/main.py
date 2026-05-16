@@ -353,13 +353,23 @@ async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> No
         last_fp = ""
         last_sent_mono = 0.0
         while True:
-            latest_rows = ingest_store.query_latest(tenant_id=tenant_id, limit=live_limit)
+            # IMPORTANT: these are sync DB calls (SQLite + sometimes Supabase
+            # via SQLAlchemy). They MUST run on a worker thread, not the
+            # asyncio event loop — otherwise every active WebSocket starves
+            # the loop and freezes unrelated endpoints (/api/health etc).
+            latest_rows = await asyncio.to_thread(
+                ingest_store.query_latest, tenant_id=tenant_id, limit=live_limit
+            )
             live_rows = _flatten_latest(latest_rows)
             # Migration-safe fallback: if v1 latest is empty, keep legacy cloud
             # mirror rows flowing so edge selection and dashboards remain usable.
             if not live_rows:
-                live_rows = app_store.get_live_rows(limit=live_limit, prefer_cloud_reads=True)
-            gateway_statuses = app_store.build_gateway_statuses_from_live_rows(live_rows, freshness_ms=20000)
+                live_rows = await asyncio.to_thread(
+                    app_store.get_live_rows, limit=live_limit, prefer_cloud_reads=True
+                )
+            gateway_statuses = await asyncio.to_thread(
+                app_store.build_gateway_statuses_from_live_rows, live_rows, freshness_ms=20000
+            )
             running_gateways = [g for g in gateway_statuses if bool(g.get("running"))]
             newest_ts = max((str(g.get("last_check_utc") or "") for g in gateway_statuses), default="")
             fp = _fingerprint(live_rows, gateway_statuses)
