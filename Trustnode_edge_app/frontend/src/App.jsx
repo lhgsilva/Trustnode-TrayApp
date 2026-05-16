@@ -6663,6 +6663,19 @@ function AppShell() {
   const setPowerDeviceRunning = async (deviceId, shouldRun) => {
     const did = String(deviceId || "").trim();
     if (!did) return;
+    // Optimistic update first so the footer Status pill + the Start/Stop
+    // button flip instantly. The footer reads isGatewayRunning(...) which
+    // for meters resolves to powerConfig.devices[did].enabled when no
+    // power_manager status row exists for the device yet. Flipping that
+    // flag immediately gives the user the visual response they expect.
+    setPowerConfig((prev) => {
+      if (!prev || !Array.isArray(prev.devices)) return prev;
+      const idx = prev.devices.findIndex((d) => String(d?.id || "") === did);
+      if (idx < 0) return prev;
+      const nextDevices = prev.devices.slice();
+      nextDevices[idx] = { ...nextDevices[idx], enabled: !!shouldRun };
+      return { ...prev, devices: nextDevices };
+    });
     setPowerBusy(true);
     try {
       const res = shouldRun ? await startPowerDevice(did) : await stopPowerDevice(did);
@@ -6683,6 +6696,15 @@ function AppShell() {
       }
       setPowerResult(shouldRun ? `Power meter ${did} started.` : `Power meter ${did} stopped.`);
     } catch (err) {
+      // Revert the optimistic flip on failure so the UI returns to truth.
+      setPowerConfig((prev) => {
+        if (!prev || !Array.isArray(prev.devices)) return prev;
+        const idx = prev.devices.findIndex((d) => String(d?.id || "") === did);
+        if (idx < 0) return prev;
+        const nextDevices = prev.devices.slice();
+        nextDevices[idx] = { ...nextDevices[idx], enabled: !shouldRun };
+        return { ...prev, devices: nextDevices };
+      });
       setPowerResult(`Power meter control failed: ${String(err?.message || err)}`);
     } finally {
       setPowerBusy(false);
@@ -8910,6 +8932,20 @@ const getGatewayHealth = (gateway) => {
     }));
   }, [dataLogView, historianFilters, gatewayNameById]);
 
+  // Render only the most recent N rows to keep DOM size bounded. Without
+  // this cap React reconciles every row on every state change — opening
+  // and leaving the Historian page took 2–5 s on 5 000-row datasets.
+  // Users still get all rows via the CSV/TXT export buttons; the table
+  // shows the most recent slice with a "showing N of M" footer plus a
+  // button to extend the slice if they need more on screen.
+  const [historianRenderLimit, setHistorianRenderLimit] = useState(500);
+  const historianRowsSliced = useMemo(() => {
+    if (!historianRows.length) return historianRows;
+    return historianRows.length > historianRenderLimit
+      ? historianRows.slice(-historianRenderLimit)
+      : historianRows;
+  }, [historianRows, historianRenderLimit]);
+
   const filteredLogs = useMemo(() => {
     return appLogsView.filter((row) => {
       if (!inRange(row.ts, logFilters.from, logFilters.to)) return false;
@@ -9374,9 +9410,16 @@ const getGatewayHealth = (gateway) => {
     const gateway = gatewayConfigs.find((g) => String(g.id || "") === String(gatewayId || "")) || null;
     // Power-meter gateways: route through power_manager (mirror of the
     // start handler). PLC stop API doesn't know about them and would 404 /
-    // do nothing.
+    // do nothing. Detection is NOT gated on `!gateway` — some meters are
+    // also pushed into gatewayConfigs by powerGatewayDescriptors, in which
+    // case both lookups succeed. Previously the function fell through to
+    // the PLC stop in that case and silently did nothing, leaving the
+    // meter running. Now whenever the id matches a configured meter we
+    // always send the meter stop through power_manager.
     const powerDevice = (powerConfig?.devices || []).find((d) => String(d?.id || "") === String(gatewayId || ""));
-    if (!gateway && powerDevice) {
+    const isMeterGateway = gateway?.power_meter === true
+      || String(gateway?.gateway_type || "") === "modbus_tcp_meter";
+    if (powerDevice || isMeterGateway) {
       try {
         await setPowerDeviceRunning(String(gatewayId), false);
         setError("");
@@ -17162,7 +17205,7 @@ const getGatewayHealth = (gateway) => {
                     <div className="thead">
                       <span>Timestamp</span><span>Tag</span><span>Value</span><span>Quality</span><span>Device</span><span>Gateway</span><span>Database</span><span>PLC</span>
                     </div>
-                    {historianRows.map((row, idx) => (
+                    {historianRowsSliced.map((row, idx) => (
                       <div key={`${row.ts}-${row.tag}-${idx}`} className="trow">
                         <span>{fmtTs(row.ts)}</span>
                         <span>{formatTagForDisplay(row.tag)}</span>
@@ -17176,6 +17219,29 @@ const getGatewayHealth = (gateway) => {
                     ))}
                   </div>
                 </div>
+                {/* Render-cap footer: shows the slice we're displaying vs
+                    the filtered total, with a button to extend the slice
+                    in 500-row steps. Keeps the page snappy when datasets
+                    grow to thousands of rows. CSV/TXT export buttons above
+                    still emit the full filtered dataset. */}
+                {historianRows.length > historianRowsSliced.length ? (
+                  <div className="row" style={{ justifyContent: "space-between", padding: "6px 4px", color: "var(--muted, #5a5a5a)", fontSize: 12 }}>
+                    <span>
+                      Showing latest <b>{historianRowsSliced.length.toLocaleString()}</b> of <b>{historianRows.length.toLocaleString()}</b> rows
+                    </span>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => setHistorianRenderLimit((prev) => Math.min(prev + 500, historianRows.length))}
+                      type="button"
+                    >
+                      Show 500 more
+                    </button>
+                  </div>
+                ) : historianRows.length > 0 ? (
+                  <div className="row" style={{ padding: "6px 4px", color: "var(--muted, #5a5a5a)", fontSize: 12 }}>
+                    <span>{historianRows.length.toLocaleString()} rows</span>
+                  </div>
+                ) : null}
               </section>
             </div>
           ) : null}
