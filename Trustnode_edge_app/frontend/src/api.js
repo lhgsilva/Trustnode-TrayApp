@@ -1044,6 +1044,19 @@ export async function getAppStoreInspector(previewLimit = 15) {
   return res.json();
 }
 
+export async function getCloudSyncStatus() {
+  // Fast read-only summary of the edge's cloud-sync workers — backlog
+  // depth, last sync time, last error, telemetry-v1 state. Used by the
+  // header strip + the backlog-too-big popup to decide whether to prompt.
+  const res = await fetchWithTimeout(
+    withNoCache(`${getAppStoreApiBase()}/api/app-store/sync/status`),
+    { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } },
+    8000
+  );
+  if (!res.ok) throw new Error("Sync status fetch failed");
+  return res.json();
+}
+
 export async function getEdgeIngestDiagnostics() {
   const res = await fetchWithTimeout(
     withNoCache(`${getApiBase()}/api/v1/edge/diagnostics`),

@@ -31,6 +31,7 @@ import {
   getAppStoreHistorianRuleStats,
   getAppStoreLogs,
   getAppStoreInspector,
+  getCloudSyncStatus,
   getEdgeIngestDiagnostics,
   repairDatabaseRecovery,
   getRetentionPolicy,
@@ -2202,6 +2203,15 @@ function AppShell() {
   const [databaseInspectorError, setDatabaseInspectorError] = useState("");
   const [edgeIngestDiagnostics, setEdgeIngestDiagnostics] = useState(null);
   const [edgeIngestDiagnosticsError, setEdgeIngestDiagnosticsError] = useState("");
+  // Cloud sync status: polled every 2s, drives the new sync status card and
+  // the "big backlog detected" popup.
+  const [cloudSyncStatus, setCloudSyncStatus] = useState(null);
+  const [cloudSyncStatusError, setCloudSyncStatusError] = useState("");
+  // Backlog popup gate. Once the user picks an option we remember the
+  // decision for the session so we don't pester them again on each poll.
+  const [backlogPromptDecision, setBacklogPromptDecision] = useState("");
+  const [backlogPromptBusy, setBacklogPromptBusy] = useState(false);
+  const [backlogPromptVisible, setBacklogPromptVisible] = useState(false);
   const [appMetadata, setAppMetadata] = useState({});
   const [showDefaultLocalDbBadge, setShowDefaultLocalDbBadge] = useState(false);
   const [forceSyncBusy, setForceSyncBusy] = useState(false);
@@ -4082,6 +4092,39 @@ function AppShell() {
       clearInterval(timer);
     };
   }, [appStoreHydrated, currentUser, endpointMode]);
+
+  // Poll the lighter /api/app-store/sync/status every 2s. Drives the new
+  // sync-status card and the backlog-too-big popup. Cheap call — backend
+  // just reads counters from the in-memory inspector snapshot.
+  useEffect(() => {
+    if (!appStoreHydrated || !currentUser) return;
+    let stopped = false;
+    const run = async () => {
+      if (stopped) return;
+      await refreshCloudSyncStatus();
+    };
+    run();
+    const timer = setInterval(run, 2000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [appStoreHydrated, currentUser, endpointMode]);
+
+  // Backlog-too-big popup gate. Threshold defaults to 10,000 pending rows
+  // OR 1 hour of oldest unsynced data. We only ever show the popup ONCE
+  // per session (until the user picks an option); the decision is sticky.
+  useEffect(() => {
+    if (!cloudSyncStatus) return;
+    if (backlogPromptVisible) return;
+    if (backlogPromptDecision) return;
+    const historianBacklog = Number(cloudSyncStatus?.historian_backlog || 0);
+    const v1Depth = Number(cloudSyncStatus?.telemetry_v1?.outbox_depth || 0);
+    const total = historianBacklog + v1Depth;
+    if (total >= 10000) {
+      setBacklogPromptVisible(true);
+    }
+  }, [cloudSyncStatus, backlogPromptVisible, backlogPromptDecision]);
 
   useEffect(() => {
     if (!appStoreHydrated) return;
@@ -10970,6 +11013,65 @@ const getGatewayHealth = (gateway) => {
     }
   };
 
+  const refreshCloudSyncStatus = async () => {
+    try {
+      const res = await getCloudSyncStatus();
+      if (res?.ok) {
+        setCloudSyncStatus(res);
+        setCloudSyncStatusError("");
+      } else {
+        setCloudSyncStatusError("Cloud sync status unavailable.");
+      }
+    } catch (err) {
+      setCloudSyncStatusError(String(err));
+    }
+  };
+
+  const handleBacklogPushAll = async () => {
+    if (backlogPromptBusy) return;
+    setBacklogPromptBusy(true);
+    try {
+      // Kicks the bulk historian + live worker — the same routine already
+      // wired to the "Force Sync" button in the cloud-connections panel.
+      await forceAppStoreSyncNow({ actor: currentUser?.username || "backlog_prompt_push" });
+      setBacklogPromptDecision("push");
+      setBacklogPromptVisible(false);
+      setForceSyncResult("Backlog push started. Live data continues in parallel.");
+      await refreshCloudSyncStatus();
+    } catch (err) {
+      setError(`Backlog push failed: ${String(err?.message || err)}`);
+    } finally {
+      setBacklogPromptBusy(false);
+    }
+  };
+
+  const handleBacklogIgnore = async () => {
+    if (backlogPromptBusy) return;
+    setBacklogPromptBusy(true);
+    try {
+      // Marks the queue position forward without uploading the rows.
+      // Local SQLite still keeps them (for reports), but the sync worker
+      // will only push new samples from now on.
+      await dropAppStoreSyncBacklog({ actor: currentUser?.username || "backlog_prompt_ignore" });
+      setBacklogPromptDecision("ignore");
+      setBacklogPromptVisible(false);
+      setForceSyncResult("Backlog ignored. Local rows are preserved; only new samples will sync.");
+      await refreshCloudSyncStatus();
+    } catch (err) {
+      setError(`Backlog ignore failed: ${String(err?.message || err)}`);
+    } finally {
+      setBacklogPromptBusy(false);
+    }
+  };
+
+  const handleBacklogDecideLater = () => {
+    // Suppress the prompt for the rest of this session. Next session start
+    // (next edge service launch) the threshold check runs again and the
+    // popup may come back if the backlog is still over the threshold.
+    setBacklogPromptDecision("later");
+    setBacklogPromptVisible(false);
+  };
+
   const refreshRetentionData = async () => {
     const [policyRes, runsRes] = await Promise.all([
       getRetentionPolicy(),
@@ -15386,22 +15488,86 @@ const getGatewayHealth = (gateway) => {
                   </div>
                 ) : null}
                 {forceSyncResult ? <div className="info-note" style={{ marginTop: 8 }}>{forceSyncResult}</div> : null}
-                {edgeIngestDiagnostics ? (
-                  <div className="info-note" style={{ marginTop: 8 }}>
-                    <b>Edge Ingest:</b>{" "}
-                    {`outbox=${Number(edgeIngestDiagnostics?.outbox_depth || 0)} | `}
-                    {`oldest_unsynced=${String(edgeIngestDiagnostics?.oldest_unsynced_sample_ts_utc || "-")} | `}
-                    {`token_mode=${String(edgeIngestDiagnostics?.device_token_mode || "-")} | `}
-                    {`vps=${String(edgeIngestDiagnostics?.vps_ingest_url || "-")}`}
-                    {edgeIngestDiagnostics?.last_outbox_error?.error ? (
-                      <>
-                        {" | "}
-                        <span style={{ color: "#b91c1c" }}>
-                          {`last_error(${String(edgeIngestDiagnostics.last_outbox_error.gateway_id || "")}): ${String(edgeIngestDiagnostics.last_outbox_error.error || "")}`}
-                        </span>
-                      </>
+                {/* Compact CLOUD SYNC STATUS card — refreshed every 2s.
+                    Replaces the older one-line diagnostic. Shows backlog
+                    depth, last sync time, and last error in one glance. */}
+                {cloudSyncStatus ? (
+                  <div
+                    className="info-note"
+                    style={{
+                      marginTop: 8,
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))",
+                      gap: 6,
+                    }}
+                  >
+                    <div>
+                      <div className="muted small">Historian backlog</div>
+                      <div>
+                        <b>{Number(cloudSyncStatus?.historian_backlog || 0).toLocaleString()}</b>{" "}
+                        rows
+                      </div>
+                    </div>
+                    <div>
+                      <div className="muted small">Pushed total</div>
+                      <div>
+                        <b>{Number(cloudSyncStatus?.historian_synced_total || 0).toLocaleString()}</b>
+                      </div>
+                    </div>
+                    <div>
+                      <div className="muted small">Last sync (UTC)</div>
+                      <div>{String(cloudSyncStatus?.last_data_sync_utc || "-").slice(0, 19) || "-"}</div>
+                    </div>
+                    <div>
+                      <div className="muted small">Cloud target</div>
+                      <div>
+                        {cloudSyncStatus?.cloud_target?.enabled
+                          ? <>
+                              <span style={{ color: "#2ea043" }}>●</span>{" "}
+                              {String(cloudSyncStatus.cloud_target?.name || cloudSyncStatus.cloud_target?.host || "enabled")}
+                            </>
+                          : <span style={{ color: "#94a3b8" }}>disabled</span>}
+                      </div>
+                    </div>
+                    {cloudSyncStatus?.last_data_error ? (
+                      <div style={{ gridColumn: "1 / -1", color: "#b91c1c" }}>
+                        ⚠ Last sync error: {String(cloudSyncStatus.last_data_error).slice(0, 240)}
+                      </div>
+                    ) : null}
+                    {cloudSyncStatus?.telemetry_v1?.enabled && cloudSyncStatus?.telemetry_v1?.outbox_depth ? (
+                      <div style={{ gridColumn: "1 / -1", color: "#8a4d00" }}>
+                        Legacy ingest backlog: {Number(cloudSyncStatus.telemetry_v1.outbox_depth).toLocaleString()} rows
+                        {cloudSyncStatus.telemetry_v1.last_error
+                          ? <> · last error: {String(cloudSyncStatus.telemetry_v1.last_error).slice(0, 160)}</>
+                          : null}
+                      </div>
                     ) : null}
                   </div>
+                ) : null}
+                {cloudSyncStatusError && !cloudSyncStatus ? (
+                  <div className="error" style={{ marginTop: 8 }}>
+                    Cloud sync status: {cloudSyncStatusError}
+                  </div>
+                ) : null}
+                {edgeIngestDiagnostics ? (
+                  <details style={{ marginTop: 8 }}>
+                    <summary className="muted small">Legacy edge-ingest details</summary>
+                    <div className="info-note" style={{ marginTop: 6 }}>
+                      <b>Edge Ingest:</b>{" "}
+                      {`outbox=${Number(edgeIngestDiagnostics?.outbox_depth || 0)} | `}
+                      {`oldest_unsynced=${String(edgeIngestDiagnostics?.oldest_unsynced_sample_ts_utc || "-")} | `}
+                      {`token_mode=${String(edgeIngestDiagnostics?.device_token_mode || "-")} | `}
+                      {`vps=${String(edgeIngestDiagnostics?.vps_ingest_url || "-")}`}
+                      {edgeIngestDiagnostics?.last_outbox_error?.error ? (
+                        <>
+                          {" | "}
+                          <span style={{ color: "#b91c1c" }}>
+                            {`last_error(${String(edgeIngestDiagnostics.last_outbox_error.gateway_id || "")}): ${String(edgeIngestDiagnostics.last_outbox_error.error || "")}`}
+                          </span>
+                        </>
+                      ) : null}
+                    </div>
+                  </details>
                 ) : null}
                 {edgeIngestDiagnosticsError ? (
                   <div className="error" style={{ marginTop: 8 }}>
@@ -18779,6 +18945,82 @@ const getGatewayHealth = (gateway) => {
               className="report-preview-frame"
               srcDoc={reportPreviewDoc.html_content || ""}
             />
+          </div>
+        </div>
+      ) : null}
+      {/* Cloud-sync backlog popup. Triggered automatically when the
+          historian backlog + telemetry-v1 outbox sum to ≥ 10 000 rows
+          and the user hasn't already picked an option this session. */}
+      {backlogPromptVisible ? (
+        <div className="modal-backdrop">
+          <div className="modal-card" style={{ maxWidth: 560 }}>
+            <h3 style={{ marginTop: 0 }}>📦 Sync backlog detected</h3>
+            <p>
+              Your edge has been collecting data faster than the cloud has been
+              accepting it. The backlog is now large enough that we should ask
+              you what to do:
+            </p>
+            <div className="info-note" style={{ marginBottom: 12 }}>
+              <div>
+                <b>Pending historian rows:</b>{" "}
+                {Number(cloudSyncStatus?.historian_backlog || 0).toLocaleString()}
+              </div>
+              {cloudSyncStatus?.telemetry_v1?.outbox_depth ? (
+                <div>
+                  <b>Legacy ingest outbox:</b>{" "}
+                  {Number(cloudSyncStatus.telemetry_v1.outbox_depth).toLocaleString()}
+                  {cloudSyncStatus.telemetry_v1.oldest_unsynced_ts ? (
+                    <> (oldest from {String(cloudSyncStatus.telemetry_v1.oldest_unsynced_ts).slice(0, 19)})</>
+                  ) : null}
+                </div>
+              ) : null}
+              {cloudSyncStatus?.last_data_error ? (
+                <div style={{ marginTop: 6, color: "#b91c1c" }}>
+                  Last sync error: {String(cloudSyncStatus.last_data_error)}
+                </div>
+              ) : null}
+            </div>
+            <p>What would you like to do?</p>
+            <ul style={{ marginTop: 0, fontSize: 14 }}>
+              <li>
+                <b>Push to cloud</b> — flush the backlog over the next few
+                minutes. Live data continues in parallel; you won't lose
+                anything.
+              </li>
+              <li>
+                <b>Ignore and start fresh</b> — keep the rows locally for
+                reports, but stop trying to upload them. Only new samples
+                from now on will reach the cloud.
+              </li>
+              <li>
+                <b>Decide later</b> — leave the prompt for now. It will appear
+                again the next time you open the edge app if the backlog is
+                still large.
+              </li>
+            </ul>
+            <div className="row" style={{ marginTop: 16, justifyContent: "flex-end", gap: 8 }}>
+              <button
+                className="btn btn-secondary"
+                onClick={handleBacklogDecideLater}
+                disabled={backlogPromptBusy}
+              >
+                Decide later
+              </button>
+              <button
+                className="btn btn-danger"
+                onClick={handleBacklogIgnore}
+                disabled={backlogPromptBusy}
+              >
+                {backlogPromptBusy ? "Working..." : "Ignore and start fresh"}
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={handleBacklogPushAll}
+                disabled={backlogPromptBusy}
+              >
+                {backlogPromptBusy ? "Working..." : "Push to cloud"}
+              </button>
+            </div>
           </div>
         </div>
       ) : null}

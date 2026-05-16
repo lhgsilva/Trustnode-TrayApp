@@ -36,7 +36,18 @@ class TelemetryService:
         self.customer_id = str(os.environ.get("TRUSTNODE_CUSTOMER_ID", "default") or "default")
         self.vps_ingest_url = str(os.environ.get("TRUSTNODE_VPS_INGEST_URL", "")).strip().rstrip("/")
         ingest_env = str(os.environ.get("TRUSTNODE_EDGE_INGEST_ENABLED", "") or "").strip().lower()
-        self.ingest_enabled = ingest_env in {"1", "true", "yes", "on"} or bool(self.vps_ingest_url)
+        # Telemetry-v1 (HTTPS POST + device_token) is the legacy path. New
+        # deployments use the direct-Postgres path in services/app_store.py
+        # (faster, no per-batch token round-trip, no dependence on the
+        # control-plane portal being up). The v1 path stays in the codebase
+        # for customers who explicitly opt in, but we no longer start its
+        # background thread unless the operator turns it on.
+        disable_v1_env = str(os.environ.get("TRUSTNODE_DISABLE_TELEMETRY_V1", "1") or "1").strip().lower()
+        self.v1_explicitly_disabled = disable_v1_env in {"1", "true", "yes", "on"}
+        self.ingest_enabled = (
+            (ingest_env in {"1", "true", "yes", "on"} or bool(self.vps_ingest_url))
+            and not self.v1_explicitly_disabled
+        )
         self.device_token = str(os.environ.get("TRUSTNODE_DEVICE_TOKEN", "")).strip()
         self.cloud_bootstrap_user = str(os.environ.get("TRUSTNODE_CLOUD_BOOTSTRAP_USER", "admin") or "admin").strip()
         self.cloud_bootstrap_password = str(os.environ.get("TRUSTNODE_CLOUD_BOOTSTRAP_PASSWORD", "admin") or "admin").strip()
@@ -597,6 +608,42 @@ class TelemetryService:
     def _outbox_depth(self, conn: sqlite3.Connection) -> int:
         row = conn.execute("SELECT COUNT(*) AS c FROM sync_outbox_v1 WHERE status IN ('pending','retry')").fetchone()
         return int(row["c"] if row else 0)
+
+    def sync_summary(self) -> Dict[str, Any]:
+        """Fast read-only snapshot used by /api/app-store/sync/status.
+
+        Never starts a flush. Returns an empty dict when the v1 path is
+        explicitly disabled so the cloud UI can hide the panel cleanly.
+        """
+        if self.v1_explicitly_disabled:
+            return {"enabled": False, "reason": "TRUSTNODE_DISABLE_TELEMETRY_V1"}
+        try:
+            with self._connect() as conn:
+                depth = self._outbox_depth(conn)
+                oldest_row = conn.execute(
+                    "SELECT sample_ts_utc FROM sync_outbox_v1 "
+                    "WHERE status IN ('pending','retry') "
+                    "ORDER BY sample_ts_utc ASC LIMIT 1"
+                ).fetchone()
+                last_err_row = conn.execute(
+                    "SELECT last_error, updated_utc FROM sync_outbox_v1 "
+                    "WHERE COALESCE(last_error,'') <> '' "
+                    "ORDER BY updated_utc DESC LIMIT 1"
+                ).fetchone()
+                acked_row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM sync_outbox_v1 WHERE status='acked'"
+                ).fetchone()
+            return {
+                "enabled": True,
+                "ingest_url": self.vps_ingest_url,
+                "outbox_depth": int(depth or 0),
+                "acked_total": int(acked_row["c"] or 0) if acked_row else 0,
+                "oldest_unsynced_ts": str(oldest_row["sample_ts_utc"] or "") if oldest_row else "",
+                "last_error": str(last_err_row["last_error"] or "") if last_err_row else "",
+                "last_error_utc": str(last_err_row["updated_utc"] or "") if last_err_row else "",
+            }
+        except Exception as exc:
+            return {"enabled": True, "error": str(exc)}
 
     def local_history(self, limit: int = 1000) -> List[Dict[str, Any]]:
         with self._connect() as conn:

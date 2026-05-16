@@ -389,6 +389,48 @@ def force_sync(payload: ForceSyncRequest) -> dict:
     return app_store.force_sync_now(actor=payload.actor)
 
 
+@router.get("/sync/status")
+def get_sync_status() -> dict:
+    """Read-only summary of the cloud sync worker state.
+
+    Returned shape matches the `summary` block of force_sync_now() but
+    runs no flush. Cheap enough for the UI to poll every 1–2 seconds.
+    Includes whether telemetry-v1 is enabled, the live/data sync errors
+    if any, and the historian/log backlog counts so the UI can decide
+    whether to show the "big backlog" prompt.
+    """
+    snap = app_store.get_inspector_snapshot(preview_limit=0) or {}
+    outbox = snap.get("sync_outbox_status") or {}
+    data_sync = snap.get("data_sync") or {}
+    sync_target = snap.get("sync_target") or {}
+    # Pull telemetry-v1 state via the same service singleton the routers
+    # already use so the UI sees a consistent picture.
+    try:
+        v1_summary = telemetry_service.sync_summary() if hasattr(telemetry_service, "sync_summary") else {}
+    except Exception:
+        v1_summary = {}
+    return {
+        "ok": True,
+        "config_pending": int(outbox.get("pending") or 0),
+        "config_failed": int(outbox.get("failed") or 0),
+        "config_sent_total": int(outbox.get("sent") or 0),
+        "historian_backlog": int(data_sync.get("historian_backlog") or 0),
+        "logs_backlog": int(data_sync.get("logs_backlog") or 0),
+        "historian_synced_total": int(data_sync.get("total_historian_synced") or 0),
+        "logs_synced_total": int(data_sync.get("total_logs_synced") or 0),
+        "last_config_sync_utc": str(sync_target.get("last_sync_utc") or ""),
+        "last_data_sync_utc": str(data_sync.get("last_data_sync_utc") or ""),
+        "last_config_error": str(sync_target.get("last_error") or ""),
+        "last_data_error": str(data_sync.get("last_data_error") or ""),
+        "cloud_target": {
+            "name": str(sync_target.get("name") or ""),
+            "host": str(sync_target.get("host") or ""),
+            "enabled": bool(sync_target.get("enabled")),
+        },
+        "telemetry_v1": v1_summary,
+    }
+
+
 @router.post("/sync/manual-period")
 def manual_period_sync(payload: ManualDataSyncRequest) -> dict:
     return app_store.manual_sync_data_period(
