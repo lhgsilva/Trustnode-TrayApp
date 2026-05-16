@@ -87,6 +87,11 @@ jobs:
           test -f Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.html
           test -f Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.php
           test -f Trustnode_edge_app/web_cloud_readonly/client/client_view.html
+          # TrustNode Lite — the new mobile-first read-only view. Hand-written,
+          # no build step, but we still want CI to fail loudly if the files
+          # disappear from the deploy artifact.
+          test -f Trustnode_edge_app/web_cloud_readonly/lite/index.html
+          test -f Trustnode_edge_app/web_cloud_readonly/lite/styles.css
           js_file="$(grep -o 'assets/index-[^"]*\.js' Trustnode_edge_app/web_cloud_readonly/index.html | head -n1)"
           test -n "$js_file"
           test -f "Trustnode_edge_app/web_cloud_readonly/$js_file"
@@ -302,6 +307,27 @@ jobs:
                 }
               ' "$TARGET_CONF" > "${TARGET_CONF}.tmp" && mv "${TARGET_CONF}.tmp" "$TARGET_CONF"
             fi
+            # TrustNode Lite location — explicit so /lite/ and /lite resolve to
+            # lite/index.html instead of falling through to the SPA's
+            # /index.html via try_files. Idempotent via the sentinel comment.
+            if [ -n "$TARGET_CONF" ] && ! grep -q 'TRUSTNODE_LITE_BEGIN' "$TARGET_CONF"; then
+              awk '
+                BEGIN{in_server=0;inserted=0}
+                {
+                  print $0
+                  if ($0 ~ /^[[:space:]]*server[[:space:]]*\{/) in_server=1
+                  else if (in_server && $0 ~ /^[[:space:]]*}$/ && inserted==0) {
+                    print "    # TRUSTNODE_LITE_BEGIN"
+                    print "    location = /lite { return 301 /lite/; }"
+                    print "    location /lite/ {"
+                    print "        try_files $uri $uri/ /lite/index.html;"
+                    print "    }"
+                    print "    # TRUSTNODE_LITE_END"
+                    inserted=1
+                  }
+                }
+              ' "$TARGET_CONF" > "${TARGET_CONF}.tmp" && mv "${TARGET_CONF}.tmp" "$TARGET_CONF"
+            fi
             chown -R nginx:nginx "${{ env.VPS_WEB_ROOT }}"
             restorecon -Rv "${{ env.VPS_WEB_ROOT }}" || true
             if [ -n "$TARGET_CONF" ]; then
@@ -310,6 +336,8 @@ jobs:
             fi
             curl -fsS https://trustnode.lsapps.app/api/health >/dev/null
             curl -fsS https://trustnode.lsapps.app/ >/dev/null
+            curl -fsS https://trustnode.lsapps.app/lite/ -o /dev/null
+            curl -fsS https://trustnode.lsapps.app/lite/styles.css -o /dev/null
             php_probe="$(curl -fsS https://trustnode.lsapps.app/client/client_test.php | head -c 240 || true)"
             if echo "$php_probe" | grep -q '<?php'; then
               echo "PHP source leak detected at /client/client_test.php"
