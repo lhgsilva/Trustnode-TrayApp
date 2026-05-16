@@ -7,7 +7,7 @@ router = APIRouter(prefix="/api", tags=["health"])
 def health() -> dict:
     return {
         "status": "ok",
-        "api_build": "edge-2026-05-16-syncfix-4-async-ws",
+        "api_build": "edge-2026-05-17-syncfix-5-env-cloud-target",
         "capabilities": {
             "database_active_sink": True,
             "database_file_sinks": True,

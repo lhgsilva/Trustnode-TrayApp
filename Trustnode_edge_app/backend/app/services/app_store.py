@@ -736,6 +736,44 @@ class AppStore:
             self._cloud_target_cache_value = None
             self._cloud_target_cache_ts = 0.0
 
+    def _cloud_target_from_env(self) -> Dict[str, Any] | None:
+        """Build a cloud target dict purely from environment variables.
+
+        Cloud-only deployments (the VPS) never go through the desktop UI and
+        therefore never get a `database_configurations` row written to their
+        local SQLite. Without this fallback the VPS silently fell through to
+        its empty local historian and served stale test data instead of
+        Supabase, regardless of TRUSTNODE_PREFER_CLOUD_READS=true.
+
+        Returns None when the required keys aren't present so callers keep
+        their existing branch behavior on the edge (which DOES configure the
+        target through the UI / config doc).
+        """
+        host = str(os.environ.get("TRUSTNODE_CLOUD_DB_HOST", "") or "").strip()
+        user = str(os.environ.get("TRUSTNODE_CLOUD_DB_USER", "") or "").strip()
+        password = str(os.environ.get("TRUSTNODE_CLOUD_DB_PASSWORD", "") or "")
+        if not (host and user and password):
+            return None
+        try:
+            port = int(os.environ.get("TRUSTNODE_CLOUD_DB_PORT", "5432") or "5432")
+        except Exception:
+            port = 5432
+        database = str(os.environ.get("TRUSTNODE_CLOUD_DB_NAME", "postgres") or "postgres").strip() or "postgres"
+        schema = str(os.environ.get("TRUSTNODE_CLOUD_DB_SCHEMA", "public") or "public").strip() or "public"
+        sslmode = str(os.environ.get("TRUSTNODE_CLOUD_DB_SSLMODE", "require") or "require").strip().lower()
+        return {
+            "id": "env",
+            "name": "Cloud DB (env)",
+            "engine": "postgresql",
+            "host": host,
+            "port": port,
+            "database": database,
+            "username": user,
+            "password": password,
+            "schema": schema,
+            "tls": sslmode != "disable",
+        }
+
     def _get_cloud_database_target(self) -> Dict[str, Any] | None:
         # Cache the resolved target for a few seconds. The function reads two
         # SQL tables under the global lock; calling it on every API request
@@ -781,10 +819,13 @@ class AppStore:
                     except Exception:
                         continue
         if not payloads:
+            # Cloud deployment path: no UI ever wrote a DB config row to the
+            # local SQLite. Fall back to env vars before giving up.
+            env_target = self._cloud_target_from_env()
             with self._cloud_target_cache_lock:
-                self._cloud_target_cache_value = None
+                self._cloud_target_cache_value = dict(env_target) if env_target else None
                 self._cloud_target_cache_ts = now
-            return None
+            return env_target
 
         def _is_enabled(item: Dict[str, Any]) -> bool:
             if "enabled" in item:
@@ -838,10 +879,11 @@ class AppStore:
                 }
             )
         if not candidates:
+            env_target = self._cloud_target_from_env()
             with self._cloud_target_cache_lock:
-                self._cloud_target_cache_value = None
+                self._cloud_target_cache_value = dict(env_target) if env_target else None
                 self._cloud_target_cache_ts = now
-            return None
+            return env_target
         supabase = [c for c in candidates if "supabase.co" in c["host"].lower()]
         chosen = supabase[0] if supabase else candidates[0]
         with self._cloud_target_cache_lock:
