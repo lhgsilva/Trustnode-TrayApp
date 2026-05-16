@@ -14,6 +14,7 @@ export const WIDGET_TYPES = [
   { key: "table_list", label: "Table List View", group: "Content", defaultSize: { w: 6, h: 4 } },
   { key: "image", label: "Pictures", group: "Media", defaultSize: { w: 4, h: 4 } },
   { key: "ip_camera", label: "IP Camera (Live Feed)", group: "Media", defaultSize: { w: 5, h: 4 } },
+  { key: "cloud_sync_status", label: "Cloud Sync Status", group: "System", defaultSize: { w: 8, h: 4 } },
 ];
 
 export function getWidgetMeta(type) {

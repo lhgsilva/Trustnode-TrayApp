@@ -11,7 +11,7 @@ import { compactWidgets, findFirstFreeSpot, normalizeWidgets, reflowWidgetsForMo
 import { filterRowsByRange, getLatestTagRow, toTsMs } from "./dashboardAnalytics";
 import "./dashboard.css";
 
-const TYPE_GROUPS = ["Charts", "KPI", "Content", "Layout", "Media"];
+const TYPE_GROUPS = ["Charts", "KPI", "Content", "Layout", "Media", "System"];
 const DASHBOARD_TIME_MODE_KEY = "trustnode_dashboard_time_mode";
 const DASHBOARD_TIME_RANGE_KEY = "trustnode_dashboard_time_range";
 const DASHBOARD_PROFILES_KEY = "trustnode_dashboard_profiles";
@@ -2071,6 +2071,65 @@ export function DashboardDesigner({
                       onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, camera_url: e.target.value } }))}
                     />
                   </label>
+                ) : null}
+
+                {form.type === "cloud_sync_status" ? (
+                  <>
+                    <label className="dashboard-full-row">
+                      Display mode
+                      <select
+                        value={String(form.config.display_mode || "combined")}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, display_mode: e.target.value } }))}
+                      >
+                        <option value="combined">Combined (donut + tiles + sparkline)</option>
+                        <option value="donut">Donut</option>
+                        <option value="stat_tiles">Stat tiles</option>
+                        <option value="progress_bar">Progress bar</option>
+                        <option value="line_history">Backlog history line</option>
+                      </select>
+                    </label>
+                    <label className="dashboard-full-row">
+                      Backlog history window
+                      <select
+                        value={String(form.config.history_window_sec || 300)}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, history_window_sec: Number(e.target.value) } }))}
+                      >
+                        <option value="60">Last 60 seconds</option>
+                        <option value="300">Last 5 minutes</option>
+                        <option value="900">Last 15 minutes</option>
+                        <option value="1800">Last 30 minutes</option>
+                        <option value="3600">Last 1 hour</option>
+                      </select>
+                    </label>
+                    <label className="dashboard-full-row">
+                      Refresh interval
+                      <select
+                        value={String(form.config.poll_interval_ms || 2000)}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, poll_interval_ms: Number(e.target.value) } }))}
+                      >
+                        <option value="1000">1 second</option>
+                        <option value="2000">2 seconds</option>
+                        <option value="5000">5 seconds</option>
+                        <option value="10000">10 seconds</option>
+                      </select>
+                    </label>
+                    <label className="dashboard-pie-option">
+                      <input
+                        type="checkbox"
+                        checked={form.config.include_config_outbox !== false}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, include_config_outbox: e.target.checked } }))}
+                      />
+                      <span className="dashboard-pie-option-label">Show config outbox counters</span>
+                    </label>
+                    <label className="dashboard-pie-option">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(form.config.include_telemetry_v1)}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, include_telemetry_v1: e.target.checked } }))}
+                      />
+                      <span className="dashboard-pie-option-label">Show legacy telemetry-v1 counters</span>
+                    </label>
+                  </>
                 ) : null}
               </div>
             )}

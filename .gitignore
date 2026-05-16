@@ -32,3 +32,12 @@ node_modules/
 .tmp*
 playwright-cloud.png
 Trustnode_edge_app/client_page_tests/diagnostics/output/
+
+# --- Local secrets (never pushed) ---
+# .env stays per-machine and holds Supabase / cloud DB credentials, edge
+# admin passwords, etc. Anything in .env.local is also ignored so
+# operators can split global vs machine-specific overrides.
+.env
+.env.*
+!.env.example
+!.env.template

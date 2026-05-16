@@ -10664,11 +10664,21 @@ const getGatewayHealth = (gateway) => {
         : isFileSink
           ? `file:${filePath}`
         : `${host}:${port}`;
-    if (!dbTestResult?.ok || dbTestResult.tested_for !== testedFor) {
+    const existingRow = editingDbId ? dbConnections.find((c) => c.id === editingDbId) : null;
+    const identityUnchanged = Boolean(
+      existingRow &&
+      existingRow.engine === dbForm.engine &&
+      String(existingRow.host || "") === host &&
+      Number(existingRow.port || 0) === port &&
+      String(existingRow.sqlite_path || "") === sqlitePath &&
+      String(existingRow.file_path || "") === filePath &&
+      String(existingRow.legacy_url || "") === dbForm.legacy_url.trim()
+    );
+    if (!identityUnchanged && (!dbTestResult?.ok || dbTestResult.tested_for !== testedFor)) {
       setDbTestResult({ ok: false, message: "Run a successful test for current connection before saving." });
       return;
     }
-    const finalizeSave = (provisionMsg = "") => {
+    const finalizeSave = async (provisionMsg = "") => {
       const next = {
         id: editingDbId || `db-${Date.now()}`,
         name,
@@ -10696,14 +10706,29 @@ const getGatewayHealth = (gateway) => {
         table: dbForm.table.trim() || "plc_readings",
         tls: Boolean(dbForm.tls),
         connection_ok: true,
-        last_test: provisionMsg ? `${dbTestResult.message} | ${provisionMsg}` : dbTestResult.message,
+        last_test: provisionMsg
+          ? `${dbTestResult?.message || existingRow?.last_test || "ok"} | ${provisionMsg}`
+          : (dbTestResult?.message || existingRow?.last_test || "ok"),
         last_check_utc: tsNow()
       };
-      setDbConnections((prev) => {
-        if (editingDbId) return prev.map((c) => (c.id === editingDbId ? next : c));
-        return [...prev, next];
-      });
-      setShowDbModal(false);
+      const prevConns = dbConnections;
+      const newConns = editingDbId
+        ? prevConns.map((c) => (c.id === editingDbId ? next : c))
+        : [...prevConns, next];
+      setDbConnections(newConns);
+      try {
+        const payload = { ...buildAppStorePayload(), database_configurations: newConns };
+        await saveAppStoreBootstrap(payload, currentUser?.username || "system");
+        try {
+          appStoreLastPersistSignatureRef.current = JSON.stringify(payload);
+        } catch (_) {
+          appStoreLastPersistSignatureRef.current = "";
+        }
+        setShowDbModal(false);
+      } catch (err) {
+        setDbConnections(prevConns);
+        setDbTestResult({ ok: false, message: `Save failed: ${String(err)}` });
+      }
     };
 
     const needsProvision =
@@ -10737,7 +10762,7 @@ const getGatewayHealth = (gateway) => {
           setDbTestResult({ ok: false, message: provision.message });
           return;
         }
-        finalizeSave(provision.message);
+        await finalizeSave(provision.message);
       } catch (err) {
         setDbTestResult({ ok: false, message: String(err) });
       } finally {
@@ -10754,7 +10779,23 @@ const getGatewayHealth = (gateway) => {
     withConfirm(
       "Delete Database Connection",
       "Are you sure you want to delete this database connection?",
-      () => setDbConnections((prev) => prev.filter((c) => c.id !== dbId))
+      async () => {
+        const prevConns = dbConnections;
+        const newConns = prevConns.filter((c) => c.id !== dbId);
+        setDbConnections(newConns);
+        try {
+          const payload = { ...buildAppStorePayload(), database_configurations: newConns };
+          await saveAppStoreBootstrap(payload, currentUser?.username || "system");
+          try {
+            appStoreLastPersistSignatureRef.current = JSON.stringify(payload);
+          } catch (_) {
+            appStoreLastPersistSignatureRef.current = "";
+          }
+        } catch (err) {
+          setDbConnections(prevConns);
+          setError(`Failed to delete database connection: ${String(err)}`);
+        }
+      }
     );
   };
 
@@ -20135,7 +20176,7 @@ const getGatewayHealth = (gateway) => {
                 {dbTestBusy ? "Testing..." : "Test Connection"}
               </button>
               <button className="btn btn-primary" onClick={saveDbConnection} disabled={!canEditPage("database") || dbProvisionBusy}>
-                {dbProvisionBusy ? "Provisioning..." : "OK"}
+                {dbProvisionBusy ? "Provisioning..." : "Save"}
               </button>
               <button className="btn btn-danger" onClick={() => setShowDbModal(false)}>
                 Cancel

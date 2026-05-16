@@ -721,19 +721,39 @@ class AppStore:
                 )
 
     def _get_cloud_database_target(self) -> Dict[str, Any] | None:
+        # Walk both the unscoped doc and every scoped doc — the sync worker
+        # has no request context to pick a scope key, so it must consider all
+        # writers. The UI always saves under the active scope, so the unscoped
+        # doc is often empty/stale.
+        payloads: list[list] = []
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute(
                     "SELECT payload_json FROM config_documents WHERE domain = ?",
                     ("database_configurations",),
                 ).fetchone()
-        if not row:
-            return None
-        try:
-            payload = json.loads(str(row["payload_json"] or "[]"))
-        except Exception:
-            return None
-        if not isinstance(payload, list):
+                if row:
+                    try:
+                        p = json.loads(str(row["payload_json"] or "[]"))
+                        if isinstance(p, list):
+                            payloads.append(p)
+                    except Exception:
+                        pass
+                try:
+                    scoped_rows = conn.execute(
+                        "SELECT payload_json, updated_utc FROM config_documents_scoped WHERE domain = ? ORDER BY updated_utc DESC",
+                        ("database_configurations",),
+                    ).fetchall()
+                except Exception:
+                    scoped_rows = []
+                for srow in scoped_rows:
+                    try:
+                        p = json.loads(str(srow["payload_json"] or "[]"))
+                        if isinstance(p, list):
+                            payloads.append(p)
+                    except Exception:
+                        continue
+        if not payloads:
             return None
 
         def _is_enabled(item: Dict[str, Any]) -> bool:
@@ -741,8 +761,21 @@ class AppStore:
                 return bool(item.get("enabled"))
             return True
 
+        merged: list[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for payload in payloads:
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("id") or "")
+                if key and key in seen_ids:
+                    continue
+                if key:
+                    seen_ids.add(key)
+                merged.append(item)
+
         candidates: list[Dict[str, Any]] = []
-        for item in payload:
+        for item in merged:
             if not isinstance(item, dict):
                 continue
             engine = str(item.get("engine") or "").strip().lower()

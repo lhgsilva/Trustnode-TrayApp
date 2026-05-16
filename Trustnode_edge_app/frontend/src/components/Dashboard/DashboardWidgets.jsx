@@ -26,6 +26,7 @@ import {
   getTagSeries as getTagSeriesFiltered,
   toTsMs,
 } from "./dashboardAnalytics";
+import CloudSyncStatusWidget from "./CloudSyncStatusWidget";
 
 const LAST_WIDGET_DIRECT_STATS_CACHE = new Map();
 const LAST_WIDGET_RULE_STATS_CACHE = new Map();
@@ -2694,6 +2695,8 @@ export function DashboardWidgetCard({
           ) : renderEmpty("Set camera URL")}
         </div>
       );
+    case "cloud_sync_status":
+      return <CloudSyncStatusWidget widget={widget} />;
     default:
       return renderEmpty("Unsupported widget");
   }
