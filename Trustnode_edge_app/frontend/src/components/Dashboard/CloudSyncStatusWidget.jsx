@@ -15,6 +15,27 @@ import { getCloudSyncStatus } from "../../api";
 const DEFAULT_POLL_MS = 2000;
 const DEFAULT_HISTORY_SEC = 300;
 
+// When the widget is loaded from the hosted client view (browser hitting the
+// VPS, no local Electron), the /sync/status endpoint reports the VPS's view
+// of sync state — which is empty, because the edge runs the sync worker, not
+// the VPS. Detect this so we can show a friendlier "monitor on the edge"
+// message instead of misleading 0/0/never numbers.
+function detectHostedClientView() {
+  try {
+    if (typeof window === "undefined") return false;
+    const ua = String(window.navigator?.userAgent || "");
+    if (/electron/i.test(ua)) return false;
+    const proto = String(window.location?.protocol || "");
+    if (proto !== "http:" && proto !== "https:") return false;
+    const host = String(window.location?.hostname || "").toLowerCase();
+    if (!host) return false;
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1") return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function fmtNum(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return "0";
@@ -190,6 +211,36 @@ export function CloudSyncStatusWidget({ widget }) {
   const includeConfigOutbox = cfg.include_config_outbox !== false;
   const includeTelemetryV1 = Boolean(cfg.include_telemetry_v1);
   const accent = String(widget?.color || cfg.accent_color || "#14a89a");
+  const isHosted = useMemo(() => detectHostedClientView(), []);
+
+  // The hosted client view talks to the VPS, which doesn't run the sync
+  // worker (the edge does). Showing live throughput here is meaningless,
+  // so render a clear placeholder instead of misleading 0/0/never numbers.
+  if (isHosted) {
+    return (
+      <div className="dashboard-widget-block dashboard-csync-widget">
+        <div className="dashboard-csync-head">
+          <div className="dashboard-csync-pill dashboard-csync-pill-muted">
+            <span className="dashboard-csync-pill-dot" />
+            <span className="dashboard-csync-pill-text">EDGE-ONLY METRIC</span>
+          </div>
+        </div>
+        <div className="dashboard-csync-body" style={{ alignItems: "center", justifyContent: "center", textAlign: "center", padding: "8px 12px" }}>
+          <div style={{ maxWidth: 460 }}>
+            <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
+              Cloud Sync Status is reported by the edge.
+            </div>
+            <div style={{ fontSize: 12, color: "var(--muted, #8a98ab)", lineHeight: 1.5 }}>
+              The edge device pushes historian rows to the cloud database.
+              The web/remote view reads that database directly — there is no
+              backlog at this layer. Open the TrustNode desktop app on the
+              edge machine to see backlog drain, throughput, and last sync.
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const [snap, setSnap] = useState(null);
   const [err, setErr] = useState("");

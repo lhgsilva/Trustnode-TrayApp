@@ -39,6 +39,17 @@ class AppStore:
         self._cloud_engine_lock = threading.Lock()
         self._cloud_schema_ready_keys: set[str] = set()
         self._cloud_engine_cache: dict[str, Any] = {}
+        # 17 different code paths call _get_cloud_database_target on every
+        # request; without a cache the lookup ran two SQL queries under the
+        # global lock for every /api/* call and serialized the backend under
+        # load (cloud client view spam-polling). Cache for 5 s.
+        self._cloud_target_cache_lock = threading.Lock()
+        self._cloud_target_cache_value: Dict[str, Any] | None = None
+        self._cloud_target_cache_ts: float = 0.0
+        self._cloud_target_cache_ttl: float = max(
+            1.0,
+            float(os.environ.get("TRUSTNODE_CLOUD_TARGET_CACHE_SECONDS", "5") or "5"),
+        )
         self._db_path = self._resolve_db_path()
         self._stop_event = threading.Event()
         self._sync_wakeup_event = threading.Event()
@@ -720,7 +731,23 @@ class AppStore:
                     (cfg_json, 1 if enabled else 0, last_sync_utc, last_error, now),
                 )
 
+    def _invalidate_cloud_target_cache(self) -> None:
+        with self._cloud_target_cache_lock:
+            self._cloud_target_cache_value = None
+            self._cloud_target_cache_ts = 0.0
+
     def _get_cloud_database_target(self) -> Dict[str, Any] | None:
+        # Cache the resolved target for a few seconds. The function reads two
+        # SQL tables under the global lock; calling it on every API request
+        # serializes the whole backend under load.
+        now = time.time()
+        with self._cloud_target_cache_lock:
+            if self._cloud_target_cache_ts > 0 and (now - self._cloud_target_cache_ts) < self._cloud_target_cache_ttl:
+                cached = self._cloud_target_cache_value
+                if cached is not None:
+                    return dict(cached)
+                # Negative result was cached — return None without re-hitting DB.
+                return None
         # Walk both the unscoped doc and every scoped doc — the sync worker
         # has no request context to pick a scope key, so it must consider all
         # writers. The UI always saves under the active scope, so the unscoped
@@ -754,6 +781,9 @@ class AppStore:
                     except Exception:
                         continue
         if not payloads:
+            with self._cloud_target_cache_lock:
+                self._cloud_target_cache_value = None
+                self._cloud_target_cache_ts = now
             return None
 
         def _is_enabled(item: Dict[str, Any]) -> bool:
@@ -808,9 +838,16 @@ class AppStore:
                 }
             )
         if not candidates:
+            with self._cloud_target_cache_lock:
+                self._cloud_target_cache_value = None
+                self._cloud_target_cache_ts = now
             return None
         supabase = [c for c in candidates if "supabase.co" in c["host"].lower()]
-        return supabase[0] if supabase else candidates[0]
+        chosen = supabase[0] if supabase else candidates[0]
+        with self._cloud_target_cache_lock:
+            self._cloud_target_cache_value = dict(chosen)
+            self._cloud_target_cache_ts = now
+        return chosen
 
     def _get_app_settings(self) -> Dict[str, Any]:
         with self._lock:
@@ -4216,6 +4253,8 @@ class AppStore:
                             (domain, domain, payload_json, now, now),
                         )
         self._sync_wakeup_event.set()
+        if domain == "database_configurations":
+            self._invalidate_cloud_target_cache()
         return {"domain": domain, "tenant_id": self._current_tenant_id(), "version": new_version, "updated_utc": now}
 
     def upsert_domain_scoped(self, scope_key: str, domain: str, payload: Any, actor: str = "system") -> Dict[str, Any]:
@@ -4278,6 +4317,8 @@ class AppStore:
                     """,
                     (f"{domain_name}#{skey}", actor, old_version if old_version > 0 else None, new_version, now),
                 )
+        if domain_name == "database_configurations":
+            self._invalidate_cloud_target_cache()
         return {
             "domain": domain_name,
             "scope_key": skey,
