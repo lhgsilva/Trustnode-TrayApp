@@ -401,81 +401,238 @@ main {
 }
 
 /* ============================================================
-   Login
+   Login — mirrors the Electron edge Login.css. Same auth-card shape,
+   icon-prefixed inputs, password eye toggle, gradient submit button.
+   No Activate tab (Lite viewers don't activate edges).
    ============================================================ */
-.login-shell {
+.login-container {
   min-height: 100vh;
   min-height: 100dvh;
-  display: grid;
-  place-items: center;
-  padding: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
   background: var(--bg);
 }
-.login-card {
+.auth-card {
   width: 100%;
-  max-width: 380px;
+  max-width: 480px;
   background: var(--card);
   border: 1px solid var(--stroke);
-  border-radius: var(--radius-lg);
-  padding: 28px 24px 22px;
-  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 12px 32px rgba(15, 23, 42, 0.08);
+  border-radius: 24px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  position: relative;
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.06),
+    0 24px 60px -24px rgba(14, 17, 22, 0.20),
+    0 4px 14px -6px rgba(14, 17, 22, 0.10);
 }
-.login-card .brand-stack {
+[data-theme="dark"] .auth-card {
+  box-shadow:
+    0 22px 46px -20px rgba(0, 0, 0, 0.65),
+    0 8px 22px -10px rgba(0, 0, 0, 0.5);
+}
+.theme-toggle-btn {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 36px;
+  height: 36px;
+  background: none;
+  border: 0;
+  color: var(--soft);
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  transition: color 0.2s, background 0.2s;
+}
+.theme-toggle-btn:hover { color: var(--teal); background: var(--card-2); }
+
+.auth-brand {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 18px;
+  gap: 4px;
+  margin: 8px 0 4px;
 }
-.login-card .brand-stack img {
-  height: 56px;
+.auth-logo {
+  width: 280px;
+  max-width: 70%;
+  height: auto;
+  max-height: 110px;
   object-fit: contain;
-}
-.login-card h2 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 700;
-  text-align: center;
-}
-.login-card .subtitle {
-  font-size: 12px;
-  color: var(--muted);
-  text-align: center;
-  margin-bottom: 8px;
-}
-.login-card label {
   display: block;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--muted);
-  margin: 10px 0 4px;
 }
-.login-card input {
+.auth-subtitle {
+  text-align: center;
+  font-size: 12px;
+  color: var(--soft);
+  margin: -4px 0 14px;
+}
+
+/* Form labels */
+.auth-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.auth-card label > span {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* Inputs (with icon prefix) */
+.auth-card .input-wrapper,
+.auth-card .pw-input-wrap {
+  position: relative;
+}
+.auth-card .field-icon {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  color: var(--soft);
+  z-index: 2;
+}
+.auth-card .field-icon svg {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  stroke-width: 2;
+}
+.auth-card input {
   width: 100%;
-  padding: 11px 12px;
+  padding: 10px 14px 10px 44px;
   background: var(--card-2);
   color: var(--text);
   border: 1px solid var(--stroke);
-  border-radius: var(--radius-sm);
+  border-radius: 12px;
   font: inherit;
+  font-size: 14px;
+  height: 44px;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
 }
-.login-card input:focus {
-  outline: 2px solid var(--teal);
-  outline-offset: 1px;
+.auth-card .pw-input-wrap input { padding-right: 44px; }
+.auth-card input::placeholder { color: var(--soft); }
+.auth-card input:focus {
+  outline: none;
   border-color: var(--teal);
+  background: var(--card);
+  box-shadow: 0 0 0 4px rgba(20, 168, 154, 0.18);
 }
-.login-card .err {
+
+/* Password header (label + Forgot link on the same line) */
+.auth-card .pw-field-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0;
+}
+.auth-card .pw-field-header span {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.forgot-link {
+  background: none;
+  border: 0;
+  color: var(--brand-strong);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0;
+}
+.forgot-link:hover { text-decoration: underline; }
+
+.pw-icon-btn {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: var(--soft);
+  cursor: pointer;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 4;
+}
+.pw-icon-btn:hover { color: var(--teal); }
+.pw-icon-btn svg { width: 16px; height: 16px; }
+
+.auth-error {
   color: var(--danger);
   font-size: 12px;
-  margin: 8px 0 0;
   min-height: 18px;
+  margin-top: -4px;
 }
-.login-card .magic-link {
-  display: block;
-  text-align: center;
-  margin-top: 10px;
+.auth-error.auth-info { color: var(--brand-strong); }
+
+/* Gradient sign-in button — same family as the edge's btn-primary on
+   the login. Overrides the dashboard-style btn we already have. */
+.auth-card .btn-primary.auth-submit {
+  width: 100%;
+  height: 46px;
+  padding: 0 16px;
+  border-radius: 12px;
+  background: linear-gradient(90deg, var(--brand) 0%, var(--brand-strong) 100%);
+  border: 1px solid var(--brand-strong);
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 700;
+  box-shadow:
+    0 12px 28px -14px rgba(31, 58, 95, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  margin-top: 6px;
+  cursor: pointer;
+  transition: transform 0.15s ease, filter 0.2s ease, box-shadow 0.2s ease;
+}
+.auth-card .btn-primary.auth-submit:hover:not(:disabled) {
+  transform: translateY(-1px);
+  filter: brightness(1.06);
+}
+.auth-card .btn-primary.auth-submit:active:not(:disabled) {
+  transform: translateY(0);
+}
+.auth-card .btn-primary.auth-submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* Magic-link "ghost" footer button (replaces the old <a class=magic-link>). */
+.btn-ghost-link {
+  background: none;
+  border: 0;
+  color: var(--brand-strong);
   font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 6px;
+  margin: 4px auto 0;
+  display: block;
 }
+.btn-ghost-link:hover { text-decoration: underline; }
 
 /* ============================================================
    Buttons — same family as the edge app's buttons.css

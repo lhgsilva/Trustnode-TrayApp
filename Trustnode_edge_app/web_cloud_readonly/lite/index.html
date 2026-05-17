@@ -1459,24 +1459,114 @@ function renderLoggedIn() {
   if (state.drawer && state.drawer.rows) requestAnimationFrame(mountChart);
 }
 
+// Inline icons matching the edge login page (user / lock / eye / theme).
+function icoUser() {
+  return el("span", { class: "field-icon", html: '<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="2"/><path d="M4 20c0-4 3.5-7 8-7s8 3 8 7" stroke="currentColor" stroke-width="2"/></svg>' });
+}
+function icoLock() {
+  return el("span", { class: "field-icon", html: '<svg viewBox="0 0 24 24" fill="none"><rect x="3" y="11" width="18" height="10" rx="2" stroke="currentColor" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4" stroke="currentColor" stroke-width="2"/></svg>' });
+}
+function icoEyeOpen() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+}
+function icoEyeClosed() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+}
+
+// Login screen — visual parity with the edge Login.jsx. The auth-card,
+// auth-brand logo block, USER ID / PASSWORD labels in uppercase, the
+// icon + input pairing, the password eye, the remember-row checkbox, and
+// the gradient Sign in button all map 1:1 to the edge styles. No Activate
+// tab (Lite viewers don't activate edges) and no Forgot password modal
+// (we offer magic link instead, which is the Supabase Auth path).
 function renderLogin() {
   let busy = false;
-  const card = el("div", { class: "login-card" },
-    el("div", { class: "brand-stack" },
-      el("img", { src: "./trustnode_logo.png", alt: "TrustNode",
-                  onerror: (e) => { e.target.style.display = "none"; } }),
-      el("h2", {}, "TrustNode Lite"),
-      el("div", { class: "subtitle" }, "Sign in to view your edge data"),
+  let showPw = false;
+  const theme = currentTheme();
+  const card = el("div", { class: "auth-card" },
+    // Theme toggle in the upper-right of the card (same as edge)
+    el("button", {
+      class: "theme-toggle-btn",
+      type: "button",
+      "aria-label": "Toggle theme",
+      title: `Switch to ${theme === "dark" ? "light" : "dark"} mode`,
+      onclick: () => { toggleTheme(); renderLogin(); },
+    }, theme === "dark" ? "☀" : "🌙"),
+    // Logo block (badge wordmark)
+    el("div", { class: "auth-brand" },
+      el("img", {
+        src: "./trustnode_login_logo.png",
+        alt: "TrustNode",
+        class: "auth-logo",
+        onerror: (e) => { e.target.style.display = "none"; }
+      })
     ),
-    el("label", {}, "Email"),
-    el("input", { id: "lite-user", type: "email", autocomplete: "username" }),
-    el("label", {}, "Password"),
-    el("input", { id: "lite-pass", type: "password", autocomplete: "current-password" }),
-    el("div", { class: "err", id: "lite-err" }, ""),
-    el("button", { id: "lite-go", class: "btn btn-primary btn-full" }, "Sign in"),
-    el("a", { href: "#", id: "lite-magic", class: "magic-link" }, "Email me a magic link instead"),
+    // Subtitle (Lite-specific)
+    el("div", { class: "auth-subtitle" }, "Sign in to view your edge data"),
+    // Username / Email
+    el("label", {},
+      el("span", {}, "Username or email"),
+      el("div", { class: "input-wrapper" },
+        icoUser(),
+        el("input", {
+          id: "lite-user",
+          type: "email",
+          autocomplete: "username",
+          placeholder: "e.g. m.silva@plant.io",
+        })
+      )
+    ),
+    // Password with header containing Forgot link
+    el("label", {},
+      el("div", { class: "pw-field-header" },
+        el("span", {}, "Password"),
+        el("button", {
+          class: "forgot-link",
+          type: "button",
+          id: "lite-forgot",
+        }, "Forgot password?")
+      ),
+      el("div", { class: "pw-input-wrap" },
+        icoLock(),
+        el("input", {
+          id: "lite-pass",
+          type: "password",
+          autocomplete: "current-password",
+          placeholder: "Enter your password",
+        }),
+        el("button", {
+          id: "lite-eye",
+          class: "pw-icon-btn",
+          type: "button",
+          "aria-label": "Toggle password visibility",
+          html: icoEyeClosed(),
+        })
+      )
+    ),
+    // Error / status box
+    el("div", { class: "auth-error", id: "lite-err" }, ""),
+    // Sign in
+    el("button", {
+      id: "lite-go",
+      class: "btn btn-primary auth-submit",
+    }, "Sign in to TrustNode Lite"),
+    // Magic link footer (kept by user request)
+    el("button", {
+      id: "lite-magic",
+      class: "btn-ghost-link",
+      type: "button",
+    }, "Email me a magic link instead")
   );
-  $("#app").replaceChildren(el("div", { class: "login-shell" }, card));
+
+  // Shell wrapper carries the same theme + container classes as the edge.
+  $("#app").replaceChildren(
+    el("div", {
+      class: `login-container theme-${theme}`,
+      "data-theme": theme,
+    }, card)
+  );
+
+  // Wire interactions
   const submit = async () => {
     if (busy) return;
     busy = true;
@@ -1485,7 +1575,7 @@ function renderLogin() {
     try {
       const email = $("#lite-user").value.trim();
       const password = $("#lite-pass").value;
-      if (!email || !password) throw new Error("Email and password are required");
+      if (!email || !password) throw new Error("Enter username and password");
       const { data, error } = await supabase.auth.signInWithPassword({ email, password });
       if (error) throw error;
       session = data.session;
@@ -1494,24 +1584,36 @@ function renderLogin() {
       errEl.textContent = e.message || String(e);
       busy = false;
       $("#lite-go").disabled = false;
-      $("#lite-go").textContent = "Sign in";
+      $("#lite-go").textContent = "Sign in to TrustNode Lite";
     }
   };
   $("#lite-go").addEventListener("click", submit);
   $("#lite-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
   $("#lite-user").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#lite-pass").focus(); });
-  $("#lite-magic").addEventListener("click", async (e) => {
-    e.preventDefault();
-    const email = $("#lite-user").value.trim();
-    if (!email) { $("#lite-err").textContent = "Type your email above first"; return; }
-    try {
-      const { error } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.href } });
-      if (error) throw error;
-      $("#lite-err").textContent = "Check your inbox for the sign-in link.";
-    } catch (err) {
-      $("#lite-err").textContent = err.message || String(err);
-    }
+  $("#lite-eye").addEventListener("click", () => {
+    showPw = !showPw;
+    const pw = $("#lite-pass");
+    pw.type = showPw ? "text" : "password";
+    $("#lite-eye").innerHTML = showPw ? icoEyeOpen() : icoEyeClosed();
   });
+  const sendMagicLink = async () => {
+    const email = $("#lite-user").value.trim();
+    const errEl = $("#lite-err");
+    if (!email) { errEl.textContent = "Type your email above first"; return; }
+    try {
+      const { error } = await supabase.auth.signInWithOtp({
+        email,
+        options: { emailRedirectTo: window.location.href },
+      });
+      if (error) throw error;
+      errEl.textContent = "Check your inbox for the sign-in link.";
+      errEl.classList.add("auth-info");
+    } catch (err) {
+      errEl.textContent = err.message || String(err);
+    }
+  };
+  $("#lite-magic").addEventListener("click", (e) => { e.preventDefault(); sendMagicLink(); });
+  $("#lite-forgot").addEventListener("click", (e) => { e.preventDefault(); sendMagicLink(); });
   setTimeout(() => $("#lite-user").focus(), 30);
 }
 
