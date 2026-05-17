@@ -9,36 +9,58 @@
   <meta name="apple-mobile-web-app-title" content="TrustNode" />
   <title>TrustNode Lite</title>
   <link rel="manifest" href="./manifest.json" />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23111'/%3E%3Ctext x='32' y='42' text-anchor='middle' font-family='Arial' font-weight='bold' font-size='28' fill='%2314a89a'%3ETN%3C/text%3E%3C/svg%3E" />
-  <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' rx='40' fill='%23111'/%3E%3Ctext x='90' y='118' text-anchor='middle' font-family='Arial' font-weight='bold' font-size='80' fill='%2314a89a'%3ETN%3C/text%3E%3C/svg%3E" />
+  <link rel="icon" href="./trustnode_app_icon.png" type="image/png" />
+  <link rel="apple-touch-icon" href="./trustnode_app_icon_180.png" />
   <link rel="stylesheet" href="./styles.css" />
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css" />
+
+  <!-- Import map so all React + Recharts modules resolve via esm.sh. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "react": "https://esm.sh/react@18.3.1",
+      "react-dom": "https://esm.sh/react-dom@18.3.1",
+      "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+      "recharts": "https://esm.sh/recharts@2.13.3?deps=react@18.3.1",
+      "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.45.4"
+    }
+  }
+  </script>
 </head>
 <body>
   <div id="app">
     <div class="empty" style="margin-top: 30vh"><div class="spinner"></div> loading…</div>
   </div>
-  <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js" defer></script>
   <script type="module">
-import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm";
+import React, { useEffect, useMemo, useRef, useState, useCallback, createElement as h } from "react";
+import { createRoot } from "react-dom/client";
+import { createClient } from "@supabase/supabase-js";
+import {
+  ResponsiveContainer, LineChart, AreaChart, BarChart, ComposedChart,
+  PieChart, Pie, Cell,
+  Line, Area, Bar, CartesianGrid, XAxis, YAxis, Tooltip, Legend,
+} from "recharts";
 
-// ---------- Tiny DOM utilities --------------------------------------------
-const $ = (sel, root = document) => root.querySelector(sel);
-const el = (tag, props = {}, ...children) => {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (k === "class") node.className = v;
-    else if (k === "style" && typeof v === "object") Object.assign(node.style, v);
-    else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2).toLowerCase(), v);
-    else if (k === "html") node.innerHTML = v;
-    else if (v !== undefined && v !== null && v !== false) node.setAttribute(k, v);
+// ============================================================
+// Config + Supabase client (loaded once at boot)
+// ============================================================
+let cfg = null;
+let supabase = null;
+
+async function loadConfig() {
+  const res = await fetch("./config.json", { cache: "no-cache" });
+  if (!res.ok) throw new Error(`config.json HTTP ${res.status}`);
+  cfg = await res.json();
+  if (!cfg?.supabase_url || !cfg?.supabase_anon_key) {
+    throw new Error("config.json is missing supabase_url or supabase_anon_key");
   }
-  for (const c of children) {
-    if (c == null || c === false) continue;
-    node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  }
-  return node;
-};
+  supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key, {
+    auth: { persistSession: true, storageKey: "tnlite-auth", autoRefreshToken: true },
+  });
+}
+
+// ============================================================
+// Utilities
+// ============================================================
 const fmtAge = (iso) => {
   if (!iso) return "never";
   const t = Date.parse(iso);
@@ -70,419 +92,186 @@ const freshnessClass = (ts) => {
   if (age < 60_000) return "stale";
   return "bad";
 };
+const SKIPPED_TYPES = new Set(["ip_camera", "cloud_sync_status"]);
 
-// ---------- Config + Supabase client --------------------------------------
-let cfg = null;
-let supabase = null;
-let session = null;
-
-async function loadConfig() {
+// Theme helpers (write to <html data-theme=...>; persist in localStorage)
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  try { localStorage.setItem("trustnode_lite_theme", theme); } catch (_) {}
+}
+function readTheme() {
   try {
-    const res = await fetch("./config.json", { cache: "no-cache" });
-    if (!res.ok) throw new Error(`config.json HTTP ${res.status}`);
-    cfg = await res.json();
-  } catch (e) {
-    cfg = null;
-    throw new Error(`Could not load config.json: ${e.message || e}`);
-  }
-  if (!cfg?.supabase_url || !cfg?.supabase_anon_key) {
-    throw new Error("config.json is missing supabase_url or supabase_anon_key");
-  }
-  supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key, {
-    auth: { persistSession: true, storageKey: "tnlite-auth", autoRefreshToken: true },
-  });
-  const { data } = await supabase.auth.getSession();
-  session = data.session || null;
+    const s = localStorage.getItem("trustnode_lite_theme");
+    if (s === "light" || s === "dark") return s;
+  } catch (_) {}
+  return "light";
 }
 
-// ---------- State ----------------------------------------------------------
-const state = {
-  tab: "dashboard",
-  tenantLabel: "",
-  userEmail: "",
-  edges: [],            // list of edge ids the viewer can see (currently a placeholder; multi-edge wiring TBD)
-  selectedEdge: "",     // "" = all edges
-  liveRows: [],
-  liveAt: 0,
-  liveError: "",
-  historyRows: [],
-  historyError: "",
-  alarmRows: [],
-  alarmError: "",
-  powerRows: [],
-  powerError: "",
-  dashboardWidgets: [],
-  dashboardLayout: null,    // full payload incl. mode, per_row, tag_colors
-  dashboardError: "",
-  // All available widget profiles (one per dashboard_configurations row the
-  // viewer is allowed to read). Populated by fetchDashboardConfig.
-  dashboardProfiles: [],
-  // Which profile is active. Restored from localStorage on boot. If empty
-  // the renderer picks the freshest row.
-  activeProfileKey: (() => { try { return localStorage.getItem("tnlite-profile") || ""; } catch (_) { return ""; } })(),
-  // Per-viewer dashboard preferences. Saved in localStorage so the choice
-  // survives a page reload.
-  dashPrefs: (() => {
-    try {
-      const raw = localStorage.getItem("tnlite-dash-prefs");
-      if (raw) return JSON.parse(raw);
-    } catch (_) {}
-    return { perRow: 2, cardHeight: 220, sampleCount: 20 };
-  })(),
-  // Per-gateway last-seen timestamp (ms) so the dashboard knows which
-  // gateways are online and which charts to refresh. Populated from
-  // state.liveRows on every fetch.
-  gatewayLastSeen: {},
-  drawer: null, // { gateway_id, tag_name, range_ms, rows, loading, error }
-  // Latency telemetry, surfaced in the header overlay.
-  latency: {
-    transport: "polling",    // "realtime" | "polling"
-    last_rtt_ms: null,        // most recent PostgREST request round-trip
-    last_age_ms: null,        // newest row age vs local clock at last refresh
-    last_event_at: 0,         // wall clock when last update arrived
-  },
-};
+// ============================================================
+// Inline SVG icons (header / nav / login)
+// ============================================================
+const SVG = (paths, w = 16) =>
+  h("svg", { width: w, height: w, viewBox: "0 0 24 24", fill: "none",
+             stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round" },
+    paths);
+const icBell    = () => SVG([h("path", { key: 1, d: "M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" }),
+                              h("path", { key: 2, d: "M10.3 21a1.94 1.94 0 0 0 3.4 0" })]);
+const icRefresh = () => SVG([h("polyline", { key: 1, points: "23 4 23 10 17 10" }),
+                              h("polyline", { key: 2, points: "1 20 1 14 7 14" }),
+                              h("path", { key: 3, d: "M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" })]);
+const icSun     = () => SVG([h("circle", { key: 1, cx: 12, cy: 12, r: 4 }),
+                              h("path", { key: 2, d: "M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" })]);
+const icMoon    = () => SVG([h("path", { key: 1, d: "M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" })]);
+const icSignOut = () => SVG([h("path", { key: 1, d: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" }),
+                              h("polyline", { key: 2, points: "16 17 21 12 16 7" }),
+                              h("line", { key: 3, x1: 21, y1: 12, x2: 9, y2: 12 })]);
+const icUser    = () => SVG([h("circle", { key: 1, cx: 12, cy: 8, r: 4 }),
+                              h("path", { key: 2, d: "M4 20c0-4 3.5-7 8-7s8 3 8 7" })]);
+const icLock    = () => SVG([h("rect", { key: 1, x: 3, y: 11, width: 18, height: 10, rx: 2 }),
+                              h("path", { key: 2, d: "M7 11V7a5 5 0 0 1 10 0v4" })]);
+const icEyeOpen = () => SVG([h("path", { key: 1, d: "M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z" }),
+                              h("circle", { key: 2, cx: 12, cy: 12, r: 3 })]);
+const icEyeClosed = () => SVG([h("path", { key: 1, d: "M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" }),
+                                h("line", { key: 2, x1: 1, y1: 1, x2: 23, y2: 23 })]);
 
-let livePoll = null;
-let historyPoll = null;
-let alarmsPoll = null;
-let powerPoll = null;
-let liveChannel = null;       // Supabase Realtime channel for live_latest
-let alarmChannel = null;      // Supabase Realtime channel for app_logs
-let headerRefreshTick = null; // 1 Hz tick so the latency overlay stays fresh
+// Nav icons (size 14)
+const icLive = () => SVG([h("circle", { key: 1, cx: 12, cy: 12, r: 10 }),
+                           h("circle", { key: 2, cx: 12, cy: 12, r: 3, fill: "currentColor" })], 14);
+const icGrid = () => SVG([h("rect", { key: 1, x: 3, y: 3, width: 7, height: 7 }),
+                           h("rect", { key: 2, x: 14, y: 3, width: 7, height: 7 }),
+                           h("rect", { key: 3, x: 14, y: 14, width: 7, height: 7 }),
+                           h("rect", { key: 4, x: 3, y: 14, width: 7, height: 7 })], 14);
+const icList = () => SVG([h("line", { key: 1, x1: 8, y1: 6, x2: 21, y2: 6 }),
+                           h("line", { key: 2, x1: 8, y1: 12, x2: 21, y2: 12 }),
+                           h("line", { key: 3, x1: 8, y1: 18, x2: 21, y2: 18 }),
+                           h("line", { key: 4, x1: 3, y1: 6, x2: 3.01, y2: 6 }),
+                           h("line", { key: 5, x1: 3, y1: 12, x2: 3.01, y2: 12 }),
+                           h("line", { key: 6, x1: 3, y1: 18, x2: 3.01, y2: 18 })], 14);
+const icBolt = () => SVG([h("polygon", { key: 1, points: "13 2 3 14 12 14 11 22 21 10 12 10 13 2" })], 14);
+const icReport = () => SVG([h("path", { key: 1, d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" }),
+                             h("polyline", { key: 2, points: "14 2 14 8 20 8" }),
+                             h("line", { key: 3, x1: 16, y1: 13, x2: 8, y2: 13 }),
+                             h("line", { key: 4, x1: 16, y1: 17, x2: 8, y2: 17 })], 14);
 
-function stopAllPolls() {
-  [livePoll, historyPoll, alarmsPoll, powerPoll].forEach((t) => t && clearInterval(t));
-  livePoll = historyPoll = alarmsPoll = powerPoll = null;
-}
+// ============================================================
+// Data hooks
+// ============================================================
+function useLiveLatest(enabled = true) {
+  const [rows, setRows] = useState([]);
+  const [error, setError] = useState("");
+  const [rtt, setRtt] = useState(null);
+  const [transport, setTransport] = useState("polling");
 
-function stopAllChannels() {
-  if (liveChannel && supabase) supabase.removeChannel(liveChannel).catch(() => {});
-  if (alarmChannel && supabase) supabase.removeChannel(alarmChannel).catch(() => {});
-  if (dashboardChannel && supabase) supabase.removeChannel(dashboardChannel).catch(() => {});
-  if (historianChannel && supabase) supabase.removeChannel(historianChannel).catch(() => {});
-  liveChannel = alarmChannel = dashboardChannel = historianChannel = null;
-  // Charts have to be re-mounted after a teardown so drop any stale refs.
-  for (const [, e] of liveCharts) { try { e.plot?.destroy?.(); } catch (_) {} }
-  liveCharts.clear();
-}
+  useEffect(() => {
+    if (!enabled) return;
+    let stopped = false;
+    let channel = null;
+    let pollTimer = null;
 
-// ---------- Data fetchers (direct Supabase) -------------------------------
-async function fetchLive() {
-  if (!supabase || !session) return;
-  const t0 = performance.now();
-  try {
-    const { data, error } = await supabase
-      .from("live_latest")
-      .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc, tenant_id")
-      .order("ts_utc", { ascending: false })
-      .limit(400);
-    if (error) throw error;
-    state.liveRows = data || [];
-    state.liveAt = Date.now();
-    state.liveError = "";
-    state.latency.last_rtt_ms = Math.round(performance.now() - t0);
-    updateLatencyAge();
-    state.latency.last_event_at = Date.now();
-    renderHeaderLatency();
-    if (state.tab === "dashboard") renderBody();
-  } catch (e) {
-    state.liveError = e.message || String(e);
-    if (state.tab === "dashboard") renderBody();
-  }
-}
+    const fetchAll = async () => {
+      const t0 = performance.now();
+      const { data, error: e } = await supabase
+        .from("live_latest")
+        .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc, tenant_id")
+        .order("ts_utc", { ascending: false })
+        .limit(400);
+      if (stopped) return;
+      if (e) { setError(e.message); return; }
+      setRows(data || []);
+      setError("");
+      setRtt(Math.round(performance.now() - t0));
+    };
 
-// Refresh state.latency.last_age_ms AND state.gatewayLastSeen from the
-// current liveRows. Pulled out so the Realtime path can call it on every
-// WS event too.
-function updateLatencyAge() {
-  const rows = state.liveRows || [];
-  let newest = 0;
-  const seen = {};
-  for (const r of rows) {
-    const t = Date.parse(r.ts_utc || 0);
-    if (Number.isFinite(t)) {
-      if (t > newest) newest = t;
-      const gid = r.gateway_id || "";
-      if (gid && (!seen[gid] || seen[gid] < t)) seen[gid] = t;
-    }
-  }
-  state.gatewayLastSeen = seen;
-  if (newest > 0) state.latency.last_age_ms = Math.max(0, Date.now() - newest);
-}
-
-// Is a gateway "online" right now? Anything seen within 30s counts.
-function isGatewayOnline(gatewayId) {
-  const t = state.gatewayLastSeen?.[gatewayId];
-  return !!t && (Date.now() - t) < 30_000;
-}
-
-// Surgically update the KPI/tile DOM for one (gateway, tag) pair without
-// blowing away the rest of the dashboard. The data-* attributes set by
-// renderWidget / renderLive let us find the targets.
-function patchLiveTiles(row) {
-  if (!row || !row.tag_name) return;
-  const gw = row.gateway_id || "";
-  const tag = row.tag_name || "";
-  const value = row.value;
-  const ts = row.ts_utc || "";
-  const freshCls = freshnessClass(ts);
-  // 1) Live tiles (the section below the dashboard)
-  const tileSel = `.tile[data-gw="${cssEscape(gw)}"][data-tag="${cssEscape(tag)}"]`;
-  document.querySelectorAll(tileSel).forEach((tile) => {
-    tile.classList.remove("fresh", "stale", "bad");
-    tile.classList.add(freshCls);
-    const v = tile.querySelector(".val");  if (v) v.textContent = fmtVal(value);
-    const a = tile.querySelector(".age");  if (a) a.textContent = fmtAge(ts);
-  });
-  // 2) Dashboard widget KPIs
-  const kpiSel = `.widget[data-gw="${cssEscape(gw)}"][data-tag="${cssEscape(tag)}"] .widget-kpi`;
-  document.querySelectorAll(kpiSel).forEach((kpi) => {
-    kpi.classList.remove("fresh", "stale", "bad");
-    kpi.classList.add(freshCls);
-    const v = kpi.querySelector(".widget-value");
-    if (v) v.textContent = fmtVal(value);
-    const sub = kpi.querySelector(".widget-sub");
-    if (sub) {
-      const gwName = sub.getAttribute("data-gw-name") || gw || "—";
-      sub.textContent = `${gwName} · ${fmtAge(ts)} ago`;
-    }
-  });
-  // 3) Section meta (e.g. "33 tags · refreshed now ago")
-  document.querySelectorAll("[data-live-refreshed-at]").forEach((m) => {
-    m.textContent = `${(state.liveRows || []).length} tags · refreshed ${fmtAge(new Date(state.liveAt).toISOString())} ago`;
-  });
-}
-
-// Minimal CSS.escape polyfill — modern browsers have CSS.escape; this is
-// a safe fallback for the gateway / tag values we put into selectors.
-function cssEscape(s) {
-  s = String(s || "");
-  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") return CSS.escape(s);
-  return s.replace(/["\\\]\[#.>+~^$=*:']/g, (m) => "\\" + m);
-}
-
-// Realtime subscription for live_latest. Pushes each row update straight into
-// state.liveRows so the tile grid re-renders without polling. Records the
-// arrival latency so the header overlay shows current freshness.
-async function subscribeLive() {
-  if (!supabase || !session) return false;
-  try {
-    // First, seed the in-memory snapshot via one REST call so tiles render
-    // immediately on tab switch instead of waiting for the first WS event.
-    await fetchLive();
-    if (liveChannel) await supabase.removeChannel(liveChannel).catch(() => {});
-    liveChannel = supabase.channel("lite-live")
+    fetchAll();
+    // Realtime: append/update in place.
+    channel = supabase.channel("lite-live-rt")
       .on("postgres_changes",
         { event: "*", schema: "public", table: "live_latest" },
         (payload) => {
-          const row = payload.new || payload.record || null;
-          if (!row || !row.tag_name) return;
-          const key = `${row.gateway_id || ""}|${row.tag_name}`;
-          const next = state.liveRows.filter((r) =>
-            (r.gateway_id || "") + "|" + r.tag_name !== key);
-          next.unshift(row);
-          // Cap at 400 to match the REST limit and bound memory.
-          state.liveRows = next.slice(0, 400);
-          state.liveAt = Date.now();
-          state.latency.last_event_at = Date.now();
-          updateLatencyAge();
-          renderHeaderLatency();
-          // Targeted updates instead of full re-render. Surgically patches
-          // each KPI tile, leaves charts/tables alone so they don't flicker
-          // and don't re-fetch the historian on every WS event.
-          if (state.tab === "dashboard") patchLiveTiles(row);
+          const r = payload.new || payload.record || null;
+          if (!r || !r.tag_name) return;
+          setRows((prev) => {
+            const key = `${r.gateway_id || ""}|${r.tag_name}`;
+            const next = prev.filter((p) => `${p.gateway_id || ""}|${p.tag_name}` !== key);
+            next.unshift(r);
+            return next.slice(0, 400);
+          });
         })
       .subscribe((status) => {
-        if (status === "SUBSCRIBED") {
-          state.latency.transport = "realtime";
-          renderHeaderLatency();
-        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          // Fall back to polling if the WS path is unhealthy.
-          state.latency.transport = "polling";
-          renderHeaderLatency();
-          if (!livePoll) {
-            const pollMs = Number(cfg?.live_poll_ms || 1000);
-            livePoll = setInterval(fetchLive, pollMs);
-          }
+        if (status === "SUBSCRIBED") setTransport("realtime");
+        else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          setTransport("polling");
+          if (!pollTimer) pollTimer = setInterval(fetchAll, Number(cfg?.live_poll_ms || 2000));
         }
       });
-    return true;
-  } catch (_e) {
-    return false;
-  }
+    // Belt-and-braces refresh every few seconds — picks up any missed events.
+    pollTimer = setInterval(fetchAll, Math.max(4000, Number(cfg?.live_poll_ms || 1000) * 4));
+
+    return () => {
+      stopped = true;
+      if (channel) supabase.removeChannel(channel).catch(() => {});
+      if (pollTimer) clearInterval(pollTimer);
+    };
+  }, [enabled]);
+
+  return { rows, error, rtt, transport };
 }
 
-// Subscribe to historian_readings INSERTs and append the new sample to
-// every chart that's currently rendered for that (gateway, tag) pair.
-// RLS scopes the events to the viewer's tenant — we never see other
-// customers' rows. Falls back silently if Realtime is unhealthy; the
-// 30s cache + periodic re-fetch will eventually catch up.
-async function subscribeHistorian() {
-  if (!supabase || !session) return;
-  try {
-    if (historianChannel) await supabase.removeChannel(historianChannel).catch(() => {});
-    historianChannel = supabase.channel("lite-historian")
+function useDashboardProfiles(enabled = true) {
+  const [profiles, setProfiles] = useState([]);
+  const [activeKey, setActiveKey] = useState(() => {
+    try { return localStorage.getItem("tnlite-profile") || ""; } catch (_) { return ""; }
+  });
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!enabled) return;
+    let stopped = false;
+    let channel = null;
+    const load = async () => {
+      const { data, error: e } = await supabase
+        .from("dashboard_configurations")
+        .select("scope_key, payload_json, version, updated_utc")
+        .order("updated_utc", { ascending: false })
+        .limit(20);
+      if (stopped) return;
+      if (e) { setError(e.message); return; }
+      setError("");
+      const profs = (data || []).map((r) => ({
+        key: r.scope_key || "",
+        label: profileLabel(r.scope_key || ""),
+        payload: r.payload_json || {},
+      }));
+      setProfiles(profs);
+    };
+    load();
+    channel = supabase.channel("lite-dash-rt")
       .on("postgres_changes",
-        { event: "INSERT", schema: "public", table: "historian_readings" },
-        (payload) => {
-          const row = payload.new || payload.record || null;
-          if (!row || !row.tag_name) return;
-          const key = `${row.gateway_id || ""}|${row.tag_name}`;
-          const entry = liveCharts.get(key);
-          if (!entry || !entry.plot) return;
-          const x = Math.floor(Date.parse(row.ts_utc || 0) / 1000);
-          const y = Number(row.value);
-          if (!Number.isFinite(x)) return;
-          // Append. Drop the oldest point if we'd exceed sampleCount.
-          entry.xs.push(x);
-          entry.ys.push(Number.isFinite(y) ? y : null);
-          const cap = Math.max(2, Number(entry.sampleCount) || 20);
-          while (entry.xs.length > cap) { entry.xs.shift(); entry.ys.shift(); }
-          // setData triggers an in-place re-render that's much cheaper
-          // than recreating the chart. uPlot handles thousands of points
-          // at 60fps so this stays smooth on phones too.
-          try { entry.plot.setData([entry.xs, entry.ys]); } catch (_) {}
-        })
+        { event: "*", schema: "public", table: "dashboard_configurations" },
+        () => load())
       .subscribe();
-  } catch (_e) {}
+    return () => {
+      stopped = true;
+      if (channel) supabase.removeChannel(channel).catch(() => {});
+    };
+  }, [enabled]);
+
+  const setActive = (key) => {
+    setActiveKey(key || "");
+    try { localStorage.setItem("tnlite-profile", key || ""); } catch (_) {}
+  };
+
+  const active = useMemo(() => {
+    if (!profiles.length) return null;
+    return profiles.find((p) => p.key === activeKey) || profiles[0];
+  }, [profiles, activeKey]);
+
+  return { profiles, active, activeKey: active?.key || "", setActiveKey: setActive, error };
 }
 
-async function subscribeAlarms() {
-  if (!supabase || !session) return;
-  try {
-    if (alarmChannel) await supabase.removeChannel(alarmChannel).catch(() => {});
-    alarmChannel = supabase.channel("lite-alarms")
-      .on("postgres_changes",
-        { event: "INSERT", schema: "public", table: "app_logs" },
-        (payload) => {
-          const row = payload.new || payload.record || null;
-          if (!row) return;
-          state.alarmRows = [row, ...(state.alarmRows || [])].slice(0, 200);
-          if (state.tab === "alarms") renderBody();
-        })
-      .subscribe();
-  } catch (_e) {}
-}
-
-async function fetchHistory() {
-  if (!supabase || !session) return;
-  try {
-    const lim = Number(cfg?.history_default_limit || 300);
-    const { data, error } = await supabase
-      .from("historian_readings")
-      .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc")
-      .order("ts_utc", { ascending: false })
-      .limit(lim);
-    if (error) throw error;
-    state.historyRows = data || [];
-    state.historyError = "";
-    if (state.tab === "history") renderBody();
-  } catch (e) {
-    state.historyError = e.message || String(e);
-    if (state.tab === "history") renderBody();
-  }
-}
-
-async function fetchAlarms() {
-  if (!supabase || !session) return;
-  try {
-    const { data, error } = await supabase
-      .from("app_logs")
-      .select("ts_utc, level, category, message, gateway_id, gateway_name")
-      .order("ts_utc", { ascending: false })
-      .limit(200);
-    if (error) throw error;
-    state.alarmRows = data || [];
-    state.alarmError = "";
-    if (state.tab === "alarms") renderBody();
-  } catch (e) {
-    state.alarmError = e.message || String(e);
-    if (state.tab === "alarms") renderBody();
-  }
-}
-
-// Power tab: derive from live_latest by filtering tag names. The desktop
-// power-meter integration writes voltage_v / current_a / active_power_w /
-// energy_wh / power_factor / frequency_hz tags. We group by gateway_id.
-async function fetchPower() {
-  if (!supabase || !session) return;
-  try {
-    const meterTags = ["voltage_v","current_a","active_power_w","energy_wh","power_factor","frequency_hz"];
-    const { data, error } = await supabase
-      .from("live_latest")
-      .select("gateway_id, gateway_name, tag_name, value, ts_utc")
-      .in("tag_name", meterTags);
-    if (error) throw error;
-    const byGw = new Map();
-    for (const r of data || []) {
-      const gid = r.gateway_id || "—";
-      if (!byGw.has(gid)) byGw.set(gid, { gateway_id: gid, gateway_name: r.gateway_name || gid, ts_utc: r.ts_utc, tags: {} });
-      const e = byGw.get(gid);
-      e.tags[r.tag_name] = r.value;
-      if (!e.ts_utc || (r.ts_utc && r.ts_utc > e.ts_utc)) e.ts_utc = r.ts_utc;
-    }
-    state.powerRows = [...byGw.values()];
-    state.powerError = "";
-    if (state.tab === "power") renderBody();
-  } catch (e) {
-    state.powerError = e.message || String(e);
-    if (state.tab === "power") renderBody();
-  }
-}
-
-// Dashboard widgets come from cp_users.permissions_json? No — they live in
-// Read every operator-configured widget layout the viewer is allowed to
-// see. Each row in public.dashboard_configurations is treated as a
-// "profile" — typically one per edge/user combo. The Lite app remembers
-// which profile the viewer selected in localStorage.
-async function fetchDashboardConfig() {
-  if (!supabase || !session) return;
-  try {
-    const { data, error } = await supabase
-      .from("dashboard_configurations")
-      .select("scope_key, payload_json, version, updated_utc")
-      .order("updated_utc", { ascending: false })
-      .limit(20);
-    if (error) throw error;
-    const rows = data || [];
-    // Build a profile list. scope_key '' (empty) means the global default
-    // for the tenant — label it "Default".
-    state.dashboardProfiles = rows.map((r) => ({
-      key: r.scope_key || "",
-      label: profileLabel(r.scope_key || ""),
-      payload: r.payload_json || {},
-      version: r.version,
-      updated_utc: r.updated_utc,
-    }));
-    // Pick the active profile: stored preference, else the freshest row.
-    const stored = state.activeProfileKey || "";
-    const active = state.dashboardProfiles.find((p) => p.key === stored)
-                || state.dashboardProfiles[0]
-                || null;
-    if (active) {
-      state.activeProfileKey = active.key;
-      state.dashboardLayout = active.payload;
-      state.dashboardWidgets = Array.isArray(active.payload?.widgets) ? active.payload.widgets : [];
-    } else {
-      state.dashboardLayout = null;
-      state.dashboardWidgets = [];
-    }
-    state.dashboardError = "";
-    if (state.tab === "dashboard") renderBody();
-  } catch (e) {
-    state.dashboardError = e.message || String(e);
-    if (state.tab === "dashboard") renderBody();
-  }
-}
-
-// Derive a human-readable name for a scope_key. Scope keys on the edge are
-// shaped 'tenant|-|edge_id|user'. We pull out edge and user so the dropdown
-// reads e.g. "edge-1868e2b401 / admin" instead of the raw key.
 function profileLabel(scopeKey) {
   if (!scopeKey) return "Default";
   const parts = String(scopeKey).split("|");
-  // tenant | "-" | edge_id | user
   const edge = parts[2] || "";
   const user = parts[3] || "";
   if (edge && user) return `${edge} / ${user}`;
@@ -490,112 +279,731 @@ function profileLabel(scopeKey) {
   return scopeKey;
 }
 
-// Switch to a different dashboard profile. Persists the choice and
-// re-renders. Charts re-fetch because mountWidgetData() runs again.
-function setActiveProfile(key) {
-  state.activeProfileKey = key || "";
-  try { localStorage.setItem("tnlite-profile", state.activeProfileKey); } catch (_) {}
-  const active = state.dashboardProfiles.find((p) => p.key === key);
-  if (active) {
-    state.dashboardLayout = active.payload;
-    state.dashboardWidgets = Array.isArray(active.payload?.widgets) ? active.payload.widgets : [];
+// Per-(gw|tag) chart series, fetched once then appended via realtime.
+function useChartSeries(gw, tag, sampleCount) {
+  const [series, setSeries] = useState([]); // [{ ts, value, idx }]
+  const seriesRef = useRef(series);
+  seriesRef.current = series;
+
+  useEffect(() => {
+    let stopped = false;
+    if (!gw || !tag) { setSeries([]); return; }
+    const fetchSeed = async () => {
+      const { data, error } = await supabase
+        .from("historian_readings")
+        .select("ts_utc, value")
+        .eq("tag_name", tag)
+        .eq("gateway_id", gw)
+        .order("ts_utc", { ascending: false })
+        .limit(Math.max(2, Math.min(2000, Number(sampleCount) || 20)));
+      if (stopped) return;
+      if (error) return;
+      const rows = (data || []).slice().reverse();
+      setSeries(rows.map((r, idx) => ({
+        idx,
+        ts: r.ts_utc,
+        value: Number(r.value),
+      })));
+    };
+    fetchSeed();
+
+    // Use the shared historian realtime channel (one channel, route by gw|tag).
+    const handler = (row) => {
+      if (!row || row.gateway_id !== gw || row.tag_name !== tag) return;
+      const v = Number(row.value);
+      setSeries((prev) => {
+        const next = [...prev, { idx: prev.length, ts: row.ts_utc, value: Number.isFinite(v) ? v : null }];
+        const cap = Math.max(2, Number(sampleCount) || 20);
+        if (next.length > cap) next.splice(0, next.length - cap);
+        // Re-number idx so XAxis stays monotonic.
+        for (let i = 0; i < next.length; i++) next[i].idx = i;
+        return next;
+      });
+    };
+    historianSubscribers.add(handler);
+    return () => { stopped = true; historianSubscribers.delete(handler); };
+  }, [gw, tag, sampleCount]);
+
+  return series;
+}
+
+// One shared historian realtime channel; chart hooks register a handler.
+const historianSubscribers = new Set();
+let _historianChan = null;
+function ensureHistorianChannel() {
+  if (_historianChan || !supabase) return;
+  _historianChan = supabase.channel("lite-hist-rt")
+    .on("postgres_changes",
+      { event: "INSERT", schema: "public", table: "historian_readings" },
+      (payload) => {
+        const r = payload.new || payload.record || null;
+        if (!r) return;
+        historianSubscribers.forEach((fn) => { try { fn(r); } catch (_) {} });
+      })
+    .subscribe();
+}
+
+// ============================================================
+// Charts (Recharts) — styled to match the desktop edge dashboard
+// ============================================================
+// Generous margins so the axis tick labels never collide with the card
+// borders. Bottom: room for x-axis labels. Left: room for the y-axis
+// tick numbers (we use width:38 on the YAxis itself but margins help
+// when the body resizes small).
+const chartMargin = { top: 10, right: 16, left: 8, bottom: 18 };
+const chartTooltipProps = {
+  contentStyle: {
+    background: "var(--card, #171717)",
+    border: "1px solid var(--stroke, rgba(255,255,255,0.14))",
+    borderRadius: 8,
+    color: "var(--text, #f2f4f7)",
+    fontSize: 12,
+  },
+  labelStyle: { color: "var(--text, #f2f4f7)", fontWeight: 600 },
+  itemStyle: { color: "var(--text, #f2f4f7)" },
+};
+function buildXAxisProps(series) {
+  return {
+    dataKey: "idx",
+    tickFormatter: (v) => {
+      const p = series.find((p) => p.idx === v);
+      if (!p?.ts) return "";
+      try { return new Date(p.ts).toLocaleTimeString().slice(0, 5); } catch { return ""; }
+    },
+    stroke: "var(--soft, #8a98ab)",
+    tick: { fill: "var(--soft, #8a98ab)", fontSize: 10 },
+    minTickGap: 28,
+    axisLine: { stroke: "var(--line, rgba(138,152,171,0.25))" },
+    tickLine: { stroke: "var(--line, rgba(138,152,171,0.25))" },
+  };
+}
+// Compact tick formatter: 2-decimal max, k/M/G suffixes for big numbers.
+// Keeps the Y axis readable for both ~119.84 sensor values AND large Wh
+// totals like 11_279_318 that would otherwise wreck the layout.
+const fmtTick = (v) => {
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return "";
+  const n = Number(v);
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return (n / 1e9).toFixed(2) + "G";
+  if (abs >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (abs >= 1e3) return (n / 1e3).toFixed(2) + "k";
+  // Decimals only when meaningful — integers stay clean.
+  return (Math.round(n * 100) / 100).toString();
+};
+
+const yAxisProps = {
+  stroke: "var(--soft, #8a98ab)",
+  tick: { fill: "var(--soft, #8a98ab)", fontSize: 10 },
+  width: 48,
+  tickFormatter: fmtTick,
+  axisLine: { stroke: "var(--line, rgba(138,152,171,0.25))" },
+  tickLine: { stroke: "var(--line, rgba(138,152,171,0.25))" },
+};
+
+// `domain` for `<YAxis>` — when autoFit is true we hug the data with a 5%
+// pad above the max (so the peak isn't clipped by the chart frame) and 2%
+// below the min. When off, fall back to Recharts default padded auto.
+function buildYAxisProps(autoFit) {
+  const pad = (n) => (Number.isFinite(n) ? n : 0);
+  if (autoFit) {
+    return {
+      ...yAxisProps,
+      // Generous top pad so the peak (e.g. a bar top) is fully visible.
+      domain: [
+        (dataMin) => pad(dataMin) - Math.abs(pad(dataMin)) * 0.02 - 0.001,
+        (dataMax) => pad(dataMax) + Math.abs(pad(dataMax)) * 0.05 + 0.001,
+      ],
+      allowDataOverflow: false,
+    };
   }
-  // Clear the chart cache so the new layout fetches fresh data.
-  chartDataCache.clear();
-  if (state.tab === "dashboard") renderBody();
+  return yAxisProps;
 }
 
-// Update a single dashboard preference and persist.
-function setDashPref(name, value) {
-  const next = { ...(state.dashPrefs || {}), [name]: value };
-  state.dashPrefs = next;
-  try { localStorage.setItem("tnlite-dash-prefs", JSON.stringify(next)); } catch (_) {}
-  if (state.tab === "dashboard") renderBody();
+// Resolve the full series list for a chart widget: primary + every
+// non-limit `cfg.series_extra` row. Each series carries gw/tag/color/axis/
+// chart_type so we can render a multi-series ComposedChart that overlays
+// lines, areas and bars on shared or split Y axes — matching the edge.
+function widgetAllSeries(widget) {
+  const cfg = widget?.config || {};
+  const widgetType = String(widget?.type || "line_chart");
+  const primaryColor = String(widget?.color || "#14a89a");
+  const primaryKind =
+    widgetType === "bar_chart" ? "bar" :
+    widgetType === "line_area_chart" ? "area" : "line";
+  const out = [];
+  if (cfg.tag_name) {
+    out.push({
+      id: "primary",
+      gateway_id: cfg.gateway_id || "",
+      tag_name: cfg.tag_name,
+      label: String(widget?.title || cfg.tag_name || "").trim() || cfg.tag_name,
+      color: primaryColor,
+      axis: "left",
+      chart_type: primaryKind,
+    });
+  }
+  const extras = Array.isArray(cfg.series_extra) ? cfg.series_extra : [];
+  extras.forEach((s, i) => {
+    if (!s || !s.tag_name) return;
+    if (String(s.chart_type || "").toLowerCase() === "limit") return; // skip ref lines for now
+    out.push({
+      id: String(s.id || `s${i + 1}`),
+      gateway_id: String(s.gateway_id || cfg.gateway_id || ""),
+      tag_name: String(s.tag_name),
+      label: String(s.label || s.tag_name),
+      color: String(s.color || pickPaletteColor(i + 1)),
+      axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
+      chart_type: String(s.chart_type || primaryKind).toLowerCase() || primaryKind,
+    });
+  });
+  return out;
 }
 
-// Per-(gateway, tag) chart data cache. Lets us avoid re-fetching every time
-// the dashboard re-renders. Keys: "gw|tag". Entries: { rows, fetched_at }.
-const chartDataCache = new Map();
-const CHART_TTL_MS = 30_000; // refresh charts at most every 30s when online
-
-// Live chart registry: maps "gw|tag" -> { plot, xs, ys, sampleCount }
-// so the realtime historian subscription can append in place to every
-// chart that's currently mounted. Tearing down the dashboard clears this.
-const liveCharts = new Map();
-let historianChannel = null;
-
-// Subscribe to dashboard_configurations updates so the Lite view reflects
-// the operator's widget changes within seconds. RLS scopes the channel
-// to the viewer's tenant.
-let dashboardChannel = null;
-async function subscribeDashboardConfig() {
-  if (!supabase || !session) return;
-  try {
-    if (dashboardChannel) await supabase.removeChannel(dashboardChannel).catch(() => {});
-    dashboardChannel = supabase.channel("lite-dashboard-config")
-      .on("postgres_changes",
-        { event: "*", schema: "public", table: "dashboard_configurations" },
-        () => fetchDashboardConfig())
-      .subscribe();
-  } catch (_e) {}
+function pickPaletteColor(i) {
+  const palette = ["#14a89a", "#f97316", "#6e8dd2", "#e2585d", "#a855f7", "#0e8479", "#22c55e", "#fbbf24"];
+  return palette[i % palette.length];
 }
 
-async function fetchTagHistory(gateway_id, tag_name, rangeMs) {
-  if (!supabase) throw new Error("not ready");
-  const fromTs = new Date(Date.now() - rangeMs).toISOString();
+// Hook: fetch + realtime-append every series for a chart widget at once,
+// then merge them into a single Recharts dataset keyed by index.
+//
+// Returns { merged, seriesDefs } where `merged` is an array of rows like
+// { idx, ts, val_primary, val_s1, val_s2, ... } so Recharts dataKey can
+// pick each series by its id.
+function useMultiSeries(widget, sampleCount) {
+  const seriesDefs = useMemo(() => widgetAllSeries(widget), [
+    widget?.id, widget?.type, widget?.color, widget?.title,
+    widget?.config?.tag_name, widget?.config?.gateway_id,
+    JSON.stringify(widget?.config?.series_extra || []),
+  ]);
+  // Each series has its own running buffer keyed by ts_utc -> value.
+  const [tick, setTick] = useState(0);
+  const buffersRef = useRef(new Map()); // id -> Map<ts, value>
+
+  useEffect(() => {
+    buffersRef.current = new Map(seriesDefs.map((s) => [s.id, new Map()]));
+    setTick((t) => t + 1);
+    if (!seriesDefs.length) return;
+
+    let stopped = false;
+    const subs = new Set();
+    const handlers = new Map(); // gw|tag -> handler
+
+    const fetchSeed = async (s) => {
+      const { data, error } = await supabase
+        .from("historian_readings")
+        .select("ts_utc, value")
+        .eq("tag_name", s.tag_name)
+        .eq("gateway_id", s.gateway_id)
+        .order("ts_utc", { ascending: false })
+        .limit(Math.max(2, Math.min(2000, Number(sampleCount) || 20)));
+      if (stopped || error) return;
+      const buf = buffersRef.current.get(s.id);
+      if (!buf) return;
+      buf.clear();
+      (data || []).slice().reverse().forEach((r) => {
+        const v = Number(r.value);
+        buf.set(r.ts_utc, Number.isFinite(v) ? v : null);
+      });
+      setTick((t) => t + 1);
+    };
+
+    // Seed all series in parallel.
+    Promise.all(seriesDefs.map(fetchSeed)).catch(() => {});
+
+    // Register one realtime handler per (gw|tag) so each new row appends.
+    for (const s of seriesDefs) {
+      const fn = (row) => {
+        if (!row || row.tag_name !== s.tag_name || row.gateway_id !== s.gateway_id) return;
+        const buf = buffersRef.current.get(s.id);
+        if (!buf) return;
+        const v = Number(row.value);
+        buf.set(row.ts_utc, Number.isFinite(v) ? v : null);
+        // Cap each buffer at sampleCount * 2 entries.
+        const cap = Math.max(20, (Number(sampleCount) || 20) * 2);
+        if (buf.size > cap) {
+          const keys = [...buf.keys()].sort();
+          for (let i = 0; i < keys.length - cap; i++) buf.delete(keys[i]);
+        }
+        setTick((t) => t + 1);
+      };
+      historianSubscribers.add(fn);
+      subs.add(fn);
+      handlers.set(`${s.gateway_id}|${s.tag_name}`, fn);
+    }
+    return () => {
+      stopped = true;
+      subs.forEach((fn) => historianSubscribers.delete(fn));
+    };
+  }, [seriesDefs, sampleCount]);
+
+  // Build the merged dataset. Take the union of all timestamps across
+  // every series, sort, then for each timestamp emit a row carrying each
+  // series's most recent value at-or-before that timestamp (carry-forward
+  // resample). Without this, two series sampled on slightly different
+  // clocks render as alternating null/value rows and the line never
+  // appears even with connectNulls.
+  const merged = useMemo(() => {
+    if (!seriesDefs.length) return [];
+    const tsSet = new Set();
+    for (const def of seriesDefs) {
+      const buf = buffersRef.current.get(def.id);
+      if (!buf) continue;
+      for (const ts of buf.keys()) tsSet.add(ts);
+    }
+    const sortedTs = [...tsSet].sort();
+    if (!sortedTs.length) return [];
+    const cap = Math.max(2, Number(sampleCount) || 20);
+    const window = sortedTs.slice(-cap);
+
+    // For each series, pre-sort its entries; walk the window in lockstep
+    // with each series's pointer to forward-fill the current value.
+    const seriesEntries = seriesDefs.map((def) => {
+      const buf = buffersRef.current.get(def.id);
+      const entries = buf ? [...buf.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1) : [];
+      return { def, entries, ptr: 0, last: null };
+    });
+
+    return window.map((ts, idx) => {
+      const row = { idx, ts };
+      for (const st of seriesEntries) {
+        while (st.ptr < st.entries.length && st.entries[st.ptr][0] <= ts) {
+          st.last = st.entries[st.ptr][1];
+          st.ptr += 1;
+        }
+        row[st.def.id] = (st.last === undefined ? null : st.last);
+      }
+      return row;
+    });
+    // tick triggers re-build on any new sample.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seriesDefs, sampleCount, tick]);
+
+  return { merged, seriesDefs };
+}
+
+function ChartWidget({ widget }) {
+  const cfg = widget?.config || {};
+  const widgetType = String(widget?.type || "line_chart");
+  const sampleCount = useDashSamples();
+  const { yAxisAutoFit } = useDashPrefs();
+  const yProps = buildYAxisProps(!!yAxisAutoFit);
+  const { merged, seriesDefs } = useMultiSeries(widget, sampleCount);
+
+  if (!seriesDefs.length) return h("div", { className: "widget-empty muted" }, "no tag");
+  if (!merged.length) return h("div", { className: "widget-empty muted" }, "no samples");
+
+  const labelFmt = (v) => merged.find((p) => p.idx === v)?.ts || String(v);
+  const hasRightAxis = seriesDefs.some((s) => s.axis === "right");
+
+  // Pick the right Recharts root for the primary chart type, then overlay
+  // each series as a Line/Area/Bar child within it.
+  return h(ResponsiveContainer, { width: "100%", height: "100%" },
+    h(buildChartRoot(widgetType, seriesDefs.length), { data: merged, margin: chartMargin },
+      h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
+      h(XAxis, buildXAxisProps(merged)),
+      h(YAxis, { ...yProps, yAxisId: "left" }),
+      hasRightAxis ? h(YAxis, { ...yProps, yAxisId: "right", orientation: "right" }) : null,
+      h(Tooltip, { ...chartTooltipProps, labelFormatter: labelFmt, formatter: (v, name) => [fmtVal(v), name] }),
+      seriesDefs.length > 1 ? h(Legend, { wrapperStyle: { fontSize: 11, color: "var(--muted, #8a98ab)" } }) : null,
+      ...seriesDefs.map((s) => renderSeriesElement(s, widgetType))
+    )
+  );
+}
+
+// Pick the Recharts root for a chart. For single-series widgets the
+// natural Line/Area/BarChart is used; for multi-series widgets we use
+// ComposedChart which is the only Recharts container that lets you mix
+// Line + Area + Bar children freely.
+function buildChartRoot(widgetType, seriesCount = 1) {
+  if (seriesCount > 1) return ComposedChart;
+  if (widgetType === "bar_chart") return BarChart;
+  if (widgetType === "line_area_chart") return AreaChart;
+  return LineChart;
+}
+
+function renderSeriesElement(s, widgetType) {
+  if (s.chart_type === "bar" || (widgetType === "bar_chart" && s.chart_type === "")) {
+    return h(Bar, {
+      key: s.id, dataKey: s.id, name: s.label,
+      yAxisId: s.axis === "right" ? "right" : "left",
+      isAnimationActive: false, fill: s.color,
+    });
+  }
+  if (s.chart_type === "area" || (widgetType === "line_area_chart" && s.chart_type === "")) {
+    return h(Area, {
+      key: s.id, dataKey: s.id, name: s.label,
+      yAxisId: s.axis === "right" ? "right" : "left",
+      type: "monotone", stroke: s.color, fill: s.color + "33",
+      strokeWidth: 1.8, dot: false, isAnimationActive: false, connectNulls: true,
+    });
+  }
+  // default: line
+  return h(Line, {
+    key: s.id, dataKey: s.id, name: s.label,
+    yAxisId: s.axis === "right" ? "right" : "left",
+    type: "monotone", stroke: s.color, strokeWidth: 1.8,
+    dot: false, isAnimationActive: false, connectNulls: true,
+  });
+}
+
+// ============================================================
+// Widgets (KPI, Meter, Pie, Table, Image, FixedText, Divider)
+// ============================================================
+function widgetTitle(w) {
+  const cfg = w?.config || {};
+  return String(w?.title || cfg.title || cfg.tag_name || cfg.text || "").trim();
+}
+
+function KpiWidget({ widget, liveByKey, onOpen }) {
+  const cfg = widget?.config || {};
+  const color = String(widget?.color || "#14a89a");
+  const isText = widget?.type === "text_kpi";
+  const row = liveByKey.get(`${cfg.gateway_id}|${cfg.tag_name}`);
+  const value = row ? row.value : null;
+  const ts = row ? row.ts_utc : null;
+  const cls = `widget-kpi ${freshnessClass(ts)}`;
+  return h("button", {
+      className: cls,
+      onClick: () => cfg.tag_name && onOpen(cfg.gateway_id, cfg.gateway_id || "", cfg.tag_name, value, ts),
+    },
+    h("div", { className: "widget-title" }, widgetTitle(widget) || cfg.tag_name || "—"),
+    h("div", { className: "widget-value", style: { color } },
+      isText ? (row?.value_text || row?.quality_label || (value == null ? "—" : String(value)))
+             : fmtVal(value)),
+    h("div", { className: "widget-sub" },
+      (cfg.gateway_name || cfg.gateway_id || "—"), " · ", fmtAge(ts), " ago")
+  );
+}
+
+// Compute color ranges for a meter from widget.config.compute_rules.
+// Each rule has { operator, value1, value2, label, color }. Mirrors the
+// edge's computeMeterRanges() so the same configured ranges render the
+// same arcs in Lite. Falls back to a sensible Low/Normal/High split when
+// no rules are configured.
+function computeMeterRanges(widget, value) {
+  const rules = Array.isArray(widget?.config?.compute_rules) ? widget.config.compute_rules : [];
+  const parsed = [];
+  rules.forEach((r, idx) => {
+    const op = String((r || {}).operator || "between").toLowerCase();
+    const v1 = Number(r?.value1);
+    const v2 = Number(r?.value2);
+    let min = NaN, max = NaN;
+    if (op === "between") {
+      if (Number.isFinite(v1) && Number.isFinite(v2)) { min = Math.min(v1, v2); max = Math.max(v1, v2); }
+    } else if (op === "lt" || op === "lte") { if (Number.isFinite(v1)) { min = -Infinity; max = v1; } }
+    else if (op === "gt" || op === "gte") { if (Number.isFinite(v1)) { min = v1; max = Infinity; } }
+    else if (op === "eq") { if (Number.isFinite(v1)) { min = v1 - 0.5; max = v1 + 0.5; } }
+    if (!Number.isFinite(min) && !Number.isFinite(max)) return;
+    parsed.push({
+      id: String(r?.id || `range-${idx}`),
+      label: String(r?.label || `Range ${idx + 1}`),
+      color: String(r?.color || "#14a89a"),
+      min, max,
+    });
+  });
+  if (!parsed.length) {
+    const v = Number.isFinite(Number(value)) ? Number(value) : 0;
+    const floor = Math.floor((v - 10) / 10) * 10;
+    const ceil = Math.ceil((v + 10) / 10) * 10;
+    const span = Math.max(10, ceil - floor);
+    const a = floor;
+    const b = floor + span * 0.6;
+    const c = floor + span * 0.85;
+    return [
+      { id: "low", label: "Low", color: "#22c55e", min: a, max: b },
+      { id: "normal", label: "Normal", color: "#14a89a", min: b, max: c },
+      { id: "high", label: "High", color: "#e2585d", min: c, max: ceil },
+    ];
+  }
+  const finiteMins = parsed.map((r) => r.min).filter((n) => Number.isFinite(n));
+  const finiteMaxs = parsed.map((r) => r.max).filter((n) => Number.isFinite(n));
+  const cur = Number(value);
+  const baseMin = finiteMins.length ? Math.min(...finiteMins) : (Number.isFinite(cur) ? cur - 10 : 0);
+  const baseMax = finiteMaxs.length ? Math.max(...finiteMaxs) : (Number.isFinite(cur) ? cur + 10 : 100);
+  const domainMin = Math.min(baseMin, Number.isFinite(cur) ? cur : baseMin);
+  const domainMax = Math.max(baseMax, Number.isFinite(cur) ? cur : baseMax);
+  return parsed.map((r) => ({
+    ...r,
+    min: Number.isFinite(r.min) ? r.min : domainMin,
+    max: Number.isFinite(r.max) ? r.max : domainMax,
+  })).sort((a, b) => a.min - b.min);
+}
+
+function MeterWidget({ widget, liveByKey, onOpen }) {
+  const cfg = widget?.config || {};
+  const row = liveByKey.get(`${cfg.gateway_id}|${cfg.tag_name}`);
+  const value = row ? Number(row.value) : NaN;
+  const ts = row ? row.ts_utc : null;
+  // Honour explicit min/max if the operator set them on the widget; the
+  // computed ranges (from compute_rules) still drive the colored arcs.
+  const explicitMin = Number(cfg.meter_min);
+  const explicitMax = Number(cfg.meter_max);
+  const ranges = computeMeterRanges(widget, value);
+  const rangeMin = ranges.length ? Math.min(...ranges.map((r) => Number(r.min))) : 0;
+  const rangeMax = ranges.length ? Math.max(...ranges.map((r) => Number(r.max))) : 100;
+  const domainMin = Number.isFinite(explicitMin) ? explicitMin : rangeMin;
+  const domainMax = Number.isFinite(explicitMax) ? explicitMax : rangeMax;
+  const gaugeData = ranges
+    .map((r) => ({ name: r.label, color: r.color, value: Math.max(0, Number(r.max) - Number(r.min)) }))
+    .filter((r) => Number.isFinite(r.value) && r.value > 0);
+  const currentPct = Number.isFinite(value)
+    ? ((Math.max(domainMin, Math.min(domainMax, value)) - domainMin) / Math.max(1e-9, (domainMax - domainMin))) * 100
+    : NaN;
+  const pointerDeg = Number.isFinite(currentPct) ? (Math.max(0, Math.min(100, currentPct)) * 180) / 100 - 90 : -90;
+
+  return h("button", {
+    className: `widget-meter ${freshnessClass(ts)}`,
+    onClick: () => cfg.tag_name && onOpen(cfg.gateway_id, cfg.gateway_id || "", cfg.tag_name, value, ts),
+  },
+    h("div", { className: "widget-title" }, widgetTitle(widget) || cfg.tag_name || "—"),
+    h("div", { className: "widget-meter-gauge" },
+      h(ResponsiveContainer, { width: "100%", height: "100%" },
+        h(PieChart, null,
+          h(Pie, {
+            data: gaugeData, dataKey: "value",
+            startAngle: 180, endAngle: 0,
+            cx: "50%", cy: "70%", innerRadius: "60%", outerRadius: "95%",
+            stroke: "none", paddingAngle: 0.6, isAnimationActive: false,
+          },
+            ...gaugeData.map((entry, idx) =>
+              h(Cell, { key: `mseg-${idx}`, fill: entry.color }))
+          )
+        )
+      ),
+      // SVG pointer overlay
+      h("div", { className: "meter-pointer-wrap", "aria-hidden": "true" },
+        h("div", { className: "meter-pointer", style: { transform: `translate(-50%, 0) rotate(${pointerDeg}deg)` } }),
+        h("div", { className: "meter-pointer-cap" })
+      ),
+      h("div", { className: "meter-caption" },
+        h("div", { className: "meter-caption-value" }, Number.isFinite(value) ? value.toFixed(2) : "—"),
+        h("div", { className: "meter-caption-pct" }, Number.isFinite(currentPct) ? `${currentPct.toFixed(1)}%` : "—")
+      )
+    ),
+    // Compact legend underneath
+    ranges.length ? h("div", { className: "meter-legend" },
+      ...ranges.map((r) => h("span", { key: r.id, className: "meter-legend-item" },
+        h("span", { className: "meter-legend-swatch", style: { background: r.color } }),
+        h("span", { className: "meter-legend-label" }, `${r.label} ${Number(r.min).toFixed(1)}–${Number(r.max).toFixed(1)}`)
+      ))
+    ) : null,
+    h("div", { className: "widget-sub" }, fmtAge(ts), " ago")
+  );
+}
+
+// Match a value against a single computed rule.
+function ruleMatches(rule, v) {
+  if (!Number.isFinite(v)) return false;
+  const op = String(rule?.operator || "between").toLowerCase();
+  const v1 = Number(rule?.value1);
+  const v2 = Number(rule?.value2);
+  if (op === "between" && Number.isFinite(v1) && Number.isFinite(v2))
+    return v >= Math.min(v1, v2) && v <= Math.max(v1, v2);
+  if ((op === "lt" || op === "lte") && Number.isFinite(v1)) return op === "lt" ? v < v1 : v <= v1;
+  if ((op === "gt" || op === "gte") && Number.isFinite(v1)) return op === "gt" ? v > v1 : v >= v1;
+  if (op === "eq" && Number.isFinite(v1)) return Math.abs(v - v1) < 1e-9;
+  return false;
+}
+
+// Fetch the last-N values for a (gw, tag) from historian — used by pie
+// "computed" mode to count rule matches. Cached for CHART_TTL_MS like the
+// chart widgets so we don't hammer Supabase.
+const pieCache = new Map();
+async function fetchPieValues(gw, tag, sampleCount) {
+  const key = `${gw}|${tag}|${sampleCount}`;
+  const now = Date.now();
+  const hit = pieCache.get(key);
+  if (hit && (now - hit.t) < 30_000) return hit.values;
   const { data, error } = await supabase
     .from("historian_readings")
-    .select("ts_utc, value")
-    .eq("tag_name", tag_name)
-    .eq("gateway_id", gateway_id)
-    .gte("ts_utc", fromTs)
-    .order("ts_utc", { ascending: true })
-    .limit(5000);
-  if (error) throw error;
-  return data || [];
+    .select("value")
+    .eq("gateway_id", gw)
+    .eq("tag_name", tag)
+    .order("ts_utc", { ascending: false })
+    .limit(Math.max(20, Number(sampleCount) || 200));
+  if (error) return [];
+  const values = (data || []).map((r) => Number(r.value)).filter(Number.isFinite);
+  pieCache.set(key, { values, t: now });
+  return values;
 }
 
-// ---------- Polling / Realtime lifecycle ---------------------------------
-// Try Supabase Realtime first; fall back to short-interval polling if the WS
-// can't connect (corporate proxies, offline, RLS misconfig, etc).
-function startPolls() {
-  stopAllPolls();
-  const pollMs = Number(cfg?.live_poll_ms || 1000);
+// Pie chart widget. Modes:
+//   * computed: each rule's slice value = count of historian samples that
+//     match the rule. We fetch the last-N samples once per widget (cached
+//     30s) and count matches client-side. This matches the desktop's
+//     aggregation: 'count' behaviour without needing the stats endpoint.
+//   * tag_direct (default): one slice per series_extra + primary tag.
+//     Value is the latest absolute reading from live_latest.
+function PieWidget({ widget, liveByKey }) {
+  const cfg = widget?.config || {};
+  const showLegend = cfg.pie_show_legend !== false;
+  const isComputed = String(cfg.data_source_type || "").toLowerCase() === "computed";
+  const sampleCount = useDashSamples();
+  const [computedCounts, setComputedCounts] = useState(null);
 
-  // live_latest powers the Live tab AND the Dashboard mirror.
-  if (state.tab === "dashboard") {
-    if (!liveChannel) {
-      subscribeLive();
-    } else {
-      // Already subscribed — just refresh the snapshot to catch any rows
-      // that landed while the tab was hidden.
-      fetchLive();
+  // Fetch historian samples for computed mode, refresh when rule set or
+  // sampleCount changes. Also re-run on each new live tick for the
+  // primary tag so the counts stay current.
+  useEffect(() => {
+    if (!isComputed) return;
+    let stopped = false;
+    const refresh = async () => {
+      const rules = Array.isArray(cfg.compute_rules) ? cfg.compute_rules : [];
+      if (!rules.length) { setComputedCounts([]); return; }
+      // Each rule can carry its own (gateway_id, tag_name); fall back to
+      // the widget's primary tag if missing.
+      const fetched = new Map();
+      const counts = [];
+      for (const r of rules) {
+        const gw  = r.gateway_id || cfg.gateway_id || "";
+        const tag = r.tag_name || cfg.tag_name || "";
+        const k = `${gw}|${tag}`;
+        if (!fetched.has(k)) fetched.set(k, await fetchPieValues(gw, tag, Number(sampleCount) || 200));
+        const values = fetched.get(k);
+        counts.push(values.reduce((acc, v) => acc + (ruleMatches(r, v) ? 1 : 0), 0));
+      }
+      if (!stopped) setComputedCounts(counts);
+    };
+    refresh();
+    // Re-run when a fresh live sample for the configured tag arrives.
+    const handler = (row) => {
+      if (!row || row.tag_name !== cfg.tag_name || row.gateway_id !== cfg.gateway_id) return;
+      // Invalidate cache so the next refresh picks the new sample up.
+      const key = `${cfg.gateway_id}|${cfg.tag_name}|${Number(sampleCount) || 200}`;
+      pieCache.delete(key);
+      refresh();
+    };
+    historianSubscribers.add(handler);
+    ensureHistorianChannel();
+    return () => { stopped = true; historianSubscribers.delete(handler); };
+  }, [isComputed, JSON.stringify(cfg.compute_rules || []), cfg.gateway_id, cfg.tag_name, sampleCount]);
+
+  let data;
+  if (isComputed) {
+    const rules = Array.isArray(cfg.compute_rules) ? cfg.compute_rules : [];
+    if (computedCounts == null) {
+      return h("div", { className: "widget-empty muted" }, h("span", { className: "spinner" }), " loading…");
     }
-    // Belt-and-braces poll at half the previous rate. If Realtime is healthy
-    // this just refreshes the snapshot occasionally; if it dropped silently,
-    // the user still sees data.
-    livePoll = setInterval(fetchLive, Math.max(pollMs * 4, 4000));
-    if (state.tab === "dashboard") {
-      fetchDashboardConfig();
-      if (!dashboardChannel) subscribeDashboardConfig();
-    }
+    data = rules.map((r, idx) => ({
+      name: String(r?.label || `Item ${idx + 1}`),
+      value: Math.max(0, Number(computedCounts[idx] || 0)),
+      color: String(r?.color || pickPaletteColor(idx)),
+    }));
+  } else {
+    const series = widgetAllSeries(widget);
+    data = series.map((s, idx) => {
+      const row = liveByKey.get(`${s.gateway_id}|${s.tag_name}`);
+      const v = Number(row?.value);
+      return {
+        name: s.label,
+        value: Number.isFinite(v) ? Math.abs(v) : 0,
+        color: s.color || pickPaletteColor(idx),
+      };
+    });
   }
-  if (state.tab === "history") {
-    fetchHistory();
-    historyPoll = setInterval(fetchHistory, 5000);
-  }
-  if (state.tab === "alarms") {
-    fetchAlarms();
-    if (!alarmChannel) subscribeAlarms();
-    alarmsPoll = setInterval(fetchAlarms, 30000); // safety net only
-  }
-  if (state.tab === "power") {
-    fetchPower();
-    powerPoll = setInterval(fetchPower, 3000);
-  }
+  const total = data.reduce((acc, d) => acc + (d.value || 0), 0);
+  if (!total) return h("div", { className: "widget-empty muted" }, "no matches");
+  return h("div", { className: "widget-pie-wrap" },
+    h("div", { className: "widget-pie-chart" },
+      h(ResponsiveContainer, { width: "100%", height: "100%" },
+        h(PieChart, null,
+          h(Pie, {
+            data, dataKey: "value", nameKey: "name",
+            cx: "50%", cy: "50%", innerRadius: "55%", outerRadius: "90%",
+            stroke: "none", paddingAngle: 1.4, isAnimationActive: false,
+          },
+            ...data.map((entry, idx) => h(Cell, { key: `pie-${idx}`, fill: entry.color }))
+          ),
+          h(Tooltip, { ...chartTooltipProps, formatter: (v, n) => [fmtVal(v), n] })
+        )
+      )
+    ),
+    showLegend ? h("div", { className: "widget-pie-legend" },
+      ...data.map((d, i) => {
+        const pct = total > 0 ? (d.value / total * 100) : 0;
+        return h("span", { key: i, className: "pie-legend-item" },
+          h("span", { className: "pie-legend-dot", style: { background: d.color } }),
+          h("span", null, d.name),
+          h("span", { className: "pie-legend-value" }, `${fmtVal(d.value)} (${pct.toFixed(0)}%)`)
+        );
+      })
+    ) : null
+  );
 }
 
-// ---------- Drawer (chart on tap) -----------------------------------------
+function TableWidget({ widget }) {
+  const cfg = widget?.config || {};
+  const sampleCount = useDashSamples();
+  const series = useChartSeries(cfg.gateway_id || "", cfg.tag_name || "", sampleCount);
+  const rows = series.slice().reverse();
+  if (!cfg.tag_name) return h("div", { className: "widget-empty muted" }, "no tag");
+  if (!rows.length) return h("div", { className: "widget-empty muted" }, "no samples");
+  return h("div", { className: "widget-table-mount" },
+    h("table", { className: "hist-table", style: { fontSize: 11 } },
+      h("thead", null, h("tr", null,
+        h("th", null, "Time"), h("th", null, "Value"))),
+      h("tbody", null, ...rows.map((r, i) =>
+        h("tr", { key: i },
+          h("td", null, fmtTs(r.ts)),
+          h("td", { className: "num" }, fmtVal(r.value))
+        )))
+    )
+  );
+}
+
+function ImageWidget({ widget }) {
+  const cfg = widget?.config || {};
+  if (!cfg.source_url) return h("div", { className: "widget-empty muted" }, "no image");
+  return h("img", { className: "widget-image", src: cfg.source_url, alt: widgetTitle(widget) || "image" });
+}
+
+function Widget({ widget, liveByKey, onOpen, onOpenWidget }) {
+  const type = String(widget?.type || "");
+  if (SKIPPED_TYPES.has(type)) return null;
+  const isChart = type === "line_chart" || type === "line_area_chart" || type === "bar_chart";
+  const isKpi   = type === "value_kpi" || type === "text_kpi";
+  const inner =
+    isChart        ? h(ChartWidget,  { widget }) :
+    isKpi          ? h(KpiWidget,    { widget, liveByKey, onOpen }) :
+    type === "meter_chart" ? h(MeterWidget, { widget, liveByKey, onOpen }) :
+    type === "pie_chart"   ? h(PieWidget,   { widget, liveByKey }) :
+    type === "table_list"  ? h(TableWidget, { widget }) :
+    type === "image"       ? h(ImageWidget, { widget }) :
+    type === "fixed_text"  ? h("div", { className: "widget-text" }, widget?.config?.text || "") :
+    type === "divider"     ? h("div", { className: "widget-divider" }, widget?.config?.text || "") :
+                              h("div", { className: "widget-empty muted" }, type || "widget");
+  const cfg = widget?.config || {};
+  // Chart widgets get a small maximize button in their title bar that
+  // opens the Tag Monitor modal with all of the widget's series. Mirrors
+  // the desktop edge's "monitor" button behaviour.
+  const titleBar = isChart
+    ? h("div", { className: "widget-title-row" },
+        h("div", { className: "widget-title" }, widgetTitle(widget) || cfg.tag_name || "—"),
+        onOpenWidget ? h("button", {
+          className: "widget-expand",
+          title: "Open in Tag Monitor",
+          "aria-label": "Open in Tag Monitor",
+          onClick: () => onOpenWidget(widget),
+        }, h("span", { dangerouslySetInnerHTML: { __html:
+          '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>'
+        } })) : null
+      )
+    : null;
+  return h("div", {
+    className: `widget widget-${type}`,
+    "data-gw": cfg.gateway_id || "",
+    "data-tag": cfg.tag_name || "",
+  },
+    titleBar,
+    h("div", { className: "widget-body" + (isChart ? " widget-chart" : "") }, inner)
+  );
+}
+
+// ============================================================
+// Drawer (tap a tile -> uPlot would have been the old way; with
+// Recharts loaded we render the chart full-size inside the modal).
+// ============================================================
 const RANGE_OPTS = [
   { label: "5m", ms: 5 * 60_000 },
   { label: "15m", ms: 15 * 60_000 },
@@ -605,862 +1013,1362 @@ const RANGE_OPTS = [
   { label: "7d", ms: 7 * 24 * 60 * 60_000 },
 ];
 
-async function openDrawer(gateway_id, gateway_name, tag_name, value, ts) {
-  const defaultRangeMs = Math.max(60_000, Number(cfg?.default_chart_range_minutes || 60) * 60_000);
-  state.drawer = { gateway_id, gateway_name, tag_name, value, ts, range_ms: defaultRangeMs, rows: null, loading: true, error: "" };
-  render();
-  try {
-    state.drawer.rows = await fetchTagHistory(gateway_id, tag_name, defaultRangeMs);
-    state.drawer.loading = false;
-    render();
-  } catch (e) {
-    state.drawer.error = e.message || String(e);
-    state.drawer.loading = false;
-    render();
+// Merge multiple per-series ts->value buffers into one Recharts dataset.
+// Uses the same carry-forward resample as useMultiSeries so missing
+// samples in one series don't blank out the other.
+function buildMergedFromBuffers(defs, buffers, cap) {
+  const tsSet = new Set();
+  for (const def of defs) {
+    const buf = buffers.get(def.id);
+    if (!buf) continue;
+    for (const ts of buf.keys()) tsSet.add(ts);
   }
+  const sortedTs = [...tsSet].sort();
+  if (!sortedTs.length) return [];
+  const limit = Math.max(20, Math.min(20000, Number(cap) || 500));
+  const window = sortedTs.slice(-limit);
+  const seriesEntries = defs.map((def) => {
+    const buf = buffers.get(def.id);
+    const entries = buf ? [...buf.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1) : [];
+    return { def, entries, ptr: 0, last: null };
+  });
+  return window.map((ts, idx) => {
+    const row = { idx, ts };
+    for (const st of seriesEntries) {
+      while (st.ptr < st.entries.length && st.entries[st.ptr][0] <= ts) {
+        st.last = st.entries[st.ptr][1];
+        st.ptr += 1;
+      }
+      row[st.def.id] = (st.last === undefined ? null : st.last);
+    }
+    return row;
+  });
 }
 
-async function setDrawerRange(ms) {
-  if (!state.drawer) return;
-  state.drawer.range_ms = ms;
-  state.drawer.loading = true;
-  state.drawer.rows = null;
-  state.drawer.error = "";
-  render();
-  try {
-    state.drawer.rows = await fetchTagHistory(state.drawer.gateway_id, state.drawer.tag_name, ms);
-    state.drawer.loading = false;
-    render();
-  } catch (e) {
-    if (state.drawer) { state.drawer.error = e.message || String(e); state.drawer.loading = false; }
-    render();
-  }
-}
+// Tag Monitor: full-screen modal that overlays every series of a chart
+// widget (or a single ad-hoc tag from a tile tap) onto one big chart.
+// Range tabs from 5 minutes to 7 days. Max-points selector to keep large
+// ranges responsive. Live-appends each new historian row in place via the
+// shared realtime channel so the chart stays current while open.
+function TagMonitor({ open, payload, onClose }) {
+  const [rangeMs, setRangeMs] = useState(60 * 60_000);
+  const [maxPoints, setMaxPoints] = useState(500);
+  const [data, setData] = useState(null);
+  const [error, setError] = useState("");
+  const [seriesDefs, setSeriesDefs] = useState([]);
+  // Keep raw per-series buffers in a ref so the live handler can mutate
+  // without triggering a re-merge on every tick (we throttle to rAF).
+  const buffersRef = useRef(new Map());
 
-function closeDrawer() {
-  state.drawer = null;
-  render();
-}
+  useEffect(() => {
+    if (!open || !payload) return;
+    let stopped = false;
+    setData(null); setError("");
+    let defs;
+    if (payload.widget) {
+      defs = widgetAllSeries(payload.widget);
+    } else if (payload.tag_name) {
+      defs = [{
+        id: "primary",
+        gateway_id: payload.gateway_id || "",
+        tag_name: payload.tag_name,
+        label: payload.tag_name,
+        color: "#14a89a",
+        axis: "left",
+        chart_type: "line",
+      }];
+    } else { defs = []; }
+    setSeriesDefs(defs);
+    buffersRef.current = new Map(defs.map((s) => [s.id, new Map()]));
 
-function mountChart() {
-  if (!state.drawer || !state.drawer.rows || state.drawer.rows.length === 0) return;
-  if (typeof uPlot === "undefined") return;
-  const mount = $("#uplot-mount");
-  if (!mount) return;
-  const sorted = state.drawer.rows.slice().sort((a, b) =>
-    Date.parse(a.ts_utc || 0) - Date.parse(b.ts_utc || 0));
-  const xs = sorted.map((r) => Math.floor(Date.parse(r.ts_utc) / 1000));
-  const ys = sorted.map((r) => { const n = Number(r.value); return Number.isFinite(n) ? n : null; });
-  mount.innerHTML = "";
-  const w = mount.clientWidth || 600;
-  new uPlot({
-    width: w,
-    height: 300,
-    cursor: { show: true },
-    scales: { x: { time: true } },
-    series: [
-      {},
-      { label: state.drawer.tag_name, stroke: "#14a89a", width: 1.8, points: { show: false } },
-    ],
-    axes: [
-      { stroke: "#8a98ab", grid: { stroke: "rgba(138,152,171,0.15)" } },
-      { stroke: "#8a98ab", grid: { stroke: "rgba(138,152,171,0.15)" } },
-    ],
-  }, [xs, ys], mount);
-}
+    const fromTs = new Date(Date.now() - rangeMs).toISOString();
+    (async () => {
+      const results = await Promise.all(defs.map((s) =>
+        supabase.from("historian_readings")
+          .select("ts_utc, value")
+          .eq("tag_name", s.tag_name)
+          .eq("gateway_id", s.gateway_id)
+          .gte("ts_utc", fromTs)
+          .order("ts_utc", { ascending: true })
+          .limit(Math.max(50, Math.min(20000, Number(maxPoints) || 500)))
+          .then(({ data, error }) => ({ s, rows: data || [], error }))
+      ));
+      if (stopped) return;
+      const errored = results.find((r) => r.error);
+      if (errored) { setError(errored.error.message); return; }
+      // Fill buffers + first merge.
+      results.forEach(({ s, rows }) => {
+        const buf = buffersRef.current.get(s.id);
+        if (!buf) return;
+        for (const r of rows) {
+          const v = Number(r.value);
+          if (Number.isFinite(v)) buf.set(r.ts_utc, v);
+        }
+      });
+      setData(buildMergedFromBuffers(defs, buffersRef.current, maxPoints));
+    })();
 
-// ---------- Rendering -----------------------------------------------------
-// Latency status pill — uses the SAME .status-pill classes the edge app
-// uses for its Edge Link indicator so the visual language matches.
-function buildLatencyPill() {
-  const l = state.latency || {};
-  const age = l.last_age_ms;
-  const rtt = l.last_rtt_ms;
-  const tx = l.transport || "polling";
-  let cls = "status-online";
-  let label = "LIVE";
-  if (age == null) { cls = "status-muted"; label = "LOADING"; }
-  else if (age > 3000) { cls = "status-offline"; label = "STALE"; }
-  else if (age > 1000) { cls = "status-warning"; label = "DELAYED"; }
-  else if (tx !== "realtime") { cls = "status-online"; label = "POLLING"; }
-  const fmt = (v) => v == null ? "—" : v < 1000 ? `${Math.round(v)} ms` : `${(v / 1000).toFixed(1)} s`;
-  const title = `Transport: ${tx === "realtime" ? "WebSocket push" : "HTTP polling"}` +
-                `\nLatest sample age: ${fmt(age)}` +
-                `\nLast request round-trip: ${fmt(rtt)}` +
-                `\nLast update: ${l.last_event_at ? new Date(l.last_event_at).toLocaleTimeString() : "—"}`;
-  return el("span", { class: `status-pill ${cls}`, title, "aria-label": title },
-    el("span", { class: "pill-dot" }),
-    el("span", {}, `${label} · ${fmt(age)}`),
-  );
-}
+    // Live-append: subscribe to historian inserts for each (gw,tag) pair.
+    ensureHistorianChannel();
+    let rafScheduled = false;
+    const handler = (row) => {
+      if (!row || !row.tag_name) return;
+      const match = defs.find((s) => s.gateway_id === row.gateway_id && s.tag_name === row.tag_name);
+      if (!match) return;
+      const buf = buffersRef.current.get(match.id);
+      const v = Number(row.value);
+      if (!Number.isFinite(v)) return;
+      buf.set(row.ts_utc, v);
+      // Throttle the merge to one per animation frame.
+      if (rafScheduled) return;
+      rafScheduled = true;
+      requestAnimationFrame(() => {
+        rafScheduled = false;
+        if (stopped) return;
+        setData(buildMergedFromBuffers(defs, buffersRef.current, maxPoints));
+      });
+    };
+    historianSubscribers.add(handler);
 
-// Cheap re-render of just the pill — called by both the 1 Hz tick and the
-// data fetchers. Avoids ripping the whole header DOM each second.
-function renderHeaderLatency() {
-  const slot = $("#header-latency-slot");
-  if (!slot) return;
-  updateLatencyAge();
-  slot.replaceChildren(buildLatencyPill());
-}
+    return () => {
+      stopped = true;
+      historianSubscribers.delete(handler);
+    };
+  }, [open, payload, rangeMs, maxPoints]);
 
-// Theme toggle — same behaviour as the edge app's icon-btn theme button.
-function applyTheme(theme) {
-  document.documentElement.setAttribute("data-theme", theme);
-  try { localStorage.setItem("trustnode_lite_theme", theme); } catch (_) {}
-}
+  const { yAxisAutoFit: monAutoFit } = useDashPrefs();
+  const monYProps = buildYAxisProps(!!monAutoFit);
+  if (!open) return null;
+  const title = payload?.widget
+    ? widgetTitle(payload.widget) || "Tag Monitor"
+    : `${payload?.tag_name || ""} · ${payload?.gateway_name || payload?.gateway_id || ""}`;
+  const hasRight = seriesDefs.some((s) => s.axis === "right");
+  const widgetType = String(payload?.widget?.type || "line_chart");
+  const labelFmt = (v) => (data && data.find((p) => p.idx === v)?.ts) || String(v);
 
-function currentTheme() {
-  try {
-    const stored = localStorage.getItem("trustnode_lite_theme");
-    if (stored === "light" || stored === "dark") return stored;
-  } catch (_) {}
-  return "light"; // default light, matches the edge app
-}
-
-function toggleTheme() {
-  const next = currentTheme() === "dark" ? "light" : "dark";
-  applyTheme(next);
-  renderHeader();
-}
-
-// Inline SVG icons matching the edge app's icon-btn style.
-function icoBell() { return el("span", { class: "ico", html: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>' }); }
-function icoRefresh() { return el("span", { class: "ico", html: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>' }); }
-function icoSun() { return el("span", { class: "ico", html: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>' }); }
-function icoMoon() { return el("span", { class: "ico", html: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>' }); }
-function icoSignOut() { return el("span", { class: "ico", html: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>' }); }
-
-function renderHeader() {
-  const root = $("#header-root");
-  if (!root) return;
-  const label = state.tenantLabel || cfg?.customer_label || "TrustNode";
-
-  const headerLeft = el("div", { class: "header-left" },
-    el("div", { class: "brand" },
-      el("img", {
-        src: "./trustnode_logo.png",
-        alt: "TrustNode",
-        class: "brand-full-logo",
-        onerror: (e) => { e.target.style.display = "none"; },
-      })
-    )
-  );
-
-  const edges = state.edges || [];
-  const headerCenter = el("div", { class: "header-center" },
-    el("div", { class: "header-cloud-controls" },
-      el("span", { class: "header-cloud-label" }, "Customer"),
-      el("span", { style: { fontWeight: "600", fontSize: "13px" } }, label),
-      edges.length > 1
-        ? el("select", {
-            class: "header-edge-select",
-            value: state.selectedEdge || "",
-            onchange: (e) => {
-              state.selectedEdge = e.target.value;
-              try { localStorage.setItem("tnlite-edge", state.selectedEdge); } catch (_) {}
-              renderBody();
-            }
-          },
-            el("option", { value: "" }, "All edges"),
-            ...edges.map((eid) => el("option", { value: eid, selected: eid === state.selectedEdge ? "" : null }, eid))
-          )
-        : null,
-      el("span", { id: "header-latency-slot" }, buildLatencyPill())
-    )
-  );
-
-  const theme = currentTheme();
-  const headerRight = el("div", { class: "header-right" },
-    el("button", {
-      class: "icon-btn",
-      title: "Notifications",
-      onclick: () => { state.tab = "alarms"; renderNav(); renderBody(); startPolls(); }
-    }, icoBell()),
-    el("button", {
-      class: "icon-btn",
-      title: "Refresh",
-      onclick: () => window.location.reload(),
-    }, icoRefresh()),
-    el("button", {
-      class: "icon-btn",
-      title: `Switch to ${theme === "dark" ? "light" : "dark"} mode`,
-      onclick: toggleTheme,
-    }, theme === "dark" ? icoSun() : icoMoon()),
-    el("button", {
-      class: "icon-btn",
-      title: "Sign out",
-      onclick: async () => {
-        if (supabase) await supabase.auth.signOut().catch(() => {});
-        session = null;
-        render();
-      },
-    }, icoSignOut()),
-  );
-
-  root.replaceChildren(headerLeft, headerCenter, headerRight);
-}
-
-function renderLive() {
-  const tiles = (state.liveRows || []).map((r) => ({
-    key: `${r.gateway_id}|${r.tag_name}`,
-    gateway_id: r.gateway_id || "",
-    gateway_name: r.gateway_name || r.gateway_id || "",
-    tag_name: r.tag_name || "",
-    value: r.value,
-    ts: r.ts_utc || "",
-  })).filter((t) => t.tag_name);
-
-  if (state.liveError && tiles.length === 0) {
-    return el("div", {},
-      el("div", { class: "banner" }, `Live read failed: ${state.liveError}`),
-      el("div", { class: "empty" }, "No data to display.")
-    );
-  }
-  if (tiles.length === 0) {
-    return el("div", { class: "empty" }, el("div", { class: "spinner" }), " loading…");
-  }
-  return el("div", {},
-    el("div", { class: "section" },
-      el("h2", {}, "Live readings"),
-      el("span", { class: "meta", "data-live-refreshed-at": "" },
-        `${tiles.length} tags · refreshed ${fmtAge(new Date(state.liveAt).toISOString())} ago`)
-    ),
-    el("div", { class: "tile-grid" },
-      ...tiles.map((t) => el("button", {
-        class: `tile ${freshnessClass(t.ts)}`,
-        "data-gw": t.gateway_id,
-        "data-tag": t.tag_name,
-        onclick: () => openDrawer(t.gateway_id, t.gateway_name, t.tag_name, t.value, t.ts),
-      },
-        el("span", { class: "age" }, fmtAge(t.ts)),
-        el("div", { class: "tag" }, t.tag_name),
-        el("div", { class: "val" }, fmtVal(t.value)),
-        el("div", { class: "gw" }, t.gateway_name)
-      ))
-    )
-  );
-}
-
-function renderHistory() {
-  if (state.historyError && state.historyRows.length === 0) {
-    return el("div", { class: "banner" }, `History read failed: ${state.historyError}`);
-  }
-  if (state.historyRows.length === 0) {
-    return el("div", { class: "empty" }, el("div", { class: "spinner" }), " loading…");
-  }
-  return el("div", {},
-    el("div", { class: "section" },
-      el("h2", {}, "Historian"),
-      el("span", { class: "meta" }, `${state.historyRows.length} rows`)
-    ),
-    el("div", { class: "hist-table-wrap" },
-      el("table", { class: "hist-table" },
-        el("thead", {},
-          el("tr", {},
-            el("th", {}, "Time"),
-            el("th", {}, "Gateway"),
-            el("th", {}, "Tag"),
-            el("th", {}, "Value"),
-            el("th", {}, "Q")
-          )
-        ),
-        el("tbody", {},
-          ...state.historyRows.map((r) => el("tr", {},
-            el("td", {}, fmtTs(r.ts_utc)),
-            el("td", {}, r.gateway_name || r.gateway_id || "—"),
-            el("td", {}, r.tag_name || "—"),
-            el("td", { class: "num" }, fmtVal(r.value)),
-            el("td", {}, r.quality_label || (r.quality != null ? String(r.quality) : ""))
-          ))
-        )
-      )
-    )
-  );
-}
-
-function renderAlarms() {
-  if (state.alarmError && state.alarmRows.length === 0) {
-    return el("div", { class: "banner" }, `Alarms read failed: ${state.alarmError}`);
-  }
-  if (state.alarmRows.length === 0) {
-    return el("div", { class: "empty" }, "No recent events.");
-  }
-  return el("div", {},
-    el("div", { class: "section" },
-      el("h2", {}, "Recent events"),
-      el("span", { class: "meta" }, `${state.alarmRows.length} entries`)
-    ),
-    ...state.alarmRows.map((r) => {
-      const lvl = String(r.level || "").toLowerCase();
-      const cls = lvl.includes("err") || lvl.includes("crit") ? "error"
-                 : lvl.includes("warn") || lvl.includes("alarm") ? "warn" : "";
-      return el("div", { class: `alarm-row ${cls}` },
-        el("div", { class: "lvl" }),
-        el("div", { class: "body" },
-          el("div", { class: "msg" }, r.message || r.category || "—"),
-          el("div", { class: "meta" }, fmtTs(r.ts_utc), " · ", r.gateway_name || r.gateway_id || r.category || "—")
-        )
-      );
-    })
-  );
-}
-
-function renderPower() {
-  if (state.powerError && state.powerRows.length === 0) {
-    return el("div", { class: "banner" }, `Power read failed: ${state.powerError}`);
-  }
-  if (state.powerRows.length === 0) {
-    return el("div", { class: "empty" }, "No power meters reporting.");
-  }
-  const fields = [
-    ["voltage_v", "V", "Voltage"],
-    ["current_a", "A", "Current"],
-    ["active_power_w", "W", "Active power"],
-    ["power_factor", "", "PF"],
-    ["frequency_hz", "Hz", "Frequency"],
-    ["energy_wh", "Wh", "Energy"],
-  ];
-  return el("div", {},
-    el("div", { class: "section" },
-      el("h2", {}, "Power overview"),
-      el("span", { class: "meta" }, `${state.powerRows.length} device${state.powerRows.length === 1 ? "" : "s"}`)
-    ),
-    ...state.powerRows.map((d) => el("div", { class: "power-card" },
-      el("h3", {}, d.gateway_name || d.gateway_id),
-      el("div", { class: "power-grid" },
-        ...fields.map(([k, unit, label]) => {
-          const v = d.tags[k];
-          if (v === undefined || v === null) return null;
-          return el("div", { class: "power-stat" },
-            el("div", { class: "label" }, label),
-            el("div", { class: "value" }, `${fmtVal(v)}${unit ? " " + unit : ""}`)
-          );
-        })
-      )
-    ))
-  );
-}
-
-// ============================================================
-// Widget renderer
-// Reads the widget layout the desktop edge published. Each widget has:
-//   id, type, color, position: {x,y,w,h}, config: {...}, title?
-// On desktop (>720px) we use a 20-column CSS grid that respects the
-// configured x/y/w/h; on mobile we stack widgets in a single column.
-// ============================================================
-const SKIPPED_TYPES = new Set(["ip_camera", "cloud_sync_status"]);
-
-function renderDashboard() {
-  if (state.dashboardError) {
-    return el("div", { class: "banner" }, `Dashboard read failed: ${state.dashboardError}`);
-  }
-  const widgets = (state.dashboardWidgets || [])
-    .filter((w) => w && !SKIPPED_TYPES.has(String(w.type || "")));
-
-  // Toolbar always renders so the viewer can switch profile / per-row
-  // even before any widgets are configured.
-  const toolbar = renderDashboardToolbar(widgets.length);
-
-  if (widgets.length === 0) {
-    return el("div", {},
-      toolbar,
-      el("div", { class: "empty" },
-        "No dashboard widgets have been published from the edge yet. ",
-        "Configure widgets in the TrustNode desktop app and they will appear here.")
-    );
-  }
-  // Build a fast lookup so KPI/chart widgets can find their live value.
-  const liveByKey = new Map();
-  for (const r of state.liveRows) {
-    liveByKey.set(`${r.gateway_id}|${r.tag_name}`, r);
-  }
-  const prefs = state.dashPrefs || {};
-  const perRow = Math.max(1, Math.min(2, Number(prefs.perRow) || 2));
-  const cardH  = Math.max(140, Math.min(520, Number(prefs.cardHeight) || 220));
-  return el("div", {},
-    toolbar,
-    el("div", {
-      class: `widget-flow per-row-${perRow}`,
-      style: { "--lite-card-height": `${cardH}px` },
-    },
-      ...widgets.map((w) => renderWidget(w, liveByKey))
-    )
-  );
-}
-
-// Dashboard toolbar: profile dropdown, per-row toggle, card-height slider,
-// sample count, online-gateway summary badge. Same gestalt as the desktop
-// dashboard configurator but read-only (the underlying layout is operator-
-// owned; the viewer only tweaks how they SEE it locally).
-function renderDashboardToolbar(widgetCount) {
-  const prefs = state.dashPrefs || {};
-  const profiles = state.dashboardProfiles || [];
-  const onlineGateways = Object.entries(state.gatewayLastSeen || {})
-    .filter(([_, t]) => Date.now() - t < 30_000).length;
-  const totalGateways = Object.keys(state.gatewayLastSeen || {}).length;
-
-  return el("div", { class: "dash-toolbar" },
-    el("div", { class: "dash-toolbar-left" },
-      el("h2", { class: "section-h2" }, "Dashboard"),
-      el("span", { class: "section-meta" }, `${widgetCount} widget${widgetCount === 1 ? "" : "s"}`),
-    ),
-    el("div", { class: "dash-toolbar-right" },
-      // Online gateways badge — green if any gateway has fresh data
-      el("span", {
-        class: `status-pill ${onlineGateways > 0 ? "status-online" : "status-offline"}`,
-        title: totalGateways === 0
-          ? "No gateways reporting"
-          : `${onlineGateways} of ${totalGateways} gateways reporting within 30s`,
-      },
-        el("span", { class: "pill-dot" }),
-        el("span", {}, `Gateways: ${onlineGateways}/${totalGateways || "0"}`),
+  return h("div", { className: "monitor-back", onClick: (e) => { if (e.target.classList.contains("monitor-back")) onClose(); } },
+    h("div", { className: "monitor" },
+      h("div", { className: "monitor-head" },
+        h("h3", null, title),
+        h("button", { className: "close", onClick: onClose }, "Close")
       ),
-      // Profile dropdown — only when there are 2+
-      profiles.length > 1
-        ? el("label", { class: "dash-control" },
-            el("span", { class: "dash-control-label" }, "Profile"),
-            el("select", {
-              value: state.activeProfileKey || "",
-              onchange: (e) => setActiveProfile(e.target.value),
-            },
-              ...profiles.map((p) => el("option", {
-                value: p.key,
-                selected: p.key === state.activeProfileKey ? "" : null,
-              }, p.label))
+      h("div", { className: "monitor-chart-wrap" },
+        data == null ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…") :
+        error       ? h("div", { className: "banner" }, error) :
+        (data.length === 0 || seriesDefs.length === 0)
+          ? h("div", { className: "empty" }, "No samples in this range.")
+          : h(ResponsiveContainer, { width: "100%", height: "100%" },
+              h(buildChartRoot(widgetType, seriesDefs.length), { data, margin: { top: 12, right: 16, left: 8, bottom: 4 } },
+                h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
+                h(XAxis, buildXAxisProps(data)),
+                h(YAxis, { ...monYProps, yAxisId: "left" }),
+                hasRight ? h(YAxis, { ...monYProps, yAxisId: "right", orientation: "right" }) : null,
+                h(Tooltip, { ...chartTooltipProps, labelFormatter: labelFmt, formatter: (v, n) => [fmtVal(v), n] }),
+                h(Legend, { wrapperStyle: { fontSize: 12, color: "var(--muted, #8a98ab)" } }),
+                ...seriesDefs.map((s) => renderSeriesElement(s, widgetType))
+              )
+            )
+      ),
+      h("div", { className: "monitor-meta" },
+        h("span", { className: "status-pill status-online" },
+          h("span", { className: "pill-dot" }),
+          h("span", null, "LIVE")
+        ),
+        h("span", null, "Series: ", seriesDefs.length),
+        h("span", null, "Samples: ", data ? data.length : 0),
+        h("label", { className: "monitor-points-pick" },
+          h("span", null, "Points"),
+          h("select", {
+            value: String(maxPoints),
+            onChange: (e) => setMaxPoints(Number(e.target.value)),
+          },
+            ...[50, 100, 200, 500, 1000, 2000, 5000].map((n) =>
+              h("option", { key: n, value: String(n) }, String(n))
             )
           )
-        : null,
-      // Per-row toggle (1 or 2 cards per row)
-      el("label", { class: "dash-control" },
-        el("span", { class: "dash-control-label" }, "Per row"),
-        el("div", { class: "seg" },
-          el("button", {
-            class: `seg-btn ${(prefs.perRow || 2) === 1 ? "active" : ""}`,
-            onclick: () => setDashPref("perRow", 1),
-          }, "1"),
-          el("button", {
-            class: `seg-btn ${(prefs.perRow || 2) === 2 ? "active" : ""}`,
-            onclick: () => setDashPref("perRow", 2),
-          }, "2"),
         )
       ),
-      // Card height slider
-      el("label", { class: "dash-control" },
-        el("span", { class: "dash-control-label" }, "Card height"),
-        el("input", {
-          type: "range",
-          min: "140",
-          max: "520",
-          step: "20",
-          value: String(prefs.cardHeight || 220),
-          oninput: (e) => setDashPref("cardHeight", Number(e.target.value)),
-        }),
-        el("span", { class: "dash-control-value" }, `${prefs.cardHeight || 220}px`),
-      ),
-      // Sample count (chart history length)
-      el("label", { class: "dash-control" },
-        el("span", { class: "dash-control-label" }, "Samples"),
-        el("select", {
-          value: String(prefs.sampleCount || 20),
-          onchange: (e) => {
-            setDashPref("sampleCount", Number(e.target.value));
-            // Invalidate cached chart data so charts re-fetch with the new count.
-            chartDataCache.clear();
-          },
-        },
-          ...[20, 50, 100, 250, 500, 1000].map((n) => el("option", {
-            value: String(n),
-            selected: (prefs.sampleCount || 20) === n ? "" : null,
-          }, String(n)))
-        )
-      ),
-    )
-  );
-}
-
-function widgetTitle(w) {
-  const cfg = w?.config || {};
-  return String(w?.title || cfg.title || cfg.tag_name || cfg.text || "").trim();
-}
-
-function renderWidget(w, liveByKey) {
-  const type = String(w?.type || "");
-  const cfg = w?.config || {};
-  const color = String(w?.color || "#14a89a");
-  const wrap = (inner, extraClass = "") => el("div", {
-    class: `widget widget-${type} ${extraClass}`,
-    "data-widget-id": w?.id || "",
-    "data-gw": cfg.gateway_id || "",
-    "data-tag": cfg.tag_name || "",
-  }, inner);
-
-  if (type === "fixed_text") {
-    return wrap(el("div", { class: "widget-body widget-text" }, cfg.text || ""));
-  }
-  if (type === "divider") {
-    return wrap(el("div", { class: "widget-body widget-divider" }, cfg.text || ""));
-  }
-  if (type === "image") {
-    if (!cfg.source_url) return wrap(el("div", { class: "widget-empty muted" }, "no image"));
-    return wrap(el("img", { class: "widget-image", src: cfg.source_url, alt: widgetTitle(w) || "image" }));
-  }
-  if (type === "text_kpi" || type === "value_kpi") {
-    const row = liveByKey.get(`${cfg.gateway_id}|${cfg.tag_name}`);
-    const value = row ? row.value : null;
-    const ts = row ? row.ts_utc : null;
-    const isText = type === "text_kpi";
-    const title = widgetTitle(w) || cfg.tag_name || "—";
-    return wrap(
-      el("button", {
-        class: `widget-kpi ${freshnessClass(ts)}`,
-        onclick: () => cfg.tag_name && openDrawer(cfg.gateway_id, cfg.gateway_id || "", cfg.tag_name, value, ts),
-      },
-        el("div", { class: "widget-title" }, title),
-        el("div", { class: "widget-value", style: { color } },
-          isText ? (row?.value_text || row?.quality_label || (value == null ? "—" : String(value)))
-                 : fmtVal(value)
-        ),
-        el("div", {
-          class: "widget-sub",
-          "data-gw-name": (cfg.gateway_name || cfg.gateway_id || "—"),
-        },
-          (cfg.gateway_name || cfg.gateway_id || "—"),
-          " · ", fmtAge(ts), " ago"
-        ),
-      ),
-      "widget-kpi-wrap"
-    );
-  }
-  if (type === "meter_chart") {
-    const row = liveByKey.get(`${cfg.gateway_id}|${cfg.tag_name}`);
-    const value = Number(row?.value);
-    const min = Number(cfg.meter_min ?? cfg.min ?? 0);
-    const max = Number(cfg.meter_max ?? cfg.max ?? 100);
-    const ts = row ? row.ts_utc : null;
-    return wrap(
-      el("button", {
-        class: `widget-meter ${freshnessClass(ts)}`,
-        onclick: () => cfg.tag_name && openDrawer(cfg.gateway_id, cfg.gateway_id || "", cfg.tag_name, value, ts),
-      },
-        el("div", { class: "widget-title" }, widgetTitle(w) || cfg.tag_name || "—"),
-        renderMeterSvg(value, min, max, color),
-        el("div", { class: "widget-sub" }, fmtAge(ts), " ago"),
-      ),
-      "widget-meter-wrap"
-    );
-  }
-  if (type === "pie_chart") {
-    return wrap(
-      el("div", { class: "widget-body" },
-        el("div", { class: "widget-title" }, widgetTitle(w) || "Pie"),
-        el("div", { class: "widget-pie-mount", "data-w": w?.id || "" })
-      ),
-      "widget-pie-wrap"
-    );
-  }
-  if (type === "line_chart" || type === "line_area_chart" || type === "bar_chart") {
-    // Mounting point; chart instances are rendered after DOM lands.
-    return wrap(
-      el("div", { class: "widget-body widget-chart" },
-        el("div", { class: "widget-title" }, widgetTitle(w) || cfg.tag_name || "—"),
-        el("div", { class: "widget-chart-mount", "data-w": w?.id || "",
-                    "data-type": type,
-                    "data-gw": cfg.gateway_id || "",
-                    "data-tag": cfg.tag_name || "",
-                    "data-color": color }),
-      ),
-      "widget-chart-wrap"
-    );
-  }
-  if (type === "table_list") {
-    return wrap(
-      el("div", { class: "widget-body" },
-        el("div", { class: "widget-title" }, widgetTitle(w) || "Recent readings"),
-        el("div", { class: "widget-table-mount", "data-w": w?.id || "",
-                    "data-gw": cfg.gateway_id || "",
-                    "data-tag": cfg.tag_name || "" }),
-      ),
-      "widget-table-wrap"
-    );
-  }
-  // Unknown / unsupported type — show a small placeholder.
-  return wrap(el("div", { class: "widget-empty muted" }, type || "widget"));
-}
-
-// SVG arc for the meter widget. Stays simple — semicircle 0..180 deg.
-function renderMeterSvg(value, min, max, color) {
-  const v = Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : min;
-  const pct = (max > min) ? (v - min) / (max - min) : 0;
-  const angle = -90 + pct * 180; // -90deg..+90deg
-  const cx = 60, cy = 60, r = 46;
-  const trackPath = "M 14 60 A 46 46 0 0 1 106 60";
-  // Compute path for the filled arc.
-  const startA = -180 * Math.PI / 180;
-  const endA = (angle - 90) * Math.PI / 180; // because arc starts from -180deg of unit circle
-  const x1 = cx + r * Math.cos(startA), y1 = cy + r * Math.sin(startA);
-  const x2 = cx + r * Math.cos(endA),   y2 = cy + r * Math.sin(endA);
-  const large = (endA - startA) > Math.PI ? 1 : 0;
-  const fillPath = `M ${x1.toFixed(1)} ${y1.toFixed(1)} A ${r} ${r} 0 ${large} 1 ${x2.toFixed(1)} ${y2.toFixed(1)}`;
-  return el("div", { class: "widget-meter-svg",
-                     html: `
-    <svg viewBox="0 0 120 80" preserveAspectRatio="xMidYMax meet" width="100%" height="100%">
-      <path d="${trackPath}" stroke="#2a2a2a55" stroke-width="10" fill="none" stroke-linecap="round"/>
-      <path d="${fillPath}" stroke="${color}" stroke-width="10" fill="none" stroke-linecap="round"/>
-      <text x="60" y="65" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="18" font-weight="700" fill="currentColor">${fmtVal(v)}</text>
-    </svg>` });
-}
-
-// Fetch the last-N readings for a (gateway, tag) pair, using an in-memory
-// cache so identical widgets don't re-hit Supabase on every render.
-//
-// Cache rules:
-//   - Fresh entry (< CHART_TTL_MS old) → return cached rows, no fetch.
-//   - Stale entry AND gateway online → refresh from Supabase.
-//   - Stale entry AND gateway offline → keep showing the stale rows (the
-//     viewer would otherwise see an empty chart for an off-shift gateway).
-async function getChartRowsCached(gw, tag, sampleCount) {
-  const key = `${gw}|${tag}|${sampleCount}`;
-  const now = Date.now();
-  const hit = chartDataCache.get(key);
-  if (hit && (now - hit.fetched_at) < CHART_TTL_MS) return hit.rows;
-  if (hit && !isGatewayOnline(gw)) {
-    // Show stale data and let the viewer know via the offline badge —
-    // don't bother Supabase when the gateway can't be feeding new rows anyway.
-    return hit.rows;
-  }
-  // Fetch latest-N rows directly (cheaper than range scan + slice).
-  const { data, error } = await supabase
-    .from("historian_readings")
-    .select("ts_utc, value")
-    .eq("tag_name", tag)
-    .eq("gateway_id", gw)
-    .order("ts_utc", { ascending: false })
-    .limit(Math.max(2, Math.min(2000, Number(sampleCount) || 20)));
-  if (error) throw error;
-  const rows = (data || []).slice().reverse(); // ascending for charts
-  chartDataCache.set(key, { rows, fetched_at: now });
-  return rows;
-}
-
-// After the dashboard renders, walk every chart/table/pie mount and
-// populate it with real data. Called from renderDashboardCombined.
-async function mountWidgetData() {
-  const sampleCount = Number(state.dashPrefs?.sampleCount) || 20;
-
-  // Tear down the previous chart instances before re-mounting so we don't
-  // leak DOM nodes or duplicate live-append entries when the dashboard
-  // re-renders (e.g. profile switch, per-row toggle).
-  for (const [, entry] of liveCharts) {
-    try { entry.plot?.destroy?.(); } catch (_) {}
-  }
-  liveCharts.clear();
-
-  // ---- Inline charts (line/area/bar) ----
-  if (typeof uPlot === "undefined") return;
-  const chartMounts = document.querySelectorAll(".widget-chart-mount");
-  for (const m of chartMounts) {
-    const gw = m.getAttribute("data-gw") || "";
-    const tag = m.getAttribute("data-tag") || "";
-    const type = m.getAttribute("data-type") || "line_chart";
-    const color = m.getAttribute("data-color") || "#14a89a";
-    if (!tag) { m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no tag")); continue; }
-    try {
-      const rows = await getChartRowsCached(gw, tag, sampleCount);
-      if (!rows || rows.length === 0) {
-        m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no samples"));
-        continue;
-      }
-      const xs = rows.map((r) => Math.floor(Date.parse(r.ts_utc) / 1000));
-      const ys = rows.map((r) => { const n = Number(r.value); return Number.isFinite(n) ? n : null; });
-      m.innerHTML = "";
-      const w = m.clientWidth || 240;
-      const h = m.clientHeight || 140;
-      const seriesCfg =
-        type === "bar_chart" ?
-          { label: tag, stroke: color, fill: color, paths: uPlot?.paths?.bars?.({ size: [0.8] }) || undefined, points: { show: false } } :
-        type === "line_area_chart" ?
-          { label: tag, stroke: color, fill: color + "33", width: 1.5, points: { show: false } } :
-          { label: tag, stroke: color, width: 1.5, points: { show: false } };
-      const plot = new uPlot({
-        width: w, height: h, cursor: { show: false }, legend: { show: false },
-        scales: { x: { time: true } },
-        series: [{}, seriesCfg],
-        axes: [
-          { stroke: "#8a98ab", size: 18, grid: { show: false } },
-          { stroke: "#8a98ab", size: 30, grid: { stroke: "rgba(138,152,171,0.15)" } },
-        ],
-      }, [xs, ys], m);
-      // Register so the realtime historian subscription can append rows.
-      liveCharts.set(`${gw}|${tag}`, { plot, xs, ys, sampleCount });
-      // Add an offline overlay if the gateway hasn't been seen in 30s.
-      if (gw && !isGatewayOnline(gw)) {
-        const overlay = el("div", { class: "widget-offline-overlay", title: "Gateway offline" }, "OFFLINE");
-        m.appendChild(overlay);
-      }
-    } catch (e) {
-      m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "chart err"));
-    }
-  }
-
-  // Make sure the realtime historian subscription is up. We only subscribe
-  // once we have charts to feed — there's no point holding a WS open if the
-  // dashboard has only KPIs and tables.
-  if (liveCharts.size > 0 && !historianChannel) {
-    subscribeHistorian();
-  }
-
-  // ---- Table widgets ----
-  const tableMounts = document.querySelectorAll(".widget-table-mount");
-  for (const m of tableMounts) {
-    const gw = m.getAttribute("data-gw") || "";
-    const tag = m.getAttribute("data-tag") || "";
-    if (!tag) { m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no tag")); continue; }
-    try {
-      const rows = await getChartRowsCached(gw, tag, sampleCount);
-      const last = (rows || []).slice().reverse();
-      if (last.length === 0) { m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no samples")); continue; }
-      m.replaceChildren(el("table", { class: "hist-table", style: { fontSize: "11px" } },
-        el("thead", {}, el("tr", {}, el("th", {}, "Time"), el("th", {}, "Value"))),
-        el("tbody", {}, ...last.map((r) =>
-          el("tr", {}, el("td", {}, fmtTs(r.ts_utc)), el("td", { class: "num" }, fmtVal(r.value)))
-        )),
-      ));
-    } catch (e) {
-      m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "table err"));
-    }
-  }
-
-  // ---- Pie charts — same uPlot lib isn't great for pies, render a simple SVG ----
-  const pieMounts = document.querySelectorAll(".widget-pie-mount");
-  for (const m of pieMounts) {
-    m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "pie pending"));
-  }
-}
-
-function renderDrawer() {
-  if (!state.drawer) return null;
-  const d = state.drawer;
-  return el("div", { class: "drawer-back", onclick: (e) => { if (e.target.classList.contains("drawer-back")) closeDrawer(); } },
-    el("div", { class: "drawer" },
-      el("header", {},
-        el("h3", {}, `${d.tag_name} · ${d.gateway_name || d.gateway_id}`),
-        el("button", { class: "close", onclick: closeDrawer }, "Close")
-      ),
-      el("div", { class: "chart-wrap", id: "chart-wrap" },
-        d.loading
-          ? el("div", { class: "empty" }, el("div", { class: "spinner" }), " loading…")
-          : d.error
-            ? el("div", { class: "banner" }, d.error)
-            : (d.rows && d.rows.length > 0)
-              ? el("div", { id: "uplot-mount", style: { width: "100%", height: "300px" } })
-              : el("div", { class: "empty" }, "No samples in this range.")
-      ),
-      el("div", { class: "chart-meta" },
-        el("span", {}, "Latest: ", el("strong", {}, fmtVal(d.value))),
-        el("span", {}, "Updated: ", fmtTs(d.ts)),
-        el("span", {}, "Samples: ", d.rows ? d.rows.length : 0)
-      ),
-      el("div", { class: "range-tabs" },
-        ...RANGE_OPTS.map((opt) => el("button", {
-          class: d.range_ms === opt.ms ? "active" : "",
-          onclick: () => setDrawerRange(opt.ms),
+      h("div", { className: "range-tabs" },
+        ...RANGE_OPTS.map((opt) => h("button", {
+          key: opt.label,
+          className: rangeMs === opt.ms ? "active" : "",
+          onClick: () => setRangeMs(opt.ms),
         }, opt.label))
       )
     )
   );
 }
 
-function navItems() {
-  // Order matters: Dashboard (live) -> Power -> Historian -> Reporting -> Alarms.
-  // We dropped the separate "Live" item because the Dashboard now IS the live
-  // tile grid plus any configured widgets — same single source of truth a
-  // remote operator wants to see first.
-  const items = [["dashboard", icoGrid(), "Dashboard"]];
-  if (cfg?.show_power_tab !== false) items.push(["power", icoBolt(), "Power"]);
-  items.push(["history", icoList(), "Historian"]);
-  if (cfg?.show_reporting_tab !== false) items.push(["reporting", icoReport(), "Reporting"]);
-  if (cfg?.show_alarms_tab !== false) items.push(["alarms", icoBell(), "Alarms"]);
-  return items;
+// ============================================================
+// Dashboard prefs (per-row, card-height, sample-count)
+// ============================================================
+// `yAxisAutoFit` — when true, chart Y-axes hug `[dataMin, dataMax]` so small
+// variations are visible. When false (default) Recharts pads the domain with
+// rounded ticks (`['auto', 'auto']`), giving more headroom but flattening
+// small swings. Toggle from the Settings modal.
+const DashPrefsCtx = React.createContext({ perRow: 2, cardHeight: 220, sampleCount: 20, yAxisAutoFit: false });
+function useDashPrefs() { return React.useContext(DashPrefsCtx); }
+function useDashSamples() { return useDashPrefs().sampleCount; }
+
+const DEFAULT_DASH_PREFS = { perRow: 2, cardHeight: 220, sampleCount: 20, yAxisAutoFit: false };
+function loadDashPrefs() {
+  try {
+    const raw = localStorage.getItem("tnlite-dash-prefs");
+    if (raw) return { ...DEFAULT_DASH_PREFS, ...JSON.parse(raw) };
+  } catch (_) {}
+  return { ...DEFAULT_DASH_PREFS };
+}
+function saveDashPrefs(p) {
+  try { localStorage.setItem("tnlite-dash-prefs", JSON.stringify(p)); } catch (_) {}
 }
 
-// Sidebar (desktop) navigation matching the edge app's nav-section + nav-item.
-function renderSidebar() {
-  const root = $("#sidebar-root");
-  if (!root) return;
-  root.replaceChildren(
-    el("div", { class: "sidebar-scroll" },
-      el("div", { class: "nav-section" },
-        el("div", { class: "nav-group-title" }, "Overview"),
-        ...navItems().map(([key, ico, label]) => el("button", {
-          class: `nav-item ${state.tab === key ? "active" : ""}`,
-          onclick: () => {
-            if (state.tab === key) return;
-            state.tab = key;
-            renderNav();
-            renderBody();
-            startPolls();
-          },
+// ============================================================
+// Header + Sidebar + Tabs
+// ============================================================
+function StatusPill({ liveRows, transport }) {
+  // Find newest ts.
+  let newest = 0;
+  for (const r of liveRows) {
+    const t = Date.parse(r.ts_utc || 0);
+    if (Number.isFinite(t) && t > newest) newest = t;
+  }
+  const age = newest ? Math.max(0, Date.now() - newest) : null;
+  let label = "LIVE", cls = "status-online";
+  if (age == null) { label = "LOADING"; cls = "status-muted"; }
+  else if (age > 3000) { label = "STALE"; cls = "status-offline"; }
+  else if (age > 1000) { label = "DELAYED"; cls = "status-warning"; }
+  else if (transport !== "realtime") { label = "POLLING"; cls = "status-online"; }
+  const fmt = (v) => v == null ? "—" : v < 1000 ? `${Math.round(v)} ms` : `${(v / 1000).toFixed(1)} s`;
+  return h("span", { className: `status-pill ${cls}` },
+    h("span", { className: "pill-dot" }),
+    h("span", null, `${label} · ${fmt(age)}`)
+  );
+}
+
+function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, transport, onJumpAlarms }) {
+  const activeAlarms = useActiveAlarmCount();
+  return h("header", { className: "app-header" },
+    h("div", { className: "header-left" },
+      h("div", { className: "brand" },
+        h("img", {
+          src: "./trustnode_logo.png",
+          alt: "TrustNode",
+          className: "brand-full-logo",
+          onError: (e) => { e.target.style.display = "none"; },
+        })
+      )
+    ),
+    h("div", { className: "header-center" },
+      h("div", { className: "header-cloud-controls" },
+        h("span", { className: "header-cloud-label" }, "Customer"),
+        h("span", { style: { fontWeight: 600, fontSize: 13 } }, tenantLabel),
+        h(StatusPill, { liveRows, transport })
+      )
+    ),
+    h("div", { className: "header-right" },
+      h("button", {
+        className: `icon-btn ${activeAlarms > 0 ? "has-alerts" : ""}`,
+        title: activeAlarms > 0 ? `${activeAlarms} active alarm${activeAlarms === 1 ? "" : "s"}` : "Alarms",
+        onClick: onJumpAlarms,
+      },
+        icBell(),
+        activeAlarms > 0 ? h("span", { className: "alarm-badge" },
+          activeAlarms > 99 ? "99+" : String(activeAlarms)) : null
+      ),
+      h("button", { className: "icon-btn", title: "Refresh", onClick: () => window.location.reload() }, icRefresh()),
+      h("button", {
+        className: "icon-btn",
+        title: `Switch to ${theme === "dark" ? "light" : "dark"} mode`,
+        onClick: onToggleTheme,
+      }, theme === "dark" ? icSun() : icMoon()),
+      h("button", { className: "icon-btn", title: "Sign out", onClick: onSignOut }, icSignOut())
+    )
+  );
+}
+
+const NAV_ITEMS = (cfgIn) => {
+  const items = [["dashboard", icGrid, "Dashboard"]];
+  if (cfgIn?.show_power_tab !== false) items.push(["power", icBolt, "Power"]);
+  items.push(["history", icList, "Historian"]);
+  if (cfgIn?.show_reporting_tab !== false) items.push(["reporting", icReport, "Reporting"]);
+  if (cfgIn?.show_alarms_tab !== false) items.push(["alarms", icBell, "Alarms"]);
+  return items;
+};
+
+function Sidebar({ tab, setTab, user, tenantLabel }) {
+  const items = NAV_ITEMS(cfg);
+  return h("aside", { className: "sidebar" },
+    h("div", { className: "sidebar-scroll" },
+      h("div", { className: "nav-section" },
+        h("div", { className: "nav-group-title" }, "Overview"),
+        ...items.map(([key, ico, label]) => h("button", {
+          key,
+          className: `nav-item ${tab === key ? "active" : ""}`,
+          onClick: () => setTab(key),
         },
-          el("span", { class: "nav-icon" }, ico),
-          el("span", {}, label),
+          h("span", { className: "nav-icon" }, ico()),
+          h("span", null, label)
         ))
       )
     ),
-    el("div", { class: "sidebar-footer" },
-      el("div", { class: "user-box" },
-        el("div", {},
-          el("div", { class: "user-name" }, state.userEmail || "Signed in"),
-          el("div", { class: "user-role" }, state.tenantLabel || cfg?.customer_label || ""),
+    h("div", { className: "sidebar-footer" },
+      h("div", { className: "user-box" },
+        h("div", null,
+          h("div", { className: "user-name" }, user || "Signed in"),
+          h("div", { className: "user-role" }, tenantLabel || "")
         )
       )
     )
   );
 }
 
-// Bottom-tab bar (mobile) — same items, CSS hides this on wide screens.
-function renderTabs() {
-  const root = $("#tabs-root");
-  if (!root) return;
-  root.replaceChildren(
-    ...navItems().map(([key, ico, label]) => el("button", {
-      class: `tab ${state.tab === key ? "active" : ""}`,
-      onclick: () => {
-        if (state.tab === key) return;
-        state.tab = key;
-        renderNav();
-        renderBody();
-        startPolls();
-      }
+function BottomTabs({ tab, setTab }) {
+  const items = NAV_ITEMS(cfg);
+  const activeAlarms = useActiveAlarmCount();
+  return h("nav", { className: "tabs" },
+    ...items.map(([key, ico, label]) => h("button", {
+      key,
+      className: `tab ${tab === key ? "active" : ""} ${key === "alarms" && activeAlarms > 0 ? "has-alerts" : ""}`,
+      onClick: () => setTab(key),
     },
-      el("span", { class: "ico" }, ico),
-      el("span", {}, label)
+      h("span", { className: "ico" },
+        ico(),
+        key === "alarms" && activeAlarms > 0 ? h("span", { className: "alarm-badge alarm-badge-tab" },
+          activeAlarms > 99 ? "99+" : String(activeAlarms)) : null
+      ),
+      h("span", null, label)
     ))
   );
 }
 
-// Re-render both nav surfaces in one call.
-function renderNav() { renderSidebar(); renderTabs(); }
+// ============================================================
+// Dashboard view
+// ============================================================
+// Gear icon button (same style as the edge dashboard toolbar gear)
+const icGear = () => h("span", { dangerouslySetInnerHTML: { __html:
+  '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>'
+} });
 
-// Inline icons used by the nav (sidebar + bottom tabs).
-function icoLive() { return el("span", { html: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>' }); }
-function icoGrid() { return el("span", { html: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>' }); }
-function icoList() { return el("span", { html: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>' }); }
-function icoBolt() { return el("span", { html: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>' }); }
-function icoReport() { return el("span", { html: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>' }); }
-
-// Reporting view. The edge generates reports locally; we do not yet mirror
-// the generated_reports table to Supabase, so for v1 this is an honest
-// placeholder rather than a stub list of fake rows.
-function renderReporting() {
-  return el("div", {},
-    el("div", { class: "section" },
-      el("h2", {}, "Reporting"),
-      el("span", { class: "meta" }, "Read-only")
+// Compact toolbar — only the gateways pill stays visible. All controls
+// move behind a gear button that opens a popover (matches the edge's
+// dashboard configurator gear).
+function DashboardToolbar({ widgetCount, profiles, activeKey, setActiveKey, prefs, setPrefs, gatewayLastSeen, settingsOpen, setSettingsOpen }) {
+  const onlineCount = Object.entries(gatewayLastSeen).filter(([_, t]) => Date.now() - t < 30_000).length;
+  const totalCount = Object.keys(gatewayLastSeen).length;
+  const activeProfile = profiles.find((p) => p.key === activeKey);
+  return h("div", { className: "dash-toolbar" },
+    h("div", { className: "dash-toolbar-left" },
+      h("h2", { className: "section-h2" }, "Dashboard"),
+      h("span", { className: "section-meta" }, `${widgetCount} widget${widgetCount === 1 ? "" : "s"}`),
+      activeProfile ? h("span", { className: "dash-active-profile" }, activeProfile.label) : null
     ),
-    el("div", { class: "card", style: { textAlign: "center", padding: "32px 20px" } },
-      el("div", { style: { fontSize: "14px", fontWeight: "600", marginBottom: "8px" } },
+    h("div", { className: "dash-toolbar-right" },
+      h("span", {
+        className: `status-pill ${onlineCount > 0 ? "status-online" : "status-offline"}`,
+        title: totalCount === 0 ? "No gateways reporting" :
+               `${onlineCount} of ${totalCount} gateways reporting within 30s`,
+      },
+        h("span", { className: "pill-dot" }),
+        h("span", null, `Gateways: ${onlineCount}/${totalCount || "0"}`)
+      ),
+      h("button", {
+        className: `icon-btn dash-gear-btn ${settingsOpen ? "active" : ""}`,
+        title: "Dashboard settings",
+        "aria-label": "Dashboard settings",
+        onClick: () => setSettingsOpen(true),
+      }, icGear())
+    )
+  );
+}
+
+// Settings popover/modal — same controls that used to live in the toolbar.
+function DashboardSettingsModal({ open, onClose, profiles, activeKey, setActiveKey, prefs, setPrefs }) {
+  if (!open) return null;
+  return h("div", {
+    className: "settings-back",
+    onClick: (e) => { if (e.target.classList.contains("settings-back")) onClose(); }
+  },
+    h("div", { className: "settings-card" },
+      h("div", { className: "settings-head" },
+        h("h3", null, "Dashboard settings"),
+        h("button", { className: "close", onClick: onClose }, "Close")
+      ),
+      h("div", { className: "settings-body" },
+        profiles.length > 1 ? h("div", { className: "settings-row" },
+          h("label", null, "Profile"),
+          h("select", {
+            value: activeKey,
+            onChange: (e) => setActiveKey(e.target.value),
+          }, ...profiles.map((p) => h("option", { key: p.key, value: p.key }, p.label)))
+        ) : null,
+        h("div", { className: "settings-row" },
+          h("label", null, "Cards per row"),
+          h("div", { className: "seg" },
+            h("button", {
+              className: `seg-btn ${prefs.perRow === 1 ? "active" : ""}`,
+              onClick: () => setPrefs({ ...prefs, perRow: 1 }),
+            }, "1 column"),
+            h("button", {
+              className: `seg-btn ${prefs.perRow === 2 ? "active" : ""}`,
+              onClick: () => setPrefs({ ...prefs, perRow: 2 }),
+            }, "2 columns")
+          )
+        ),
+        h("div", { className: "settings-row" },
+          h("label", null, "Samples per chart"),
+          h("select", {
+            value: String(prefs.sampleCount),
+            onChange: (e) => setPrefs({ ...prefs, sampleCount: Number(e.target.value) }),
+          }, ...[10, 20, 50, 100, 250, 500, 1000].map((n) => h("option", { key: n, value: String(n) }, String(n))))
+        ),
+        h("div", { className: "settings-row" },
+          h("label", { title: "When on, the Y axis hugs the actual min/max so small variations stay visible." }, "Auto-fit Y axis"),
+          h("button", {
+            className: `toggle ${prefs.yAxisAutoFit ? "is-on" : ""}`,
+            "aria-pressed": prefs.yAxisAutoFit ? "true" : "false",
+            onClick: () => setPrefs({ ...prefs, yAxisAutoFit: !prefs.yAxisAutoFit }),
+          },
+            h("span", { className: "toggle-track" }, h("span", { className: "toggle-thumb" })),
+            h("span", { className: "toggle-label" }, prefs.yAxisAutoFit ? "On" : "Off")
+          )
+        )
+      )
+    )
+  );
+}
+
+function DashboardView({ liveRows, profiles, active, activeKey, setActiveKey, prefs, setPrefs, gatewayLastSeen, onOpenDrawer, onOpenWidget }) {
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  // ensure historian channel is up so chart widgets can append.
+  useEffect(() => { ensureHistorianChannel(); }, []);
+
+  const widgets = useMemo(() => {
+    const ws = Array.isArray(active?.payload?.widgets) ? active.payload.widgets : [];
+    return ws.filter((w) => w && !SKIPPED_TYPES.has(String(w.type || "")));
+  }, [active]);
+
+  const liveByKey = useMemo(() => {
+    const m = new Map();
+    for (const r of liveRows) m.set(`${r.gateway_id}|${r.tag_name}`, r);
+    return m;
+  }, [liveRows]);
+
+  return h("div", null,
+    h(DashboardToolbar, {
+      widgetCount: widgets.length, profiles, activeKey, setActiveKey,
+      prefs, setPrefs, gatewayLastSeen,
+      settingsOpen, setSettingsOpen,
+    }),
+    h(DashboardSettingsModal, {
+      open: settingsOpen, onClose: () => setSettingsOpen(false),
+      profiles, activeKey, setActiveKey, prefs, setPrefs,
+    }),
+    widgets.length === 0 ?
+      h("div", { className: "empty" },
+        "No dashboard widgets have been published from the edge yet. ",
+        "Configure widgets in the TrustNode desktop app and they will appear here.")
+    :
+      h("div", {
+        className: `widget-flow per-row-${prefs.perRow}`,
+      },
+        ...widgets.map((w) => h(Widget, {
+          key: w.id || `${w.type}-${w.config?.tag_name || Math.random()}`,
+          widget: w,
+          liveByKey,
+          onOpen: onOpenDrawer,
+          onOpenWidget,
+        }))
+      )
+  );
+}
+
+// ============================================================
+// Other tabs (Historian, Alarms, Power, Reporting)
+// ============================================================
+// Historian view with a one-row filter bar: gateway / tag / time range /
+// limit. Filters are server-side so we don't drag thousands of rows down
+// just to grep them client-side. Both gateway and tag use case-insensitive
+// substring matching via ilike. Re-runs whenever a filter changes; auto-
+// refreshes every 5s.
+const HISTORY_RANGES = [
+  { label: "15m", ms: 15 * 60_000 },
+  { label: "1h",  ms: 60 * 60_000 },
+  { label: "6h",  ms: 6 * 60 * 60_000 },
+  { label: "24h", ms: 24 * 60 * 60_000 },
+  { label: "7d",  ms: 7 * 24 * 60 * 60_000 },
+  { label: "All", ms: 0 },
+];
+function HistorianView() {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState("");
+  const [gwFilter, setGwFilter] = useState("");
+  const [tagFilter, setTagFilter] = useState("");
+  const [rangeMs, setRangeMs] = useState(60 * 60_000);
+  const [limit, setLimit] = useState(300);
+
+  useEffect(() => {
+    let stop = false;
+    const f = async () => {
+      let q = supabase
+        .from("historian_readings")
+        .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc")
+        .order("ts_utc", { ascending: false })
+        .limit(Math.max(20, Math.min(5000, Number(limit) || 300)));
+      if (rangeMs > 0) {
+        const from = new Date(Date.now() - rangeMs).toISOString();
+        q = q.gte("ts_utc", from);
+      }
+      if (gwFilter.trim())  q = q.ilike("gateway_id", `%${gwFilter.trim()}%`);
+      if (tagFilter.trim()) q = q.ilike("tag_name", `%${tagFilter.trim()}%`);
+      const { data, error: e } = await q;
+      if (stop) return;
+      if (e) setError(e.message);
+      else { setRows(data || []); setError(""); }
+    };
+    f();
+    const t = setInterval(f, 5000);
+    return () => { stop = true; clearInterval(t); };
+  }, [gwFilter, tagFilter, rangeMs, limit]);
+
+  return h("div", null,
+    h("div", { className: "section" },
+      h("h2", null, "Historian"),
+      h("span", { className: "meta" }, rows ? `${rows.length} rows` : "")
+    ),
+    // One-row filter bar
+    h("div", { className: "hist-filters" },
+      h("input", {
+        className: "hist-filter-input",
+        type: "text",
+        placeholder: "Gateway contains…",
+        value: gwFilter,
+        onChange: (e) => setGwFilter(e.target.value),
+      }),
+      h("input", {
+        className: "hist-filter-input",
+        type: "text",
+        placeholder: "Tag contains…",
+        value: tagFilter,
+        onChange: (e) => setTagFilter(e.target.value),
+      }),
+      h("div", { className: "seg" },
+        ...HISTORY_RANGES.map((opt) => h("button", {
+          key: opt.label,
+          className: `seg-btn ${rangeMs === opt.ms ? "active" : ""}`,
+          onClick: () => setRangeMs(opt.ms),
+        }, opt.label))
+      ),
+      h("select", {
+        className: "hist-filter-input",
+        value: String(limit),
+        onChange: (e) => setLimit(Number(e.target.value)),
+        title: "Max rows to fetch",
+      },
+        ...[100, 300, 500, 1000, 2000].map((n) => h("option", { key: n, value: String(n) }, `${n} rows`))
+      ),
+      (gwFilter || tagFilter) ? h("button", {
+        className: "btn-ghost hist-filter-clear",
+        onClick: () => { setGwFilter(""); setTagFilter(""); },
+      }, "Clear") : null
+    ),
+    error ? h("div", { className: "banner" }, error) : null,
+    rows == null
+      ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…")
+      : !rows.length
+        ? h("div", { className: "empty" }, "no rows match the filters")
+        : h("div", { className: "hist-table-wrap" },
+            h("table", { className: "hist-table" },
+              h("thead", null, h("tr", null,
+                h("th", null, "Time"), h("th", null, "Gateway"),
+                h("th", null, "Tag"), h("th", null, "Value"), h("th", null, "Q"))),
+              h("tbody", null, ...rows.map((r, i) =>
+                h("tr", { key: i },
+                  h("td", { "data-label": "Time" }, fmtTs(r.ts_utc)),
+                  h("td", { "data-label": "Gateway" }, r.gateway_name || r.gateway_id || "—"),
+                  h("td", { "data-label": "Tag" }, r.tag_name || "—"),
+                  h("td", { "data-label": "Value", className: "num" }, fmtVal(r.value)),
+                  h("td", { "data-label": "Quality" }, r.quality_label || (r.quality != null ? String(r.quality) : ""))
+                )))
+            )
+          )
+  );
+}
+
+// Alarms view: shows the alarm RULES the operator configured on the edge
+// (mirrored via triggers_limits.trigger_rules), each evaluated against
+// the latest live_latest row for its (gateway, tag) pair. Realtime updates
+// as live_latest changes — when a value crosses a threshold the row's
+// TRIGGERED badge flips instantly.
+function evalRule(rule, value) {
+  if (rule == null || !Number.isFinite(value)) return false;
+  // Match the edge's two-threshold shape: lower_enabled/lower_operator/lower_value
+  // and upper_enabled/upper_operator/upper_value. If neither lower nor upper is
+  // enabled the rule is informational (never triggers).
+  const cmp = (op, v, t) => {
+    switch (String(op || "").toLowerCase()) {
+      case "<":   case "lt":   return v <  t;
+      case "<=":  case "lte":  return v <= t;
+      case ">":   case "gt":   return v >  t;
+      case ">=":  case "gte":  return v >= t;
+      case "==":  case "eq":   return v === t;
+      case "!=":  case "ne":   return v !== t;
+      default:                  return false;
+    }
+  };
+  const lower = rule.lower_enabled ? cmp(rule.lower_operator || "<", value, Number(rule.lower_value)) : false;
+  const upper = rule.upper_enabled ? cmp(rule.upper_operator || ">=", value, Number(rule.upper_value)) : false;
+  return lower || upper;
+}
+
+function ruleConditionLabel(rule) {
+  const parts = [];
+  if (rule?.lower_enabled) parts.push(`${rule.lower_operator || "<"} ${rule.lower_value}`);
+  if (rule?.upper_enabled) parts.push(`${rule.upper_operator || ">="} ${rule.upper_value}`);
+  return parts.join("  OR  ") || "—";
+}
+
+// Reads the `alarms_setup.payload_json.alarms[]` events list from Supabase
+// in realtime. The edge frontend appends to this list every time a trigger
+// rule fires or clears — same payload schema, so Lite renders the exact
+// same events.
+//
+// `activeOnly` filter is applied in derived state, not in the fetch, so the
+// caller can compute a total count + a filtered list from a single sub.
+function useAlarmEvents(enabled = true) {
+  const [events, setEvents] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!enabled) return;
+    let stop = false;
+    const f = async () => {
+      const { data, error: e } = await supabase
+        .from("alarms_setup")
+        .select("payload_json, updated_utc")
+        .order("updated_utc", { ascending: false })
+        .limit(1);
+      if (stop) return;
+      if (e) { setError(e.message); return; }
+      const row = data && data[0];
+      const list = Array.isArray(row?.payload_json?.alarms) ? row.payload_json.alarms : [];
+      setEvents(list);
+      setError("");
+    };
+    f();
+    const ch = supabase.channel("lite-alarms-events-rt")
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "alarms_setup" },
+        () => f())
+      .subscribe();
+    return () => { stop = true; supabase.removeChannel(ch).catch(() => {}); };
+  }, [enabled]);
+  return { events, error };
+}
+
+// Returns the number of active, unacknowledged alarms — used by the header
+// bell icon to show a red badge with the count.
+function useActiveAlarmCount() {
+  const { events } = useAlarmEvents(true);
+  return useMemo(() => {
+    if (!Array.isArray(events)) return 0;
+    return events.filter((a) => a && a.event_type === "active" && !a.acknowledged).length;
+  }, [events]);
+}
+
+function AlarmsView({ liveRows }) {
+  const [section, setSection] = useState("active");  // "active" | "rules"
+  return h("div", null,
+    h("div", { className: "section" },
+      h("h2", null, "Alarms"),
+      h("div", { className: "seg" },
+        h("button", {
+          className: `seg-btn ${section === "active" ? "active" : ""}`,
+          onClick: () => setSection("active"),
+        }, "Active"),
+        h("button", {
+          className: `seg-btn ${section === "rules" ? "active" : ""}`,
+          onClick: () => setSection("rules"),
+        }, "Rules")
+      )
+    ),
+    section === "active" ? h(ActiveAlarmsList, null) : h(AlarmRulesView, { liveRows })
+  );
+}
+
+// Active alarms list: events with event_type === 'active' AND !acknowledged.
+// Read-only on Lite — acknowledging is an edge-side action because that's
+// where the rule engine lives.
+function ActiveAlarmsList() {
+  const { events, error } = useAlarmEvents(true);
+  const [showAll, setShowAll] = useState(false);  // when true include cleared/acknowledged
+
+  const filtered = useMemo(() => {
+    if (!Array.isArray(events)) return [];
+    if (showAll) return events;
+    return events.filter((a) => a && a.event_type === "active" && !a.acknowledged);
+  }, [events, showAll]);
+
+  const activeCount = useMemo(() => {
+    if (!Array.isArray(events)) return 0;
+    return events.filter((a) => a && a.event_type === "active" && !a.acknowledged).length;
+  }, [events]);
+
+  const sevClass = (s) => {
+    const k = String(s || "").toLowerCase();
+    if (k === "critical") return "status-offline";
+    if (k === "warning")  return "status-warning";
+    return "status-muted";
+  };
+
+  return h("div", null,
+    h("div", { className: "section-sub" },
+      h("span", { className: "meta" },
+        events == null ? "" :
+        `${activeCount} active${activeCount === 1 ? "" : ""} · ${events.length} total in history`),
+      h("button", {
+        className: "btn-ghost",
+        style: { marginLeft: "auto" },
+        onClick: () => setShowAll((s) => !s),
+      }, showAll ? "Active only" : "Show history")
+    ),
+    error ? h("div", { className: "banner" }, error) : null,
+    events == null
+      ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…")
+      : !filtered.length
+        ? h("div", { className: "card", style: { textAlign: "center", padding: "32px 20px" } },
+            h("div", { style: { fontSize: 14, fontWeight: 600, marginBottom: 8 } },
+              showAll ? "No alarm events recorded yet." : "No active alarms."),
+            h("div", { className: "muted", style: { fontSize: 12 } },
+              showAll
+                ? "When a configured limit rule fires on the edge, the event will appear here."
+                : "Everything is within limits right now."))
+        : h("div", { className: "alarm-events" },
+            ...filtered.map((a) => h("div", {
+              key: a.id || `${a.tag}-${a.ts}`,
+              className: `alarm-event ${a.event_type === "active" && !a.acknowledged ? "is-active" : "is-cleared"}`,
+            },
+              h("div", { className: "alarm-event-head" },
+                h("span", { className: `status-pill ${sevClass(a.severity)}` },
+                  h("span", { className: "pill-dot" }),
+                  h("span", null, (a.severity || "info").toUpperCase())
+                ),
+                h("span", { className: "alarm-event-ts" }, fmtTs(a.ts)),
+                a.acknowledged ? h("span", { className: "status-pill status-online" },
+                  h("span", { className: "pill-dot" }),
+                  h("span", null, "ACK")
+                ) : null
+              ),
+              h("div", { className: "alarm-event-msg" }, a.message || `${a.tag} = ${fmtVal(a.value)}`),
+              h("div", { className: "alarm-event-meta" },
+                a.tag ? h("span", null, h("strong", null, "Tag: "), a.tag) : null,
+                (a.gateway_name || a.gateway_id) ? h("span", null,
+                  h("strong", null, "Gateway: "), a.gateway_name || a.gateway_id) : null,
+                a.value != null ? h("span", null, h("strong", null, "Value: "), fmtVal(a.value)) : null,
+                h("span", null, h("strong", null, "State: "),
+                  a.event_type === "clear" ? "cleared" : (a.acknowledged ? "acknowledged" : "active"))
+              )
+            ))
+          )
+  );
+}
+
+function AlarmRulesView({ liveRows }) {
+  const [rules, setRules] = useState(null);
+  const [error, setError] = useState("");
+  const [stateFilter, setStateFilter] = useState("all");  // all | triggered | ok
+  const [search, setSearch] = useState("");
+
+  useEffect(() => {
+    let stop = false;
+    const f = async () => {
+      const { data, error: e } = await supabase
+        .from("triggers_limits")
+        .select("payload_json, version, updated_utc")
+        .order("updated_utc", { ascending: false })
+        .limit(1);
+      if (stop) return;
+      if (e) { setError(e.message); return; }
+      const row = data && data[0];
+      const list = Array.isArray(row?.payload_json?.trigger_rules) ? row.payload_json.trigger_rules : [];
+      setRules(list);
+      setError("");
+    };
+    f();
+    const ch = supabase.channel("lite-alarms-rules-rt")
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "triggers_limits" },
+        () => f())
+      .subscribe();
+    return () => { stop = true; supabase.removeChannel(ch).catch(() => {}); };
+  }, []);
+
+  const liveByKey = useMemo(() => {
+    const m = new Map();
+    for (const r of (liveRows || [])) m.set(`${r.gateway_id}|${r.tag_name}`, r);
+    return m;
+  }, [liveRows]);
+
+  const evaluated = useMemo(() => {
+    if (!Array.isArray(rules)) return [];
+    return rules.map((r, idx) => {
+      const gw  = String(r?.gateway_id || "");
+      const tag = String(r?.tag_name || "");
+      const row = liveByKey.get(`${gw}|${tag}`);
+      const v = row ? Number(row.value) : NaN;
+      const triggered = Number.isFinite(v) ? evalRule(r, v) : false;
+      return {
+        id: r?.id || `rule-${idx}`,
+        name: r?.name || tag || `Rule ${idx + 1}`,
+        gateway_id: gw,
+        tag_name: tag,
+        condition: ruleConditionLabel(r),
+        enabled: r?.enabled !== false,
+        value: row ? row.value : null,
+        ts: row ? row.ts_utc : null,
+        triggered,
+      };
+    });
+  }, [rules, liveByKey]);
+
+  const filtered = useMemo(() => {
+    let list = evaluated;
+    if (stateFilter === "triggered") list = list.filter((r) => r.triggered);
+    else if (stateFilter === "ok")    list = list.filter((r) => !r.triggered && r.enabled);
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      list = list.filter((r) =>
+        (r.name || "").toLowerCase().includes(q) ||
+        (r.tag_name || "").toLowerCase().includes(q) ||
+        (r.gateway_id || "").toLowerCase().includes(q));
+    }
+    return list;
+  }, [evaluated, stateFilter, search]);
+
+  const triggeredCount = evaluated.filter((r) => r.triggered).length;
+
+  return h("div", null,
+    h("div", { className: "section-sub" },
+      h("span", { className: "meta" },
+        rules == null ? "" :
+        `${evaluated.length} rule${evaluated.length === 1 ? "" : "s"} · ${triggeredCount} triggered`)
+    ),
+    h("div", { className: "hist-filters" },
+      h("div", { className: "seg" },
+        ...[["all", "All"], ["triggered", "Triggered"], ["ok", "OK"]].map(([k, label]) =>
+          h("button", {
+            key: k,
+            className: `seg-btn ${stateFilter === k ? "active" : ""}`,
+            onClick: () => setStateFilter(k),
+          }, label))
+      ),
+      h("input", {
+        className: "hist-filter-input",
+        type: "text",
+        placeholder: "Filter by name / tag / gateway",
+        value: search,
+        onChange: (e) => setSearch(e.target.value),
+      }),
+      search ? h("button", { className: "btn-ghost hist-filter-clear",
+                              onClick: () => setSearch("") }, "Clear") : null
+    ),
+    error ? h("div", { className: "banner" }, error) : null,
+    rules == null
+      ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…")
+      : !filtered.length
+        ? h("div", { className: "empty" },
+            evaluated.length === 0
+              ? "No alarm rules have been configured on the edge yet."
+              : "No rules match the filter.")
+        : h("div", { className: "alarm-rules" },
+            ...filtered.map((r) => h("div", {
+              key: r.id,
+              className: `alarm-rule-card ${r.triggered ? "is-triggered" : (r.enabled ? "is-ok" : "is-disabled")}`,
+            },
+              h("div", { className: "alarm-rule-head" },
+                h("div", { className: "alarm-rule-name" }, r.name),
+                h("span", {
+                  className: `status-pill ${r.triggered ? "status-offline" : (r.enabled ? "status-online" : "status-muted")}`,
+                },
+                  h("span", { className: "pill-dot" }),
+                  h("span", null, r.triggered ? "TRIGGERED" : (r.enabled ? "OK" : "DISABLED"))
+                )
+              ),
+              h("div", { className: "alarm-rule-meta" },
+                h("span", null, h("strong", null, "Tag: "), r.tag_name || "—"),
+                h("span", null, h("strong", null, "Gateway: "), r.gateway_id || "—"),
+                h("span", null, h("strong", null, "Condition: "), r.condition),
+                h("span", null, h("strong", null, "Current: "), fmtVal(r.value),
+                  r.ts ? ` · ${fmtAge(r.ts)} ago` : "")
+              )
+            ))
+          )
+  );
+}
+
+// LEGACY app_logs alarm feed — kept until reports/alarm wiring is done.
+function _LegacyAppLogsAlarmsView() {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState("");
+  const [levelFilter, setLevelFilter] = useState("");     // "", "info", "warning", "error", ...
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [gwFilter, setGwFilter] = useState("");
+  const [textFilter, setTextFilter] = useState("");
+  const [limit, setLimit] = useState(200);
+  // Distinct values seen so we can populate the dropdowns.
+  const [knownLevels, setKnownLevels] = useState([]);
+  const [knownCategories, setKnownCategories] = useState([]);
+
+  useEffect(() => {
+    let stop = false;
+    const f = async () => {
+      let q = supabase
+        .from("app_logs")
+        .select("ts_utc, level, category, message, gateway_id, gateway_name")
+        .order("ts_utc", { ascending: false })
+        .limit(Math.max(20, Math.min(2000, Number(limit) || 200)));
+      if (levelFilter) q = q.eq("level", levelFilter);
+      if (categoryFilter) q = q.eq("category", categoryFilter);
+      if (gwFilter.trim()) q = q.ilike("gateway_id", `%${gwFilter.trim()}%`);
+      if (textFilter.trim()) q = q.ilike("message", `%${textFilter.trim()}%`);
+      const { data, error: e } = await q;
+      if (stop) return;
+      if (e) setError(e.message);
+      else {
+        setRows(data || []);
+        setError("");
+        // Refresh dropdown options from what we've seen.
+        const lv = new Set(knownLevels);
+        const cat = new Set(knownCategories);
+        for (const r of data || []) {
+          if (r.level) lv.add(r.level);
+          if (r.category) cat.add(r.category);
+        }
+        setKnownLevels([...lv].sort());
+        setKnownCategories([...cat].sort());
+      }
+    };
+    f();
+    // Realtime: only append if the new row passes the current filters.
+    const ch = supabase.channel("lite-alarms-rt")
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "app_logs" },
+        (payload) => {
+          const r = payload.new || payload.record || null;
+          if (!r) return;
+          if (levelFilter && r.level !== levelFilter) return;
+          if (categoryFilter && r.category !== categoryFilter) return;
+          if (gwFilter.trim() && !String(r.gateway_id || "").toLowerCase().includes(gwFilter.trim().toLowerCase())) return;
+          if (textFilter.trim() && !String(r.message || "").toLowerCase().includes(textFilter.trim().toLowerCase())) return;
+          setRows((prev) => [r, ...(prev || [])].slice(0, Math.max(20, Math.min(2000, Number(limit) || 200))));
+        }).subscribe();
+    return () => { stop = true; supabase.removeChannel(ch).catch(() => {}); };
+  }, [levelFilter, categoryFilter, gwFilter, textFilter, limit]);
+
+  return h("div", null,
+    h("div", { className: "section" },
+      h("h2", null, "Recent events"),
+      h("span", { className: "meta" }, rows ? `${rows.length} entries` : "")
+    ),
+    h("div", { className: "hist-filters" },
+      h("select", {
+        className: "hist-filter-input",
+        value: levelFilter,
+        onChange: (e) => setLevelFilter(e.target.value),
+      },
+        h("option", { value: "" }, "All levels"),
+        ...knownLevels.map((l) => h("option", { key: l, value: l }, l))
+      ),
+      h("select", {
+        className: "hist-filter-input",
+        value: categoryFilter,
+        onChange: (e) => setCategoryFilter(e.target.value),
+      },
+        h("option", { value: "" }, "All categories"),
+        ...knownCategories.map((c) => h("option", { key: c, value: c }, c))
+      ),
+      h("input", {
+        className: "hist-filter-input",
+        type: "text",
+        placeholder: "Gateway contains…",
+        value: gwFilter,
+        onChange: (e) => setGwFilter(e.target.value),
+      }),
+      h("input", {
+        className: "hist-filter-input",
+        type: "text",
+        placeholder: "Message contains…",
+        value: textFilter,
+        onChange: (e) => setTextFilter(e.target.value),
+      }),
+      h("select", {
+        className: "hist-filter-input",
+        value: String(limit),
+        onChange: (e) => setLimit(Number(e.target.value)),
+      },
+        ...[100, 200, 500, 1000].map((n) => h("option", { key: n, value: String(n) }, `${n} rows`))
+      ),
+      (levelFilter || categoryFilter || gwFilter || textFilter) ? h("button", {
+        className: "btn-ghost hist-filter-clear",
+        onClick: () => { setLevelFilter(""); setCategoryFilter(""); setGwFilter(""); setTextFilter(""); },
+      }, "Clear") : null
+    ),
+    error ? h("div", { className: "banner" }, error) : null,
+    rows == null
+      ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…")
+      : !rows.length
+        ? h("div", { className: "empty" }, "No events match the filters.")
+        : h("div", null, ...rows.map((r, i) => {
+            const lvl = String(r.level || "").toLowerCase();
+            const cls = lvl.includes("err") || lvl.includes("crit") ? "error" :
+                        lvl.includes("warn") || lvl.includes("alarm") ? "warn" : "";
+            return h("div", { key: i, className: `alarm-row ${cls}` },
+              h("div", { className: "lvl" }),
+              h("div", { className: "body" },
+                h("div", { className: "msg" }, r.message || r.category || "—"),
+                h("div", { className: "meta" },
+                  fmtTs(r.ts_utc), " · ", r.level || "—",
+                  r.category ? ` · ${r.category}` : "",
+                  r.gateway_id ? ` · ${r.gateway_name || r.gateway_id}` : "")
+              )
+            );
+          }))
+  );
+}
+
+// Tags the edge's power_manager emits per device. Kept in module scope so
+// PowerView and the synthetic chart widgets share one list.
+const POWER_METER_TAGS = ["voltage_v","current_a","active_power_w","energy_wh","power_factor","frequency_hz"];
+
+// Build a synthetic chart-widget shape so we can reuse the existing
+// ChartWidget pipeline (useChartSeries + Recharts) without re-implementing
+// historian fetching. Each entry mirrors a dashboard `line_chart` widget.
+function buildPowerWidget(gw, tag, label, color) {
+  return {
+    id: `power-${gw}-${tag}`,
+    type: "line_chart",
+    config: {
+      title: label,
+      gateway_id: gw,
+      tag_name: tag,
+      color: color,
+      // No compute_rules / no series_extra — single tag.
+    },
+  };
+}
+
+function PowerView({ liveRows }) {
+  const prefs = useDashPrefs();
+  const cardHeight = prefs.cardHeight || 220;
+
+  const byGw = new Map();
+  for (const r of liveRows) {
+    if (!POWER_METER_TAGS.includes(r.tag_name)) continue;
+    const gid = r.gateway_id || "—";
+    if (!byGw.has(gid)) byGw.set(gid, { gateway_id: gid, gateway_name: r.gateway_name || gid, ts_utc: r.ts_utc, tags: {} });
+    const e = byGw.get(gid);
+    e.tags[r.tag_name] = r.value;
+    if (!e.ts_utc || (r.ts_utc && r.ts_utc > e.ts_utc)) e.ts_utc = r.ts_utc;
+  }
+  const list = [...byGw.values()];
+  if (!list.length) return h("div", { className: "empty" }, "No power meters reporting.");
+
+  const fields = [
+    ["voltage_v", "V", "Voltage"], ["current_a", "A", "Current"],
+    ["active_power_w", "W", "Active power"], ["power_factor", "", "PF"],
+    ["frequency_hz", "Hz", "Frequency"], ["energy_wh", "Wh", "Energy"],
+  ];
+
+  return h("div", null,
+    h("div", { className: "section" }, h("h2", null, "Power overview"),
+      h("span", { className: "meta" }, `${list.length} device${list.length === 1 ? "" : "s"}`)),
+    ...list.map((d) => h("div", { key: d.gateway_id, className: "power-card" },
+      h("h3", null, d.gateway_name || d.gateway_id),
+      h("div", { className: "power-grid" }, ...fields.map(([k, unit, label]) => {
+        const v = d.tags[k];
+        if (v === undefined || v === null) return null;
+        return h("div", { key: k, className: "power-stat" },
+          h("div", { className: "label" }, label),
+          h("div", { className: "value" }, `${fmtVal(v)}${unit ? " " + unit : ""}`)
+        );
+      })),
+      // Live active-power line chart — same widget rendering as the dashboard.
+      d.tags.active_power_w !== undefined ? h("div", {
+        className: "power-chart-wrap widget widget-line_chart",
+        style: { height: `${cardHeight}px` },
+      },
+        h(ChartWidget, { widget: buildPowerWidget(d.gateway_id, "active_power_w", "Active power (W)", "#14a89a") })
+      ) : null
+    ))
+  );
+}
+
+// Reporting view: lists the report templates the operator published from
+// the desktop. Mirrors are read from public.report_templates via RLS.
+//
+// "Run" / "Request" actions are intentionally deferred — Lite has no PDF
+// generator and the edge backend's /api/reports/render is not yet exposed
+// over the cloud. For v1 the catalogue alone is honest: customers see
+// which reports exist and can fall back to the desktop to actually run
+// them. We will wire generation through a cloud worker in a follow-up.
+// Storage bucket for generated PDFs (matches db/migrations/20260518_alarms_reports_queue.sql).
+const LITE_REPORTS_BUCKET = "lite-reports";
+
+function ReportingView() {
+  const [section, setSection] = useState("generated");  // "generated" | "templates"
+  return h("div", null,
+    h("div", { className: "section" },
+      h("h2", null, "Reporting"),
+      h("div", { className: "seg" },
+        h("button", {
+          className: `seg-btn ${section === "generated" ? "active" : ""}`,
+          onClick: () => setSection("generated"),
+        }, "Generated"),
+        h("button", {
+          className: `seg-btn ${section === "templates" ? "active" : ""}`,
+          onClick: () => setSection("templates"),
+        }, "Templates")
+      )
+    ),
+    section === "generated" ? h(GeneratedReportsView, null) : h(ReportTemplatesView, null)
+  );
+}
+
+// --- Generated reports list (preview + download via signed URL) ----------- //
+function GeneratedReportsView() {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState("");
+  const [busyId, setBusyId] = useState("");      // id of report currently fetching a signed URL
+  const [previewUrl, setPreviewUrl] = useState("");
+
+  const refresh = async () => {
+    const { data, error: e } = await supabase
+      .from("generated_reports")
+      .select("id, tenant_id, template_id, template_name, schedule_id, schedule_name, triggered_by, file_name, file_bytes, storage_path, created_utc")
+      .order("created_utc", { ascending: false })
+      .limit(200);
+    if (e) { setError(e.message); return; }
+    setRows(data || []);
+    setError("");
+  };
+
+  useEffect(() => {
+    let stop = false;
+    const f = async () => { if (!stop) await refresh(); };
+    f();
+    const ch = supabase.channel("lite-generated-reports-rt")
+      .on("postgres_changes", { event: "*", schema: "public", table: "generated_reports" },
+        () => f())
+      .subscribe();
+    return () => { stop = true; supabase.removeChannel(ch).catch(() => {}); };
+  }, []);
+
+  const signedUrl = async (storagePath) => {
+    if (!storagePath) return null;
+    const { data, error: e } = await supabase
+      .storage.from(LITE_REPORTS_BUCKET)
+      .createSignedUrl(storagePath, 300);  // 5-minute link
+    if (e) { setError(e.message); return null; }
+    return data?.signedUrl || null;
+  };
+
+  const onPreview = async (r) => {
+    if (!r.storage_path) {
+      setError("This report has not finished uploading to cloud Storage yet — try again in a moment.");
+      return;
+    }
+    setBusyId(r.id);
+    const url = await signedUrl(r.storage_path);
+    setBusyId("");
+    if (url) setPreviewUrl(url);
+  };
+
+  const onDownload = async (r) => {
+    if (!r.storage_path) {
+      setError("This report has not finished uploading to cloud Storage yet.");
+      return;
+    }
+    setBusyId(r.id);
+    const url = await signedUrl(r.storage_path);
+    setBusyId("");
+    if (url) {
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = r.file_name || `${r.id}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+  };
+
+  return h("div", null,
+    error ? h("div", { className: "banner" }, error) : null,
+    rows == null
+      ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…")
+      : !rows.length
+        ? h("div", { className: "card", style: { textAlign: "center", padding: "32px 20px" } },
+            h("div", { style: { fontSize: 14, fontWeight: 600, marginBottom: 8 } },
+              "No reports have been generated yet."),
+            h("div", { className: "muted", style: { fontSize: 12 } },
+              "Generate one from the Templates tab, or run a scheduled report on the edge."))
+        : h("div", { className: "report-list" },
+            ...rows.map((r) => h("div", { key: `${r.tenant_id}|${r.id}`, className: "report-card" },
+              h("div", { className: "report-card-head" },
+                h("div", { className: "report-card-title" }, r.template_name || r.file_name || r.id),
+                h("span", { className: `status-pill ${r.storage_path ? "status-online" : "status-muted"}` },
+                  h("span", { className: "pill-dot" }),
+                  h("span", null, r.storage_path ? "READY" : "UPLOADING")
+                )
+              ),
+              h("div", { className: "report-card-summary" },
+                `${r.triggered_by || "manual"} · ${fmtBytes(r.file_bytes)} · ${fmtTs(r.created_utc)}`),
+              r.schedule_name ? h("div", { className: "report-card-desc" },
+                `Schedule: ${r.schedule_name}`) : null,
+              h("div", { className: "report-card-actions" },
+                h("button", {
+                  className: "btn btn-primary",
+                  disabled: !r.storage_path || busyId === r.id,
+                  onClick: () => onPreview(r),
+                }, busyId === r.id ? "…" : "Preview"),
+                h("button", {
+                  className: "btn-ghost",
+                  disabled: !r.storage_path || busyId === r.id,
+                  onClick: () => onDownload(r),
+                }, "Download")
+              )
+            ))
+          ),
+    previewUrl ? h(PdfPreviewModal, { url: previewUrl, onClose: () => setPreviewUrl("") }) : null
+  );
+}
+
+function PdfPreviewModal({ url, onClose }) {
+  return h("div", { className: "monitor-back", onClick: onClose },
+    h("div", { className: "monitor pdf-preview", onClick: (e) => e.stopPropagation() },
+      h("div", { className: "monitor-head" },
+        h("h3", null, "Report preview"),
+        h("button", { className: "close", onClick: onClose }, "Close")
+      ),
+      h("iframe", { className: "pdf-frame", src: url, title: "PDF preview" })
+    )
+  );
+}
+
+// --- Templates list (read + Generate via queue) --------------------------- //
+function ReportTemplatesView() {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState("");
+  const [selected, setSelected] = useState(null);
+  const [queueing, setQueueing] = useState("");
+  const [submittedFor, setSubmittedFor] = useState("");
+
+  useEffect(() => {
+    let stop = false;
+    const f = async () => {
+      const { data, error: e } = await supabase
+        .from("report_templates")
+        .select("id, tenant_id, name, description, definition_json, created_utc, updated_utc, created_by")
+        .order("updated_utc", { ascending: false })
+        .limit(100);
+      if (stop) return;
+      if (e) setError(e.message);
+      else { setRows(data || []); setError(""); }
+    };
+    f();
+    const ch = supabase.channel("lite-report-templates-rt")
+      .on("postgres_changes", { event: "*", schema: "public", table: "report_templates" },
+        () => f())
+      .subscribe();
+    return () => { stop = true; supabase.removeChannel(ch).catch(() => {}); };
+  }, []);
+
+  const summarize = (t) => {
+    const def = t.definition_json || {};
+    const sections = Array.isArray(def.sections) ? def.sections.length : 0;
+    const filters = def.filters || {};
+    return `${sections} section${sections === 1 ? "" : "s"}${filters.tag_name ? ` · ${filters.tag_name}` : ""}`;
+  };
+
+  const onGenerate = async (t) => {
+    setQueueing(t.id);
+    setError("");
+    try {
+      const { data: userRes } = await supabase.auth.getUser();
+      const user = userRes?.user;
+      const payload = {
+        tenant_id: t.tenant_id || "default",
+        template_id: t.id,
+        template_name: t.name || t.id,
+        requested_by: user?.id || null,
+        requester_email: user?.email || null,
+      };
+      const { error: e } = await supabase.from("lite_report_requests").insert(payload);
+      if (e) { setError(`Could not queue the request: ${e.message}`); return; }
+      setSubmittedFor(t.id);
+      setTimeout(() => setSubmittedFor((cur) => (cur === t.id ? "" : cur)), 4000);
+    } finally {
+      setQueueing("");
+    }
+  };
+
+  return h("div", null,
+    h("div", { className: "section-sub" },
+      h("span", { className: "meta" }, rows ? `${rows.length} template${rows.length === 1 ? "" : "s"}` : "")
+    ),
+    error ? h("div", { className: "banner" }, error) : null,
+    rows == null
+      ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…")
+      : !rows.length
+        ? h("div", { className: "card", style: { textAlign: "center", padding: "32px 20px" } },
+            h("div", { style: { fontSize: 14, fontWeight: 600, marginBottom: 8 } },
+              "No report templates yet."),
+            h("div", { className: "muted", style: { fontSize: 12 } },
+              "Create a template in the TrustNode desktop app and it will appear here."))
+        : h("div", { className: "report-list" },
+            ...rows.map((t) => h("div", { key: `${t.tenant_id}|${t.id}`, className: "report-card" },
+              h("div", { className: "report-card-head" },
+                h("div", { className: "report-card-title" }, t.name || t.id),
+                h("button", {
+                  className: "btn-ghost",
+                  onClick: () => setSelected(selected?.id === t.id ? null : t),
+                }, selected?.id === t.id ? "Hide details" : "View details")
+              ),
+              h("div", { className: "report-card-summary" }, summarize(t)),
+              t.description ? h("div", { className: "report-card-desc" }, t.description) : null,
+              h("div", { className: "report-card-meta" },
+                `Updated ${fmtTs(t.updated_utc)}${t.created_by ? ` · by ${t.created_by}` : ""}`),
+              selected?.id === t.id ? h("pre", { className: "report-card-json" },
+                JSON.stringify(t.definition_json, null, 2)) : null,
+              h("div", { className: "report-card-actions" },
+                h("button", {
+                  className: "btn btn-primary",
+                  disabled: queueing === t.id,
+                  onClick: () => onGenerate(t),
+                }, queueing === t.id ? "Queuing…" :
+                   submittedFor === t.id ? "Queued ✓" : "Generate")
+              )
+            ))
+          )
+  );
+}
+
+// Tiny byte formatter for report sizes.
+function fmtBytes(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return "—";
+  if (v < 1024) return `${v} B`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+  return `${(v / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// LEGACY: kept the placeholder code below in case we want to fall back to
+// the static notice — guarded with `false` so it is never rendered.
+function _LegacyReportingPlaceholder() {
+  return h("div", null,
+    h("div", { className: "section" }, h("h2", null, "Reporting"),
+      h("span", { className: "meta" }, "Read-only")),
+    h("div", { className: "card", style: { textAlign: "center", padding: "32px 20px" } },
+      h("div", { style: { fontSize: 14, fontWeight: 600, marginBottom: 8 } },
         "Reports are generated on the edge device."),
-      el("div", { class: "muted", style: { fontSize: "12px", lineHeight: "1.5", maxWidth: "440px", margin: "0 auto" } },
+      h("div", { className: "muted", style: { fontSize: 12, lineHeight: 1.5, maxWidth: 440, margin: "0 auto" } },
         "Open the TrustNode desktop app on the edge to schedule, generate, ",
         "or email reports. Once cloud sync of the report registry is enabled, ",
         "every report will appear here read-only with a download link.")
@@ -1468,289 +2376,217 @@ function renderReporting() {
   );
 }
 
-function renderBody() {
-  const body = $("#body-root");
-  if (!body) return;
-  let content;
-  switch (state.tab) {
-    case "dashboard": content = renderDashboardCombined(); break;
-    case "power":     content = renderPower(); break;
-    case "history":   content = renderHistory(); break;
-    case "reporting": content = renderReporting(); break;
-    case "alarms":    content = renderAlarms(); break;
-    default:          content = renderDashboardCombined();
-  }
-  body.replaceChildren(content);
-}
-
-// Combined Dashboard view: the configured widget mirror at the top, the
-// auto live tile grid below. The single landing page for a remote viewer.
-function renderDashboardCombined() {
-  const wrap = el("div", {});
-  // Section 1: configured widgets (if any). renderDashboard() already returns
-  // the right element; we append it so the user sees their widgets first.
-  const widgets = (state.dashboardWidgets || []).filter((w) =>
-    w && !SKIPPED_TYPES.has(String(w.type || "")));
-  if (widgets.length > 0) {
-    wrap.appendChild(renderDashboard());
-    // Defer chart/table population until the DOM lands so clientWidth is correct.
-    requestAnimationFrame(() => { mountWidgetData().catch(() => {}); });
-  }
-  // Section 2: the full live tile grid — every tag the viewer can see.
-  wrap.appendChild(renderLive());
-  return wrap;
-}
-
-function renderLoggedIn() {
-  // Shell: header on top, body with sidebar + main, bottom tabs for mobile.
-  $("#app").replaceChildren(
-    el("div", { class: "app-shell" },
-      el("header", { class: "app-header", id: "header-root" }),
-      el("div", { class: "body" },
-        el("aside", { class: "sidebar", id: "sidebar-root" }),
-        el("main", { id: "body-root" }),
-      ),
-      el("nav", { class: "tabs", id: "tabs-root" }),
-    )
-  );
-  renderHeader();
-  renderNav();
-  renderBody();
-  const drawer = renderDrawer();
-  if (drawer) $("#app").appendChild(drawer);
-  if (state.drawer && state.drawer.rows) requestAnimationFrame(mountChart);
-}
-
-// Inline icons matching the edge login page (user / lock / eye / theme).
-function icoUser() {
-  return el("span", { class: "field-icon", html: '<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="2"/><path d="M4 20c0-4 3.5-7 8-7s8 3 8 7" stroke="currentColor" stroke-width="2"/></svg>' });
-}
-function icoLock() {
-  return el("span", { class: "field-icon", html: '<svg viewBox="0 0 24 24" fill="none"><rect x="3" y="11" width="18" height="10" rx="2" stroke="currentColor" stroke-width="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4" stroke="currentColor" stroke-width="2"/></svg>' });
-}
-function icoEyeOpen() {
-  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
-}
-function icoEyeClosed() {
-  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
-}
-
-// Login screen — visual parity with the edge Login.jsx. The auth-card,
-// auth-brand logo block, USER ID / PASSWORD labels in uppercase, the
-// icon + input pairing, the password eye, the remember-row checkbox, and
-// the gradient Sign in button all map 1:1 to the edge styles. No Activate
-// tab (Lite viewers don't activate edges) and no Forgot password modal
-// (we offer magic link instead, which is the Supabase Auth path).
-function renderLogin() {
-  let busy = false;
-  let showPw = false;
-  const theme = currentTheme();
-  const card = el("div", { class: "auth-card" },
-    // Theme toggle in the upper-right of the card. Uses the same .icon-btn
-    // shape and SVG sun/moon glyphs as the in-app header so the visual
-    // language matches everywhere in the product.
-    el("button", {
-      class: "icon-btn theme-toggle-btn",
-      type: "button",
-      "aria-label": "Toggle theme",
-      title: `Switch to ${theme === "dark" ? "light" : "dark"} mode`,
-      onclick: () => { toggleTheme(); renderLogin(); },
-    }, theme === "dark" ? icoSun() : icoMoon()),
-    // Logo block (badge wordmark)
-    el("div", { class: "auth-brand" },
-      el("img", {
-        src: "./trustnode_login_logo.png",
-        alt: "TrustNode",
-        class: "auth-logo",
-        onerror: (e) => { e.target.style.display = "none"; }
-      })
-    ),
-    // Subtitle (Lite-specific)
-    el("div", { class: "auth-subtitle" }, "Sign in to view your edge data"),
-    // Username / Email
-    el("label", {},
-      el("span", {}, "Username or email"),
-      el("div", { class: "input-wrapper" },
-        icoUser(),
-        el("input", {
-          id: "lite-user",
-          type: "email",
-          autocomplete: "username",
-          placeholder: "e.g. m.silva@plant.io",
-        })
-      )
-    ),
-    // Password with header containing Forgot link
-    el("label", {},
-      el("div", { class: "pw-field-header" },
-        el("span", {}, "Password"),
-        el("button", {
-          class: "forgot-link",
-          type: "button",
-          id: "lite-forgot",
-        }, "Forgot password?")
-      ),
-      el("div", { class: "pw-input-wrap" },
-        icoLock(),
-        el("input", {
-          id: "lite-pass",
-          type: "password",
-          autocomplete: "current-password",
-          placeholder: "Enter your password",
-        }),
-        el("button", {
-          id: "lite-eye",
-          class: "pw-icon-btn",
-          type: "button",
-          "aria-label": "Toggle password visibility",
-          html: icoEyeClosed(),
-        })
-      )
-    ),
-    // Error / status box
-    el("div", { class: "auth-error", id: "lite-err" }, ""),
-    // Sign in
-    el("button", {
-      id: "lite-go",
-      class: "btn btn-primary auth-submit",
-    }, "Sign in to TrustNode Lite"),
-    // Magic link footer (kept by user request)
-    el("button", {
-      id: "lite-magic",
-      class: "btn-ghost-link",
-      type: "button",
-    }, "Email me a magic link instead")
-  );
-
-  // Shell wrapper carries the same theme + container classes as the edge.
-  $("#app").replaceChildren(
-    el("div", {
-      class: `login-container theme-${theme}`,
-      "data-theme": theme,
-    }, card)
-  );
-
-  // Wire interactions
+// ============================================================
+// Login
+// ============================================================
+function LoginCard({ theme, onToggleTheme, onSignedIn }) {
+  const [user, setUser] = useState("");
+  const [pw, setPw] = useState("");
+  const [show, setShow] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
   const submit = async () => {
     if (busy) return;
-    busy = true;
-    const go = $("#lite-go"); const errEl = $("#lite-err");
-    go.disabled = true; go.textContent = "Signing in…"; errEl.textContent = "";
+    setBusy(true); setErr("");
     try {
-      const email = $("#lite-user").value.trim();
-      const password = $("#lite-pass").value;
-      if (!email || !password) throw new Error("Enter username and password");
-      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (!user.trim() || !pw) throw new Error("Enter username and password");
+      const { data, error } = await supabase.auth.signInWithPassword({ email: user.trim(), password: pw });
       if (error) throw error;
-      session = data.session;
-      render();
+      onSignedIn(data.session);
     } catch (e) {
-      errEl.textContent = e.message || String(e);
-      busy = false;
-      $("#lite-go").disabled = false;
-      $("#lite-go").textContent = "Sign in to TrustNode Lite";
+      setErr(e.message || String(e));
+      setBusy(false);
     }
   };
-  $("#lite-go").addEventListener("click", submit);
-  $("#lite-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
-  $("#lite-user").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#lite-pass").focus(); });
-  $("#lite-eye").addEventListener("click", () => {
-    showPw = !showPw;
-    const pw = $("#lite-pass");
-    pw.type = showPw ? "text" : "password";
-    $("#lite-eye").innerHTML = showPw ? icoEyeOpen() : icoEyeClosed();
-  });
-  const sendMagicLink = async () => {
-    const email = $("#lite-user").value.trim();
-    const errEl = $("#lite-err");
-    if (!email) { errEl.textContent = "Type your email above first"; return; }
+  const sendMagic = async () => {
+    if (!user.trim()) { setErr("Type your email above first"); return; }
     try {
       const { error } = await supabase.auth.signInWithOtp({
-        email,
+        email: user.trim(),
         options: { emailRedirectTo: window.location.href },
       });
       if (error) throw error;
-      errEl.textContent = "Check your inbox for the sign-in link.";
-      errEl.classList.add("auth-info");
-    } catch (err) {
-      errEl.textContent = err.message || String(err);
-    }
+      setErr("Check your inbox for the sign-in link.");
+    } catch (e) { setErr(e.message || String(e)); }
   };
-  $("#lite-magic").addEventListener("click", (e) => { e.preventDefault(); sendMagicLink(); });
-  $("#lite-forgot").addEventListener("click", (e) => { e.preventDefault(); sendMagicLink(); });
-  setTimeout(() => $("#lite-user").focus(), 30);
+  return h("div", { className: `login-container theme-${theme}` },
+    h("div", { className: "auth-card" },
+      h("button", {
+        className: "icon-btn theme-toggle-btn",
+        type: "button",
+        title: `Switch to ${theme === "dark" ? "light" : "dark"} mode`,
+        onClick: onToggleTheme,
+      }, theme === "dark" ? icSun() : icMoon()),
+      h("div", { className: "auth-brand" },
+        h("img", { src: "./trustnode_login_logo.png", alt: "TrustNode", className: "auth-logo",
+                    onError: (e) => { e.target.style.display = "none"; } })
+      ),
+      h("div", { className: "auth-subtitle" }, "Sign in to view your edge data"),
+      h("label", null,
+        h("span", null, "Username or email"),
+        h("div", { className: "input-wrapper" },
+          h("span", { className: "field-icon" }, icUser()),
+          h("input", {
+            type: "email", autoComplete: "username", placeholder: "e.g. m.silva@plant.io",
+            value: user, onChange: (e) => setUser(e.target.value),
+            onKeyDown: (e) => { if (e.key === "Enter") document.getElementById("lite-pass")?.focus(); }
+          })
+        )
+      ),
+      h("label", null,
+        h("div", { className: "pw-field-header" },
+          h("span", null, "Password"),
+          h("button", { type: "button", className: "forgot-link", onClick: sendMagic }, "Forgot password?")
+        ),
+        h("div", { className: "pw-input-wrap" },
+          h("span", { className: "field-icon" }, icLock()),
+          h("input", {
+            id: "lite-pass",
+            type: show ? "text" : "password", autoComplete: "current-password",
+            placeholder: "Enter your password",
+            value: pw, onChange: (e) => setPw(e.target.value),
+            onKeyDown: (e) => { if (e.key === "Enter") submit(); }
+          }),
+          h("button", { className: "pw-icon-btn", type: "button", onClick: () => setShow((s) => !s) },
+            show ? icEyeOpen() : icEyeClosed())
+        )
+      ),
+      h("div", { className: "auth-error" }, err),
+      h("button", {
+        className: "btn btn-primary auth-submit",
+        onClick: submit, disabled: busy,
+      }, busy ? "Signing in…" : "Sign in to TrustNode Lite"),
+      h("button", { className: "btn-ghost-link", type: "button", onClick: sendMagic },
+        "Email me a magic link instead")
+    )
+  );
 }
 
-function renderConfigError(message) {
-  $("#app").replaceChildren(el("div", { class: "login" },
-    el("h2", {}, "TrustNode Lite — not configured"),
-    el("div", { class: "err" }, message),
-    el("p", { class: "muted", style: { fontSize: "12px", lineHeight: "1.4" } },
-      "Drop a ", el("code", {}, "config.json"), " next to this page with your Supabase URL and anon key. See ",
-      el("code", {}, "config.json.example"), " for the expected shape.")
-  ));
+// ============================================================
+// App
+// ============================================================
+function App() {
+  const [session, setSession] = useState(null);
+  const [theme, setTheme] = useState(readTheme());
+  const [tab, setTab] = useState("dashboard");
+  // Tag Monitor modal payload. Two shapes:
+  //   { widget }                                   → opened from a chart-widget "expand" button
+  //   { gateway_id, gateway_name, tag_name, value, ts }  → opened from a tile/KPI tap
+  const [monitor, setMonitor] = useState(null);
+  const [tenantLabel, setTenantLabel] = useState(cfg?.customer_label || "");
+  const [prefs, setPrefs] = useState(loadDashPrefs());
+
+  useEffect(() => { applyTheme(theme); }, [theme]);
+  useEffect(() => { saveDashPrefs(prefs); }, [prefs]);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session || null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s || null));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  // Tenant label from lite_profiles once signed in.
+  useEffect(() => {
+    if (!session) return;
+    supabase.from("lite_profiles").select("tenant_id, customer_id").limit(1).maybeSingle()
+      .then(({ data }) => {
+        if (data) setTenantLabel(data.customer_id || data.tenant_id || cfg?.customer_label || "");
+      }).catch(() => {});
+  }, [session]);
+
+  // Hooks must run unconditionally. The hooks themselves check supabase/
+  // session before making any RPC, so calling them when signed out is a
+  // cheap no-op that returns empty state.
+  const { rows: liveRows, transport } = useLiveLatest(!!session);
+  const { profiles, active, activeKey, setActiveKey } = useDashboardProfiles(!!session);
+
+  const gatewayLastSeen = useMemo(() => {
+    const m = {};
+    for (const r of (liveRows || [])) {
+      const t = Date.parse(r.ts_utc || 0);
+      if (Number.isFinite(t)) {
+        const gid = r.gateway_id || "";
+        if (gid && (!m[gid] || m[gid] < t)) m[gid] = t;
+      }
+    }
+    return m;
+  }, [liveRows]);
+
+  // Open the Tag Monitor modal. Called by tile/KPI taps (single tag) or by
+  // the expand button on a chart widget (full widget incl. multi-series).
+  const onOpenDrawer = useCallback((gw, gwName, tag, value, ts) => {
+    setMonitor({ gateway_id: gw, gateway_name: gwName, tag_name: tag, value, ts });
+  }, []);
+  const onOpenWidget = useCallback((widget) => {
+    setMonitor({ widget });
+  }, []);
+
+  const toggleTheme = () => setTheme(theme === "dark" ? "light" : "dark");
+
+  if (!session) {
+    return h(LoginCard, { theme, onToggleTheme: toggleTheme, onSignedIn: setSession });
+  }
+
+  let content;
+  if (tab === "dashboard") content = h(DashboardView, {
+    liveRows, profiles, active, activeKey, setActiveKey,
+    prefs, setPrefs, gatewayLastSeen, onOpenDrawer, onOpenWidget,
+  });
+  else if (tab === "history") content = h(HistorianView, null);
+  else if (tab === "alarms") content = h(AlarmsView, { liveRows });
+  else if (tab === "power") content = h(PowerView, { liveRows });
+  else if (tab === "reporting") content = h(ReportingView, null);
+  else content = h("div", { className: "empty" }, "Unknown tab");
+
+  const user = session?.user?.email || "";
+
+  return h(DashPrefsCtx.Provider, { value: prefs },
+    h("div", { className: "app-shell" },
+      h(Header, {
+        user, tenantLabel, theme, onToggleTheme: toggleTheme,
+        liveRows, transport,
+        onJumpAlarms: () => setTab("alarms"),
+        onSignOut: async () => {
+          await supabase.auth.signOut().catch(() => {});
+          setSession(null);
+        },
+      }),
+      h("div", { className: "body" },
+        h(Sidebar, { tab, setTab, user, tenantLabel }),
+        h("main", null, content)
+      ),
+      h(BottomTabs, { tab, setTab }),
+      h(TagMonitor, { open: !!monitor, payload: monitor, onClose: () => setMonitor(null) })
+    )
+  );
 }
 
-function render() {
-  stopAllPolls();
-  if (!session) stopAllChannels();
-  if (!supabase) { renderConfigError("Supabase client not initialised."); return; }
-  if (!session) { renderLogin(); return; }
-  renderLoggedIn();
-  startPolls();
-}
-
-// ---------- Boot -----------------------------------------------------------
+// ============================================================
+// Boot
+// ============================================================
 (async () => {
+  applyTheme(readTheme());
   try {
     await loadConfig();
   } catch (e) {
-    renderConfigError(e.message || String(e));
+    const root = document.getElementById("app");
+    root.innerHTML = "";
+    const r = createRoot(root);
+    r.render(h("div", { className: "login-container theme-light" },
+      h("div", { className: "auth-card" },
+        h("div", { className: "auth-subtitle" }, "TrustNode Lite — not configured"),
+        h("div", { className: "auth-error" }, e.message || String(e))
+      )
+    ));
     return;
   }
-  // Listen for auth changes (sign-in/out, token refresh) and re-render.
-  supabase.auth.onAuthStateChange((_event, newSession) => {
-    session = newSession || null;
-    state.userEmail = session?.user?.email || "";
-    render();
-  });
-  // Read the tenant label once we have a session for nicer header copy.
-  if (session) {
-    state.userEmail = session?.user?.email || "";
-    supabase.from("lite_profiles").select("tenant_id, customer_id").limit(1).maybeSingle().then(({ data }) => {
-      if (data) {
-        state.tenantLabel = data.customer_id || data.tenant_id || (cfg?.customer_label || "");
-        renderHeader();
-        renderNav();
-      }
-    }).catch(() => {});
-  }
-  // Apply the saved theme (or default light) BEFORE first render so the
-  // login screen / first paint shows the right palette.
-  applyTheme(currentTheme());
-  render();
-
-  // Register service worker for installable offline shell.
   if ("serviceWorker" in navigator) {
     try { navigator.serviceWorker.register("./sw.js"); } catch (_) {}
   }
-  // 1 Hz header refresh so the latency overlay's "age" counter ticks without
-  // a full re-render of the body. Cheap (one badge swap).
-  if (!headerRefreshTick) {
-    headerRefreshTick = setInterval(() => {
-      if (!document.hidden && session) renderHeaderLatency();
-    }, 1000);
-  }
-  // Pause polling AND tear down WS channels when the tab is hidden, restart
-  // when visible — saves battery and avoids zombie subscriptions.
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) {
-      stopAllPolls();
-      stopAllChannels();
-    } else if (session) {
-      startPolls();
-    }
-  });
+  const root = document.getElementById("app");
+  root.innerHTML = "";
+  const r = createRoot(root);
+  r.render(h(App));
 })();
   </script>
 </body>

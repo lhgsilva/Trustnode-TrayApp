@@ -29,6 +29,7 @@ from app.state import (
     power_manager,
     reports_store,
     report_scheduler,
+    lite_report_poller,
 )
 from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
 
@@ -179,6 +180,12 @@ async def startup_event() -> None:
     # Start the report scheduler daemon (15s tick, idle when no schedules).
     try:
         report_scheduler.start()
+    except Exception:
+        pass
+    # Drains the Supabase `lite_report_requests` queue (Lite "Generate" button).
+    # Idle and silent when no cloud DB target is configured.
+    try:
+        lite_report_poller.start()
     except Exception:
         pass
 
@@ -434,6 +441,10 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
 async def on_shutdown() -> None:
     try:
         report_scheduler.stop()
+    except Exception:
+        pass
+    try:
+        lite_report_poller.stop()
     except Exception:
         pass
     telemetry_service.shutdown()

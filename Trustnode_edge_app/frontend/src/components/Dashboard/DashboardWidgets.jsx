@@ -1411,7 +1411,38 @@ export function DashboardWidgetCard({
     // gateway produced any sample inside that bucket, so both lines are
     // drawn at every X tick with no jittered gaps.
 
-    const allPtsByDef = [primaryPts, ...extrasPts];
+    // ─── Align series to a shared time window ───────────────────────────
+    // The primary series and each extra series are sliced independently by
+    // sample count, so their date ranges often disagree (primary covers
+    // the last 60 s, extra covers the last 5 minutes, etc.). Trim them to
+    // the **intersection** of their time ranges so every chart bucket has
+    // real samples from BOTH sides — no more flat carry-forward tails or
+    // gaps where one series has no data.
+    const windowStart = Math.max(
+      primaryPts.length ? primaryPts[0].tsMs : -Infinity,
+      ...extrasPts.map((arr) => (arr.length ? arr[0].tsMs : -Infinity)),
+    );
+    const windowEnd = Math.min(
+      primaryPts.length ? primaryPts[primaryPts.length - 1].tsMs : Infinity,
+      ...extrasPts.map((arr) => (arr.length ? arr[arr.length - 1].tsMs : Infinity)),
+    );
+    const inWindow = (p) => p.tsMs >= windowStart && p.tsMs <= windowEnd;
+    // Only apply the trim when the intersection is non-empty AND every
+    // series has at least one point inside it; otherwise fall back to the
+    // raw arrays so we still draw *something* on a fresh dashboard.
+    let trimmedPrimary = primaryPts;
+    let trimmedExtras = extrasPts;
+    if (Number.isFinite(windowStart) && Number.isFinite(windowEnd) && windowEnd > windowStart) {
+      const tp = primaryPts.filter(inWindow);
+      const te = extrasPts.map((arr) => arr.filter(inWindow));
+      const allHaveData = tp.length && te.every((a) => a.length);
+      if (allHaveData) {
+        trimmedPrimary = tp;
+        trimmedExtras = te;
+      }
+    }
+
+    const allPtsByDef = [trimmedPrimary, ...trimmedExtras];
 
     const estimateBucketMs = (ptsArrays) => {
       // Use the median delta between consecutive samples of the densest
@@ -1450,18 +1481,18 @@ export function DashboardWidgetCard({
       return row;
     };
     // primary
-    for (const p of primaryPts) {
+    for (const p of trimmedPrimary) {
       const bk = bucketKey(p.tsMs);
       const row = getOrInitRow(bk, p.ts);
-      // last-write wins (primaryPts is already chronological asc)
+      // last-write wins (trimmedPrimary is already chronological asc)
       row.value = p.value;
       row.ts = p.ts || row.ts;
     }
     // extras
-    for (let j = 0; j < extrasPts.length; j += 1) {
+    for (let j = 0; j < trimmedExtras.length; j += 1) {
       const def = extraSeriesDefs[j];
       const key = `s_${def.id}`;
-      for (const p of extrasPts[j]) {
+      for (const p of trimmedExtras[j]) {
         const bk = bucketKey(p.tsMs);
         const row = getOrInitRow(bk, p.ts);
         row[key] = p.value;
@@ -1472,6 +1503,26 @@ export function DashboardWidgetCard({
     // Trim to the most recent N points so the chart doesn't grow unbounded.
     const limit = Math.max(60, reads);
     const trimmed = ordered.length > limit ? ordered.slice(-limit) : ordered;
+
+    // ─── Carry-forward fill across series ────────────────────────────────
+    // After bucketing, a bucket may carry a value for series A but not for
+    // series B (different gateways, slightly different sample cadences, or
+    // one gateway briefly down). Recharts won't draw a line through an
+    // undefined dataKey, so the user sees a hole in series B until B's next
+    // sample. Walk the buckets in order and forward-fill the last seen
+    // value for each series — same rule the historian uses ("display the
+    // most recent value at-or-before this timestamp").
+    const seriesKeys = ["value", ...extraSeriesDefs.map((d) => `s_${d.id}`)];
+    const lastVal = {};
+    for (const row of trimmed) {
+      for (const k of seriesKeys) {
+        if (row[k] !== undefined && row[k] !== null) {
+          lastVal[k] = row[k];
+        } else if (lastVal[k] !== undefined) {
+          row[k] = lastVal[k];
+        }
+      }
+    }
     return trimmed.map((row, i) => ({ ...row, idx: i + 1 }));
   }, [series, extraSeriesDefs, extraSeriesRowsByDef, cfgReadingsCount, resolvedLimitLines.length]);
 

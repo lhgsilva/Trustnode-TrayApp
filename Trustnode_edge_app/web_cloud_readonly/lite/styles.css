@@ -138,6 +138,11 @@ button { font: inherit; cursor: pointer; }
   grid-template-rows: auto 1fr;
   min-height: 100vh;
   min-height: 100dvh;
+  /* Honour the iPhone safe-areas on left/right edges so content never
+     slides under the notch or dynamic island in landscape. Top is handled
+     by the header (`padding-top`) and bottom by the tab bar. */
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
 }
 
 .app-header {
@@ -148,8 +153,13 @@ button { font: inherit; cursor: pointer; }
   align-items: center;
   gap: 10px;
   padding: 0 14px;
-  height: 56px;
+  /* Reserve room above the header for the iPhone status bar/dynamic island
+     when the PWA runs standalone — without this the brand collides with
+     the system clock. */
+  padding-top: env(safe-area-inset-top);
+  height: calc(56px + env(safe-area-inset-top));
   border-bottom: 1px solid var(--header-border);
+  box-sizing: border-box;
 }
 .header-left, .header-center, .header-right {
   display: flex;
@@ -393,8 +403,15 @@ main {
   .body { grid-template-columns: 1fr; }
   .sidebar { display: none; }
   .tabs { display: flex; }
-  main { padding-bottom: 80px; }
-  .app-header { grid-template-columns: 1fr auto; padding: 0 10px; height: 52px; }
+  /* Bottom tab bar + iPhone home indicator both eat space. Add them both
+     to the padding so the last widget never gets hidden behind the bar. */
+  main { padding-bottom: calc(80px + env(safe-area-inset-bottom)); }
+  .app-header {
+    grid-template-columns: 1fr auto;
+    padding: 0 10px;
+    padding-top: env(safe-area-inset-top);
+    height: calc(52px + env(safe-area-inset-top));
+  }
   .header-center { display: none; }
   .brand-full-logo { height: 30px; }
   .icon-btn { min-width: 36px; height: 36px; }
@@ -1109,6 +1126,14 @@ main {
   padding: 4px 2px;
   cursor: pointer;
 }
+/* On phones, centre the KPI value so the card feels deliberate at a glance.
+   Keeps the title/sub aligned with the value for a tight, symmetric look. */
+@media (max-width: 600px) {
+  .widget-kpi { text-align: center; align-items: center; }
+  .widget-kpi .widget-title,
+  .widget-kpi .widget-value,
+  .widget-kpi .widget-sub { text-align: center; width: 100%; }
+}
 .widget-kpi .widget-value {
   font-family: var(--font-mono);
   font-weight: 700;
@@ -1268,23 +1293,50 @@ main {
 .seg-btn + .seg-btn { border-left: 1px solid var(--stroke); }
 
 /* ============================================================ */
-/* Widget flow layout (replaces the 20-col grid)                 */
+/* Widget flow layout — auto-fit rows                            */
+/* Each widget gets the minimum vertical space it needs. Charts  */
+/* still claim a sensible min-height so the axis labels and the  */
+/* plot area stay visible.                                       */
 /* ============================================================ */
 .widget-flow {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  grid-auto-rows: var(--lite-card-height, 220px);
+  grid-auto-flow: row dense;
+  grid-auto-rows: auto;
   gap: 12px;
   margin-bottom: 18px;
+  align-items: stretch;
 }
 .widget-flow.per-row-1 { grid-template-columns: 1fr; }
 @media (max-width: 720px) {
-  /* Always single column on phones regardless of toggle. */
   .widget-flow { grid-template-columns: 1fr; }
 }
 .widget-flow > .widget {
-  /* Make widgets fill the row height set by --lite-card-height. */
-  height: 100%;
+  /* No forced row height — each widget claims its natural size. */
+  min-height: 0;
+}
+/* Per-widget natural sizes. Chart widgets need a real plot area;
+   KPI/meter/divider/text can be much shorter. */
+.widget.widget-line_chart,
+.widget.widget-line_area_chart,
+.widget.widget-bar_chart {
+  min-height: 240px;
+}
+.widget.widget-meter_chart,
+.widget.widget-pie_chart {
+  min-height: 240px;
+}
+.widget.widget-value_kpi,
+.widget.widget-text_kpi {
+  min-height: 110px;
+}
+.widget.widget-table_list {
+  min-height: 200px;
+}
+.widget.widget-fixed_text,
+.widget.widget-divider,
+.widget.widget-image {
+  min-height: 90px;
 }
 
 /* Offline overlay over a chart whose gateway hasn't reported in 30s. */
@@ -1307,4 +1359,720 @@ main {
 @media (max-width: 720px) {
   .dash-toolbar-right { width: 100%; justify-content: flex-start; gap: 10px; }
   .dash-control input[type="range"] { width: 88px; }
+}
+
+/* ============================================================ */
+/* Tag Monitor — full-screen modal opened from a chart widget    */
+/* ============================================================ */
+.monitor-back {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+[data-theme="dark"] .monitor-back { background: rgba(0, 0, 0, 0.65); }
+.monitor {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 16px;
+  width: min(100%, 1100px);
+  height: min(50vh, 480px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 24px 60px -16px rgba(15, 23, 42, 0.4);
+}
+.monitor-head {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--stroke);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.monitor-head h3 { margin: 0; font-size: 16px; flex: 1; }
+.monitor-head .close {
+  background: var(--card-2);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.monitor-chart-wrap {
+  flex: 1;
+  min-height: 0;
+  padding: 16px;
+}
+.monitor-meta {
+  padding: 6px 18px 4px;
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  gap: 16px;
+}
+.monitor .range-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 10px 16px 14px;
+  border-top: 1px solid var(--stroke);
+  background: var(--card-2);
+  overflow-x: auto;
+}
+.monitor .range-tabs button {
+  background: var(--card);
+  color: var(--muted);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 7px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.monitor .range-tabs button.active {
+  background: var(--teal);
+  color: #ffffff;
+  border-color: var(--teal);
+}
+
+/* ============================================================ */
+/* Expand button on chart widget titles                          */
+/* ============================================================ */
+.widget-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.widget-expand {
+  background: var(--card-2);
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  width: 28px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: color .15s ease, border-color .15s ease;
+}
+.widget-expand:hover { color: var(--teal); border-color: var(--teal); }
+
+/* ============================================================ */
+/* Meter / gauge widget — Recharts pie + pointer needle          */
+/* ============================================================ */
+.widget-meter-gauge {
+  position: relative;
+  flex: 1;
+  min-height: 80px;
+  width: 100%;
+}
+.meter-pointer-wrap {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.meter-pointer {
+  position: absolute;
+  left: 50%;
+  bottom: 30%;
+  width: 3px;
+  height: 36%;
+  background: var(--text);
+  border-radius: 2px;
+  transform-origin: bottom center;
+}
+.meter-pointer-cap {
+  position: absolute;
+  left: 50%;
+  bottom: 30%;
+  width: 10px;
+  height: 10px;
+  background: var(--text);
+  border-radius: 50%;
+  transform: translate(-50%, 50%);
+}
+.meter-caption {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 4px;
+  text-align: center;
+  pointer-events: none;
+}
+.meter-caption-value {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 700;
+}
+.meter-caption-pct {
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 1px;
+}
+.meter-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-size: 10px;
+  color: var(--muted);
+  margin-top: 4px;
+  justify-content: center;
+}
+.meter-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.meter-legend-swatch { width: 8px; height: 8px; border-radius: 2px; }
+
+/* ============================================================ */
+/* Pie chart legend                                              */
+/* ============================================================ */
+.widget-pie-wrap {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.widget-pie-chart { flex: 1; min-height: 0; }
+.widget-pie-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 11px;
+  color: var(--muted);
+  padding-top: 6px;
+  justify-content: center;
+}
+.pie-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.pie-legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+.pie-legend-value {
+  font-family: var(--font-mono);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ============================================================ */
+/* Dashboard toolbar — slim row with gear button                 */
+/* ============================================================ */
+.dash-gear-btn {
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  padding: 0;
+}
+.dash-gear-btn.active { color: var(--teal); border-color: var(--teal); }
+.dash-active-profile {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--stroke);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--card-2);
+}
+
+/* ============================================================ */
+/* Settings modal (gear popup) — same shape as the edge config   */
+/* modal: centered card, label rows, no inline controls          */
+/* ============================================================ */
+.settings-back {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+}
+[data-theme="dark"] .settings-back { background: rgba(0, 0, 0, 0.65); }
+.settings-card {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 16px;
+  width: min(100%, 480px);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 24px 60px -16px rgba(15, 23, 42, 0.4);
+}
+.settings-head {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--stroke);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.settings-head h3 { margin: 0; font-size: 16px; flex: 1; font-weight: 700; }
+.settings-head .close {
+  background: var(--card-2);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.settings-body {
+  padding: 16px 18px 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.settings-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.settings-row > label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.settings-row select,
+.settings-row input[type="range"] {
+  width: 100%;
+}
+.settings-row select {
+  background: var(--surface-elev);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+.settings-row-inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.settings-row-inline input[type="range"] {
+  flex: 1;
+  accent-color: var(--teal);
+}
+
+/* Monitor Points selector */
+.monitor-points-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: auto;
+}
+.monitor-points-pick select {
+  background: var(--surface-elev);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 11px;
+}
+
+/* ============================================================ */
+/* Historian / Alarms filter bar (one-row, mobile-wraps)         */
+/* ============================================================ */
+.hist-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0 12px;
+  border-bottom: 1px solid var(--stroke);
+  margin-bottom: 12px;
+}
+.hist-filter-input {
+  background: var(--surface-elev);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  height: 32px;
+  min-width: 120px;
+}
+.hist-filter-input:focus {
+  outline: none;
+  border-color: var(--teal);
+  box-shadow: 0 0 0 3px rgba(20, 168, 154, 0.15);
+}
+select.hist-filter-input { padding-right: 24px; }
+.hist-filter-clear {
+  height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.hist-filters .seg { height: 32px; }
+.hist-filters .seg-btn { font-size: 11px; padding: 4px 10px; }
+
+/* ============================================================ */
+/* Reporting view                                                */
+/* ============================================================ */
+.report-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+.report-card {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.report-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.report-card-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+.report-card-summary {
+  font-size: 12px;
+  color: var(--muted);
+}
+.report-card-desc {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.4;
+}
+.report-card-meta {
+  font-size: 11px;
+  color: var(--soft);
+  margin-top: 4px;
+}
+.report-card-json {
+  background: var(--card-2);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin: 6px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  max-height: 240px;
+  overflow: auto;
+  color: var(--text);
+}
+.report-card-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.report-card-actions .btn {
+  height: 32px;
+  padding: 0 12px;
+  font-size: 12px;
+}
+
+/* ============================================================ */
+/* Mobile responsive — Historian table + filter row              */
+/* ============================================================ */
+@media (max-width: 600px) {
+  /* Filter row: each control takes a sensible width and wraps */
+  .hist-filters {
+    gap: 6px;
+    padding: 6px 0 10px;
+  }
+  .hist-filter-input {
+    flex: 1 1 calc(50% - 6px);
+    min-width: 0;
+    font-size: 12px;
+    height: 30px;
+    padding: 4px 8px;
+  }
+  .hist-filters .seg {
+    flex: 1 1 100%;
+    justify-content: space-between;
+    height: 30px;
+  }
+  .hist-filters .seg-btn { flex: 1; padding: 4px 6px; }
+  .hist-filter-clear { flex: 1 1 100%; }
+
+  /* Table -> card list. The thead becomes invisible (visually hidden,
+     stays in the DOM for screen readers). Each row stacks its cells with
+     a label in front of the value via data-label. */
+  /* Compact one-line per row: time · tag · value (gateway/quality dropped
+     into title attributes to save space). Each row is a horizontal strip,
+     not a stacked card. */
+  .hist-table-wrap { overflow-x: visible; }
+  .hist-table { background: transparent; border: 0; width: 100%; }
+  .hist-table thead {
+    position: absolute;
+    width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0,0,0,0); border: 0;
+  }
+  .hist-table, .hist-table tbody { display: block; width: 100%; }
+  .hist-table tr {
+    display: grid;
+    grid-template-columns: minmax(0, auto) minmax(0, 1fr) minmax(0, auto);
+    column-gap: 8px;
+    align-items: baseline;
+    background: var(--card);
+    border: 1px solid var(--stroke);
+    border-radius: var(--radius-md);
+    margin-bottom: 6px;
+    padding: 6px 10px;
+  }
+  .hist-table tbody tr:nth-child(even) td { background: transparent; }
+  .hist-table td {
+    border: 0;
+    padding: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 11px;
+  }
+  .hist-table td::before { content: none; }
+  .hist-table td.num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    font-weight: 600;
+    color: var(--text);
+  }
+  /* Hide Gateway + Quality on mobile — keep Time, Tag, Value visible. */
+  .hist-table td[data-label="Gateway"],
+  .hist-table td[data-label="Quality"] { display: none; }
+  .hist-table td[data-label="Time"] {
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .hist-table td[data-label="Tag"] {
+    color: var(--text);
+    font-weight: 500;
+  }
+}
+
+/* ---- Active-alarm bell badge in the header ----------------------------- */
+.icon-btn { position: relative; }
+.icon-btn.has-alerts svg { color: #ef4444; }
+.alarm-badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #ef4444;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  border: 2px solid var(--header, #111);
+  box-sizing: content-box;
+  pointer-events: none;
+}
+/* Tab-bar variant sits on the icon, not the whole button */
+.tab .ico { position: relative; }
+.alarm-badge-tab {
+  position: absolute;
+  top: -4px;
+  right: -8px;
+  border-color: var(--header, #111);
+}
+.tab.has-alerts .ico svg { color: #ef4444; }
+
+/* ---- Active-alarm event list (Alarms → Active tab) --------------------- */
+.alarm-events {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+.alarm-event {
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-md, 10px);
+  background: var(--card);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.alarm-event.is-active {
+  border-color: #ef4444;
+  box-shadow: 0 0 0 1px #ef4444 inset;
+}
+.alarm-event.is-cleared { opacity: 0.75; }
+.alarm-event-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.alarm-event-ts {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.alarm-event-msg {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  line-height: 1.35;
+}
+.alarm-event-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.alarm-event-meta strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.status-warning { background: #fef3c7; color: #92400e; }
+[data-theme="dark"] .status-warning { background: #3b2914; color: #fcd34d; }
+
+@media (max-width: 600px) {
+  .alarm-event { padding: 8px 10px; }
+  .alarm-event-msg { font-size: 12px; }
+  .alarm-event-meta strong { display: none; }
+}
+
+/* ---- Alarm rule cards (Alarms tab) -------------------------------------- */
+.alarm-rules {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+.alarm-rule-card {
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.alarm-rule-card.is-triggered {
+  border-color: #ef4444;
+  box-shadow: 0 0 0 1px #ef4444 inset, 0 4px 10px -6px rgba(239, 68, 68, 0.5);
+}
+.alarm-rule-card.is-ok { border-color: var(--stroke); }
+.alarm-rule-card.is-disabled { opacity: 0.7; }
+.alarm-rule-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.alarm-rule-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.alarm-rule-meta {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.alarm-rule-meta strong {
+  color: var(--text);
+  font-weight: 600;
+}
+@media (max-width: 600px) {
+  .alarm-rules { grid-template-columns: 1fr; gap: 6px; }
+  /* Compact each rule into a single row: name+pill on one line, meta in
+     a single line below. Saves a lot of vertical space on phones. */
+  .alarm-rule-card { padding: 8px 10px; gap: 4px; }
+  .alarm-rule-name { font-size: 13px; }
+  .alarm-rule-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    font-size: 11px;
+  }
+  .alarm-rule-meta strong { display: none; }
+}
+
+/* ---- Toggle slider button (Settings modal) ------------------------------ */
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: 0;
+  padding: 4px 6px;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 12px;
+}
+.toggle .toggle-track {
+  width: 34px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--card-2, #2a2f3a);
+  border: 1px solid var(--stroke);
+  position: relative;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.toggle .toggle-thumb {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--soft, #8a98ab);
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.toggle.is-on .toggle-track {
+  background: var(--accent, #14a89a);
+  border-color: var(--accent, #14a89a);
+}
+.toggle.is-on .toggle-thumb {
+  transform: translateX(16px);
+  background: #ffffff;
+}
+.toggle-label { color: var(--muted); }
+
+/* ---- Power overview: live active-power chart per meter ----------------- */
+.power-chart-wrap {
+  margin-top: 12px;
+  border-top: 1px dashed var(--stroke);
+  padding-top: 10px;
+}
+
+/* ---- Reporting: PDF preview iframe + sub-section meta ------------------- */
+.pdf-frame {
+  flex: 1;
+  width: 100%;
+  border: 0;
+  background: var(--card-2, var(--card));
+}
+.section-sub {
+  display: flex;
+  align-items: center;
+  margin: 6px 0 4px;
 }

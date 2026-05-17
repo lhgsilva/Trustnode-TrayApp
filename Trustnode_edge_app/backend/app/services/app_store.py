@@ -736,8 +736,9 @@ class AppStore:
             self._cloud_target_cache_value = None
             self._cloud_target_cache_ts = 0.0
 
-    def _mirror_dashboard_configurations_to_cloud(
+    def _mirror_config_doc_to_cloud(
         self,
+        table_name: str,
         *,
         tenant_id: str,
         scope_key: str,
@@ -745,47 +746,72 @@ class AppStore:
         version: int,
         updated_utc: str,
     ) -> None:
-        """Best-effort mirror of the dashboard_configurations doc to Supabase.
+        """Best-effort generic upsert into a (tenant_id, scope_key, payload_json,
+        version, updated_utc) mirror table on Supabase. Used by both
+        dashboard_configurations and alarms_setup so the Lite app can read
+        them via RLS. Silent on any failure — never block the local save.
 
-        The Lite app SELECTs `public.dashboard_configurations` to render the
-        widget layout the operator built in the desktop. Without this mirror
-        the Lite dashboard stays empty even though the edge has widgets.
-
-        This runs synchronously on the request thread but is cheap (one
-        upsert, no joins). On failure we swallow the exception so a flaky
-        cloud doesn't break the local config save.
+        IMPORTANT: dispatches to a background thread. Synchronous mirroring
+        was blocking the bootstrap-save HTTP request for the entire round-trip
+        to Supabase (often 200–800 ms), and because the edge frontend re-saves
+        the bootstrap every time `alarms` changes (alarms fire on every poll
+        cycle while active), the request thread serialized into a queue that
+        starved live-data and gateway-control endpoints. The mirror itself
+        is non-essential to the local save, so it never has to block.
         """
-        cloud = self._get_cloud_database_target()
+        # Cheap pre-check on the request thread — avoid spawning a thread
+        # at all when no cloud target is configured.
+        try:
+            cloud = self._get_cloud_database_target()
+        except Exception:
+            cloud = None
         if not cloud:
             return
-        try:
-            from sqlalchemy import text  # type: ignore
-            engine, _ = self._get_or_create_cloud_engine(cloud, str(cloud.get("schema") or "public"))
-            schema = str(cloud.get("schema") or "public")
-            with engine.begin() as conn:
-                conn.execute(
-                    text(
-                        f"""
-                        INSERT INTO "{schema}"."dashboard_configurations"
-                          (tenant_id, scope_key, payload_json, version, updated_utc)
-                        VALUES (:tenant_id, :scope_key, :payload_json::jsonb, :version, :updated_utc)
-                        ON CONFLICT (tenant_id, scope_key) DO UPDATE SET
-                          payload_json = EXCLUDED.payload_json,
-                          version      = EXCLUDED.version,
-                          updated_utc  = EXCLUDED.updated_utc
-                        """
-                    ),
-                    {
-                        "tenant_id": tenant_id,
-                        "scope_key": scope_key or "",
-                        "payload_json": payload_json,
-                        "version": int(version),
-                        "updated_utc": updated_utc,
-                    },
+
+        # Snapshot the args (small, immutable) and run the upsert off-thread.
+        kwargs = dict(
+            tenant_id=tenant_id,
+            scope_key=scope_key or "",
+            payload_json=payload_json,
+            version=int(version),
+            updated_utc=updated_utc,
+        )
+
+        def _do_upsert() -> None:
+            try:
+                from sqlalchemy import text  # type: ignore
+                engine, _ = self._get_or_create_cloud_engine(
+                    cloud, str(cloud.get("schema") or "public")
                 )
+                schema = str(cloud.get("schema") or "public")
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."{table_name}"
+                              (tenant_id, scope_key, payload_json, version, updated_utc)
+                            VALUES (:tenant_id, :scope_key, :payload_json::jsonb, :version, :updated_utc)
+                            ON CONFLICT (tenant_id, scope_key) DO UPDATE SET
+                              payload_json = EXCLUDED.payload_json,
+                              version      = EXCLUDED.version,
+                              updated_utc  = EXCLUDED.updated_utc
+                            """
+                        ),
+                        kwargs,
+                    )
+            except Exception:
+                pass
+
+        try:
+            import threading
+            threading.Thread(target=_do_upsert, name=f"tn-mirror-{table_name}",
+                             daemon=True).start()
         except Exception:
-            # Cloud mirror is non-essential — never fail the local save over it.
             pass
+
+    # Backwards-compatible wrapper used by the existing call sites.
+    def _mirror_dashboard_configurations_to_cloud(self, **kwargs) -> None:
+        self._mirror_config_doc_to_cloud("dashboard_configurations", **kwargs)
 
     def _cloud_target_from_env(self) -> Dict[str, Any] | None:
         """Build a cloud target dict purely from environment variables.
@@ -2194,12 +2220,16 @@ class AppStore:
         with self._lock:
             with self._connect() as conn:
                 if max_id <= 0:
+                    # ORDER BY ts_utc DESC uses idx_hist_tenant_ts directly;
+                    # ORDER BY id DESC forces a full temp B-tree sort over the
+                    # entire table — 100s of ms on a busy edge. Same result
+                    # because ts_utc and id increase monotonically together.
                     db_rows = conn.execute(
                         """
                         SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                tag_name, value, quality, quality_label, source
                         FROM historian_readings
-                        ORDER BY id DESC
+                        ORDER BY ts_utc DESC
                         LIMIT ?
                         """,
                         (self._live_fast_initial_rows,),
@@ -2590,13 +2620,12 @@ class AppStore:
                       source TEXT NULL,
                       created_utc TEXT NOT NULL
                     );
-                    CREATE INDEX IF NOT EXISTS idx_hist_ts ON historian_readings(ts_utc DESC);
-                    CREATE INDEX IF NOT EXISTS idx_hist_tag ON historian_readings(tag_name);
-                    CREATE INDEX IF NOT EXISTS idx_hist_gateway ON historian_readings(gateway_id);
-                    -- Composite covering index for dashboard widget aggregations
-                    -- (rule-stats, stats, range queries scoped by tenant+gateway+tag+ts).
-                    CREATE INDEX IF NOT EXISTS idx_hist_tenant_gw_tag_ts
-                      ON historian_readings(tenant_id, gateway_id, tag_name, ts_utc DESC);
+                    -- Indexes — kept minimal. Earlier revisions also created
+                    -- idx_hist_ts / idx_hist_tag / idx_hist_gateway /
+                    -- idx_hist_tenant_gw_tag_ts, all of which were subsumed
+                    -- by the (tenant_id, ...) composites below. Carrying
+                    -- duplicates roughly doubled per-row disk cost on a
+                    -- busy edge (8 indexes × 50 tags × 1 Hz → +2.5 GB/month).
                     CREATE INDEX IF NOT EXISTS idx_hist_tenant_tag_ts
                       ON historian_readings(tenant_id, tag_name, ts_utc DESC);
 
@@ -2835,16 +2864,37 @@ class AppStore:
                     conn.execute("ALTER TABLE scheduled_reports ADD COLUMN attach_csv INTEGER NOT NULL DEFAULT 0")
                 if "attach_txt" not in sched_cols:
                     conn.execute("ALTER TABLE scheduled_reports ADD COLUMN attach_txt INTEGER NOT NULL DEFAULT 0")
+                # 2026-05-18: generated_reports gained a `storage_path` column so the
+                # edge can remember where each PDF was uploaded inside the Lite
+                # Storage bucket (lets the Lite app render signed-URL downloads).
+                gen_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(generated_reports)").fetchall()}
+                if "storage_path" not in gen_cols:
+                    conn.execute("ALTER TABLE generated_reports ADD COLUMN storage_path TEXT NULL")
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_hist_tenant_ts ON historian_readings(tenant_id, ts_utc DESC)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_hist_tenant_gwid_tag_ts ON historian_readings(tenant_id, gateway_id, tag_name, ts_utc DESC)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_hist_tenant_gwname_tag_ts ON historian_readings(tenant_id, gateway_name, tag_name, ts_utc DESC)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_tenant_ts ON app_logs(tenant_id, ts_utc DESC)')
+                # 2026-05-18: drop the 4 redundant historian indexes on boot so
+                # upgrading installs don't keep paying for them. They were
+                # subsumed by the composites above. Idempotent — DROP IF EXISTS.
+                for _legacy_ix in (
+                    "idx_hist_ts", "idx_hist_tag", "idx_hist_gateway", "idx_hist_tenant_gw_tag_ts",
+                ):
+                    try:
+                        conn.execute(f'DROP INDEX IF EXISTS {_legacy_ix}')
+                    except Exception:
+                        pass
                 now = self._utc_now()
+                # Retention defaults: enabled by default with 7d raw / 30d
+                # minute / 180d hour / 730d day. Without retention the
+                # historian grows unbounded (~250 GB/month at 50 tags @ 1 Hz),
+                # so we ship enabled=1 out of the box. Users can tune or
+                # disable from Settings → Retention.
                 conn.execute(
                     """
                     INSERT INTO retention_policy
                     (id, enabled, schedule_minutes, raw_keep_days, minute_keep_days, hour_keep_days, day_keep_days, backup_before_cleanup, max_delete_rows_per_run, updated_utc)
-                    VALUES (1, 0, 60, 7, 30, 180, 730, 1, 50000, ?)
+                    VALUES (1, 1, 60, 7, 30, 180, 730, 1, 50000, ?)
                     ON CONFLICT(id) DO NOTHING
                     """,
                     (now,),
@@ -4349,7 +4399,26 @@ class AppStore:
         if domain == "database_configurations":
             self._invalidate_cloud_target_cache()
         if domain == "dashboard_configurations":
-            self._mirror_dashboard_configurations_to_cloud(
+            self._mirror_config_doc_to_cloud(
+                "dashboard_configurations",
+                tenant_id=self._current_tenant_id(),
+                scope_key="",
+                payload_json=payload_json,
+                version=new_version,
+                updated_utc=now,
+            )
+        if domain == "alarms_setup":
+            self._mirror_config_doc_to_cloud(
+                "alarms_setup",
+                tenant_id=self._current_tenant_id(),
+                scope_key="",
+                payload_json=payload_json,
+                version=new_version,
+                updated_utc=now,
+            )
+        if domain == "triggers_limits":
+            self._mirror_config_doc_to_cloud(
+                "triggers_limits",
                 tenant_id=self._current_tenant_id(),
                 scope_key="",
                 payload_json=payload_json,
@@ -4420,13 +4489,14 @@ class AppStore:
                 )
         if domain_name == "database_configurations":
             self._invalidate_cloud_target_cache()
-        if domain_name == "dashboard_configurations":
+        if domain_name in ("dashboard_configurations", "alarms_setup", "triggers_limits"):
             # scope_key shape on the edge is 'tenant|-|edge_id|user'; the
             # leading segment is the tenant. RLS in Supabase uses tenant_id,
             # so we propagate it. The scope_key is preserved as-is so the
             # Lite app can pick the right row for the signed-in user.
             tenant_from_scope = (skey.split("|") or ["default"])[0] or "default"
-            self._mirror_dashboard_configurations_to_cloud(
+            self._mirror_config_doc_to_cloud(
+                domain_name,
                 tenant_id=tenant_from_scope,
                 scope_key=skey,
                 payload_json=payload_json,
@@ -4630,6 +4700,10 @@ class AppStore:
             where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
             params["tag_like"] = f"%{tag_txt}%"
         # Read-only path: parallel readers via WAL, no global lock.
+        # IMPORTANT: ORDER BY ts_utc DESC (not id DESC) so SQLite can walk
+        # the (tenant_id, ts_utc DESC) covering index in order — otherwise
+        # it falls back to "USE TEMP B-TREE FOR ORDER BY" and full-sorts the
+        # entire tenant slice (~1.4M rows on a busy edge = ~400ms per call).
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
@@ -4637,7 +4711,7 @@ class AppStore:
                        tag_name, value, value_text, quality, quality_label
                 FROM historian_readings
                 {where}
-                ORDER BY id DESC
+                ORDER BY ts_utc DESC
                 LIMIT :lim
                 """,
                 params,
@@ -5481,13 +5555,15 @@ class AppStore:
 
         with self._lock:
             with self._connect() as conn:
+                # ORDER BY ts_utc DESC uses idx_hist_tenant_ts; ORDER BY id DESC
+                # falls back to a temp B-tree sort over the full tenant slice.
                 rows = conn.execute(
                     """
                     SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                            tag_name, value, quality, quality_label
                     FROM historian_readings
                     WHERE tenant_id = ?
-                    ORDER BY id DESC
+                    ORDER BY ts_utc DESC
                     LIMIT ?
                     """,
                     (tenant_id, max(fetch_lim, 20000)),
@@ -5635,12 +5711,13 @@ class AppStore:
 
         with self._lock:
             with self._connect() as conn:
+                # ORDER BY ts_utc DESC walks idx_logs_tenant_ts in order.
                 rows = conn.execute(
                     """
                     SELECT tenant_id, ts_utc, level, category, message, gateway_id, gateway_name, device_name, database_name
                     FROM app_logs
                     WHERE tenant_id = ?
-                    ORDER BY id DESC
+                    ORDER BY ts_utc DESC
                     LIMIT ?
                     """,
                     (tenant_id, fetch_lim),

@@ -128,6 +128,17 @@ class ReportsStore:
                     )
                     created_utc = now
                 conn.commit()
+        # Best-effort mirror to Supabase so the Lite app sees new/edited
+        # templates without a full bootstrap fetch. Never fail the local
+        # save on a cloud hiccup.
+        try:
+            self._mirror_template_to_cloud(
+                tenant_id=tid, tpl_id=tpl_id, name=name, description=description,
+                definition_json=definition_json, created_utc=created_utc,
+                updated_utc=now, author=author,
+            )
+        except Exception:
+            pass
         return {
             "id": tpl_id,
             "name": name,
@@ -137,6 +148,64 @@ class ReportsStore:
             "updated_utc": now,
             "created_by": author,
         }
+
+    def _mirror_template_to_cloud(self, *, tenant_id: str, tpl_id: str, name: str,
+                                   description: str, definition_json: str,
+                                   created_utc: str, updated_utc: str,
+                                   author: str | None) -> None:
+        """Push a freshly-saved report template into Supabase.
+
+        Runs in a background thread so the local save doesn't block on a
+        cloud round-trip (same pattern as `_mirror_config_doc_to_cloud`).
+        """
+        from .app_store import app_store  # local import to avoid a cycle
+        try:
+            cloud = app_store._get_cloud_database_target()  # noqa: SLF001
+        except Exception:
+            cloud = None
+        if not cloud:
+            return
+
+        kwargs = {
+            "id": tpl_id, "tenant_id": tenant_id, "name": name,
+            "description": description, "definition_json": definition_json,
+            "created_utc": created_utc, "updated_utc": updated_utc,
+            "author": author,
+        }
+
+        def _do_upsert() -> None:
+            try:
+                from sqlalchemy import text  # type: ignore
+                schema = str(cloud.get("schema") or "public")
+                engine, _ = app_store._get_or_create_cloud_engine(cloud, schema)  # noqa: SLF001
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."report_templates"
+                              (id, tenant_id, name, description, definition_json, created_utc, updated_utc, created_by)
+                            VALUES
+                              (:id, :tenant_id, :name, :description, :definition_json::jsonb,
+                               :created_utc, :updated_utc, :author)
+                            ON CONFLICT (tenant_id, id) DO UPDATE SET
+                              name            = EXCLUDED.name,
+                              description     = EXCLUDED.description,
+                              definition_json = EXCLUDED.definition_json,
+                              updated_utc     = EXCLUDED.updated_utc,
+                              created_by      = EXCLUDED.created_by
+                            """
+                        ),
+                        kwargs,
+                    )
+            except Exception:
+                pass
+
+        try:
+            import threading
+            threading.Thread(target=_do_upsert, name="tn-mirror-report-template",
+                             daemon=True).start()
+        except Exception:
+            pass
 
     def delete_template(self, template_id: str, tenant_id: str | None = None) -> bool:
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
@@ -452,7 +521,42 @@ class ReportsStore:
                     ),
                 )
                 conn.commit()
-        return self.get_generated(gid, tenant_id=tid) or {}
+        full = self.get_generated(gid, tenant_id=tid) or {}
+        # Best-effort: push the PDF to Supabase Storage + mirror the row so
+        # the Lite app can list/preview/download without touching the edge.
+        # Runs in a background thread to keep the API response snappy.
+        try:
+            import threading
+            from app.services.reports_cloud_uploader import upload_and_mirror
+
+            def _push(rec: dict[str, Any], store: "ReportsStore") -> None:
+                try:
+                    storage_path = upload_and_mirror(rec)
+                except Exception:
+                    storage_path = None
+                if storage_path:
+                    try:
+                        store._set_storage_path(str(rec.get("id") or ""), storage_path)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_push, args=(dict(full), self), daemon=True).start()
+        except Exception:
+            pass
+        return full
+
+    def _set_storage_path(self, generated_id: str, storage_path: str) -> None:
+        """Backfill the local `storage_path` column after a successful upload.
+        Local SQLite stays authoritative even if the cloud copy lags."""
+        if not (generated_id and storage_path):
+            return
+        with self._write_lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE generated_reports SET storage_path = ? WHERE id = ?",
+                    (storage_path, generated_id),
+                )
+                conn.commit()
 
     def update_generated_email_status(
         self,
@@ -508,6 +612,11 @@ class ReportsStore:
             meta = json.loads(str(row["meta_json"] or "{}"))
         except Exception:
             meta = {}
+        # storage_path is a 2026-05-18 addition; older rows lack the column.
+        try:
+            storage_path = str(row["storage_path"] or "") or None
+        except Exception:
+            storage_path = None
         return {
             "id": str(row["id"]),
             "tenant_id": str(row["tenant_id"] or "default"),
@@ -520,6 +629,7 @@ class ReportsStore:
             "file_name": str(row["file_name"] or ""),
             "file_bytes": int(row["file_bytes"] or 0),
             "file_sha256": str(row["file_sha256"] or "") or None,
+            "storage_path": storage_path,
             "created_utc": str(row["created_utc"] or ""),
             "email_status": str(row["email_status"] or "") or None,
             "email_message": str(row["email_message"] or "") or None,

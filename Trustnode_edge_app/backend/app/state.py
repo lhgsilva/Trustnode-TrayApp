@@ -10,6 +10,7 @@ from app.services.power_manager import PowerManager
 from app.services.reports_store import ReportsStore
 from app.services.report_renderer import render_template_to_pdf
 from app.services.report_scheduler import ReportRunner, ReportScheduler
+from app.services.lite_report_poller import LiteReportRequestPoller
 from app.routers.notifications import send_email_request
 
 telemetry_service = TelemetryService()
@@ -109,4 +110,12 @@ report_scheduler = ReportScheduler(
     email_settings_lookup=scheduler_email_settings_holder.get,
     is_any_gateway_running=_is_any_gateway_running,
     tick_seconds=15,
+)
+
+# Drains the Lite "Generate" queue (Supabase table populated by the Lite app).
+# Same ReportRunner — the synthesized schedule never asks for email delivery.
+lite_report_poller = LiteReportRequestPoller(
+    runner=report_runner,
+    reports_store=reports_store,
+    tick_seconds=10,
 )

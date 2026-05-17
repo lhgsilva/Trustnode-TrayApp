@@ -987,6 +987,14 @@ class PowerManager:
                         "unit_id": int(d.get("unit_id") or 1),
                         "poll_interval_ms": int(d.get("poll_interval_ms") or 1000),
                     }
+                # Always overlay the current `enabled` flag from cfg.
+                # `_status_by_device` is only refreshed by the poll loop, so
+                # if the loop is sleeping (device disabled), it carries a
+                # stale `enabled=true` from the last successful poll. Without
+                # this overlay the UI keeps showing "Running" for up to one
+                # full poll cycle (~1 s) AND for as long as the loop is in
+                # the disabled-sleep state.
+                st["enabled"] = bool(d.get("enabled", True))
                 st.update(
                     {
                         "poll_duration_ms": metrics.get("poll_duration_ms"),

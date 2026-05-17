@@ -2743,6 +2743,11 @@ function AppShell() {
   const cloudNewestLiveTsMsRef = useRef(0);
   const cloudLastApplyMsRef = useRef(0);
   const gatewayDownPollCountersRef = useRef({});
+  // Wall-clock ms when the user (or this client) intentionally stopped a
+  // gateway. While this is recent the debounce in refreshGatewayRuntimes is
+  // bypassed so the UI doesn't keep showing RUNNING for ~20 s because the
+  // last DB write is still fresh.
+  const userStoppedAtRef = useRef({});
   const cloudLastAcceptedTsByKeyRef = useRef(new Map());
   const cloudPollLogThrottleRef = useRef({ live: 0, aux: 0 });
   const powerHistoryLastFetchMsRef = useRef(0);
@@ -3160,15 +3165,23 @@ function AppShell() {
           (Number.isFinite(lastCheckMs) && (nowMs - lastCheckMs) <= 20000);
         const incomingRunning = incoming?.running === true;
         const currentRunning = current?.running === true;
+        const userStopMs = Number(userStoppedAtRef.current[gid] || 0);
+        const recentlyUserStopped = userStopMs > 0 && (nowMs - userStopMs) < 15000;
         if (incomingRunning) {
+          if (recentlyUserStopped) {
+            next[gid] = { ...current, ...incoming, gateway_id: gid, running: false };
+            continue;
+          }
           gatewayDownPollCountersRef.current[gid] = 0;
+          userStoppedAtRef.current[gid] = 0;
           next[gid] = { ...current, ...incoming, gateway_id: gid, running: true };
           continue;
         }
         const prevCount = Number(gatewayDownPollCountersRef.current[gid] || 0);
         const downCount = prevCount + 1;
         gatewayDownPollCountersRef.current[gid] = downCount;
-        if (currentRunning && (hasFreshRuntimeSignal || downCount < 3)) {
+        if (currentRunning && !recentlyUserStopped
+            && (hasFreshRuntimeSignal || downCount < 3)) {
           next[gid] = { ...current, ...incoming, gateway_id: gid, running: true };
           continue;
         }
@@ -3189,6 +3202,23 @@ function AppShell() {
   const markGatewayRunningState = (gatewayIds, running) => {
     const ids = (gatewayIds || []).filter(Boolean);
     if (!ids.length) return;
+    if (!running) {
+      // Remember when we asked for a stop so the debounce in
+      // refreshGatewayRuntimes doesn't fight the optimistic flip. Without
+      // this the freshness-grace (20 s window on db_last_write_utc) keeps
+      // the gateway listed as RUNNING even though the backend already
+      // honoured the stop — the user sees a long lag.
+      const now = Date.now();
+      for (const id of ids) {
+        userStoppedAtRef.current[String(id)] = now;
+        gatewayDownPollCountersRef.current[String(id)] = 99;  // skip downCount < 3 grace
+      }
+    } else {
+      for (const id of ids) {
+        delete userStoppedAtRef.current[String(id)];
+        gatewayDownPollCountersRef.current[String(id)] = 0;
+      }
+    }
     setGatewayRuntimeStatuses((prev) => {
       const next = { ...prev };
       for (const id of ids) {
@@ -3271,8 +3301,17 @@ function AppShell() {
 
             const incomingRunning = incoming?.running === true;
             const currentRunning = current?.running === true;
+            const userStopMs = Number(userStoppedAtRef.current[gid] || 0);
+            const recentlyUserStopped = userStopMs > 0 && (nowMs - userStopMs) < 15000;
             if (incomingRunning) {
+              // If the user just asked for a stop, ignore an immediate
+              // "still running" poll — the backend hasn't finished the stop yet.
+              if (recentlyUserStopped) {
+                next[gid] = { ...current, ...incoming, gateway_id: gid, running: false };
+                continue;
+              }
               gatewayDownPollCountersRef.current[gid] = 0;
+              userStoppedAtRef.current[gid] = 0;
               next[gid] = { ...current, ...incoming, gateway_id: gid, running: true };
               continue;
             }
@@ -3282,7 +3321,8 @@ function AppShell() {
             const downCount = prevCount + 1;
             gatewayDownPollCountersRef.current[gid] = downCount;
 
-            if (currentRunning && (hasFreshRuntimeSignal || downCount < 3)) {
+            if (currentRunning && !recentlyUserStopped
+                && (hasFreshRuntimeSignal || downCount < 3)) {
               next[gid] = {
                 ...current,
                 ...incoming,

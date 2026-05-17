@@ -9,12 +9,14 @@
  * evicted on activate. Browsers re-check the service worker on each navigation
  * so users pick the new shell up automatically next time they open the app.
  */
-const CACHE_VERSION = "tnlite-v2";
+const CACHE_VERSION = "tnlite-v12-active-alarms";
 const SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./manifest.json",
+  "./trustnode_app_icon.png",
+  "./trustnode_app_icon_180.png",
 ];
 
 self.addEventListener("install", (event) => {

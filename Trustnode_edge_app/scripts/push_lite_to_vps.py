@@ -16,7 +16,9 @@ import paramiko
 HERE = Path(__file__).resolve().parent.parent
 LITE_DIR = HERE / "web_cloud_readonly" / "lite"
 REMOTE_DIR = "/var/www/trustnode/lite"
-FILES = ["index.html", "styles.css", "manifest.json", "sw.js", "config.json", "trustnode_logo.png", "trustnode_login_logo.png"]
+FILES = ["index.html", "styles.css", "manifest.json", "sw.js", "config.json",
+         "trustnode_logo.png", "trustnode_login_logo.png",
+         "trustnode_app_icon.png", "trustnode_app_icon_180.png"]
 
 
 def load_env(p: Path) -> dict[str, str]:
