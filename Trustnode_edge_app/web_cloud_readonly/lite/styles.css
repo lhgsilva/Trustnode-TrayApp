@@ -1386,6 +1386,23 @@ main {
   overflow: hidden;
   box-shadow: 0 24px 60px -16px rgba(15, 23, 42, 0.4);
 }
+/* PDF preview is its own animal — readers need vertical real-estate to
+   read a full report page. Cap to a generous portion of the viewport so
+   the body of the report is visible without scroll on mobile. */
+.monitor.pdf-preview {
+  width: min(100%, 900px);
+  height: 92vh;
+}
+@media (max-width: 600px) {
+  .monitor.pdf-preview {
+    width: 100%;
+    height: 100vh;
+    height: 100dvh;
+    border-radius: 0;
+    border: 0;
+  }
+  .monitor-back:has(> .pdf-preview) { padding: 0; }
+}
 .monitor-head {
   padding: 14px 18px;
   border-bottom: 1px solid var(--stroke);
@@ -2075,4 +2092,50 @@ select.hist-filter-input { padding-right: 24px; }
   display: flex;
   align-items: center;
   margin: 6px 0 4px;
+}
+
+/* ---- Print stylesheet --------------------------------------------------- */
+/* When the operator hits Ctrl+P from a dashboard or report page, hide the
+   chrome (header, sidebar, bottom tabs, settings buttons) and let widgets
+   flow at full page width. Without this everything prints with the dark
+   theme + navigation visible. */
+@media print {
+  :root, [data-theme="dark"], [data-theme="light"] {
+    --bg: #ffffff;
+    --card: #ffffff;
+    --card-2: #ffffff;
+    --text: #111111;
+    --muted: #444444;
+    --stroke: #cccccc;
+    --header: #ffffff;
+  }
+  html, body { background: #ffffff !important; color: #111 !important; }
+  .app-header, .sidebar, .tabs, .icon-btn, .seg, .hist-filters,
+  .dashboard-toolbar, .gateway-footer, .footer-bar,
+  .monitor-back, .modal-back, .settings-back {
+    display: none !important;
+  }
+  .app-shell { display: block !important; min-height: auto !important; }
+  main { padding: 0 !important; }
+  /* Each widget should sit on its own page area when long enough; never split a card */
+  .widget, .alarm-rule-card, .alarm-event, .report-card,
+  .power-card, .dashboard-widget {
+    page-break-inside: avoid;
+    break-inside: avoid;
+    box-shadow: none !important;
+    border-color: #cccccc !important;
+    background: #ffffff !important;
+    color: #111 !important;
+  }
+  .widget-flow {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    gap: 8px !important;
+  }
+  .widget-flow.per-row-1 { grid-template-columns: 1fr !important; }
+  /* Recharts text needs to be dark on white paper */
+  .recharts-text, .recharts-cartesian-axis-tick text,
+  .recharts-legend-item-text { fill: #111 !important; color: #111 !important; }
+  /* PDF preview iframe occupies the full printable page */
+  .pdf-frame { width: 100% !important; height: 100vh !important; }
 }

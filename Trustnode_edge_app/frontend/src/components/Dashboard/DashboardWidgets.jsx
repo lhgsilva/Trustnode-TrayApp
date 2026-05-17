@@ -982,7 +982,12 @@ export function DashboardWidgetCard({
   useEffect(() => {
     const isPieDirect = widgetType === "pie_chart" && String(effectiveDataSourceType || "tag_direct") === "tag_direct";
     const canQuery = typeof fetchWidgetStatsRef.current === "function";
-    if (!isPieDirect || !canQuery) {
+    // When the operator picked a non-"none" group_interval, the server
+    // stats endpoint can't honour it (no group_interval param exists), so
+    // we skip the server call and let the client-side fallback at
+    // localDirectStats compute the bucketed aggregation properly.
+    const hasGrouping = String(cfgGroupInterval || "none") !== "none";
+    if (!isPieDirect || !canQuery || hasGrouping) {
       setServerQueryStats(null);
       setLastGoodServerQueryStats(null);
       setServerQueryStatsError("");

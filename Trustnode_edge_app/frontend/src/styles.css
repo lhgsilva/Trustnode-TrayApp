@@ -4758,3 +4758,29 @@ textarea {
   align-items: center;
   justify-content: center;
 }
+
+/* ---- Print stylesheet --------------------------------------------------- */
+/* Hide app chrome and force paper-friendly contrast when the operator prints
+   a dashboard. Widgets keep their layout but lose dark backgrounds; cards
+   never split across page boundaries. */
+@media print {
+  html, body { background: #ffffff !important; color: #111 !important; }
+  .app-header, .app-sidebar, .footer-bar, .gateway-footer, .tabs,
+  .toolbar, .top-bar, .navbar, .dashboard-toolbar,
+  .widget-toolbar, .widget-controls,
+  .modal-overlay, .settings-overlay, .toast-host {
+    display: none !important;
+  }
+  main, .main, .page, .content { padding: 0 !important; margin: 0 !important; }
+  .dashboard-widget, .widget, .dashboard-widget-block, .widget-card {
+    page-break-inside: avoid;
+    break-inside: avoid;
+    box-shadow: none !important;
+    border: 1px solid #cccccc !important;
+    background: #ffffff !important;
+    color: #111 !important;
+  }
+  .recharts-text,
+  .recharts-cartesian-axis-tick text,
+  .recharts-legend-item-text { fill: #111 !important; color: #111 !important; }
+}

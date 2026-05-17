@@ -878,13 +878,35 @@ function PieWidget({ widget, liveByKey }) {
       // the widget's primary tag if missing.
       const fetched = new Map();
       const counts = [];
+      // Same aggregation semantics the edge applies in dashboardAnalytics.js:
+      //   count   — number of samples that match the rule
+      //   sum     — total of matching values
+      //   avg     — mean of matching values
+      //   min/max — extremes of matching values
+      //   latest  — most-recent matching value (values arrive oldest-first
+      //             from fetchPieValues, so this is the last entry)
+      const reduce = (matchVals, mode) => {
+        if (!matchVals.length) return mode === "count" ? 0 : null;
+        switch (String(mode || "count").toLowerCase()) {
+          case "sum":    return matchVals.reduce((a, b) => a + b, 0);
+          case "avg":    return matchVals.reduce((a, b) => a + b, 0) / matchVals.length;
+          case "min":    return Math.min(...matchVals);
+          case "max":    return Math.max(...matchVals);
+          case "latest":
+          case "last":   return matchVals[matchVals.length - 1];
+          case "count":
+          default:       return matchVals.length;
+        }
+      };
       for (const r of rules) {
         const gw  = r.gateway_id || cfg.gateway_id || "";
         const tag = r.tag_name || cfg.tag_name || "";
         const k = `${gw}|${tag}`;
         if (!fetched.has(k)) fetched.set(k, await fetchPieValues(gw, tag, Number(sampleCount) || 200));
         const values = fetched.get(k);
-        counts.push(values.reduce((acc, v) => acc + (ruleMatches(r, v) ? 1 : 0), 0));
+        const matching = values.filter((v) => ruleMatches(r, v));
+        const agg = reduce(matching, r.aggregation || "count");
+        counts.push(Number.isFinite(agg) ? agg : 0);
       }
       if (!stopped) setComputedCounts(counts);
     };
@@ -958,8 +980,23 @@ function PieWidget({ widget, liveByKey }) {
 function TableWidget({ widget }) {
   const cfg = widget?.config || {};
   const sampleCount = useDashSamples();
-  const series = useChartSeries(cfg.gateway_id || "", cfg.tag_name || "", sampleCount);
-  const rows = series.slice().reverse();
+  // Per-widget table size (query_row_limit / list_limit) takes precedence
+  // over the dashboard-level sample count so the edge editor's table-row
+  // selector is honoured in Lite. Falls back to the dashboard default
+  // when no per-widget limit is set.
+  const rowLimit = Math.max(1, Math.min(2000, Number(cfg.query_row_limit || cfg.list_limit || sampleCount || 20)));
+  const rowSel = String(cfg.query_row_selection || "all").toLowerCase();
+  const series = useChartSeries(cfg.gateway_id || "", cfg.tag_name || "", rowLimit);
+  // useChartSeries returns oldest-first; pick the right slice for the
+  // configured row_selection (latest/last_n = tail, oldest = head, all = full).
+  let rows;
+  if (rowSel === "oldest") {
+    rows = series.slice(0, rowLimit).reverse();
+  } else if (rowSel === "all") {
+    rows = series.slice().reverse();
+  } else {
+    rows = series.slice(-rowLimit).reverse();
+  }
   if (!cfg.tag_name) return h("div", { className: "widget-empty muted" }, "no tag");
   if (!rows.length) return h("div", { className: "widget-empty muted" }, "no samples");
   return h("div", { className: "widget-table-mount" },
