@@ -6,774 +6,745 @@
   <meta name="theme-color" content="#111111" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="TrustNode" />
   <title>TrustNode Lite</title>
+  <link rel="manifest" href="./manifest.json" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23111'/%3E%3Ctext x='32' y='42' text-anchor='middle' font-family='Arial' font-weight='bold' font-size='28' fill='%2314a89a'%3ETN%3C/text%3E%3C/svg%3E" />
+  <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' rx='40' fill='%23111'/%3E%3Ctext x='90' y='118' text-anchor='middle' font-family='Arial' font-weight='bold' font-size='80' fill='%2314a89a'%3ETN%3C/text%3E%3C/svg%3E" />
   <link rel="stylesheet" href="./styles.css" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css" />
 </head>
 <body>
-  <div id="app"></div>
+  <div id="app">
+    <div class="empty" style="margin-top: 30vh"><div class="spinner"></div> loading…</div>
+  </div>
   <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js" defer></script>
-  <script defer>
-(() => {
-  "use strict";
+  <script type="module">
+import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm";
 
-  // ----- Config -----------------------------------------------------------
-  // The page is hosted on the same origin as the API. If you ever want to
-  // point it elsewhere, append ?api=https://other.example.com to the URL.
-  const url = new URL(window.location.href);
-  const apiOverride = (url.searchParams.get("api") || "").replace(/\/+$/, "");
-  const API_BASE = apiOverride || `${window.location.origin}`;
-  const TOKEN_KEY = "trustnode_lite_token";
-  const TOKEN_USER_KEY = "trustnode_lite_user";
-  const EDGE_KEY = "trustnode_lite_edge";
-
-  // ----- Tiny utilities ---------------------------------------------------
-  const $ = (sel, root = document) => root.querySelector(sel);
-  const el = (tag, props = {}, ...children) => {
-    const node = document.createElement(tag);
-    for (const [k, v] of Object.entries(props)) {
-      if (k === "class") node.className = v;
-      else if (k === "style" && typeof v === "object") Object.assign(node.style, v);
-      else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2).toLowerCase(), v);
-      else if (k === "html") node.innerHTML = v;
-      else if (v !== undefined && v !== null && v !== false) node.setAttribute(k, v);
-    }
-    for (const c of children) {
-      if (c == null || c === false) continue;
-      node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-    }
-    return node;
-  };
-  const fmtAge = (iso) => {
-    if (!iso) return "never";
-    const t = Date.parse(iso);
-    if (!Number.isFinite(t)) return "never";
-    const dt = Math.max(0, Date.now() - t);
-    if (dt < 1500) return "now";
-    if (dt < 60_000) return `${Math.round(dt / 1000)}s`;
-    if (dt < 3_600_000) return `${Math.round(dt / 60_000)}m`;
-    if (dt < 86_400_000) return `${Math.round(dt / 3_600_000)}h`;
-    return `${Math.round(dt / 86_400_000)}d`;
-  };
-  const fmtVal = (v) => {
-    if (v === null || v === undefined) return "—";
-    const n = Number(v);
-    if (!Number.isFinite(n)) return String(v);
-    if (Math.abs(n) >= 1000) return n.toFixed(0);
-    if (Math.abs(n) >= 1) return n.toFixed(2);
-    return n.toFixed(3);
-  };
-  const fmtTs = (iso) => {
-    if (!iso) return "—";
-    try {
-      const d = new Date(iso);
-      return d.toLocaleString();
-    } catch {
-      return String(iso);
-    }
-  };
-  const safeJSON = async (res) => {
-    const text = await res.text();
-    try { return JSON.parse(text); } catch { return null; }
-  };
-
-  // ----- API client -------------------------------------------------------
-  let authToken = sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY) || "";
-  let authUser = localStorage.getItem(TOKEN_USER_KEY) || "";
-
-  async function api(path, init = {}) {
-    const headers = new Headers(init.headers || {});
-    headers.set("Cache-Control", "no-store");
-    if (authToken) headers.set("Authorization", `Bearer ${authToken}`);
-    if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-    const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
-    if (res.status === 401) {
-      authToken = "";
-      sessionStorage.removeItem(TOKEN_KEY);
-      localStorage.removeItem(TOKEN_KEY);
-      render();
-      throw new Error("unauthorized");
-    }
-    return res;
+// ---------- Tiny DOM utilities --------------------------------------------
+const $ = (sel, root = document) => root.querySelector(sel);
+const el = (tag, props = {}, ...children) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") node.className = v;
+    else if (k === "style" && typeof v === "object") Object.assign(node.style, v);
+    else if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (k === "html") node.innerHTML = v;
+    else if (v !== undefined && v !== null && v !== false) node.setAttribute(k, v);
   }
-
-  async function login(username, password) {
-    const res = await fetch(`${API_BASE}/api/auth/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username, password }),
-    });
-    const data = await safeJSON(res);
-    if (!res.ok || !data) throw new Error((data && data.detail) || `Login failed (${res.status})`);
-    const tok = data.access_token || data.token;
-    if (!tok) throw new Error("Login response missing token");
-    authToken = tok;
-    authUser = username;
-    localStorage.setItem(TOKEN_KEY, tok);
-    localStorage.setItem(TOKEN_USER_KEY, username);
+  for (const c of children) {
+    if (c == null || c === false) continue;
+    node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
   }
+  return node;
+};
+const fmtAge = (iso) => {
+  if (!iso) return "never";
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "never";
+  const dt = Math.max(0, Date.now() - t);
+  if (dt < 1500) return "now";
+  if (dt < 60_000) return `${Math.round(dt / 1000)}s`;
+  if (dt < 3_600_000) return `${Math.round(dt / 60_000)}m`;
+  if (dt < 86_400_000) return `${Math.round(dt / 3_600_000)}h`;
+  return `${Math.round(dt / 86_400_000)}d`;
+};
+const fmtVal = (v) => {
+  if (v === null || v === undefined) return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v);
+  if (Math.abs(n) >= 1000) return n.toFixed(0);
+  if (Math.abs(n) >= 1) return n.toFixed(2);
+  return n.toFixed(3);
+};
+const fmtTs = (iso) => {
+  if (!iso) return "—";
+  try { return new Date(iso).toLocaleString(); } catch { return String(iso); }
+};
+const freshnessClass = (ts) => {
+  const t = ts ? Date.parse(ts) : 0;
+  if (!t) return "bad";
+  const age = Date.now() - t;
+  if (age < 10_000) return "fresh";
+  if (age < 60_000) return "stale";
+  return "bad";
+};
 
-  function logout() {
-    authToken = "";
-    authUser = "";
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(TOKEN_USER_KEY);
-    sessionStorage.removeItem(TOKEN_KEY);
+// ---------- Config + Supabase client --------------------------------------
+let cfg = null;
+let supabase = null;
+let session = null;
+
+async function loadConfig() {
+  try {
+    const res = await fetch("./config.json", { cache: "no-cache" });
+    if (!res.ok) throw new Error(`config.json HTTP ${res.status}`);
+    cfg = await res.json();
+  } catch (e) {
+    cfg = null;
+    throw new Error(`Could not load config.json: ${e.message || e}`);
   }
-
-  // ----- App state --------------------------------------------------------
-  const state = {
-    tab: "live",            // live | dashboard | history | alarms | power
-    edges: [],              // list of edge ids/names from bootstrap
-    selectedEdge: localStorage.getItem(EDGE_KEY) || "",  // "" = all
-    live: [],
-    liveAt: 0,
-    liveError: "",
-    bootstrap: null,
-    bootstrapError: "",
-    drawer: null,           // { gateway_id, tag, value, ts, rows, range }
-    alarms: [],
-    alarmsError: "",
-    historian: [],
-    historianError: "",
-    power: null,
-    powerError: "",
-  };
-
-  let livePoll = null;
-  let alarmsPoll = null;
-  let historianPoll = null;
-  let powerPoll = null;
-  let bootstrapPoll = null;
-
-  // ----- Data fetchers ----------------------------------------------------
-  function edgeQS() {
-    return state.selectedEdge ? `&edge_id=${encodeURIComponent(state.selectedEdge)}` : "";
+  if (!cfg?.supabase_url || !cfg?.supabase_anon_key) {
+    throw new Error("config.json is missing supabase_url or supabase_anon_key");
   }
+  supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key, {
+    auth: { persistSession: true, storageKey: "tnlite-auth", autoRefreshToken: true },
+  });
+  const { data } = await supabase.auth.getSession();
+  session = data.session || null;
+}
 
-  async function fetchLive() {
-    try {
-      const res = await api(`/api/app-store/live?limit=400${edgeQS()}`);
-      const data = await safeJSON(res);
-      const rows = Array.isArray(data?.rows) ? data.rows : [];
-      state.live = rows;
-      state.liveAt = Date.now();
-      state.liveError = "";
-      if (state.tab === "live") renderBody();
-    } catch (e) {
-      if (e.message !== "unauthorized") {
-        state.liveError = e.message || String(e);
-        if (state.tab === "live") renderBody();
+// ---------- State ----------------------------------------------------------
+const state = {
+  tab: "live",
+  tenantLabel: "",
+  liveRows: [],
+  liveAt: 0,
+  liveError: "",
+  historyRows: [],
+  historyError: "",
+  alarmRows: [],
+  alarmError: "",
+  powerRows: [],
+  powerError: "",
+  dashboardWidgets: [],
+  dashboardError: "",
+  drawer: null, // { gateway_id, tag_name, range_ms, rows, loading, error }
+};
+
+let livePoll = null;
+let historyPoll = null;
+let alarmsPoll = null;
+let powerPoll = null;
+
+function stopAllPolls() {
+  [livePoll, historyPoll, alarmsPoll, powerPoll].forEach((t) => t && clearInterval(t));
+  livePoll = historyPoll = alarmsPoll = powerPoll = null;
+}
+
+// ---------- Data fetchers (direct Supabase) -------------------------------
+async function fetchLive() {
+  if (!supabase || !session) return;
+  try {
+    const { data, error } = await supabase
+      .from("live_latest")
+      .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc, tenant_id")
+      .order("ts_utc", { ascending: false })
+      .limit(400);
+    if (error) throw error;
+    state.liveRows = data || [];
+    state.liveAt = Date.now();
+    state.liveError = "";
+    if (state.tab === "live" || state.tab === "dashboard") renderBody();
+  } catch (e) {
+    state.liveError = e.message || String(e);
+    if (state.tab === "live" || state.tab === "dashboard") renderBody();
+  }
+}
+
+async function fetchHistory() {
+  if (!supabase || !session) return;
+  try {
+    const lim = Number(cfg?.history_default_limit || 300);
+    const { data, error } = await supabase
+      .from("historian_readings")
+      .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc")
+      .order("ts_utc", { ascending: false })
+      .limit(lim);
+    if (error) throw error;
+    state.historyRows = data || [];
+    state.historyError = "";
+    if (state.tab === "history") renderBody();
+  } catch (e) {
+    state.historyError = e.message || String(e);
+    if (state.tab === "history") renderBody();
+  }
+}
+
+async function fetchAlarms() {
+  if (!supabase || !session) return;
+  try {
+    const { data, error } = await supabase
+      .from("app_logs")
+      .select("ts_utc, level, category, message, gateway_id, gateway_name")
+      .order("ts_utc", { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    state.alarmRows = data || [];
+    state.alarmError = "";
+    if (state.tab === "alarms") renderBody();
+  } catch (e) {
+    state.alarmError = e.message || String(e);
+    if (state.tab === "alarms") renderBody();
+  }
+}
+
+// Power tab: derive from live_latest by filtering tag names. The desktop
+// power-meter integration writes voltage_v / current_a / active_power_w /
+// energy_wh / power_factor / frequency_hz tags. We group by gateway_id.
+async function fetchPower() {
+  if (!supabase || !session) return;
+  try {
+    const meterTags = ["voltage_v","current_a","active_power_w","energy_wh","power_factor","frequency_hz"];
+    const { data, error } = await supabase
+      .from("live_latest")
+      .select("gateway_id, gateway_name, tag_name, value, ts_utc")
+      .in("tag_name", meterTags);
+    if (error) throw error;
+    const byGw = new Map();
+    for (const r of data || []) {
+      const gid = r.gateway_id || "—";
+      if (!byGw.has(gid)) byGw.set(gid, { gateway_id: gid, gateway_name: r.gateway_name || gid, ts_utc: r.ts_utc, tags: {} });
+      const e = byGw.get(gid);
+      e.tags[r.tag_name] = r.value;
+      if (!e.ts_utc || (r.ts_utc && r.ts_utc > e.ts_utc)) e.ts_utc = r.ts_utc;
+    }
+    state.powerRows = [...byGw.values()];
+    state.powerError = "";
+    if (state.tab === "power") renderBody();
+  } catch (e) {
+    state.powerError = e.message || String(e);
+    if (state.tab === "power") renderBody();
+  }
+}
+
+// Dashboard widgets come from cp_users.permissions_json? No — they live in
+// the desktop config which the edge syncs into cp_user_tenant_memberships's
+// `modules_json`. For v1 we read a simple list of (gateway_id, tag_name)
+// pairs from cp_users.modules_json for the logged-in user, falling back to
+// "show every distinct tag in live_latest" if none configured.
+async function fetchDashboardConfig() {
+  if (!supabase || !session) return;
+  try {
+    // Try to read the current user's profile via lite_profiles -> map to
+    // saved widgets. We don't have a `dashboard_configurations` mirror in
+    // Supabase yet, so v1 derives widgets from the freshest 8 tags in
+    // live_latest, sorted by recency. This still gives the customer a
+    // useful "what's running" dashboard immediately.
+    const { data, error } = await supabase
+      .from("live_latest")
+      .select("gateway_id, gateway_name, tag_name, value, ts_utc")
+      .order("ts_utc", { ascending: false })
+      .limit(12);
+    if (error) throw error;
+    state.dashboardWidgets = (data || []).map((r, i) => ({
+      id: `dw-${i}`,
+      title: r.tag_name,
+      gateway_id: r.gateway_id,
+      gateway_name: r.gateway_name,
+      tag_name: r.tag_name,
+      type: "value_kpi",
+    }));
+    state.dashboardError = "";
+    if (state.tab === "dashboard") renderBody();
+  } catch (e) {
+    state.dashboardError = e.message || String(e);
+    if (state.tab === "dashboard") renderBody();
+  }
+}
+
+async function fetchTagHistory(gateway_id, tag_name, rangeMs) {
+  if (!supabase) throw new Error("not ready");
+  const fromTs = new Date(Date.now() - rangeMs).toISOString();
+  const { data, error } = await supabase
+    .from("historian_readings")
+    .select("ts_utc, value")
+    .eq("tag_name", tag_name)
+    .eq("gateway_id", gateway_id)
+    .gte("ts_utc", fromTs)
+    .order("ts_utc", { ascending: true })
+    .limit(5000);
+  if (error) throw error;
+  return data || [];
+}
+
+// ---------- Polling lifecycle ---------------------------------------------
+function startPolls() {
+  stopAllPolls();
+  const pollMs = Number(cfg?.live_poll_ms || 2000);
+  if (state.tab === "live" || state.tab === "dashboard") {
+    fetchLive();
+    livePoll = setInterval(fetchLive, pollMs);
+    if (state.tab === "dashboard") fetchDashboardConfig();
+  }
+  if (state.tab === "history") {
+    fetchHistory();
+    historyPoll = setInterval(fetchHistory, 5000);
+  }
+  if (state.tab === "alarms") {
+    fetchAlarms();
+    alarmsPoll = setInterval(fetchAlarms, 5000);
+  }
+  if (state.tab === "power") {
+    fetchPower();
+    powerPoll = setInterval(fetchPower, 3000);
+  }
+}
+
+// ---------- Drawer (chart on tap) -----------------------------------------
+const RANGE_OPTS = [
+  { label: "5m", ms: 5 * 60_000 },
+  { label: "15m", ms: 15 * 60_000 },
+  { label: "1h", ms: 60 * 60_000 },
+  { label: "6h", ms: 6 * 60 * 60_000 },
+  { label: "24h", ms: 24 * 60 * 60_000 },
+  { label: "7d", ms: 7 * 24 * 60 * 60_000 },
+];
+
+async function openDrawer(gateway_id, gateway_name, tag_name, value, ts) {
+  const defaultRangeMs = Math.max(60_000, Number(cfg?.default_chart_range_minutes || 60) * 60_000);
+  state.drawer = { gateway_id, gateway_name, tag_name, value, ts, range_ms: defaultRangeMs, rows: null, loading: true, error: "" };
+  render();
+  try {
+    state.drawer.rows = await fetchTagHistory(gateway_id, tag_name, defaultRangeMs);
+    state.drawer.loading = false;
+    render();
+  } catch (e) {
+    state.drawer.error = e.message || String(e);
+    state.drawer.loading = false;
+    render();
+  }
+}
+
+async function setDrawerRange(ms) {
+  if (!state.drawer) return;
+  state.drawer.range_ms = ms;
+  state.drawer.loading = true;
+  state.drawer.rows = null;
+  state.drawer.error = "";
+  render();
+  try {
+    state.drawer.rows = await fetchTagHistory(state.drawer.gateway_id, state.drawer.tag_name, ms);
+    state.drawer.loading = false;
+    render();
+  } catch (e) {
+    if (state.drawer) { state.drawer.error = e.message || String(e); state.drawer.loading = false; }
+    render();
+  }
+}
+
+function closeDrawer() {
+  state.drawer = null;
+  render();
+}
+
+function mountChart() {
+  if (!state.drawer || !state.drawer.rows || state.drawer.rows.length === 0) return;
+  if (typeof uPlot === "undefined") return;
+  const mount = $("#uplot-mount");
+  if (!mount) return;
+  const sorted = state.drawer.rows.slice().sort((a, b) =>
+    Date.parse(a.ts_utc || 0) - Date.parse(b.ts_utc || 0));
+  const xs = sorted.map((r) => Math.floor(Date.parse(r.ts_utc) / 1000));
+  const ys = sorted.map((r) => { const n = Number(r.value); return Number.isFinite(n) ? n : null; });
+  mount.innerHTML = "";
+  const w = mount.clientWidth || 600;
+  new uPlot({
+    width: w,
+    height: 300,
+    cursor: { show: true },
+    scales: { x: { time: true } },
+    series: [
+      {},
+      { label: state.drawer.tag_name, stroke: "#14a89a", width: 1.8, points: { show: false } },
+    ],
+    axes: [
+      { stroke: "#8a98ab", grid: { stroke: "rgba(138,152,171,0.15)" } },
+      { stroke: "#8a98ab", grid: { stroke: "rgba(138,152,171,0.15)" } },
+    ],
+  }, [xs, ys], mount);
+}
+
+// ---------- Rendering -----------------------------------------------------
+function renderHeader() {
+  const root = $("#header-root");
+  if (!root) return;
+  const label = state.tenantLabel || cfg?.customer_label || "TrustNode";
+  root.replaceChildren(
+    el("span", { class: "brand-dot" }),
+    el("h1", {}, "TrustNode Lite"),
+    el("span", { class: "spacer" }),
+    el("span", { class: "edge-pill" }, label),
+    el("button", {
+      class: "close",
+      title: "Sign out",
+      style: { marginLeft: "8px" },
+      onclick: async () => {
+        if (supabase) await supabase.auth.signOut().catch(() => {});
+        session = null;
+        render();
       }
-    }
-  }
+    }, "↩")
+  );
+}
 
-  async function fetchBootstrap() {
-    try {
-      const res = await api(`/api/app-store/bootstrap`);
-      const wrapper = await safeJSON(res);
-      const data = (wrapper && wrapper.data) || wrapper || {};
-      state.bootstrap = data;
-      state.bootstrapError = "";
-      // Edges list — try a few sources the SPA writes to.
-      const found = new Set();
-      if (Array.isArray(data?.cloud_edges)) data.cloud_edges.forEach((e) => found.add(String(e?.edge_id || e?.id || "").trim()));
-      if (Array.isArray(data?.devices)) data.devices.forEach((d) => { const eid = String(d?.edge_id || "").trim(); if (eid) found.add(eid); });
-      state.edges = [...found].filter(Boolean).sort();
-      renderHeader();
-      if (state.tab === "dashboard") renderBody();
-    } catch (e) {
-      if (e.message !== "unauthorized") state.bootstrapError = e.message || String(e);
-    }
-  }
+function renderLive() {
+  const tiles = (state.liveRows || []).map((r) => ({
+    key: `${r.gateway_id}|${r.tag_name}`,
+    gateway_id: r.gateway_id || "",
+    gateway_name: r.gateway_name || r.gateway_id || "",
+    tag_name: r.tag_name || "",
+    value: r.value,
+    ts: r.ts_utc || "",
+  })).filter((t) => t.tag_name);
 
-  async function fetchAlarms() {
-    try {
-      const res = await api(`/api/app-store/logs?limit=200${edgeQS()}`);
-      const data = await safeJSON(res);
-      state.alarms = Array.isArray(data?.rows) ? data.rows : [];
-      state.alarmsError = "";
-      if (state.tab === "alarms") renderBody();
-    } catch (e) {
-      if (e.message !== "unauthorized") {
-        state.alarmsError = e.message || String(e);
-        if (state.tab === "alarms") renderBody();
-      }
-    }
-  }
-
-  async function fetchHistorian() {
-    try {
-      const res = await api(`/api/app-store/historian?limit=300${edgeQS()}`);
-      const data = await safeJSON(res);
-      state.historian = Array.isArray(data?.rows) ? data.rows : [];
-      state.historianError = "";
-      if (state.tab === "history") renderBody();
-    } catch (e) {
-      if (e.message !== "unauthorized") {
-        state.historianError = e.message || String(e);
-        if (state.tab === "history") renderBody();
-      }
-    }
-  }
-
-  async function fetchPower() {
-    try {
-      const res = await api(`/api/power/latest?limit=120`);
-      const data = await safeJSON(res);
-      state.power = data || null;
-      state.powerError = "";
-      if (state.tab === "power") renderBody();
-    } catch (e) {
-      if (e.message !== "unauthorized") {
-        state.powerError = e.message || String(e);
-        if (state.tab === "power") renderBody();
-      }
-    }
-  }
-
-  async function fetchTagSeries(gateway, tag, rangeMs) {
-    const toUtc = new Date().toISOString();
-    const fromUtc = new Date(Date.now() - rangeMs).toISOString();
-    const params = new URLSearchParams({
-      from_utc: fromUtc, to_utc: toUtc, limit: "5000", offset: "0",
-      gateway: gateway || "", tag: tag || "", prefer_cloud: "true",
-    });
-    if (state.selectedEdge) params.set("edge_id", state.selectedEdge);
-    const res = await api(`/api/app-store/historian/range?${params.toString()}`);
-    const data = await safeJSON(res);
-    return Array.isArray(data?.rows) ? data.rows : [];
-  }
-
-  // ----- Polling lifecycle ------------------------------------------------
-  function stopAllPolls() {
-    [livePoll, alarmsPoll, historianPoll, powerPoll, bootstrapPoll].forEach((t) => t && clearInterval(t));
-    livePoll = alarmsPoll = historianPoll = powerPoll = bootstrapPoll = null;
-  }
-
-  function startPolls() {
-    stopAllPolls();
-    // Bootstrap rarely changes — refresh every 60 s so a new edge shows up.
-    fetchBootstrap();
-    bootstrapPoll = setInterval(fetchBootstrap, 60_000);
-    // Per-tab poll.
-    if (state.tab === "live" || state.tab === "dashboard") {
-      fetchLive();
-      livePoll = setInterval(fetchLive, 2000);
-    } else if (state.tab === "alarms") {
-      fetchAlarms();
-      alarmsPoll = setInterval(fetchAlarms, 5000);
-    } else if (state.tab === "history") {
-      fetchHistorian();
-      historianPoll = setInterval(fetchHistorian, 5000);
-    } else if (state.tab === "power") {
-      fetchPower();
-      powerPoll = setInterval(fetchPower, 3000);
-    }
-  }
-
-  // ----- Render: header ---------------------------------------------------
-  function renderHeader() {
-    const header = $("#header-root");
-    if (!header) return;
-    header.replaceChildren(
-      el("span", { class: "brand-dot" }),
-      el("h1", {}, "TrustNode Lite"),
-      el("span", { class: "spacer" }),
-      state.edges.length > 0
-        ? el("select", {
-            class: "edge-select",
-            onchange: (e) => {
-              state.selectedEdge = e.target.value;
-              localStorage.setItem(EDGE_KEY, state.selectedEdge);
-              startPolls();
-            }
-          },
-            el("option", { value: "" }, "All edges"),
-            ...state.edges.map((eid) => el("option", { value: eid, selected: eid === state.selectedEdge ? "" : null }, eid))
-          )
-        : el("span", { class: "edge-pill" }, "edge: ", el("strong", {}, state.selectedEdge || "all")),
-      el("button", {
-        class: "close",
-        title: "Sign out",
-        style: { marginLeft: "8px" },
-        onclick: () => { logout(); render(); }
-      }, "↩"),
+  if (state.liveError && tiles.length === 0) {
+    return el("div", {},
+      el("div", { class: "banner" }, `Live read failed: ${state.liveError}`),
+      el("div", { class: "empty" }, "No data to display.")
     );
   }
-
-  // ----- Render: body per tab --------------------------------------------
-  function tilesFromLive(rows) {
-    // Each row from /api/app-store/live is one tag's most recent value.
-    return rows.map((r) => ({
-      key: `${r.gateway_id || ""}|${r.tag || r.tag_name || ""}`,
-      gateway_id: r.gateway_id || "",
-      gateway_name: r.gateway_name || r.gateway_id || "",
-      tag: r.tag || r.tag_name || "",
-      value: r.value,
-      ts: r.ts || r.ts_utc || "",
-      quality: r.quality,
-    })).filter((t) => t.tag);
+  if (tiles.length === 0) {
+    return el("div", { class: "empty" }, el("div", { class: "spinner" }), " loading…");
   }
+  return el("div", {},
+    el("div", { class: "section" },
+      el("h2", {}, "Live readings"),
+      el("span", { class: "meta" }, `${tiles.length} tags · refreshed ${fmtAge(new Date(state.liveAt).toISOString())} ago`)
+    ),
+    el("div", { class: "tile-grid" },
+      ...tiles.map((t) => el("button", {
+        class: `tile ${freshnessClass(t.ts)}`,
+        onclick: () => openDrawer(t.gateway_id, t.gateway_name, t.tag_name, t.value, t.ts),
+      },
+        el("span", { class: "age" }, fmtAge(t.ts)),
+        el("div", { class: "tag" }, t.tag_name),
+        el("div", { class: "val" }, fmtVal(t.value)),
+        el("div", { class: "gw" }, t.gateway_name)
+      ))
+    )
+  );
+}
 
-  function freshnessClass(ts) {
-    const t = ts ? Date.parse(ts) : 0;
-    if (!t) return "bad";
-    const age = Date.now() - t;
-    if (age < 10_000) return "fresh";
-    if (age < 60_000) return "stale";
-    return "bad";
+function renderHistory() {
+  if (state.historyError && state.historyRows.length === 0) {
+    return el("div", { class: "banner" }, `History read failed: ${state.historyError}`);
   }
-
-  function renderLive() {
-    const tiles = tilesFromLive(state.live);
-    if (state.liveError && tiles.length === 0) {
-      return el("div", {},
-        el("div", { class: "banner" }, `Live read failed: ${state.liveError}`),
-        el("div", { class: "empty" }, "No data to display."),
-      );
-    }
-    if (tiles.length === 0) {
-      return el("div", { class: "empty" },
-        el("div", { class: "spinner" }), " loading…"
-      );
-    }
-    return el("div", {},
-      el("div", { class: "section" },
-        el("h2", {}, "Live readings"),
-        el("span", { class: "meta" }, `${tiles.length} tags · refreshed ${fmtAge(new Date(state.liveAt).toISOString())} ago`)
-      ),
-      el("div", { class: "tile-grid" },
-        ...tiles.map((t) => el("button", {
-          class: `tile ${freshnessClass(t.ts)}`,
-          onclick: () => openDrawer(t.gateway_id, t.tag, t.gateway_name, t.value, t.ts),
-        },
-          el("span", { class: "age" }, fmtAge(t.ts)),
-          el("div", { class: "tag" }, t.tag),
-          el("div", { class: "val" }, fmtVal(t.value)),
-          el("div", { class: "gw" }, t.gateway_name),
-        ))
-      )
-    );
+  if (state.historyRows.length === 0) {
+    return el("div", { class: "empty" }, el("div", { class: "spinner" }), " loading…");
   }
-
-  function renderHistory() {
-    if (state.historianError && state.historian.length === 0) {
-      return el("div", {},
-        el("div", { class: "banner" }, `History read failed: ${state.historianError}`),
-      );
-    }
-    if (state.historian.length === 0) {
-      return el("div", { class: "empty" },
-        el("div", { class: "spinner" }), " loading…"
-      );
-    }
-    return el("div", {},
-      el("div", { class: "section" },
-        el("h2", {}, "Historian"),
-        el("span", { class: "meta" }, `${state.historian.length} rows`)
-      ),
-      el("div", { class: "hist-table-wrap" },
-        el("table", { class: "hist-table" },
-          el("thead", {},
-            el("tr", {},
-              el("th", {}, "Time"),
-              el("th", {}, "Gateway"),
-              el("th", {}, "Tag"),
-              el("th", {}, "Value"),
-              el("th", {}, "Q"),
-            )
-          ),
-          el("tbody", {},
-            ...state.historian.map((r) => el("tr", {},
-              el("td", {}, fmtTs(r.ts || r.ts_utc)),
-              el("td", {}, r.gateway_name || r.gateway_id || "—"),
-              el("td", {}, r.tag || r.tag_name || "—"),
-              el("td", { class: "num" }, fmtVal(r.value)),
-              el("td", {}, r.quality_label || (r.quality != null ? String(r.quality) : "")),
-            ))
+  return el("div", {},
+    el("div", { class: "section" },
+      el("h2", {}, "Historian"),
+      el("span", { class: "meta" }, `${state.historyRows.length} rows`)
+    ),
+    el("div", { class: "hist-table-wrap" },
+      el("table", { class: "hist-table" },
+        el("thead", {},
+          el("tr", {},
+            el("th", {}, "Time"),
+            el("th", {}, "Gateway"),
+            el("th", {}, "Tag"),
+            el("th", {}, "Value"),
+            el("th", {}, "Q")
           )
+        ),
+        el("tbody", {},
+          ...state.historyRows.map((r) => el("tr", {},
+            el("td", {}, fmtTs(r.ts_utc)),
+            el("td", {}, r.gateway_name || r.gateway_id || "—"),
+            el("td", {}, r.tag_name || "—"),
+            el("td", { class: "num" }, fmtVal(r.value)),
+            el("td", {}, r.quality_label || (r.quality != null ? String(r.quality) : ""))
+          ))
         )
       )
-    );
-  }
+    )
+  );
+}
 
-  function alarmLevelClass(row) {
-    const l = String(row.level || row.severity || row.kind || "").toLowerCase();
-    if (l.includes("err") || l.includes("crit") || l.includes("fault")) return "error";
-    if (l.includes("warn") || l.includes("alarm")) return "warn";
-    return "";
+function renderAlarms() {
+  if (state.alarmError && state.alarmRows.length === 0) {
+    return el("div", { class: "banner" }, `Alarms read failed: ${state.alarmError}`);
   }
-
-  function renderAlarms() {
-    if (state.alarmsError && state.alarms.length === 0) {
-      return el("div", { class: "banner" }, `Alarms read failed: ${state.alarmsError}`);
-    }
-    if (state.alarms.length === 0) {
-      return el("div", { class: "empty" }, "No recent events.");
-    }
-    return el("div", {},
-      el("div", { class: "section" },
-        el("h2", {}, "Recent events"),
-        el("span", { class: "meta" }, `${state.alarms.length} entries`)
-      ),
-      ...state.alarms.map((r) => el("div", { class: `alarm-row ${alarmLevelClass(r)}` },
+  if (state.alarmRows.length === 0) {
+    return el("div", { class: "empty" }, "No recent events.");
+  }
+  return el("div", {},
+    el("div", { class: "section" },
+      el("h2", {}, "Recent events"),
+      el("span", { class: "meta" }, `${state.alarmRows.length} entries`)
+    ),
+    ...state.alarmRows.map((r) => {
+      const lvl = String(r.level || "").toLowerCase();
+      const cls = lvl.includes("err") || lvl.includes("crit") ? "error"
+                 : lvl.includes("warn") || lvl.includes("alarm") ? "warn" : "";
+      return el("div", { class: `alarm-row ${cls}` },
         el("div", { class: "lvl" }),
         el("div", { class: "body" },
-          el("div", { class: "msg" }, r.message || r.text || r.event || JSON.stringify(r).slice(0, 80)),
-          el("div", { class: "meta" }, fmtTs(r.ts || r.ts_utc), " · ", r.source || r.actor || r.gateway_id || r.gateway_name || "—"),
-        ),
-      ))
-    );
-  }
+          el("div", { class: "msg" }, r.message || r.category || "—"),
+          el("div", { class: "meta" }, fmtTs(r.ts_utc), " · ", r.gateway_name || r.gateway_id || r.category || "—")
+        )
+      );
+    })
+  );
+}
 
-  function renderPower() {
-    if (state.powerError && !state.power) {
-      return el("div", { class: "banner" }, `Power read failed: ${state.powerError}`);
-    }
-    if (!state.power) {
-      return el("div", { class: "empty" }, el("div", { class: "spinner" }), " loading…");
-    }
-    // /api/power/latest shape varies by deployment; render whatever device list
-    // we can find (rows, devices, items) with the standard meter fields.
-    const list = state.power.devices || state.power.rows || state.power.items || [];
-    if (!Array.isArray(list) || list.length === 0) {
-      return el("div", { class: "empty" }, "No power meters configured.");
-    }
-    return el("div", {},
-      el("div", { class: "section" },
-        el("h2", {}, "Power overview"),
-        el("span", { class: "meta" }, `${list.length} device${list.length === 1 ? "" : "s"}`)
-      ),
-      ...list.map((d) => {
-        const tags = d.tags || d.readings || {};
-        // Common SunSpec / Modbus meter tags
-        const fields = [
-          ["voltage_v", "V", "Voltage"],
-          ["current_a", "A", "Current"],
-          ["active_power_w", "W", "Active power"],
-          ["power_factor", "", "PF"],
-          ["frequency_hz", "Hz", "Frequency"],
-          ["energy_wh", "Wh", "Energy"],
-        ];
-        return el("div", { class: "power-card" },
-          el("h3", {}, d.name || d.device_id || d.id || "Meter"),
-          el("div", { class: "power-grid" },
-            ...fields.map(([k, unit, label]) => {
-              const v = tags[k] !== undefined ? tags[k] : d[k];
-              if (v === undefined || v === null) return null;
-              return el("div", { class: "power-stat" },
-                el("div", { class: "label" }, label),
-                el("div", { class: "value" }, `${fmtVal(v)}${unit ? " " + unit : ""}`)
-              );
-            })
-          )
+function renderPower() {
+  if (state.powerError && state.powerRows.length === 0) {
+    return el("div", { class: "banner" }, `Power read failed: ${state.powerError}`);
+  }
+  if (state.powerRows.length === 0) {
+    return el("div", { class: "empty" }, "No power meters reporting.");
+  }
+  const fields = [
+    ["voltage_v", "V", "Voltage"],
+    ["current_a", "A", "Current"],
+    ["active_power_w", "W", "Active power"],
+    ["power_factor", "", "PF"],
+    ["frequency_hz", "Hz", "Frequency"],
+    ["energy_wh", "Wh", "Energy"],
+  ];
+  return el("div", {},
+    el("div", { class: "section" },
+      el("h2", {}, "Power overview"),
+      el("span", { class: "meta" }, `${state.powerRows.length} device${state.powerRows.length === 1 ? "" : "s"}`)
+    ),
+    ...state.powerRows.map((d) => el("div", { class: "power-card" },
+      el("h3", {}, d.gateway_name || d.gateway_id),
+      el("div", { class: "power-grid" },
+        ...fields.map(([k, unit, label]) => {
+          const v = d.tags[k];
+          if (v === undefined || v === null) return null;
+          return el("div", { class: "power-stat" },
+            el("div", { class: "label" }, label),
+            el("div", { class: "value" }, `${fmtVal(v)}${unit ? " " + unit : ""}`)
+          );
+        })
+      )
+    ))
+  );
+}
+
+function renderDashboard() {
+  if (state.dashboardError) {
+    return el("div", { class: "banner" }, `Dashboard read failed: ${state.dashboardError}`);
+  }
+  const widgets = state.dashboardWidgets || [];
+  if (widgets.length === 0) {
+    return el("div", { class: "empty" }, "No tags reporting yet.");
+  }
+  const liveByKey = new Map();
+  for (const r of state.liveRows) {
+    liveByKey.set(`${r.gateway_id}|${r.tag_name}`, r);
+  }
+  return el("div", {},
+    el("div", { class: "section" },
+      el("h2", {}, "Dashboard"),
+      el("span", { class: "meta" }, `${widgets.length} widgets · auto`)
+    ),
+    el("div", { class: "dashboard" },
+      ...widgets.map((w) => {
+        const row = liveByKey.get(`${w.gateway_id}|${w.tag_name}`);
+        const value = row ? row.value : w.value;
+        const ts = row ? row.ts_utc : null;
+        return el("button", {
+          class: `dash-widget kpi ${freshnessClass(ts)}`,
+          onclick: () => openDrawer(w.gateway_id, w.gateway_name, w.tag_name, value, ts),
+        },
+          el("div", { class: "title" }, w.title),
+          el("div", { class: "value" }, fmtVal(value)),
+          el("div", { class: "sub" }, `${w.gateway_name || "—"} · ${fmtAge(ts)} ago`)
         );
       })
-    );
-  }
+    )
+  );
+}
 
-  function renderDashboard() {
-    const cfg = (state.bootstrap && state.bootstrap.dashboard_configurations) || {};
-    const widgets = Array.isArray(cfg.widgets) ? cfg.widgets : [];
-    if (widgets.length === 0) {
-      return el("div", { class: "empty" },
-        "No dashboard widgets configured.",
-        el("div", { class: "muted", style: { marginTop: "8px", fontSize: "11px" } },
-          "Configure widgets in the TrustNode desktop app and they'll appear here read-only."
-        )
-      );
-    }
-    // Build a quick lookup by gateway+tag from current live snapshot.
-    const liveByKey = new Map();
-    for (const r of state.live) {
-      const k = `${r.gateway_id || ""}|${r.tag || r.tag_name || ""}`;
-      liveByKey.set(k, r);
-    }
-    return el("div", {},
-      el("div", { class: "section" },
-        el("h2", {}, "Dashboard"),
-        el("span", { class: "meta" }, `${widgets.length} widgets · read-only`)
+function renderDrawer() {
+  if (!state.drawer) return null;
+  const d = state.drawer;
+  return el("div", { class: "drawer-back", onclick: (e) => { if (e.target.classList.contains("drawer-back")) closeDrawer(); } },
+    el("div", { class: "drawer" },
+      el("header", {},
+        el("h3", {}, `${d.tag_name} · ${d.gateway_name || d.gateway_id}`),
+        el("button", { class: "close", onclick: closeDrawer }, "Close")
       ),
-      el("div", { class: "dashboard" },
-        ...widgets.map((w) => renderDashWidget(w, liveByKey))
+      el("div", { class: "chart-wrap", id: "chart-wrap" },
+        d.loading
+          ? el("div", { class: "empty" }, el("div", { class: "spinner" }), " loading…")
+          : d.error
+            ? el("div", { class: "banner" }, d.error)
+            : (d.rows && d.rows.length > 0)
+              ? el("div", { id: "uplot-mount", style: { width: "100%", height: "300px" } })
+              : el("div", { class: "empty" }, "No samples in this range.")
+      ),
+      el("div", { class: "chart-meta" },
+        el("span", {}, "Latest: ", el("strong", {}, fmtVal(d.value))),
+        el("span", {}, "Updated: ", fmtTs(d.ts)),
+        el("span", {}, "Samples: ", d.rows ? d.rows.length : 0)
+      ),
+      el("div", { class: "range-tabs" },
+        ...RANGE_OPTS.map((opt) => el("button", {
+          class: d.range_ms === opt.ms ? "active" : "",
+          onclick: () => setDrawerRange(opt.ms),
+        }, opt.label))
       )
-    );
-  }
+    )
+  );
+}
 
-  function renderDashWidget(w, liveByKey) {
-    const cfg = w.config || {};
-    const type = String(w.type || "");
-    const title = w.title || cfg.title || cfg.tag_name || cfg.text || "";
-    if (type === "fixed_text") {
-      return el("div", { class: "dash-widget text" },
-        el("div", { class: "title" }, title || "Note"),
-        el("div", { class: "body" }, cfg.text || "")
-      );
-    }
-    if (type === "cloud_sync_status") {
-      return el("div", { class: "dash-widget text" },
-        el("div", { class: "title" }, "Cloud Sync"),
-        el("div", { class: "body muted" }, "Reported by the edge device.")
-      );
-    }
-    // KPI / chart / table all show "latest value" in lite mode.
-    const gid = cfg.gateway_id || "";
-    const tag = cfg.tag_name || cfg.tag || "";
-    const key = `${gid}|${tag}`;
-    const row = liveByKey.get(key);
-    const value = row ? row.value : null;
-    const ts = row ? (row.ts || row.ts_utc) : "";
-    return el("button", {
-      class: `dash-widget kpi ${freshnessClass(ts)}`,
-      onclick: () => tag ? openDrawer(gid, tag, row?.gateway_name || gid, value, ts) : null,
-    },
-      el("div", { class: "title" }, title || tag || "Widget"),
-      el("div", { class: "value" }, fmtVal(value)),
-      el("div", { class: "sub" }, `${tag || "—"} · ${fmtAge(ts)} ago`)
-    );
-  }
-
-  // ----- Drawer (tag chart) ----------------------------------------------
-  const RANGE_OPTS = [
-    { label: "5m", ms: 5 * 60_000 },
-    { label: "15m", ms: 15 * 60_000 },
-    { label: "1h", ms: 60 * 60_000 },
-    { label: "6h", ms: 6 * 60 * 60_000 },
-    { label: "24h", ms: 24 * 60 * 60_000 },
-    { label: "7d", ms: 7 * 24 * 60 * 60_000 },
+function renderTabs() {
+  const root = $("#tabs-root");
+  if (!root) return;
+  const items = [
+    ["live", "●", "Live"],
+    ...(cfg?.show_dashboard_tab !== false ? [["dashboard", "▦", "Dashboard"]] : []),
+    ["history", "≡", "History"],
+    ...(cfg?.show_alarms_tab !== false ? [["alarms", "!", "Alarms"]] : []),
+    ...(cfg?.show_power_tab !== false ? [["power", "⚡", "Power"]] : []),
   ];
-
-  async function openDrawer(gateway, tag, gatewayName, value, ts) {
-    state.drawer = { gateway, tag, gatewayName, value, ts, rows: null, range: 60 * 60_000, loading: true, error: "" };
-    render();
-    try {
-      const rows = await fetchTagSeries(gateway, tag, state.drawer.range);
-      state.drawer.rows = rows;
-      state.drawer.loading = false;
-      render();
-    } catch (e) {
-      state.drawer.error = e.message || String(e);
-      state.drawer.loading = false;
-      render();
-    }
-  }
-
-  async function setDrawerRange(rangeMs) {
-    if (!state.drawer) return;
-    state.drawer.range = rangeMs;
-    state.drawer.loading = true;
-    state.drawer.rows = null;
-    state.drawer.error = "";
-    render();
-    try {
-      const rows = await fetchTagSeries(state.drawer.gateway, state.drawer.tag, rangeMs);
-      if (!state.drawer) return;
-      state.drawer.rows = rows;
-      state.drawer.loading = false;
-      render();
-    } catch (e) {
-      if (!state.drawer) return;
-      state.drawer.error = e.message || String(e);
-      state.drawer.loading = false;
-      render();
-    }
-  }
-
-  function closeDrawer() {
-    state.drawer = null;
-    render();
-  }
-
-  function renderDrawer() {
-    if (!state.drawer) return null;
-    const d = state.drawer;
-    return el("div", { class: "drawer-back", onclick: (e) => { if (e.target.classList.contains("drawer-back")) closeDrawer(); } },
-      el("div", { class: "drawer" },
-        el("header", {},
-          el("h3", {}, `${d.tag} · ${d.gatewayName || d.gateway}`),
-          el("button", { class: "close", onclick: closeDrawer }, "Close")
-        ),
-        el("div", { class: "chart-wrap", id: "chart-wrap" },
-          d.loading
-            ? el("div", { class: "empty" }, el("div", { class: "spinner" }), " loading…")
-            : d.error
-              ? el("div", { class: "banner" }, d.error)
-              : (d.rows && d.rows.length > 0)
-                ? el("div", { id: "uplot-mount", style: { width: "100%", height: "300px" } })
-                : el("div", { class: "empty" }, "No samples in this range.")
-        ),
-        el("div", { class: "chart-meta" },
-          el("span", {}, "Latest: ", el("strong", {}, fmtVal(d.value))),
-          el("span", {}, "Updated: ", fmtTs(d.ts)),
-          el("span", {}, "Samples: ", d.rows ? d.rows.length : 0),
-        ),
-        el("div", { class: "range-tabs" },
-          ...RANGE_OPTS.map((opt) => el("button", {
-            class: d.range === opt.ms ? "active" : "",
-            onclick: () => setDrawerRange(opt.ms),
-          }, opt.label))
-        )
-      )
-    );
-  }
-
-  function mountChart() {
-    if (!state.drawer || !state.drawer.rows || state.drawer.rows.length === 0) return;
-    if (typeof uPlot === "undefined") return;
-    const mount = $("#uplot-mount");
-    if (!mount) return;
-    const sorted = state.drawer.rows.slice().sort((a, b) => {
-      const ta = Date.parse(a.ts || a.ts_utc || 0);
-      const tb = Date.parse(b.ts || b.ts_utc || 0);
-      return ta - tb;
-    });
-    const xs = sorted.map((r) => Math.floor(Date.parse(r.ts || r.ts_utc) / 1000));
-    const ys = sorted.map((r) => {
-      const n = Number(r.value);
-      return Number.isFinite(n) ? n : null;
-    });
-    mount.innerHTML = "";
-    const w = mount.clientWidth || 600;
-    new uPlot({
-      width: w,
-      height: 300,
-      cursor: { show: true },
-      scales: { x: { time: true } },
-      series: [
-        {},
-        {
-          label: state.drawer.tag,
-          stroke: "#14a89a",
-          width: 1.8,
-          points: { show: false },
-        },
-      ],
-      axes: [
-        { stroke: "#8a98ab", grid: { stroke: "rgba(138,152,171,0.15)" } },
-        { stroke: "#8a98ab", grid: { stroke: "rgba(138,152,171,0.15)" } },
-      ],
-    }, [xs, ys], mount);
-  }
-
-  // ----- Render entry points ---------------------------------------------
-  function renderBody() {
-    const body = $("#body-root");
-    if (!body) return;
-    let content;
-    switch (state.tab) {
-      case "live": content = renderLive(); break;
-      case "dashboard": content = renderDashboard(); break;
-      case "history": content = renderHistory(); break;
-      case "alarms": content = renderAlarms(); break;
-      case "power": content = renderPower(); break;
-      default: content = renderLive();
-    }
-    body.replaceChildren(content);
-  }
-
-  function renderTabs() {
-    const tabs = $("#tabs-root");
-    if (!tabs) return;
-    const items = [
-      ["live", "●", "Live"],
-      ["dashboard", "▦", "Dashboard"],
-      ["history", "≡", "History"],
-      ["alarms", "!", "Alarms"],
-      ["power", "⚡", "Power"],
-    ];
-    tabs.replaceChildren(
-      ...items.map(([key, ico, label]) => el("button", {
-        class: `tab ${state.tab === key ? "active" : ""}`,
-        onclick: () => {
-          if (state.tab === key) return;
-          state.tab = key;
-          renderTabs();
-          renderBody();
-          startPolls();
-        }
-      },
-        el("span", { class: "ico" }, ico),
-        el("span", {}, label),
-      ))
-    );
-  }
-
-  function renderLoggedIn() {
-    const app = $("#app");
-    app.replaceChildren(
-      el("div", { class: "app" },
-        el("header", { class: "header", id: "header-root" }),
-        el("main", { id: "body-root" }),
-        el("nav", { class: "tabs", id: "tabs-root" }),
-      )
-    );
-    renderHeader();
-    renderTabs();
-    renderBody();
-    const drawer = renderDrawer();
-    if (drawer) app.appendChild(drawer);
-    // Chart mounts after DOM lands.
-    if (state.drawer && state.drawer.rows) requestAnimationFrame(mountChart);
-  }
-
-  function renderLogin() {
-    const app = $("#app");
-    let busy = false;
-    let err = "";
-    const card = el("div", { class: "login" },
-      el("h2", {}, "TrustNode Lite"),
-      el("label", {}, "Username"),
-      el("input", { id: "lite-user", type: "text", autocomplete: "username", value: authUser || "" }),
-      el("label", {}, "Password"),
-      el("input", { id: "lite-pass", type: "password", autocomplete: "current-password" }),
-      el("div", { class: "err", id: "lite-err" }, err),
-      el("button", { id: "lite-go" }, "Sign in"),
-    );
-    app.replaceChildren(card);
-    const go = $("#lite-go");
-    const errEl = $("#lite-err");
-    const submit = async () => {
-      if (busy) return;
-      busy = true;
-      go.disabled = true;
-      go.textContent = "Signing in…";
-      errEl.textContent = "";
-      try {
-        await login($("#lite-user").value.trim(), $("#lite-pass").value);
-        render();
-      } catch (e) {
-        errEl.textContent = e.message || String(e);
-        busy = false;
-        go.disabled = false;
-        go.textContent = "Sign in";
+  root.replaceChildren(
+    ...items.map(([key, ico, label]) => el("button", {
+      class: `tab ${state.tab === key ? "active" : ""}`,
+      onclick: () => {
+        if (state.tab === key) return;
+        state.tab = key;
+        renderTabs();
+        renderBody();
+        startPolls();
       }
-    };
-    go.addEventListener("click", submit);
-    $("#lite-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
-    $("#lite-user").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#lite-pass").focus(); });
-    setTimeout(() => $("#lite-user").focus(), 30);
-  }
+    },
+      el("span", { class: "ico" }, ico),
+      el("span", {}, label)
+    ))
+  );
+}
 
-  function render() {
-    stopAllPolls();
-    if (!authToken) {
-      renderLogin();
-      return;
+function renderBody() {
+  const body = $("#body-root");
+  if (!body) return;
+  let content;
+  switch (state.tab) {
+    case "live": content = renderLive(); break;
+    case "dashboard": content = renderDashboard(); break;
+    case "history": content = renderHistory(); break;
+    case "alarms": content = renderAlarms(); break;
+    case "power": content = renderPower(); break;
+    default: content = renderLive();
+  }
+  body.replaceChildren(content);
+}
+
+function renderLoggedIn() {
+  $("#app").replaceChildren(
+    el("div", { class: "app" },
+      el("header", { class: "header", id: "header-root" }),
+      el("main", { id: "body-root" }),
+      el("nav", { class: "tabs", id: "tabs-root" })
+    )
+  );
+  renderHeader();
+  renderTabs();
+  renderBody();
+  const drawer = renderDrawer();
+  if (drawer) $("#app").appendChild(drawer);
+  if (state.drawer && state.drawer.rows) requestAnimationFrame(mountChart);
+}
+
+function renderLogin() {
+  let busy = false;
+  const card = el("div", { class: "login" },
+    el("h2", {}, "TrustNode Lite"),
+    el("label", {}, "Email"),
+    el("input", { id: "lite-user", type: "email", autocomplete: "username" }),
+    el("label", {}, "Password"),
+    el("input", { id: "lite-pass", type: "password", autocomplete: "current-password" }),
+    el("div", { class: "err", id: "lite-err" }, ""),
+    el("button", { id: "lite-go" }, "Sign in"),
+    el("div", { style: { textAlign: "center", marginTop: "10px", fontSize: "12px" } },
+      el("a", { href: "#", id: "lite-magic" }, "Email me a magic link instead"))
+  );
+  $("#app").replaceChildren(card);
+  const submit = async () => {
+    if (busy) return;
+    busy = true;
+    const go = $("#lite-go"); const errEl = $("#lite-err");
+    go.disabled = true; go.textContent = "Signing in…"; errEl.textContent = "";
+    try {
+      const email = $("#lite-user").value.trim();
+      const password = $("#lite-pass").value;
+      if (!email || !password) throw new Error("Email and password are required");
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+      session = data.session;
+      render();
+    } catch (e) {
+      errEl.textContent = e.message || String(e);
+      busy = false;
+      $("#lite-go").disabled = false;
+      $("#lite-go").textContent = "Sign in";
     }
-    renderLoggedIn();
-    startPolls();
-  }
+  };
+  $("#lite-go").addEventListener("click", submit);
+  $("#lite-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+  $("#lite-user").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#lite-pass").focus(); });
+  $("#lite-magic").addEventListener("click", async (e) => {
+    e.preventDefault();
+    const email = $("#lite-user").value.trim();
+    if (!email) { $("#lite-err").textContent = "Type your email above first"; return; }
+    try {
+      const { error } = await supabase.auth.signInWithOtp({ email, options: { emailRedirectTo: window.location.href } });
+      if (error) throw error;
+      $("#lite-err").textContent = "Check your inbox for the sign-in link.";
+    } catch (err) {
+      $("#lite-err").textContent = err.message || String(err);
+    }
+  });
+  setTimeout(() => $("#lite-user").focus(), 30);
+}
 
-  document.addEventListener("DOMContentLoaded", render);
-  // Pause polling when the tab is hidden — saves battery on phones.
+function renderConfigError(message) {
+  $("#app").replaceChildren(el("div", { class: "login" },
+    el("h2", {}, "TrustNode Lite — not configured"),
+    el("div", { class: "err" }, message),
+    el("p", { class: "muted", style: { fontSize: "12px", lineHeight: "1.4" } },
+      "Drop a ", el("code", {}, "config.json"), " next to this page with your Supabase URL and anon key. See ",
+      el("code", {}, "config.json.example"), " for the expected shape.")
+  ));
+}
+
+function render() {
+  stopAllPolls();
+  if (!supabase) { renderConfigError("Supabase client not initialised."); return; }
+  if (!session) { renderLogin(); return; }
+  renderLoggedIn();
+  startPolls();
+}
+
+// ---------- Boot -----------------------------------------------------------
+(async () => {
+  try {
+    await loadConfig();
+  } catch (e) {
+    renderConfigError(e.message || String(e));
+    return;
+  }
+  // Listen for auth changes (sign-in/out, token refresh) and re-render.
+  supabase.auth.onAuthStateChange((_event, newSession) => {
+    session = newSession || null;
+    render();
+  });
+  // Read the tenant label once we have a session for nicer header copy.
+  if (session) {
+    supabase.from("lite_profiles").select("tenant_id, customer_id").limit(1).maybeSingle().then(({ data }) => {
+      if (data) {
+        state.tenantLabel = data.customer_id || data.tenant_id || (cfg?.customer_label || "");
+        renderHeader();
+      }
+    }).catch(() => {});
+  }
+  render();
+
+  // Register service worker for installable offline shell.
+  if ("serviceWorker" in navigator) {
+    try { navigator.serviceWorker.register("./sw.js"); } catch (_) {}
+  }
+  // Pause polling when the tab is hidden, restart when visible — saves battery.
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) {
-      stopAllPolls();
-    } else if (authToken) {
-      startPolls();
-    }
+    if (document.hidden) stopAllPolls();
+    else if (session) startPolls();
   });
 })();
   </script>

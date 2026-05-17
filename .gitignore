@@ -41,3 +41,7 @@ Trustnode_edge_app/client_page_tests/diagnostics/output/
 .env.*
 !.env.example
 !.env.template
+
+# TrustNode Lite per-deployment config — holds the Supabase URL + anon key.
+# Each operator generates their own locally; the template lives next to it.
+Trustnode_edge_app/web_cloud_readonly/lite/config.json

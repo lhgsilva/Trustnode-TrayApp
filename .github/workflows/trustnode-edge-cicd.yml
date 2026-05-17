@@ -84,8 +84,14 @@ jobs:
           # afterwards so it lands in the deploy artifact. We source the
           # files via git so we don't accidentally read what we're writing.
           mkdir -p Trustnode_edge_app/web_cloud_readonly/lite
-          git show HEAD:Trustnode_edge_app/web_cloud_readonly/lite/index.html > Trustnode_edge_app/web_cloud_readonly/lite/index.html
-          git show HEAD:Trustnode_edge_app/web_cloud_readonly/lite/styles.css > Trustnode_edge_app/web_cloud_readonly/lite/styles.css
+          for f in index.html styles.css manifest.json sw.js config.json.example; do
+            git show "HEAD:Trustnode_edge_app/web_cloud_readonly/lite/$f" \
+              > "Trustnode_edge_app/web_cloud_readonly/lite/$f"
+          done
+          # NOTE: config.json itself is intentionally NOT shipped. Each
+          # deployment must supply its own Supabase URL + anon key.
+          # The sample VPS deployment writes a default config.json below if
+          # the deployer wants to enable Lite on trustnode.lsapps.app.
           ls -la Trustnode_edge_app/web_cloud_readonly/lite/
 
       - name: Validate web bundle wiring
@@ -103,6 +109,9 @@ jobs:
           # disappear from the deploy artifact.
           test -f Trustnode_edge_app/web_cloud_readonly/lite/index.html
           test -f Trustnode_edge_app/web_cloud_readonly/lite/styles.css
+          test -f Trustnode_edge_app/web_cloud_readonly/lite/manifest.json
+          test -f Trustnode_edge_app/web_cloud_readonly/lite/sw.js
+          test -f Trustnode_edge_app/web_cloud_readonly/lite/config.json.example
           js_file="$(grep -o 'assets/index-[^"]*\.js' Trustnode_edge_app/web_cloud_readonly/index.html | head -n1)"
           test -n "$js_file"
           test -f "Trustnode_edge_app/web_cloud_readonly/$js_file"
@@ -344,6 +353,30 @@ jobs:
             if [ -n "$TARGET_CONF" ]; then
               nginx -t
               systemctl reload nginx
+            fi
+            # Write the public config.json for the sample VPS Lite deploy.
+            # Each operator who clones the Lite folder elsewhere supplies
+            # their own config. We only write the file when the public
+            # secrets are present; without them the app shows the
+            # "not configured" screen rather than failing silently.
+            LITE_SUPABASE_URL_VALUE='${{ secrets.TRUSTNODE_PUBLIC_SUPABASE_URL }}'
+            LITE_SUPABASE_ANON_VALUE='${{ secrets.TRUSTNODE_PUBLIC_SUPABASE_ANON_KEY }}'
+            if [ -n "$LITE_SUPABASE_URL_VALUE" ] && [ -n "$LITE_SUPABASE_ANON_VALUE" ]; then
+              cat >"${{ env.VPS_WEB_ROOT }}/lite/config.json" <<EOF
+            {
+              "supabase_url": "$LITE_SUPABASE_URL_VALUE",
+              "supabase_anon_key": "$LITE_SUPABASE_ANON_VALUE",
+              "customer_label": "TrustNode",
+              "live_poll_ms": 2000,
+              "history_default_limit": 300,
+              "default_chart_range_minutes": 60
+            }
+            EOF
+              chown nginx:nginx "${{ env.VPS_WEB_ROOT }}/lite/config.json"
+            else
+              # No public Supabase secrets configured; leave config.json
+              # absent so the Lite app shows its config-error screen.
+              rm -f "${{ env.VPS_WEB_ROOT }}/lite/config.json" 2>/dev/null || true
             fi
             curl -fsS https://trustnode.lsapps.app/api/health >/dev/null
             curl -fsS https://trustnode.lsapps.app/ >/dev/null
