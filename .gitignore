@@ -25,6 +25,11 @@ build/
 dist/
 *.spec
 
+# Vite alternate-mode build output. `dist_cloud_readonly/` IS tracked
+# because the VPS deploy reads from it; `dist_client_view/` is a per-dev
+# build artifact and should be ignored.
+Trustnode_edge_app/frontend/dist_client_view/
+
 # --- Node ---
 node_modules/
 
