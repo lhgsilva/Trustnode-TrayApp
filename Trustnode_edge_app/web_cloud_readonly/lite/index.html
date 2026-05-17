@@ -430,6 +430,16 @@ function widgetAllSeries(widget) {
   const primaryKind =
     widgetType === "bar_chart" ? "bar" :
     widgetType === "line_area_chart" ? "area" : "line";
+  // Per-widget rescale — same rule the edge dashboard uses so values
+  // displayed in Lite match the edge to the decimal.
+  const cleanMul = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n !== 0 ? n : 1;
+  };
+  const cleanOff = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  };
   const out = [];
   if (cfg.tag_name) {
     out.push({
@@ -440,6 +450,8 @@ function widgetAllSeries(widget) {
       color: primaryColor,
       axis: "left",
       chart_type: primaryKind,
+      multiplier: cleanMul(cfg.multiplier),
+      offset: cleanOff(cfg.offset),
     });
   }
   const extras = Array.isArray(cfg.series_extra) ? cfg.series_extra : [];
@@ -454,6 +466,8 @@ function widgetAllSeries(widget) {
       color: String(s.color || pickPaletteColor(i + 1)),
       axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
       chart_type: String(s.chart_type || primaryKind).toLowerCase() || primaryKind,
+      multiplier: cleanMul(s.multiplier),
+      offset: cleanOff(s.offset),
     });
   });
   return out;
@@ -489,6 +503,17 @@ function useMultiSeries(widget, sampleCount) {
     const subs = new Set();
     const handlers = new Map(); // gw|tag -> handler
 
+    // Apply the series's multiplier + offset before storing so every
+    // downstream consumer (the chart, the tooltip, the live tile) sees
+    // already-scaled values. Same rule the edge applies.
+    const scale = (s, raw) => {
+      const v = Number(raw);
+      if (!Number.isFinite(v)) return null;
+      const m = Number.isFinite(s?.multiplier) && s.multiplier !== 0 ? s.multiplier : 1;
+      const o = Number.isFinite(s?.offset) ? s.offset : 0;
+      return v * m + o;
+    };
+
     const fetchSeed = async (s) => {
       const { data, error } = await supabase
         .from("historian_readings")
@@ -502,8 +527,7 @@ function useMultiSeries(widget, sampleCount) {
       if (!buf) return;
       buf.clear();
       (data || []).slice().reverse().forEach((r) => {
-        const v = Number(r.value);
-        buf.set(r.ts_utc, Number.isFinite(v) ? v : null);
+        buf.set(r.ts_utc, scale(s, r.value));
       });
       setTick((t) => t + 1);
     };
@@ -517,8 +541,7 @@ function useMultiSeries(widget, sampleCount) {
         if (!row || row.tag_name !== s.tag_name || row.gateway_id !== s.gateway_id) return;
         const buf = buffersRef.current.get(s.id);
         if (!buf) return;
-        const v = Number(row.value);
-        buf.set(row.ts_utc, Number.isFinite(v) ? v : null);
+        buf.set(row.ts_utc, scale(s, row.value));
         // Cap each buffer at sampleCount * 2 entries.
         const cap = Math.max(20, (Number(sampleCount) || 20) * 2);
         if (buf.size > cap) {

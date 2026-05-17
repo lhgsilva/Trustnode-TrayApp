@@ -163,6 +163,9 @@ function bucketMsFromInterval(interval) {
 }
 
 function bucketRows(rows, interval) {
+  // Legacy "last-write-wins" bucketing — kept for callers (pie/table) that
+  // just want the most-recent row per bucket. For chart series that need
+  // proper aggregation use bucketAndAggregateRows().
   const bucketMs = bucketMsFromInterval(interval);
   if (!bucketMs) return Array.isArray(rows) ? rows : [];
   const grouped = new Map();
@@ -175,6 +178,65 @@ function bucketRows(rows, interval) {
   return Array.from(grouped.values()).sort(
     (a, b) => toTsMs(a?.ts || a?.ts_utc) - toTsMs(b?.ts || b?.ts_utc)
   );
+}
+
+// Bucket rows by `interval` and collapse each bucket to a single row using
+// `mode` (first/last/avg/min/max/sum/count). Used by chart widgets so the
+// "Group interval" + "Result aggregation" config from the editor actually
+// changes what the chart plots — without this the dashboard ignored both
+// settings and always rendered raw samples.
+function bucketAndAggregateRows(rows, interval, mode) {
+  const src = Array.isArray(rows) ? rows : [];
+  if (!src.length) return src;
+  const bucketMs = bucketMsFromInterval(interval);
+  if (!bucketMs) return src;  // "none" — pass through
+
+  const aggKey = String(mode || "last").toLowerCase();
+  const groups = new Map();  // bucketKey -> { ts, rows: [], values: [], first, last, valid }
+  for (const r of src) {
+    const tsMs = toTsMs(r?.ts || r?.ts_utc);
+    if (!Number.isFinite(tsMs)) continue;
+    const key = Math.floor(tsMs / bucketMs) * bucketMs;
+    let g = groups.get(key);
+    if (!g) {
+      g = { ts: tsMs, last: r, first: r, lastTs: tsMs, firstTs: tsMs, values: [], count: 0 };
+      groups.set(key, g);
+    }
+    const numeric = Number(r?.value);
+    if (Number.isFinite(numeric)) g.values.push(numeric);
+    g.count += 1;
+    if (tsMs > g.lastTs) { g.last = r; g.lastTs = tsMs; }
+    if (tsMs < g.firstTs) { g.first = r; g.firstTs = tsMs; }
+  }
+
+  const reduce = (vals) => {
+    if (!vals.length) return null;
+    if (aggKey === "avg" || aggKey === "average" || aggKey === "mean") {
+      return vals.reduce((a, b) => a + b, 0) / vals.length;
+    }
+    if (aggKey === "min") return Math.min(...vals);
+    if (aggKey === "max") return Math.max(...vals);
+    if (aggKey === "sum") return vals.reduce((a, b) => a + b, 0);
+    if (aggKey === "count") return vals.length;
+    return null;
+  };
+
+  const out = [];
+  for (const [key, g] of groups.entries()) {
+    let row;
+    // Anchor the row to the bucket boundary so the X axis steps cleanly.
+    const bucketTsIso = new Date(key + Math.floor(bucketMs / 2)).toISOString();
+    if (aggKey === "first") {
+      row = { ...g.first, ts: g.first?.ts || bucketTsIso };
+    } else if (aggKey === "last" || aggKey === "latest") {
+      row = { ...g.last, ts: g.last?.ts || bucketTsIso };
+    } else {
+      const v = reduce(g.values);
+      row = { ...g.last, value: v, ts: bucketTsIso };
+    }
+    out.push(row);
+  }
+  return out.sort((a, b) => toTsMs(a?.ts || a?.ts_utc) - toTsMs(b?.ts || b?.ts_utc));
 }
 
 function toLocalInputMs(value) {
@@ -1155,14 +1217,54 @@ export function DashboardWidgetCard({
     [effectiveRows, cfgTimePreset, cfgTimeFrom, cfgTimeTo]
   );
 
-  const latest = useMemo(
+  const latestRaw = useMemo(
     () => getLatestTagRow(directScopedRowsTimeFiltered, resolvedGatewayId, tagName),
     [directScopedRowsTimeFiltered, resolvedGatewayId, tagName]
   );
-  const series = useMemo(
-    () => getTagSeriesFiltered(directScopedRowsTimeFiltered, resolvedGatewayId, tagName, cfgReadingsCount),
-    [directScopedRowsTimeFiltered, resolvedGatewayId, tagName, cfgReadingsCount]
+  // KPI / meter widgets show the most-recent value scaled by the widget's
+  // multiplier + offset (same rule chart series use). Done by cloning the
+  // row so downstream renderers don't have to know about scaling.
+  const latest = useMemo(() => {
+    if (!latestRaw) return latestRaw;
+    const mul = Number(cfg?.multiplier);
+    const off = Number(cfg?.offset);
+    const m = Number.isFinite(mul) && mul !== 0 ? mul : 1;
+    const o = Number.isFinite(off) ? off : 0;
+    if (m === 1 && o === 0) return latestRaw;
+    const v = Number(latestRaw?.last_value);
+    if (!Number.isFinite(v)) return latestRaw;
+    return { ...latestRaw, last_value: v * m + o };
+  }, [latestRaw, cfg?.multiplier, cfg?.offset]);
+  // 1) time-filter (already done in directScopedRowsTimeFiltered)
+  // 2) optionally bucket-and-aggregate per query_group_interval +
+  //    query_result_aggregation so the editor's Grouping + Aggregation
+  //    selectors actually change what the chart plots
+  // 3) extract the (ts, value) tuples for the configured tag
+  // 4) apply per-widget multiplier + offset so users can rescale a raw
+  //    sensor value (e.g. mV -> V, °C -> °F) without changing the source
+  const directScopedRowsAggregated = useMemo(
+    () => bucketAndAggregateRows(directScopedRowsTimeFiltered, cfgGroupInterval, cfgResultAggregation),
+    [directScopedRowsTimeFiltered, cfgGroupInterval, cfgResultAggregation]
   );
+  const primaryMultiplier = useMemo(() => {
+    const m = Number(cfg?.multiplier);
+    return Number.isFinite(m) && m !== 0 ? m : 1;
+  }, [cfg?.multiplier]);
+  const primaryOffset = useMemo(() => {
+    const o = Number(cfg?.offset);
+    return Number.isFinite(o) ? o : 0;
+  }, [cfg?.offset]);
+  const series = useMemo(() => {
+    const raw = getTagSeriesFiltered(directScopedRowsAggregated, resolvedGatewayId, tagName, cfgReadingsCount);
+    if (primaryMultiplier === 1 && primaryOffset === 0) return raw;
+    return raw.map((p) => {
+      const v = Number(p?.value);
+      return {
+        ...p,
+        value: Number.isFinite(v) ? v * primaryMultiplier + primaryOffset : p?.value,
+      };
+    });
+  }, [directScopedRowsAggregated, resolvedGatewayId, tagName, cfgReadingsCount, primaryMultiplier, primaryOffset]);
 
   // -------- multi-series support --------------------------------------------
   // Additional series for trend charts. Each extra entry is rendered alongside
@@ -2470,9 +2572,16 @@ export function DashboardWidgetCard({
           });
         });
 
-        // Take the last N buckets (most-recent at the bottom).
+        // Apply row_selection: "latest" (default — most-recent N), "oldest"
+        // (first N in time), or "all" (no trim). The editor exposes this
+        // option but the legacy code always took the tail, so "oldest"
+        // produced the same table as "latest".
         const rowLimit = Math.max(1, Number(cfg.list_limit || cfg.query_row_limit || 8));
-        const visibleBuckets = matchingBuckets.slice(-rowLimit);
+        const rowSel = String(cfg?.query_row_selection || "all").toLowerCase();
+        const visibleBuckets =
+          rowSel === "oldest" ? matchingBuckets.slice(0, rowLimit)
+          : rowSel === "all" ? matchingBuckets
+          : matchingBuckets.slice(-rowLimit);
 
         const numeric = (v) => {
           const n = Number(v);
@@ -2570,8 +2679,11 @@ export function DashboardWidgetCard({
         })
         .sort((a, b) => toTsMs(a?.ts || a?.ts_utc) - toTsMs(b?.ts || b?.ts_utc));
       const directRowsGrouped = bucketRows(directRowsRaw, String(cfg.query_group_interval || "none"));
-      const directRowsSelected = String(cfg.query_row_selection || "all") === "last_n"
-        ? directRowsGrouped.slice(-Math.max(1, Number(cfg.query_row_limit || cfg.list_limit || 8)))
+      const tableSel = String(cfg.query_row_selection || "all").toLowerCase();
+      const tableLimit = Math.max(1, Number(cfg.query_row_limit || cfg.list_limit || 8));
+      const directRowsSelected =
+        tableSel === "last_n" || tableSel === "latest" ? directRowsGrouped.slice(-tableLimit)
+        : tableSel === "oldest" ? directRowsGrouped.slice(0, tableLimit)
         : directRowsGrouped;
       const rows = effectiveDataSourceType === "computed"
         ? computedItemsWithQuery.slice(0, Math.max(1, Number(cfg.list_limit || 8)))
