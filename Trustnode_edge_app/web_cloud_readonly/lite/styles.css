@@ -83,8 +83,11 @@
   --surface: #111111;
   --surface-elev: #171717;
   --text: #f2f4f7;
-  --muted: #b6c0cc;
-  --soft: #8a98ab;
+  /* Lift mid-greys in dark mode so secondary text reads cleanly against
+     the dark surface. The previous values matched the edge tokens but
+     looked muddy in screenshots where the surfaces are near-black. */
+  --muted: #c8d0db;
+  --soft: #a0acbd;
   --stroke: #2a2a2a;
   --line: #2a2a2a;
   --table-row: #1f1f1f;
@@ -99,8 +102,17 @@
   --sidebar-soft: #1f1f1f;
   --sidebar-border: #2a2a2a;
   --sidebar-text: #f2f4f7;
-  --sidebar-title: #8a98ab;
+  --sidebar-title: #a0acbd;
 }
+
+/* Section headings ("DASHBOARD", "LIVE READINGS", etc.) should pop a bit
+   more in dark mode than the body-muted grey does. */
+[data-theme="dark"] .section h2 { color: #e2e8f0; }
+/* Tile/widget titles too: they were lost against the dark card. */
+[data-theme="dark"] .tile .tag,
+[data-theme="dark"] .dash-widget .title,
+[data-theme="dark"] .power-card h3,
+[data-theme="dark"] .power-stat .label { color: #cfd6e0; }
 
 /* ============================================================
    Base
@@ -849,3 +861,169 @@ main {
 }
 
 .muted { color: var(--muted); }
+
+/* ============================================================ */
+/* Widget grid — mirrors the desktop edge's 20x20 grid layout    */
+/* ============================================================ */
+.widget-grid {
+  display: grid;
+  grid-template-columns: repeat(20, minmax(0, 1fr));
+  grid-auto-rows: 36px;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+@media (max-width: 720px) {
+  /* Stack on mobile — ignore configured positions. */
+  .widget-grid {
+    grid-template-columns: 1fr;
+    grid-auto-rows: auto;
+  }
+  .widget-grid > .widget {
+    grid-column: 1 / -1 !important;
+    grid-row: auto !important;
+    min-height: 120px;
+  }
+}
+.widget {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-lg);
+  padding: 10px 12px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.widget-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.widget-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.widget-text {
+  font-size: 13px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow: auto;
+}
+.widget-divider {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  border-top: 2px solid var(--stroke);
+  margin-top: auto;
+  margin-bottom: auto;
+  padding-top: 6px;
+}
+.widget-image {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.widget-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-size: 12px;
+}
+/* KPI widget — big value, click opens chart drawer */
+.widget-kpi {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 4px 2px;
+  cursor: pointer;
+}
+.widget-kpi .widget-value {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: clamp(20px, 2.6vw, 32px);
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.widget-kpi .widget-sub {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.widget-kpi.fresh .widget-sub { color: var(--ok); }
+.widget-kpi.stale .widget-sub { color: var(--warning); }
+.widget-kpi.bad .widget-sub { color: var(--danger); }
+/* Meter (gauge) */
+.widget-meter {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 2px;
+  cursor: pointer;
+}
+.widget-meter-svg {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.widget-meter .widget-sub {
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+  margin-top: 2px;
+}
+/* Inline chart container — uPlot renders into widget-chart-mount */
+.widget-chart {
+  height: 100%;
+}
+.widget-chart-mount {
+  flex: 1;
+  min-height: 80px;
+  min-width: 0;
+}
+/* Pie pending styling */
+.widget-pie-mount {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+}
+/* Table widget — slim layout */
+.widget-table-mount {
+  flex: 1;
+  overflow: auto;
+}
+.widget-table-mount table { width: 100%; }

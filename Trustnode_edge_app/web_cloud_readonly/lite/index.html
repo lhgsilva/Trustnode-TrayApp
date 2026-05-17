@@ -112,6 +112,7 @@ const state = {
   powerRows: [],
   powerError: "",
   dashboardWidgets: [],
+  dashboardLayout: null,    // full payload incl. mode, per_row, tag_colors
   dashboardError: "",
   drawer: null, // { gateway_id, tag_name, range_ms, rows, loading, error }
   // Latency telemetry, surfaced in the header overlay.
@@ -139,7 +140,8 @@ function stopAllPolls() {
 function stopAllChannels() {
   if (liveChannel && supabase) supabase.removeChannel(liveChannel).catch(() => {});
   if (alarmChannel && supabase) supabase.removeChannel(alarmChannel).catch(() => {});
-  liveChannel = alarmChannel = null;
+  if (dashboardChannel && supabase) supabase.removeChannel(dashboardChannel).catch(() => {});
+  liveChannel = alarmChannel = dashboardChannel = null;
 }
 
 // ---------- Data fetchers (direct Supabase) -------------------------------
@@ -311,38 +313,47 @@ async function fetchPower() {
 }
 
 // Dashboard widgets come from cp_users.permissions_json? No — they live in
-// the desktop config which the edge syncs into cp_user_tenant_memberships's
-// `modules_json`. For v1 we read a simple list of (gateway_id, tag_name)
-// pairs from cp_users.modules_json for the logged-in user, falling back to
-// "show every distinct tag in live_latest" if none configured.
+// Read the operator-configured widget layout from Supabase. The edge
+// mirrors its config_documents.dashboard_configurations into the
+// public.dashboard_configurations table whenever it changes. We prefer
+// the freshest row for the viewer's tenant; falls back to no widgets
+// if the tenant hasn't published any yet.
 async function fetchDashboardConfig() {
   if (!supabase || !session) return;
   try {
-    // Try to read the current user's profile via lite_profiles -> map to
-    // saved widgets. We don't have a `dashboard_configurations` mirror in
-    // Supabase yet, so v1 derives widgets from the freshest 8 tags in
-    // live_latest, sorted by recency. This still gives the customer a
-    // useful "what's running" dashboard immediately.
     const { data, error } = await supabase
-      .from("live_latest")
-      .select("gateway_id, gateway_name, tag_name, value, ts_utc")
-      .order("ts_utc", { ascending: false })
-      .limit(12);
+      .from("dashboard_configurations")
+      .select("scope_key, payload_json, version, updated_utc")
+      .order("updated_utc", { ascending: false })
+      .limit(1);
     if (error) throw error;
-    state.dashboardWidgets = (data || []).map((r, i) => ({
-      id: `dw-${i}`,
-      title: r.tag_name,
-      gateway_id: r.gateway_id,
-      gateway_name: r.gateway_name,
-      tag_name: r.tag_name,
-      type: "value_kpi",
-    }));
+    const row = (data && data[0]) || null;
+    state.dashboardLayout = row ? row.payload_json : null;
+    state.dashboardWidgets = (row && Array.isArray(row.payload_json?.widgets))
+      ? row.payload_json.widgets
+      : [];
     state.dashboardError = "";
     if (state.tab === "dashboard") renderBody();
   } catch (e) {
     state.dashboardError = e.message || String(e);
     if (state.tab === "dashboard") renderBody();
   }
+}
+
+// Subscribe to dashboard_configurations updates so the Lite view reflects
+// the operator's widget changes within seconds. RLS scopes the channel
+// to the viewer's tenant.
+let dashboardChannel = null;
+async function subscribeDashboardConfig() {
+  if (!supabase || !session) return;
+  try {
+    if (dashboardChannel) await supabase.removeChannel(dashboardChannel).catch(() => {});
+    dashboardChannel = supabase.channel("lite-dashboard-config")
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "dashboard_configurations" },
+        () => fetchDashboardConfig())
+      .subscribe();
+  } catch (_e) {}
 }
 
 async function fetchTagHistory(gateway_id, tag_name, rangeMs) {
@@ -380,7 +391,10 @@ function startPolls() {
     // this just refreshes the snapshot occasionally; if it dropped silently,
     // the user still sees data.
     livePoll = setInterval(fetchLive, Math.max(pollMs * 4, 4000));
-    if (state.tab === "dashboard") fetchDashboardConfig();
+    if (state.tab === "dashboard") {
+      fetchDashboardConfig();
+      if (!dashboardChannel) subscribeDashboardConfig();
+    }
   }
   if (state.tab === "history") {
     fetchHistory();
@@ -740,14 +754,32 @@ function renderPower() {
   );
 }
 
+// ============================================================
+// Widget renderer
+// Reads the widget layout the desktop edge published. Each widget has:
+//   id, type, color, position: {x,y,w,h}, config: {...}, title?
+// On desktop (>720px) we use a 20-column CSS grid that respects the
+// configured x/y/w/h; on mobile we stack widgets in a single column.
+// ============================================================
+const SKIPPED_TYPES = new Set(["ip_camera", "cloud_sync_status"]);
+
 function renderDashboard() {
   if (state.dashboardError) {
     return el("div", { class: "banner" }, `Dashboard read failed: ${state.dashboardError}`);
   }
-  const widgets = state.dashboardWidgets || [];
+  const widgets = (state.dashboardWidgets || [])
+    .filter((w) => w && !SKIPPED_TYPES.has(String(w.type || "")));
   if (widgets.length === 0) {
-    return el("div", { class: "empty" }, "No tags reporting yet.");
+    return el("div", {},
+      el("div", { class: "section" },
+        el("h2", {}, "Dashboard"),
+        el("span", { class: "meta" }, "No widgets configured")),
+      el("div", { class: "empty" },
+        "No dashboard widgets have been published from the edge yet. ",
+        "Configure widgets in the TrustNode desktop app and they will appear here.")
+    );
   }
+  // Build a fast lookup so KPI/chart widgets can find their live value.
   const liveByKey = new Map();
   for (const r of state.liveRows) {
     liveByKey.set(`${r.gateway_id}|${r.tag_name}`, r);
@@ -755,24 +787,226 @@ function renderDashboard() {
   return el("div", {},
     el("div", { class: "section" },
       el("h2", {}, "Dashboard"),
-      el("span", { class: "meta" }, `${widgets.length} widgets · auto`)
+      el("span", { class: "meta" }, `${widgets.length} widget${widgets.length === 1 ? "" : "s"}`)
     ),
-    el("div", { class: "dashboard" },
-      ...widgets.map((w) => {
-        const row = liveByKey.get(`${w.gateway_id}|${w.tag_name}`);
-        const value = row ? row.value : w.value;
-        const ts = row ? row.ts_utc : null;
-        return el("button", {
-          class: `dash-widget kpi ${freshnessClass(ts)}`,
-          onclick: () => openDrawer(w.gateway_id, w.gateway_name, w.tag_name, value, ts),
-        },
-          el("div", { class: "title" }, w.title),
-          el("div", { class: "value" }, fmtVal(value)),
-          el("div", { class: "sub" }, `${w.gateway_name || "—"} · ${fmtAge(ts)} ago`)
-        );
-      })
+    el("div", { class: "widget-grid" },
+      ...widgets.map((w) => renderWidget(w, liveByKey))
     )
   );
+}
+
+// Position a widget on the grid using its configured x/y/w/h.
+// Falls back to a sensible default if the widget has no position.
+function widgetGridStyle(w) {
+  const p = w?.position || {};
+  const x = Math.max(0, Math.min(19, Number(p.x ?? 0) || 0));
+  const y = Math.max(0, Math.min(19, Number(p.y ?? 0) || 0));
+  const wd = Math.max(1, Math.min(20, Number(p.w ?? 4) || 4));
+  const hd = Math.max(1, Math.min(20, Number(p.h ?? 3) || 3));
+  return {
+    gridColumn: `${x + 1} / span ${wd}`,
+    gridRow: `${y + 1} / span ${hd}`,
+  };
+}
+
+function widgetTitle(w) {
+  const cfg = w?.config || {};
+  return String(w?.title || cfg.title || cfg.tag_name || cfg.text || "").trim();
+}
+
+function renderWidget(w, liveByKey) {
+  const type = String(w?.type || "");
+  const cfg = w?.config || {};
+  const color = String(w?.color || "#14a89a");
+  const style = widgetGridStyle(w);
+  const wrap = (inner, extraClass = "") => el("div", {
+    class: `widget widget-${type} ${extraClass}`,
+    style,
+    "data-widget-id": w?.id || "",
+  }, inner);
+
+  if (type === "fixed_text") {
+    return wrap(el("div", { class: "widget-body widget-text" }, cfg.text || ""));
+  }
+  if (type === "divider") {
+    return wrap(el("div", { class: "widget-body widget-divider" }, cfg.text || ""));
+  }
+  if (type === "image") {
+    if (!cfg.source_url) return wrap(el("div", { class: "widget-empty muted" }, "no image"));
+    return wrap(el("img", { class: "widget-image", src: cfg.source_url, alt: widgetTitle(w) || "image" }));
+  }
+  if (type === "text_kpi" || type === "value_kpi") {
+    const row = liveByKey.get(`${cfg.gateway_id}|${cfg.tag_name}`);
+    const value = row ? row.value : null;
+    const ts = row ? row.ts_utc : null;
+    const isText = type === "text_kpi";
+    const title = widgetTitle(w) || cfg.tag_name || "—";
+    return wrap(
+      el("button", {
+        class: `widget-kpi ${freshnessClass(ts)}`,
+        onclick: () => cfg.tag_name && openDrawer(cfg.gateway_id, cfg.gateway_id || "", cfg.tag_name, value, ts),
+      },
+        el("div", { class: "widget-title" }, title),
+        el("div", { class: "widget-value", style: { color } },
+          isText ? (row?.value_text || row?.quality_label || (value == null ? "—" : String(value)))
+                 : fmtVal(value)
+        ),
+        el("div", { class: "widget-sub" },
+          (cfg.gateway_name || cfg.gateway_id || "—"),
+          " · ", fmtAge(ts), " ago"
+        ),
+      ),
+      "widget-kpi-wrap"
+    );
+  }
+  if (type === "meter_chart") {
+    const row = liveByKey.get(`${cfg.gateway_id}|${cfg.tag_name}`);
+    const value = Number(row?.value);
+    const min = Number(cfg.meter_min ?? cfg.min ?? 0);
+    const max = Number(cfg.meter_max ?? cfg.max ?? 100);
+    const ts = row ? row.ts_utc : null;
+    return wrap(
+      el("button", {
+        class: `widget-meter ${freshnessClass(ts)}`,
+        onclick: () => cfg.tag_name && openDrawer(cfg.gateway_id, cfg.gateway_id || "", cfg.tag_name, value, ts),
+      },
+        el("div", { class: "widget-title" }, widgetTitle(w) || cfg.tag_name || "—"),
+        renderMeterSvg(value, min, max, color),
+        el("div", { class: "widget-sub" }, fmtAge(ts), " ago"),
+      ),
+      "widget-meter-wrap"
+    );
+  }
+  if (type === "pie_chart") {
+    return wrap(
+      el("div", { class: "widget-body" },
+        el("div", { class: "widget-title" }, widgetTitle(w) || "Pie"),
+        el("div", { class: "widget-pie-mount", "data-w": w?.id || "" })
+      ),
+      "widget-pie-wrap"
+    );
+  }
+  if (type === "line_chart" || type === "line_area_chart" || type === "bar_chart") {
+    // Mounting point; chart instances are rendered after DOM lands.
+    return wrap(
+      el("div", { class: "widget-body widget-chart" },
+        el("div", { class: "widget-title" }, widgetTitle(w) || cfg.tag_name || "—"),
+        el("div", { class: "widget-chart-mount", "data-w": w?.id || "",
+                    "data-type": type,
+                    "data-gw": cfg.gateway_id || "",
+                    "data-tag": cfg.tag_name || "",
+                    "data-color": color }),
+      ),
+      "widget-chart-wrap"
+    );
+  }
+  if (type === "table_list") {
+    return wrap(
+      el("div", { class: "widget-body" },
+        el("div", { class: "widget-title" }, widgetTitle(w) || "Recent readings"),
+        el("div", { class: "widget-table-mount", "data-w": w?.id || "",
+                    "data-gw": cfg.gateway_id || "",
+                    "data-tag": cfg.tag_name || "" }),
+      ),
+      "widget-table-wrap"
+    );
+  }
+  // Unknown / unsupported type — show a small placeholder.
+  return wrap(el("div", { class: "widget-empty muted" }, type || "widget"));
+}
+
+// SVG arc for the meter widget. Stays simple — semicircle 0..180 deg.
+function renderMeterSvg(value, min, max, color) {
+  const v = Number.isFinite(value) ? Math.max(min, Math.min(max, value)) : min;
+  const pct = (max > min) ? (v - min) / (max - min) : 0;
+  const angle = -90 + pct * 180; // -90deg..+90deg
+  const cx = 60, cy = 60, r = 46;
+  const trackPath = "M 14 60 A 46 46 0 0 1 106 60";
+  // Compute path for the filled arc.
+  const startA = -180 * Math.PI / 180;
+  const endA = (angle - 90) * Math.PI / 180; // because arc starts from -180deg of unit circle
+  const x1 = cx + r * Math.cos(startA), y1 = cy + r * Math.sin(startA);
+  const x2 = cx + r * Math.cos(endA),   y2 = cy + r * Math.sin(endA);
+  const large = (endA - startA) > Math.PI ? 1 : 0;
+  const fillPath = `M ${x1.toFixed(1)} ${y1.toFixed(1)} A ${r} ${r} 0 ${large} 1 ${x2.toFixed(1)} ${y2.toFixed(1)}`;
+  return el("div", { class: "widget-meter-svg",
+                     html: `
+    <svg viewBox="0 0 120 80" preserveAspectRatio="xMidYMax meet" width="100%" height="100%">
+      <path d="${trackPath}" stroke="#2a2a2a55" stroke-width="10" fill="none" stroke-linecap="round"/>
+      <path d="${fillPath}" stroke="${color}" stroke-width="10" fill="none" stroke-linecap="round"/>
+      <text x="60" y="65" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="18" font-weight="700" fill="currentColor">${fmtVal(v)}</text>
+    </svg>` });
+}
+
+// After the dashboard renders, walk every chart/table/pie mount and
+// populate it with real data. Called from renderDashboardCombined.
+async function mountWidgetData() {
+  // ---- Inline charts (line/area/bar) ----
+  if (typeof uPlot === "undefined") return;
+  const chartMounts = document.querySelectorAll(".widget-chart-mount");
+  for (const m of chartMounts) {
+    const gw = m.getAttribute("data-gw") || "";
+    const tag = m.getAttribute("data-tag") || "";
+    const type = m.getAttribute("data-type") || "line_chart";
+    const color = m.getAttribute("data-color") || "#14a89a";
+    if (!tag) { m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no tag")); continue; }
+    try {
+      const rows = await fetchTagHistory(gw, tag, 60 * 60_000); // last hour
+      if (!rows || rows.length === 0) {
+        m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no samples"));
+        continue;
+      }
+      const sorted = rows.slice().sort((a, b) =>
+        Date.parse(a.ts_utc || 0) - Date.parse(b.ts_utc || 0));
+      const xs = sorted.map((r) => Math.floor(Date.parse(r.ts_utc) / 1000));
+      const ys = sorted.map((r) => { const n = Number(r.value); return Number.isFinite(n) ? n : null; });
+      m.innerHTML = "";
+      const w = m.clientWidth || 240;
+      const h = m.clientHeight || 140;
+      const seriesCfg =
+        type === "bar_chart" ?
+          { label: tag, stroke: color, fill: color, paths: uPlot?.paths?.bars?.({ size: [0.8] }) || undefined, points: { show: false } } :
+        type === "line_area_chart" ?
+          { label: tag, stroke: color, fill: color + "33", width: 1.5, points: { show: false } } :
+          { label: tag, stroke: color, width: 1.5, points: { show: false } };
+      new uPlot({
+        width: w, height: h, cursor: { show: false }, legend: { show: false },
+        scales: { x: { time: true } },
+        series: [{}, seriesCfg],
+        axes: [
+          { stroke: "#8a98ab", size: 18, grid: { show: false } },
+          { stroke: "#8a98ab", size: 30, grid: { stroke: "rgba(138,152,171,0.15)" } },
+        ],
+      }, [xs, ys], m);
+    } catch (e) {
+      m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "chart err"));
+    }
+  }
+  // ---- Table widgets ----
+  const tableMounts = document.querySelectorAll(".widget-table-mount");
+  for (const m of tableMounts) {
+    const gw = m.getAttribute("data-gw") || "";
+    const tag = m.getAttribute("data-tag") || "";
+    if (!tag) { m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no tag")); continue; }
+    try {
+      const rows = await fetchTagHistory(gw, tag, 60 * 60_000);
+      const last = (rows || []).slice(-30).reverse();
+      if (last.length === 0) { m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no samples")); continue; }
+      m.replaceChildren(el("table", { class: "hist-table", style: { fontSize: "11px" } },
+        el("thead", {}, el("tr", {}, el("th", {}, "Time"), el("th", {}, "Value"))),
+        el("tbody", {}, ...last.map((r) =>
+          el("tr", {}, el("td", {}, fmtTs(r.ts_utc)), el("td", { class: "num" }, fmtVal(r.value)))
+        )),
+      ));
+    } catch (e) {
+      m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "table err"));
+    }
+  }
+  // ---- Pie charts — same uPlot lib isn't great for pies, render a simple SVG ----
+  const pieMounts = document.querySelectorAll(".widget-pie-mount");
+  for (const m of pieMounts) {
+    m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "pie pending"));
+  }
 }
 
 function renderDrawer() {
@@ -921,15 +1155,18 @@ function renderBody() {
   body.replaceChildren(content);
 }
 
-// Combined Dashboard view: the configurable widget mirror at the top, the
+// Combined Dashboard view: the configured widget mirror at the top, the
 // auto live tile grid below. The single landing page for a remote viewer.
 function renderDashboardCombined() {
   const wrap = el("div", {});
   // Section 1: configured widgets (if any). renderDashboard() already returns
   // the right element; we append it so the user sees their widgets first.
-  const widgets = state.dashboardWidgets || [];
+  const widgets = (state.dashboardWidgets || []).filter((w) =>
+    w && !SKIPPED_TYPES.has(String(w.type || "")));
   if (widgets.length > 0) {
     wrap.appendChild(renderDashboard());
+    // Defer chart/table population until the DOM lands so clientWidth is correct.
+    requestAnimationFrame(() => { mountWidgetData().catch(() => {}); });
   }
   // Section 2: the full live tile grid — every tag the viewer can see.
   wrap.appendChild(renderLive());

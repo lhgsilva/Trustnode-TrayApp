@@ -736,6 +736,57 @@ class AppStore:
             self._cloud_target_cache_value = None
             self._cloud_target_cache_ts = 0.0
 
+    def _mirror_dashboard_configurations_to_cloud(
+        self,
+        *,
+        tenant_id: str,
+        scope_key: str,
+        payload_json: str,
+        version: int,
+        updated_utc: str,
+    ) -> None:
+        """Best-effort mirror of the dashboard_configurations doc to Supabase.
+
+        The Lite app SELECTs `public.dashboard_configurations` to render the
+        widget layout the operator built in the desktop. Without this mirror
+        the Lite dashboard stays empty even though the edge has widgets.
+
+        This runs synchronously on the request thread but is cheap (one
+        upsert, no joins). On failure we swallow the exception so a flaky
+        cloud doesn't break the local config save.
+        """
+        cloud = self._get_cloud_database_target()
+        if not cloud:
+            return
+        try:
+            from sqlalchemy import text  # type: ignore
+            engine, _ = self._get_or_create_cloud_engine(cloud, str(cloud.get("schema") or "public"))
+            schema = str(cloud.get("schema") or "public")
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema}"."dashboard_configurations"
+                          (tenant_id, scope_key, payload_json, version, updated_utc)
+                        VALUES (:tenant_id, :scope_key, :payload_json::jsonb, :version, :updated_utc)
+                        ON CONFLICT (tenant_id, scope_key) DO UPDATE SET
+                          payload_json = EXCLUDED.payload_json,
+                          version      = EXCLUDED.version,
+                          updated_utc  = EXCLUDED.updated_utc
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "scope_key": scope_key or "",
+                        "payload_json": payload_json,
+                        "version": int(version),
+                        "updated_utc": updated_utc,
+                    },
+                )
+        except Exception:
+            # Cloud mirror is non-essential — never fail the local save over it.
+            pass
+
     def _cloud_target_from_env(self) -> Dict[str, Any] | None:
         """Build a cloud target dict purely from environment variables.
 
@@ -4297,6 +4348,14 @@ class AppStore:
         self._sync_wakeup_event.set()
         if domain == "database_configurations":
             self._invalidate_cloud_target_cache()
+        if domain == "dashboard_configurations":
+            self._mirror_dashboard_configurations_to_cloud(
+                tenant_id=self._current_tenant_id(),
+                scope_key="",
+                payload_json=payload_json,
+                version=new_version,
+                updated_utc=now,
+            )
         return {"domain": domain, "tenant_id": self._current_tenant_id(), "version": new_version, "updated_utc": now}
 
     def upsert_domain_scoped(self, scope_key: str, domain: str, payload: Any, actor: str = "system") -> Dict[str, Any]:
@@ -4361,6 +4420,19 @@ class AppStore:
                 )
         if domain_name == "database_configurations":
             self._invalidate_cloud_target_cache()
+        if domain_name == "dashboard_configurations":
+            # scope_key shape on the edge is 'tenant|-|edge_id|user'; the
+            # leading segment is the tenant. RLS in Supabase uses tenant_id,
+            # so we propagate it. The scope_key is preserved as-is so the
+            # Lite app can pick the right row for the signed-in user.
+            tenant_from_scope = (skey.split("|") or ["default"])[0] or "default"
+            self._mirror_dashboard_configurations_to_cloud(
+                tenant_id=tenant_from_scope,
+                scope_key=skey,
+                payload_json=payload_json,
+                version=new_version,
+                updated_utc=now,
+            )
         return {
             "domain": domain_name,
             "scope_key": skey,
