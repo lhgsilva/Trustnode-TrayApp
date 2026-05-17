@@ -77,6 +77,17 @@ jobs:
           cp Trustnode_edge_app/client_page_tests/portal_single_page.php Trustnode_edge_app/web_cloud_readonly/client/portal_single_page.php
           cp Trustnode_edge_app/client_page_tests/client_view.html Trustnode_edge_app/web_cloud_readonly/client/client_view.html
 
+      - name: Add TrustNode Lite static bundle
+        run: |
+          # build-web-cloud-readonly.ps1 wipes web_cloud_readonly/ before
+          # copying the SPA bundle in. Restore the hand-written Lite app
+          # afterwards so it lands in the deploy artifact. We source the
+          # files via git so we don't accidentally read what we're writing.
+          mkdir -p Trustnode_edge_app/web_cloud_readonly/lite
+          git show HEAD:Trustnode_edge_app/web_cloud_readonly/lite/index.html > Trustnode_edge_app/web_cloud_readonly/lite/index.html
+          git show HEAD:Trustnode_edge_app/web_cloud_readonly/lite/styles.css > Trustnode_edge_app/web_cloud_readonly/lite/styles.css
+          ls -la Trustnode_edge_app/web_cloud_readonly/lite/
+
       - name: Validate web bundle wiring
         run: |
           test -f Trustnode_edge_app/web_cloud_readonly/index.html
