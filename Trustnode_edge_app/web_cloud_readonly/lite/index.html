@@ -1484,14 +1484,16 @@ function renderLogin() {
   let showPw = false;
   const theme = currentTheme();
   const card = el("div", { class: "auth-card" },
-    // Theme toggle in the upper-right of the card (same as edge)
+    // Theme toggle in the upper-right of the card. Uses the same .icon-btn
+    // shape and SVG sun/moon glyphs as the in-app header so the visual
+    // language matches everywhere in the product.
     el("button", {
-      class: "theme-toggle-btn",
+      class: "icon-btn theme-toggle-btn",
       type: "button",
       "aria-label": "Toggle theme",
       title: `Switch to ${theme === "dark" ? "light" : "dark"} mode`,
       onclick: () => { toggleTheme(); renderLogin(); },
-    }, theme === "dark" ? "☀" : "🌙"),
+    }, theme === "dark" ? icoSun() : icoMoon()),
     // Logo block (badge wordmark)
     el("div", { class: "auth-brand" },
       el("img", {
