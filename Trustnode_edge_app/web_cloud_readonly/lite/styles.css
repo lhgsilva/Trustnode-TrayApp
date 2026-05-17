@@ -1027,3 +1027,133 @@ main {
   overflow: auto;
 }
 .widget-table-mount table { width: 100%; }
+
+/* ============================================================ */
+/* Dashboard toolbar (above the widgets)                         */
+/* ============================================================ */
+.dash-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 10px 0 12px;
+  border-bottom: 1px solid var(--stroke);
+  margin-bottom: 14px;
+}
+.dash-toolbar-left {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.dash-toolbar-left .section-h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+[data-theme="dark"] .dash-toolbar-left .section-h2 { color: #e2e8f0; }
+.dash-toolbar-left .section-meta { font-size: 12px; color: var(--muted); }
+.dash-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.dash-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.dash-control-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.dash-control-value {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 44px;
+  text-align: right;
+}
+.dash-control select {
+  background: var(--surface-elev);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.dash-control input[type="range"] {
+  width: 110px;
+  accent-color: var(--teal);
+}
+/* Segmented control (per-row 1/2) */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--surface-elev);
+}
+.seg-btn {
+  background: transparent;
+  color: var(--muted);
+  border: 0;
+  padding: 6px 10px;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+}
+.seg-btn.active { background: var(--teal); color: #fff; }
+.seg-btn + .seg-btn { border-left: 1px solid var(--stroke); }
+
+/* ============================================================ */
+/* Widget flow layout (replaces the 20-col grid)                 */
+/* ============================================================ */
+.widget-flow {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-rows: var(--lite-card-height, 220px);
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.widget-flow.per-row-1 { grid-template-columns: 1fr; }
+@media (max-width: 720px) {
+  /* Always single column on phones regardless of toggle. */
+  .widget-flow { grid-template-columns: 1fr; }
+}
+.widget-flow > .widget {
+  /* Make widgets fill the row height set by --lite-card-height. */
+  height: 100%;
+}
+
+/* Offline overlay over a chart whose gateway hasn't reported in 30s. */
+.widget-chart-mount { position: relative; }
+.widget-offline-overlay {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: rgba(226, 88, 93, 0.85);
+  color: #fff;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  pointer-events: none;
+}
+
+/* Mobile: stack toolbar controls vertically so they don't overflow. */
+@media (max-width: 720px) {
+  .dash-toolbar-right { width: 100%; justify-content: flex-start; gap: 10px; }
+  .dash-control input[type="range"] { width: 88px; }
+}

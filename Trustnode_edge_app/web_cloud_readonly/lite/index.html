@@ -114,6 +114,25 @@ const state = {
   dashboardWidgets: [],
   dashboardLayout: null,    // full payload incl. mode, per_row, tag_colors
   dashboardError: "",
+  // All available widget profiles (one per dashboard_configurations row the
+  // viewer is allowed to read). Populated by fetchDashboardConfig.
+  dashboardProfiles: [],
+  // Which profile is active. Restored from localStorage on boot. If empty
+  // the renderer picks the freshest row.
+  activeProfileKey: (() => { try { return localStorage.getItem("tnlite-profile") || ""; } catch (_) { return ""; } })(),
+  // Per-viewer dashboard preferences. Saved in localStorage so the choice
+  // survives a page reload.
+  dashPrefs: (() => {
+    try {
+      const raw = localStorage.getItem("tnlite-dash-prefs");
+      if (raw) return JSON.parse(raw);
+    } catch (_) {}
+    return { perRow: 2, cardHeight: 220, sampleCount: 20 };
+  })(),
+  // Per-gateway last-seen timestamp (ms) so the dashboard knows which
+  // gateways are online and which charts to refresh. Populated from
+  // state.liveRows on every fetch.
+  gatewayLastSeen: {},
   drawer: null, // { gateway_id, tag_name, range_ms, rows, loading, error }
   // Latency telemetry, surfaced in the header overlay.
   latency: {
@@ -169,16 +188,74 @@ async function fetchLive() {
   }
 }
 
-// Refresh state.latency.last_age_ms from the current liveRows. Pulled out so
-// the Realtime path can call it on every WS event too.
+// Refresh state.latency.last_age_ms AND state.gatewayLastSeen from the
+// current liveRows. Pulled out so the Realtime path can call it on every
+// WS event too.
 function updateLatencyAge() {
   const rows = state.liveRows || [];
   let newest = 0;
+  const seen = {};
   for (const r of rows) {
     const t = Date.parse(r.ts_utc || 0);
-    if (Number.isFinite(t) && t > newest) newest = t;
+    if (Number.isFinite(t)) {
+      if (t > newest) newest = t;
+      const gid = r.gateway_id || "";
+      if (gid && (!seen[gid] || seen[gid] < t)) seen[gid] = t;
+    }
   }
+  state.gatewayLastSeen = seen;
   if (newest > 0) state.latency.last_age_ms = Math.max(0, Date.now() - newest);
+}
+
+// Is a gateway "online" right now? Anything seen within 30s counts.
+function isGatewayOnline(gatewayId) {
+  const t = state.gatewayLastSeen?.[gatewayId];
+  return !!t && (Date.now() - t) < 30_000;
+}
+
+// Surgically update the KPI/tile DOM for one (gateway, tag) pair without
+// blowing away the rest of the dashboard. The data-* attributes set by
+// renderWidget / renderLive let us find the targets.
+function patchLiveTiles(row) {
+  if (!row || !row.tag_name) return;
+  const gw = row.gateway_id || "";
+  const tag = row.tag_name || "";
+  const value = row.value;
+  const ts = row.ts_utc || "";
+  const freshCls = freshnessClass(ts);
+  // 1) Live tiles (the section below the dashboard)
+  const tileSel = `.tile[data-gw="${cssEscape(gw)}"][data-tag="${cssEscape(tag)}"]`;
+  document.querySelectorAll(tileSel).forEach((tile) => {
+    tile.classList.remove("fresh", "stale", "bad");
+    tile.classList.add(freshCls);
+    const v = tile.querySelector(".val");  if (v) v.textContent = fmtVal(value);
+    const a = tile.querySelector(".age");  if (a) a.textContent = fmtAge(ts);
+  });
+  // 2) Dashboard widget KPIs
+  const kpiSel = `.widget[data-gw="${cssEscape(gw)}"][data-tag="${cssEscape(tag)}"] .widget-kpi`;
+  document.querySelectorAll(kpiSel).forEach((kpi) => {
+    kpi.classList.remove("fresh", "stale", "bad");
+    kpi.classList.add(freshCls);
+    const v = kpi.querySelector(".widget-value");
+    if (v) v.textContent = fmtVal(value);
+    const sub = kpi.querySelector(".widget-sub");
+    if (sub) {
+      const gwName = sub.getAttribute("data-gw-name") || gw || "—";
+      sub.textContent = `${gwName} · ${fmtAge(ts)} ago`;
+    }
+  });
+  // 3) Section meta (e.g. "33 tags · refreshed now ago")
+  document.querySelectorAll("[data-live-refreshed-at]").forEach((m) => {
+    m.textContent = `${(state.liveRows || []).length} tags · refreshed ${fmtAge(new Date(state.liveAt).toISOString())} ago`;
+  });
+}
+
+// Minimal CSS.escape polyfill — modern browsers have CSS.escape; this is
+// a safe fallback for the gateway / tag values we put into selectors.
+function cssEscape(s) {
+  s = String(s || "");
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") return CSS.escape(s);
+  return s.replace(/["\\\]\[#.>+~^$=*:']/g, (m) => "\\" + m);
 }
 
 // Realtime subscription for live_latest. Pushes each row update straight into
@@ -207,7 +284,10 @@ async function subscribeLive() {
           state.latency.last_event_at = Date.now();
           updateLatencyAge();
           renderHeaderLatency();
-          if (state.tab === "dashboard") renderBody();
+          // Targeted updates instead of full re-render. Surgically patches
+          // each KPI tile, leaves charts/tables alone so they don't flicker
+          // and don't re-fetch the historian on every WS event.
+          if (state.tab === "dashboard") patchLiveTiles(row);
         })
       .subscribe((status) => {
         if (status === "SUBSCRIBED") {
@@ -313,11 +393,10 @@ async function fetchPower() {
 }
 
 // Dashboard widgets come from cp_users.permissions_json? No — they live in
-// Read the operator-configured widget layout from Supabase. The edge
-// mirrors its config_documents.dashboard_configurations into the
-// public.dashboard_configurations table whenever it changes. We prefer
-// the freshest row for the viewer's tenant; falls back to no widgets
-// if the tenant hasn't published any yet.
+// Read every operator-configured widget layout the viewer is allowed to
+// see. Each row in public.dashboard_configurations is treated as a
+// "profile" — typically one per edge/user combo. The Lite app remembers
+// which profile the viewer selected in localStorage.
 async function fetchDashboardConfig() {
   if (!supabase || !session) return;
   try {
@@ -325,13 +404,31 @@ async function fetchDashboardConfig() {
       .from("dashboard_configurations")
       .select("scope_key, payload_json, version, updated_utc")
       .order("updated_utc", { ascending: false })
-      .limit(1);
+      .limit(20);
     if (error) throw error;
-    const row = (data && data[0]) || null;
-    state.dashboardLayout = row ? row.payload_json : null;
-    state.dashboardWidgets = (row && Array.isArray(row.payload_json?.widgets))
-      ? row.payload_json.widgets
-      : [];
+    const rows = data || [];
+    // Build a profile list. scope_key '' (empty) means the global default
+    // for the tenant — label it "Default".
+    state.dashboardProfiles = rows.map((r) => ({
+      key: r.scope_key || "",
+      label: profileLabel(r.scope_key || ""),
+      payload: r.payload_json || {},
+      version: r.version,
+      updated_utc: r.updated_utc,
+    }));
+    // Pick the active profile: stored preference, else the freshest row.
+    const stored = state.activeProfileKey || "";
+    const active = state.dashboardProfiles.find((p) => p.key === stored)
+                || state.dashboardProfiles[0]
+                || null;
+    if (active) {
+      state.activeProfileKey = active.key;
+      state.dashboardLayout = active.payload;
+      state.dashboardWidgets = Array.isArray(active.payload?.widgets) ? active.payload.widgets : [];
+    } else {
+      state.dashboardLayout = null;
+      state.dashboardWidgets = [];
+    }
     state.dashboardError = "";
     if (state.tab === "dashboard") renderBody();
   } catch (e) {
@@ -339,6 +436,48 @@ async function fetchDashboardConfig() {
     if (state.tab === "dashboard") renderBody();
   }
 }
+
+// Derive a human-readable name for a scope_key. Scope keys on the edge are
+// shaped 'tenant|-|edge_id|user'. We pull out edge and user so the dropdown
+// reads e.g. "edge-1868e2b401 / admin" instead of the raw key.
+function profileLabel(scopeKey) {
+  if (!scopeKey) return "Default";
+  const parts = String(scopeKey).split("|");
+  // tenant | "-" | edge_id | user
+  const edge = parts[2] || "";
+  const user = parts[3] || "";
+  if (edge && user) return `${edge} / ${user}`;
+  if (edge) return edge;
+  return scopeKey;
+}
+
+// Switch to a different dashboard profile. Persists the choice and
+// re-renders. Charts re-fetch because mountWidgetData() runs again.
+function setActiveProfile(key) {
+  state.activeProfileKey = key || "";
+  try { localStorage.setItem("tnlite-profile", state.activeProfileKey); } catch (_) {}
+  const active = state.dashboardProfiles.find((p) => p.key === key);
+  if (active) {
+    state.dashboardLayout = active.payload;
+    state.dashboardWidgets = Array.isArray(active.payload?.widgets) ? active.payload.widgets : [];
+  }
+  // Clear the chart cache so the new layout fetches fresh data.
+  chartDataCache.clear();
+  if (state.tab === "dashboard") renderBody();
+}
+
+// Update a single dashboard preference and persist.
+function setDashPref(name, value) {
+  const next = { ...(state.dashPrefs || {}), [name]: value };
+  state.dashPrefs = next;
+  try { localStorage.setItem("tnlite-dash-prefs", JSON.stringify(next)); } catch (_) {}
+  if (state.tab === "dashboard") renderBody();
+}
+
+// Per-(gateway, tag) chart data cache. Lets us avoid re-fetching every time
+// the dashboard re-renders. Keys: "gw|tag". Entries: { rows, fetched_at }.
+const chartDataCache = new Map();
+const CHART_TTL_MS = 30_000; // refresh charts at most every 30s when online
 
 // Subscribe to dashboard_configurations updates so the Lite view reflects
 // the operator's widget changes within seconds. RLS scopes the channel
@@ -638,11 +777,14 @@ function renderLive() {
   return el("div", {},
     el("div", { class: "section" },
       el("h2", {}, "Live readings"),
-      el("span", { class: "meta" }, `${tiles.length} tags · refreshed ${fmtAge(new Date(state.liveAt).toISOString())} ago`)
+      el("span", { class: "meta", "data-live-refreshed-at": "" },
+        `${tiles.length} tags · refreshed ${fmtAge(new Date(state.liveAt).toISOString())} ago`)
     ),
     el("div", { class: "tile-grid" },
       ...tiles.map((t) => el("button", {
         class: `tile ${freshnessClass(t.ts)}`,
+        "data-gw": t.gateway_id,
+        "data-tag": t.tag_name,
         onclick: () => openDrawer(t.gateway_id, t.gateway_name, t.tag_name, t.value, t.ts),
       },
         el("span", { class: "age" }, fmtAge(t.ts)),
@@ -769,11 +911,14 @@ function renderDashboard() {
   }
   const widgets = (state.dashboardWidgets || [])
     .filter((w) => w && !SKIPPED_TYPES.has(String(w.type || "")));
+
+  // Toolbar always renders so the viewer can switch profile / per-row
+  // even before any widgets are configured.
+  const toolbar = renderDashboardToolbar(widgets.length);
+
   if (widgets.length === 0) {
     return el("div", {},
-      el("div", { class: "section" },
-        el("h2", {}, "Dashboard"),
-        el("span", { class: "meta" }, "No widgets configured")),
+      toolbar,
       el("div", { class: "empty" },
         "No dashboard widgets have been published from the edge yet. ",
         "Configure widgets in the TrustNode desktop app and they will appear here.")
@@ -784,29 +929,108 @@ function renderDashboard() {
   for (const r of state.liveRows) {
     liveByKey.set(`${r.gateway_id}|${r.tag_name}`, r);
   }
+  const prefs = state.dashPrefs || {};
+  const perRow = Math.max(1, Math.min(2, Number(prefs.perRow) || 2));
+  const cardH  = Math.max(140, Math.min(520, Number(prefs.cardHeight) || 220));
   return el("div", {},
-    el("div", { class: "section" },
-      el("h2", {}, "Dashboard"),
-      el("span", { class: "meta" }, `${widgets.length} widget${widgets.length === 1 ? "" : "s"}`)
-    ),
-    el("div", { class: "widget-grid" },
+    toolbar,
+    el("div", {
+      class: `widget-flow per-row-${perRow}`,
+      style: { "--lite-card-height": `${cardH}px` },
+    },
       ...widgets.map((w) => renderWidget(w, liveByKey))
     )
   );
 }
 
-// Position a widget on the grid using its configured x/y/w/h.
-// Falls back to a sensible default if the widget has no position.
-function widgetGridStyle(w) {
-  const p = w?.position || {};
-  const x = Math.max(0, Math.min(19, Number(p.x ?? 0) || 0));
-  const y = Math.max(0, Math.min(19, Number(p.y ?? 0) || 0));
-  const wd = Math.max(1, Math.min(20, Number(p.w ?? 4) || 4));
-  const hd = Math.max(1, Math.min(20, Number(p.h ?? 3) || 3));
-  return {
-    gridColumn: `${x + 1} / span ${wd}`,
-    gridRow: `${y + 1} / span ${hd}`,
-  };
+// Dashboard toolbar: profile dropdown, per-row toggle, card-height slider,
+// sample count, online-gateway summary badge. Same gestalt as the desktop
+// dashboard configurator but read-only (the underlying layout is operator-
+// owned; the viewer only tweaks how they SEE it locally).
+function renderDashboardToolbar(widgetCount) {
+  const prefs = state.dashPrefs || {};
+  const profiles = state.dashboardProfiles || [];
+  const onlineGateways = Object.entries(state.gatewayLastSeen || {})
+    .filter(([_, t]) => Date.now() - t < 30_000).length;
+  const totalGateways = Object.keys(state.gatewayLastSeen || {}).length;
+
+  return el("div", { class: "dash-toolbar" },
+    el("div", { class: "dash-toolbar-left" },
+      el("h2", { class: "section-h2" }, "Dashboard"),
+      el("span", { class: "section-meta" }, `${widgetCount} widget${widgetCount === 1 ? "" : "s"}`),
+    ),
+    el("div", { class: "dash-toolbar-right" },
+      // Online gateways badge — green if any gateway has fresh data
+      el("span", {
+        class: `status-pill ${onlineGateways > 0 ? "status-online" : "status-offline"}`,
+        title: totalGateways === 0
+          ? "No gateways reporting"
+          : `${onlineGateways} of ${totalGateways} gateways reporting within 30s`,
+      },
+        el("span", { class: "pill-dot" }),
+        el("span", {}, `Gateways: ${onlineGateways}/${totalGateways || "0"}`),
+      ),
+      // Profile dropdown — only when there are 2+
+      profiles.length > 1
+        ? el("label", { class: "dash-control" },
+            el("span", { class: "dash-control-label" }, "Profile"),
+            el("select", {
+              value: state.activeProfileKey || "",
+              onchange: (e) => setActiveProfile(e.target.value),
+            },
+              ...profiles.map((p) => el("option", {
+                value: p.key,
+                selected: p.key === state.activeProfileKey ? "" : null,
+              }, p.label))
+            )
+          )
+        : null,
+      // Per-row toggle (1 or 2 cards per row)
+      el("label", { class: "dash-control" },
+        el("span", { class: "dash-control-label" }, "Per row"),
+        el("div", { class: "seg" },
+          el("button", {
+            class: `seg-btn ${(prefs.perRow || 2) === 1 ? "active" : ""}`,
+            onclick: () => setDashPref("perRow", 1),
+          }, "1"),
+          el("button", {
+            class: `seg-btn ${(prefs.perRow || 2) === 2 ? "active" : ""}`,
+            onclick: () => setDashPref("perRow", 2),
+          }, "2"),
+        )
+      ),
+      // Card height slider
+      el("label", { class: "dash-control" },
+        el("span", { class: "dash-control-label" }, "Card height"),
+        el("input", {
+          type: "range",
+          min: "140",
+          max: "520",
+          step: "20",
+          value: String(prefs.cardHeight || 220),
+          oninput: (e) => setDashPref("cardHeight", Number(e.target.value)),
+        }),
+        el("span", { class: "dash-control-value" }, `${prefs.cardHeight || 220}px`),
+      ),
+      // Sample count (chart history length)
+      el("label", { class: "dash-control" },
+        el("span", { class: "dash-control-label" }, "Samples"),
+        el("select", {
+          value: String(prefs.sampleCount || 20),
+          onchange: (e) => {
+            setDashPref("sampleCount", Number(e.target.value));
+            // Invalidate cached chart data so charts re-fetch with the new count.
+            chartDataCache.clear();
+          },
+        },
+          ...[20, 50, 100, 250, 500, 1000].map((n) => el("option", {
+            value: String(n),
+            selected: (prefs.sampleCount || 20) === n ? "" : null,
+          }, String(n)))
+        )
+      ),
+    )
+  );
 }
 
 function widgetTitle(w) {
@@ -818,11 +1042,11 @@ function renderWidget(w, liveByKey) {
   const type = String(w?.type || "");
   const cfg = w?.config || {};
   const color = String(w?.color || "#14a89a");
-  const style = widgetGridStyle(w);
   const wrap = (inner, extraClass = "") => el("div", {
     class: `widget widget-${type} ${extraClass}`,
-    style,
     "data-widget-id": w?.id || "",
+    "data-gw": cfg.gateway_id || "",
+    "data-tag": cfg.tag_name || "",
   }, inner);
 
   if (type === "fixed_text") {
@@ -851,7 +1075,10 @@ function renderWidget(w, liveByKey) {
           isText ? (row?.value_text || row?.quality_label || (value == null ? "—" : String(value)))
                  : fmtVal(value)
         ),
-        el("div", { class: "widget-sub" },
+        el("div", {
+          class: "widget-sub",
+          "data-gw-name": (cfg.gateway_name || cfg.gateway_id || "—"),
+        },
           (cfg.gateway_name || cfg.gateway_id || "—"),
           " · ", fmtAge(ts), " ago"
         ),
@@ -938,9 +1165,43 @@ function renderMeterSvg(value, min, max, color) {
     </svg>` });
 }
 
+// Fetch the last-N readings for a (gateway, tag) pair, using an in-memory
+// cache so identical widgets don't re-hit Supabase on every render.
+//
+// Cache rules:
+//   - Fresh entry (< CHART_TTL_MS old) → return cached rows, no fetch.
+//   - Stale entry AND gateway online → refresh from Supabase.
+//   - Stale entry AND gateway offline → keep showing the stale rows (the
+//     viewer would otherwise see an empty chart for an off-shift gateway).
+async function getChartRowsCached(gw, tag, sampleCount) {
+  const key = `${gw}|${tag}|${sampleCount}`;
+  const now = Date.now();
+  const hit = chartDataCache.get(key);
+  if (hit && (now - hit.fetched_at) < CHART_TTL_MS) return hit.rows;
+  if (hit && !isGatewayOnline(gw)) {
+    // Show stale data and let the viewer know via the offline badge —
+    // don't bother Supabase when the gateway can't be feeding new rows anyway.
+    return hit.rows;
+  }
+  // Fetch latest-N rows directly (cheaper than range scan + slice).
+  const { data, error } = await supabase
+    .from("historian_readings")
+    .select("ts_utc, value")
+    .eq("tag_name", tag)
+    .eq("gateway_id", gw)
+    .order("ts_utc", { ascending: false })
+    .limit(Math.max(2, Math.min(2000, Number(sampleCount) || 20)));
+  if (error) throw error;
+  const rows = (data || []).slice().reverse(); // ascending for charts
+  chartDataCache.set(key, { rows, fetched_at: now });
+  return rows;
+}
+
 // After the dashboard renders, walk every chart/table/pie mount and
 // populate it with real data. Called from renderDashboardCombined.
 async function mountWidgetData() {
+  const sampleCount = Number(state.dashPrefs?.sampleCount) || 20;
+
   // ---- Inline charts (line/area/bar) ----
   if (typeof uPlot === "undefined") return;
   const chartMounts = document.querySelectorAll(".widget-chart-mount");
@@ -951,15 +1212,13 @@ async function mountWidgetData() {
     const color = m.getAttribute("data-color") || "#14a89a";
     if (!tag) { m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no tag")); continue; }
     try {
-      const rows = await fetchTagHistory(gw, tag, 60 * 60_000); // last hour
+      const rows = await getChartRowsCached(gw, tag, sampleCount);
       if (!rows || rows.length === 0) {
         m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no samples"));
         continue;
       }
-      const sorted = rows.slice().sort((a, b) =>
-        Date.parse(a.ts_utc || 0) - Date.parse(b.ts_utc || 0));
-      const xs = sorted.map((r) => Math.floor(Date.parse(r.ts_utc) / 1000));
-      const ys = sorted.map((r) => { const n = Number(r.value); return Number.isFinite(n) ? n : null; });
+      const xs = rows.map((r) => Math.floor(Date.parse(r.ts_utc) / 1000));
+      const ys = rows.map((r) => { const n = Number(r.value); return Number.isFinite(n) ? n : null; });
       m.innerHTML = "";
       const w = m.clientWidth || 240;
       const h = m.clientHeight || 140;
@@ -978,10 +1237,16 @@ async function mountWidgetData() {
           { stroke: "#8a98ab", size: 30, grid: { stroke: "rgba(138,152,171,0.15)" } },
         ],
       }, [xs, ys], m);
+      // Add an offline overlay if the gateway hasn't been seen in 30s.
+      if (gw && !isGatewayOnline(gw)) {
+        const overlay = el("div", { class: "widget-offline-overlay", title: "Gateway offline" }, "OFFLINE");
+        m.appendChild(overlay);
+      }
     } catch (e) {
       m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "chart err"));
     }
   }
+
   // ---- Table widgets ----
   const tableMounts = document.querySelectorAll(".widget-table-mount");
   for (const m of tableMounts) {
@@ -989,8 +1254,8 @@ async function mountWidgetData() {
     const tag = m.getAttribute("data-tag") || "";
     if (!tag) { m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no tag")); continue; }
     try {
-      const rows = await fetchTagHistory(gw, tag, 60 * 60_000);
-      const last = (rows || []).slice(-30).reverse();
+      const rows = await getChartRowsCached(gw, tag, sampleCount);
+      const last = (rows || []).slice().reverse();
       if (last.length === 0) { m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "no samples")); continue; }
       m.replaceChildren(el("table", { class: "hist-table", style: { fontSize: "11px" } },
         el("thead", {}, el("tr", {}, el("th", {}, "Time"), el("th", {}, "Value"))),
@@ -1002,6 +1267,7 @@ async function mountWidgetData() {
       m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "table err"));
     }
   }
+
   // ---- Pie charts — same uPlot lib isn't great for pies, render a simple SVG ----
   const pieMounts = document.querySelectorAll(".widget-pie-mount");
   for (const m of pieMounts) {
