@@ -45,3 +45,23 @@ Trustnode_edge_app/client_page_tests/diagnostics/output/
 # TrustNode Lite per-deployment config — holds the Supabase URL + anon key.
 # Each operator generates their own locally; the template lives next to it.
 Trustnode_edge_app/web_cloud_readonly/lite/config.json
+
+# --- Local Claude Code state ---
+# Per-developer permissions and scheduler lockfiles — not part of the repo.
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+
+# --- Per-run diagnostic outputs ---
+# Audit and diagnostic scripts can be tracked; their JSON output snapshots
+# from a single run should not be.
+Trustnode_edge_app/scripts/audit_historian_alignment_*.json
+
+# --- Stray backup CSV next to electron-builder output ---
+# The `dist#trustnode_backup.csv` file is junk left over by an aborted
+# file move; ignore the pattern so it doesn't keep appearing in VS Code.
+Trustnode_edge_app/desktop/dist#*
+
+# --- Credential-discovery utilities are local-only ---
+# Reads env vars / service files from the VPS to fish out secrets. Useful
+# for one-off ops, but not appropriate for a shared repo.
+Trustnode_edge_app/scripts/vps_grab_anon_key.py
