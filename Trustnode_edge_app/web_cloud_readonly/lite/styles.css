@@ -151,11 +151,16 @@ button { font: inherit; cursor: pointer; }
 
 .brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .brand-full-logo {
-  width: min(100%, 220px);
-  height: 36px;
+  /* Wide wordmark logo. Constrain by height so the aspect ratio survives. */
+  height: 32px;
+  width: auto;
+  max-width: 220px;
   object-fit: contain;
   object-position: left center;
   display: block;
+}
+@media (max-width: 720px) {
+  .brand-full-logo { height: 26px; max-width: 160px; }
 }
 
 .header-cloud-controls {
@@ -198,16 +203,27 @@ button { font: inherit; cursor: pointer; }
 }
 .icon-btn:hover { filter: brightness(1.06); }
 .icon-btn:active { transform: translateY(1px); }
-[data-theme="light"] .app-header .icon-btn,
-:root .app-header .icon-btn {
+/* Header icon buttons. In light mode they sit on a pale-grey chip so
+   they read against the equally-pale header. In dark mode the icon-btn
+   inherits the dark .icon-btn defaults above and only needs a slight
+   tone-down to feel native against the very dark header. */
+:root:not([data-theme="dark"]) .app-header .icon-btn {
   background: #e8edf3;
   border-color: #c9d3de;
   color: #1f2a37;
 }
-[data-theme="light"] .app-header .icon-btn:hover,
-:root .app-header .icon-btn:hover {
+:root:not([data-theme="dark"]) .app-header .icon-btn:hover {
   background: #dde5ee;
   border-color: #b8c5d4;
+}
+[data-theme="dark"] .app-header .icon-btn {
+  background: #1f1f1f;
+  border-color: #2a2a2a;
+  color: var(--text);
+}
+[data-theme="dark"] .app-header .icon-btn:hover {
+  background: #2a2a2a;
+  border-color: #3a3a3a;
 }
 .notif-dot {
   position: absolute;

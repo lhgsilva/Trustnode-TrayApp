@@ -97,7 +97,7 @@ async function loadConfig() {
 
 // ---------- State ----------------------------------------------------------
 const state = {
-  tab: "live",
+  tab: "dashboard",
   tenantLabel: "",
   userEmail: "",
   edges: [],            // list of edge ids the viewer can see (currently a placeholder; multi-edge wiring TBD)
@@ -160,10 +160,10 @@ async function fetchLive() {
     updateLatencyAge();
     state.latency.last_event_at = Date.now();
     renderHeaderLatency();
-    if (state.tab === "live" || state.tab === "dashboard") renderBody();
+    if (state.tab === "dashboard") renderBody();
   } catch (e) {
     state.liveError = e.message || String(e);
-    if (state.tab === "live" || state.tab === "dashboard") renderBody();
+    if (state.tab === "dashboard") renderBody();
   }
 }
 
@@ -205,7 +205,7 @@ async function subscribeLive() {
           state.latency.last_event_at = Date.now();
           updateLatencyAge();
           renderHeaderLatency();
-          if (state.tab === "live" || state.tab === "dashboard") renderBody();
+          if (state.tab === "dashboard") renderBody();
         })
       .subscribe((status) => {
         if (status === "SUBSCRIBED") {
@@ -368,7 +368,7 @@ function startPolls() {
   const pollMs = Number(cfg?.live_poll_ms || 1000);
 
   // live_latest powers the Live tab AND the Dashboard mirror.
-  if (state.tab === "live" || state.tab === "dashboard") {
+  if (state.tab === "dashboard") {
     if (!liveChannel) {
       subscribeLive();
     } else {
@@ -809,13 +809,16 @@ function renderDrawer() {
 }
 
 function navItems() {
-  return [
-    ["live", icoLive(), "Live"],
-    ...(cfg?.show_dashboard_tab !== false ? [["dashboard", icoGrid(), "Dashboard"]] : []),
-    ["history", icoList(), "History"],
-    ...(cfg?.show_alarms_tab !== false ? [["alarms", icoBell(), "Alarms"]] : []),
-    ...(cfg?.show_power_tab !== false ? [["power", icoBolt(), "Power"]] : []),
-  ];
+  // Order matters: Dashboard (live) -> Power -> Historian -> Reporting -> Alarms.
+  // We dropped the separate "Live" item because the Dashboard now IS the live
+  // tile grid plus any configured widgets — same single source of truth a
+  // remote operator wants to see first.
+  const items = [["dashboard", icoGrid(), "Dashboard"]];
+  if (cfg?.show_power_tab !== false) items.push(["power", icoBolt(), "Power"]);
+  items.push(["history", icoList(), "Historian"]);
+  if (cfg?.show_reporting_tab !== false) items.push(["reporting", icoReport(), "Reporting"]);
+  if (cfg?.show_alarms_tab !== false) items.push(["alarms", icoBell(), "Alarms"]);
+  return items;
 }
 
 // Sidebar (desktop) navigation matching the edge app's nav-section + nav-item.
@@ -881,20 +884,56 @@ function icoLive() { return el("span", { html: '<svg width="14" height="14" view
 function icoGrid() { return el("span", { html: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>' }); }
 function icoList() { return el("span", { html: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>' }); }
 function icoBolt() { return el("span", { html: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>' }); }
+function icoReport() { return el("span", { html: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>' }); }
+
+// Reporting view. The edge generates reports locally; we do not yet mirror
+// the generated_reports table to Supabase, so for v1 this is an honest
+// placeholder rather than a stub list of fake rows.
+function renderReporting() {
+  return el("div", {},
+    el("div", { class: "section" },
+      el("h2", {}, "Reporting"),
+      el("span", { class: "meta" }, "Read-only")
+    ),
+    el("div", { class: "card", style: { textAlign: "center", padding: "32px 20px" } },
+      el("div", { style: { fontSize: "14px", fontWeight: "600", marginBottom: "8px" } },
+        "Reports are generated on the edge device."),
+      el("div", { class: "muted", style: { fontSize: "12px", lineHeight: "1.5", maxWidth: "440px", margin: "0 auto" } },
+        "Open the TrustNode desktop app on the edge to schedule, generate, ",
+        "or email reports. Once cloud sync of the report registry is enabled, ",
+        "every report will appear here read-only with a download link.")
+    )
+  );
+}
 
 function renderBody() {
   const body = $("#body-root");
   if (!body) return;
   let content;
   switch (state.tab) {
-    case "live": content = renderLive(); break;
-    case "dashboard": content = renderDashboard(); break;
-    case "history": content = renderHistory(); break;
-    case "alarms": content = renderAlarms(); break;
-    case "power": content = renderPower(); break;
-    default: content = renderLive();
+    case "dashboard": content = renderDashboardCombined(); break;
+    case "power":     content = renderPower(); break;
+    case "history":   content = renderHistory(); break;
+    case "reporting": content = renderReporting(); break;
+    case "alarms":    content = renderAlarms(); break;
+    default:          content = renderDashboardCombined();
   }
   body.replaceChildren(content);
+}
+
+// Combined Dashboard view: the configurable widget mirror at the top, the
+// auto live tile grid below. The single landing page for a remote viewer.
+function renderDashboardCombined() {
+  const wrap = el("div", {});
+  // Section 1: configured widgets (if any). renderDashboard() already returns
+  // the right element; we append it so the user sees their widgets first.
+  const widgets = state.dashboardWidgets || [];
+  if (widgets.length > 0) {
+    wrap.appendChild(renderDashboard());
+  }
+  // Section 2: the full live tile grid — every tag the viewer can see.
+  wrap.appendChild(renderLive());
+  return wrap;
 }
 
 function renderLoggedIn() {
