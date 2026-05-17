@@ -70,3 +70,7 @@ Trustnode_edge_app/desktop/dist#*
 # Reads env vars / service files from the VPS to fish out secrets. Useful
 # for one-off ops, but not appropriate for a shared repo.
 Trustnode_edge_app/scripts/vps_grab_anon_key.py
+
+# One-shot temp credential output from the user-mirror backfill script.
+# Each run rewrites it; never commit to history.
+Trustnode_edge_app/backfill_temp_passwords.json

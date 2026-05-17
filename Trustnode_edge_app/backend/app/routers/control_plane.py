@@ -482,6 +482,21 @@ def upsert_user(payload: UserUpsertRequest, request: Request, tenant_id: str | N
     )
     row.pop("password_hash", None)
     _audit(request, tenant_id=tid, action="user.upsert", outcome="ok", details={"username": payload.username})
+    # Mirror the user to Supabase Auth + lite_profiles so the same login
+    # works in the cloud Lite app under the same tenant. Best-effort —
+    # the local save above is the source of truth; cloud mirror is a
+    # convenience and never blocks this endpoint.
+    try:
+        from app.services.lite_user_mirror import mirror_user_upsert
+        mirror_user_upsert(
+            tenant_id=tid,
+            username=payload.username,
+            password=payload.password,
+            role=payload.role,
+            email=payload.email,
+        )
+    except Exception:
+        pass
     return {"ok": True, "tenant_id": tid, "row": row}
 
 
@@ -495,6 +510,13 @@ def delete_user(request: Request, username: str, tenant_id: str | None = None) -
         _audit(request, tenant_id=tid, action="user.delete", outcome="not_found", details={"username": username})
         raise HTTPException(status_code=404, detail="user_not_found")
     _audit(request, tenant_id=tid, action="user.delete", outcome="ok", details={"username": username})
+    # Drop the mirrored Supabase Auth account so the deleted user can't
+    # log into Lite anymore. Best-effort.
+    try:
+        from app.services.lite_user_mirror import mirror_user_delete
+        mirror_user_delete(tenant_id=tid, username=username)
+    except Exception:
+        pass
     return {"ok": True, "tenant_id": tid, "username": username}
 
 @router.post("/users/{username}/delete")
