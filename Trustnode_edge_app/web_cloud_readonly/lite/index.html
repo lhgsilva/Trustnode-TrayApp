@@ -111,21 +111,38 @@ const state = {
   dashboardWidgets: [],
   dashboardError: "",
   drawer: null, // { gateway_id, tag_name, range_ms, rows, loading, error }
+  // Latency telemetry, surfaced in the header overlay.
+  latency: {
+    transport: "polling",    // "realtime" | "polling"
+    last_rtt_ms: null,        // most recent PostgREST request round-trip
+    last_age_ms: null,        // newest row age vs local clock at last refresh
+    last_event_at: 0,         // wall clock when last update arrived
+  },
 };
 
 let livePoll = null;
 let historyPoll = null;
 let alarmsPoll = null;
 let powerPoll = null;
+let liveChannel = null;       // Supabase Realtime channel for live_latest
+let alarmChannel = null;      // Supabase Realtime channel for app_logs
+let headerRefreshTick = null; // 1 Hz tick so the latency overlay stays fresh
 
 function stopAllPolls() {
   [livePoll, historyPoll, alarmsPoll, powerPoll].forEach((t) => t && clearInterval(t));
   livePoll = historyPoll = alarmsPoll = powerPoll = null;
 }
 
+function stopAllChannels() {
+  if (liveChannel && supabase) supabase.removeChannel(liveChannel).catch(() => {});
+  if (alarmChannel && supabase) supabase.removeChannel(alarmChannel).catch(() => {});
+  liveChannel = alarmChannel = null;
+}
+
 // ---------- Data fetchers (direct Supabase) -------------------------------
 async function fetchLive() {
   if (!supabase || !session) return;
+  const t0 = performance.now();
   try {
     const { data, error } = await supabase
       .from("live_latest")
@@ -136,11 +153,92 @@ async function fetchLive() {
     state.liveRows = data || [];
     state.liveAt = Date.now();
     state.liveError = "";
+    state.latency.last_rtt_ms = Math.round(performance.now() - t0);
+    updateLatencyAge();
+    state.latency.last_event_at = Date.now();
+    renderHeaderLatency();
     if (state.tab === "live" || state.tab === "dashboard") renderBody();
   } catch (e) {
     state.liveError = e.message || String(e);
     if (state.tab === "live" || state.tab === "dashboard") renderBody();
   }
+}
+
+// Refresh state.latency.last_age_ms from the current liveRows. Pulled out so
+// the Realtime path can call it on every WS event too.
+function updateLatencyAge() {
+  const rows = state.liveRows || [];
+  let newest = 0;
+  for (const r of rows) {
+    const t = Date.parse(r.ts_utc || 0);
+    if (Number.isFinite(t) && t > newest) newest = t;
+  }
+  if (newest > 0) state.latency.last_age_ms = Math.max(0, Date.now() - newest);
+}
+
+// Realtime subscription for live_latest. Pushes each row update straight into
+// state.liveRows so the tile grid re-renders without polling. Records the
+// arrival latency so the header overlay shows current freshness.
+async function subscribeLive() {
+  if (!supabase || !session) return false;
+  try {
+    // First, seed the in-memory snapshot via one REST call so tiles render
+    // immediately on tab switch instead of waiting for the first WS event.
+    await fetchLive();
+    if (liveChannel) await supabase.removeChannel(liveChannel).catch(() => {});
+    liveChannel = supabase.channel("lite-live")
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "live_latest" },
+        (payload) => {
+          const row = payload.new || payload.record || null;
+          if (!row || !row.tag_name) return;
+          const key = `${row.gateway_id || ""}|${row.tag_name}`;
+          const next = state.liveRows.filter((r) =>
+            (r.gateway_id || "") + "|" + r.tag_name !== key);
+          next.unshift(row);
+          // Cap at 400 to match the REST limit and bound memory.
+          state.liveRows = next.slice(0, 400);
+          state.liveAt = Date.now();
+          state.latency.last_event_at = Date.now();
+          updateLatencyAge();
+          renderHeaderLatency();
+          if (state.tab === "live" || state.tab === "dashboard") renderBody();
+        })
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          state.latency.transport = "realtime";
+          renderHeaderLatency();
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          // Fall back to polling if the WS path is unhealthy.
+          state.latency.transport = "polling";
+          renderHeaderLatency();
+          if (!livePoll) {
+            const pollMs = Number(cfg?.live_poll_ms || 1000);
+            livePoll = setInterval(fetchLive, pollMs);
+          }
+        }
+      });
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+
+async function subscribeAlarms() {
+  if (!supabase || !session) return;
+  try {
+    if (alarmChannel) await supabase.removeChannel(alarmChannel).catch(() => {});
+    alarmChannel = supabase.channel("lite-alarms")
+      .on("postgres_changes",
+        { event: "INSERT", schema: "public", table: "app_logs" },
+        (payload) => {
+          const row = payload.new || payload.record || null;
+          if (!row) return;
+          state.alarmRows = [row, ...(state.alarmRows || [])].slice(0, 200);
+          if (state.tab === "alarms") renderBody();
+        })
+      .subscribe();
+  } catch (_e) {}
 }
 
 async function fetchHistory() {
@@ -259,13 +357,26 @@ async function fetchTagHistory(gateway_id, tag_name, rangeMs) {
   return data || [];
 }
 
-// ---------- Polling lifecycle ---------------------------------------------
+// ---------- Polling / Realtime lifecycle ---------------------------------
+// Try Supabase Realtime first; fall back to short-interval polling if the WS
+// can't connect (corporate proxies, offline, RLS misconfig, etc).
 function startPolls() {
   stopAllPolls();
-  const pollMs = Number(cfg?.live_poll_ms || 2000);
+  const pollMs = Number(cfg?.live_poll_ms || 1000);
+
+  // live_latest powers the Live tab AND the Dashboard mirror.
   if (state.tab === "live" || state.tab === "dashboard") {
-    fetchLive();
-    livePoll = setInterval(fetchLive, pollMs);
+    if (!liveChannel) {
+      subscribeLive();
+    } else {
+      // Already subscribed — just refresh the snapshot to catch any rows
+      // that landed while the tab was hidden.
+      fetchLive();
+    }
+    // Belt-and-braces poll at half the previous rate. If Realtime is healthy
+    // this just refreshes the snapshot occasionally; if it dropped silently,
+    // the user still sees data.
+    livePoll = setInterval(fetchLive, Math.max(pollMs * 4, 4000));
     if (state.tab === "dashboard") fetchDashboardConfig();
   }
   if (state.tab === "history") {
@@ -274,7 +385,8 @@ function startPolls() {
   }
   if (state.tab === "alarms") {
     fetchAlarms();
-    alarmsPoll = setInterval(fetchAlarms, 5000);
+    if (!alarmChannel) subscribeAlarms();
+    alarmsPoll = setInterval(fetchAlarms, 30000); // safety net only
   }
   if (state.tab === "power") {
     fetchPower();
@@ -357,6 +469,48 @@ function mountChart() {
 }
 
 // ---------- Rendering -----------------------------------------------------
+// Latency overlay: small badge in the header that shows transport (live WS
+// vs polling), freshness of the newest sample, and last REST round-trip.
+// Color-coded green/amber/red.
+function buildLatencyBadge() {
+  const l = state.latency || {};
+  const age = l.last_age_ms;
+  const rtt = l.last_rtt_ms;
+  const tx = l.transport || "polling";
+  let dot = "ok";
+  if (age == null) dot = "muted";
+  else if (age > 3000) dot = "bad";
+  else if (age > 1000) dot = "warn";
+  const fmt = (v) => v == null ? "—" : v < 1000 ? `${Math.round(v)} ms` : `${(v / 1000).toFixed(1)} s`;
+  const title = `Transport: ${tx === "realtime" ? "WebSocket push" : "HTTP polling"}` +
+                `\nLatest sample age: ${fmt(age)}` +
+                `\nLast request round-trip: ${fmt(rtt)}` +
+                `\nLast update: ${l.last_event_at ? new Date(l.last_event_at).toLocaleTimeString() : "—"}`;
+  return el("span", {
+    class: `lat-badge lat-${dot}`,
+    title,
+    "aria-label": title,
+  },
+    el("span", { class: "lat-dot" }),
+    el("span", { class: "lat-text" },
+      tx === "realtime" ? "live" : "poll",
+      " · ",
+      fmt(age),
+    ),
+  );
+}
+
+// Cheap re-render of just the badge — called by both the 1 Hz tick and the
+// data fetchers. Avoids ripping the whole header DOM each second.
+function renderHeaderLatency() {
+  const slot = $("#header-latency-slot");
+  if (!slot) return;
+  // Recompute age from the freshest row before painting so the number is
+  // honest even when no new event has arrived in a while.
+  updateLatencyAge();
+  slot.replaceChildren(buildLatencyBadge());
+}
+
 function renderHeader() {
   const root = $("#header-root");
   if (!root) return;
@@ -365,7 +519,8 @@ function renderHeader() {
     el("span", { class: "brand-dot" }),
     el("h1", {}, "TrustNode Lite"),
     el("span", { class: "spacer" }),
-    el("span", { class: "edge-pill" }, label),
+    el("span", { id: "header-latency-slot", class: "lat-slot" }, buildLatencyBadge()),
+    el("span", { class: "edge-pill", style: { marginLeft: "8px" } }, label),
     el("button", {
       class: "close",
       title: "Sign out",
@@ -707,6 +862,7 @@ function renderConfigError(message) {
 
 function render() {
   stopAllPolls();
+  if (!session) stopAllChannels();
   if (!supabase) { renderConfigError("Supabase client not initialised."); return; }
   if (!session) { renderLogin(); return; }
   renderLoggedIn();
@@ -741,10 +897,22 @@ function render() {
   if ("serviceWorker" in navigator) {
     try { navigator.serviceWorker.register("./sw.js"); } catch (_) {}
   }
-  // Pause polling when the tab is hidden, restart when visible — saves battery.
+  // 1 Hz header refresh so the latency overlay's "age" counter ticks without
+  // a full re-render of the body. Cheap (one badge swap).
+  if (!headerRefreshTick) {
+    headerRefreshTick = setInterval(() => {
+      if (!document.hidden && session) renderHeaderLatency();
+    }, 1000);
+  }
+  // Pause polling AND tear down WS channels when the tab is hidden, restart
+  // when visible — saves battery and avoids zombie subscriptions.
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) stopAllPolls();
-    else if (session) startPolls();
+    if (document.hidden) {
+      stopAllPolls();
+      stopAllChannels();
+    } else if (session) {
+      startPolls();
+    }
   });
 })();
   </script>

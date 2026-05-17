@@ -454,3 +454,32 @@ main {
   font-size: 13px;
 }
 .muted { color: var(--muted); }
+
+/* ============================================================ */
+/* Latency overlay badge in the header                          */
+/* ============================================================ */
+.lat-slot { display: inline-flex; align-items: center; }
+.lat-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  cursor: help;
+}
+.lat-badge .lat-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.lat-badge.lat-ok    { color: #0ea58a; background: rgba(14, 165, 138, 0.12);  border-color: rgba(14, 165, 138, 0.35); }
+.lat-badge.lat-warn  { color: #d97706; background: rgba(217, 119, 6, 0.12);   border-color: rgba(217, 119, 6, 0.35); }
+.lat-badge.lat-bad   { color: #dc2626; background: rgba(220, 38, 38, 0.12);   border-color: rgba(220, 38, 38, 0.35); }
+.lat-badge.lat-muted { color: #8a98ab; background: rgba(138, 152, 171, 0.12); border-color: rgba(138, 152, 171, 0.35); }
+.lat-badge .lat-text { font-variant-numeric: tabular-nums; }
