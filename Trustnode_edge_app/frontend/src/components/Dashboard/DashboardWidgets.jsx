@@ -1358,9 +1358,15 @@ export function DashboardWidgetCard({
       if (!resolvedLimitLines.length) return [];
       return series.map((p, i) => ({ idx: i + 1, ts: p.ts || "", value: p.value ?? null }));
     }
-    const primary = series; // [{idx, ts, value}] oldest-first
-    const reads = Math.max(10, Number(cfgReadingsCount || 120));
 
+    // ─── Simple multi-series merge ────────────────────────────────────────
+    // The primary series owns the X axis: one chart row per primary sample.
+    // For each extra series, look up its **most recent value at-or-before**
+    // the primary's timestamp — same rule the historian uses ("show the last
+    // value as of this moment"). No buckets, no median estimation, no
+    // intersection windowing. The chart's length is exactly the primary's
+    // length so the X range never "zooms in/out" when a secondary gateway's
+    // history is longer or shorter.
     const tsToMs = (raw) => {
       const t = String(raw || "");
       if (!t) return NaN;
@@ -1371,160 +1377,47 @@ export function DashboardWidgetCard({
       return Number.isFinite(ms2) ? ms2 : NaN;
     };
 
-    const primaryPts = primary
-      .map((p) => ({ ts: p.ts, tsMs: tsToMs(p.ts), value: p.value }))
-      .filter((p) => Number.isFinite(p.tsMs));
+    const primaryPts = series
+      .map((p) => ({ ts: p.ts || "", tsMs: tsToMs(p.ts), value: p.value }))
+      .filter((p) => Number.isFinite(p.tsMs))
+      .sort((a, b) => a.tsMs - b.tsMs);
 
-    const extrasPts = extraSeriesDefs.map((def) => {
-      // The rows in extraSeriesRowsByDef are already pre-filtered to this
-      // series' tag (in the fetch effect + the merge memo). Re-filtering via
-      // getTagSeries can drop rows when the historian's gateway_id alias
-      // differs from the saved series gateway_id. Going straight to the
-      // rows is more permissive and matches what the user expects.
+    // Pre-sort each extra series ascending so we can walk with a pointer.
+    const extraSorted = extraSeriesDefs.map((def) => {
       const rows = Array.isArray(extraSeriesRowsByDef[def.id]) ? extraSeriesRowsByDef[def.id] : [];
-      const sorted = rows
+      const pts = rows
         .map((r) => {
-          const raw = Number(r?.value);
-          const numeric = Number.isFinite(raw) ? raw : null;
+          const numeric = Number(r?.value);
           return {
-            ts: String(r?.ts || r?.ts_utc || ""),
             tsMs: tsToMs(r?.ts || r?.ts_utc),
-            value: numeric === null ? null : numeric * def.multiplier + def.offset,
+            value: Number.isFinite(numeric) ? numeric * def.multiplier + def.offset : null,
           };
         })
         .filter((p) => Number.isFinite(p.tsMs))
         .sort((a, b) => a.tsMs - b.tsMs);
-      const sliced = sorted.length > reads ? sorted.slice(-reads) : sorted;
-      return sliced;
+      return { def, pts, ptr: 0, lastVal: null };
     });
 
-    // ─── Bucketed multi-series merge ──────────────────────────────────────
-    // When series come from different gateways the raw timestamps almost
-    // never line up to the millisecond. A naive "set on ts, null elsewhere"
-    // merge produces a chart that alternates one series per X tick and
-    // shows visible gaps in the others. To avoid that we bucket all
-    // samples into a small time window (the median sample spacing of the
-    // densest series, clamped to a sensible range). Each bucket keeps the
-    // LAST sample per series — the standard historian display rule.
-    //
-    // Effect: every bucket row now has a value for every series whose
-    // gateway produced any sample inside that bucket, so both lines are
-    // drawn at every X tick with no jittered gaps.
-
-    // ─── Align series to a shared time window ───────────────────────────
-    // The primary series and each extra series are sliced independently by
-    // sample count, so their date ranges often disagree (primary covers
-    // the last 60 s, extra covers the last 5 minutes, etc.). Trim them to
-    // the **intersection** of their time ranges so every chart bucket has
-    // real samples from BOTH sides — no more flat carry-forward tails or
-    // gaps where one series has no data.
-    const windowStart = Math.max(
-      primaryPts.length ? primaryPts[0].tsMs : -Infinity,
-      ...extrasPts.map((arr) => (arr.length ? arr[0].tsMs : -Infinity)),
-    );
-    const windowEnd = Math.min(
-      primaryPts.length ? primaryPts[primaryPts.length - 1].tsMs : Infinity,
-      ...extrasPts.map((arr) => (arr.length ? arr[arr.length - 1].tsMs : Infinity)),
-    );
-    const inWindow = (p) => p.tsMs >= windowStart && p.tsMs <= windowEnd;
-    // Only apply the trim when the intersection is non-empty AND every
-    // series has at least one point inside it; otherwise fall back to the
-    // raw arrays so we still draw *something* on a fresh dashboard.
-    let trimmedPrimary = primaryPts;
-    let trimmedExtras = extrasPts;
-    if (Number.isFinite(windowStart) && Number.isFinite(windowEnd) && windowEnd > windowStart) {
-      const tp = primaryPts.filter(inWindow);
-      const te = extrasPts.map((arr) => arr.filter(inWindow));
-      const allHaveData = tp.length && te.every((a) => a.length);
-      if (allHaveData) {
-        trimmedPrimary = tp;
-        trimmedExtras = te;
-      }
-    }
-
-    const allPtsByDef = [trimmedPrimary, ...trimmedExtras];
-
-    const estimateBucketMs = (ptsArrays) => {
-      // Use the median delta between consecutive samples of the densest
-      // series as the bucket size. Median is robust to outliers (PLC
-      // restarts, brief stalls). Falls back to 1000ms when there's not
-      // enough data.
-      let bestArr = ptsArrays[0] || [];
-      for (const a of ptsArrays) if (a.length > bestArr.length) bestArr = a;
-      if (bestArr.length < 3) return 1000;
-      const deltas = [];
-      for (let k = 1; k < bestArr.length; k += 1) {
-        const d = bestArr[k].tsMs - bestArr[k - 1].tsMs;
-        if (Number.isFinite(d) && d > 0) deltas.push(d);
-      }
-      if (!deltas.length) return 1000;
-      deltas.sort((a, b) => a - b);
-      const median = deltas[Math.floor(deltas.length / 2)];
-      // Clamp so we don't bucket too aggressively (which would erase real
-      // sub-second jitter) nor too coarsely (long PLC pauses shouldn't
-      // collapse 10 minutes of samples into one point).
-      return Math.max(200, Math.min(60000, median));
-    };
-
-    const bucketMs = estimateBucketMs(allPtsByDef);
-    const bucketKey = (tsMs) => Math.floor(tsMs / bucketMs) * bucketMs;
-
-    // tsMap key = bucket start; row keeps "last sample wins" per series so
-    // dashboards reflect the most recent value at each bucket boundary.
-    const tsMap = new Map();
-    const getOrInitRow = (bk, fallbackTs) => {
-      let row = tsMap.get(bk);
-      if (!row) {
-        row = { ts: fallbackTs || new Date(bk).toISOString(), tsMs: bk, value: null };
-        tsMap.set(bk, row);
+    // Walk primary once. For each row advance each extra series's pointer
+    // up to the primary timestamp; the last value scanned is the carry-
+    // forward value for that primary tick.
+    const merged = primaryPts.map((p, i) => {
+      const row = { idx: i + 1, ts: p.ts, value: p.value };
+      for (const st of extraSorted) {
+        while (st.ptr < st.pts.length && st.pts[st.ptr].tsMs <= p.tsMs) {
+          st.lastVal = st.pts[st.ptr].value;
+          st.ptr += 1;
+        }
+        // If no extra sample is at-or-before this primary tick, leave it
+        // null — Recharts skips nulls with connectNulls so the line starts
+        // when real data appears. This avoids inventing flat-line tails.
+        row[`s_${st.def.id}`] = st.lastVal;
       }
       return row;
-    };
-    // primary
-    for (const p of trimmedPrimary) {
-      const bk = bucketKey(p.tsMs);
-      const row = getOrInitRow(bk, p.ts);
-      // last-write wins (trimmedPrimary is already chronological asc)
-      row.value = p.value;
-      row.ts = p.ts || row.ts;
-    }
-    // extras
-    for (let j = 0; j < trimmedExtras.length; j += 1) {
-      const def = extraSeriesDefs[j];
-      const key = `s_${def.id}`;
-      for (const p of trimmedExtras[j]) {
-        const bk = bucketKey(p.tsMs);
-        const row = getOrInitRow(bk, p.ts);
-        row[key] = p.value;
-        // Don't overwrite a primary-derived ts here; keep it human-friendly.
-      }
-    }
-    const ordered = Array.from(tsMap.values()).sort((a, b) => a.tsMs - b.tsMs);
-    // Trim to the most recent N points so the chart doesn't grow unbounded.
-    const limit = Math.max(60, reads);
-    const trimmed = ordered.length > limit ? ordered.slice(-limit) : ordered;
+    });
 
-    // ─── Carry-forward fill across series ────────────────────────────────
-    // After bucketing, a bucket may carry a value for series A but not for
-    // series B (different gateways, slightly different sample cadences, or
-    // one gateway briefly down). Recharts won't draw a line through an
-    // undefined dataKey, so the user sees a hole in series B until B's next
-    // sample. Walk the buckets in order and forward-fill the last seen
-    // value for each series — same rule the historian uses ("display the
-    // most recent value at-or-before this timestamp").
-    const seriesKeys = ["value", ...extraSeriesDefs.map((d) => `s_${d.id}`)];
-    const lastVal = {};
-    for (const row of trimmed) {
-      for (const k of seriesKeys) {
-        if (row[k] !== undefined && row[k] !== null) {
-          lastVal[k] = row[k];
-        } else if (lastVal[k] !== undefined) {
-          row[k] = lastVal[k];
-        }
-      }
-    }
-    return trimmed.map((row, i) => ({ ...row, idx: i + 1 }));
-  }, [series, extraSeriesDefs, extraSeriesRowsByDef, cfgReadingsCount, resolvedLimitLines.length]);
+    return merged;
+  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length]);
 
   const hasMultiSeries = extraSeriesDefs.length > 0 || resolvedLimitLines.length > 0;
   const anyRightAxis =
