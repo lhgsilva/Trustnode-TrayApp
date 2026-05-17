@@ -160,7 +160,11 @@ function stopAllChannels() {
   if (liveChannel && supabase) supabase.removeChannel(liveChannel).catch(() => {});
   if (alarmChannel && supabase) supabase.removeChannel(alarmChannel).catch(() => {});
   if (dashboardChannel && supabase) supabase.removeChannel(dashboardChannel).catch(() => {});
-  liveChannel = alarmChannel = dashboardChannel = null;
+  if (historianChannel && supabase) supabase.removeChannel(historianChannel).catch(() => {});
+  liveChannel = alarmChannel = dashboardChannel = historianChannel = null;
+  // Charts have to be re-mounted after a teardown so drop any stale refs.
+  for (const [, e] of liveCharts) { try { e.plot?.destroy?.(); } catch (_) {} }
+  liveCharts.clear();
 }
 
 // ---------- Data fetchers (direct Supabase) -------------------------------
@@ -307,6 +311,41 @@ async function subscribeLive() {
   } catch (_e) {
     return false;
   }
+}
+
+// Subscribe to historian_readings INSERTs and append the new sample to
+// every chart that's currently rendered for that (gateway, tag) pair.
+// RLS scopes the events to the viewer's tenant — we never see other
+// customers' rows. Falls back silently if Realtime is unhealthy; the
+// 30s cache + periodic re-fetch will eventually catch up.
+async function subscribeHistorian() {
+  if (!supabase || !session) return;
+  try {
+    if (historianChannel) await supabase.removeChannel(historianChannel).catch(() => {});
+    historianChannel = supabase.channel("lite-historian")
+      .on("postgres_changes",
+        { event: "INSERT", schema: "public", table: "historian_readings" },
+        (payload) => {
+          const row = payload.new || payload.record || null;
+          if (!row || !row.tag_name) return;
+          const key = `${row.gateway_id || ""}|${row.tag_name}`;
+          const entry = liveCharts.get(key);
+          if (!entry || !entry.plot) return;
+          const x = Math.floor(Date.parse(row.ts_utc || 0) / 1000);
+          const y = Number(row.value);
+          if (!Number.isFinite(x)) return;
+          // Append. Drop the oldest point if we'd exceed sampleCount.
+          entry.xs.push(x);
+          entry.ys.push(Number.isFinite(y) ? y : null);
+          const cap = Math.max(2, Number(entry.sampleCount) || 20);
+          while (entry.xs.length > cap) { entry.xs.shift(); entry.ys.shift(); }
+          // setData triggers an in-place re-render that's much cheaper
+          // than recreating the chart. uPlot handles thousands of points
+          // at 60fps so this stays smooth on phones too.
+          try { entry.plot.setData([entry.xs, entry.ys]); } catch (_) {}
+        })
+      .subscribe();
+  } catch (_e) {}
 }
 
 async function subscribeAlarms() {
@@ -478,6 +517,12 @@ function setDashPref(name, value) {
 // the dashboard re-renders. Keys: "gw|tag". Entries: { rows, fetched_at }.
 const chartDataCache = new Map();
 const CHART_TTL_MS = 30_000; // refresh charts at most every 30s when online
+
+// Live chart registry: maps "gw|tag" -> { plot, xs, ys, sampleCount }
+// so the realtime historian subscription can append in place to every
+// chart that's currently mounted. Tearing down the dashboard clears this.
+const liveCharts = new Map();
+let historianChannel = null;
 
 // Subscribe to dashboard_configurations updates so the Lite view reflects
 // the operator's widget changes within seconds. RLS scopes the channel
@@ -1202,6 +1247,14 @@ async function getChartRowsCached(gw, tag, sampleCount) {
 async function mountWidgetData() {
   const sampleCount = Number(state.dashPrefs?.sampleCount) || 20;
 
+  // Tear down the previous chart instances before re-mounting so we don't
+  // leak DOM nodes or duplicate live-append entries when the dashboard
+  // re-renders (e.g. profile switch, per-row toggle).
+  for (const [, entry] of liveCharts) {
+    try { entry.plot?.destroy?.(); } catch (_) {}
+  }
+  liveCharts.clear();
+
   // ---- Inline charts (line/area/bar) ----
   if (typeof uPlot === "undefined") return;
   const chartMounts = document.querySelectorAll(".widget-chart-mount");
@@ -1228,7 +1281,7 @@ async function mountWidgetData() {
         type === "line_area_chart" ?
           { label: tag, stroke: color, fill: color + "33", width: 1.5, points: { show: false } } :
           { label: tag, stroke: color, width: 1.5, points: { show: false } };
-      new uPlot({
+      const plot = new uPlot({
         width: w, height: h, cursor: { show: false }, legend: { show: false },
         scales: { x: { time: true } },
         series: [{}, seriesCfg],
@@ -1237,6 +1290,8 @@ async function mountWidgetData() {
           { stroke: "#8a98ab", size: 30, grid: { stroke: "rgba(138,152,171,0.15)" } },
         ],
       }, [xs, ys], m);
+      // Register so the realtime historian subscription can append rows.
+      liveCharts.set(`${gw}|${tag}`, { plot, xs, ys, sampleCount });
       // Add an offline overlay if the gateway hasn't been seen in 30s.
       if (gw && !isGatewayOnline(gw)) {
         const overlay = el("div", { class: "widget-offline-overlay", title: "Gateway offline" }, "OFFLINE");
@@ -1245,6 +1300,13 @@ async function mountWidgetData() {
     } catch (e) {
       m.replaceChildren(el("div", { class: "muted", style: { fontSize: "11px" } }, "chart err"));
     }
+  }
+
+  // Make sure the realtime historian subscription is up. We only subscribe
+  // once we have charts to feed — there's no point holding a WS open if the
+  // dashboard has only KPIs and tables.
+  if (liveCharts.size > 0 && !historianChannel) {
+    subscribeHistorian();
   }
 
   // ---- Table widgets ----
