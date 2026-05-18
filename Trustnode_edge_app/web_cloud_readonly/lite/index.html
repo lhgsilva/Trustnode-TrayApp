@@ -312,6 +312,12 @@ function useDashboardProfiles(enabled = true) {
         widgetCount: Array.isArray(r.payload_json?.widgets) ? r.payload_json.widgets.length : 0,
         tenant_id: r.tenant_id || "",
       })).filter((p) => {
+        // Drop the legacy unscoped bootstrap row (scope_key='') — every
+        // install carries one from initial bootstrap and its widgets
+        // point at stale gateway_ids no longer present on the edge.
+        // Real per-user profiles always have a scope_key.
+        if (!p.key) return false;
+        // Dedupe.
         if (seen.has(p.key)) return false;
         seen.add(p.key);
         return true;
@@ -2036,8 +2042,17 @@ function useAlarmEvents(enabled = true) {
 function useActiveAlarmCount() {
   const { events } = useAlarmEvents(true);
   return useMemo(() => {
+    // Same "latest event per alert_key" logic as ActiveAlarmsList so the
+    // header bell badge and the alarms tab agree on what's active.
     if (!Array.isArray(events)) return 0;
-    return events.filter((a) => a && a.event_type === "active" && !a.acknowledged).length;
+    const byKey = new Map();
+    for (const a of events) {
+      if (!a || typeof a !== "object") continue;
+      const key = String(a.alert_key || a.id || `${a.gateway_id || ""}|${a.tag || ""}`);
+      const prev = byKey.get(key);
+      if (!prev || String(a.ts || "") > String(prev.ts || "")) byKey.set(key, a);
+    }
+    return [...byKey.values()].filter((a) => a && a.event_type === "active" && !a.acknowledged).length;
   }, [events]);
 }
 
@@ -2068,16 +2083,37 @@ function ActiveAlarmsList() {
   const { events, error } = useAlarmEvents(true);
   const [showAll, setShowAll] = useState(false);  // when true include cleared/acknowledged
 
-  const filtered = useMemo(() => {
+  // "Currently active" means: for each alert_key, look at its MOST
+  // RECENT event. If that event is `active` and not acknowledged, the
+  // alarm is live. The naïve `event_type === "active"` filter showed
+  // historical activations even after the edge had already cleared
+  // them — so the user would see "active" alarms in Lite long after
+  // they'd been resolved on the edge.
+  const latestPerKey = useMemo(() => {
     if (!Array.isArray(events)) return [];
-    if (showAll) return events;
-    return events.filter((a) => a && a.event_type === "active" && !a.acknowledged);
-  }, [events, showAll]);
-
-  const activeCount = useMemo(() => {
-    if (!Array.isArray(events)) return 0;
-    return events.filter((a) => a && a.event_type === "active" && !a.acknowledged).length;
+    const byKey = new Map(); // alert_key -> most recent event
+    for (const a of events) {
+      if (!a || typeof a !== "object") continue;
+      const key = String(a.alert_key || a.id || `${a.gateway_id || ""}|${a.tag || ""}`);
+      const prev = byKey.get(key);
+      if (!prev || String(a.ts || "") > String(prev.ts || "")) {
+        byKey.set(key, a);
+      }
+    }
+    return [...byKey.values()].sort(
+      (x, y) => String(y?.ts || "").localeCompare(String(x?.ts || ""))
+    );
   }, [events]);
+
+  const filtered = useMemo(() => {
+    if (showAll) return events || [];
+    return latestPerKey.filter((a) => a && a.event_type === "active" && !a.acknowledged);
+  }, [latestPerKey, events, showAll]);
+
+  const activeCount = useMemo(
+    () => latestPerKey.filter((a) => a && a.event_type === "active" && !a.acknowledged).length,
+    [latestPerKey]
+  );
 
   const sevClass = (s) => {
     const k = String(s || "").toLowerCase();

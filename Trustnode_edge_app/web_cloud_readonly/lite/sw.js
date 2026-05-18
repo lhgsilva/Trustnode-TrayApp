@@ -9,7 +9,7 @@
  * evicted on activate. Browsers re-check the service worker on each navigation
  * so users pick the new shell up automatically next time they open the app.
  */
-const CACHE_VERSION = "tnlite-v22-tight-widgets-rules-mirror-reconcile";
+const CACHE_VERSION = "tnlite-v23-active-by-latest-event-per-key";
 const SHELL = [
   "./",
   "./index.html",
