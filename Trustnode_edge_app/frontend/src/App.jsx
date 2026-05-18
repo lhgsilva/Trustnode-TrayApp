@@ -2766,6 +2766,18 @@ function AppShell() {
   const dashboardDomainSaveTimerRef = useRef(null);
   const dashboardDomainPersistInFlightRef = useRef(false);
   const dashboardDomainLastPersistSignatureRef = useRef("");
+  // Dedicated debounce refs for alarms_setup and triggers_limits. The
+  // bootstrap-wide save was being starved: its 2.5s timer keeps getting
+  // reset whenever ANY dep in its huge dep array changes. With alarms
+  // firing every few seconds the timer never gets to idle long enough
+  // to run, so the alarms_setup row in SQLite (and the cloud mirror)
+  // never updates. Per-domain timers run independently.
+  const alarmsDomainSaveTimerRef = useRef(null);
+  const alarmsDomainPersistInFlightRef = useRef(false);
+  const alarmsDomainLastPersistSignatureRef = useRef("");
+  const triggersDomainSaveTimerRef = useRef(null);
+  const triggersDomainPersistInFlightRef = useRef(false);
+  const triggersDomainLastPersistSignatureRef = useRef("");
   const liveTagValuesRef = useRef({});
   const powerConfigRef = useRef({});
   const cloudNewestLiveTsMsRef = useRef(0);
@@ -4483,6 +4495,86 @@ function AppShell() {
       }
     };
   }, [appStoreHydrated, currentUser, dashboardWidgets, dashboardMode, dashboardPerRow, dashboardTagColors]);
+
+  // Dedicated alarms_setup persistence. The bootstrap-wide debounce
+  // could not keep up because alarms churn every few seconds and the
+  // 2.5s idle timer kept getting reset by other state changes. This
+  // effect ONLY depends on `alarms`, so its 1s debounce always reaches
+  // idle and the save lands. Lite then picks it up via the
+  // reconcile loop (see app_store._reconcile_lite_mirror_tables_once).
+  useEffect(() => {
+    if (!appStoreHydrated) return;
+    if (isHostedWebClient) return;
+    if (alarmsDomainSaveTimerRef.current) {
+      clearTimeout(alarmsDomainSaveTimerRef.current);
+      alarmsDomainSaveTimerRef.current = null;
+    }
+    alarmsDomainSaveTimerRef.current = setTimeout(async () => {
+      if (alarmsDomainPersistInFlightRef.current) return;
+      const payload = { alarms: Array.isArray(alarms) ? alarms : [] };
+      const signature = JSON.stringify(payload);
+      if (!alarmsDomainLastPersistSignatureRef.current) {
+        alarmsDomainLastPersistSignatureRef.current = signature;
+        return;
+      }
+      if (signature === alarmsDomainLastPersistSignatureRef.current) return;
+      alarmsDomainPersistInFlightRef.current = true;
+      try {
+        await saveAppStoreDomain("alarms_setup", payload, currentUser?.username || "system");
+        alarmsDomainLastPersistSignatureRef.current = signature;
+      } catch (_) {
+        // Bootstrap save loop still tries periodically — non-fatal.
+      } finally {
+        alarmsDomainPersistInFlightRef.current = false;
+      }
+    }, 1000);
+    return () => {
+      if (alarmsDomainSaveTimerRef.current) {
+        clearTimeout(alarmsDomainSaveTimerRef.current);
+        alarmsDomainSaveTimerRef.current = null;
+      }
+    };
+  }, [appStoreHydrated, isHostedWebClient, currentUser, alarms]);
+
+  // Same treatment for triggers_limits. Less urgent (rules change far
+  // less often) but it makes the round-trip explicit and the Lite Rules
+  // tab stays in sync without waiting for a bootstrap save.
+  useEffect(() => {
+    if (!appStoreHydrated) return;
+    if (isHostedWebClient) return;
+    if (triggersDomainSaveTimerRef.current) {
+      clearTimeout(triggersDomainSaveTimerRef.current);
+      triggersDomainSaveTimerRef.current = null;
+    }
+    triggersDomainSaveTimerRef.current = setTimeout(async () => {
+      if (triggersDomainPersistInFlightRef.current) return;
+      const payload = {
+        collection_triggers: Array.isArray(collectionTriggers) ? collectionTriggers : [],
+        collection_trigger_mode: collectionTriggerMode,
+        trigger_rules: Array.isArray(triggerRules) ? triggerRules : [],
+      };
+      const signature = JSON.stringify(payload);
+      if (!triggersDomainLastPersistSignatureRef.current) {
+        triggersDomainLastPersistSignatureRef.current = signature;
+        return;
+      }
+      if (signature === triggersDomainLastPersistSignatureRef.current) return;
+      triggersDomainPersistInFlightRef.current = true;
+      try {
+        await saveAppStoreDomain("triggers_limits", payload, currentUser?.username || "system");
+        triggersDomainLastPersistSignatureRef.current = signature;
+      } catch (_) {}
+      finally {
+        triggersDomainPersistInFlightRef.current = false;
+      }
+    }, 700);
+    return () => {
+      if (triggersDomainSaveTimerRef.current) {
+        clearTimeout(triggersDomainSaveTimerRef.current);
+        triggersDomainSaveTimerRef.current = null;
+      }
+    };
+  }, [appStoreHydrated, isHostedWebClient, currentUser, collectionTriggers, collectionTriggerMode, triggerRules]);
 
   useEffect(() => {
     const timer = setInterval(() => {
