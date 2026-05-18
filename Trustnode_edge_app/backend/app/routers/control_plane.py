@@ -301,26 +301,33 @@ def list_customers(request: Request, tenant_id: str | None = None) -> dict[str, 
 def _customer_tenant_id(customer_id: str) -> str:
     """Resolve the per-customer tenant slug.
 
-    Decided 2026-05-18: keep whatever tenant_id each customer already
-    has in cp_customers (the existing dataset uses naming like
-    'customer_a', 'customer_b' rather than 'tenant-<id>'). For brand-new
-    customers (no cp_customers row yet) we generate the slug as
-    'tenant-<customer_id>' so new installs pick a clear, consistent
-    format. Either way the slug returned here is what every downstream
-    resource (cp_edges, cp_licenses, activation codes, Lite profiles)
-    must use.
+    Rules (refined 2026-05-18 after seeing live data):
+
+      1. If the customer has an EXISTING tenant_id that's NOT 'default'
+         (e.g. 'customer_a', 'tenant-cust-x'), honour it. This preserves
+         compatibility with the customers you created before per-customer
+         tenancy was enforced ('customer_a' etc.).
+
+      2. If the customer is on tenant_id='default' or doesn't exist yet,
+         GENERATE 'tenant-<customer_id>'. 'default' is the master admin's
+         own tenant; no customer-scoped resource may live on it, otherwise
+         that customer's Lite users would see every other 'default' row.
+
+      3. If customer_id itself is empty, raise — the caller (POST /customers)
+         must auto-generate it BEFORE calling here, since the tenant slug
+         needs the id baked in.
     """
     cid = str(customer_id or "").strip()
     if not cid:
         raise HTTPException(status_code=400, detail="customer_id is required for tenant assignment")
-    # 1) Existing customer: honour whatever tenant_id is already on file.
+    # 1) Existing customer with a real per-customer tenant: honour it.
     try:
-        existing_tenant = control_plane_store.get_customer_tenant_id(customer_id=cid)
+        existing_tenant = (control_plane_store.get_customer_tenant_id(customer_id=cid) or "").strip()
     except Exception:
         existing_tenant = ""
-    if existing_tenant:
+    if existing_tenant and existing_tenant.lower() != "default":
         return existing_tenant
-    # 2) New customer: generate. Format 'tenant-<id>' for clarity.
+    # 2) New customer OR customer stuck on 'default': always generate.
     return f"tenant-{cid}"
 
 
@@ -331,6 +338,13 @@ def upsert_customer(payload: CustomerUpsertRequest, request: Request, tenant_id:
     # tenant. Each customer gets their own tenant — that's what makes the
     # existing Lite RLS isolate them from each other.
     _scoped_tenant(request, tenant_id, require_admin_write=True)
+    # Auto-generate a customer_id when the portal sends an empty one.
+    # control_plane_store.upsert_customer falls back to 'cust-<8hex>' if
+    # we don't supply one, but _customer_tenant_id below needs the id
+    # before the store assigns it, so we mint it here ourselves.
+    if not str(payload.customer_id or "").strip():
+        import secrets as _secrets
+        payload.customer_id = f"cust-{_secrets.token_hex(4)}"
     assigned_tenant = _customer_tenant_id(payload.customer_id)
     # Ensure the per-customer tenant exists before inserting the customer
     # row (cp_customers.tenant_id has a foreign key to cp_tenants).
