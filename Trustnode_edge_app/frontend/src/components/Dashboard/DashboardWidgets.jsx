@@ -1596,6 +1596,15 @@ export function DashboardWidgetCard({
     serverQueryRowsLoading
     && (!Array.isArray(serverQueryRows) || serverQueryRows.length === 0)
     && (!Array.isArray(lastGoodServerQueryRows) || lastGoodServerQueryRows.length === 0);
+  // When the historian fetch failed (network, 5xx, or backend error), surface
+  // the error inside the widget instead of silently rendering "No points".
+  // Without this, charts on fresh installs stay blank with no clue why.
+  const trendEmptyText =
+    trendIsInitialLoading
+      ? "Loading..."
+      : (serverQueryError && (!Array.isArray(serverQueryRows) || serverQueryRows.length === 0))
+        ? `Historian error: ${String(serverQueryError).slice(0, 120)}`
+        : "No points";
   useEffect(() => {
     setPieHiddenNames({});
     setPieActiveIndex(-1);
@@ -1776,7 +1785,7 @@ export function DashboardWidgetCard({
                   </ResponsiveContainer>
                 )}
               </div>
-            ) : trendIsInitialLoading ? renderEmpty("Loading...") : renderEmpty("No points")}
+            ) : renderEmpty(trendEmptyText)}
           </div>
         );
       }
@@ -2019,7 +2028,7 @@ export function DashboardWidgetCard({
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
-          ) : trendIsInitialLoading ? renderEmpty("Loading...") : renderEmpty("No points")}
+          ) : renderEmpty(trendEmptyText)}
         </div>
       );
     }

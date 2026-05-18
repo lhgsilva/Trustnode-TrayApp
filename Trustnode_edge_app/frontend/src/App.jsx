@@ -10895,7 +10895,27 @@ const getGatewayHealth = (gateway) => {
           : `${host}:${port}`;
       setDbTestResult({ ...res, tested_for: testedFor });
     } catch (err) {
-      setDbTestResult({ ok: false, message: String(err) });
+      // Supabase Direct (db.<ref>.supabase.co:5432) is IPv6-only on the free
+      // tier. On an IPv4-only network the TCP connect hangs and the frontend
+      // times out before SQLAlchemy gets a chance to fail cleanly. Give the
+      // operator the concrete fix instead of the generic 'network interrupted'.
+      const hostLower = String(host || "").toLowerCase();
+      const portNum = Number(port || 0);
+      const looksLikeSupabaseDirect =
+        dbForm.engine === "postgresql" &&
+        hostLower.startsWith("db.") &&
+        hostLower.endsWith(".supabase.co") &&
+        portNum === 5432;
+      if (looksLikeSupabaseDirect) {
+        setDbTestResult({
+          ok: false,
+          message:
+            "Supabase Direct connection (db.<ref>.supabase.co:5432) is IPv6-only on the free tier and likely unreachable from this network. " +
+            "Use the Pooler instead: host 'aws-<region>.pooler.supabase.com', port 6543, username 'postgres.<projectref>'.",
+        });
+      } else {
+        setDbTestResult({ ok: false, message: String(err) });
+      }
     } finally {
       setDbTestBusy(false);
     }
