@@ -216,18 +216,13 @@ jobs:
             .venv/bin/python -m pip install --upgrade pip
             .venv/bin/python -m pip install -r requirements.txt
             mkdir -p /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d
-            # Build override.conf in stages so we can omit Supabase
-            # Environment lines cleanly when the secret is missing. The
-            # ssh-action expands workflow expressions at render-time before
-            # sending the script, so the secret values embed directly into
-            # the shell variables below.
-            CLOUD_DB_HOST_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_HOST }}'
-            CLOUD_DB_PORT_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_PORT }}'
-            CLOUD_DB_NAME_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_NAME }}'
-            CLOUD_DB_USER_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_USER }}'
-            CLOUD_DB_PASSWORD_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_PASSWORD }}'
-            CLOUD_DB_SCHEMA_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_SCHEMA }}'
-            CLOUD_DB_SSLMODE_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_SSLMODE }}'
+            # CI owns ONLY override.conf (perf knobs + ExecStart). Secret
+            # env vars live in a separate drop-in 10-secrets.conf that
+            # scripts/install_vps_secrets.py manages out-of-band — CI
+            # must NOT write to that file. systemd merges all *.conf in
+            # the .d directory at daemon-reload time, so both files take
+            # effect together. This stops every deploy from clobbering
+            # the Supabase/cloud-DB credentials.
             {
               echo '[Service]'
               echo 'TimeoutStopSec=10'
@@ -239,19 +234,18 @@ jobs:
               echo 'Environment=TRUSTNODE_DATA_BULK_SYNC_SECONDS=0.25'
               echo 'Environment=TRUSTNODE_DATA_SYNC_BATCH_SIZE=1000'
               echo 'Environment=TRUSTNODE_CLOUD_LIVE_SSE_MS=250'
-              # Supabase credentials — cloud read path needs these because
-              # the VPS never goes through the desktop UI to write a DB
-              # config row. Missing secrets simply omit the line.
-              [ -n "$CLOUD_DB_HOST_VALUE" ]     && echo "Environment=TRUSTNODE_CLOUD_DB_HOST=$CLOUD_DB_HOST_VALUE"
-              [ -n "$CLOUD_DB_PORT_VALUE" ]     && echo "Environment=TRUSTNODE_CLOUD_DB_PORT=$CLOUD_DB_PORT_VALUE"
-              [ -n "$CLOUD_DB_NAME_VALUE" ]     && echo "Environment=TRUSTNODE_CLOUD_DB_NAME=$CLOUD_DB_NAME_VALUE"
-              [ -n "$CLOUD_DB_USER_VALUE" ]     && echo "Environment=TRUSTNODE_CLOUD_DB_USER=$CLOUD_DB_USER_VALUE"
-              [ -n "$CLOUD_DB_PASSWORD_VALUE" ] && echo "Environment=TRUSTNODE_CLOUD_DB_PASSWORD=$CLOUD_DB_PASSWORD_VALUE"
-              [ -n "$CLOUD_DB_SCHEMA_VALUE" ]   && echo "Environment=TRUSTNODE_CLOUD_DB_SCHEMA=$CLOUD_DB_SCHEMA_VALUE"
-              [ -n "$CLOUD_DB_SSLMODE_VALUE" ]  && echo "Environment=TRUSTNODE_CLOUD_DB_SSLMODE=$CLOUD_DB_SSLMODE_VALUE"
               echo 'ExecStart='
               echo "ExecStart=${{ env.VPS_APP_ROOT }}/Trustnode_edge_app/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5"
             } > /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d/override.conf
+            # Fail-fast: refuse to restart if 10-secrets.conf is missing,
+            # because the backend will be dead in the water (no mirror,
+            # no cloud reads). Operators bootstrap it via
+            #   python scripts/install_vps_secrets.py
+            # from a developer workstation (see scripts/README.md).
+            if [ ! -f /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d/10-secrets.conf ]; then
+              echo "ERROR: 10-secrets.conf missing on VPS. Run scripts/install_vps_secrets.py before deploying." >&2
+              exit 78
+            fi
             systemctl daemon-reload
             systemctl reset-failed ${{ env.BACKEND_SERVICE }} || true
             systemctl restart ${{ env.BACKEND_SERVICE }}
@@ -408,18 +402,13 @@ jobs:
             .venv/bin/python -m pip install --upgrade pip
             .venv/bin/python -m pip install -r requirements.txt
             mkdir -p /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d
-            # Build override.conf in stages so we can omit Supabase
-            # Environment lines cleanly when the secret is missing. The
-            # ssh-action expands workflow expressions at render-time before
-            # sending the script, so the secret values embed directly into
-            # the shell variables below.
-            CLOUD_DB_HOST_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_HOST }}'
-            CLOUD_DB_PORT_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_PORT }}'
-            CLOUD_DB_NAME_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_NAME }}'
-            CLOUD_DB_USER_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_USER }}'
-            CLOUD_DB_PASSWORD_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_PASSWORD }}'
-            CLOUD_DB_SCHEMA_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_SCHEMA }}'
-            CLOUD_DB_SSLMODE_VALUE='${{ secrets.TRUSTNODE_CLOUD_DB_SSLMODE }}'
+            # CI owns ONLY override.conf (perf knobs + ExecStart). Secret
+            # env vars live in a separate drop-in 10-secrets.conf that
+            # scripts/install_vps_secrets.py manages out-of-band — CI
+            # must NOT write to that file. systemd merges all *.conf in
+            # the .d directory at daemon-reload time, so both files take
+            # effect together. This stops every deploy from clobbering
+            # the Supabase/cloud-DB credentials.
             {
               echo '[Service]'
               echo 'TimeoutStopSec=10'
@@ -431,19 +420,18 @@ jobs:
               echo 'Environment=TRUSTNODE_DATA_BULK_SYNC_SECONDS=0.25'
               echo 'Environment=TRUSTNODE_DATA_SYNC_BATCH_SIZE=1000'
               echo 'Environment=TRUSTNODE_CLOUD_LIVE_SSE_MS=250'
-              # Supabase credentials — cloud read path needs these because
-              # the VPS never goes through the desktop UI to write a DB
-              # config row. Missing secrets simply omit the line.
-              [ -n "$CLOUD_DB_HOST_VALUE" ]     && echo "Environment=TRUSTNODE_CLOUD_DB_HOST=$CLOUD_DB_HOST_VALUE"
-              [ -n "$CLOUD_DB_PORT_VALUE" ]     && echo "Environment=TRUSTNODE_CLOUD_DB_PORT=$CLOUD_DB_PORT_VALUE"
-              [ -n "$CLOUD_DB_NAME_VALUE" ]     && echo "Environment=TRUSTNODE_CLOUD_DB_NAME=$CLOUD_DB_NAME_VALUE"
-              [ -n "$CLOUD_DB_USER_VALUE" ]     && echo "Environment=TRUSTNODE_CLOUD_DB_USER=$CLOUD_DB_USER_VALUE"
-              [ -n "$CLOUD_DB_PASSWORD_VALUE" ] && echo "Environment=TRUSTNODE_CLOUD_DB_PASSWORD=$CLOUD_DB_PASSWORD_VALUE"
-              [ -n "$CLOUD_DB_SCHEMA_VALUE" ]   && echo "Environment=TRUSTNODE_CLOUD_DB_SCHEMA=$CLOUD_DB_SCHEMA_VALUE"
-              [ -n "$CLOUD_DB_SSLMODE_VALUE" ]  && echo "Environment=TRUSTNODE_CLOUD_DB_SSLMODE=$CLOUD_DB_SSLMODE_VALUE"
               echo 'ExecStart='
               echo "ExecStart=${{ env.VPS_APP_ROOT }}/Trustnode_edge_app/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5"
             } > /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d/override.conf
+            # Fail-fast: refuse to restart if 10-secrets.conf is missing,
+            # because the backend will be dead in the water (no mirror,
+            # no cloud reads). Operators bootstrap it via
+            #   python scripts/install_vps_secrets.py
+            # from a developer workstation (see scripts/README.md).
+            if [ ! -f /etc/systemd/system/${{ env.BACKEND_SERVICE }}.service.d/10-secrets.conf ]; then
+              echo "ERROR: 10-secrets.conf missing on VPS. Run scripts/install_vps_secrets.py before deploying." >&2
+              exit 78
+            fi
             systemctl daemon-reload
             systemctl reset-failed ${{ env.BACKEND_SERVICE }} || true
             systemctl restart ${{ env.BACKEND_SERVICE }}

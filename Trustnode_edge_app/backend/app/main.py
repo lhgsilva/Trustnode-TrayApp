@@ -102,7 +102,10 @@ from app.state import (
     reports_store,
     report_scheduler,
     lite_report_poller,
+    control_plane_store,
 )
+from app.services.cp_users_puller import build_from_env as build_cp_users_puller
+import app.state as _state
 from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
 
 app = FastAPI(title="Trustnode Edge API", version="0.1.0")
@@ -258,6 +261,36 @@ async def startup_event() -> None:
     # Idle and silent when no cloud DB target is configured.
     try:
         lite_report_poller.start()
+    except Exception:
+        pass
+    # Pull portal-side cp_users changes into the local edge SQLite so an
+    # operator deactivated via the portal can't keep logging into the
+    # local edge. No-ops on the portal/VPS itself (it loops back to its
+    # own /api/cp/users — harmless but wasteful), so we skip when the
+    # cloud URL matches our own host. Skips entirely when cloud sync is
+    # disabled or no cloud URL is configured.
+    try:
+        app_settings = {}
+        if isinstance(bootstrap, dict):
+            data = bootstrap.get("data") if isinstance(bootstrap.get("data"), dict) else bootstrap
+            cand = data.get("app_settings") if isinstance(data, dict) else None
+            if isinstance(cand, dict): app_settings = cand
+        puller = build_cp_users_puller(control_plane_store, app_settings)
+        if puller is not None:
+            # Skip on the VPS itself — pointless self-loop.
+            self_loop = False
+            try:
+                cu = (app_settings.get("cloud_url") or app_settings.get("cloud_api_url") or "")
+                if "trustnode.lsapps.app" in cu and not app_settings.get("endpoint_mode", "").lower() == "local":
+                    # heuristic: if our /api/health is what cloud_url points at
+                    # (i.e. we're the VPS itself), don't bother. This is best-effort.
+                    import socket
+                    self_loop = socket.gethostname().startswith("localhost")
+            except Exception:
+                self_loop = False
+            if not self_loop:
+                puller.start()
+                _state.cp_users_puller = puller
     except Exception:
         pass
 
@@ -517,6 +550,11 @@ async def on_shutdown() -> None:
         pass
     try:
         lite_report_poller.stop()
+    except Exception:
+        pass
+    try:
+        if _state.cp_users_puller is not None:
+            _state.cp_users_puller.stop()
     except Exception:
         pass
     telemetry_service.shutdown()

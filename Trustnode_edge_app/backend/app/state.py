@@ -11,6 +11,7 @@ from app.services.reports_store import ReportsStore
 from app.services.report_renderer import render_template_to_pdf
 from app.services.report_scheduler import ReportRunner, ReportScheduler
 from app.services.lite_report_poller import LiteReportRequestPoller
+from app.services.cp_users_puller import CpUsersPuller, build_from_env as build_cp_users_puller
 from app.routers.notifications import send_email_request
 
 telemetry_service = TelemetryService()
@@ -20,6 +21,10 @@ app_store = AppStore()
 power_manager = PowerManager(app_store)
 control_plane_store = ControlPlaneStore()
 reports_store = ReportsStore()
+
+# cp_users puller is created lazily on startup (main.py) once app_settings
+# are loaded — we need the cloud URL + tenant from the bootstrap config.
+cp_users_puller: "CpUsersPuller | None" = None
 
 
 class _EmailSettingsHolder:
