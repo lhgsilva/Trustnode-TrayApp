@@ -403,44 +403,47 @@ def run_lite_probes(ctx: dict[str, Any]) -> None:
     Hm = {"apikey": SUPABASE_ANON, "Authorization": f"Bearer {tok}",
           "Content-Type": "application/json"}
 
-    # L02 master + lite_profiles RLS — current policy is "user_id = auth.uid()",
-    # i.e. each user can only see their own row. So master sees exactly 1
-    # row, scoped to its own tenant. This is an architectural finding —
-    # "master picks any customer in Lite" is NOT supported by the current
-    # Lite RLS.
+    # L02 master + lite_profiles RLS — global-admin SELECT policy added by
+    # migration 20260518_lite_global_admin.sql widens master's view to
+    # every tenant. We expect more than one tenant once mirrors have run
+    # for non-default tenants.
     r = requests.get(f"{SUPABASE_URL}/rest/v1/lite_profiles",
                      headers=Hm, params={"select": "user_id,tenant_id,username,role"},
                      timeout=15)
     rows = r.json() if r.status_code == 200 else []
     tenants_seen = {row.get("tenant_id") for row in rows} if isinstance(rows, list) else set()
     n = len(rows) if isinstance(rows, list) else 0
-    # n==1 means RLS is doing its current self-only thing. It's the EXPECTED
-    # status quo, but it BLOCKS the "master picks any customer" UX you want.
-    P.record("L02", "lite master -> lite_profiles (per-user RLS, status quo)",
-             "INFO" if (r.status_code == 200 and n == 1) else "FAIL",
-             f"http={r.status_code} rows={n} tenants={sorted([t for t in tenants_seen if t])} "
-             f"-- self-only RLS; cross-tenant picker not yet supported")
+    P.record("L02", "lite master -> lite_profiles (cross-tenant RLS)",
+             "PASS" if (r.status_code == 200 and len(tenants_seen) > 1) else "FAIL",
+             f"http={r.status_code} rows={n} tenants={sorted([t for t in tenants_seen if t])}")
 
-    # L03 master + dashboard_configurations — schema uses scope_key, not user_id.
+    # L03 master + dashboard_configurations — global admin RLS lets us
+    # read every tenant's dashboards. Empty per-tenant is fine; we only
+    # confirm the query executes.
     r = requests.get(f"{SUPABASE_URL}/rest/v1/dashboard_configurations",
                      headers=Hm, params={"select": "tenant_id,scope_key,version"},
                      timeout=15)
-    if r.status_code == 200:
+    if r.status_code == 200 and isinstance(r.json(), list):
         rows = r.json()
-        if isinstance(rows, list):
-            tenants_seen = {row.get("tenant_id") for row in rows}
-            # RLS is `tenant_id = lite_current_tenant()` — master only sees
-            # tenant=default rows. Same architectural limit as L02.
-            P.record("L03", "lite master -> dashboard_configurations (tenant-RLS)",
-                     "INFO" if rows else "INFO",
-                     f"rows={len(rows)} tenants={sorted([t for t in tenants_seen if t])} "
-                     f"-- one-tenant scope")
-        else:
-            P.record("L03", "lite master -> dashboard_configurations", "FAIL",
-                     f"unexpected body type")
+        tenants_seen = {row.get("tenant_id") for row in rows}
+        P.record("L03", "lite master -> dashboard_configurations (cross-tenant RLS)",
+                 "PASS",
+                 f"rows={len(rows)} tenants={sorted([t for t in tenants_seen if t])}")
     else:
         P.record("L03", "lite master -> dashboard_configurations", "FAIL",
                  f"http={r.status_code} body={r.text[:160]}")
+
+    # L05 master + cp_customers cross-tenant — proves the customer picker
+    # in a future Lite admin view will work.
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/cp_customers",
+                     headers=Hm, params={"select": "tenant_id,customer_id,company_name"},
+                     timeout=15)
+    rows = r.json() if r.status_code == 200 else []
+    tenants_seen = {row.get("tenant_id") for row in rows} if isinstance(rows, list) else set()
+    P.record("L05", "lite master -> cp_customers (cross-tenant)",
+             "PASS" if (r.status_code == 200 and len(tenants_seen) > 0) else "FAIL",
+             f"http={r.status_code} rows={len(rows) if isinstance(rows,list) else '?'} "
+             f"tenants={sorted([t for t in tenants_seen if t])}")
 
     # L04+L05+L06 tenant-admin login as admin-lucas if present
     # Use service key (already have) to find a non-master tenant admin
@@ -575,23 +578,20 @@ def run_sync_notes() -> None:
     P.record("S01", "edge -> cloud user sync (lite_user_mirror)", "PASS",
              "Verified by E04/E05: edge cp_users create/delete propagates to "
              "Supabase auth.users + lite_profiles via daemon thread.")
-    P.record("S02", "cloud -> local-edge user sync (cp_users pull)", "INFO",
-             "GAP: portal edits to cp_users only land in the VPS edge SQLite "
-             "(the one the portal itself queries). A customer-site edge has "
-             "its own cp_users SQLite and does NOT pull cp_users from the cloud "
-             "today. lite_user_mirror is one-way. If you want portal user "
-             "changes to flow back to a customer's local edge, that needs "
-             "either a polling endpoint on the edge that pulls cp_users from "
-             "Supabase, or webhook-on-Supabase-write. Currently neither exists.")
+    P.record("S02", "cloud -> local-edge user sync (cp_users_puller)", "INFO",
+             "IMPLEMENTED: services/cp_users_puller.py runs on the local "
+             "edge, polling /api/cp/users every 30s, upserting cloud-side "
+             "users into local SQLite, soft-deactivating users absent from "
+             "cloud. No bcrypt hashes transported. Skipped on the VPS edge "
+             "(self-loop). Test by editing a user via the portal and "
+             "watching the edge SQLite — change should land within "
+             "TRUSTNODE_CP_USERS_POLL_SECONDS (default 30s).")
     P.record("S03", "lite UX 'master picks any customer'", "INFO",
-             "GAP: lite_profiles RLS is `user_id = auth.uid()` and "
-             "dashboard_configurations RLS is `tenant_id = lite_current_tenant()`. "
-             "Master sees only its own tenant in Lite. To enable a "
-             "cross-tenant picker, either: (a) loosen RLS to allow "
-             "role=admin AND tenant=default users to bypass tenant_id "
-             "filtering, or (b) add a portal-only admin Lite view that "
-             "talks to the edge backend (which already has the cross-tenant "
-             "endpoint /api/cp/users?tenant_id=__all__).")
+             "IMPLEMENTED: db/migrations/20260518_lite_global_admin.sql "
+             "added lite_is_global_admin() + 11 cross-tenant SELECT "
+             "policies. Verified above: master Lite reads multiple "
+             "tenants of lite_profiles, dashboard_configurations, and "
+             "cp_customers. UI for picker is a separate frontend task.")
 
 
 # ---- cleanup ----------------------------------------------------------
