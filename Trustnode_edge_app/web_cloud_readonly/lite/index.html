@@ -133,6 +133,9 @@ const icEyeOpen = () => SVG([h("path", { key: 1, d: "M1 12s4-8 11-8 11 8 11 8-4 
                               h("circle", { key: 2, cx: 12, cy: 12, r: 3 })]);
 const icEyeClosed = () => SVG([h("path", { key: 1, d: "M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" }),
                                 h("line", { key: 2, x1: 1, y1: 1, x2: 23, y2: 23 })]);
+const icMenu    = () => SVG([h("line", { key: 1, x1: 3, y1: 6,  x2: 21, y2: 6  }),
+                              h("line", { key: 2, x1: 3, y1: 12, x2: 21, y2: 12 }),
+                              h("line", { key: 3, x1: 3, y1: 18, x2: 21, y2: 18 })]);
 
 // Nav icons (size 14)
 const icLive = () => SVG([h("circle", { key: 1, cx: 12, cy: 12, r: 10 }),
@@ -1305,10 +1308,18 @@ function StatusPill({ liveRows, transport }) {
   );
 }
 
-function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, transport, onJumpAlarms }) {
+function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, transport, onJumpAlarms, sidebarVisible, onToggleSidebar }) {
   const activeAlarms = useActiveAlarmCount();
   return h("header", { className: "app-header" },
     h("div", { className: "header-left" },
+      // Sidebar toggle — visible only on landscape/desktop (the bottom-
+      // tab bar takes over on portrait/mobile). Mirrors the edge app's
+      // collapse-sidebar button.
+      h("button", {
+        className: "icon-btn header-sidebar-toggle",
+        title: sidebarVisible ? "Hide menu" : "Show menu",
+        onClick: onToggleSidebar,
+      }, icMenu()),
       h("div", { className: "brand" },
         h("img", {
           src: "./trustnode_logo.png",
@@ -1507,6 +1518,18 @@ function DashboardView({ liveRows, profiles, active, activeKey, setActiveKey, pr
     return ws.filter((w) => w && !SKIPPED_TYPES.has(String(w.type || "")));
   }, [active]);
 
+  // Honour the per_row saved in the dashboard payload (1..4) — this is
+  // what the operator configured on the edge. Lite was ignoring it and
+  // always reading the local "Cards per row" preference, which made the
+  // cloud view look different from the desktop view. The user can still
+  // override locally from the settings modal; profile per_row wins on
+  // first load.
+  const profilePerRow = useMemo(() => {
+    const n = Number(active?.payload?.per_row);
+    return Number.isFinite(n) && n >= 1 && n <= 4 ? Math.round(n) : null;
+  }, [active]);
+  const effectivePerRow = profilePerRow ?? prefs.perRow;
+
   const liveByKey = useMemo(() => {
     const m = new Map();
     for (const r of liveRows) m.set(`${r.gateway_id}|${r.tag_name}`, r);
@@ -1529,7 +1552,7 @@ function DashboardView({ liveRows, profiles, active, activeKey, setActiveKey, pr
         "Configure widgets in the TrustNode desktop app and they will appear here.")
     :
       h("div", {
-        className: `widget-flow per-row-${prefs.perRow}`,
+        className: `widget-flow per-row-${effectivePerRow}`,
       },
         ...widgets.map((w) => h(Widget, {
           key: w.id || `${w.type}-${w.config?.tag_name || Math.random()}`,
@@ -2535,9 +2558,22 @@ function App() {
   const [monitor, setMonitor] = useState(null);
   const [tenantLabel, setTenantLabel] = useState(cfg?.customer_label || "");
   const [prefs, setPrefs] = useState(loadDashPrefs());
+  // Side-menu collapse state. Persisted to localStorage so the user's
+  // preference survives reloads. Defaults to visible on desktop and
+  // hidden on phones (the bottom-tab bar replaces it there anyway).
+  const [sidebarVisible, setSidebarVisible] = useState(() => {
+    try {
+      const raw = localStorage.getItem("tnlite-sidebar-visible");
+      if (raw === "true" || raw === "false") return raw === "true";
+    } catch (_) {}
+    return true;
+  });
 
   useEffect(() => { applyTheme(theme); }, [theme]);
   useEffect(() => { saveDashPrefs(prefs); }, [prefs]);
+  useEffect(() => {
+    try { localStorage.setItem("tnlite-sidebar-visible", String(!!sidebarVisible)); } catch (_) {}
+  }, [sidebarVisible]);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session || null));
@@ -2605,14 +2641,16 @@ function App() {
       h(Header, {
         user, tenantLabel, theme, onToggleTheme: toggleTheme,
         liveRows, transport,
+        sidebarVisible,
+        onToggleSidebar: () => setSidebarVisible((v) => !v),
         onJumpAlarms: () => setTab("alarms"),
         onSignOut: async () => {
           await supabase.auth.signOut().catch(() => {});
           setSession(null);
         },
       }),
-      h("div", { className: "body" },
-        h(Sidebar, { tab, setTab, user, tenantLabel }),
+      h("div", { className: `body ${sidebarVisible ? "" : "sidebar-hidden"}` },
+        sidebarVisible ? h(Sidebar, { tab, setTab, user, tenantLabel }) : null,
         h("main", null, content)
       ),
       h(BottomTabs, { tab, setTab }),

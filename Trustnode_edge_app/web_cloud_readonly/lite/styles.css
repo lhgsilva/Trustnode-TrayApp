@@ -415,6 +415,14 @@ main {
   .header-center { display: none; }
   .brand-full-logo { height: 30px; }
   .icon-btn { min-width: 36px; height: 36px; }
+  /* Hide the sidebar-toggle on phones — the bottom tab bar IS the menu
+     there, so the toggle would be redundant. */
+  .header-sidebar-toggle { display: none; }
+}
+
+/* Header sidebar-toggle button — visible on tablets-landscape + desktop. */
+.header-sidebar-toggle {
+  margin-right: 6px;
 }
 
 /* ============================================================
@@ -1307,9 +1315,27 @@ main {
   margin-bottom: 18px;
   align-items: stretch;
 }
+/* Mirror the edge dashboard's "Cards per row" setting (1..4). Lite was
+   capped at 2 — operators who configured a 3- or 4-column layout on the
+   edge saw it forced to 2 in the cloud view. */
 .widget-flow.per-row-1 { grid-template-columns: 1fr; }
+.widget-flow.per-row-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.widget-flow.per-row-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.widget-flow.per-row-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+/* Phones (portrait + small tablets in portrait) always stack to a single
+   column — there isn't room for the configured grid. Tablet-landscape
+   keeps the desktop layout intact (handled implicitly because the
+   max-width: 720px breakpoint won't match landscape iPads, which are
+   1024+px wide). */
 @media (max-width: 720px) {
-  .widget-flow { grid-template-columns: 1fr; }
+  .widget-flow,
+  .widget-flow.per-row-1,
+  .widget-flow.per-row-2,
+  .widget-flow.per-row-3,
+  .widget-flow.per-row-4 {
+    grid-template-columns: 1fr;
+  }
 }
 .widget-flow > .widget {
   /* No forced row height — each widget claims its natural size. */
@@ -1805,8 +1831,11 @@ select.hist-filter-input { padding-right: 24px; }
 
 /* ============================================================ */
 /* Mobile responsive — Historian table + filter row              */
+/* The same breakpoint (720px) that switches the shell to bottom */
+/* tabs also collapses the historian to a one-row-per-record     */
+/* list. Tablet landscape (1024+ wide) keeps the desktop table.  */
 /* ============================================================ */
-@media (max-width: 600px) {
+@media (max-width: 720px) {
   /* Filter row: each control takes a sensible width and wraps */
   .hist-filters {
     gap: 6px;
