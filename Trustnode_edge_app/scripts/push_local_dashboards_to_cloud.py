@@ -57,10 +57,12 @@ def main() -> int:
         sslmode=env.get("TRUSTNODE_CLOUD_DB_SSLMODE") or "require",
         connect_timeout=15,
     )
-    # Both domains live in mirror tables with the same shape:
+    # Every Lite-readable domain lives in a mirror table with the same shape:
     # (tenant_id, scope_key, payload_json, version, updated_utc).
-    # Lite reads both, so we sync both in one pass.
-    DOMAINS = ("dashboard_configurations", "alarms_setup")
+    # The edge mirrors these via _mirror_config_doc_to_cloud, a daemon
+    # thread that silently drops writes; until that's hardened, we
+    # explicitly re-push every domain Lite cares about.
+    DOMAINS = ("dashboard_configurations", "alarms_setup", "triggers_limits")
     total_pushed = 0
     try:
         for domain in DOMAINS:

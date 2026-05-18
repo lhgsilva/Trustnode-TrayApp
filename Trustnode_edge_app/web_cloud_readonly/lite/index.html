@@ -438,7 +438,18 @@ function ensureHistorianChannel() {
 // borders. Bottom: room for x-axis labels. Left: room for the y-axis
 // tick numbers (we use width:38 on the YAxis itself but margins help
 // when the body resizes small).
+// Default chart margins. Mobile values (≤600px viewport) are tighter so
+// the actual plot area gets most of the card; otherwise on a phone the
+// axis labels eat half the widget. Recharts re-measures whenever the
+// container resizes, so the chart picks the right margin automatically
+// when the viewport rotates.
+const isMobileViewport = () =>
+  typeof window !== "undefined" && window.matchMedia && window.matchMedia("(max-width: 600px)").matches;
 const chartMargin = { top: 10, right: 16, left: 8, bottom: 18 };
+const chartMarginMobile = { top: 4, right: 4, left: 0, bottom: 4 };
+function getChartMargin() {
+  return isMobileViewport() ? chartMarginMobile : chartMargin;
+}
 const chartTooltipProps = {
   contentStyle: {
     background: "var(--card, #171717)",
@@ -451,6 +462,7 @@ const chartTooltipProps = {
   itemStyle: { color: "var(--text, #f2f4f7)" },
 };
 function buildXAxisProps(series) {
+  const mobile = isMobileViewport();
   return {
     dataKey: "idx",
     tickFormatter: (v) => {
@@ -459,8 +471,11 @@ function buildXAxisProps(series) {
       try { return new Date(p.ts).toLocaleTimeString().slice(0, 5); } catch { return ""; }
     },
     stroke: "var(--soft, #8a98ab)",
-    tick: { fill: "var(--soft, #8a98ab)", fontSize: 10 },
-    minTickGap: 28,
+    tick: { fill: "var(--soft, #8a98ab)", fontSize: mobile ? 9 : 10 },
+    // Wider tick gap on mobile so labels don't overlap when the plot
+    // shrinks. Keeps the axis readable at single-column phone widths.
+    minTickGap: mobile ? 40 : 28,
+    height: mobile ? 18 : undefined,
     axisLine: { stroke: "var(--line, rgba(138,152,171,0.25))" },
     tickLine: { stroke: "var(--line, rgba(138,152,171,0.25))" },
   };
@@ -479,6 +494,9 @@ const fmtTick = (v) => {
   return (Math.round(n * 100) / 100).toString();
 };
 
+// YAxis tick + width responsive to viewport. On phones the default
+// width:48 + fontSize:10 gives away ~25% of a small card's width to
+// labels; shrink both so the actual plot has room.
 const yAxisProps = {
   stroke: "var(--soft, #8a98ab)",
   tick: { fill: "var(--soft, #8a98ab)", fontSize: 10 },
@@ -487,15 +505,22 @@ const yAxisProps = {
   axisLine: { stroke: "var(--line, rgba(138,152,171,0.25))" },
   tickLine: { stroke: "var(--line, rgba(138,152,171,0.25))" },
 };
+const yAxisPropsMobile = {
+  ...yAxisProps,
+  tick: { fill: "var(--soft, #8a98ab)", fontSize: 9 },
+  width: 30,
+};
+const getYAxisBase = () => isMobileViewport() ? yAxisPropsMobile : yAxisProps;
 
 // `domain` for `<YAxis>` — when autoFit is true we hug the data with a 5%
 // pad above the max (so the peak isn't clipped by the chart frame) and 2%
 // below the min. When off, fall back to Recharts default padded auto.
 function buildYAxisProps(autoFit) {
   const pad = (n) => (Number.isFinite(n) ? n : 0);
+  const base = getYAxisBase();
   if (autoFit) {
     return {
-      ...yAxisProps,
+      ...base,
       // Generous top pad so the peak (e.g. a bar top) is fully visible.
       domain: [
         (dataMin) => pad(dataMin) - Math.abs(pad(dataMin)) * 0.02 - 0.001,
@@ -504,7 +529,7 @@ function buildYAxisProps(autoFit) {
       allowDataOverflow: false,
     };
   }
-  return yAxisProps;
+  return base;
 }
 
 // Resolve the full series list for a chart widget: primary + every
@@ -732,7 +757,7 @@ function ChartWidget({ widget }) {
   // Pick the right Recharts root for the primary chart type, then overlay
   // each series as a Line/Area/Bar child within it.
   return h(ResponsiveContainer, { width: "100%", height: "100%" },
-    h(buildChartRoot(widgetType, seriesDefs.length), { data: merged, margin: chartMargin },
+    h(buildChartRoot(widgetType, seriesDefs.length), { data: merged, margin: getChartMargin() },
       h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
       h(XAxis, buildXAxisProps(merged)),
       h(YAxis, { ...yProps, yAxisId: "left" }),
@@ -1359,7 +1384,7 @@ function TagMonitor({ open, payload, onClose }) {
         (data.length === 0 || seriesDefs.length === 0)
           ? h("div", { className: "empty" }, "No samples in this range.")
           : h(ResponsiveContainer, { width: "100%", height: "100%" },
-              h(buildChartRoot(widgetType, seriesDefs.length), { data, margin: { top: 12, right: 16, left: 8, bottom: 4 } },
+              h(buildChartRoot(widgetType, seriesDefs.length), { data, margin: getChartMargin() },
                 h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
                 h(XAxis, buildXAxisProps(data)),
                 h(YAxis, { ...monYProps, yAxisId: "left" }),
@@ -2123,19 +2148,32 @@ function AlarmRulesView({ liveRows }) {
   useEffect(() => {
     let stop = false;
     const f = async () => {
+      // Same shape as useAlarmEvents: union across every scoped row
+      // so we don't miss rules just because the most-recently-touched
+      // row was an empty user-scope one.
       const { data, error: e } = await applyTenantScope(
         supabase
           .from("triggers_limits")
-          .select("payload_json, version, updated_utc, tenant_id"),
+          .select("scope_key, payload_json, version, updated_utc, tenant_id"),
         pickedTenantId,
       )
         .order("updated_utc", { ascending: false })
-        .limit(1);
+        .limit(20);
       if (stop) return;
       if (e) { setError(e.message); return; }
-      const row = data && data[0];
-      const list = Array.isArray(row?.payload_json?.trigger_rules) ? row.payload_json.trigger_rules : [];
-      setRules(list);
+      const seen = new Set();
+      const merged = [];
+      for (const row of (data || [])) {
+        const list = Array.isArray(row?.payload_json?.trigger_rules) ? row.payload_json.trigger_rules : [];
+        for (const r of list) {
+          if (!r || typeof r !== "object") continue;
+          const k = String(r.id || `${r.gateway_id || ""}|${r.tag_name || ""}|${r.condition || ""}`);
+          if (seen.has(k)) continue;
+          seen.add(k);
+          merged.push(r);
+        }
+      }
+      setRules(merged);
       setError("");
     };
     f();

@@ -1082,7 +1082,7 @@ main {
   background: var(--card);
   border: 1px solid var(--stroke);
   border-radius: var(--radius-lg);
-  padding: 10px 12px;
+  padding: 8px 10px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -1094,7 +1094,7 @@ main {
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  margin-bottom: 4px;
+  margin-bottom: 2px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1104,6 +1104,19 @@ main {
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+/* Tighter on phones — the user reported too much dead space between
+   the card edge and the chart. Drop padding to nearly zero around the
+   chart area, shrink the title row, and ask Recharts to use smaller
+   axis tick fonts (the media query for .recharts-text below does the
+   actual font shrink). */
+@media (max-width: 600px) {
+  .widget { padding: 4px 6px; }
+  .widget-title { font-size: 10px; margin-bottom: 1px; }
+  /* Cards in the grid still need some breathing room between each
+     other but inner whitespace is minimal. */
+  .widget-grid { gap: 6px; }
+  .widget-flow { gap: 6px; }
 }
 .widget-text {
   font-size: 13px;
@@ -1381,6 +1394,36 @@ main {
 .widget.widget-divider,
 .widget.widget-image {
   min-height: 90px;
+}
+
+/* On phones, shrink Recharts tick labels so axis numbers don't dwarf
+   the tiny plot area. Recharts emits `<text class="recharts-text">`
+   for every axis label, legend, etc. — overriding font-size in CSS
+   wins over the inline default Recharts ships (12px / 14px). The
+   `font` attribute on the SVG also needs overriding because Recharts
+   sometimes sets it inline. */
+@media (max-width: 600px) {
+  .widget .recharts-text,
+  .widget .recharts-cartesian-axis-tick text,
+  .widget .recharts-legend-item-text {
+    font-size: 9px;
+  }
+  /* Cartesian axis label sizes are also configured via Recharts'
+     props; this scales down anything that slipped through. */
+  .widget .recharts-cartesian-axis-tick {
+    font-size: 9px;
+  }
+  /* The legend (e.g. multi-series chart) eats vertical space; tighten. */
+  .widget .recharts-legend-wrapper {
+    padding-top: 2px !important;
+  }
+  /* Chart heights on mobile — slightly shorter is OK since the user
+     is on a single column anyway. The minimum stays usable. */
+  .widget.widget-line_chart,
+  .widget.widget-line_area_chart,
+  .widget.widget-bar_chart { min-height: 180px; }
+  .widget.widget-meter_chart,
+  .widget.widget-pie_chart { min-height: 200px; }
 }
 
 /* Offline overlay over a chart whose gateway hasn't reported in 30s. */

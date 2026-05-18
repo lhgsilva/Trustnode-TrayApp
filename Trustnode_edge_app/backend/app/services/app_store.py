@@ -11,7 +11,7 @@ import math
 from urllib.parse import quote_plus
 from datetime import timedelta
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 from app.tenant import get_current_tenant, normalize_tenant_id
 
@@ -1292,6 +1292,7 @@ class AppStore:
     def _config_sync_loop(self) -> None:
         next_config_pull_mono = 0.0
         next_bulk_sync_mono = 0.0
+        next_mirror_reconcile_mono = 0.0
         while not self._stop_event.is_set():
             try:
                 if self._is_cloud_auto_sync_enabled():
@@ -1307,10 +1308,121 @@ class AppStore:
                     if not self._disable_config_push:
                         self._flush_config_outbox_once()
                     next_config_pull_mono = now_mono + float(self._config_pull_interval_seconds)
+                # Reconcile Lite-readable mirror tables (alarms_setup,
+                # triggers_limits, dashboard_configurations). The per-save
+                # daemon-thread mirror occasionally drops writes; this
+                # idempotent catch-up compares local vs cloud version and
+                # re-pushes anything stale. Cheap when nothing has changed
+                # (one SELECT per domain).
+                if self._is_cloud_auto_sync_enabled() and now_mono >= next_mirror_reconcile_mono:
+                    try:
+                        self._reconcile_lite_mirror_tables_once()
+                    except Exception:
+                        # Reconciler is best-effort; never poison the loop.
+                        pass
+                    next_mirror_reconcile_mono = now_mono + 5.0  # every 5s
             except Exception as exc:
                 self._upsert_sync_target_state(enabled=True, config={}, last_error=f"Config sync loop error: {exc}")
             self._sync_wakeup_event.wait(timeout=self._sync_interval_seconds)
             self._sync_wakeup_event.clear()
+
+    def _reconcile_lite_mirror_tables_once(self) -> None:
+        """Catch-up reconciliation between local config_documents_scoped
+        and the cloud mirror tables Lite reads from. Fixes the gap where
+        _mirror_config_doc_to_cloud's daemon thread silently dropped a
+        write — without this, an operator clearing alarms on the edge
+        would see Lite stuck on the old list until the next bootstrap
+        save accidentally re-mirrored it.
+
+        Idempotent: if cloud version >= local version we skip. If a
+        domain isn't represented in the cloud mirror table at all we
+        upsert it. Runs ~every 5s from the config sync loop."""
+        cloud = self._get_cloud_database_target()
+        if not cloud:
+            return
+        domains = ("alarms_setup", "triggers_limits", "dashboard_configurations")
+        # Pull local rows for all three in one trip
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT scope_key, domain, payload_json, version, updated_utc "
+                    "FROM config_documents_scoped WHERE domain IN (?, ?, ?)",
+                    domains,
+                ).fetchall()
+        if not rows:
+            return
+        try:
+            from sqlalchemy import text  # type: ignore
+        except Exception:
+            return
+        schema = str(cloud.get("schema") or "public")
+        try:
+            engine, _ = self._get_or_create_cloud_engine(cloud, schema)
+        except Exception:
+            return
+        # Group by domain so we can do one SELECT per domain to discover
+        # the cloud versions, then upsert what's stale.
+        local_by_domain: Dict[str, List[Tuple[str, str, int, str]]] = {}
+        for r in rows:
+            scope_key = str(r["scope_key"] or "")
+            domain = str(r["domain"] or "")
+            payload = str(r["payload_json"] or "")
+            version = int(r["version"] or 0)
+            updated = str(r["updated_utc"] or "")
+            local_by_domain.setdefault(domain, []).append((scope_key, payload, version, updated))
+        try:
+            with engine.connect() as conn:
+                for domain, entries in local_by_domain.items():
+                    scope_keys = [e[0] for e in entries]
+                    if not scope_keys:
+                        continue
+                    placeholders = ",".join([f":k{i}" for i in range(len(scope_keys))])
+                    params = {f"k{i}": k for i, k in enumerate(scope_keys)}
+                    cloud_versions: Dict[str, int] = {}
+                    try:
+                        result = conn.execute(
+                            text(
+                                f'SELECT scope_key, version FROM "{schema}"."{domain}" '
+                                f"WHERE scope_key IN ({placeholders})"
+                            ),
+                            params,
+                        )
+                        for row in result:
+                            cloud_versions[str(row[0] or "")] = int(row[1] or 0)
+                    except Exception:
+                        # Table missing or permission error — skip this domain.
+                        continue
+                    for scope_key, payload, version, updated in entries:
+                        if cloud_versions.get(scope_key, 0) >= version:
+                            continue
+                        tenant_from_scope = (scope_key.split("|") or ["default"])[0] or "default"
+                        try:
+                            with engine.begin() as wconn:
+                                wconn.execute(
+                                    text(
+                                        f"""
+                                        INSERT INTO "{schema}"."{domain}"
+                                          (tenant_id, scope_key, payload_json, version, updated_utc)
+                                        VALUES (:tenant_id, :scope_key, :payload_json::jsonb, :version, :updated_utc)
+                                        ON CONFLICT (tenant_id, scope_key) DO UPDATE SET
+                                          payload_json = EXCLUDED.payload_json,
+                                          version      = EXCLUDED.version,
+                                          updated_utc  = EXCLUDED.updated_utc
+                                        """
+                                    ),
+                                    dict(
+                                        tenant_id=tenant_from_scope,
+                                        scope_key=scope_key,
+                                        payload_json=payload,
+                                        version=version,
+                                        updated_utc=updated,
+                                    ),
+                                )
+                        except Exception:
+                            # Don't let one bad row block the others.
+                            continue
+        except Exception:
+            return
 
     def _live_sync_loop(self) -> None:
         while not self._stop_event.is_set():
