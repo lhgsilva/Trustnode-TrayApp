@@ -588,48 +588,127 @@ def _discover_ab_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
                 except Exception:
                     pass
 
-                def _fmt_ab_tag_name(tag: dict) -> str:
+                # Cap how many indexed elements we enumerate per array
+                # so a REAL[10000] data buffer doesn't drown the picker.
+                # The user can always type a higher index by hand if they
+                # really need element 1000 of a 1000-element array.
+                ARRAY_ELEMENT_CAP = 256
+
+                def _base_name(tag: dict) -> str:
                     name = str(tag.get("tag_name") or tag.get("name") or tag.get("symbol_name") or "").strip()
                     if not name:
                         return ""
                     program = str(tag.get("program_name") or tag.get("program") or "").strip()
-                    # Keep program-scoped tags explicit if metadata gives program name.
                     if program and not name.startswith("Program:"):
                         if "." not in name:
                             name = f"Program:{program}.{name}"
                         else:
                             name = f"Program:{program}.{name.split('.')[-1]}"
-
-                    dims = tag.get("dimensions") or tag.get("dim") or []
-                    if isinstance(dims, (list, tuple)):
-                        arr_dims = [int(d) for d in dims if isinstance(d, (int, float)) and int(d) > 0]
-                        if arr_dims and "[" not in name:
-                            name = f"{name}{''.join([f'[{d}]' for d in arr_dims])}"
                     return name
 
+                def _array_dims(tag: dict) -> list[int]:
+                    raw = tag.get("dimensions") or tag.get("dim") or []
+                    if not isinstance(raw, (list, tuple)):
+                        return []
+                    return [int(d) for d in raw if isinstance(d, (int, float)) and int(d) > 0]
+
+                def _enumerate_indexed_names(base: str, dims: list[int]) -> list[str]:
+                    """SimREAL with dims=[10] -> SimREAL[0]..SimREAL[9].
+                    MyTag with dims=[3,4] -> MyTag[0,0]..MyTag[2,3] (12 entries).
+                    Capped at ARRAY_ELEMENT_CAP total elements per tag."""
+                    if not dims:
+                        return [base]
+                    out: list[str] = []
+                    # Walk the cartesian product of all dimensions.
+                    import itertools
+                    ranges = [range(min(d, ARRAY_ELEMENT_CAP)) for d in dims]
+                    for combo in itertools.product(*ranges):
+                        out.append(f"{base}[{','.join(str(i) for i in combo)}]")
+                        if len(out) >= ARRAY_ELEMENT_CAP:
+                            break
+                    return out
+
+                # Build the candidate list: scalars stay as-is, arrays are
+                # expanded into [0]..[N-1] indices.
                 seen: set[str] = set()
-                names: list[str] = []
+                candidates: list[str] = []
                 for td in tag_defs:
                     if not isinstance(td, dict):
                         continue
-                    formatted = _fmt_ab_tag_name(td)
-                    if not formatted or formatted in seen:
+                    base = _base_name(td)
+                    if not base:
                         continue
-                    seen.add(formatted)
-                    names.append(formatted)
-                    if len(names) >= max_tags:
+                    # If the base name already carries a subscript (rare —
+                    # the discovery sources sometimes do this), keep it as-is.
+                    if "[" in base:
+                        if base not in seen:
+                            seen.add(base); candidates.append(base)
+                        continue
+                    dims = _array_dims(td)
+                    for nm in _enumerate_indexed_names(base, dims):
+                        if nm in seen:
+                            continue
+                        seen.add(nm); candidates.append(nm)
+                        if len(candidates) >= max_tags:
+                            break
+                    if len(candidates) >= max_tags:
                         break
-                if names:
-                    array_count = sum(1 for n in names if "[" in n and "]" in n)
+
+                if not candidates:
                     return TagDiscoveryResult(
-                        ok=True,
-                        tags=names,
-                        message=f"Discovered {len(names)} AB tags from {path} (arrays detected: {array_count})",
+                        ok=False,
+                        tags=[],
+                        message=f"No browseable AB tags found at {path}. Check External Access and controller browse permissions.",
                     )
+
+                # Probe-read every candidate so only tags that the PLC
+                # actually accepts are offered. Program-scoped names are
+                # exempt because pycomm3 returns them in plc.tags only
+                # when init_program_tags=True (which we did) — those are
+                # already vetted. We probe in chunks because pycomm3
+                # accepts a large batch but a single huge call can stall.
+                CHUNK = 64
+                good: list[str] = []
+                bad_count = 0
+                for i in range(0, len(candidates), CHUNK):
+                    chunk = candidates[i:i + CHUNK]
+                    try:
+                        results = plc.read(*chunk)
+                    except Exception:
+                        # If a chunk fails wholesale, fall back to single-
+                        # tag reads so one poison tag doesn't blacklist
+                        # everything else in the chunk.
+                        results = []
+                        for nm in chunk:
+                            try:
+                                r = plc.read(nm)
+                                results.append(r)
+                            except Exception as inner:
+                                # synthesize a result-like object with an
+                                # error so it gets filtered below.
+                                class _Bad:
+                                    error = str(inner) or "read failed"
+                                    value = None
+                                results.append(_Bad())
+                    if not isinstance(results, list):
+                        results = [results]
+                    for nm, res in zip(chunk, results):
+                        err = getattr(res, "error", None)
+                        if err:
+                            bad_count += 1
+                            continue
+                        good.append(nm)
+
+                if good:
+                    array_count = sum(1 for n in good if "[" in n and "]" in n)
+                    msg = f"Discovered {len(good)} valid AB tags from {path} (arrays expanded: {array_count})"
+                    if bad_count:
+                        msg += f"; filtered {bad_count} unreadable tag(s)"
+                    return TagDiscoveryResult(ok=True, tags=good, message=msg)
                 return TagDiscoveryResult(
                     ok=False,
                     tags=[],
-                    message=f"No browseable AB tags found at {path}. Check External Access and controller browse permissions.",
+                    message=f"Every tag at {path} failed probe-read; check External Access on the controller.",
                 )
         except Exception as exc:  # pragma: no cover - runtime/device dependent
             last_err = str(exc)
