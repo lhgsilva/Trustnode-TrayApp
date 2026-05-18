@@ -292,15 +292,32 @@ function useDashboardProfiles(enabled = true) {
         pickedTenantId,
       )
         .order("updated_utc", { ascending: false })
-        .limit(20);
+        .limit(50);
       if (stopped) return;
       if (e) { setError(e.message); return; }
       setError("");
-      const profs = (data || []).map((r) => ({
+      // Build a clean profile list:
+      //   * drop the legacy unscoped empty row (scope_key = '') — every
+      //     install has one as a bootstrap leftover with zero widgets,
+      //     and it confuses operators who saved several real dashboards.
+      //   * drop rows with zero widgets unless they're the only choice
+      //     (an empty dashboard is rarely what the user wants to see).
+      //   * dedupe by scope_key just in case the realtime channel
+      //     delivers duplicates.
+      const seen = new Set();
+      const raw = (data || []).map((r) => ({
         key: r.scope_key || "",
         label: profileLabel(r.scope_key || ""),
         payload: r.payload_json || {},
-      }));
+        widgetCount: Array.isArray(r.payload_json?.widgets) ? r.payload_json.widgets.length : 0,
+        tenant_id: r.tenant_id || "",
+      })).filter((p) => {
+        if (seen.has(p.key)) return false;
+        seen.add(p.key);
+        return true;
+      });
+      const withWidgets = raw.filter((p) => p.widgetCount > 0);
+      const profs = withWidgets.length ? withWidgets : raw;
       setProfiles(profs);
     };
     load();
@@ -1619,12 +1636,20 @@ function DashboardSettingsModal({ open, onClose, profiles, activeKey, setActiveK
               )
             )
           : null,
-        profiles.length > 1 ? h("div", { className: "settings-row" },
+        // Show the profile picker whenever profiles exist — operators
+        // with only one profile still want to confirm WHICH one is
+        // selected (and to see when more get added). Hidden only when
+        // the list is genuinely empty.
+        profiles.length > 0 ? h("div", { className: "settings-row" },
           h("label", null, "Profile"),
           h("select", {
             value: activeKey,
             onChange: (e) => setActiveKey(e.target.value),
-          }, ...profiles.map((p) => h("option", { key: p.key, value: p.key }, p.label)))
+            style: { minWidth: 220 },
+          }, ...profiles.map((p) => h("option", { key: p.key, value: p.key },
+            // Show "name (N widgets)" so the operator can spot the
+            // dashboard they actually want without opening each one.
+            `${p.label}${Number.isFinite(p.widgetCount) ? ` (${p.widgetCount} widget${p.widgetCount === 1 ? "" : "s"})` : ""}`)))
         ) : null,
         h("div", { className: "settings-row" },
           h("label", null, "Cards per row"),
@@ -2565,11 +2590,18 @@ function GeneratedReportsView() {
 }
 
 function PdfPreviewModal({ url, onClose }) {
-  return h("div", { className: "monitor-back", onClick: onClose },
+  // Extra `pdf-preview-back` class on the backdrop so CSS can drop the
+  // centring padding on mobile WITHOUT relying on :has() (Android
+  // WebView <12 and old Samsung Internet don't support it).
+  return h("div", { className: "monitor-back pdf-preview-back", onClick: onClose },
     h("div", { className: "monitor pdf-preview", onClick: (e) => e.stopPropagation() },
       h("div", { className: "monitor-head" },
         h("h3", null, "Report preview"),
-        h("button", { className: "close", onClick: onClose }, "Close")
+        h("button", {
+          className: "close",
+          onClick: onClose,
+          "aria-label": "Close preview",
+        }, "Close")
       ),
       h("iframe", { className: "pdf-frame", src: url, title: "PDF preview" })
     )
