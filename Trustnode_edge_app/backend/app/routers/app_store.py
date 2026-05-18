@@ -60,6 +60,10 @@ _SHARED_EDGE_DOMAINS = frozenset({
     # reads unscoped only) and breaks both 'admin creates user, user
     # logs in' AND 'activation creates admin, admin logs in'.
     "users_access",
+    # Dashboards are also shared per user's explicit requirement: every
+    # operator on the edge should see the same dashboards/charts; finer
+    # personalisation (last-selected profile) lives in app_settings.
+    "dashboard_configurations",
 })
 
 
