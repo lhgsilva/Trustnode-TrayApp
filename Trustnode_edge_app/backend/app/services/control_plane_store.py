@@ -424,13 +424,39 @@ class ControlPlaneStore:
 
     def get_customer_tenant_id(self, *, customer_id: str) -> str:
         """Return the tenant_id currently associated with a customer_id,
-        or '' if no such customer exists. Used by the per-customer
-        tenant resolver in control_plane.py to honour whatever slug
-        each customer was created with (existing data uses 'customer_a'
-        style; new customers get 'tenant-<id>')."""
+        or '' if no such customer exists.
+
+        The canonical store for customers is the cloud Supabase
+        `public.cp_customers` table (the portal writes there directly).
+        The local SQLite is only populated by edge activations, so it's
+        mostly empty on the cloud backend. We try cloud first, then
+        fall back to local — that way the portal-managed customer set
+        wins over any stale local cache.
+        """
         cid = str(customer_id or "").strip()
         if not cid:
             return ""
+
+        # ---- 1. Try cloud Supabase first (canonical) ----
+        try:
+            from app.state import app_store as _app_store  # local import to avoid circular at module load
+            cloud = _app_store._get_cloud_database_target()  # type: ignore[attr-defined]
+            if cloud:
+                from sqlalchemy import text  # type: ignore
+                schema = str(cloud.get("schema") or "public")
+                engine, _key = _app_store._get_or_create_cloud_engine(cloud, schema)  # type: ignore[attr-defined]
+                with engine.connect() as conn:
+                    row = conn.execute(
+                        text(f"SELECT tenant_id FROM \"{schema}\".cp_customers WHERE customer_id = :cid LIMIT 1"),
+                        {"cid": cid},
+                    ).fetchone()
+                if row and row[0]:
+                    return str(row[0])
+        except Exception:
+            # Cloud unreachable / not configured — fall through to local.
+            pass
+
+        # ---- 2. Fall back to local SQLite ----
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute(
