@@ -112,6 +112,11 @@ class GatewayWorker:
         self._last_partial_error: str = ""
         self._opc_resolve_cache_key = ""
         self._opc_resolved_targets: list[tuple[str, str]] = []
+        # Persistent OPC-UA client. The previous behaviour was to
+        # Client.connect()+disconnect() on every poll, costing 6 round-
+        # trips per cycle. Now we cache the session like the AB driver.
+        self._opc_client = None
+        self._opc_endpoint: str = ""
         self._telemetry_runtime_refresh_monotonic = 0.0
 
     def set_config(self, config: GatewayConfig) -> None:
@@ -830,7 +835,7 @@ class GatewayWorker:
 
     def _read_from_opcua(self) -> List[GatewayReading]:
         try:
-            from opcua import Client  # type: ignore
+            from opcua import Client  # noqa: F401  imported for clear error message  # type: ignore
         except Exception as exc:
             raise RuntimeError(f"OPC-UA client not installed: {exc}") from exc
 
@@ -841,9 +846,18 @@ class GatewayWorker:
 
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         out: List[GatewayReading] = []
-        client = Client(endpoint, timeout=4.0)
+
+        # Persistent session: connect once, reuse across polls. Reconnect
+        # only on failure. Mirrors the AB pycomm3 driver pattern.
         try:
-            client.connect()
+            client = self._ensure_opc_client(endpoint)
+        except Exception as exc:
+            self._close_opc_client()
+            raise RuntimeError(f"OPC-UA connect failed for {endpoint}: {exc}") from exc
+
+        try:
+            # Resolve once per (endpoint, tag-set). Cached across polls so
+            # the per-tag node lookup doesn't happen every second.
             cache_key = f"{endpoint}|{'|'.join(requested_ids)}"
             resolved_targets: list[tuple[str, str]]
             unresolved_items: list[str] = []
@@ -870,15 +884,73 @@ class GatewayWorker:
                 )
             if not resolved_targets:
                 raise RuntimeError("OPC-UA read failed: no variable nodes resolved from configured tags.")
-            for requested_tag, node_id in resolved_targets:
+
+            # Batch read: one OPC-UA Read request for ALL nodes instead of
+            # one round-trip per tag. With 2 tags this saves ~20ms; with
+            # 50 tags it saves ~1 second per cycle.
+            nodes = [client.get_node(node_id) for _, node_id in resolved_targets]
+            data_values: list = []
+            tag_errors: list[str] = []
+            try:
+                # The python-opcua API:
+                #   Client.get_values(nodes)        -> list[Any]  (values only)
+                #   ua_client.get_attributes(...)   -> data_values with StatusCode
+                # We need StatusCode for quality, so prefer per-node
+                # get_data_value() but in a single batched server call.
+                # python-opcua's Node.get_data_value() under the hood
+                # round-trips one Read; for true batching we use the
+                # internal read helper.
+                from opcua import ua  # type: ignore
+                params = ua.ReadParameters()
+                for node in nodes:
+                    rv = ua.ReadValueId()
+                    rv.NodeId = node.nodeid
+                    rv.AttributeId = ua.AttributeIds.Value
+                    params.NodesToRead.append(rv)
+                result = client.uaclient.read(params)
+                data_values = list(result) if result else []
+            except Exception as exc:
+                # Server doesn't accept batch read, or we hit a transient
+                # protocol error. Fall back to per-node reads — slower
+                # but never worse than the old code path. If THIS fails
+                # too we'll catch it below and trigger a reconnect.
+                data_values = []
+                for node in nodes:
+                    try:
+                        data_values.append(node.get_data_value())
+                    except Exception as inner:
+                        tag_errors.append(f"{node.nodeid}: {inner}")
+                        data_values.append(None)
+                if tag_errors and not any(dv for dv in data_values):
+                    # Wholesale failure → reconnect on next cycle.
+                    self._close_opc_client()
+                    raise RuntimeError(
+                        f"OPC-UA batch read failed and per-node fallback also failed: {exc}; "
+                        + "; ".join(tag_errors[:3])
+                    ) from exc
+
+            for (requested_tag, _node_id), data_value in zip(resolved_targets, data_values):
+                if data_value is None:
+                    out.append(
+                        GatewayReading(
+                            ts_utc=ts,
+                            tag_name=requested_tag,
+                            value=0.0,
+                            quality=0,
+                            quality_label="BAD",
+                            source=self.config.gateway_type,
+                            site=self.config.site,
+                            area=self.config.area,
+                            equipment=self.config.equipment,
+                        )
+                    )
+                    continue
                 try:
-                    node = client.get_node(node_id)
-                    data_value = node.get_data_value()
                     value = data_value.Value.Value
-                    status_name = str(data_value.StatusCode.name) if data_value and data_value.StatusCode else ""
+                    status_name = str(data_value.StatusCode.name) if data_value.StatusCode else ""
                     quality, quality_label = self._normalize_quality(
                         self.config.gateway_type,
-                        raw_status=status_name
+                        raw_status=status_name,
                     )
                     if value is None:
                         num_val, txt_val = 0.0, None
@@ -901,12 +973,14 @@ class GatewayWorker:
                             equipment=self.config.equipment,
                         )
                     )
-                except Exception:
+                except Exception as exc:
+                    tag_errors.append(f"{requested_tag}: {exc}")
                     out.append(
                         GatewayReading(
                             ts_utc=ts,
                             tag_name=requested_tag,
                             value=0.0,
+                            value_text=str(exc),
                             quality=0,
                             quality_label="BAD",
                             source=self.config.gateway_type,
@@ -915,14 +989,25 @@ class GatewayWorker:
                             equipment=self.config.equipment,
                         )
                     )
-            if not out:
-                raise RuntimeError("No OPC-UA nodes returned readings.")
+            # Surface per-tag failures the same way the AB path does. Do
+            # NOT raise — keep the GOOD readings flowing.
+            good_count = sum(1 for r in out if r.quality >= 192)
+            if good_count == 0:
+                # Every tag failed → close the session so next cycle
+                # reconnects cleanly.
+                self._close_opc_client()
+                raise RuntimeError(
+                    "Every OPC-UA tag failed: " + "; ".join(tag_errors[:6])
+                )
+            self._last_partial_error = (
+                f"{len(tag_errors)} bad OPC-UA tag(s): " + "; ".join(tag_errors[:4])
+            ) if tag_errors else ""
             return out
-        finally:
-            try:
-                client.disconnect()
-            except Exception:
-                pass
+        except Exception:
+            # Any exception that escapes here means the session might be
+            # in a bad state. Drop it; next cycle will reconnect.
+            self._close_opc_client()
+            raise
 
     def _normalize_quality(self, gateway_type: str, raw_quality: Any = None, raw_status: Any = None) -> tuple[int, str]:
         gt = (gateway_type or "").strip().lower()
@@ -1032,6 +1117,32 @@ class GatewayWorker:
     def _dispose_gateway_clients(self) -> None:
         self._close_ab_pycomm3_client()
         self._close_ab_pylogix_client()
+        self._close_opc_client()
+
+    def _ensure_opc_client(self, endpoint: str):
+        """Connect (or return the cached session) for an OPC-UA endpoint.
+        Mirrors `_ensure_ab_pycomm3_client`: the worker keeps the session
+        alive across polls so each cycle pays one round-trip (the read),
+        not six (connect + Hello + CreateSession + ActivateSession +
+        Close + TCP teardown). Reconnect on any cycle that throws."""
+        from opcua import Client  # type: ignore
+        if self._opc_client is not None and self._opc_endpoint == endpoint:
+            return self._opc_client
+        self._close_opc_client()
+        client = Client(endpoint, timeout=4.0)
+        client.connect()
+        self._opc_client = client
+        self._opc_endpoint = endpoint
+        return client
+
+    def _close_opc_client(self) -> None:
+        if self._opc_client is not None:
+            try:
+                self._opc_client.disconnect()
+            except Exception:
+                pass
+        self._opc_client = None
+        self._opc_endpoint = ""
 
     def _sqlite_url_from_path(self, sqlite_path: str) -> str:
         path_norm = (sqlite_path or "").strip()
