@@ -31,7 +31,7 @@
     <div class="empty" style="margin-top: 30vh"><div class="spinner"></div> loading…</div>
   </div>
   <script type="module">
-import React, { useEffect, useMemo, useRef, useState, useCallback, createElement as h } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback, useContext, createContext, createElement as h } from "react";
 import { createRoot } from "react-dom/client";
 import { createClient } from "@supabase/supabase-js";
 import {
@@ -56,6 +56,46 @@ async function loadConfig() {
   supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key, {
     auth: { persistSession: true, storageKey: "tnlite-auth", autoRefreshToken: true },
   });
+}
+
+// ============================================================
+// Tenant scope (master-admin cross-tenant picker)
+// ============================================================
+// Lite's Supabase RLS normally restricts every read to the caller's
+// tenant. The 20260518_lite_global_admin migration ADDS bypass policies
+// for `role=admin AND tenant_id=default` so the master sees every
+// tenant. When that's true we let the user pick which tenant's data to
+// look at; the picked id is added as an explicit `.eq('tenant_id', ...)`
+// to each query so we don't render a confusing pile of cross-tenant
+// rows. For non-admin users the context value stays empty and queries
+// behave exactly as before (RLS does the filtering).
+const TenantScopeCtx = createContext({
+  pickedTenantId: "",     // empty == no override (use RLS default)
+  setPickedTenantId: () => {},
+  isGlobalAdmin: false,
+  userTenantId: "",       // the tenant_id the user actually belongs to
+});
+
+// Wrap any `supabase.from(...)` call site with this helper so we apply
+// the master-picker scope automatically. Returns the (potentially
+// scoped) Supabase query builder. Safe to use everywhere — when no
+// tenant is picked the call passes through untouched.
+function applyTenantScope(query, pickedTenantId) {
+  if (!pickedTenantId) return query;
+  try { return query.eq("tenant_id", pickedTenantId); }
+  catch (_) { return query; }
+}
+
+// Read role + tenant out of a Supabase JWT's user_metadata claim. The
+// portal mirror (lite_user_mirror.py) writes these on user creation, so
+// every Lite-capable account has them.
+function isJwtGlobalAdmin(session) {
+  const meta = session?.user?.user_metadata || {};
+  return String(meta.role || "") === "admin" && String(meta.tenant_id || "") === "default";
+}
+function jwtTenantId(session) {
+  const meta = session?.user?.user_metadata || {};
+  return String(meta.tenant_id || "");
 }
 
 // ============================================================
@@ -164,6 +204,10 @@ function useLiveLatest(enabled = true) {
   const [error, setError] = useState("");
   const [rtt, setRtt] = useState(null);
   const [transport, setTransport] = useState("polling");
+  // Master-picker scope. When picked, filter queries AND drop realtime
+  // rows that don't match (Supabase realtime doesn't filter by RLS for
+  // global-admin subscriptions — we'd otherwise get every tenant's rows).
+  const { pickedTenantId } = useContext(TenantScopeCtx);
 
   useEffect(() => {
     if (!enabled) return;
@@ -173,9 +217,12 @@ function useLiveLatest(enabled = true) {
 
     const fetchAll = async () => {
       const t0 = performance.now();
-      const { data, error: e } = await supabase
-        .from("live_latest")
-        .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc, tenant_id")
+      const { data, error: e } = await applyTenantScope(
+        supabase
+          .from("live_latest")
+          .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc, tenant_id"),
+        pickedTenantId,
+      )
         .order("ts_utc", { ascending: false })
         .limit(400);
       if (stopped) return;
@@ -193,6 +240,8 @@ function useLiveLatest(enabled = true) {
         (payload) => {
           const r = payload.new || payload.record || null;
           if (!r || !r.tag_name) return;
+          // Discard rows from other tenants when the master picked one.
+          if (pickedTenantId && r.tenant_id && r.tenant_id !== pickedTenantId) return;
           setRows((prev) => {
             const key = `${r.gateway_id || ""}|${r.tag_name}`;
             const next = prev.filter((p) => `${p.gateway_id || ""}|${p.tag_name}` !== key);
@@ -215,7 +264,7 @@ function useLiveLatest(enabled = true) {
       if (channel) supabase.removeChannel(channel).catch(() => {});
       if (pollTimer) clearInterval(pollTimer);
     };
-  }, [enabled]);
+  }, [enabled, pickedTenantId]);
 
   return { rows, error, rtt, transport };
 }
@@ -226,15 +275,19 @@ function useDashboardProfiles(enabled = true) {
     try { return localStorage.getItem("tnlite-profile") || ""; } catch (_) { return ""; }
   });
   const [error, setError] = useState("");
+  const { pickedTenantId } = useContext(TenantScopeCtx);
 
   useEffect(() => {
     if (!enabled) return;
     let stopped = false;
     let channel = null;
     const load = async () => {
-      const { data, error: e } = await supabase
-        .from("dashboard_configurations")
-        .select("scope_key, payload_json, version, updated_utc")
+      const { data, error: e } = await applyTenantScope(
+        supabase
+          .from("dashboard_configurations")
+          .select("scope_key, payload_json, version, updated_utc, tenant_id"),
+        pickedTenantId,
+      )
         .order("updated_utc", { ascending: false })
         .limit(20);
       if (stopped) return;
@@ -257,7 +310,7 @@ function useDashboardProfiles(enabled = true) {
       stopped = true;
       if (channel) supabase.removeChannel(channel).catch(() => {});
     };
-  }, [enabled]);
+  }, [enabled, pickedTenantId]);
 
   const setActive = (key) => {
     setActiveKey(key || "");
@@ -287,14 +340,18 @@ function useChartSeries(gw, tag, sampleCount) {
   const [series, setSeries] = useState([]); // [{ ts, value, idx }]
   const seriesRef = useRef(series);
   seriesRef.current = series;
+  const { pickedTenantId } = useContext(TenantScopeCtx);
 
   useEffect(() => {
     let stopped = false;
     if (!gw || !tag) { setSeries([]); return; }
     const fetchSeed = async () => {
-      const { data, error } = await supabase
-        .from("historian_readings")
-        .select("ts_utc, value")
+      const { data, error } = await applyTenantScope(
+        supabase
+          .from("historian_readings")
+          .select("ts_utc, value, tenant_id"),
+        pickedTenantId,
+      )
         .eq("tag_name", tag)
         .eq("gateway_id", gw)
         .order("ts_utc", { ascending: false })
@@ -325,7 +382,7 @@ function useChartSeries(gw, tag, sampleCount) {
     };
     historianSubscribers.add(handler);
     return () => { stopped = true; historianSubscribers.delete(handler); };
-  }, [gw, tag, sampleCount]);
+  }, [gw, tag, sampleCount, pickedTenantId]);
 
   return series;
 }
@@ -493,6 +550,7 @@ function useMultiSeries(widget, sampleCount) {
     widget?.config?.tag_name, widget?.config?.gateway_id,
     JSON.stringify(widget?.config?.series_extra || []),
   ]);
+  const { pickedTenantId } = useContext(TenantScopeCtx);
   // Each series has its own running buffer keyed by ts_utc -> value.
   const [tick, setTick] = useState(0);
   const buffersRef = useRef(new Map()); // id -> Map<ts, value>
@@ -518,9 +576,12 @@ function useMultiSeries(widget, sampleCount) {
     };
 
     const fetchSeed = async (s) => {
-      const { data, error } = await supabase
-        .from("historian_readings")
-        .select("ts_utc, value")
+      const { data, error } = await applyTenantScope(
+        supabase
+          .from("historian_readings")
+          .select("ts_utc, value, tenant_id"),
+        pickedTenantId,
+      )
         .eq("tag_name", s.tag_name)
         .eq("gateway_id", s.gateway_id)
         .order("ts_utc", { ascending: false })
@@ -561,7 +622,7 @@ function useMultiSeries(widget, sampleCount) {
       stopped = true;
       subs.forEach((fn) => historianSubscribers.delete(fn));
     };
-  }, [seriesDefs, sampleCount]);
+  }, [seriesDefs, sampleCount, pickedTenantId]);
 
   // Build the merged dataset. Take the union of all timestamps across
   // every series, sort, then for each timestamp emit a row carrying each
@@ -836,14 +897,19 @@ function ruleMatches(rule, v) {
 // "computed" mode to count rule matches. Cached for CHART_TTL_MS like the
 // chart widgets so we don't hammer Supabase.
 const pieCache = new Map();
-async function fetchPieValues(gw, tag, sampleCount) {
-  const key = `${gw}|${tag}|${sampleCount}`;
+async function fetchPieValues(gw, tag, sampleCount, pickedTenantId = "") {
+  // Cache key includes pickedTenantId so master switching tenants doesn't
+  // serve a stale per-tenant result.
+  const key = `${pickedTenantId || "*"}|${gw}|${tag}|${sampleCount}`;
   const now = Date.now();
   const hit = pieCache.get(key);
   if (hit && (now - hit.t) < 30_000) return hit.values;
-  const { data, error } = await supabase
-    .from("historian_readings")
-    .select("value")
+  const { data, error } = await applyTenantScope(
+    supabase
+      .from("historian_readings")
+      .select("value, tenant_id"),
+    pickedTenantId,
+  )
     .eq("gateway_id", gw)
     .eq("tag_name", tag)
     .order("ts_utc", { ascending: false })
@@ -867,6 +933,7 @@ function PieWidget({ widget, liveByKey }) {
   const isComputed = String(cfg.data_source_type || "").toLowerCase() === "computed";
   const sampleCount = useDashSamples();
   const [computedCounts, setComputedCounts] = useState(null);
+  const { pickedTenantId } = useContext(TenantScopeCtx);
 
   // Fetch historian samples for computed mode, refresh when rule set or
   // sampleCount changes. Also re-run on each new live tick for the
@@ -905,7 +972,7 @@ function PieWidget({ widget, liveByKey }) {
         const gw  = r.gateway_id || cfg.gateway_id || "";
         const tag = r.tag_name || cfg.tag_name || "";
         const k = `${gw}|${tag}`;
-        if (!fetched.has(k)) fetched.set(k, await fetchPieValues(gw, tag, Number(sampleCount) || 200));
+        if (!fetched.has(k)) fetched.set(k, await fetchPieValues(gw, tag, Number(sampleCount) || 200, pickedTenantId));
         const values = fetched.get(k);
         const matching = values.filter((v) => ruleMatches(r, v));
         const agg = reduce(matching, r.aggregation || "count");
@@ -925,7 +992,7 @@ function PieWidget({ widget, liveByKey }) {
     historianSubscribers.add(handler);
     ensureHistorianChannel();
     return () => { stopped = true; historianSubscribers.delete(handler); };
-  }, [isComputed, JSON.stringify(cfg.compute_rules || []), cfg.gateway_id, cfg.tag_name, sampleCount]);
+  }, [isComputed, JSON.stringify(cfg.compute_rules || []), cfg.gateway_id, cfg.tag_name, sampleCount, pickedTenantId]);
 
   let data;
   if (isComputed) {
@@ -1119,6 +1186,7 @@ function TagMonitor({ open, payload, onClose }) {
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
   const [seriesDefs, setSeriesDefs] = useState([]);
+  const { pickedTenantId } = useContext(TenantScopeCtx);
   // Keep raw per-series buffers in a ref so the live handler can mutate
   // without triggering a re-merge on every tick (we throttle to rAF).
   const buffersRef = useRef(new Map());
@@ -1147,8 +1215,11 @@ function TagMonitor({ open, payload, onClose }) {
     const fromTs = new Date(Date.now() - rangeMs).toISOString();
     (async () => {
       const results = await Promise.all(defs.map((s) =>
-        supabase.from("historian_readings")
-          .select("ts_utc, value")
+        applyTenantScope(
+          supabase.from("historian_readings")
+            .select("ts_utc, value, tenant_id"),
+          pickedTenantId,
+        )
           .eq("tag_name", s.tag_name)
           .eq("gateway_id", s.gateway_id)
           .gte("ts_utc", fromTs)
@@ -1197,7 +1268,7 @@ function TagMonitor({ open, payload, onClose }) {
       stopped = true;
       historianSubscribers.delete(handler);
     };
-  }, [open, payload, rangeMs, maxPoints]);
+  }, [open, payload, rangeMs, maxPoints, pickedTenantId]);
 
   const { yAxisAutoFit: monAutoFit } = useDashPrefs();
   const monYProps = buildYAxisProps(!!monAutoFit);
@@ -1308,7 +1379,8 @@ function StatusPill({ liveRows, transport }) {
   );
 }
 
-function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, transport, onJumpAlarms, sidebarVisible, onToggleSidebar }) {
+function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, transport, onJumpAlarms, sidebarVisible, onToggleSidebar,
+                  isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant }) {
   const activeAlarms = useActiveAlarmCount();
   return h("header", { className: "app-header" },
     h("div", { className: "header-left" },
@@ -1332,7 +1404,24 @@ function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, 
     h("div", { className: "header-center" },
       h("div", { className: "header-cloud-controls" },
         h("span", { className: "header-cloud-label" }, "Customer"),
-        h("span", { style: { fontWeight: 600, fontSize: 13 } }, tenantLabel),
+        // Master-admin gets a real dropdown so they can switch tenants.
+        // Tenant users see the static label only. The empty option
+        // ("All tenants") clears the filter — queries then pull every
+        // row the global-admin RLS policies allow.
+        isGlobalAdmin && Array.isArray(availableTenants) && availableTenants.length > 0
+          ? h("select", {
+              className: "tenant-picker",
+              value: pickedTenantId || "",
+              onChange: (e) => onPickTenant && onPickTenant(e.target.value),
+              title: "Master admin: switch tenant",
+              style: { fontWeight: 600, fontSize: 13 },
+            },
+              h("option", { value: "" }, "All tenants"),
+              ...availableTenants.map((t) => h("option", {
+                key: t.tenant_id, value: t.tenant_id,
+              }, `${t.label} · ${t.tenant_id}`))
+            )
+          : h("span", { style: { fontWeight: 600, fontSize: 13 } }, tenantLabel),
         h(StatusPill, { liveRows, transport })
       )
     ),
@@ -1588,13 +1677,17 @@ function HistorianView() {
   const [tagFilter, setTagFilter] = useState("");
   const [rangeMs, setRangeMs] = useState(60 * 60_000);
   const [limit, setLimit] = useState(300);
+  const { pickedTenantId } = useContext(TenantScopeCtx);
 
   useEffect(() => {
     let stop = false;
     const f = async () => {
-      let q = supabase
-        .from("historian_readings")
-        .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc")
+      let q = applyTenantScope(
+        supabase
+          .from("historian_readings")
+          .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc, tenant_id"),
+        pickedTenantId,
+      )
         .order("ts_utc", { ascending: false })
         .limit(Math.max(20, Math.min(5000, Number(limit) || 300)));
       if (rangeMs > 0) {
@@ -1611,7 +1704,7 @@ function HistorianView() {
     f();
     const t = setInterval(f, 5000);
     return () => { stop = true; clearInterval(t); };
-  }, [gwFilter, tagFilter, rangeMs, limit]);
+  }, [gwFilter, tagFilter, rangeMs, limit, pickedTenantId]);
 
   return h("div", null,
     h("div", { className: "section" },
@@ -1720,14 +1813,18 @@ function ruleConditionLabel(rule) {
 function useAlarmEvents(enabled = true) {
   const [events, setEvents] = useState(null);
   const [error, setError] = useState("");
+  const { pickedTenantId } = useContext(TenantScopeCtx);
 
   useEffect(() => {
     if (!enabled) return;
     let stop = false;
     const f = async () => {
-      const { data, error: e } = await supabase
-        .from("alarms_setup")
-        .select("payload_json, updated_utc")
+      const { data, error: e } = await applyTenantScope(
+        supabase
+          .from("alarms_setup")
+          .select("payload_json, updated_utc, tenant_id"),
+        pickedTenantId,
+      )
         .order("updated_utc", { ascending: false })
         .limit(1);
       if (stop) return;
@@ -1744,7 +1841,7 @@ function useAlarmEvents(enabled = true) {
         () => f())
       .subscribe();
     return () => { stop = true; supabase.removeChannel(ch).catch(() => {}); };
-  }, [enabled]);
+  }, [enabled, pickedTenantId]);
   return { events, error };
 }
 
@@ -1860,13 +1957,17 @@ function AlarmRulesView({ liveRows }) {
   const [error, setError] = useState("");
   const [stateFilter, setStateFilter] = useState("all");  // all | triggered | ok
   const [search, setSearch] = useState("");
+  const { pickedTenantId } = useContext(TenantScopeCtx);
 
   useEffect(() => {
     let stop = false;
     const f = async () => {
-      const { data, error: e } = await supabase
-        .from("triggers_limits")
-        .select("payload_json, version, updated_utc")
+      const { data, error: e } = await applyTenantScope(
+        supabase
+          .from("triggers_limits")
+          .select("payload_json, version, updated_utc, tenant_id"),
+        pickedTenantId,
+      )
         .order("updated_utc", { ascending: false })
         .limit(1);
       if (stop) return;
@@ -1883,7 +1984,7 @@ function AlarmRulesView({ liveRows }) {
         () => f())
       .subscribe();
     return () => { stop = true; supabase.removeChannel(ch).catch(() => {}); };
-  }, []);
+  }, [pickedTenantId]);
 
   const liveByKey = useMemo(() => {
     const m = new Map();
@@ -2221,11 +2322,15 @@ function GeneratedReportsView() {
   const [error, setError] = useState("");
   const [busyId, setBusyId] = useState("");      // id of report currently fetching a signed URL
   const [previewUrl, setPreviewUrl] = useState("");
+  const { pickedTenantId } = useContext(TenantScopeCtx);
 
   const refresh = async () => {
-    const { data, error: e } = await supabase
-      .from("generated_reports")
-      .select("id, tenant_id, template_id, template_name, schedule_id, schedule_name, triggered_by, file_name, file_bytes, storage_path, created_utc")
+    const { data, error: e } = await applyTenantScope(
+      supabase
+        .from("generated_reports")
+        .select("id, tenant_id, template_id, template_name, schedule_id, schedule_name, triggered_by, file_name, file_bytes, storage_path, created_utc"),
+      pickedTenantId,
+    )
       .order("created_utc", { ascending: false })
       .limit(200);
     if (e) { setError(e.message); return; }
@@ -2242,7 +2347,7 @@ function GeneratedReportsView() {
         () => f())
       .subscribe();
     return () => { stop = true; supabase.removeChannel(ch).catch(() => {}); };
-  }, []);
+  }, [pickedTenantId]);
 
   const signedUrl = async (storagePath) => {
     if (!storagePath) return null;
@@ -2342,13 +2447,17 @@ function ReportTemplatesView() {
   const [selected, setSelected] = useState(null);
   const [queueing, setQueueing] = useState("");
   const [submittedFor, setSubmittedFor] = useState("");
+  const { pickedTenantId } = useContext(TenantScopeCtx);
 
   useEffect(() => {
     let stop = false;
     const f = async () => {
-      const { data, error: e } = await supabase
-        .from("report_templates")
-        .select("id, tenant_id, name, description, definition_json, created_utc, updated_utc, created_by")
+      const { data, error: e } = await applyTenantScope(
+        supabase
+          .from("report_templates")
+          .select("id, tenant_id, name, description, definition_json, created_utc, updated_utc, created_by"),
+        pickedTenantId,
+      )
         .order("updated_utc", { ascending: false })
         .limit(100);
       if (stop) return;
@@ -2361,7 +2470,7 @@ function ReportTemplatesView() {
         () => f())
       .subscribe();
     return () => { stop = true; supabase.removeChannel(ch).catch(() => {}); };
-  }, []);
+  }, [pickedTenantId]);
 
   const summarize = (t) => {
     const def = t.definition_json || {};
@@ -2558,6 +2667,18 @@ function App() {
   const [monitor, setMonitor] = useState(null);
   const [tenantLabel, setTenantLabel] = useState(cfg?.customer_label || "");
   const [prefs, setPrefs] = useState(loadDashPrefs());
+  // Master-admin cross-tenant picker. `pickedTenantId` is what every
+  // scoped query filters by; empty string means "follow the user's
+  // default tenant" (RLS does the filtering). `availableTenants` is the
+  // list shown in the picker dropdown — built from cp_customers so the
+  // master sees human-readable company names, not raw slugs.
+  const [pickedTenantId, setPickedTenantId] = useState(() => {
+    try { return localStorage.getItem("tnlite-picked-tenant") || ""; }
+    catch (_) { return ""; }
+  });
+  const [availableTenants, setAvailableTenants] = useState([]);
+  const isGlobalAdmin = isJwtGlobalAdmin(session);
+  const userTenantId = jwtTenantId(session);
   // Side-menu collapse state. Persisted to localStorage so the user's
   // preference survives reloads. Defaults to visible on desktop and
   // hidden on phones (the bottom-tab bar replaces it there anyway).
@@ -2581,14 +2702,79 @@ function App() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  // Tenant label from lite_profiles once signed in.
+  // Tenant label from lite_profiles once signed in. Non-admin users see
+  // their own assignment. Master-admin sees whichever tenant they've
+  // picked (or 'All tenants' as a fallback).
   useEffect(() => {
     if (!session) return;
+    if (isGlobalAdmin) {
+      // For master, label follows the picker. We resolve the picked
+      // tenant's company_name from cp_customers when possible.
+      if (!pickedTenantId) { setTenantLabel("All tenants"); return; }
+      supabase.from("cp_customers")
+        .select("company_name, tenant_id")
+        .eq("tenant_id", pickedTenantId)
+        .limit(1).maybeSingle()
+        .then(({ data }) => {
+          setTenantLabel(data?.company_name || pickedTenantId);
+        }).catch(() => setTenantLabel(pickedTenantId));
+      return;
+    }
     supabase.from("lite_profiles").select("tenant_id, customer_id").limit(1).maybeSingle()
       .then(({ data }) => {
         if (data) setTenantLabel(data.customer_id || data.tenant_id || cfg?.customer_label || "");
       }).catch(() => {});
-  }, [session]);
+  }, [session, isGlobalAdmin, pickedTenantId]);
+
+  // Load the list of tenants the master can switch to. Reads cp_customers
+  // (one row per customer) and lite_profiles (covers tenants with no
+  // customer yet) and merges. No-op for non-admin users.
+  useEffect(() => {
+    if (!session || !isGlobalAdmin) { setAvailableTenants([]); return; }
+    let stopped = false;
+    (async () => {
+      const seen = new Map();   // tenant_id -> { tenant_id, label }
+      const { data: custs } = await supabase.from("cp_customers")
+        .select("tenant_id, company_name").limit(500);
+      for (const r of (custs || [])) {
+        const tid = String(r.tenant_id || "");
+        if (!tid) continue;
+        const label = String(r.company_name || tid);
+        // First seen wins; cp_customers usually has the prettiest label.
+        if (!seen.has(tid)) seen.set(tid, { tenant_id: tid, label });
+      }
+      // Fallback: any tenant with at least one lite_profile that isn't in
+      // cp_customers yet (admin-only tenants, e.g.).
+      const { data: profs } = await supabase.from("lite_profiles")
+        .select("tenant_id").limit(2000);
+      for (const r of (profs || [])) {
+        const tid = String(r.tenant_id || "");
+        if (!tid || seen.has(tid)) continue;
+        seen.set(tid, { tenant_id: tid, label: tid });
+      }
+      if (!stopped) {
+        const list = [...seen.values()].sort((a, b) => a.label.localeCompare(b.label));
+        setAvailableTenants(list);
+      }
+    })().catch(() => {});
+    return () => { stopped = true; };
+  }, [session, isGlobalAdmin]);
+
+  // Persist the picker selection so a page reload keeps the view.
+  useEffect(() => {
+    try { localStorage.setItem("tnlite-picked-tenant", pickedTenantId || ""); }
+    catch (_) {}
+  }, [pickedTenantId]);
+
+  // Tenant scope for every scoped query in the app. We only set a real
+  // value for global admin — for tenant users it stays empty so RLS
+  // filters happen on the server (and the picker never appears).
+  const tenantScopeValue = useMemo(() => ({
+    pickedTenantId: isGlobalAdmin ? (pickedTenantId || "") : "",
+    setPickedTenantId,
+    isGlobalAdmin,
+    userTenantId,
+  }), [isGlobalAdmin, pickedTenantId, userTenantId]);
 
   // Hooks must run unconditionally. The hooks themselves check supabase/
   // session before making any RPC, so calling them when signed out is a
@@ -2636,7 +2822,8 @@ function App() {
 
   const user = session?.user?.email || "";
 
-  return h(DashPrefsCtx.Provider, { value: prefs },
+  return h(TenantScopeCtx.Provider, { value: tenantScopeValue },
+    h(DashPrefsCtx.Provider, { value: prefs },
     h("div", { className: "app-shell" },
       h(Header, {
         user, tenantLabel, theme, onToggleTheme: toggleTheme,
@@ -2644,6 +2831,12 @@ function App() {
         sidebarVisible,
         onToggleSidebar: () => setSidebarVisible((v) => !v),
         onJumpAlarms: () => setTab("alarms"),
+        // Master-only props (Header renders the picker iff
+        // isGlobalAdmin is true). For tenant users these are ignored.
+        isGlobalAdmin,
+        availableTenants,
+        pickedTenantId,
+        onPickTenant: setPickedTenantId,
         onSignOut: async () => {
           await supabase.auth.signOut().catch(() => {});
           setSession(null);
@@ -2655,6 +2848,7 @@ function App() {
       ),
       h(BottomTabs, { tab, setTab }),
       h(TagMonitor, { open: !!monitor, payload: monitor, onClose: () => setMonitor(null) })
+    )
     )
   );
 }

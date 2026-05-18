@@ -208,6 +208,21 @@ button { font: inherit; cursor: pointer; }
   padding: 6px 10px;
 }
 
+/* Master-admin tenant picker. Replaces the static customer label in the
+   header for users whose JWT has role=admin AND tenant_id=default.
+   Identical styling to .header-edge-select so the header layout stays
+   consistent regardless of which kind of user is signed in. */
+.tenant-picker {
+  min-width: 180px;
+  max-width: min(45vw, 380px);
+  background: var(--surface-elev);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
 .icon-btn {
   border: 1px solid var(--header-surface-border);
   background: var(--header-surface);
