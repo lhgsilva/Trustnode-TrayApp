@@ -4876,21 +4876,40 @@ function AppShell() {
             const db = dbConnectionsRef.current.find((c) => c.id === gateway?.database_id) || null;
             const activeGatewayTriggers = collectionTriggersRef.current.filter((t) => t.enabled !== false);
             if (gatewayId) {
+              // Resolve the PLC endpoint for this gateway so we can ALSO
+              // index incoming readings by (endpoint, tag). The endpoint is
+              // `opc_url` for Siemens OPC-UA gateways, otherwise `plc_ip`.
+              // Two gateways pointing at the same PLC will share this key,
+              // so a chart configured for gateway-A's tag1 keeps drawing
+              // when only gateway-B is running. The gateway-id key still
+              // wins when present (see findLiveByGatewayOrEndpoint).
+              const gatewayEndpoint = gateway
+                ? (String(gateway.gateway_type || "") === "siemens_opcua"
+                    ? String(gateway.opc_url || "")
+                    : String(gateway.plc_ip || ""))
+                : "";
               setLiveTagValues((prev) => {
                 const next = { ...prev };
                 for (const r of data.readings) {
                   const normTag = normalizeTagName(r.tag_name || "");
                   if (!normTag) continue;
-                  const key = `${gatewayId}::${normTag}`;
                   const readingTs = String(r.ts_utc || tsNow());
-                  next[key] = {
+                  const entry = {
                     gateway_id: gatewayId,
+                    plc_endpoint: gatewayEndpoint,
                     tag: String(r.tag_name || ""),
                     ts: readingTs,
                     value: r.value,
                     quality: r.quality,
                     quality_label: r.quality_label || qualityLabelFromCode(r.quality)
                   };
+                  next[`${gatewayId}::${normTag}`] = entry;
+                  // Endpoint-keyed mirror — only written when we know the
+                  // endpoint, and the entry already records its owning
+                  // gateway_id so debuggers can trace it back.
+                  if (gatewayEndpoint) {
+                    next[`ENDPOINT::${gatewayEndpoint}::${normTag}`] = entry;
+                  }
                 }
                 return next;
               });
@@ -5188,14 +5207,25 @@ function AppShell() {
               const qualityLabel = row?.quality_label || qualityLabelFromCode(quality);
               const dbName = String(row?.database_name || "").trim();
               const dbMeta = dbMetaByName.get(dbName.toLowerCase()) || null;
-              nextLive[key] = {
+              // PLC endpoint for the IP-fallback live key. Cloud rows
+              // already carry plc_ip (see acceptedLiveRows shape just
+              // below); OPC-UA gateways would need opc_url but the cloud
+              // mirror doesn't surface that today, so falling back to
+              // plc_ip is best-effort.
+              const plcEndpoint = String(row?.plc_ip || "");
+              const liveEntry = {
                 gateway_id: gatewayId,
+                plc_endpoint: plcEndpoint,
                 tag: rawTag,
                 ts: readingTs,
                 value: row?.value,
                 quality,
                 quality_label: qualityLabel
               };
+              nextLive[key] = liveEntry;
+              if (plcEndpoint) {
+                nextLive[`ENDPOINT::${plcEndpoint}::${normTag}`] = liveEntry;
+              }
               nextReadings.push({
                 ts_utc: readingTs,
                 source: row?.source || "",
@@ -7691,8 +7721,9 @@ function AppShell() {
   );
   const getTriggerLiveStatus = (trigger) => {
     if (!trigger?.gateway_id || !trigger?.tag_name) return { ok: null, label: "No Data", valueText: "-", ageText: "-" };
-    const key = `${String(trigger.gateway_id || "")}::${normalizeTagName(trigger.tag_name || "")}`;
-    const latest = liveTagValuesRef.current[key] || null;
+    // IP-fallback: if the configured gateway is stopped but another
+    // gateway with the same PLC endpoint is publishing this tag, use it.
+    const latest = findLiveByGatewayOrEndpoint(trigger.gateway_id, trigger.tag_name);
     if (!latest) return { ok: null, label: "No Data", valueText: "-", ageText: "-" };
     const intervalMs = getGatewayIntervalMs(trigger.gateway_id);
     const ageMs = Date.now() - parseTimestampMs(latest.ts || "");
@@ -7707,8 +7738,7 @@ function AppShell() {
   const getLimitRuleLiveStatus = (rule) => {
     if (!rule?.gateway_id || !rule?.tag_name) return { ok: null, label: "No Data", valueText: "-", ageText: "-" };
     if (rule.enabled === false) return { ok: null, label: "DISABLED", valueText: "-", ageText: "-" };
-    const key = `${String(rule.gateway_id || "")}::${normalizeTagName(rule.tag_name || "")}`;
-    const latest = liveTagValuesRef.current[key] || null;
+    const latest = findLiveByGatewayOrEndpoint(rule.gateway_id, rule.tag_name);
     if (!latest) return { ok: null, label: "No Data", valueText: "-", ageText: "-" };
     const intervalMs = getGatewayIntervalMs(rule.gateway_id);
     const ageMs = Date.now() - parseTimestampMs(latest.ts || "");
@@ -8035,6 +8065,34 @@ const getGatewayHealth = (gateway) => {
     if (gateway.gateway_type === "siemens_opcua" && gateway.opc_url) return gateway.opc_url;
     return gateway.plc_ip || "-";
   };
+
+  // Resolve the PLC endpoint (the address that uniquely identifies the
+  // physical device — `opc_url` for Siemens, `plc_ip` for everything
+  // else) for a given gateway_id. Returns "" when unknown.
+  // Powers the (IP, tag) fallback used by chart/tile/trigger lookups.
+  const getGatewayPlcEndpoint = useCallback((gatewayId) => {
+    if (!gatewayId) return "";
+    const gw = (gatewayConfigsRef.current || []).find((g) => String(g.id) === String(gatewayId));
+    if (!gw) return "";
+    if (String(gw.gateway_type || "") === "siemens_opcua") return String(gw.opc_url || "");
+    return String(gw.plc_ip || "");
+  }, []);
+
+  // Look up the latest live value for (gateway_id, tag_name) with an
+  // IP-fallback: if no row keyed by the configured gateway_id is
+  // present, try the ENDPOINT-keyed mirror so a chart configured for
+  // gateway-A keeps reflecting samples from gateway-B (same PLC).
+  const findLiveByGatewayOrEndpoint = useCallback((gatewayId, tagName) => {
+    if (!tagName) return null;
+    const normTag = normalizeTagName(tagName || "");
+    if (!normTag) return null;
+    const tagMap = liveTagValuesRef.current || {};
+    const primary = tagMap[`${String(gatewayId || "")}::${normTag}`];
+    if (primary) return primary;
+    const endpoint = getGatewayPlcEndpoint(gatewayId);
+    if (!endpoint) return null;
+    return tagMap[`ENDPOINT::${endpoint}::${normTag}`] || null;
+  }, [getGatewayPlcEndpoint]);
 
   
 
@@ -8516,13 +8574,29 @@ const getGatewayHealth = (gateway) => {
     for (const gw of gatewayConfigsView) {
       const device = devicesView.find((d) => d.id === gw.device_id);
       const tags = Array.isArray(gw.tags) ? gw.tags : [];
+      // Endpoint that uniquely identifies the physical PLC behind this
+      // gateway, for the IP-fallback live lookup below.
+      const gwEndpoint = String(gw.gateway_type || "") === "siemens_opcua"
+        ? String(gw.opc_url || "")
+        : String(gw.plc_ip || "");
       for (const tag of tags) {
+        const normTag = normalizeTagName(tag);
+        // Same fallback rule as the rest of the dashboard: prefer rows
+        // matching this gateway_id, otherwise any row from another
+        // gateway pointing at the same PLC endpoint.
         const latest = dataLogView.find(
           (r) =>
             String(r.tag || r.tag_name || "") === String(tag) &&
             (!r.gateway_id || String(r.gateway_id) === String(gw.id))
-        );
-        const live = liveTagValuesView[`${String(gw.id)}::${normalizeTagName(tag)}`];
+        ) || (gwEndpoint
+          ? dataLogView.find(
+              (r) =>
+                String(r.tag || r.tag_name || "") === String(tag) &&
+                String(r.plc_ip || "") === gwEndpoint
+            )
+          : null);
+        const live = liveTagValuesView[`${String(gw.id)}::${normTag}`]
+          || (gwEndpoint ? liveTagValuesView[`ENDPOINT::${gwEndpoint}::${normTag}`] : null);
         rows.push({
           key: `${gw.id}::${tag}`,
           tag_name: tag,
@@ -8638,13 +8712,24 @@ const getGatewayHealth = (gateway) => {
         w.color || getDashboardTagColor(w.gateway_id, w.tag_name, "#16a34a"),
         "#16a34a"
       );
+      // PLC endpoint for the IP-fallback chart filter. Two gateways can
+      // point at the same PLC (same plc_ip / opc_url) with overlapping
+      // tag lists. When the user starts gateway B while the widget is
+      // wired to gateway A, we still want the chart to animate as
+      // long as B publishes the matching tag against the same endpoint.
+      // The filter prefers gateway_id matches and falls back to endpoint.
+      const widgetEndpoint = String(gateway?.gateway_type || "") === "siemens_opcua"
+        ? String(gateway?.opc_url || "")
+        : String(gateway?.plc_ip || "");
+      const widgetTag = String(w.tag_name || "");
+      const filteredRows = dataLogView.filter((r) => {
+        if (String(r.tag || r.tag_name || "") !== widgetTag) return false;
+        if (String(r.gateway_id || "") === String(w.gateway_id || "")) return true;
+        if (widgetEndpoint && String(r.plc_ip || "") === widgetEndpoint) return true;
+        return false;
+      });
       const points = buildChronologicalSeries(
-        dataLogView
-        .filter(
-          (r) =>
-            String(r.gateway_id || "") === String(w.gateway_id || "") &&
-            String(r.tag || r.tag_name || "") === String(w.tag_name || "")
-        )
+        filteredRows
       , Number(w.readings_count || 120), Number(gateway?.interval_ms || 1000), endpointMode === "cloud");
       const lineSeries = buildSmoothedSeries(
         points,
@@ -9226,12 +9311,24 @@ const getGatewayHealth = (gateway) => {
       setError("Dashboard item requires gateway and tag.");
       return;
     }
+    // Snapshot the PLC endpoint (plc_ip / opc_url) at save time. The
+    // Lite app uses this as a fallback when the configured gateway is
+    // stopped but another gateway with the same endpoint is still
+    // publishing the tag. Stored on the widget payload so Lite can
+    // read it from dashboard_configurations without a separate lookup.
+    const _gw = (gatewayConfigsRef.current || []).find((g) => String(g.id) === gatewayId);
+    const plcEndpoint = _gw
+      ? (String(_gw.gateway_type || "") === "siemens_opcua"
+          ? String(_gw.opc_url || "")
+          : String(_gw.plc_ip || ""))
+      : "";
     const payload = {
       id: editingDashboardWidgetId || `dw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       title: dashboardWidgetForm.title.trim() || tagName,
       gateway_id: gatewayId,
       tag_name: tagName,
       readings_count: count,
+      plc_endpoint: plcEndpoint,
       color: normalizeHexColor(
         dashboardWidgetForm.color || getDashboardTagColor(gatewayId, tagName, "#16a34a"),
         "#16a34a"

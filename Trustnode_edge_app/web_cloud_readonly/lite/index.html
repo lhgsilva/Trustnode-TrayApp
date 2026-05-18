@@ -220,7 +220,10 @@ function useLiveLatest(enabled = true) {
       const { data, error: e } = await applyTenantScope(
         supabase
           .from("live_latest")
-          .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc, tenant_id"),
+          // plc_ip is included so widgets can fall back to (IP, tag)
+          // matching when their configured gateway_id stops publishing
+          // (two gateways pointing at the same PLC scenario).
+          .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc, tenant_id, plc_ip"),
         pickedTenantId,
       )
         .order("ts_utc", { ascending: false })
@@ -336,7 +339,7 @@ function profileLabel(scopeKey) {
 }
 
 // Per-(gw|tag) chart series, fetched once then appended via realtime.
-function useChartSeries(gw, tag, sampleCount) {
+function useChartSeries(gw, tag, sampleCount, plcEndpoint = "") {
   const [series, setSeries] = useState([]); // [{ ts, value, idx }]
   const seriesRef = useRef(series);
   seriesRef.current = series;
@@ -346,14 +349,18 @@ function useChartSeries(gw, tag, sampleCount) {
     let stopped = false;
     if (!gw || !tag) { setSeries([]); return; }
     const fetchSeed = async () => {
-      const { data, error } = await applyTenantScope(
+      // Match by gateway_id OR plc_ip. When plcEndpoint is unknown we
+      // collapse the OR to the original gateway_id-only filter.
+      const baseQuery = applyTenantScope(
         supabase
           .from("historian_readings")
-          .select("ts_utc, value, tenant_id"),
+          .select("ts_utc, value, tenant_id, gateway_id, plc_ip"),
         pickedTenantId,
-      )
-        .eq("tag_name", tag)
-        .eq("gateway_id", gw)
+      ).eq("tag_name", tag);
+      const filtered = plcEndpoint
+        ? baseQuery.or(`gateway_id.eq.${gw},plc_ip.eq.${plcEndpoint}`)
+        : baseQuery.eq("gateway_id", gw);
+      const { data, error } = await filtered
         .order("ts_utc", { ascending: false })
         .limit(Math.max(2, Math.min(2000, Number(sampleCount) || 20)));
       if (stopped) return;
@@ -367,9 +374,13 @@ function useChartSeries(gw, tag, sampleCount) {
     };
     fetchSeed();
 
-    // Use the shared historian realtime channel (one channel, route by gw|tag).
+    // Realtime: accept a row when its (gateway_id, tag_name) matches OR
+    // its (plc_ip, tag_name) matches the widget's endpoint.
     const handler = (row) => {
-      if (!row || row.gateway_id !== gw || row.tag_name !== tag) return;
+      if (!row || row.tag_name !== tag) return;
+      const gatewayMatch = row.gateway_id === gw;
+      const endpointMatch = plcEndpoint && row.plc_ip && row.plc_ip === plcEndpoint;
+      if (!gatewayMatch && !endpointMatch) return;
       const v = Number(row.value);
       setSeries((prev) => {
         const next = [...prev, { idx: prev.length, ts: row.ts_utc, value: Number.isFinite(v) ? v : null }];
@@ -382,7 +393,7 @@ function useChartSeries(gw, tag, sampleCount) {
     };
     historianSubscribers.add(handler);
     return () => { stopped = true; historianSubscribers.delete(handler); };
-  }, [gw, tag, sampleCount, pickedTenantId]);
+  }, [gw, tag, sampleCount, pickedTenantId, plcEndpoint]);
 
   return series;
 }
@@ -500,11 +511,18 @@ function widgetAllSeries(widget) {
     const n = Number(v);
     return Number.isFinite(n) ? n : 0;
   };
+  // PLC endpoint snapshot the edge wrote when the widget was saved
+  // (saveDashboardWidget in App.jsx). Used as an IP-fallback so a chart
+  // configured for gateway A keeps drawing samples from gateway B when
+  // both target the same PLC. Older widgets predate the snapshot —
+  // they just won't get the fallback until they're re-saved.
+  const widgetEndpoint = String(cfg.plc_endpoint || cfg.plc_ip || "");
   const out = [];
   if (cfg.tag_name) {
     out.push({
       id: "primary",
       gateway_id: cfg.gateway_id || "",
+      plc_endpoint: widgetEndpoint,
       tag_name: cfg.tag_name,
       label: String(widget?.title || cfg.tag_name || "").trim() || cfg.tag_name,
       color: primaryColor,
@@ -521,6 +539,9 @@ function widgetAllSeries(widget) {
     out.push({
       id: String(s.id || `s${i + 1}`),
       gateway_id: String(s.gateway_id || cfg.gateway_id || ""),
+      // extras carry their own endpoint if set, otherwise fall back to the
+      // primary widget's snapshot (extras almost always share the same gw).
+      plc_endpoint: String(s.plc_endpoint || s.plc_ip || widgetEndpoint || ""),
       tag_name: String(s.tag_name),
       label: String(s.label || s.tag_name),
       color: String(s.color || pickPaletteColor(i + 1)),
@@ -576,14 +597,19 @@ function useMultiSeries(widget, sampleCount) {
     };
 
     const fetchSeed = async (s) => {
-      const { data, error } = await applyTenantScope(
+      const base = applyTenantScope(
         supabase
           .from("historian_readings")
-          .select("ts_utc, value, tenant_id"),
+          .select("ts_utc, value, tenant_id, gateway_id, plc_ip"),
         pickedTenantId,
-      )
-        .eq("tag_name", s.tag_name)
-        .eq("gateway_id", s.gateway_id)
+      ).eq("tag_name", s.tag_name);
+      // (gateway_id == s.gateway_id) OR (plc_ip == s.plc_endpoint), so a
+      // running gateway B with the same PLC IP can drive a chart wired
+      // to gateway A.
+      const filtered = s.plc_endpoint
+        ? base.or(`gateway_id.eq.${s.gateway_id},plc_ip.eq.${s.plc_endpoint}`)
+        : base.eq("gateway_id", s.gateway_id);
+      const { data, error } = await filtered
         .order("ts_utc", { ascending: false })
         .limit(Math.max(2, Math.min(2000, Number(sampleCount) || 20)));
       if (stopped || error) return;
@@ -602,7 +628,10 @@ function useMultiSeries(widget, sampleCount) {
     // Register one realtime handler per (gw|tag) so each new row appends.
     for (const s of seriesDefs) {
       const fn = (row) => {
-        if (!row || row.tag_name !== s.tag_name || row.gateway_id !== s.gateway_id) return;
+        if (!row || row.tag_name !== s.tag_name) return;
+        const gatewayMatch = row.gateway_id === s.gateway_id;
+        const endpointMatch = s.plc_endpoint && row.plc_ip && row.plc_ip === s.plc_endpoint;
+        if (!gatewayMatch && !endpointMatch) return;
         const buf = buffersRef.current.get(s.id);
         if (!buf) return;
         buf.set(row.ts_utc, scale(s, row.value));
@@ -746,7 +775,12 @@ function KpiWidget({ widget, liveByKey, onOpen }) {
   const cfg = widget?.config || {};
   const color = String(widget?.color || "#14a89a");
   const isText = widget?.type === "text_kpi";
-  const row = liveByKey.get(`${cfg.gateway_id}|${cfg.tag_name}`);
+  // Prefer the new lookup() (IP-fallback aware) when available; fall
+  // back to .get() so older code paths still work during deploy
+  // rollover.
+  const row = (liveByKey?.lookup
+    ? liveByKey.lookup({ gateway_id: cfg.gateway_id, tag_name: cfg.tag_name, plc_endpoint: cfg.plc_endpoint })
+    : liveByKey.get(`${cfg.gateway_id}|${cfg.tag_name}`));
   const value = row ? row.value : null;
   const ts = row ? row.ts_utc : null;
   const cls = `widget-kpi ${freshnessClass(ts)}`;
@@ -819,7 +853,9 @@ function computeMeterRanges(widget, value) {
 
 function MeterWidget({ widget, liveByKey, onOpen }) {
   const cfg = widget?.config || {};
-  const row = liveByKey.get(`${cfg.gateway_id}|${cfg.tag_name}`);
+  const row = (liveByKey?.lookup
+    ? liveByKey.lookup({ gateway_id: cfg.gateway_id, tag_name: cfg.tag_name, plc_endpoint: cfg.plc_endpoint })
+    : liveByKey.get(`${cfg.gateway_id}|${cfg.tag_name}`));
   const value = row ? Number(row.value) : NaN;
   const ts = row ? row.ts_utc : null;
   // Honour explicit min/max if the operator set them on the widget; the
@@ -1008,7 +1044,9 @@ function PieWidget({ widget, liveByKey }) {
   } else {
     const series = widgetAllSeries(widget);
     data = series.map((s, idx) => {
-      const row = liveByKey.get(`${s.gateway_id}|${s.tag_name}`);
+      const row = (liveByKey?.lookup
+        ? liveByKey.lookup({ gateway_id: s.gateway_id, tag_name: s.tag_name, plc_endpoint: s.plc_endpoint || cfg.plc_endpoint })
+        : liveByKey.get(`${s.gateway_id}|${s.tag_name}`));
       const v = Number(row?.value);
       return {
         name: s.label,
@@ -1056,7 +1094,7 @@ function TableWidget({ widget }) {
   // when no per-widget limit is set.
   const rowLimit = Math.max(1, Math.min(2000, Number(cfg.query_row_limit || cfg.list_limit || sampleCount || 20)));
   const rowSel = String(cfg.query_row_selection || "all").toLowerCase();
-  const series = useChartSeries(cfg.gateway_id || "", cfg.tag_name || "", rowLimit);
+  const series = useChartSeries(cfg.gateway_id || "", cfg.tag_name || "", rowLimit, cfg.plc_endpoint || cfg.plc_ip || "");
   // useChartSeries returns oldest-first; pick the right slice for the
   // configured row_selection (latest/last_n = tail, oldest = head, all = full).
   let rows;
@@ -1202,6 +1240,7 @@ function TagMonitor({ open, payload, onClose }) {
       defs = [{
         id: "primary",
         gateway_id: payload.gateway_id || "",
+        plc_endpoint: payload.plc_endpoint || payload.plc_ip || "",
         tag_name: payload.tag_name,
         label: payload.tag_name,
         color: "#14a89a",
@@ -1214,19 +1253,21 @@ function TagMonitor({ open, payload, onClose }) {
 
     const fromTs = new Date(Date.now() - rangeMs).toISOString();
     (async () => {
-      const results = await Promise.all(defs.map((s) =>
-        applyTenantScope(
+      const results = await Promise.all(defs.map((s) => {
+        const base = applyTenantScope(
           supabase.from("historian_readings")
-            .select("ts_utc, value, tenant_id"),
+            .select("ts_utc, value, tenant_id, gateway_id, plc_ip"),
           pickedTenantId,
-        )
-          .eq("tag_name", s.tag_name)
-          .eq("gateway_id", s.gateway_id)
+        ).eq("tag_name", s.tag_name);
+        const filtered = s.plc_endpoint
+          ? base.or(`gateway_id.eq.${s.gateway_id},plc_ip.eq.${s.plc_endpoint}`)
+          : base.eq("gateway_id", s.gateway_id);
+        return filtered
           .gte("ts_utc", fromTs)
           .order("ts_utc", { ascending: true })
           .limit(Math.max(50, Math.min(20000, Number(maxPoints) || 500)))
-          .then(({ data, error }) => ({ s, rows: data || [], error }))
-      ));
+          .then(({ data, error }) => ({ s, rows: data || [], error }));
+      }));
       if (stopped) return;
       const errored = results.find((r) => r.error);
       if (errored) { setError(errored.error.message); return; }
@@ -1247,7 +1288,11 @@ function TagMonitor({ open, payload, onClose }) {
     let rafScheduled = false;
     const handler = (row) => {
       if (!row || !row.tag_name) return;
-      const match = defs.find((s) => s.gateway_id === row.gateway_id && s.tag_name === row.tag_name);
+      // Same gateway-id-or-endpoint match as the seed query.
+      const match = defs.find((s) =>
+        s.tag_name === row.tag_name &&
+        (s.gateway_id === row.gateway_id ||
+          (s.plc_endpoint && row.plc_ip && s.plc_endpoint === row.plc_ip)));
       if (!match) return;
       const buf = buffersRef.current.get(match.id);
       const v = Number(row.value);
@@ -1619,10 +1664,34 @@ function DashboardView({ liveRows, profiles, active, activeKey, setActiveKey, pr
   }, [active]);
   const effectivePerRow = profilePerRow ?? prefs.perRow;
 
+  // Two-layer index: gateway_id-keyed (primary) + plc_ip-keyed (fallback).
+  // When a widget's configured gateway is silent, lookups can still hit
+  // a row from a second gateway pointing at the same PLC. Widget code
+  // calls `liveByKey.lookup(widget)`; we keep `.get(key)` for the
+  // legacy chart-series code path elsewhere.
   const liveByKey = useMemo(() => {
-    const m = new Map();
-    for (const r of liveRows) m.set(`${r.gateway_id}|${r.tag_name}`, r);
-    return m;
+    const byId = new Map();   // `${gateway_id}|${tag}` -> row
+    const byIp = new Map();   // `IP::${plc_ip}|${tag}` -> row
+    for (const r of liveRows) {
+      byId.set(`${r.gateway_id || ""}|${r.tag_name}`, r);
+      if (r.plc_ip) byIp.set(`IP::${r.plc_ip}|${r.tag_name}`, r);
+    }
+    return {
+      get: (key) => byId.get(key),
+      // widget can carry { gateway_id, tag_name, plc_endpoint }; lookup
+      // tries gateway-id first, then plc_endpoint fallback. plc_endpoint
+      // is written by the edge at widget-save time (saveDashboardWidget).
+      lookup: (widget) => {
+        if (!widget?.tag_name) return null;
+        const gid = widget.gateway_id || "";
+        const tag = widget.tag_name;
+        const primary = byId.get(`${gid}|${tag}`);
+        if (primary) return primary;
+        const ip = widget.plc_endpoint || widget.plc_ip || "";
+        if (ip) return byIp.get(`IP::${ip}|${tag}`) || null;
+        return null;
+      },
+    };
   }, [liveRows]);
 
   return h("div", null,
