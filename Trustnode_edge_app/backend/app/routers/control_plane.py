@@ -292,8 +292,36 @@ def upsert_tenant(payload: TenantUpsertRequest, request: Request) -> dict[str, A
     return {"ok": True, "row": row}
 
 
+def _master_wants_all_tenants(request: Request, tenant_id: str | None) -> bool:
+    """True when the caller is the master admin (role=admin AND
+    tenant_id=default in their JWT) AND they're asking for either the
+    explicit `__all__` sentinel or filtering by `default`. The portal's
+    Customers/Edges/Licenses pages have always sent
+    `?tenant_id=default`, which used to return only master's own rows;
+    after per-customer tenancy that filter hides every customer-scoped
+    row, so the page came up empty. Treat it as cross-tenant for the
+    master."""
+    requested = str(tenant_id or "").strip().lower()
+    if requested in ("__all__", "*"):
+        try:
+            payload = _require_auth_payload(request)
+            return _is_global_admin(payload)
+        except Exception:
+            return False
+    if requested in ("", "default"):
+        try:
+            payload = _require_auth_payload(request)
+            return _is_global_admin(payload)
+        except Exception:
+            return False
+    return False
+
+
 @router.get("/customers")
 def list_customers(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    if _master_wants_all_tenants(request, tenant_id):
+        rows = control_plane_store.list_customers(all_tenants=True)
+        return {"ok": True, "tenant_id": "__all__", "rows": rows}
     tid = _scoped_tenant(request, tenant_id)
     return {"ok": True, "tenant_id": tid, "rows": control_plane_store.list_customers(tenant_id=tid)}
 
@@ -401,6 +429,9 @@ def delete_customer_post(request: Request, customer_id: str, tenant_id: str | No
 
 @router.get("/edges")
 def list_edges(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    if _master_wants_all_tenants(request, tenant_id):
+        rows = control_plane_store.list_edges(all_tenants=True)
+        return {"ok": True, "tenant_id": "__all__", "rows": rows}
     tid = _scoped_tenant(request, tenant_id)
     return {"ok": True, "tenant_id": tid, "rows": control_plane_store.list_edges(tenant_id=tid)}
 
@@ -464,6 +495,9 @@ def heartbeat_edge(request: Request, edge_id: str, payload: dict[str, Any] | Non
 
 @router.get("/licenses")
 def list_licenses(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    if _master_wants_all_tenants(request, tenant_id):
+        rows = control_plane_store.list_licenses(all_tenants=True)
+        return {"ok": True, "tenant_id": "__all__", "rows": rows}
     tid = _scoped_tenant(request, tenant_id)
     return {"ok": True, "tenant_id": tid, "rows": control_plane_store.list_licenses(tenant_id=tid)}
 
@@ -791,6 +825,9 @@ def apply_activation_code(payload: ActivationCodeApplyRequest, request: Request)
 
 @router.get("/activation-codes")
 def list_activation_codes(request: Request, tenant_id: str | None = None, customer_id: str = "") -> dict[str, Any]:
+    if _master_wants_all_tenants(request, tenant_id):
+        rows = control_plane_store.list_activation_codes(all_tenants=True, customer_id=customer_id)
+        return {"ok": True, "tenant_id": "__all__", "rows": rows}
     tid = _scoped_tenant(request, tenant_id)
     rows = control_plane_store.list_activation_codes(tenant_id=tid, customer_id=customer_id)
     return {"ok": True, "tenant_id": tid, "rows": rows}

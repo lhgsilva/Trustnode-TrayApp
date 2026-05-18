@@ -416,11 +416,24 @@ class ControlPlaneStore:
                 row = conn.execute("SELECT * FROM cp_tenants WHERE tenant_id=?", (tid,)).fetchone()
         return dict(row) if row else {}
 
-    def list_customers(self, *, tenant_id: str) -> list[dict[str, Any]]:
-        tid = normalize_tenant_id(tenant_id)
+    def list_customers(self, *, tenant_id: str | None = None,
+                       all_tenants: bool = False) -> list[dict[str, Any]]:
+        """List customers. With `all_tenants=True` returns every customer
+        across every tenant — the master admin view, used by the portal's
+        Customers page so newly-created per-customer-tenant rows show up
+        alongside legacy ones."""
         with self._lock:
             with self._connect() as conn:
-                rows = conn.execute("SELECT * FROM cp_customers WHERE tenant_id=? ORDER BY created_utc ASC", (tid,)).fetchall()
+                if all_tenants:
+                    rows = conn.execute(
+                        "SELECT * FROM cp_customers ORDER BY created_utc ASC"
+                    ).fetchall()
+                else:
+                    tid = normalize_tenant_id(tenant_id or "default")
+                    rows = conn.execute(
+                        "SELECT * FROM cp_customers WHERE tenant_id=? ORDER BY created_utc ASC",
+                        (tid,),
+                    ).fetchall()
         return [dict(r) for r in rows]
 
     def get_customer_tenant_id(self, *, customer_id: str) -> str:
@@ -563,11 +576,22 @@ class ControlPlaneStore:
                 conn.commit()
                 return int(cur.rowcount or 0) > 0
 
-    def list_edges(self, *, tenant_id: str) -> list[dict[str, Any]]:
-        tid = normalize_tenant_id(tenant_id)
+    def list_edges(self, *, tenant_id: str | None = None,
+                   all_tenants: bool = False) -> list[dict[str, Any]]:
+        """List edges. With `all_tenants=True` returns every edge across
+        every tenant — the master admin view."""
         with self._lock:
             with self._connect() as conn:
-                rows = conn.execute("SELECT * FROM cp_edges WHERE tenant_id=? ORDER BY created_utc ASC", (tid,)).fetchall()
+                if all_tenants:
+                    rows = conn.execute(
+                        "SELECT * FROM cp_edges ORDER BY created_utc ASC"
+                    ).fetchall()
+                else:
+                    tid = normalize_tenant_id(tenant_id or "default")
+                    rows = conn.execute(
+                        "SELECT * FROM cp_edges WHERE tenant_id=? ORDER BY created_utc ASC",
+                        (tid,),
+                    ).fetchall()
         return [dict(r) for r in rows]
 
     def upsert_edge(self, *, tenant_id: str, edge_id: str, edge_name: str, customer_id: str = "", site: str = "", area: str = "", equipment: str = "", status: str = "inactive", metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -664,11 +688,22 @@ class ControlPlaneStore:
                 conn.commit()
                 return int(cur.rowcount or 0) > 0
 
-    def list_licenses(self, *, tenant_id: str) -> list[dict[str, Any]]:
-        tid = normalize_tenant_id(tenant_id)
+    def list_licenses(self, *, tenant_id: str | None = None,
+                      all_tenants: bool = False) -> list[dict[str, Any]]:
+        """List licenses. With `all_tenants=True` returns every license
+        across every tenant — the master admin view."""
         with self._lock:
             with self._connect() as conn:
-                rows = conn.execute("SELECT * FROM cp_licenses WHERE tenant_id=? ORDER BY created_utc ASC", (tid,)).fetchall()
+                if all_tenants:
+                    rows = conn.execute(
+                        "SELECT * FROM cp_licenses ORDER BY created_utc ASC"
+                    ).fetchall()
+                else:
+                    tid = normalize_tenant_id(tenant_id or "default")
+                    rows = conn.execute(
+                        "SELECT * FROM cp_licenses WHERE tenant_id=? ORDER BY created_utc ASC",
+                        (tid,),
+                    ).fetchall()
         return [dict(r) for r in rows]
 
     def set_license_modules(self, *, license_id: str, modules: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1193,21 +1228,37 @@ class ControlPlaneStore:
                     ).fetchone()
         return dict(row) if row else None
 
-    def list_activation_codes(self, *, tenant_id: str, customer_id: str = "") -> list[dict[str, Any]]:
-        tid = normalize_tenant_id(tenant_id)
+    def list_activation_codes(self, *, tenant_id: str | None = None,
+                              customer_id: str = "",
+                              all_tenants: bool = False) -> list[dict[str, Any]]:
+        """List activation codes. With `all_tenants=True` returns codes
+        across every tenant — the master admin view."""
         cid = str(customer_id or "").strip()
+        cols = "rowid AS id, activation_code, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc"
         with self._lock:
             with self._connect() as conn:
-                if cid:
-                    rows = conn.execute(
-                        "SELECT rowid AS id, activation_code, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? AND customer_id=? ORDER BY rowid DESC LIMIT 300",
-                        (tid, cid),
-                    ).fetchall()
+                if all_tenants:
+                    if cid:
+                        rows = conn.execute(
+                            f"SELECT {cols} FROM cp_edge_activation_codes WHERE customer_id=? ORDER BY rowid DESC LIMIT 300",
+                            (cid,),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            f"SELECT {cols} FROM cp_edge_activation_codes ORDER BY rowid DESC LIMIT 300"
+                        ).fetchall()
                 else:
-                    rows = conn.execute(
-                        "SELECT rowid AS id, activation_code, tenant_id, customer_id, edge_id, license_id, edge_name, expires_utc, used_utc, status, created_utc FROM cp_edge_activation_codes WHERE tenant_id=? ORDER BY rowid DESC LIMIT 300",
-                        (tid,),
-                    ).fetchall()
+                    tid = normalize_tenant_id(tenant_id or "default")
+                    if cid:
+                        rows = conn.execute(
+                            f"SELECT {cols} FROM cp_edge_activation_codes WHERE tenant_id=? AND customer_id=? ORDER BY rowid DESC LIMIT 300",
+                            (tid, cid),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            f"SELECT {cols} FROM cp_edge_activation_codes WHERE tenant_id=? ORDER BY rowid DESC LIMIT 300",
+                            (tid,),
+                        ).fetchall()
         return [dict(r) for r in rows]
 
     def update_activation_code(self, *, tenant_id: str, row_id: int, status: str = "", expires_utc: str = "") -> dict[str, Any]:
