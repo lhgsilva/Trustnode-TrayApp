@@ -36,7 +36,29 @@ def _resolve_prefer_cloud_reads(request: Request, prefer_cloud: str = "") -> boo
     return bool(host and host not in {"localhost", "127.0.0.1", "::1"})
 
 
-def _build_scope_key(request: Request, bootstrap_hint: Dict[str, Any] | None = None) -> str:
+# Domains that represent COMPANY ASSETS shared by every operator on the
+# same edge. Their scope_key drops the trailing `|<username>` segment so
+# everyone reading the same edge sees the same gateways, databases,
+# meters, reports, alarm rules, etc.
+#
+# Per-user domains (NOT in this set) keep the full
+# `tenant|customer|edge|username` key — dashboards, app_settings, the
+# user's personal preferences.
+_SHARED_EDGE_DOMAINS = frozenset({
+    "gateway_configurations",   # physical PLC/OPC gateways
+    "database_configurations",  # DB sinks for historian writes
+    "power_management_config",  # power-meter device list
+    "devices",                  # device catalog
+    "triggers_limits",          # alarm rules
+    "alarms_setup",             # alarm event log
+    "reporting_setup",          # report templates + schedules
+    "tags",                     # tag catalog
+    "email_notifications",      # email server config
+})
+
+
+def _build_scope_key(request: Request, bootstrap_hint: Dict[str, Any] | None = None,
+                     *, domain: str | None = None) -> str:
     payload = getattr(request.state, "user_payload", {}) or {}
     username = str(payload.get("sub") or "").strip().lower()
     tenant_id = str(payload.get("tenant_id") or get_current_tenant() or "default").strip().lower()
@@ -53,7 +75,13 @@ def _build_scope_key(request: Request, bootstrap_hint: Dict[str, Any] | None = N
         str(edge_profile.get("linked_customer_id") or "").strip().lower()
         or str(bootstrap.get("customer_id") or "").strip().lower()
     )
-    if not username or not edge_id:
+    if not edge_id:
+        return ""
+    # Shared domains drop the user segment so every operator on the edge
+    # reads/writes the same row.
+    if domain and str(domain).lower() in _SHARED_EDGE_DOMAINS:
+        return f"{tenant_id}|{customer_id or '-'}|{edge_id}"
+    if not username:
         return ""
     return f"{tenant_id}|{customer_id or '-'}|{edge_id}|{username}"
 
@@ -147,30 +175,76 @@ def get_bootstrap(request: Request) -> dict:
     # Bootstrap configuration must be served from local app-store authority
     # to keep cloud client UI consistent and avoid stale/slow cloud-read drift.
     prefer_cloud_reads = False
-    scope_key = _build_scope_key(request)
-    data = app_store.get_bootstrap_scoped(scope_key, prefer_cloud_reads=prefer_cloud_reads) if scope_key else app_store.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
+    user_scope = _build_scope_key(request)
+    shared_scope = _build_scope_key(request, domain=next(iter(_SHARED_EDGE_DOMAINS)))
+    # Start from the user-scoped view (which already overlays the global
+    # bootstrap), then overlay the shared-edge scope so company assets
+    # (gateways, DBs, alarm rules, …) are always the same for every user.
+    if user_scope:
+        data = app_store.get_bootstrap_scoped(user_scope, prefer_cloud_reads=prefer_cloud_reads)
+    else:
+        data = app_store.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
+    if shared_scope and shared_scope != user_scope:
+        try:
+            shared = app_store.get_bootstrap_scoped(shared_scope, prefer_cloud_reads=prefer_cloud_reads)
+            for d in _SHARED_EDGE_DOMAINS:
+                if d in shared:
+                    data[d] = shared[d]
+        except Exception:
+            pass
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
-        "scope_key": scope_key,
+        "scope_key": user_scope,
+        "shared_scope_key": shared_scope,
         "data": data,
     }
 
 
 @router.put("/bootstrap")
 def save_bootstrap(payload: BootstrapSaveRequest, request: Request) -> dict:
-    scope_key = _build_scope_key(request, payload.data if isinstance(payload.data, dict) else None)
-    versions = (
-        app_store.save_bootstrap_scoped(scope_key, payload.data, actor=payload.actor)
-        if scope_key
-        else app_store.save_bootstrap(payload.data, actor=payload.actor)
+    # Split the bootstrap payload by scope: shared-edge domains go to the
+    # per-edge scope key, personal domains to the per-user scope key. This
+    # is what lets every operator on the same edge see the same gateways,
+    # databases, alarm rules, etc., while keeping each user's dashboard
+    # layout private to them.
+    user_scope = _build_scope_key(request, payload.data if isinstance(payload.data, dict) else None)
+    shared_scope = _build_scope_key(
+        request, payload.data if isinstance(payload.data, dict) else None,
+        domain=next(iter(_SHARED_EDGE_DOMAINS)),
     )
-    return {"ok": True, "tenant_id": get_current_tenant(), "scope_key": scope_key, "versions": versions}
+    if not user_scope and not shared_scope:
+        versions = app_store.save_bootstrap(payload.data, actor=payload.actor)
+        return {"ok": True, "tenant_id": get_current_tenant(), "scope_key": "", "versions": versions}
+
+    versions: Dict[str, Any] = {}
+    user_payload: Dict[str, Any] = {}
+    shared_payload: Dict[str, Any] = {}
+    for domain, value in (payload.data or {}).items():
+        if not isinstance(domain, str) or not domain.strip():
+            continue
+        if domain.strip().lower() in _SHARED_EDGE_DOMAINS:
+            shared_payload[domain] = value
+        else:
+            user_payload[domain] = value
+    if user_payload and user_scope:
+        versions.update(app_store.save_bootstrap_scoped(user_scope, user_payload, actor=payload.actor))
+    if shared_payload and shared_scope:
+        versions.update(app_store.save_bootstrap_scoped(shared_scope, shared_payload, actor=payload.actor))
+    return {
+        "ok": True, "tenant_id": get_current_tenant(),
+        "scope_key": user_scope, "shared_scope_key": shared_scope,
+        "versions": versions,
+    }
 
 
 @router.put("/domain")
 def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
-    scope_key = _build_scope_key(request)
+    # Shared domains (gateway_configurations, database_configurations,
+    # power_management_config, …) use a per-edge scope so every operator
+    # on the same physical edge shares the company assets. Personal
+    # domains (dashboards, app_settings) keep the per-user scope.
+    scope_key = _build_scope_key(request, domain=payload.domain)
     result = (
         app_store.upsert_domain_scoped(scope_key, payload.domain, payload.payload, actor=payload.actor)
         if scope_key
