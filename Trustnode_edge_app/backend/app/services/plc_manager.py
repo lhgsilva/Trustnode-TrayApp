@@ -451,6 +451,18 @@ class GatewayWorker:
         def _norm_tag(t: str) -> str:
             return str(t or "").strip().replace(" ", "").lower()
 
+        # Reduce a configured tag name to its controller-tag base so we
+        # can validate it against pycomm3's `plc.tags` dict, which only
+        # carries base names. A user-configured `SimREAL[3]` needs to
+        # match the controller's `SimREAL` (array tag), and
+        # `MyStruct.field[2]` should match `MyStruct`. We strip array
+        # subscripts from every segment and take the first one.
+        import re as _re
+        def _tag_base_for_validation(t: str) -> str:
+            cleaned = _re.sub(r"\[[^\]]*\]", "", str(t or "").strip())
+            # Take the controller-tag root (everything before the first '.').
+            return cleaned.split(".", 1)[0]
+
         for path in candidate_paths:
             try:
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -461,7 +473,21 @@ class GatewayWorker:
                 if isinstance(getattr(plc, "tags", None), dict):
                     known_tags = {str(k).strip() for k in plc.tags.keys() if str(k).strip()}
                 if known_tags:
-                    missing = [t for t in tags if t not in known_tags]
+                    # Compare BASE names (sans [N] subscripts and .members)
+                    # against pycomm3's tag dict. The actual read further
+                    # below uses the full configured string, so out-of-
+                    # range subscripts (e.g. SimDINT[99] when the array
+                    # is size 10) still surface as a per-tag read error
+                    # — they just don't fail this presence check.
+                    # Program-scoped tags ("Program:Foo.bar") are skipped
+                    # because we open with init_program_tags=False; their
+                    # base name won't be in known_tags but they're valid.
+                    def _validatable(t: str) -> bool:
+                        return not str(t or "").strip().startswith("Program:")
+                    missing = [
+                        t for t in tags
+                        if _validatable(t) and _tag_base_for_validation(t) not in known_tags
+                    ]
                     if missing:
                         raise RuntimeError(
                             f"Configured AB tags not found in controller ({len(missing)}): {', '.join(missing[:8])}"
