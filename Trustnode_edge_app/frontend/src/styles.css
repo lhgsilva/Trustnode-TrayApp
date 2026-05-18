@@ -2728,12 +2728,24 @@ input[type="checkbox"] {
 
 .modal-card {
   width: min(430px, 96vw);
+  /* Cap the modal at the viewport so long forms (permission groups,
+     temp-password reveal, etc.) become internally scrollable instead
+     of bleeding off the bottom of the screen. */
+  max-height: 92vh;
+  max-height: 92dvh;
+  overflow-y: auto;
   background: var(--card);
   border: 1px solid var(--stroke);
   border-radius: 14px;
   padding: 16px;
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
+}
+
+/* The Edit User modal carries many permission groups + module checkboxes;
+   needs more horizontal room than the 430-px default. */
+.edit-user-modal {
+  width: min(820px, 96vw);
 }
 
 .modal-card input,

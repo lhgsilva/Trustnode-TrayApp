@@ -13688,7 +13688,7 @@ const getGatewayHealth = (gateway) => {
         await refreshControlPlaneUsers(tenantScope);
         await refreshControlPlaneData(tenantScope);
         // Local desktop only: keep users_access mirror for bootstrap compatibility.
-        if (!isHostedWebClientRuntime()) {
+        if (!isHostedWebClient) {
           await saveAppStoreDomain(
             "users_access",
             { users: nextUsers, current_user: currentUser?.username || "" },
@@ -13702,7 +13702,7 @@ const getGatewayHealth = (gateway) => {
           role: "viewer",
           permissions: buildRolePermissions("viewer")
         });
-        if (!isHostedWebClientRuntime()) {
+        if (!isHostedWebClient) {
           try {
             await forceAppStoreSyncNow(actor);
           } catch {
@@ -14015,6 +14015,28 @@ const getGatewayHealth = (gateway) => {
     currentUser.permissions?.users_and_access_control
   );
 
+  // Master / developer admin: role=admin AND tenant=default. This mirrors
+  // the backend's _is_global_admin helper. Master admin can see every
+  // customer and every user across the platform. Regular tenant admins
+  // see only their own tenant's records.
+  const isMasterAdmin = Boolean(
+    currentUser &&
+    String(currentUser.role || "").toLowerCase() === "admin" &&
+    String(currentUser.tenant_id || "default").toLowerCase() === "default"
+  );
+
+  // When a tenant admin logs in, default the customer filter to their
+  // own customer instead of "All customers". Master admins keep the
+  // open selector. Re-runs whenever the customer list arrives.
+  useEffect(() => {
+    if (isMasterAdmin) return;  // master admin chooses freely
+    if (!Array.isArray(cpCustomers) || !cpCustomers.length) return;
+    if (cpCustomerFilter && cpCustomerFilter !== "__all__") return;
+    // Tenant admins typically belong to a single customer; pick the first one.
+    const first = String(cpCustomers[0]?.customer_id || "");
+    if (first) setCpCustomerFilter(first);
+  }, [isMasterAdmin, cpCustomers, cpCustomerFilter]);
+
   const openEditUser = (user) => {
     if (!canManageUsers || !user) return;
     setEditingUsername(String(user.username || ""));
@@ -14061,7 +14083,7 @@ const getGatewayHealth = (gateway) => {
       .then(async () => {
         await refreshControlPlaneUsers(tenantScope);
         await refreshControlPlaneData(tenantScope);
-        if (!isHostedWebClientRuntime()) {
+        if (!isHostedWebClient) {
           await saveAppStoreDomain(
             "users_access",
             { users: nextUsers, current_user: currentUser?.username || "" },
@@ -14083,7 +14105,7 @@ const getGatewayHealth = (gateway) => {
         setShowEditUserModal(false);
         setEditingUsername("");
         setError("");
-        if (!isHostedWebClientRuntime()) {
+        if (!isHostedWebClient) {
           try {
             await forceAppStoreSyncNow(actor);
           } catch {
@@ -14112,7 +14134,7 @@ const getGatewayHealth = (gateway) => {
         .then(async () => {
           await refreshControlPlaneUsers(tenantScope);
           await refreshControlPlaneData(tenantScope);
-          if (!isHostedWebClientRuntime()) {
+          if (!isHostedWebClient) {
             await saveAppStoreDomain(
               "users_access",
               { users: nextUsers, current_user: currentUser?.username || "" },
@@ -14121,7 +14143,7 @@ const getGatewayHealth = (gateway) => {
           }
           setError("");
           if (currentUser?.username === target) logout();
-          if (!isHostedWebClientRuntime()) {
+          if (!isHostedWebClient) {
             try {
               await forceAppStoreSyncNow(actor);
             } catch {
@@ -14354,8 +14376,16 @@ const getGatewayHealth = (gateway) => {
                     <button className={`nav-item nav-subitem ${cpPortalPage === "interface" ? "active" : ""}`} onClick={() => openPortalPage("interface")}><span className="nav-icon"><MenuIcon page="interface" /></span><span>Interface</span></button>
                     <div className="portal-filter-block">
                       <label style={{ fontSize: 12, color: "var(--muted)" }}>Customer</label>
-                      <select value={cpCustomerFilter} onChange={(e) => setCpCustomerFilter(e.target.value)}>
-                        <option value="__all__">All customers</option>
+                      <select
+                        value={cpCustomerFilter}
+                        onChange={(e) => setCpCustomerFilter(e.target.value)}
+                        disabled={!isMasterAdmin}
+                        title={isMasterAdmin ? "" : "Tenant admins see their own customer only — locked to your tenant"}
+                      >
+                        {/* Only master admin (the developer / default-tenant
+                            admin) can switch between customers. Tenant
+                            admins see only their company. */}
+                        {isMasterAdmin ? <option value="__all__">All customers</option> : null}
                         {cpCustomerOptions.map((c) => (
                           <option key={`cp-side-filter-${c.customer_id}`} value={c.customer_id}>
                             {c.company_name || c.customer_id}
@@ -17708,8 +17738,13 @@ const getGatewayHealth = (gateway) => {
                   <div className="form-grid" style={{ marginTop: 12 }}>
                     <label>
                       Customer Filter
-                      <select value={cpCustomerFilter} onChange={(e) => setCpCustomerFilter(e.target.value)}>
-                        <option value="__all__">All customers</option>
+                      <select
+                        value={cpCustomerFilter}
+                        onChange={(e) => setCpCustomerFilter(e.target.value)}
+                        disabled={!isMasterAdmin}
+                        title={isMasterAdmin ? "" : "Tenant admins see their own customer only"}
+                      >
+                        {isMasterAdmin ? <option value="__all__">All customers</option> : null}
                         {cpCustomerOptions.map((c) => (
                           <option key={`cp-filter-${c.customer_id}`} value={c.customer_id}>
                             {c.company_name || c.customer_id}
@@ -20413,7 +20448,7 @@ const getGatewayHealth = (gateway) => {
       ) : null}
       {showEditUserModal ? (
         <div className="modal-backdrop">
-          <div className="modal-card trigger-modal-card">
+          <div className="modal-card edit-user-modal">
             <h3>Edit User</h3>
             <div className="trigger-form-grid">
               <label>
