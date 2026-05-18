@@ -298,11 +298,42 @@ def list_customers(request: Request, tenant_id: str | None = None) -> dict[str, 
     return {"ok": True, "tenant_id": tid, "rows": control_plane_store.list_customers(tenant_id=tid)}
 
 
+def _customer_tenant_id(customer_id: str) -> str:
+    """Canonical per-customer tenant slug. Decided 2026-05-18.
+    Format: 'tenant-<customer_id>'. customer_id is already required to be
+    URL-safe at the portal level, so no sanitization needed here."""
+    cid = str(customer_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="customer_id is required for tenant assignment")
+    return f"tenant-{cid}"
+
+
 @router.post("/customers")
 def upsert_customer(payload: CustomerUpsertRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    # Authorize against the *caller's* tenant (master admin's `default` for
+    # cross-tenant creates), then assign the *customer's* per-customer
+    # tenant. Each customer gets their own tenant — that's what makes the
+    # existing Lite RLS isolate them from each other.
+    _scoped_tenant(request, tenant_id, require_admin_write=True)
+    assigned_tenant = _customer_tenant_id(payload.customer_id)
+    # Ensure the per-customer tenant exists before inserting the customer
+    # row (cp_customers.tenant_id has a foreign key to cp_tenants).
+    try:
+        control_plane_store.upsert_tenant(
+            tenant_id=assigned_tenant,
+            name=payload.company_name or payload.customer_id,
+            status="active",
+            primary_domain="",
+            timezone_name="UTC",
+            metadata={"source": "per_customer_auto", "customer_id": payload.customer_id},
+        )
+    except Exception as exc:
+        # If tenant creation fails for any reason, surface it rather than
+        # silently dropping the customer onto 'default' (which would
+        # reopen the cross-tenant leak).
+        raise HTTPException(status_code=500, detail=f"failed to provision per-customer tenant: {exc}") from exc
     row = control_plane_store.upsert_customer(
-        tenant_id=tid,
+        tenant_id=assigned_tenant,
         customer_id=payload.customer_id,
         company_name=payload.company_name,
         contact_email=payload.contact_email,
@@ -311,12 +342,12 @@ def upsert_customer(payload: CustomerUpsertRequest, request: Request, tenant_id:
     )
     _audit(
         request,
-        tenant_id=tid,
+        tenant_id=assigned_tenant,
         action="customer.upsert",
         outcome="ok",
-        details={"customer_id": row.get("customer_id", "")},
+        details={"customer_id": row.get("customer_id", ""), "assigned_tenant": assigned_tenant},
     )
-    return {"ok": True, "tenant_id": tid, "row": row}
+    return {"ok": True, "tenant_id": assigned_tenant, "row": row}
 
 
 @router.delete("/customers/{customer_id}")
@@ -346,9 +377,16 @@ def list_edges(request: Request, tenant_id: str | None = None) -> dict[str, Any]
 
 @router.post("/edges")
 def upsert_edge(payload: EdgeUpsertRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    # Authorize against the caller's tenant, then put the edge on its
+    # owning customer's tenant. If no customer_id is supplied, fall back
+    # to the caller's tenant (master may create unowned edges; tenant
+    # users without a customer is undefined and rejected upstream).
+    caller_tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    assigned_tenant = (
+        _customer_tenant_id(payload.customer_id) if str(payload.customer_id or "").strip() else caller_tid
+    )
     row = control_plane_store.upsert_edge(
-        tenant_id=tid,
+        tenant_id=assigned_tenant,
         edge_id=payload.edge_id,
         edge_name=payload.edge_name,
         customer_id=payload.customer_id,
@@ -360,12 +398,12 @@ def upsert_edge(payload: EdgeUpsertRequest, request: Request, tenant_id: str | N
     )
     _audit(
         request,
-        tenant_id=tid,
+        tenant_id=assigned_tenant,
         action="edge.upsert",
         outcome="ok",
-        details={"edge_id": row.get("edge_id", "")},
+        details={"edge_id": row.get("edge_id", ""), "assigned_tenant": assigned_tenant},
     )
-    return {"ok": True, "tenant_id": tid, "row": row}
+    return {"ok": True, "tenant_id": assigned_tenant, "row": row}
 
 
 @router.delete("/edges/{edge_id}")
@@ -402,9 +440,14 @@ def list_licenses(request: Request, tenant_id: str | None = None) -> dict[str, A
 
 @router.post("/licenses")
 def upsert_license(payload: LicenseUpsertRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    # Same pattern as customers/edges: authorize the caller, then put the
+    # license on the customer's per-customer tenant.
+    caller_tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    assigned_tenant = (
+        _customer_tenant_id(payload.customer_id) if str(payload.customer_id or "").strip() else caller_tid
+    )
     row = control_plane_store.upsert_license(
-        tenant_id=tid,
+        tenant_id=assigned_tenant,
         license_id=payload.license_id,
         customer_id=payload.customer_id,
         plan_code=payload.plan_code,
@@ -417,12 +460,12 @@ def upsert_license(payload: LicenseUpsertRequest, request: Request, tenant_id: s
     )
     _audit(
         request,
-        tenant_id=tid,
+        tenant_id=assigned_tenant,
         action="license.upsert",
         outcome="ok",
-        details={"license_id": row.get("license_id", "")},
+        details={"license_id": row.get("license_id", ""), "assigned_tenant": assigned_tenant},
     )
-    return {"ok": True, "tenant_id": tid, "row": row}
+    return {"ok": True, "tenant_id": assigned_tenant, "row": row}
 
 
 @router.delete("/licenses/{license_id}")
@@ -493,9 +536,16 @@ def list_users(request: Request, tenant_id: str | None = None) -> dict[str, Any]
 
 @router.post("/users")
 def upsert_user(payload: UserUpsertRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    # Per-customer tenancy: the user lives on the customer's tenant, not
+    # the caller's. master admin creating a Lite user for Customer A
+    # writes the user under 'tenant-<A>'. Without a customer_id we fall
+    # back to the caller's tenant (master's own staff accounts).
+    caller_tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    assigned_tenant = (
+        _customer_tenant_id(payload.customer_id) if str(payload.customer_id or "").strip() else caller_tid
+    )
     row = control_plane_store.upsert_user(
-        tenant_id=tid,
+        tenant_id=assigned_tenant,
         customer_id=payload.customer_id,
         username=payload.username,
         password=payload.password,
@@ -507,7 +557,8 @@ def upsert_user(payload: UserUpsertRequest, request: Request, tenant_id: str | N
         permissions=payload.permissions,
     )
     row.pop("password_hash", None)
-    _audit(request, tenant_id=tid, action="user.upsert", outcome="ok", details={"username": payload.username})
+    _audit(request, tenant_id=assigned_tenant, action="user.upsert", outcome="ok",
+           details={"username": payload.username, "assigned_tenant": assigned_tenant})
     # Mirror the user to Supabase Auth + lite_profiles so the same login
     # works in the cloud Lite app under the same tenant. Best-effort —
     # the local save above is the source of truth; cloud mirror is a
@@ -515,7 +566,7 @@ def upsert_user(payload: UserUpsertRequest, request: Request, tenant_id: str | N
     try:
         from app.services.lite_user_mirror import mirror_user_upsert
         mirror_user_upsert(
-            tenant_id=tid,
+            tenant_id=assigned_tenant,
             username=payload.username,
             password=payload.password,
             role=payload.role,
@@ -523,7 +574,7 @@ def upsert_user(payload: UserUpsertRequest, request: Request, tenant_id: str | N
         )
     except Exception:
         pass
-    return {"ok": True, "tenant_id": tid, "row": row}
+    return {"ok": True, "tenant_id": assigned_tenant, "row": row}
 
 
 @router.delete("/users/{username}")
@@ -620,10 +671,18 @@ def delete_user_post(request: Request, username: str, tenant_id: str | None = No
 
 @router.post("/activation-code/issue")
 def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    # The activation code is what the edge reads to know which tenant it
+    # belongs to (edge_link/local-finalize uses payload.tenant_id). For
+    # per-customer isolation that MUST be the customer's tenant, not the
+    # master admin's `default`. Force it here regardless of what the
+    # portal sent in the request.
+    caller_tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    assigned_tenant = (
+        _customer_tenant_id(payload.customer_id) if str(payload.customer_id or "").strip() else caller_tid
+    )
     try:
         row = control_plane_store.issue_activation_code(
-            tenant_id=tid,
+            tenant_id=assigned_tenant,
             customer_id=payload.customer_id,
             edge_id=payload.edge_id,
             license_id=payload.license_id,
@@ -634,7 +693,7 @@ def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request,
     except Exception as exc:
         _audit(
             request,
-            tenant_id=tid,
+            tenant_id=assigned_tenant,
             action="activation_code.issue",
             outcome="error",
             details={
@@ -647,7 +706,7 @@ def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _audit(
         request,
-        tenant_id=tid,
+        tenant_id=assigned_tenant,
         action="activation_code.issue",
         outcome="ok",
         details={
@@ -655,9 +714,10 @@ def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request,
             "edge_id": payload.edge_id,
             "license_id": payload.license_id,
             "edge_name": payload.edge_name,
+            "assigned_tenant": assigned_tenant,
         },
     )
-    return {"ok": True, "tenant_id": tid, "row": row}
+    return {"ok": True, "tenant_id": assigned_tenant, "row": row}
 
 
 @router.post("/activation-code/apply")
@@ -1550,6 +1610,19 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
             raise ValueError("customer_id_missing_for_local_finalize")
         if not license_id:
             raise ValueError("license_id_missing_for_local_finalize")
+
+        # Per-customer tenant guard (decided 2026-05-18): every customer
+        # gets their own tenant slug 'tenant-<customer_id>'. If the cloud
+        # bootstrap returned 'default' for a customer-scoped activation,
+        # the portal hasn't been upgraded to per-customer tenancy yet and
+        # finalizing the edge here would tag every write with 'default'
+        # — which breaks Lite isolation between customers.
+        expected_tenant = f"tenant-{customer_id}"
+        if tenant_id == "default" and customer_id:
+            raise ValueError(
+                f"tenant_id_default_with_customer_id (got 'default', expected '{expected_tenant}'). "
+                "Cloud portal is on an older build; apply the per-customer tenancy migration before activating."
+            )
 
         # Materialize local control-plane scope so license-check can validate immediately.
         step = "upsert_customer"
