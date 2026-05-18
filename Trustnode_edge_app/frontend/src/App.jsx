@@ -90,6 +90,9 @@ import {
   getControlPlaneUsers,
   upsertControlPlaneUser,
   deleteControlPlaneUser,
+  setControlPlaneUserPassword,
+  generateControlPlaneUserTempPassword,
+  changeOwnPassword,
   issueControlPlaneActivationCode,
   applyControlPlaneActivationCode,
   getControlPlaneActivationCodes,
@@ -1310,6 +1313,15 @@ function DeleteIcon() {
   );
 }
 
+function KeyIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="7.5" cy="15.5" r="3.5" />
+      <path d="M10 13l7-7m2 0l2 2m-4-2l3 3" />
+    </svg>
+  );
+}
+
 function SaveIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -2111,6 +2123,12 @@ function AppShell() {
   const [dbModalPresetScope, setDbModalPresetScope] = useState("gateway");
   const [showTagMonitorModal, setShowTagMonitorModal] = useState(false);
   const [tagMonitorSelection, setTagMonitorSelection] = useState(null);
+  // Portal: in-line user editor + temp-password reveal popover.
+  const [cpEditUser, setCpEditUser] = useState(null);
+  const [cpTempPasswordReveal, setCpTempPasswordReveal] = useState(null);
+  // After login, when must_change_password is true we surface the
+  // change-password modal before the user reaches any dashboard.
+  const [forceChangePassword, setForceChangePassword] = useState(null);
   const [dashboardWidgets, setDashboardWidgets] = useState([]);
   const [dashboardTagColors, setDashboardTagColors] = useState({});
   const [dashboardMode, setDashboardMode] = useState("kpi");
@@ -13455,24 +13473,104 @@ const getGatewayHealth = (gateway) => {
   const deleteCpUser = (username) => {
     const target = String(username || "").trim();
     if (!target || target.toLowerCase() === "admin") return;
-    setConfirmModal({
-      open: true,
-      title: "Delete User",
-      message: `Delete user '${target}' from control-plane?`,
-      onConfirm: async () => {
+    withConfirm("Delete User", `Delete user '${target}' from control-plane?`, async () => {
+      setCpBusy(true);
+      try {
+        const scopedTenant = getControlPlaneTenantScope();
+        await deleteControlPlaneUser(target, scopedTenant);
+        setCpResult(`User '${target}' deleted.`);
+        await refreshControlPlaneUsers(scopedTenant);
+      } catch (err) {
+        setCpResult(`User delete failed: ${String(err?.message || err)}`);
+      } finally {
+        setCpBusy(false);
+      }
+    });
+  };
+
+  // Open the inline edit-user modal pre-populated with the row's data.
+  // The modal lets the admin update role / email / status / customer
+  // and optionally set a new password (which mirrors to Supabase too).
+  const openEditCpUser = (row) => {
+    if (!row) return;
+    setCpEditUser({
+      username: String(row.username || ""),
+      role: String(row.role || "viewer"),
+      status: String(row.status || "active"),
+      email: String(row.email || ""),
+      customer_id: String(row.customer_id || ""),
+      new_password: "",
+      must_change: false,
+    });
+  };
+
+  // Save the edit-user modal.
+  const saveEditCpUser = async () => {
+    if (!cpEditUser?.username) return;
+    setCpBusy(true);
+    try {
+      const scopedTenant = getControlPlaneTenantScope();
+      // First upsert role/email/status/customer (no password — leave the
+      // existing one alone unless the admin explicitly typed a new one).
+      await upsertControlPlaneUser(
+        {
+          username: cpEditUser.username,
+          role: cpEditUser.role,
+          status: cpEditUser.status,
+          email: cpEditUser.email,
+          customer_id: cpEditUser.customer_id,
+          mfa_enabled: false,
+        },
+        scopedTenant,
+      );
+      // If the admin typed a new password, install it (and optionally
+      // flag must_change_password so the user has to change on next
+      // login). This also mirrors to Supabase Auth via the backend.
+      if (cpEditUser.new_password && cpEditUser.new_password.length >= 6) {
+        await setControlPlaneUserPassword(
+          cpEditUser.username,
+          cpEditUser.new_password,
+          !!cpEditUser.must_change,
+          scopedTenant,
+        );
+      }
+      setCpResult(`User '${cpEditUser.username}' updated.`);
+      setCpEditUser(null);
+      await refreshControlPlaneUsers(scopedTenant);
+    } catch (err) {
+      setCpResult(`User update failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpBusy(false);
+    }
+  };
+
+  // Roll a fresh temp password for the user, install it on the edge AND
+  // mirror to Supabase, then show the plaintext in a popover the admin
+  // can copy. The password is only displayed once.
+  const issueCpUserTempPassword = (row) => {
+    if (!row?.username) return;
+    const uname = String(row.username);
+    withConfirm(
+      "Reset Password",
+      `Issue a temporary password for '${uname}'? The user must change it on their next login (works on the edge app and the Lite cloud app).`,
+      async () => {
         setCpBusy(true);
         try {
           const scopedTenant = getControlPlaneTenantScope();
-          await deleteControlPlaneUser(target, scopedTenant);
-          setCpResult(`User '${target}' deleted.`);
+          const res = await generateControlPlaneUserTempPassword(uname, 14, scopedTenant);
+          setCpTempPasswordReveal({
+            username: uname,
+            password: String(res?.temp_password || ""),
+            email: String(row?.email || `${uname}@trustnode.local`),
+          });
           await refreshControlPlaneUsers(scopedTenant);
         } catch (err) {
-          setCpResult(`User delete failed: ${String(err?.message || err)}`);
+          setCpResult(`Temp password failed: ${String(err?.message || err)}`);
         } finally {
           setCpBusy(false);
         }
       },
-    });
+    );
   };
 
   const bulkDeleteCpItems = (group, rows, keyFn, deleteFn, label) => {
@@ -14020,6 +14118,12 @@ const getGatewayHealth = (gateway) => {
             onLoginSuccess={(user) => {
               setCurrentUser(user);
               setActivePage("dashboard");
+              // Backend flags must_change_password=true after an admin
+              // issues a temporary password. Pop the change-password
+              // modal so the user can't skip it.
+              if (user && user.must_change_password) {
+                setForceChangePassword({ current: "", next: "", confirm: "", error: "", busy: false });
+              }
             }}
           />
         </div>
@@ -17935,21 +18039,55 @@ const getGatewayHealth = (gateway) => {
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
                         <div className="table cp-users-table">
-                          <div className="thead"><span><input type="checkbox" checked={cpUsersFiltered.length > 0 && cpUsersFiltered.every((row) => isCpRowSelected("users", row?.username))} onChange={(e) => setCpRowsSelectedAll("users", cpUsersFiltered, (row) => row?.username, e.target.checked)} /></span><span>Username</span><span>Company</span><span>Role</span><span>Email</span><span>Status</span><span>MFA</span><span>Actions</span></div>
-                          {(cpUsersFiltered || []).map((row, idx) => (
-                            <div className="trow" key={`cp-user-${idx}`}>
-                              <span><input type="checkbox" checked={isCpRowSelected("users", row?.username)} onChange={(e) => setCpRowSelected("users", row?.username, e.target.checked)} disabled={String(row?.username || "").toLowerCase() === "admin"} /></span>
-                              <span>{String(row?.username || "-")}</span>
-                              <span>{String(customerNameById.get(String(row?.customer_id || "").trim()) || (row?.customer_id ? String(row.customer_id) : "-"))}</span>
-                              <span>{String(row?.role || "-")}</span>
-                              <span>{String(row?.email || "-")}</span>
-                              <span>{String(row?.status || "-")}</span>
-                              <span>{Boolean(row?.mfa_enabled) ? "yes" : "no"}</span>
-                              <span className="row-actions">
-                                <button className="icon-btn danger table-action-btn" onClick={() => deleteCpUser(String(row?.username || ""))} disabled={cpBusy || !canEditPage("control_plane") || String(row?.username || "").toLowerCase() === "admin"} title="Delete"><DeleteIcon /></button>
-                              </span>
-                            </div>
-                          ))}
+                          <div className="thead">
+                            <span><input type="checkbox" checked={cpUsersFiltered.length > 0 && cpUsersFiltered.every((row) => isCpRowSelected("users", row?.username))} onChange={(e) => setCpRowsSelectedAll("users", cpUsersFiltered, (row) => row?.username, e.target.checked)} /></span>
+                            <span>Username</span>
+                            <span>Company</span>
+                            <span>Role</span>
+                            <span>Email</span>
+                            <span>Status</span>
+                            <span>MFA</span>
+                            <span style={{ textAlign: "right" }}>Actions</span>
+                          </div>
+                          {(cpUsersFiltered || []).map((row, idx) => {
+                            const uname = String(row?.username || "");
+                            const isBuiltin = uname.toLowerCase() === "admin";
+                            const mustChange = Boolean(row?.must_change_password);
+                            return (
+                              <div className="trow" key={`cp-user-${idx}`}>
+                                <span><input type="checkbox" checked={isCpRowSelected("users", row?.username)} onChange={(e) => setCpRowSelected("users", row?.username, e.target.checked)} disabled={isBuiltin} /></span>
+                                <span>
+                                  {uname || "-"}
+                                  {mustChange ? <span className="must-change-pill" title="Temp password issued — user must change on next login">TEMP</span> : null}
+                                </span>
+                                <span>{String(customerNameById.get(String(row?.customer_id || "").trim()) || (row?.customer_id ? String(row.customer_id) : "-"))}</span>
+                                <span>{String(row?.role || "-")}</span>
+                                <span>{String(row?.email || "-")}</span>
+                                <span>{String(row?.status || "-")}</span>
+                                <span>{Boolean(row?.mfa_enabled) ? "yes" : "no"}</span>
+                                <span className="row-actions">
+                                  <button
+                                    className="icon-btn table-action-btn"
+                                    onClick={() => openEditCpUser(row)}
+                                    disabled={cpBusy || !canEditPage("control_plane") || isBuiltin}
+                                    title="Edit user"
+                                  ><EditIcon /></button>
+                                  <button
+                                    className="icon-btn table-action-btn"
+                                    onClick={() => issueCpUserTempPassword(row)}
+                                    disabled={cpBusy || !canEditPage("control_plane") || isBuiltin}
+                                    title="Reset to temporary password"
+                                  ><KeyIcon /></button>
+                                  <button
+                                    className="icon-btn danger table-action-btn"
+                                    onClick={() => deleteCpUser(uname)}
+                                    disabled={cpBusy || !canEditPage("control_plane") || isBuiltin}
+                                    title="Delete user"
+                                  ><DeleteIcon /></button>
+                                </span>
+                              </div>
+                            );
+                          })}
                           {!cpUsersFiltered?.length ? <div className="trow"><span>-</span><span>-</span><span>-</span><span>No users found</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
@@ -21075,6 +21213,202 @@ const getGatewayHealth = (gateway) => {
             <div className="row modal-actions">
               <button className="btn btn-danger" onClick={confirmAndRun}>Confirm</button>
               <button className="btn btn-primary" onClick={closeConfirmDialog}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Portal: edit user inline modal */}
+      {cpEditUser ? (
+        <div className="modal-backdrop">
+          <div className="modal-card" style={{ minWidth: 420 }}>
+            <h3>Edit user — {cpEditUser.username}</h3>
+            <div className="form-grid" style={{ marginTop: 8 }}>
+              <label>
+                Role
+                <select
+                  value={cpEditUser.role}
+                  onChange={(e) => setCpEditUser((p) => ({ ...p, role: e.target.value }))}
+                >
+                  <option value="admin">admin</option>
+                  <option value="operator">operator</option>
+                  <option value="engineer">engineer</option>
+                  <option value="viewer">viewer</option>
+                  <option value="client">client</option>
+                </select>
+              </label>
+              <label>
+                Status
+                <select
+                  value={cpEditUser.status}
+                  onChange={(e) => setCpEditUser((p) => ({ ...p, status: e.target.value }))}
+                >
+                  <option value="active">active</option>
+                  <option value="suspended">suspended</option>
+                </select>
+              </label>
+              <label>
+                Email
+                <input
+                  type="email"
+                  value={cpEditUser.email}
+                  onChange={(e) => setCpEditUser((p) => ({ ...p, email: e.target.value }))}
+                  placeholder="user@company.com"
+                />
+              </label>
+              <label>
+                Customer ID
+                <input
+                  type="text"
+                  value={cpEditUser.customer_id}
+                  onChange={(e) => setCpEditUser((p) => ({ ...p, customer_id: e.target.value }))}
+                />
+              </label>
+              <label>
+                New password (optional — leave blank to keep current)
+                <input
+                  type="password"
+                  value={cpEditUser.new_password}
+                  onChange={(e) => setCpEditUser((p) => ({ ...p, new_password: e.target.value }))}
+                  placeholder="At least 6 characters"
+                  autoComplete="new-password"
+                />
+              </label>
+              <label className="row" style={{ gap: 8, alignItems: "center" }}>
+                <input
+                  type="checkbox"
+                  checked={!!cpEditUser.must_change}
+                  onChange={(e) => setCpEditUser((p) => ({ ...p, must_change: e.target.checked }))}
+                  disabled={!cpEditUser.new_password}
+                />
+                <span style={{ fontSize: 12 }}>Force user to change this password on next login</span>
+              </label>
+            </div>
+            <div className="row modal-actions">
+              <button className="btn btn-primary" onClick={saveEditCpUser} disabled={cpBusy}>Save</button>
+              <button className="btn btn-danger" onClick={() => setCpEditUser(null)} disabled={cpBusy}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Portal: temporary-password reveal popover */}
+      {cpTempPasswordReveal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card" style={{ minWidth: 460 }}>
+            <h3>Temporary password — {cpTempPasswordReveal.username}</h3>
+            <p style={{ fontSize: 13, lineHeight: 1.4, opacity: 0.85 }}>
+              Share these credentials with the user. The password is shown
+              only this once — they will be required to set their own
+              password on their next login (works in both the edge app
+              and the Lite cloud app at trustnode.lsapps.app/lite/).
+            </p>
+            <div className="form-grid" style={{ marginTop: 8 }}>
+              <label>
+                Username (edge app)
+                <input readOnly value={cpTempPasswordReveal.username} onFocus={(e) => e.target.select()} />
+              </label>
+              <label>
+                Email (Lite cloud login)
+                <input readOnly value={cpTempPasswordReveal.email} onFocus={(e) => e.target.select()} />
+              </label>
+              <label>
+                Temporary password
+                <input
+                  readOnly
+                  value={cpTempPasswordReveal.password}
+                  style={{ fontFamily: "monospace", fontSize: 14 }}
+                  onFocus={(e) => e.target.select()}
+                />
+              </label>
+            </div>
+            <div className="row modal-actions">
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  try {
+                    const text = `Edge username: ${cpTempPasswordReveal.username}\nLite email: ${cpTempPasswordReveal.email}\nTemporary password: ${cpTempPasswordReveal.password}`;
+                    navigator.clipboard?.writeText?.(text);
+                    setCpResult("Credentials copied to clipboard.");
+                  } catch (_) {}
+                }}
+              >Copy to clipboard</button>
+              <button className="btn btn-danger" onClick={() => setCpTempPasswordReveal(null)}>Close</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Force-change-password modal (shown after login when the user's
+          must_change_password flag is true). */}
+      {forceChangePassword ? (
+        <div className="modal-backdrop">
+          <div className="modal-card" style={{ minWidth: 420 }}>
+            <h3>Set your password</h3>
+            <p style={{ fontSize: 13, lineHeight: 1.4, opacity: 0.85 }}>
+              An administrator issued you a temporary password. Choose
+              your own password now before continuing.
+            </p>
+            <div className="form-grid" style={{ marginTop: 8 }}>
+              <label>
+                Current (temporary) password
+                <input
+                  type="password"
+                  value={forceChangePassword.current || ""}
+                  onChange={(e) => setForceChangePassword((p) => ({ ...p, current: e.target.value }))}
+                  autoComplete="current-password"
+                />
+              </label>
+              <label>
+                New password
+                <input
+                  type="password"
+                  value={forceChangePassword.next || ""}
+                  onChange={(e) => setForceChangePassword((p) => ({ ...p, next: e.target.value }))}
+                  autoComplete="new-password"
+                  placeholder="At least 6 characters"
+                />
+              </label>
+              <label>
+                Confirm new password
+                <input
+                  type="password"
+                  value={forceChangePassword.confirm || ""}
+                  onChange={(e) => setForceChangePassword((p) => ({ ...p, confirm: e.target.value }))}
+                  autoComplete="new-password"
+                />
+              </label>
+              {forceChangePassword.error ? (
+                <div style={{ color: "#fca5a5", fontSize: 12 }}>{forceChangePassword.error}</div>
+              ) : null}
+            </div>
+            <div className="row modal-actions">
+              <button
+                className="btn btn-primary"
+                disabled={!!forceChangePassword.busy}
+                onClick={async () => {
+                  const next = String(forceChangePassword.next || "");
+                  const confirm = String(forceChangePassword.confirm || "");
+                  if (next.length < 6) {
+                    setForceChangePassword((p) => ({ ...p, error: "New password must be at least 6 characters." }));
+                    return;
+                  }
+                  if (next !== confirm) {
+                    setForceChangePassword((p) => ({ ...p, error: "Passwords do not match." }));
+                    return;
+                  }
+                  setForceChangePassword((p) => ({ ...p, busy: true, error: "" }));
+                  try {
+                    const res = await changeOwnPassword(String(forceChangePassword.current || ""), next);
+                    if (res?.token) {
+                      try { localStorage.setItem("auth_token", String(res.token)); } catch (_) {}
+                    }
+                    setForceChangePassword(null);
+                  } catch (err) {
+                    setForceChangePassword((p) => ({ ...p, busy: false, error: String(err?.message || err) }));
+                  }
+                }}
+              >Save</button>
             </div>
           </div>
         </div>

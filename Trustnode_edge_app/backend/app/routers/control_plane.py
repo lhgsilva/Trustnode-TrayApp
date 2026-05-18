@@ -98,6 +98,17 @@ class UserUpsertRequest(BaseModel):
     permissions: dict[str, Any] = Field(default_factory=dict)
 
 
+class UserSetPasswordRequest(BaseModel):
+    password: str
+    must_change: bool = False
+
+
+class UserTempPasswordRequest(BaseModel):
+    """Empty body — admin clicks the button; backend rolls the password
+    and returns it. Pydantic still wants a model so we keep one here."""
+    length: int = 14
+
+
 class ActivationCodeIssueRequest(BaseModel):
     customer_id: str
     edge_id: str
@@ -518,6 +529,74 @@ def delete_user(request: Request, username: str, tenant_id: str | None = None) -
     except Exception:
         pass
     return {"ok": True, "tenant_id": tid, "username": username}
+
+@router.post("/users/{username}/password")
+def set_user_password(payload: UserSetPasswordRequest, request: Request, username: str,
+                      tenant_id: str | None = None) -> dict[str, Any]:
+    """Admin sets a specific password for a user (and optionally flags
+    the account so the user must change it on next login)."""
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    if not str(payload.password or "").strip():
+        raise HTTPException(status_code=400, detail="password_required")
+    row = control_plane_store.set_user_password(
+        tenant_id=tid, username=username,
+        password=payload.password, must_change=bool(payload.must_change),
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="user_not_found")
+    _audit(request, tenant_id=tid, action="user.password.set", outcome="ok",
+           details={"username": username, "must_change": bool(payload.must_change)})
+    # Mirror the new password to Supabase Auth so the same credential
+    # works in Lite without re-saving the user from the edge UI.
+    try:
+        from app.services.lite_user_mirror import mirror_user_upsert
+        mirror_user_upsert(
+            tenant_id=tid, username=username,
+            password=payload.password,
+            role=str(row.get("role") or "viewer"),
+            email=str(row.get("email") or ""),
+        )
+    except Exception:
+        pass
+    return {"ok": True, "tenant_id": tid, "row": row}
+
+
+@router.post("/users/{username}/password/temp")
+def generate_temp_user_password(payload: UserTempPasswordRequest, request: Request,
+                                username: str, tenant_id: str | None = None) -> dict[str, Any]:
+    """Admin presses the Reset button: backend rolls a strong random
+    password, installs it on the user with must_change_password=1, and
+    returns the plaintext ONCE so the admin can copy it from the portal
+    screen and hand it to the user.
+    """
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    result = control_plane_store.generate_temp_password(
+        tenant_id=tid, username=username, length=int(payload.length or 14),
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="user_not_found")
+    plaintext, row = result
+    _audit(request, tenant_id=tid, action="user.password.temp", outcome="ok",
+           details={"username": username})
+    # Mirror to Supabase Auth so the user can use the temp password to
+    # log into Lite right away (must_change_password is an edge concept
+    # — the Lite app shows the change-password modal on first login by
+    # reading the flag from /api/auth/login when used through the edge,
+    # or operators can simply re-issue from the edge after the user logs
+    # in to Lite once. Mirror keeps the credentials in sync regardless).
+    try:
+        from app.services.lite_user_mirror import mirror_user_upsert
+        mirror_user_upsert(
+            tenant_id=tid, username=username,
+            password=plaintext,
+            role=str(row.get("role") or "viewer"),
+            email=str(row.get("email") or ""),
+        )
+    except Exception:
+        pass
+    return {"ok": True, "tenant_id": tid, "row": row,
+            "temp_password": plaintext, "must_change_password": True}
+
 
 @router.post("/users/{username}/delete")
 def delete_user_post(request: Request, username: str, tenant_id: str | None = None) -> dict[str, Any]:

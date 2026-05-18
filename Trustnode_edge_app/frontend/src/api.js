@@ -1574,6 +1574,50 @@ export async function upsertControlPlaneUser(payload, tenantId = "") {
   return res.json();
 }
 
+export async function setControlPlaneUserPassword(username, password, mustChange = false, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const uname = encodeURIComponent(String(username || ""));
+  const res = await fetchWithTimeout(
+    `${getApiBase()}/api/control-plane/users/${uname}/password${suffix}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: String(password || ""), must_change: !!mustChange }),
+    },
+  );
+  await ensureOk(res, "Set password failed");
+  return res.json();
+}
+
+export async function generateControlPlaneUserTempPassword(username, length = 14, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const uname = encodeURIComponent(String(username || ""));
+  const res = await fetchWithTimeout(
+    `${getApiBase()}/api/control-plane/users/${uname}/password/temp${suffix}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ length: Number(length || 14) }),
+    },
+  );
+  await ensureOk(res, "Temp password generation failed");
+  return res.json();
+}
+
+export async function changeOwnPassword(currentPassword, newPassword) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/change-password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current_password: String(currentPassword || ""), new_password: String(newPassword || "") }),
+  });
+  await ensureOk(res, "Change password failed");
+  return res.json();
+}
+
 export async function deleteControlPlaneUser(username, tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));

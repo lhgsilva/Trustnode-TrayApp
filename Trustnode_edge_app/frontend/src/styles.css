@@ -2223,7 +2223,29 @@ body {
 
 .cp-users-table .thead,
 .cp-users-table .trow {
-  grid-template-columns: 40px 1fr .85fr 1.2fr .7fr .55fr 120px;
+  /* 8 columns: select / username / company / role / email / status / MFA / actions
+     Actions column wide enough for 3 buttons (Edit, Reset Temp, Delete). */
+  grid-template-columns: 40px 1.1fr .9fr .7fr 1.2fr .6fr .45fr 180px;
+}
+.cp-users-table .row-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  justify-content: flex-end;
+}
+.cp-users-table .row-actions .table-action-btn {
+  flex: 0 0 auto;
+}
+.must-change-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(251, 191, 36, 0.18);
+  color: #fbbf24;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 
 .cp-activation-table .thead,

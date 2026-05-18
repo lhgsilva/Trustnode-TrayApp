@@ -74,6 +74,11 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
 def _load_users_payload(prefer_cloud_reads: bool = False) -> Dict[str, Any]:
     # Local-first for speed; caller can request cloud-refreshed bootstrap when needed.
     data = app_store.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads) or {}
@@ -135,6 +140,10 @@ def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
         "permissions": permissions,
         "modules": user_row.get("modules") or [],
         "tenant_id": normalize_tenant_id(str(user_row.get("tenant_id") or fallback_tenant)),
+        # True when an admin issued a temporary password through the
+        # portal. The frontend prompts the user to choose a new password
+        # before they reach any application page.
+        "must_change_password": bool(user_row.get("must_change_password") or False),
     }
 
 
@@ -171,6 +180,7 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
                     "permissions": cp_hit.get("permissions") or {},
                     "modules": cp_hit.get("modules") or [],
                     "tenant_id": cp_hit.get("tenant_id"),
+                    "must_change_password": cp_hit.get("must_change_password"),
                 }
         except Exception:
             hit = None
@@ -189,6 +199,7 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
                     "permissions": cp_any.get("permissions") or {},
                     "modules": cp_any.get("modules") or [],
                     "tenant_id": cp_any.get("tenant_id"),
+                    "must_change_password": cp_any.get("must_change_password"),
                 }
         except Exception:
             hit = None
@@ -237,3 +248,72 @@ def me(request: Request) -> Dict[str, Any]:
             "tenant_id": normalize_tenant_id(str(payload.get("tenant_id") or get_current_tenant())),
         },
     }
+
+
+@router.post("/change-password")
+def change_password(payload: ChangePasswordRequest, request: Request) -> Dict[str, Any]:
+    """User changes their own password (typically after being issued a
+    temporary password). Clears the must_change_password flag, mirrors
+    the new credential to Supabase Auth so Lite stays in sync, and
+    returns a fresh JWT (with must_change_password=False)."""
+    auth = request.headers.get("Authorization", "")
+    token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    try:
+        jwt_payload = decode_access_token(token)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}") from exc
+
+    username = str(jwt_payload.get("sub") or "").strip()
+    tenant_id = normalize_tenant_id(str(jwt_payload.get("tenant_id") or get_current_tenant()))
+    if not username:
+        raise HTTPException(status_code=401, detail="No subject in token")
+    if not str(payload.new_password or "").strip():
+        raise HTTPException(status_code=400, detail="new_password_required")
+
+    # Verify the current password through the same path that issued the
+    # token. Force-change-password sessions still know their current
+    # (temporary) password, so this guards against stolen tokens.
+    auth_ok = control_plane_store.authenticate_user(
+        tenant_id=tenant_id, username=username, password=payload.current_password,
+    )
+    if not auth_ok:
+        # Try the any-tenant fallback used during login.
+        auth_ok = control_plane_store.authenticate_user_any_tenant(
+            username=username, password=payload.current_password,
+        )
+    if not auth_ok:
+        raise HTTPException(status_code=401, detail="current_password_incorrect")
+
+    row = control_plane_store.set_user_password(
+        tenant_id=tenant_id, username=username,
+        password=payload.new_password, must_change=False,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="user_not_found")
+
+    # Mirror the rotated password to Supabase Auth so Lite stays in sync.
+    try:
+        from app.services.lite_user_mirror import mirror_user_upsert
+        mirror_user_upsert(
+            tenant_id=tenant_id, username=username,
+            password=payload.new_password,
+            role=str(row.get("role") or "viewer"),
+            email=str(row.get("email") or ""),
+        )
+    except Exception:
+        pass
+
+    # Re-mint the JWT with must_change_password cleared so the frontend
+    # can drop the change-password modal.
+    new_user = {
+        "username": username,
+        "role": str(row.get("role") or "viewer"),
+        "permissions": auth_ok.get("permissions") or {},
+        "modules": auth_ok.get("modules") or [],
+        "tenant_id": tenant_id,
+        "must_change_password": False,
+    }
+    new_token = create_access_token(new_user)
+    return {"ok": True, "token": new_token, "user": new_user}

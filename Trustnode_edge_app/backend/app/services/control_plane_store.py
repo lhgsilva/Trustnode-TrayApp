@@ -76,6 +76,16 @@ class ControlPlaneStore:
                 conn.execute("CREATE INDEX IF NOT EXISTS ix_cp_users_tenant_customer ON cp_users(tenant_id, customer_id)")
             except Exception:
                 pass
+        # Force-change-password flag — set to 1 when an admin issues a
+        # temporary password from the portal. Cleared on the user's next
+        # successful password change. The auth/login response surfaces it
+        # so the frontend can prompt the user before they reach any page.
+        if not self._table_has_column(conn, "cp_users", "must_change_password"):
+            try:
+                conn.execute("ALTER TABLE cp_users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+                conn.commit()
+            except Exception:
+                pass
         return has_col
 
     def _utc_now(self) -> str:
@@ -679,10 +689,17 @@ class ControlPlaneStore:
         with self._lock:
             with self._connect() as conn:
                 has_customer_col = self._ensure_cp_users_customer_column(conn)
+                has_mcp_col = self._table_has_column(conn, "cp_users", "must_change_password")
+                cols = ["id", "tenant_id"]
                 if has_customer_col:
-                    rows = conn.execute("SELECT id, tenant_id, customer_id, username, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc, last_login_utc FROM cp_users WHERE tenant_id=? ORDER BY username", (tid,)).fetchall()
-                else:
-                    rows = conn.execute("SELECT id, tenant_id, username, role, status, email, mfa_enabled, modules_json, permissions_json, created_utc, updated_utc, last_login_utc FROM cp_users WHERE tenant_id=? ORDER BY username", (tid,)).fetchall()
+                    cols.append("customer_id")
+                cols.extend(["username", "role", "status", "email", "mfa_enabled",
+                             "modules_json", "permissions_json",
+                             "created_utc", "updated_utc", "last_login_utc"])
+                if has_mcp_col:
+                    cols.append("must_change_password")
+                sql = f"SELECT {', '.join(cols)} FROM cp_users WHERE tenant_id=? ORDER BY username"
+                rows = conn.execute(sql, (tid,)).fetchall()
         output: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)
@@ -692,6 +709,7 @@ class ControlPlaneStore:
             d["permissions"] = json.loads(d.get("permissions_json") or "{}")
             d.pop("modules_json", None)
             d.pop("permissions_json", None)
+            d["must_change_password"] = bool(d.get("must_change_password") or 0)
             output.append(d)
         return output
 
@@ -705,6 +723,65 @@ class ControlPlaneStore:
                 cur = conn.execute("DELETE FROM cp_users WHERE tenant_id=? AND username=?", (tid, uname))
                 conn.commit()
                 return int(cur.rowcount or 0) > 0
+
+    def set_user_password(self, *, tenant_id: str, username: str, password: str,
+                          must_change: bool = False) -> dict[str, Any] | None:
+        """Replace the user's password hash and toggle the must-change flag.
+
+        Used by:
+          - admin "Reset to temp password" portal action (must_change=True)
+          - admin "Change this user's password" action       (must_change=False)
+          - the user's own first-login password change       (must_change=False)
+
+        Returns the updated row (without password_hash) or None when the
+        user doesn't exist.
+        """
+        tid = normalize_tenant_id(tenant_id)
+        uname = str(username or "").strip()
+        plaintext = str(password or "")
+        if not uname or not plaintext:
+            return None
+        now = self._utc_now()
+        with self._lock:
+            with self._connect() as conn:
+                self._ensure_cp_users_customer_column(conn)
+                row = conn.execute(
+                    "SELECT * FROM cp_users WHERE tenant_id=? AND username=?", (tid, uname),
+                ).fetchone()
+                if not row:
+                    return None
+                conn.execute(
+                    "UPDATE cp_users SET password_hash=?, must_change_password=?, updated_utc=? "
+                    "WHERE tenant_id=? AND username=?",
+                    (self._hash_password(plaintext), 1 if must_change else 0, now, tid, uname),
+                )
+                conn.commit()
+                out = conn.execute(
+                    "SELECT * FROM cp_users WHERE tenant_id=? AND username=?", (tid, uname),
+                ).fetchone()
+        result = dict(out) if out else {}
+        result.pop("password_hash", None)
+        return result
+
+    def generate_temp_password(self, *, tenant_id: str, username: str,
+                               length: int = 14) -> tuple[str, dict[str, Any]] | None:
+        """Roll a strong random password, install it as the user's current
+        credential with must_change_password=1, and return (plaintext, row).
+
+        The plaintext is returned ONCE so the admin can copy it from the
+        portal screen; it's never stored anywhere readable.
+        """
+        import secrets
+        import string
+        alphabet = string.ascii_letters + string.digits
+        # Drop a few hard-to-read chars and guarantee mixed classes.
+        alphabet = alphabet.replace("0", "").replace("O", "").replace("l", "").replace("1", "")
+        plaintext = "".join(secrets.choice(alphabet) for _ in range(max(8, int(length))))
+        row = self.set_user_password(
+            tenant_id=tenant_id, username=username,
+            password=plaintext, must_change=True,
+        )
+        return (plaintext, row) if row is not None else None
 
     def authenticate_user(self, *, tenant_id: str, username: str, password: str) -> dict[str, Any] | None:
         tid = normalize_tenant_id(tenant_id)
@@ -732,6 +809,10 @@ class ControlPlaneStore:
             "email": str(r.get("email") or ""),
             "mfa_enabled": bool(r.get("mfa_enabled") or 0),
             "modules": modules,
+            # Surfaced so /api/auth/login can return the flag and the
+            # frontend can force a password change before the user reaches
+            # any application page.
+            "must_change_password": bool(r.get("must_change_password") or 0),
         }
 
     def list_user_tenants(self, *, username: str) -> list[str]:
