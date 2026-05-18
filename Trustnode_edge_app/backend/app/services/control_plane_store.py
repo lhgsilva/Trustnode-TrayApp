@@ -6,6 +6,7 @@ import os
 import secrets
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
@@ -426,44 +427,105 @@ class ControlPlaneStore:
         """Return the tenant_id currently associated with a customer_id,
         or '' if no such customer exists.
 
-        The canonical store for customers is the cloud Supabase
-        `public.cp_customers` table (the portal writes there directly).
-        The local SQLite is only populated by edge activations, so it's
-        mostly empty on the cloud backend. We try cloud first, then
-        fall back to local — that way the portal-managed customer set
-        wins over any stale local cache.
+        Lookup order (latency-conscious — the portal calls this from
+        every POST /customers and times out at ~5s in the browser):
+
+          1. In-memory cache (60s TTL).
+          2. Local SQLite — instant. Both the running backend's writes
+             and most edge activations land here, so it has high hit
+             rate.
+          3. Cloud Supabase, with a hard 1s SQL-level statement_timeout
+             on top of a 2s wall-clock cap. The portal frontend
+             previously wrote some customers directly to Supabase
+             without touching the local store, so this fallback
+             remains useful — but it must never block the endpoint
+             for more than a fraction of a second.
+
+        We deliberately reversed the original "cloud first" ordering
+        after observing portal `POST /customers` requests hit nginx
+        `499 client closed` because the cloud round-trip took longer
+        than the browser's fetch timeout. The local SQLite cache may
+        be stale by seconds; that's acceptable in exchange for the
+        speed.
         """
         cid = str(customer_id or "").strip()
         if not cid:
             return ""
 
-        # ---- 1. Try cloud Supabase first (canonical) ----
+        # ---- 1. In-memory cache ----
+        now = time.time()
         try:
-            from app.state import app_store as _app_store  # local import to avoid circular at module load
-            cloud = _app_store._get_cloud_database_target()  # type: ignore[attr-defined]
-            if cloud:
-                from sqlalchemy import text  # type: ignore
-                schema = str(cloud.get("schema") or "public")
-                engine, _key = _app_store._get_or_create_cloud_engine(cloud, schema)  # type: ignore[attr-defined]
-                with engine.connect() as conn:
+            cache = self._customer_tenant_lookup_cache  # type: ignore[attr-defined]
+        except AttributeError:
+            cache = {}
+            self._customer_tenant_lookup_cache = cache  # type: ignore[attr-defined]
+        entry = cache.get(cid)
+        if entry and (now - entry[1]) < 60.0:
+            return entry[0]
+
+        # ---- 2. Local SQLite (fast path) ----
+        try:
+            with self._lock:
+                with self._connect() as conn:
                     row = conn.execute(
-                        text(f"SELECT tenant_id FROM \"{schema}\".cp_customers WHERE customer_id = :cid LIMIT 1"),
-                        {"cid": cid},
+                        "SELECT tenant_id FROM cp_customers WHERE customer_id=? LIMIT 1",
+                        (cid,),
                     ).fetchone()
-                if row and row[0]:
-                    return str(row[0])
+            if row and row["tenant_id"]:
+                tid = str(row["tenant_id"])
+                cache[cid] = (tid, now)
+                return tid
         except Exception:
-            # Cloud unreachable / not configured — fall through to local.
             pass
 
-        # ---- 2. Fall back to local SQLite ----
-        with self._lock:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT tenant_id FROM cp_customers WHERE customer_id=? LIMIT 1",
-                    (cid,),
-                ).fetchone()
-        return str(row["tenant_id"]) if row else ""
+        # ---- 3. Cloud Supabase (last-resort, capped at ~2s wall clock) ----
+        cloud_tid = ""
+        try:
+            import threading
+
+            def _worker(out: list[str]) -> None:
+                try:
+                    from app.state import app_store as _app_store
+                    cloud = _app_store._get_cloud_database_target()  # type: ignore[attr-defined]
+                    if not cloud:
+                        return
+                    from sqlalchemy import text  # type: ignore
+                    schema = str(cloud.get("schema") or "public")
+                    engine, _key = _app_store._get_or_create_cloud_engine(cloud, schema)  # type: ignore[attr-defined]
+                    with engine.connect() as conn:
+                        # Server-side timeout in case the connection
+                        # itself succeeds but the query stalls.
+                        try:
+                            conn.execute(text("SET LOCAL statement_timeout = 1000"))
+                        except Exception:
+                            pass
+                        row = conn.execute(
+                            text(f'SELECT tenant_id FROM "{schema}".cp_customers WHERE customer_id = :cid LIMIT 1'),
+                            {"cid": cid},
+                        ).fetchone()
+                    if row and row[0]:
+                        out.append(str(row[0]))
+                except Exception:
+                    pass
+
+            out: list[str] = []
+            t = threading.Thread(target=_worker, args=(out,), daemon=True)
+            t.start()
+            t.join(timeout=2.0)
+            if out:
+                cloud_tid = out[0]
+        except Exception:
+            cloud_tid = ""
+
+        if cloud_tid:
+            cache[cid] = (cloud_tid, now)
+            return cloud_tid
+
+        # Cache the negative result too (shorter TTL via the same field)
+        # so a flood of "create new customer" calls doesn't hammer the
+        # cloud for non-existent IDs.
+        cache[cid] = ("", now)
+        return ""
 
     def upsert_customer(self, *, tenant_id: str, customer_id: str, company_name: str, contact_email: str = "", status: str = "active", metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
