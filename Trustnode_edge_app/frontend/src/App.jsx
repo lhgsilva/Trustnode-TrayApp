@@ -1559,7 +1559,10 @@ const PERMISSION_LABELS = {
 };
 
 const PERMISSION_GROUPS = [
-  { title: "Client Test Modules", items: ["dashboard", "power_overview", "historian", "client_module_alarms", "client_module_reporting", "client_module_interface"] },
+  // Operator-facing module visibility — these toggles control which
+  // top-level menu sections appear for the user. Edit/write permissions
+  // for each module live in the groups below.
+  { title: "Module Visibility", items: ["dashboard", "power_overview", "historian", "client_module_alarms", "client_module_reporting", "client_module_interface"] },
   { title: "Gateway and Edge Control", items: ["devices", "tags", "triggers_and_limits", "gateway_configuration", "gateway_runtime_control"] },
   { title: "Reporting", items: ["reporting", "scheduled_reports"] },
   { title: "Notifications", items: ["alarms", "email_and_notifications"] },
@@ -1622,8 +1625,15 @@ function deriveModuleKeysFromPermissions(perms = {}) {
 function userHasModuleForPage(user, page) {
   const required = MODULE_KEY_BY_PAGE[page];
   if (!required) return true;
+  // Admins implicitly have every module (otherwise a fresh admin would
+  // get locked out of pages until a second admin grants them modules).
+  const role = String(user?.role || "").toLowerCase();
+  if (role === "admin" || role === "super") return true;
   const modules = Array.isArray(user?.modules) ? user.modules : [];
-  if (!modules.length) return true;
+  // Empty modules list means "no module access" — NOT "unrestricted".
+  // The old fallback granted everything when modules=[], which silently
+  // bypassed every module gate for users created before the modules UI
+  // existed.
   return modules.includes(required);
 }
 
@@ -7135,6 +7145,32 @@ function AppShell() {
     // re-route them back to Dashboard once the license clears.
     if (canOpenPage("dashboard") || canOpenPage(activePage)) {
       pageBootstrapGuardRef.current = false;
+    }
+  }, [activePage, canOpenPage, currentUser, isPortalOnly]);
+
+  // Permission guard: if a user lands on a page they're not allowed to
+  // open (e.g. localStorage restored a stale activePage, or an admin
+  // revoked the module since login), bounce them to a safe default.
+  // Prefer dashboard if accessible, otherwise the first menu item the
+  // user CAN open, otherwise stay put (they're effectively locked out).
+  useEffect(() => {
+    if (!currentUser) return;
+    if (isPortalOnly) return;
+    if (pageBootstrapGuardRef.current) return;  // boot guard above wins
+    if (canOpenPage(activePage)) return;
+    if (canOpenPage("dashboard")) {
+      setActivePage("dashboard");
+      return;
+    }
+    // Find the first opener in NAV_SECTIONS order.
+    for (const section of NAV_SECTIONS) {
+      for (const item of section.items) {
+        const id = pageId(item);
+        if (canOpenPage(id)) {
+          setActivePage(id);
+          return;
+        }
+      }
     }
   }, [activePage, canOpenPage, currentUser, isPortalOnly]);
 
@@ -13994,11 +14030,17 @@ const getGatewayHealth = (gateway) => {
     if (!canManageUsers || !editingUsername) return;
     const nextUsers = users.map((u) => {
       if (u.username !== editingUsername) return u;
+      const normPerms = normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer");
       return {
         ...u,
         role: String(editUserForm.role || "viewer"),
         password: String(editUserForm.password || ""),
-        permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")
+        permissions: normPerms,
+        // Persist the derived modules array so the nav refreshes
+        // immediately. Without this the new permission set goes into
+        // the users_access row but the user's `modules` field stays
+        // stale until the next bootstrap reload.
+        modules: deriveModuleKeysFromPermissions(normPerms),
       };
     });
     const actor = currentUser?.username || "system";
@@ -14248,10 +14290,12 @@ const getGatewayHealth = (gateway) => {
           ) : null}
         </div>
         <div className="header-right">
-          <button className="icon-btn" title="Notifications" onClick={() => handleNavClick("alarms")} disabled={!canOpenPage("alarms")}>
-            <BellIcon />
-            {criticalAlarmCount > 0 ? <span className="notif-dot">{criticalAlarmCount}</span> : null}
-          </button>
+          {canOpenPage("alarms") ? (
+            <button className="icon-btn" title="Notifications" onClick={() => handleNavClick("alarms")}>
+              <BellIcon />
+              {criticalAlarmCount > 0 ? <span className="notif-dot">{criticalAlarmCount}</span> : null}
+            </button>
+          ) : null}
           <button
             className="icon-btn"
             title="Reload app"
@@ -14326,10 +14370,13 @@ const getGatewayHealth = (gateway) => {
                 ) : null}
               </div>
             ) : NAV_SECTIONS.map((section) => {
-              const hideLockedNavItems = forcedClientMode || currentUser?.role === "client";
+              // Always hide nav items the user can't open. Earlier the
+              // hide-rule was scoped to client/forced-client mode, so
+              // viewers/operators/engineers saw lock icons on items
+              // they couldn't access. Admins keep seeing everything via
+              // canOpenPage which already grants them full access.
               const sectionItems = section.items.filter((item) => {
                 const id = pageId(item);
-                if (!hideLockedNavItems) return true;
                 return canOpenPage(id);
               });
               if (!sectionItems.length) return null;
@@ -17600,9 +17647,10 @@ const getGatewayHealth = (gateway) => {
                           });
                         }}
                       >
-                        <option value="viewer">viewer</option>
-                        <option value="operator">operator</option>
+                        <option value="admin">admin</option>
                         <option value="engineer">engineer</option>
+                        <option value="operator">operator</option>
+                        <option value="viewer">viewer</option>
                         <option value="client">client</option>
                       </select>
                     </label>
