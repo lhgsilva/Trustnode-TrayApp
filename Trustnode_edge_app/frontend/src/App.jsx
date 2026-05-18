@@ -14168,24 +14168,46 @@ const getGatewayHealth = (gateway) => {
       if (resolvedTenantId && resolvedTenantId !== String(currentTenantId || "").trim()) {
         setCurrentTenantId(resolvedTenantId);
       }
+      const resolvedCustomerId = String(resolvedRow?.customer_id || applyRes?.customer_id || "").trim();
+      const resolvedLicenseId = String(resolvedRow?.license_id || applyRes?.license_id || "").trim();
       if (resolvedEdgeId) {
         const nextProfile = {
           edge_id: resolvedEdgeId,
           edge_name: String(resolvedRow?.edge_name || edgeProfile?.edge_name || resolvedEdgeId),
+          // linked_customer_id / linked_license_id are what
+          // _build_scope_key reads to route shared-edge writes
+          // (dashboard_configurations, alarms_setup, …) to a row that
+          // Lite can filter by customer. Missing them => scope_key
+          // collapses to 'tenant|-|edge|user' and the cloud mirror
+          // writes vanish from Lite's customer picker.
+          linked_customer_id: resolvedCustomerId,
+          linked_license_id: resolvedLicenseId,
           location: String(edgeProfile?.location || ""),
           machine_group: String(edgeProfile?.machine_group || ""),
           description: String(edgeProfile?.description || ""),
         };
         setEdgeProfile(nextProfile);
         try {
-          await saveAppStoreDomain("app_settings", { edge_profile: nextProfile }, currentUser?.username || "system");
+          // Persist BOTH the profile AND the top-level customer/license
+          // ids on app_settings so the legacy code paths that read
+          // app_settings.customer_id (frontend + backend) keep working.
+          await saveAppStoreDomain(
+            "app_settings",
+            {
+              edge_profile: nextProfile,
+              edge_id: resolvedEdgeId,
+              edge_name: nextProfile.edge_name,
+              customer_id: resolvedCustomerId,
+              license_id: resolvedLicenseId,
+              edge_linked: true,
+            },
+            currentUser?.username || "system",
+          );
           setEdgeProfileSaveResult(`Edge ID synchronized to activated value: ${resolvedEdgeId}`);
         } catch {
           // ignore persistence failure; runtime state still updated
         }
       }
-      const resolvedCustomerId = String(resolvedRow?.customer_id || applyRes?.customer_id || "").trim();
-      const resolvedLicenseId = String(resolvedRow?.license_id || applyRes?.license_id || "").trim();
       if (resolvedCustomerId) setLinkedCustomerId(resolvedCustomerId);
       if (resolvedLicenseId) setLinkedLicenseId(resolvedLicenseId);
       setEdgeLinked(true);

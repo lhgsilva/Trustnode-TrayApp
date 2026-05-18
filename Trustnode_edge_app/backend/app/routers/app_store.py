@@ -80,9 +80,20 @@ def _build_scope_key(request: Request, bootstrap_hint: Dict[str, Any] | None = N
             bootstrap = {}
     app_settings = bootstrap.get("app_settings") if isinstance(bootstrap.get("app_settings"), dict) else {}
     edge_profile = app_settings.get("edge_profile") if isinstance(app_settings.get("edge_profile"), dict) else {}
-    edge_id = str(edge_profile.get("edge_id") or "").strip().lower()
+    edge_id = (
+        str(edge_profile.get("edge_id") or "").strip().lower()
+        or str(app_settings.get("edge_id") or "").strip().lower()
+    )
+    # Read customer_id from edge_profile.linked_customer_id (canonical),
+    # then fall back to app_settings.customer_id (set by activation but
+    # historically missing from edge_profile), then the bootstrap root.
+    # Without this fallback, edges activated before the linked_*
+    # fields were copied into edge_profile end up with a malformed
+    # scope key 'tenant|-|edge' and the cloud mirror writes nothing
+    # Lite can attach to a customer.
     customer_id = (
         str(edge_profile.get("linked_customer_id") or "").strip().lower()
+        or str(app_settings.get("customer_id") or "").strip().lower()
         or str(bootstrap.get("customer_id") or "").strip().lower()
     )
     if not edge_id:

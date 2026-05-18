@@ -1333,6 +1333,12 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
             app_settings_patch["edge_profile"] = {
                 "edge_id": str(row.get("edge_id") or payload.edge_id or ""),
                 "edge_name": str(row.get("edge_name") or payload.edge_name or payload.edge_id or ""),
+                # See edge-link/local-finalize: linked_customer_id /
+                # linked_license_id are what _build_scope_key reads to
+                # route scoped writes (dashboards, alarms, etc.) to a row
+                # Lite can filter by customer.
+                "linked_customer_id": resolved_customer_id,
+                "linked_license_id": resolved_license_id,
                 "description": "",
                 "location": " / ".join(
                     [p for p in [str(payload.site or "").strip(), str(payload.area or "").strip()] if p]
@@ -1716,12 +1722,24 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
         app_settings["customer_id"] = customer_id
         app_settings["license_id"] = license_id
         app_settings["edge_linked"] = True
+        # edge_profile MUST carry linked_customer_id / linked_license_id so
+        # the scoped writes (dashboard_configurations, alarms_setup, etc.)
+        # land under the right scope key. Without these the scope key
+        # collapses to 'tenant|-|edge|user' and the cloud mirror writes
+        # to a row Lite can't filter back to a customer.
+        existing_edge_profile = (
+            (app_settings.get("edge_profile") or {})
+            if isinstance(app_settings.get("edge_profile"), dict)
+            else {}
+        )
         app_settings["edge_profile"] = {
             "edge_id": edge_id,
             "edge_name": edge_name,
-            "description": "",
-            "location": "",
-            "machine_group": "",
+            "linked_customer_id": customer_id,
+            "linked_license_id": license_id,
+            "description": str(existing_edge_profile.get("description") or ""),
+            "location": str(existing_edge_profile.get("location") or ""),
+            "machine_group": str(existing_edge_profile.get("machine_group") or ""),
         }
         if str(payload.cloud_api_url or "").strip():
             app_settings["cloud_url"] = str(payload.cloud_api_url or "").strip()
