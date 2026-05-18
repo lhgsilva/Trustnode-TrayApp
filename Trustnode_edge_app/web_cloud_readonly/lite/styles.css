@@ -379,9 +379,12 @@ button { font: inherit; cursor: pointer; }
 main {
   padding: 14px 16px 80px;
   overflow-y: auto;
-  max-width: 1400px;
+  /* No max-width — the dashboard's widget grid is 20 cols wide and
+     should fill whatever screen the user has (1080p, 1440p, ultrawide,
+     wall TV). The previous 1400px cap left huge dead bands on the
+     left/right of large monitors. */
   width: 100%;
-  margin: 0 auto;
+  margin: 0;
 }
 
 /* Bottom-tab bar for mobile only. Hidden on wide screens. */
