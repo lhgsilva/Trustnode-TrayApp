@@ -105,6 +105,11 @@ class GatewayWorker:
         self._ab_pylogix_client = None
         self._ab_pylogix_ip: str | None = None
         self._ab_pylogix_slot: int | None = None
+        # Summary of per-tag failures from the last successful read cycle
+        # (some tags BAD, others GOOD). Surfaced in get_status().last_error
+        # so the operator can see WHICH tags are unhappy without losing
+        # the rest of the cycle.
+        self._last_partial_error: str = ""
         self._opc_resolve_cache_key = ""
         self._opc_resolved_targets: list[tuple[str, str]] = []
         self._telemetry_runtime_refresh_monotonic = 0.0
@@ -222,6 +227,12 @@ class GatewayWorker:
                 # asyncio loop responsive by executing reads off-loop.
                 readings = await asyncio.to_thread(self._read_from_gateway)
                 self.latest_readings = readings
+                # Surface a non-fatal "some tags are bad" summary from the
+                # AB readers, OR clear it on a clean cycle. The UI shows
+                # this in the gateway status footer; the historian still
+                # records all readings (GOOD + BAD quality).
+                partial = getattr(self, "_last_partial_error", "") or ""
+                self.last_error = partial or None
                 persisted_local = False
                 persisted_edge_record_id: str | None = None
                 if self._collection_gate_cb:
@@ -507,16 +518,45 @@ class GatewayWorker:
                     raise RuntimeError("no responses")
                 if len(results) != len(tags):
                     raise RuntimeError(f"requested {len(tags)} tags but got {len(results)} results")
+                # Per-tag handling. The previous behaviour was to raise on
+                # the FIRST tag with an error, which threw away every good
+                # reading in the same batch. Real PLCs often have one or
+                # two bad tags in a list (out-of-range subscript, renamed
+                # member, etc.) — losing the other 10 readings means the
+                # historian shows zero data even though most of the poll
+                # succeeded. Now we emit the good readings with quality
+                # GOOD and the bad ones with quality BAD + a value_text
+                # carrying the error. Operators see the failure in the
+                # historian without losing the rest of the cycle.
+                tag_errors: list[str] = []
                 for idx, res in enumerate(results):
                     requested_tag = tags[idx]
                     reported_tag = str(getattr(res, "tag", "") or "")
                     if reported_tag and _norm_tag(reported_tag) != _norm_tag(requested_tag):
+                        # Mismatch is a protocol-level issue, not a per-tag
+                        # one — bail out so the legacy diagnostics surface.
                         raise RuntimeError(
                             f"read mismatch on route {path}: requested '{requested_tag}' but got '{reported_tag}'"
                         )
                     status = str(getattr(res, "error", None) or getattr(res, "status", "") or "")
                     if status:
-                        raise RuntimeError(f"read failed for '{requested_tag}': {status}")
+                        tag_errors.append(f"{requested_tag}: {status}")
+                        quality, quality_label = self._normalize_quality(self.config.gateway_type, raw_quality=0)
+                        out.append(
+                            GatewayReading(
+                                ts_utc=ts,
+                                tag_name=requested_tag,
+                                value=0.0,
+                                value_text=status,
+                                quality=quality,
+                                quality_label=quality_label,
+                                source=self.config.gateway_type,
+                                site=self.config.site,
+                                area=self.config.area,
+                                equipment=self.config.equipment,
+                            )
+                        )
+                        continue
                     value, value_text = self._coerce_value(getattr(res, "value", None), requested_tag or "<unknown>")
                     quality, quality_label = self._normalize_quality(self.config.gateway_type, raw_quality=192)
                     out.append(
@@ -533,10 +573,24 @@ class GatewayWorker:
                             equipment=self.config.equipment,
                         )
                     )
-                if out:
-                    self._ab_preferred_path = path
-                    return out
-                raise RuntimeError("all tags returned invalid values")
+                # Surface per-tag errors via the last_error field but keep
+                # the GOOD readings. The route is still considered
+                # successful as long as at least one tag came back clean.
+                good_count = sum(1 for r in out if r.quality >= 192)
+                if good_count == 0:
+                    raise RuntimeError(
+                        f"every tag failed on route {path}: " + "; ".join(tag_errors[:6])
+                    )
+                if tag_errors:
+                    # Stash a one-line summary so it's visible in the
+                    # gateway status block without preventing collection.
+                    self._last_partial_error = (
+                        f"{len(tag_errors)} bad tag(s): " + "; ".join(tag_errors[:4])
+                    )
+                else:
+                    self._last_partial_error = ""
+                self._ab_preferred_path = path
+                return out
             except Exception as exc:
                 if self._ab_pycomm3_path == path:
                     self._close_ab_pycomm3_client()
@@ -581,12 +635,33 @@ class GatewayWorker:
                     results = [results]
                 if len(results) != len(tags):
                     raise RuntimeError(f"requested {len(tags)} tags but got {len(results)} results")
+                # Same skip-bad-tag treatment as the pycomm3 path: one
+                # out-of-range subscript shouldn't poison every other tag
+                # in the batch. Bad tags are emitted with quality=0 (BAD)
+                # so the historian still records the cycle.
+                tag_errors: list[str] = []
                 for idx, res in enumerate(results):
                     tag = tags[idx]
                     status = str(getattr(res, "Status", "") or "")
                     status_ok = status.strip().lower() in ("success", "ok", "0")
                     if not status_ok:
-                        raise RuntimeError(f"read failed for '{tag}': {status}")
+                        tag_errors.append(f"{tag}: {status}")
+                        quality, quality_label = self._normalize_quality(self.config.gateway_type, raw_quality=0)
+                        out.append(
+                            GatewayReading(
+                                ts_utc=ts,
+                                tag_name=tag,
+                                value=0.0,
+                                value_text=status,
+                                quality=quality,
+                                quality_label=quality_label,
+                                source=self.config.gateway_type,
+                                site=self.config.site,
+                                area=self.config.area,
+                                equipment=self.config.equipment,
+                            )
+                        )
+                        continue
                     value, value_text = self._coerce_value(getattr(res, "Value", None), tag)
                     quality, quality_label = self._normalize_quality(self.config.gateway_type, raw_quality=192)
                     out.append(
@@ -603,9 +678,18 @@ class GatewayWorker:
                             equipment=self.config.equipment,
                         )
                     )
-                if out:
-                    return out
-                raise RuntimeError("all tags returned invalid values")
+                good_count = sum(1 for r in out if r.quality >= 192)
+                if good_count == 0:
+                    raise RuntimeError(
+                        f"every tag failed on slot {slot}: " + "; ".join(tag_errors[:6])
+                    )
+                if tag_errors:
+                    self._last_partial_error = (
+                        f"{len(tag_errors)} bad tag(s): " + "; ".join(tag_errors[:4])
+                    )
+                else:
+                    self._last_partial_error = ""
+                return out
             except Exception as exc:
                 if self._ab_pylogix_ip == base_ip and self._ab_pylogix_slot == slot:
                     self._close_ab_pylogix_client()
