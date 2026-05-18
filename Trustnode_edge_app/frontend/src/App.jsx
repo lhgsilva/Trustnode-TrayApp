@@ -12745,8 +12745,15 @@ const getGatewayHealth = (gateway) => {
   };
 
   const refreshControlPlaneUsers = async (tenantId = "") => {
+    // Master admins see EVERY user across every tenant. The backend
+    // honours tenant_id="__all__" for global admins (role=admin and
+    // tenant=default) and returns 403 for anyone else. We pick __all__
+    // when the caller didn't explicitly scope to one tenant.
     try {
-      const res = await getControlPlaneUsers(tenantId || currentTenantId || "default");
+      const explicit = String(tenantId || "").trim();
+      const requested = explicit
+        || (isMasterAdmin ? "__all__" : (currentTenantId || "default"));
+      const res = await getControlPlaneUsers(requested);
       const rows = Array.isArray(res?.rows) ? res.rows : [];
       const normalized = rows.map((u) => ({
         ...u,
@@ -18121,10 +18128,13 @@ const getGatewayHealth = (gateway) => {
                         </label>
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
-                        <div className="table cp-users-table">
+                        <div className={`table cp-users-table ${isMasterAdmin ? "with-tenant" : ""}`}>
                           <div className="thead">
                             <span><input type="checkbox" checked={cpUsersFiltered.length > 0 && cpUsersFiltered.every((row) => isCpRowSelected("users", row?.username))} onChange={(e) => setCpRowsSelectedAll("users", cpUsersFiltered, (row) => row?.username, e.target.checked)} /></span>
                             <span>Username</span>
+                            {/* Tenant column is master-admin only — gives the developer
+                                view of every tenant's users at a glance. */}
+                            {isMasterAdmin ? <span>Tenant</span> : null}
                             <span>Company</span>
                             <span>Role</span>
                             <span>Email</span>
@@ -18137,12 +18147,13 @@ const getGatewayHealth = (gateway) => {
                             const isBuiltin = uname.toLowerCase() === "admin";
                             const mustChange = Boolean(row?.must_change_password);
                             return (
-                              <div className="trow" key={`cp-user-${idx}`}>
+                              <div className="trow" key={`cp-user-${idx}-${row?.tenant_id || ""}`}>
                                 <span><input type="checkbox" checked={isCpRowSelected("users", row?.username)} onChange={(e) => setCpRowSelected("users", row?.username, e.target.checked)} disabled={isBuiltin} /></span>
                                 <span>
                                   {uname || "-"}
                                   {mustChange ? <span className="must-change-pill" title="Temp password issued — user must change on next login">TEMP</span> : null}
                                 </span>
+                                {isMasterAdmin ? <span>{String(row?.tenant_id || "-")}</span> : null}
                                 <span>{String(customerNameById.get(String(row?.customer_id || "").trim()) || (row?.customer_id ? String(row.customer_id) : "-"))}</span>
                                 <span>{String(row?.role || "-")}</span>
                                 <span>{String(row?.email || "-")}</span>
@@ -18171,7 +18182,7 @@ const getGatewayHealth = (gateway) => {
                               </div>
                             );
                           })}
-                          {!cpUsersFiltered?.length ? <div className="trow"><span>-</span><span>-</span><span>-</span><span>No users found</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                          {!cpUsersFiltered?.length ? <div className="trow">{Array.from({ length: isMasterAdmin ? 9 : 8 }).map((_, i) => <span key={i}>{i === 3 ? "No users found" : "-"}</span>)}</div> : null}
                         </div>
                       </div>
                     </section>

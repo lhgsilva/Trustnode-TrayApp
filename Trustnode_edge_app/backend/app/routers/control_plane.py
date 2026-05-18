@@ -472,6 +472,21 @@ def set_license_modules(request: Request, license_id: str, payload: LicenseModul
 
 @router.get("/users")
 def list_users(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    """List users. Two modes:
+      - tenant_id="__all__" (or "*"): return EVERY user across every
+        tenant. Only the master/global admin (role=admin, tenant=default)
+        can call this; everyone else gets 403. Lets the master admin
+        manage all tenants/customers from one view.
+      - tenant_id=<specific tenant>: existing tenant-scoped behaviour.
+        Falls back to the caller's own tenant from the JWT if omitted.
+    """
+    requested = str(tenant_id or "").strip()
+    if requested in ("__all__", "*"):
+        payload = _require_auth_payload(request)
+        if not _is_global_admin(payload):
+            raise HTTPException(status_code=403, detail="Global admin required")
+        rows = control_plane_store.list_users(all_tenants=True)
+        return {"ok": True, "tenant_id": "__all__", "rows": rows}
     tid = _scoped_tenant(request, tenant_id)
     return {"ok": True, "tenant_id": tid, "rows": control_plane_store.list_users(tenant_id=tid)}
 

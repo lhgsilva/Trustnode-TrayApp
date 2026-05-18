@@ -684,8 +684,12 @@ class ControlPlaneStore:
                 out = conn.execute("SELECT * FROM cp_users WHERE tenant_id=? AND username=?", (tid, uname)).fetchone()
         return dict(out) if out else {}
 
-    def list_users(self, *, tenant_id: str) -> list[dict[str, Any]]:
-        tid = normalize_tenant_id(tenant_id)
+    def list_users(self, *, tenant_id: str | None = None,
+                   all_tenants: bool = False) -> list[dict[str, Any]]:
+        """List users. By default scoped to one tenant — the only mode a
+        tenant admin can use. When `all_tenants=True` returns every user
+        across every tenant; only the master/global admin is allowed to
+        call this (gating happens in the router)."""
         with self._lock:
             with self._connect() as conn:
                 has_customer_col = self._ensure_cp_users_customer_column(conn)
@@ -698,8 +702,13 @@ class ControlPlaneStore:
                              "created_utc", "updated_utc", "last_login_utc"])
                 if has_mcp_col:
                     cols.append("must_change_password")
-                sql = f"SELECT {', '.join(cols)} FROM cp_users WHERE tenant_id=? ORDER BY username"
-                rows = conn.execute(sql, (tid,)).fetchall()
+                if all_tenants:
+                    sql = f"SELECT {', '.join(cols)} FROM cp_users ORDER BY tenant_id, username"
+                    rows = conn.execute(sql).fetchall()
+                else:
+                    tid = normalize_tenant_id(tenant_id)
+                    sql = f"SELECT {', '.join(cols)} FROM cp_users WHERE tenant_id=? ORDER BY username"
+                    rows = conn.execute(sql, (tid,)).fetchall()
         output: list[dict[str, Any]] = []
         for r in rows:
             d = dict(r)

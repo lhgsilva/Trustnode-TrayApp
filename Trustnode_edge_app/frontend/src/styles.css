@@ -2227,6 +2227,11 @@ body {
      Actions column wide enough for 3 buttons (Edit, Reset Temp, Delete). */
   grid-template-columns: 40px 1.1fr .9fr .7fr 1.2fr .6fr .45fr 180px;
 }
+.cp-users-table.with-tenant .thead,
+.cp-users-table.with-tenant .trow {
+  /* 9 columns when master-admin view shows the Tenant column. */
+  grid-template-columns: 40px 1.1fr .9fr .9fr .7fr 1.2fr .6fr .45fr 180px;
+}
 .cp-users-table .row-actions {
   display: flex;
   gap: 4px;
