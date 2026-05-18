@@ -422,6 +422,23 @@ class ControlPlaneStore:
                 rows = conn.execute("SELECT * FROM cp_customers WHERE tenant_id=? ORDER BY created_utc ASC", (tid,)).fetchall()
         return [dict(r) for r in rows]
 
+    def get_customer_tenant_id(self, *, customer_id: str) -> str:
+        """Return the tenant_id currently associated with a customer_id,
+        or '' if no such customer exists. Used by the per-customer
+        tenant resolver in control_plane.py to honour whatever slug
+        each customer was created with (existing data uses 'customer_a'
+        style; new customers get 'tenant-<id>')."""
+        cid = str(customer_id or "").strip()
+        if not cid:
+            return ""
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT tenant_id FROM cp_customers WHERE customer_id=? LIMIT 1",
+                    (cid,),
+                ).fetchone()
+        return str(row["tenant_id"]) if row else ""
+
     def upsert_customer(self, *, tenant_id: str, customer_id: str, company_name: str, contact_email: str = "", status: str = "active", metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
         cid = str(customer_id or "").strip() or f"cust-{secrets.token_hex(4)}"

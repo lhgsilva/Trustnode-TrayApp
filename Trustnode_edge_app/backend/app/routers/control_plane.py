@@ -299,12 +299,28 @@ def list_customers(request: Request, tenant_id: str | None = None) -> dict[str, 
 
 
 def _customer_tenant_id(customer_id: str) -> str:
-    """Canonical per-customer tenant slug. Decided 2026-05-18.
-    Format: 'tenant-<customer_id>'. customer_id is already required to be
-    URL-safe at the portal level, so no sanitization needed here."""
+    """Resolve the per-customer tenant slug.
+
+    Decided 2026-05-18: keep whatever tenant_id each customer already
+    has in cp_customers (the existing dataset uses naming like
+    'customer_a', 'customer_b' rather than 'tenant-<id>'). For brand-new
+    customers (no cp_customers row yet) we generate the slug as
+    'tenant-<customer_id>' so new installs pick a clear, consistent
+    format. Either way the slug returned here is what every downstream
+    resource (cp_edges, cp_licenses, activation codes, Lite profiles)
+    must use.
+    """
     cid = str(customer_id or "").strip()
     if not cid:
         raise HTTPException(status_code=400, detail="customer_id is required for tenant assignment")
+    # 1) Existing customer: honour whatever tenant_id is already on file.
+    try:
+        existing_tenant = control_plane_store.get_customer_tenant_id(customer_id=cid)
+    except Exception:
+        existing_tenant = ""
+    if existing_tenant:
+        return existing_tenant
+    # 2) New customer: generate. Format 'tenant-<id>' for clarity.
     return f"tenant-{cid}"
 
 
