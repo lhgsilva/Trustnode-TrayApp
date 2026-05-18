@@ -446,7 +446,7 @@ class GatewayWorker:
         except Exception as exc:
             raise RuntimeError(f"pycomm3 unavailable: {exc}") from exc
 
-        last_error = ""
+        per_route_errors: list[str] = []
 
         def _norm_tag(t: str) -> str:
             return str(t or "").strip().replace(" ", "").lower()
@@ -514,10 +514,14 @@ class GatewayWorker:
             except Exception as exc:
                 if self._ab_pycomm3_path == path:
                     self._close_ab_pycomm3_client()
-                last_error = str(exc)
+                # Accumulate per-route errors so the operator sees WHY
+                # each route failed instead of just the last one (a
+                # later route's "Failed to get PLC info" used to hide
+                # the real "Tag doesn't exist" error from route #1).
+                per_route_errors.append(f"{path}: {exc}")
                 continue
         self._ab_preferred_path = None
-        raise RuntimeError(f"all route attempts failed ({', '.join(candidate_paths)}): {last_error}")
+        raise RuntimeError("all route attempts failed -> " + " | ".join(per_route_errors))
 
     def _read_from_allen_bradley_pylogix(self, candidate_paths: List[str], tags: List[str]) -> List[GatewayReading]:
         try:
@@ -871,7 +875,14 @@ class GatewayWorker:
         if self._ab_pycomm3_client is not None and self._ab_pycomm3_path == path:
             return self._ab_pycomm3_client
         self._close_ab_pycomm3_client()
-        plc = logix_driver_cls(path, init_tags=False, init_program_tags=False)
+        # init_tags MUST be True so pycomm3 fetches the controller's tag
+        # database at connect. Without it, indexed-tag reads such as
+        # `SimREAL[1]` fail with "Tag doesn't exist - SimREAL" because
+        # pycomm3 strips the [1] suffix and looks up the bare name in
+        # its empty cache. init_program_tags stays False — we never
+        # poll program-scoped tags from this code path, and fetching
+        # them roughly doubles connect time on real PLCs.
+        plc = logix_driver_cls(path, init_tags=True, init_program_tags=False)
         plc.open()
         self._ab_pycomm3_client = plc
         self._ab_pycomm3_path = path

@@ -14,7 +14,8 @@ gateway configs are authoritative; cloud config_documents has a stub).
 
 Run from Trustnode_edge_app/:
     python scripts/backfill_widget_plc_endpoint.py        # dry-run
-    python scripts/backfill_widget_plc_endpoint.py --apply  # write
+    python scripts/backfill_widget_plc_endpoint.py --apply  # write cloud
+    python scripts/backfill_widget_plc_endpoint.py --apply --local  # also write local SQLite
 """
 from __future__ import annotations
 import argparse, io, json, sys
@@ -141,16 +142,148 @@ def patch_widget(w: dict, gw_to_ep: dict[str, str]) -> int:
     return changes
 
 
+def local_sqlite_path() -> Path:
+    """Match the backend's _resolve_db_path() default: ~/.trustnode_edge/data/trustnode_app_store.db."""
+    return Path.home() / ".trustnode_edge" / "data" / "trustnode_app_store.db"
+
+
+def backfill_local_sqlite(gw_to_ep: dict[str, str], apply: bool) -> None:
+    """Walk every dashboard_configurations row in the local edge SQLite
+    (both unscoped `config_documents` and per-user `config_documents_scoped`)
+    and add `plc_endpoint` to every widget. Same logic as the cloud walk
+    just above, but against the local DB the desktop edge actually reads."""
+    import sqlite3
+    db = local_sqlite_path()
+    if not db.is_file():
+        print(f"\n[local] {db} not found — skipping local backfill")
+        return
+    print(f"\n== Walking LOCAL SQLite ({db}) ==")
+    con = sqlite3.connect(str(db), timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        updates: list[tuple[str, dict, str | None]] = []  # (table_id, payload, scope_key)
+        widgets_total = widgets_patched = fields_filled = 0
+
+        # Unscoped: config_documents(domain='dashboard_configurations')
+        r = con.execute(
+            "SELECT payload_json FROM config_documents WHERE domain='dashboard_configurations'"
+        ).fetchone()
+        if r:
+            payload = json.loads(r[0]) if isinstance(r[0], str) else r[0]
+            widgets = payload.get("widgets") if isinstance(payload, dict) else (payload if isinstance(payload, list) else [])
+            changed = 0
+            for w in widgets or []:
+                if not isinstance(w, dict): continue
+                widgets_total += 1
+                n = patch_widget(w, gw_to_ep)
+                if n:
+                    widgets_patched += 1
+                    changed += n
+            if changed:
+                fields_filled += changed
+                updates.append(("unscoped", payload, None))
+                print(f"  config_documents (unscoped): +{changed} field(s)")
+
+        # Scoped: config_documents_scoped per user/edge
+        for sr in con.execute(
+            "SELECT scope_key, payload_json FROM config_documents_scoped "
+            "WHERE domain='dashboard_configurations'"
+        ).fetchall():
+            scope_key = sr[0]
+            payload = json.loads(sr[1]) if isinstance(sr[1], str) else sr[1]
+            widgets = payload.get("widgets") if isinstance(payload, dict) else (payload if isinstance(payload, list) else [])
+            changed = 0
+            for w in widgets or []:
+                if not isinstance(w, dict): continue
+                widgets_total += 1
+                n = patch_widget(w, gw_to_ep)
+                if n:
+                    widgets_patched += 1
+                    changed += n
+            if changed:
+                fields_filled += changed
+                updates.append(("scoped", payload, scope_key))
+                print(f"  scoped[{scope_key}]: +{changed} field(s)")
+
+        print(f"\nlocal widgets scanned: {widgets_total}")
+        print(f"local widgets patched: {widgets_patched}")
+        print(f"local fields filled:   {fields_filled}")
+        if not updates:
+            print("local: nothing to do")
+            return
+        if not apply:
+            print("local: dry-run; pass --apply --local to write.")
+            return
+
+        # Write back. Use a tx so partial writes don't leave inconsistent state.
+        with con:
+            for kind, payload, scope in updates:
+                blob = json.dumps(payload)
+                if kind == "unscoped":
+                    con.execute(
+                        "UPDATE config_documents "
+                        "SET payload_json = ?, version = COALESCE(version, 0) + 1, "
+                        "    updated_utc = strftime('%Y-%m-%d %H:%M:%f', 'now') "
+                        "WHERE domain = 'dashboard_configurations'",
+                        (blob,),
+                    )
+                else:
+                    con.execute(
+                        "UPDATE config_documents_scoped "
+                        "SET payload_json = ?, version = COALESCE(version, 0) + 1, "
+                        "    updated_utc = strftime('%Y-%m-%d %H:%M:%f', 'now') "
+                        "WHERE domain = 'dashboard_configurations' AND scope_key = ?",
+                        (blob, scope),
+                    )
+        print(f"local: wrote {len(updates)} row(s)")
+    finally:
+        con.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="actually write changes")
+    ap.add_argument("--local", action="store_true", help="also patch the LOCAL edge SQLite")
     args = ap.parse_args()
 
     print("== Fetching VPS gateway directory ==")
     gw_to_ep = fetch_vps_gateways()
-    print(f"  {len(gw_to_ep)} gateway endpoint(s) known to the VPS:")
-    for gid, ep in sorted(gw_to_ep.items()):
-        print(f"    {gid:25s} -> {ep}")
+    print(f"  {len(gw_to_ep)} gateway endpoint(s) known to the VPS")
+
+    # Local SQLite is the authoritative source for the user's current
+    # gateways. The VPS only has the central tenant's gateways and the
+    # cloud telemetry only covers gateways that have produced data.
+    # Without this step, freshly-created gateways that haven't published
+    # yet (e.g. just configured, never started) wouldn't get a
+    # plc_endpoint mapping.
+    import sqlite3
+    local_db = local_sqlite_path()
+    if local_db.is_file():
+        print(f"\n== Merging LOCAL gateway directory ({local_db}) ==")
+        added = 0
+        con_local = sqlite3.connect(str(local_db), timeout=10)
+        try:
+            for r in con_local.execute(
+                "SELECT payload_json FROM config_documents WHERE domain='gateway_configurations'"
+            ):
+                payload = json.loads(r[0]) if isinstance(r[0], str) else r[0]
+                if isinstance(payload, list):
+                    for g in payload:
+                        gid = str(g.get("id") or ""); ep = gateway_endpoint(g)
+                        if gid and ep and gid not in gw_to_ep:
+                            gw_to_ep[gid] = ep; added += 1
+            for r in con_local.execute(
+                "SELECT payload_json FROM config_documents_scoped WHERE domain='gateway_configurations'"
+            ):
+                payload = json.loads(r[0]) if isinstance(r[0], str) else r[0]
+                if isinstance(payload, list):
+                    for g in payload:
+                        gid = str(g.get("id") or ""); ep = gateway_endpoint(g)
+                        if gid and ep and gid not in gw_to_ep:
+                            gw_to_ep[gid] = ep; added += 1
+        finally:
+            con_local.close()
+        print(f"  +{added} gateway endpoint(s) recovered from local SQLite")
 
     # Supplement from cloud telemetry: any gateway that ever published
     # a sample has its plc_ip recorded against live_latest /
@@ -228,28 +361,31 @@ def main() -> int:
         print(f"fields filled:   {fields_filled}")
 
         if not updates:
-            print("\nNothing to do.")
-            return 0
-
-        if not args.apply:
+            print("\nCloud: nothing to do.")
+        elif not args.apply:
             print("\n[dry-run] pass --apply to write these changes.")
-            return 0
-
-        print("\n== Writing updates ==")
-        with con.cursor() as cur:
-            for tid, scope, payload in updates:
-                cur.execute(
-                    "UPDATE public.dashboard_configurations "
-                    "SET payload_json = %s::jsonb, "
-                    "    version = COALESCE(version, 0) + 1, "
-                    "    updated_utc = now() "
-                    "WHERE tenant_id = %s AND scope_key = %s",
-                    (json.dumps(payload), tid, scope),
-                )
-        con.commit()
-        print(f"  wrote {len(updates)} row(s).")
+        else:
+            print("\n== Writing cloud updates ==")
+            with con.cursor() as cur:
+                for tid, scope, payload in updates:
+                    cur.execute(
+                        "UPDATE public.dashboard_configurations "
+                        "SET payload_json = %s::jsonb, "
+                        "    version = COALESCE(version, 0) + 1, "
+                        "    updated_utc = now() "
+                        "WHERE tenant_id = %s AND scope_key = %s",
+                        (json.dumps(payload), tid, scope),
+                    )
+            con.commit()
+            print(f"  wrote {len(updates)} row(s).")
     finally:
         con.close()
+
+    # Local SQLite is opt-in (the user's edge has to be reachable from
+    # this workstation). Do it after the cloud writes succeed.
+    if args.local:
+        backfill_local_sqlite(gw_to_ep, args.apply)
+
     return 0
 
 
