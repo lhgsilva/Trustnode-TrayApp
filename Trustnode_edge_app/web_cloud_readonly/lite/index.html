@@ -1126,7 +1126,7 @@ function ImageWidget({ widget }) {
   return h("img", { className: "widget-image", src: cfg.source_url, alt: widgetTitle(widget) || "image" });
 }
 
-function Widget({ widget, liveByKey, onOpen, onOpenWidget }) {
+function Widget({ widget, liveByKey, onOpen, onOpenWidget, gridStyle }) {
   const type = String(widget?.type || "");
   if (SKIPPED_TYPES.has(type)) return null;
   const isChart = type === "line_chart" || type === "line_area_chart" || type === "bar_chart";
@@ -1162,6 +1162,11 @@ function Widget({ widget, liveByKey, onOpen, onOpenWidget }) {
     className: `widget widget-${type}`,
     "data-gw": cfg.gateway_id || "",
     "data-tag": cfg.tag_name || "",
+    // gridStyle is set by DashboardView when the parent container is the
+    // 20-col widget-grid. It places the widget at its edge-defined x/y
+    // and spans w/h cells. Empty/undefined when using the auto-flow
+    // layout, where the browser sizes naturally.
+    style: gridStyle || undefined,
   },
     titleBar,
     h("div", { className: "widget-body" + (isChart ? " widget-chart" : "") }, inner)
@@ -1425,6 +1430,11 @@ function StatusPill({ liveRows, transport }) {
 }
 
 function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, transport, onJumpAlarms, sidebarVisible, onToggleSidebar,
+                  // Tenant-picker plumbing is still passed through but no
+                  // longer rendered here — the picker moved into the
+                  // dashboard-settings modal so mobile (where the header
+                  // is cramped) can reach it. We keep the static
+                  // tenantLabel in the header for at-a-glance context.
                   isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant }) {
   const activeAlarms = useActiveAlarmCount();
   return h("header", { className: "app-header" },
@@ -1449,24 +1459,11 @@ function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, 
     h("div", { className: "header-center" },
       h("div", { className: "header-cloud-controls" },
         h("span", { className: "header-cloud-label" }, "Customer"),
-        // Master-admin gets a real dropdown so they can switch tenants.
-        // Tenant users see the static label only. The empty option
-        // ("All tenants") clears the filter — queries then pull every
-        // row the global-admin RLS policies allow.
-        isGlobalAdmin && Array.isArray(availableTenants) && availableTenants.length > 0
-          ? h("select", {
-              className: "tenant-picker",
-              value: pickedTenantId || "",
-              onChange: (e) => onPickTenant && onPickTenant(e.target.value),
-              title: "Master admin: switch tenant",
-              style: { fontWeight: 600, fontSize: 13 },
-            },
-              h("option", { value: "" }, "All tenants"),
-              ...availableTenants.map((t) => h("option", {
-                key: t.tenant_id, value: t.tenant_id,
-              }, `${t.label} · ${t.tenant_id}`))
-            )
-          : h("span", { style: { fontWeight: 600, fontSize: 13 } }, tenantLabel),
+        // Static label only. The master-admin tenant picker lives in
+        // the dashboard-settings modal (the gear button) so it stays
+        // reachable on mobile, where the header has no room for a
+        // dropdown.
+        h("span", { style: { fontWeight: 600, fontSize: 13 } }, tenantLabel),
         h(StatusPill, { liveRows, transport })
       )
     ),
@@ -1586,8 +1583,13 @@ function DashboardToolbar({ widgetCount, profiles, activeKey, setActiveKey, pref
   );
 }
 
-// Settings popover/modal — same controls that used to live in the toolbar.
-function DashboardSettingsModal({ open, onClose, profiles, activeKey, setActiveKey, prefs, setPrefs }) {
+// Settings popover/modal — same controls that used to live in the
+// toolbar, plus the master-admin tenant picker (moved here from the
+// header so mobile users can reach it).
+function DashboardSettingsModal({ open, onClose, profiles, activeKey, setActiveKey, prefs, setPrefs,
+                                  // Master-admin only props. When isGlobalAdmin
+                                  // is false the picker row is hidden.
+                                  isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant }) {
   if (!open) return null;
   return h("div", {
     className: "settings-back",
@@ -1599,6 +1601,24 @@ function DashboardSettingsModal({ open, onClose, profiles, activeKey, setActiveK
         h("button", { className: "close", onClick: onClose }, "Close")
       ),
       h("div", { className: "settings-body" },
+        // Tenant picker — global admin only. Empty option clears the
+        // filter ("All tenants") so the master sees the unfiltered
+        // cross-tenant aggregate the global-admin RLS policies allow.
+        (isGlobalAdmin && Array.isArray(availableTenants) && availableTenants.length > 0)
+          ? h("div", { className: "settings-row" },
+              h("label", null, "Tenant"),
+              h("select", {
+                value: pickedTenantId || "",
+                onChange: (e) => onPickTenant && onPickTenant(e.target.value),
+                style: { minWidth: 220, fontWeight: 500 },
+              },
+                h("option", { value: "" }, "All tenants"),
+                ...availableTenants.map((t) => h("option", {
+                  key: t.tenant_id, value: t.tenant_id,
+                }, `${t.label} · ${t.tenant_id}`))
+              )
+            )
+          : null,
         profiles.length > 1 ? h("div", { className: "settings-row" },
           h("label", null, "Profile"),
           h("select", {
@@ -1642,7 +1662,9 @@ function DashboardSettingsModal({ open, onClose, profiles, activeKey, setActiveK
   );
 }
 
-function DashboardView({ liveRows, profiles, active, activeKey, setActiveKey, prefs, setPrefs, gatewayLastSeen, onOpenDrawer, onOpenWidget }) {
+function DashboardView({ liveRows, profiles, active, activeKey, setActiveKey, prefs, setPrefs, gatewayLastSeen, onOpenDrawer, onOpenWidget,
+                         // Master-admin picker props — passed through to the settings modal.
+                         isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   // ensure historian channel is up so chart widgets can append.
   useEffect(() => { ensureHistorianChannel(); }, []);
@@ -1703,22 +1725,45 @@ function DashboardView({ liveRows, profiles, active, activeKey, setActiveKey, pr
     h(DashboardSettingsModal, {
       open: settingsOpen, onClose: () => setSettingsOpen(false),
       profiles, activeKey, setActiveKey, prefs, setPrefs,
+      isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant,
     }),
     widgets.length === 0 ?
       h("div", { className: "empty" },
         "No dashboard widgets have been published from the edge yet. ",
         "Configure widgets in the TrustNode desktop app and they will appear here.")
     :
-      h("div", {
-        className: `widget-flow per-row-${effectivePerRow}`,
-      },
-        ...widgets.map((w) => h(Widget, {
-          key: w.id || `${w.type}-${w.config?.tag_name || Math.random()}`,
-          widget: w,
-          liveByKey,
-          onOpen: onOpenDrawer,
-          onOpenWidget,
-        }))
+      // Layout: when every widget carries x/y/w/h (set on the edge via
+      // drag-and-drop in the desktop dashboard), render on the 20x20
+      // grid so the cloud view mirrors the operator's arrangement. Fall
+      // back to the auto-flow `widget-flow` layout for older payloads
+      // without coordinates. Mobile (≤720px) collapses to a stacked
+      // single column either way (see styles.css media query).
+      ((widgets.every((w) => Number.isFinite(Number(w?.w)) && Number.isFinite(Number(w?.h))))
+        ? h("div", { className: "widget-grid" },
+            ...widgets.map((w) => h(Widget, {
+              key: w.id || `${w.type}-${w.config?.tag_name || Math.random()}`,
+              widget: w,
+              liveByKey,
+              onOpen: onOpenDrawer,
+              onOpenWidget,
+              // Inline grid-position so each widget lands where the edge
+              // operator placed it. clamp() guards against bad data:
+              // x/y default to auto, w/h to a sensible cell footprint.
+              gridStyle: {
+                gridColumn: `${Math.max(1, Number(w.x || 0) + 1)} / span ${Math.max(1, Math.min(20, Number(w.w) || 10))}`,
+                gridRow: `${Math.max(1, Number(w.y || 0) + 1)} / span ${Math.max(1, Math.min(40, Number(w.h) || 5))}`,
+              },
+            }))
+          )
+        : h("div", { className: `widget-flow per-row-${effectivePerRow}` },
+            ...widgets.map((w) => h(Widget, {
+              key: w.id || `${w.type}-${w.config?.tag_name || Math.random()}`,
+              widget: w,
+              liveByKey,
+              onOpen: onOpenDrawer,
+              onOpenWidget,
+            }))
+          )
       )
   );
 }
@@ -2882,6 +2927,13 @@ function App() {
   if (tab === "dashboard") content = h(DashboardView, {
     liveRows, profiles, active, activeKey, setActiveKey,
     prefs, setPrefs, gatewayLastSeen, onOpenDrawer, onOpenWidget,
+    // Master-admin tenant picker — now lives inside the dashboard
+    // settings modal (the gear). Forward the props so the modal can
+    // render the picker row when isGlobalAdmin.
+    isGlobalAdmin,
+    availableTenants,
+    pickedTenantId,
+    onPickTenant: setPickedTenantId,
   });
   else if (tab === "history") content = h(HistorianView, null);
   else if (tab === "alarms") content = h(AlarmsView, { liveRows });
