@@ -10960,6 +10960,25 @@ const getGatewayHealth = (gateway) => {
       setDbTestResult({ ok: false, message: "Select at least one role: Gateway, App, or Backup." });
       return;
     }
+    // Block saving Supabase Direct on free tier — db.<ref>.supabase.co:5432 is
+    // IPv6-only and silently fails from IPv4-only networks. Operators have
+    // been wiring this up and then watching the historian backlog grow with
+    // no visible error; refuse the save until they switch to the Pooler.
+    if (dbForm.engine === "postgresql") {
+      const hostLower = String(host || "").toLowerCase();
+      if (hostLower.startsWith("db.") && hostLower.endsWith(".supabase.co") && Number(port) === 5432) {
+        if (!window.confirm(
+          "WARNING: Supabase Direct (db.<ref>.supabase.co:5432) is IPv6-only on the free tier. " +
+          "On an IPv4-only network the historian sync will silently fail and the backlog will grow.\n\n" +
+          "Recommended: use the Pooler instead — host 'aws-<region>.pooler.supabase.com', port 6543, " +
+          "username 'postgres.<projectref>'.\n\n" +
+          "Save anyway?"
+        )) {
+          setDbTestResult({ ok: false, message: "Save cancelled. Switch to the Pooler host/port to avoid silent sync failures." });
+          return;
+        }
+      }
+    }
     const testedFor = isLegacy
       ? `legacy:${dbForm.legacy_url.trim()}`
       : isSqlite
