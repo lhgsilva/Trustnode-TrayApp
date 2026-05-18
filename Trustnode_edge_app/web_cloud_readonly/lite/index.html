@@ -1933,19 +1933,41 @@ function useAlarmEvents(enabled = true) {
     if (!enabled) return;
     let stop = false;
     const f = async () => {
+      // Pull EVERY alarms_setup row the tenant scope allows (each scope_key
+      // is one row — edge-wide, per-user, etc.). The previous `limit(1)
+      // order by updated_utc` picked whichever row was touched most
+      // recently, which on multi-user installs is often an EMPTY user-
+      // scoped row, hiding the real edge-wide alarms list. RLS still
+      // restricts the result to the caller's tenant; we just stop relying
+      // on a fragile single-row pick.
       const { data, error: e } = await applyTenantScope(
         supabase
           .from("alarms_setup")
-          .select("payload_json, updated_utc, tenant_id"),
+          .select("scope_key, payload_json, updated_utc, tenant_id"),
         pickedTenantId,
       )
         .order("updated_utc", { ascending: false })
-        .limit(1);
+        .limit(20);
       if (stop) return;
       if (e) { setError(e.message); return; }
-      const row = data && data[0];
-      const list = Array.isArray(row?.payload_json?.alarms) ? row.payload_json.alarms : [];
-      setEvents(list);
+      // Merge every row's `alarms` array, dedupe by event id, sort newest
+      // first. Edge writes one alarms_setup row per `(tenant, edge_id)`
+      // scope and one per user scope; alarms only live in the edge-scope
+      // row but we union to be safe.
+      const seen = new Set();
+      const merged = [];
+      for (const row of (data || [])) {
+        const list = Array.isArray(row?.payload_json?.alarms) ? row.payload_json.alarms : [];
+        for (const a of list) {
+          if (!a || typeof a !== "object") continue;
+          const k = String(a.id || `${a.alert_key || ""}|${a.ts || ""}|${a.event_type || ""}`);
+          if (seen.has(k)) continue;
+          seen.add(k);
+          merged.push(a);
+        }
+      }
+      merged.sort((a, b) => String(b?.ts || "").localeCompare(String(a?.ts || "")));
+      setEvents(merged);
       setError("");
     };
     f();

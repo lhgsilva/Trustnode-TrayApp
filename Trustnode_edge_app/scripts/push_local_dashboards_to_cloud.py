@@ -1,10 +1,12 @@
-"""One-shot: push every scoped dashboard from local SQLite to the cloud.
+"""One-shot: push scoped config docs from local SQLite to the cloud.
 
 The mirror in app_store._mirror_config_doc_to_cloud is best-effort
 fire-and-forget and (visibly) leaves the cloud trailing the local
 edge by tens of versions. Until that's fixed properly, this script
-forces parity so Lite users see the latest dashboard the edge user
-saved.
+forces parity so Lite users see the latest dashboard / alarms.
+
+Covers both `dashboard_configurations` and `alarms_setup` (Lite reads
+both). Idempotent — skips rows where cloud version >= local version.
 
 Usage from Trustnode_edge_app/:
     python scripts/push_local_dashboards_to_cloud.py        # dry-run
@@ -55,56 +57,66 @@ def main() -> int:
         sslmode=env.get("TRUSTNODE_CLOUD_DB_SSLMODE") or "require",
         connect_timeout=15,
     )
+    # Both domains live in mirror tables with the same shape:
+    # (tenant_id, scope_key, payload_json, version, updated_utc).
+    # Lite reads both, so we sync both in one pass.
+    DOMAINS = ("dashboard_configurations", "alarms_setup")
+    total_pushed = 0
     try:
-        rows = lc.execute(
-            "SELECT scope_key, payload_json, version, updated_utc "
-            "FROM config_documents_scoped WHERE domain='dashboard_configurations'"
-        ).fetchall()
-        print(f"Local has {len(rows)} scoped dashboard rows")
+        for domain in DOMAINS:
+            rows = lc.execute(
+                "SELECT scope_key, payload_json, version, updated_utc "
+                "FROM config_documents_scoped WHERE domain=?",
+                (domain,),
+            ).fetchall()
+            print(f"\n== {domain}: local has {len(rows)} scoped row(s) ==")
+            updates = []
+            for r in rows:
+                scope_key = r["scope_key"]
+                payload = r["payload_json"]
+                version = int(r["version"] or 0)
+                updated = r["updated_utc"]
+                tenant_id = (scope_key.split("|") or ["default"])[0] or "default"
+                with cc.cursor() as cur:
+                    cur.execute(
+                        f"SELECT version FROM public.{domain} "
+                        "WHERE tenant_id=%s AND scope_key=%s",
+                        (tenant_id, scope_key),
+                    )
+                    row = cur.fetchone()
+                cloud_v = int(row[0]) if row else 0
+                if cloud_v >= version:
+                    print(f"  {scope_key}: cloud v={cloud_v} >= local v={version}, skip")
+                    continue
+                print(f"  {scope_key}: cloud v={cloud_v} -> local v={version}  (push)")
+                updates.append((tenant_id, scope_key, payload, version, updated))
 
-        updates = []
-        for r in rows:
-            scope_key = r["scope_key"]
-            payload = r["payload_json"]
-            version = int(r["version"] or 0)
-            updated = r["updated_utc"]
-            tenant_id = (scope_key.split("|") or ["default"])[0] or "default"
-            # Compare with cloud
-            with cc.cursor() as cur:
-                cur.execute(
-                    "SELECT version FROM public.dashboard_configurations "
-                    "WHERE tenant_id=%s AND scope_key=%s",
-                    (tenant_id, scope_key),
-                )
-                row = cur.fetchone()
-            cloud_v = int(row[0]) if row else 0
-            if cloud_v >= version:
-                print(f"  {scope_key}: cloud v={cloud_v} >= local v={version}, skip")
+            if not updates:
                 continue
-            print(f"  {scope_key}: cloud v={cloud_v} -> local v={version}  (push)")
-            updates.append((tenant_id, scope_key, payload, version, updated))
+            if not args.apply:
+                print(f"  [dry-run] would push {len(updates)} {domain} row(s).")
+                continue
 
-        if not updates:
-            print("Nothing to push.")
-            return 0
-        if not args.apply:
-            print(f"\n[dry-run] would push {len(updates)} row(s). Pass --apply to write.")
-            return 0
+            with cc.cursor() as cur:
+                for tenant_id, scope_key, payload, version, updated in updates:
+                    cur.execute(
+                        f"INSERT INTO public.{domain} "
+                        "  (tenant_id, scope_key, payload_json, version, updated_utc) "
+                        "VALUES (%s, %s, %s::jsonb, %s, %s::timestamptz) "
+                        "ON CONFLICT (tenant_id, scope_key) DO UPDATE SET "
+                        "  payload_json = EXCLUDED.payload_json, "
+                        "  version      = EXCLUDED.version, "
+                        "  updated_utc  = EXCLUDED.updated_utc",
+                        (tenant_id, scope_key, payload, version, updated),
+                    )
+            cc.commit()
+            print(f"  pushed {len(updates)} {domain} row(s).")
+            total_pushed += len(updates)
 
-        with cc.cursor() as cur:
-            for tenant_id, scope_key, payload, version, updated in updates:
-                cur.execute(
-                    "INSERT INTO public.dashboard_configurations "
-                    "  (tenant_id, scope_key, payload_json, version, updated_utc) "
-                    "VALUES (%s, %s, %s::jsonb, %s, %s::timestamptz) "
-                    "ON CONFLICT (tenant_id, scope_key) DO UPDATE SET "
-                    "  payload_json = EXCLUDED.payload_json, "
-                    "  version      = EXCLUDED.version, "
-                    "  updated_utc  = EXCLUDED.updated_utc",
-                    (tenant_id, scope_key, payload, version, updated),
-                )
-        cc.commit()
-        print(f"Pushed {len(updates)} row(s).")
+        if args.apply:
+            print(f"\nTotal rows pushed: {total_pushed}")
+        else:
+            print("\n[dry-run] pass --apply to actually write.")
     finally:
         lc.close()
         cc.close()
