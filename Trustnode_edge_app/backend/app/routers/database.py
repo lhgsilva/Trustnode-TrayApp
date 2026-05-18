@@ -1,4 +1,5 @@
 from typing import Literal, Any
+import os
 import urllib.request
 import urllib.error
 import json
@@ -143,18 +144,60 @@ def _build_pg_sqlalchemy_url(host: str, port: int, database: str, username: str,
     return f"postgresql+psycopg://{user}:{pwd}@{host}:{port}/{db}"
 
 
-def _build_sqlite_sqlalchemy_url(path: str) -> str:
+def _resolve_sqlite_local_path(path: str) -> str:
+    """Turn a user-supplied SQLite path into an absolute filesystem path.
+
+    Frozen EXE installs run with cwd set wherever the user double-clicked,
+    not the install directory. A relative path like './data/trustnode_edge.db'
+    resolves against that cwd and the parent dir often doesn't exist, so
+    SQLAlchemy fails with 'unable to open database file' even though the
+    user has the same path saved that worked when running from source.
+
+    Anchor relative paths to TRUSTNODE_DATA_DIR (defaulting to
+    ~/.trustnode_edge), the same place app_store.py uses for its own DB,
+    and ensure the parent directory exists.
+    """
     clean = (path or "").strip()
     if not clean:
         clean = "./data/trustnode_edge.db"
     clean = clean.replace("\\", "/")
     if clean == ":memory:":
+        return clean
+    # Already absolute (Windows drive letter or POSIX root)
+    if re.match(r"^[A-Za-z]:/", clean) or clean.startswith("/"):
+        try:
+            os.makedirs(os.path.dirname(clean), exist_ok=True)
+        except Exception:
+            pass
+        return clean
+    # Relative: anchor to the trustnode data dir, not cwd. Use the same
+    # location plc_manager._default_data_dir resolves to so the recovery
+    # check and the live gateway writer agree on where the file lives.
+    data_dir = os.environ.get("TRUSTNODE_DATA_DIR", "").strip()
+    if not data_dir:
+        data_dir = os.path.join(os.path.expanduser("~"), ".trustnode_edge", "data")
+    # Drop a leading "./" or "data/" — the data_dir already covers both.
+    rel = clean[2:] if clean.startswith("./") else clean
+    if rel.startswith("data/"):
+        rel = rel[len("data/"):]
+    full = os.path.abspath(os.path.join(data_dir, rel))
+    try:
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+    except Exception:
+        pass
+    return full
+
+
+def _build_sqlite_sqlalchemy_url(path: str) -> str:
+    resolved = _resolve_sqlite_local_path(path)
+    resolved = resolved.replace("\\", "/")
+    if resolved == ":memory:":
         return "sqlite+pysqlite:///:memory:"
-    if re.match(r"^[A-Za-z]:/", clean):
-        return f"sqlite+pysqlite:///{clean}"
-    if clean.startswith("/"):
-        return f"sqlite+pysqlite:///{clean}"
-    return f"sqlite+pysqlite:///./{clean}"
+    if re.match(r"^[A-Za-z]:/", resolved):
+        return f"sqlite+pysqlite:///{resolved}"
+    if resolved.startswith("/"):
+        return f"sqlite+pysqlite:///{resolved}"
+    return f"sqlite+pysqlite:///./{resolved}"
 
 
 def _ensure_app_tables_postgresql(conn: Any, schema_name: str) -> None:
