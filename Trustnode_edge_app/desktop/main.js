@@ -392,7 +392,67 @@ async function startBackend() {
 
   const dataDir = resolveBackendDataDir();
   ensureBackendDataDir(dataDir);
+  // Load .env so TRUSTNODE_SUPABASE_*, TRUSTNODE_CLOUD_DB_*, etc. land
+  // in the spawned backend's environment. Without this the Lite user
+  // mirror (and the historian cloud sync, in cloud-only installs)
+  // silently no-op because the env vars are missing. Search order:
+  //   - TRUSTNODE_ENV_FILE if already set in process.env
+  //   - %LOCALAPPDATA%/TrustNode/.env (operator-installable location)
+  //   - next to the executable (portable/installer drop point)
+  //   - source tree (dev: <repo>/Trustnode_edge_app/.env)
+  const dotenvVars = {};
+  const tried = new Set();
+  const dotenvCandidates = [];
+  if (process.env.TRUSTNODE_ENV_FILE) {
+    dotenvCandidates.push(process.env.TRUSTNODE_ENV_FILE);
+  }
+  try {
+    const localAppData = process.env.LOCALAPPDATA
+      || path.join(process.env.USERPROFILE || "", "AppData", "Local");
+    if (localAppData) {
+      dotenvCandidates.push(path.join(localAppData, "TrustNode", ".env"));
+    }
+  } catch (_) {}
+  try {
+    const exeDir = path.dirname(process.execPath);
+    dotenvCandidates.push(path.join(exeDir, ".env"));
+    dotenvCandidates.push(path.join(exeDir, "..", ".env"));
+    dotenvCandidates.push(path.join(exeDir, "..", "..", ".env"));
+  } catch (_) {}
+  try {
+    // Dev tree: main.js sits in desktop/, .env lives one level up.
+    dotenvCandidates.push(path.join(__dirname, "..", ".env"));
+  } catch (_) {}
+  for (const candidate of dotenvCandidates) {
+    if (!candidate) continue;
+    let resolved;
+    try { resolved = path.resolve(candidate); } catch (_) { continue; }
+    if (tried.has(resolved)) continue;
+    tried.add(resolved);
+    if (!fs.existsSync(resolved)) continue;
+    try {
+      const raw = fs.readFileSync(resolved, "utf-8");
+      for (const line of raw.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) continue;
+        const eq = trimmed.indexOf("=");
+        const key = trimmed.slice(0, eq).trim();
+        let value = trimmed.slice(eq + 1).trim();
+        if ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'"))) {
+          value = value.slice(1, -1);
+        }
+        if (key) dotenvVars[key] = value;
+      }
+      logBackend(`Loaded .env from ${resolved} (${Object.keys(dotenvVars).length} keys)`);
+      break;
+    } catch (err) {
+      logBackend(`.env read failed at ${resolved}: ${err.message}`);
+    }
+  }
+  // Real OS env wins over .env so operators can override per-launch.
   const sharedEnv = {
+    ...dotenvVars,
     ...process.env,
     TRUSTNODE_HOST: currentBackendHost,
     TRUSTNODE_PORT: String(currentBackendPort),

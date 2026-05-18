@@ -1,6 +1,78 @@
 import asyncio
 import json
+import os
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _bootstrap_env_from_dotenv() -> None:
+    """Push every KEY=VALUE pair from .env into os.environ.
+
+    Why this is necessary:
+      - pydantic-settings only loads vars declared on its model, so the
+        `Settings` class in config.py never populates the TRUSTNODE_*
+        runtime vars used by lite_user_mirror, reports_cloud_uploader,
+        etc.
+      - The packaged Electron launcher inherits Windows env, but the
+        operator typically never sets TRUSTNODE_* at the OS level — the
+        .env file IS the configuration vehicle.
+      - So we read .env explicitly at the very top of the backend boot
+        and copy each key into os.environ. Vars already set in the real
+        environment take precedence (we use setdefault).
+
+    Search order: TRUSTNODE_ENV_FILE (explicit), then walk up from the
+    binary location looking for `.env`, then from the source tree's
+    backend directory. The first hit wins. Silent on missing file.
+    """
+    explicit = os.environ.get("TRUSTNODE_ENV_FILE", "").strip()
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    # When frozen by PyInstaller the binary lives under
+    # %TEMP%/<random>/resources/backend/trustnode-service.exe — walk up
+    # to find the resources dir, then check ../../.env (next to the EXE
+    # the operator launched).
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        for up in [exe_dir, exe_dir.parent, exe_dir.parent.parent]:
+            candidates.append(up / ".env")
+    # Common dev tree positions (when running `uvicorn app.main:app` from
+    # backend/). Resolve relative to this file's location.
+    here = Path(__file__).resolve()
+    for up in [here.parent, here.parent.parent, here.parent.parent.parent,
+               here.parent.parent.parent.parent]:
+        candidates.append(up / ".env")
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not resolved.is_file():
+            continue
+        try:
+            for line in resolved.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+        except Exception:
+            continue
+        # Stop after the first successful parse so a deeper file doesn't
+        # overwrite values from a closer one.
+        break
+
+
+_bootstrap_env_from_dotenv()
+
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
