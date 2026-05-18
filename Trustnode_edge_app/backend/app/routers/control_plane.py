@@ -1526,6 +1526,10 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
 
 @router.post("/edge-link/local-finalize")
 def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request) -> dict[str, Any]:
+    # Track which step we're in so a downstream failure produces a useful
+    # error message instead of the generic 'No item with that key' that
+    # bubbles out of sqlite3.Row when a stale-schema column is missing.
+    step = "init"
     try:
         tenant_id = normalize_tenant_id(str(payload.tenant_id or "default"))
         admin_username = str(payload.admin_username or "").strip() or "admin"
@@ -1542,6 +1546,7 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
             raise ValueError("license_id_missing_for_local_finalize")
 
         # Materialize local control-plane scope so license-check can validate immediately.
+        step = "upsert_customer"
         if customer_id:
             control_plane_store.upsert_customer(
                 tenant_id=tenant_id,
@@ -1551,6 +1556,7 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
                 status="active",
                 metadata={"source": "edge_local_finalize"},
             )
+        step = "upsert_license"
         if license_id:
             control_plane_store.upsert_license(
                 tenant_id=tenant_id,
@@ -1565,10 +1571,30 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
                 metadata={"source": "edge_local_finalize"},
             )
             if payload.license_modules:
+                step = "set_license_modules"
+                # Defensive normalisation: accept either dict rows
+                # ({"module_key":..., "enabled":...}) or bare module-key
+                # strings, since the cloud proxy path can return either
+                # depending on which endpoint it hit. Without this,
+                # set_license_modules can raise on a sqlite3.Row that
+                # doesn't have a string key — producing the cryptic
+                # "No item with that key" the user saw.
+                normalized_modules: list[dict[str, Any]] = []
+                for m in (payload.license_modules or []):
+                    if isinstance(m, dict):
+                        key = str(m.get("module_key") or m.get("key") or "").strip()
+                        if not key: continue
+                        normalized_modules.append({
+                            "module_key": key,
+                            "enabled": bool(m.get("enabled", True)),
+                        })
+                    elif isinstance(m, str) and m.strip():
+                        normalized_modules.append({"module_key": m.strip(), "enabled": True})
                 control_plane_store.set_license_modules(
                     license_id=license_id,
-                    modules=list(payload.license_modules or []),
+                    modules=normalized_modules,
                 )
+        step = "upsert_edge"
         if edge_id:
             control_plane_store.upsert_edge(
                 tenant_id=tenant_id,
@@ -1583,6 +1609,7 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
             )
 
         # Ensure local auth store contains the edge admin for immediate login.
+        step = "upsert_user"
         control_plane_store.upsert_user(
             tenant_id=tenant_id,
             customer_id=customer_id,
@@ -1720,7 +1747,11 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
             "cloud_user_sync_error": cloud_user_sync_error,
         }
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Include the step name so the next failure is diagnosable
+        # without spelunking through this whole function. 'No item with
+        # that key' from a deeper sqlite3.Row access used to surface
+        # bare with no context.
+        raise HTTPException(status_code=400, detail=f"{step}: {exc}") from exc
 
 
 @router.post("/edge-link/unlink")
