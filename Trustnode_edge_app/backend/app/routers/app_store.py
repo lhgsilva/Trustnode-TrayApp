@@ -54,6 +54,12 @@ _SHARED_EDGE_DOMAINS = frozenset({
     "reporting_setup",          # report templates + schedules
     "tags",                     # tag catalog
     "email_notifications",      # email server config
+    # users_access MUST be edge-wide. Every operator on the same physical
+    # edge logs into the same set of users; saving it per-user-scope
+    # makes newly-created users invisible to the login endpoint (which
+    # reads unscoped only) and breaks both 'admin creates user, user
+    # logs in' AND 'activation creates admin, admin logs in'.
+    "users_access",
 })
 
 

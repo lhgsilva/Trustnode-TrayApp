@@ -83,8 +83,54 @@ def _load_users_payload(prefer_cloud_reads: bool = False) -> Dict[str, Any]:
     # Local-first for speed; caller can request cloud-refreshed bootstrap when needed.
     data = app_store.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads) or {}
     users_access = data.get("users_access") or {}
-    if isinstance(users_access, dict) and isinstance(users_access.get("users"), list) and users_access.get("users"):
-        return users_access
+    # Merge in the SCOPED users_access rows the frontend writes via
+    # /api/app-store/domain. The unscoped row is the initial seed
+    # (admin/admin or post-activation admin); user-created accounts land
+    # in the scoped row(s) under the same edge. Login was reading ONLY
+    # the unscoped row, so new users created via the Users UI were
+    # invisible to authentication. We now union every users_access entry
+    # we can find under the current edge.
+    merged_users: list[Dict[str, Any]] = []
+    seen_usernames: set[str] = set()
+    if isinstance(users_access, dict) and isinstance(users_access.get("users"), list):
+        for u in users_access["users"]:
+            if not isinstance(u, dict): continue
+            uname = str(u.get("username") or "").strip()
+            if not uname or uname in seen_usernames: continue
+            seen_usernames.add(uname)
+            merged_users.append(u)
+    # Pull scoped users_access rows directly from SQLite. This is cheap
+    # (one SELECT) and avoids restructuring app_store.get_bootstrap.
+    try:
+        import sqlite3, json as _json
+        # app_store exposes its db_path via _db_path private attr
+        db_path = getattr(app_store, "_db_path", None)
+        if db_path:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3)
+            try:
+                for row in con.execute(
+                    "SELECT payload_json FROM config_documents_scoped "
+                    "WHERE domain='users_access'"
+                ).fetchall():
+                    raw = row[0]
+                    try:
+                        scoped_payload = _json.loads(raw) if isinstance(raw, str) else raw
+                    except Exception:
+                        scoped_payload = None
+                    if not isinstance(scoped_payload, dict): continue
+                    for u in (scoped_payload.get("users") or []):
+                        if not isinstance(u, dict): continue
+                        uname = str(u.get("username") or "").strip()
+                        if not uname or uname in seen_usernames: continue
+                        seen_usernames.add(uname)
+                        merged_users.append(u)
+            finally:
+                con.close()
+    except Exception:
+        # Best-effort: scoped merge must not break the unscoped-only path.
+        pass
+    if merged_users:
+        return {"users": merged_users, "current_user": users_access.get("current_user", "") if isinstance(users_access, dict) else ""}
     return {
         "users": [
             {
