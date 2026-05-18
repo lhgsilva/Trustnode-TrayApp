@@ -2480,7 +2480,12 @@ class AppStore:
                             (last_log_id, log_batch_size),
                         ).fetchall()
             if not hist_rows and not log_rows:
-                self._set_data_sync_state(last_data_sync_utc=self._utc_now(), last_data_error="")
+                # Don't clear last_data_error on a no-op tick. The error
+                # from a failed real sync needs to stay visible until the
+                # next SUCCESSFUL sync actually pushes rows, otherwise it
+                # vanishes within a second and operators can't see why
+                # their backlog isn't draining.
+                self._set_data_sync_state(last_data_sync_utc=self._utc_now())
                 return 0
 
             try:
@@ -2612,12 +2617,32 @@ class AppStore:
             )
             return len(hist_rows) + len(log_rows)
         except Exception as exc:
-            self._set_data_sync_state(last_data_error=f"Data sync failed: {exc}")
+            # Persist the failure to app_logs as well as data_sync_state.
+            # The state row is cleared on the next no-op tick, so without a
+            # log entry there's no breadcrumb to diagnose why a backlog
+            # stops draining when nothing is visible in the UI.
+            err_msg = f"Data sync failed: {exc}"
+            self._set_data_sync_state(last_data_error=err_msg)
             self._upsert_sync_target_state(
                 enabled=True,
                 config={"name": cloud.get("name"), "host": cloud.get("host"), "schema": schema},
-                last_error=f"Data sync failed: {exc}",
+                last_error=err_msg,
             )
+            try:
+                self.append_log_rows([
+                    {
+                        "ts_utc": self._utc_now(),
+                        "level": "error",
+                        "category": "cloud_sync",
+                        "message": err_msg[:800],
+                        "gateway_id": "",
+                        "gateway_name": "",
+                        "device_name": "",
+                        "database_name": str(cloud.get("name") or ""),
+                    }
+                ])
+            except Exception:
+                pass
             return 0
 
     def _pre_migrate_tenant_columns(self, conn) -> None:
