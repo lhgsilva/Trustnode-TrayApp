@@ -2868,6 +2868,18 @@ function AppShell() {
   const [devicesSeeded, setDevicesSeeded] = useState(false);
   const [startupWarningsReady, setStartupWarningsReady] = useState(false);
 
+  // IMPORTANT: domains owned by a dedicated per-domain save effect MUST
+  // NOT be included here. The whole-bundle save runs on a 2.5 s debounce
+  // and would otherwise overwrite the per-domain doc with whatever's in
+  // React state at the moment it fires — which on startup is the empty
+  // initial value, before the bootstrap apply has populated state.
+  // Domains excluded (each has its own immediate-save effect):
+  //   - gateway_configurations
+  //   - devices
+  //   - database_configurations
+  //   - triggers_limits
+  //   - alarms_setup
+  //   - dashboard_configurations
   const buildAppStorePayload = () => ({
     app_settings: {
       remember_user: rememberUser,
@@ -2895,23 +2907,6 @@ function AppShell() {
       users,
       current_user: currentUser?.username || ""
     },
-    devices,
-    gateway_configurations: gatewayConfigs,
-    database_configurations: dbConnections,
-    triggers_limits: {
-      collection_triggers: collectionTriggers,
-      collection_trigger_mode: collectionTriggerMode,
-      trigger_rules: triggerRules
-    },
-    alarms_setup: {
-      alarms
-    },
-    dashboard_configurations: {
-      widgets: dashboardWidgets,
-      mode: dashboardMode,
-      per_row: dashboardPerRow,
-      tag_colors: dashboardTagColors || {},
-    },
     reporting_setup: {
       filters: reportFilters,
       documents: reportDocuments,
@@ -2926,7 +2921,8 @@ function AppShell() {
       profiles: emailProfiles,
       active_profile_id: activeEmailProfileId
     },
-    power_management_config: powerConfig,
+    // power_management_config also excluded — has its own per-domain saver
+    // below for the same race-safety reasons.
     metadata: {
       ...appMetadata,
       app_version: "edge-2026-02-21-db-primary-1"
@@ -4707,6 +4703,34 @@ function AppShell() {
       if (dbConnectionsSaveTimerRef.current) clearTimeout(dbConnectionsSaveTimerRef.current);
     };
   }, [appStoreHydrated, isHostedWebClient, currentUser, dbConnections]);
+
+  const powerConfigSaveTimerRef = useRef(null);
+  const powerConfigPersistInFlightRef = useRef(false);
+  const powerConfigLastPersistSignatureRef = useRef("");
+  useEffect(() => {
+    if (!appStoreHydrated) return;
+    if (isHostedWebClient) return;
+    if (powerConfigSaveTimerRef.current) clearTimeout(powerConfigSaveTimerRef.current);
+    powerConfigSaveTimerRef.current = setTimeout(async () => {
+      if (powerConfigPersistInFlightRef.current) return;
+      const payload = powerConfig && typeof powerConfig === "object" ? powerConfig : {};
+      const signature = JSON.stringify(payload);
+      if (!powerConfigLastPersistSignatureRef.current) {
+        powerConfigLastPersistSignatureRef.current = signature;
+        return;
+      }
+      if (signature === powerConfigLastPersistSignatureRef.current) return;
+      powerConfigPersistInFlightRef.current = true;
+      try {
+        await saveAppStoreDomain("power_management_config", payload, currentUser?.username || "system");
+        powerConfigLastPersistSignatureRef.current = signature;
+      } catch (_) {}
+      finally { powerConfigPersistInFlightRef.current = false; }
+    }, 700);
+    return () => {
+      if (powerConfigSaveTimerRef.current) clearTimeout(powerConfigSaveTimerRef.current);
+    };
+  }, [appStoreHydrated, isHostedWebClient, currentUser, powerConfig]);
 
   useEffect(() => {
     const timer = setInterval(() => {
