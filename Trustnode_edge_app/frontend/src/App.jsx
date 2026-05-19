@@ -10507,8 +10507,27 @@ const getGatewayHealth = (gateway) => {
     closeConfirmDialog();
   };
 
+  // Ensures the gateway-config modal always shows an up-to-date list of
+  // available databases — re-fetches the bootstrap on open if our local
+  // dbConnections cache has somehow ended up empty. Cheap fallback that
+  // bypasses every state-race we might have missed elsewhere.
+  const refreshDbConnectionsIfEmpty = async () => {
+    if (Array.isArray(dbConnections) && dbConnections.length > 0) return;
+    try {
+      const res = await getAppStoreBootstrap();
+      const list = res?.data?.database_configurations;
+      if (Array.isArray(list) && list.length > 0) {
+        setDbConnections(normalizeDbConnections(list));
+      }
+    } catch (_) {
+      // Non-fatal — modal still opens; the dropdown will just be empty
+      // and the operator can retry.
+    }
+  };
+
   const openAddGatewayConfig = () => {
     if (!canEditPage("gateway_configuration")) return;
+    refreshDbConnectionsIfEmpty();
     setEditingGatewayId(null);
     setGatewayDiscoverResult("");
     setGatewayDiscoveredTags([]);
@@ -10534,6 +10553,7 @@ const getGatewayHealth = (gateway) => {
 
   const openEditGatewayConfig = (gateway) => {
     if (!canEditPage("gateway_configuration")) return;
+    refreshDbConnectionsIfEmpty();
     setEditingGatewayId(gateway.id);
     setGatewayDiscoverResult("");
     setGatewayDiscoveredTags([]);
