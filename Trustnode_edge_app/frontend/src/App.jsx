@@ -4073,6 +4073,40 @@ function AppShell() {
     };
   }, [appStoreHydrated, cloudEdgeApiFilter]);
 
+  // Live tail poller for the Historian page. The dashboard chart updates via
+  // the WebSocket stream, but the Historian table needs an explicit refresh
+  // path so a parked tab keeps catching up — and so the "Cloud Pushed/Pending"
+  // pill on each row reflects the live sync watermark, not a snapshot from
+  // when the page was first opened. Only active while the Historian page is
+  // foregrounded so we don't spam the backend on every page in the app.
+  useEffect(() => {
+    if (!appStoreHydrated) return;
+    if (activePage !== "historian" && activePage !== "storian") return;
+    let cancelled = false;
+    let running = false;
+    const tick = async () => {
+      if (running || cancelled) return;
+      running = true;
+      try {
+        const res = await getAppStoreHistorian(CLOUD_HIST_FETCH_LIMIT, cloudEdgeApiFilter);
+        if (cancelled) return;
+        if (res?.ok && Array.isArray(res.rows)) {
+          setDataLog((prev) => mergeHistorianRowsStable(res.rows, prev, 25000));
+        }
+      } catch (_) {
+        // transient — next tick will retry
+      } finally {
+        running = false;
+      }
+    };
+    tick();
+    const timer = setInterval(tick, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [appStoreHydrated, activePage, cloudEdgeApiFilter]);
+
   useEffect(() => {
     if (!appStoreHydrated || !currentUser) return;
     if (dashboardHistorySeedRef.current) return;
@@ -9288,10 +9322,15 @@ const getGatewayHealth = (gateway) => {
   // shows the most recent slice with a "showing N of M" footer plus a
   // button to extend the slice if they need more on screen.
   const [historianRenderLimit, setHistorianRenderLimit] = useState(500);
+  // mergeHistorianRowsStable sorts DESC (newest first), so the table renders
+  // the most recent rows at the top. Slicing from index 0 keeps the live
+  // tail visible — slicing from -N showed the OLDEST 500 of the dataset,
+  // which is why operators saw 12:17 rows on a page opened at 12:36 while
+  // the chart elsewhere moved with live values.
   const historianRowsSliced = useMemo(() => {
     if (!historianRows.length) return historianRows;
     return historianRows.length > historianRenderLimit
-      ? historianRows.slice(-historianRenderLimit)
+      ? historianRows.slice(0, historianRenderLimit)
       : historianRows;
   }, [historianRows, historianRenderLimit]);
 
