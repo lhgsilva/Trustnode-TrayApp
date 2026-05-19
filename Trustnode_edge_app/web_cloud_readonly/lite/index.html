@@ -8,10 +8,10 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="TrustNode" />
   <title>TrustNode Lite</title>
-  <link rel="manifest" href="./manifest.json" />
-  <link rel="icon" href="./trustnode_app_icon.png" type="image/png" />
-  <link rel="apple-touch-icon" href="./trustnode_app_icon_180.png" />
-  <link rel="stylesheet" href="./styles.css" />
+  <link rel="manifest" href="/lite/manifest.json" />
+  <link rel="icon" href="/lite/trustnode_app_icon.png" type="image/png" />
+  <link rel="apple-touch-icon" href="/lite/trustnode_app_icon_180.png" />
+  <link rel="stylesheet" href="/lite/styles.css" />
 
   <!-- Import map so all React + Recharts modules resolve via esm.sh. -->
   <script type="importmap">
@@ -47,7 +47,10 @@ let cfg = null;
 let supabase = null;
 
 async function loadConfig() {
-  const res = await fetch("./config.json", { cache: "no-cache" });
+  // Use an absolute URL so the share-link route /lite/view/<token> still
+  // hits /lite/config.json instead of /lite/view/<token>/config.json
+  // (relative resolution against the current pathname).
+  const res = await fetch("/lite/config.json", { cache: "no-cache" });
   if (!res.ok) throw new Error(`config.json HTTP ${res.status}`);
   cfg = await res.json();
   if (!cfg?.supabase_url || !cfg?.supabase_anon_key) {
@@ -84,6 +87,28 @@ function applyTenantScope(query, pickedTenantId) {
   if (!pickedTenantId) return query;
   try { return query.eq("tenant_id", pickedTenantId); }
   catch (_) { return query; }
+}
+
+// Defensive client-side companion to applyTenantScope. Drops every row
+// whose tenant_id does not match the active pickedTenantId. Necessary
+// because the view-link RLS policy is structurally permissive ("any
+// tenant with an active share link is readable"), so if Customer A and
+// Customer B both have active links, an anon SELECT against the same
+// table could see both. The server .eq filter handles that — this is
+// the belt-and-braces guard for when the .eq slot was forgotten or
+// when realtime row events stream a sibling tenant's row.
+//   - pickedTenantId === "" (master admin "all tenants") → passthrough.
+//   - row.tenant_id === pickedTenantId                   → keep.
+//   - anything else                                      → drop.
+// Use as `.filter(scopedTo(pickedTenantId))` on any fetched row array.
+function scopedTo(pickedTenantId) {
+  if (!pickedTenantId) return () => true;
+  const target = String(pickedTenantId);
+  return (row) => {
+    if (!row || typeof row !== "object") return false;
+    const t = String(row.tenant_id || "");
+    return t === target;
+  };
 }
 
 // Read role + tenant out of a Supabase JWT's user_metadata claim. The
@@ -176,6 +201,16 @@ const icEyeClosed = () => SVG([h("path", { key: 1, d: "M17.94 17.94A10.07 10.07 
 const icMenu    = () => SVG([h("line", { key: 1, x1: 3, y1: 6,  x2: 21, y2: 6  }),
                               h("line", { key: 2, x1: 3, y1: 12, x2: 21, y2: 12 }),
                               h("line", { key: 3, x1: 3, y1: 18, x2: 21, y2: 18 })]);
+// Fullscreen enter (four corner arrows pointing OUT)
+const icMaximize = () => SVG([h("polyline", { key: 1, points: "4 9 4 4 9 4" }),
+                               h("polyline", { key: 2, points: "20 9 20 4 15 4" }),
+                               h("polyline", { key: 3, points: "20 15 20 20 15 20" }),
+                               h("polyline", { key: 4, points: "4 15 4 20 9 20" })]);
+// Fullscreen exit (four corner arrows pointing IN)
+const icMinimize = () => SVG([h("polyline", { key: 1, points: "9 4 4 4 4 9" }),
+                               h("polyline", { key: 2, points: "15 4 20 4 20 9" }),
+                               h("polyline", { key: 3, points: "15 20 20 20 20 15" }),
+                               h("polyline", { key: 4, points: "9 20 4 20 4 15" })]);
 
 // Nav icons (size 14)
 const icLive = () => SVG([h("circle", { key: 1, cx: 12, cy: 12, r: 10 }),
@@ -230,7 +265,11 @@ function useLiveLatest(enabled = true) {
         .limit(400);
       if (stopped) return;
       if (e) { setError(e.message); return; }
-      setRows(data || []);
+      // Defense in depth: drop any row whose tenant_id doesn't match.
+      // applyTenantScope already added .eq, but a permissive RLS policy
+      // (e.g. the view-link cross-tenant SELECT) could let sibling rows
+      // through. Never display another customer's data.
+      setRows((data || []).filter(scopedTo(pickedTenantId)));
       setError("");
       setRtt(Math.round(performance.now() - t0));
     };
@@ -279,6 +318,17 @@ function useDashboardProfiles(enabled = true) {
   });
   const [error, setError] = useState("");
   const { pickedTenantId } = useContext(TenantScopeCtx);
+  // Clear the persisted active profile key whenever the tenant changes
+  // (share-link switch, master picker change, login under a different
+  // account). Carrying a previous tenant's scope_key as activeKey caused
+  // the picker to fall through to profiles[0] from a different company
+  // when the new tenant's dashboards hadn't loaded yet.
+  useEffect(() => {
+    setActiveKey((prev) => {
+      if (!prev || !pickedTenantId) return prev;
+      return prev.startsWith(pickedTenantId + "|") ? prev : "";
+    });
+  }, [pickedTenantId]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -312,6 +362,10 @@ function useDashboardProfiles(enabled = true) {
       if (stopped) return;
       if (e) { setError(e.message); return; }
       setError("");
+      // Defensive double-filter: RLS for view-link viewers grants reads
+      // across multiple tenants when more than one tenant has an active
+      // share-link. If pickedTenantId is set, NEVER let a row from a
+      // different tenant slip into this customer's profile picker.
       const seen = new Set();
       const raw = (data || []).map((r) => ({
         key: r.scope_key || "",
@@ -322,6 +376,15 @@ function useDashboardProfiles(enabled = true) {
       })).filter((p) => {
         if (!p.key) return false;
         if (seen.has(p.key)) return false;
+        // Client-side tenant guard. applyTenantScope already added an
+        // .eq filter, but a stale RLS row or a permissive policy must
+        // not reach the picker. The picker is the gateway every chart
+        // widget then trusts.
+        if (pickedTenantId && p.tenant_id && p.tenant_id !== pickedTenantId) return false;
+        // Also enforce scope-key starts with the tenant prefix — catches
+        // the edge case where a row's tenant_id column is correct but
+        // the scope_key was authored against another tenant.
+        if (pickedTenantId && p.key && !p.key.startsWith(pickedTenantId + "|")) return false;
         seen.add(p.key);
         return true;
       });
@@ -1485,6 +1548,7 @@ function StatusPill({ liveRows, transport }) {
 }
 
 function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, transport, onJumpAlarms, sidebarVisible, onToggleSidebar,
+                  isViewLinkMode = false,
                   // Tenant-picker plumbing is still passed through but no
                   // longer rendered here — the picker moved into the
                   // dashboard-settings modal so mobile (where the header
@@ -1492,19 +1556,49 @@ function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, 
                   // tenantLabel in the header for at-a-glance context.
                   isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant }) {
   const activeAlarms = useActiveAlarmCount();
+  // Browser fullscreen state. Tracked via the fullscreenchange event so
+  // the icon flips even when the user pressed F11/Esc directly.
+  const [isFullscreen, setIsFullscreen] = useState(() => {
+    try { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
+    catch (_) { return false; }
+  });
+  useEffect(() => {
+    const sync = () => {
+      try { setIsFullscreen(!!(document.fullscreenElement || document.webkitFullscreenElement)); }
+      catch (_) { setIsFullscreen(false); }
+    };
+    document.addEventListener("fullscreenchange", sync);
+    document.addEventListener("webkitfullscreenchange", sync);
+    return () => {
+      document.removeEventListener("fullscreenchange", sync);
+      document.removeEventListener("webkitfullscreenchange", sync);
+    };
+  }, []);
+  const toggleFullscreen = async () => {
+    try {
+      if (document.fullscreenElement || document.webkitFullscreenElement) {
+        if (document.exitFullscreen) await document.exitFullscreen();
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      } else {
+        const el = document.documentElement;
+        if (el.requestFullscreen) await el.requestFullscreen();
+        else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      }
+    } catch (_) { /* ignore */ }
+  };
   return h("header", { className: "app-header" },
     h("div", { className: "header-left" },
-      // Sidebar toggle — visible only on landscape/desktop (the bottom-
-      // tab bar takes over on portrait/mobile). Mirrors the edge app's
-      // collapse-sidebar button.
-      h("button", {
+      // Sidebar toggle — hidden in share-link mode where the link is
+      // intentionally distraction-free (Dashboard only). Tenant users
+      // and master keep their menu chevron.
+      isViewLinkMode ? null : h("button", {
         className: "icon-btn header-sidebar-toggle",
         title: sidebarVisible ? "Hide menu" : "Show menu",
         onClick: onToggleSidebar,
       }, icMenu()),
       h("div", { className: "brand" },
         h("img", {
-          src: "./trustnode_logo.png",
+          src: "/lite/trustnode_logo.png",
           alt: "TrustNode",
           className: "brand-full-logo",
           onError: (e) => { e.target.style.display = "none"; },
@@ -1538,7 +1632,14 @@ function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, 
         title: `Switch to ${theme === "dark" ? "light" : "dark"} mode`,
         onClick: onToggleTheme,
       }, theme === "dark" ? icSun() : icMoon()),
-      h("button", { className: "icon-btn", title: "Sign out", onClick: onSignOut }, icSignOut())
+      h("button", {
+        className: "icon-btn",
+        title: isFullscreen ? "Exit fullscreen" : "Enter fullscreen",
+        onClick: toggleFullscreen,
+      }, isFullscreen ? icMinimize() : icMaximize()),
+      // Sign-out is meaningless in share-link mode (no session); hide it.
+      isViewLinkMode ? null
+        : h("button", { className: "icon-btn", title: "Sign out", onClick: onSignOut }, icSignOut())
     )
   );
 }
@@ -1876,7 +1977,11 @@ function HistorianView() {
       const { data, error: e } = await q;
       if (stop) return;
       if (e) setError(e.message);
-      else { setRows(data || []); setError(""); }
+      else {
+        // Defense in depth — never display rows from another tenant.
+        setRows((data || []).filter(scopedTo(pickedTenantId)));
+        setError("");
+      }
     };
     f();
     // Faster cadence than before (was 5 s) so the table feels live even
@@ -2060,7 +2165,10 @@ function useAlarmEvents(enabled = true) {
       // row but we union to be safe.
       const seen = new Set();
       const merged = [];
-      for (const row of (data || [])) {
+      // Defense in depth — drop any row whose tenant_id slipped past
+      // applyTenantScope (RLS permissiveness for view-link viewers).
+      const safeRows = (data || []).filter(scopedTo(pickedTenantId));
+      for (const row of safeRows) {
         const list = Array.isArray(row?.payload_json?.alarms) ? row.payload_json.alarms : [];
         for (const a of list) {
           if (!a || typeof a !== "object") continue;
@@ -2289,7 +2397,8 @@ function AlarmRulesView({ liveRows }) {
       if (e) { setError(e.message); return; }
       const seen = new Set();
       const merged = [];
-      for (const row of (data || [])) {
+      const safeRows = (data || []).filter(scopedTo(pickedTenantId));
+      for (const row of safeRows) {
         const list = Array.isArray(row?.payload_json?.trigger_rules) ? row.payload_json.trigger_rules : [];
         for (const r of list) {
           if (!r || typeof r !== "object") continue;
@@ -2443,7 +2552,7 @@ function _LegacyAppLogsAlarmsView() {
       if (stop) return;
       if (e) setError(e.message);
       else {
-        setRows(data || []);
+        setRows((data || []).filter(scopedTo(pickedTenantId)));
         setError("");
         // Refresh dropdown options from what we've seen.
         const lv = new Set(knownLevels);
@@ -2659,7 +2768,7 @@ function GeneratedReportsView() {
       .order("created_utc", { ascending: false })
       .limit(200);
     if (e) { setError(e.message); return; }
-    setRows(data || []);
+    setRows((data || []).filter(scopedTo(pickedTenantId)));
     setError("");
   };
 
@@ -2794,7 +2903,7 @@ function ReportTemplatesView() {
         .limit(100);
       if (stop) return;
       if (e) setError(e.message);
-      else { setRows(data || []); setError(""); }
+      else { setRows((data || []).filter(scopedTo(pickedTenantId))); setError(""); }
     };
     f();
     const ch = supabase.channel("lite-report-templates-rt")
@@ -2942,7 +3051,7 @@ function LoginCard({ theme, onToggleTheme, onSignedIn }) {
         onClick: onToggleTheme,
       }, theme === "dark" ? icSun() : icMoon()),
       h("div", { className: "auth-brand" },
-        h("img", { src: "./trustnode_login_logo.png", alt: "TrustNode", className: "auth-logo",
+        h("img", { src: "/lite/trustnode_login_logo.png", alt: "TrustNode", className: "auth-logo",
                     onError: (e) => { e.target.style.display = "none"; } })
       ),
       h("div", { className: "auth-subtitle" }, "Sign in to view your edge data"),
@@ -3024,6 +3133,10 @@ function App({ viewLink = null }) {
   // preference survives reloads. Defaults to visible on desktop and
   // hidden on phones (the bottom-tab bar replaces it there anyway).
   const [sidebarVisible, setSidebarVisible] = useState(() => {
+    // Share-link viewers default to no sidebar — the link is meant for
+    // distraction-free "see one edge, period" demos to customers /
+    // partners. They can still toggle it back via the header chevron.
+    if (viewLink) return false;
     try {
       const raw = localStorage.getItem("tnlite-sidebar-visible");
       if (raw === "true" || raw === "false") return raw === "true";
@@ -3121,26 +3234,43 @@ function App({ viewLink = null }) {
   }, [session, isGlobalAdmin]);
 
   // Persist the picker selection so a page reload keeps the view.
+  // EXCEPT in view-link mode — the tenant is pinned by the share token,
+  // not a user choice, and writing it into localStorage would leak the
+  // share-link tenant into whatever the next session does on this
+  // browser (their own login, a different share link, etc.).
   useEffect(() => {
+    if (isViewLinkMode) return;
     try { localStorage.setItem("tnlite-picked-tenant", pickedTenantId || ""); }
     catch (_) {}
-  }, [pickedTenantId]);
+  }, [pickedTenantId, isViewLinkMode]);
 
-  // Tenant scope for every scoped query in the app. We only set a real
-  // value for global admin — for tenant users it stays empty so RLS
-  // filters happen on the server (and the picker never appears).
+  // Tenant scope for every scoped query in the app. Three cases:
+  //   - view-link mode: pin to the resolved tenant_id (anon viewer needs
+  //     an explicit filter because there's no auth.uid() for RLS to
+  //     match against the user's lite_profile).
+  //   - global admin: use the picker (empty = all tenants).
+  //   - regular signed-in user: empty so RLS does the filtering.
   const tenantScopeValue = useMemo(() => ({
-    pickedTenantId: isGlobalAdmin ? (pickedTenantId || "") : "",
+    pickedTenantId: isViewLinkMode
+      ? (viewLink?.tenant_id || "")
+      : (isGlobalAdmin ? (pickedTenantId || "") : ""),
     setPickedTenantId,
     isGlobalAdmin,
     userTenantId,
-  }), [isGlobalAdmin, pickedTenantId, userTenantId]);
+  }), [isGlobalAdmin, pickedTenantId, userTenantId, isViewLinkMode, viewLink]);
 
   // Hooks must run unconditionally. The hooks themselves check supabase/
   // session before making any RPC, so calling them when signed out is a
-  // cheap no-op that returns empty state.
-  const { rows: liveRows, transport } = useLiveLatest(!!session);
-  const { profiles, active, activeKey, setActiveKey } = useDashboardProfiles(!!session);
+  // cheap no-op that returns empty state. In view-link mode we enable
+  // them too — the anon RLS policies grant read access for tenants
+  // that have an active cp_edge_view_links row.
+  const { rows: liveRows, transport } = useLiveLatest(!!session || isViewLinkMode);
+  // In view-link mode there's no Supabase Auth session, but the anon
+  // RLS policy on dashboard_configurations grants read access for any
+  // tenant that has an active cp_edge_view_links row — so the dashboard
+  // loader is still allowed to run. Enable it whenever we either have
+  // a logged-in session OR a resolved view-link scope.
+  const { profiles, active, activeKey, setActiveKey } = useDashboardProfiles(!!session || isViewLinkMode);
 
   const gatewayLastSeen = useMemo(() => {
     const m = {};
@@ -3200,6 +3330,7 @@ function App({ viewLink = null }) {
         sidebarVisible,
         onToggleSidebar: () => setSidebarVisible((v) => !v),
         onJumpAlarms: () => setTab("alarms"),
+        isViewLinkMode,
         // Master-only props (Header renders the picker iff
         // isGlobalAdmin is true). For tenant users these are ignored.
         isGlobalAdmin,
@@ -3274,7 +3405,7 @@ async function _resolveViewLink(token) {
     return;
   }
   if ("serviceWorker" in navigator) {
-    try { navigator.serviceWorker.register("./sw.js"); } catch (_) {}
+    try { navigator.serviceWorker.register("/lite/sw.js", { scope: "/lite/" }); } catch (_) {}
   }
   // Resolve share-link before mounting so the App component knows from
   // its first render whether to enter read-only mode and skip the login
