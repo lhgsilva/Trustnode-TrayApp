@@ -238,12 +238,22 @@ class AppStore:
                     "-c lock_timeout=1200ms -c statement_timeout=4500ms",
                 ),
             }
+            # Pool sizing: the data-sync workers + control-plane reads
+            # (when running in cloud-canonical mode) + the Lite mirror
+            # all share this engine. Bumped from 4+4 to 8+12 (max 20)
+            # to ride out portal-page-load bursts that fire ~10 cp_*
+            # endpoints in parallel without exhausting the pool. The
+            # Supabase Pooler can comfortably hold ~30 concurrent
+            # connections per project; we're well under that.
+            pool_size = int(os.environ.get("TRUSTNODE_CLOUD_DB_POOL_SIZE", "8") or "8")
+            max_overflow = int(os.environ.get("TRUSTNODE_CLOUD_DB_MAX_OVERFLOW", "12") or "12")
             engine = create_engine(
                 url,
                 pool_pre_ping=True,
-                pool_size=4,
-                max_overflow=4,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
                 pool_recycle=300,
+                pool_timeout=10,  # don't wait forever if pool is exhausted
                 connect_args=connect_args,
             )
             stale_keys = [k for k in self._cloud_engine_cache.keys() if k != key]

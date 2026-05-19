@@ -220,23 +220,34 @@ class _Conn:
             pass
 
     def close(self) -> None:
-        # Connection is owned by the SA engine pool — don't close it.
-        # Just commit any pending work so the next acquirer sees it.
+        # CRITICAL: raw_connection() returns a SQLAlchemy _ConnectionFairy
+        # that holds a connection from the pool. Calling .close() on it
+        # RELEASES it back to the pool; without that, every _connect()
+        # leaks a pooled connection and the pool drains within seconds
+        # under burst load (causing psycopg.errors.ConnectionTimeout
+        # because new TCP connects to the Supabase Pooler can't keep up
+        # with the leak rate).
+        if self._raw is None:
+            return
         try:
-            self._raw.commit()
+            self._raw.close()
         except Exception:
             pass
+        finally:
+            self._raw = None
 
     # Context-manager protocol so `with self._connect() as conn:` works
     def __enter__(self) -> "_Conn":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if exc_type is None:
-            self.commit()
-        else:
-            self.rollback()
-        self.close()
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +259,14 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
     a connection to the cloud Postgres / Supabase project instead of the
     local SQLite file."""
 
+    # How long (seconds) the burst-shield read cache holds list_* /
+    # tenant_summary results before going back to Supabase. A few seconds
+    # is enough for the portal's first-page-load burst (the same browser
+    # hits 10+ endpoints in parallel) to land mostly on cache. Per-page
+    # navigation invalidates naturally since each click re-acquires under
+    # the same TTL window.
+    _BURST_CACHE_TTL_SECONDS = 5.0
+
     def __init__(self) -> None:
         # Bypass the SQLite parent's __init__ entirely — we don't have
         # a local file to point at. We DO need MODULE_CATALOG inherited
@@ -256,8 +275,44 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
         self._db_path = "<cloud:supabase>"
         # Read cache for hot lookups; same shape as SQLite path uses.
         self._customer_tenant_lookup_cache: dict[str, tuple[str, float]] = {}
+        # Burst-shield cache for list_* and summary endpoints. Keys are
+        # (method_name, frozen_kwargs); values are (timestamp, result).
+        self._burst_cache: dict[tuple, tuple[float, Any]] = {}
+        self._burst_cache_lock = threading.Lock()
         # Defer engine binding until first call so import order doesn't matter.
         self._engine = None
+
+    # -- Burst-shield cache helpers --------------------------------------
+
+    def _cache_get(self, key: tuple) -> Any | None:
+        import time as _t
+        now = _t.time()
+        with self._burst_cache_lock:
+            entry = self._burst_cache.get(key)
+            if entry and (now - entry[0]) < self._BURST_CACHE_TTL_SECONDS:
+                return entry[1]
+        return None
+
+    def _cache_put(self, key: tuple, value: Any) -> None:
+        import time as _t
+        now = _t.time()
+        with self._burst_cache_lock:
+            self._burst_cache[key] = (now, value)
+            # Bound the cache size at ~256 entries so a flood of distinct
+            # tenant_ids can't grow it forever.
+            if len(self._burst_cache) > 256:
+                # Drop the oldest 64 entries
+                oldest = sorted(self._burst_cache.items(), key=lambda kv: kv[1][0])[:64]
+                for k, _ in oldest:
+                    self._burst_cache.pop(k, None)
+
+    def _cache_invalidate(self, *method_names: str) -> None:
+        """Drop all entries for the given method names. Called after writes
+        so the next read sees fresh data instead of stale cached rows."""
+        with self._burst_cache_lock:
+            doomed = [k for k in self._burst_cache.keys() if k[0] in method_names]
+            for k in doomed:
+                self._burst_cache.pop(k, None)
 
     # -- Connection management ---------------------------------------------
 
@@ -383,12 +438,143 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
                 ).fetchall()
         return {"license_id": lid, "modules": [{"module_key": r[0], "enabled": bool(r[1])} for r in rows]}
 
+    # -- Cached list reads (burst shield) --------------------------------
+
+    def list_tenants(self, *, include_suspended: bool = True) -> list[dict[str, Any]]:  # type: ignore[override]
+        key = ("list_tenants", bool(include_suspended))
+        hit = self._cache_get(key)
+        if hit is not None:
+            return hit
+        rows = super().list_tenants(include_suspended=include_suspended)
+        self._cache_put(key, rows)
+        return rows
+
+    def list_customers(self, *, tenant_id: str | None = None,  # type: ignore[override]
+                       all_tenants: bool = False) -> list[dict[str, Any]]:
+        key = ("list_customers", str(tenant_id or ""), bool(all_tenants))
+        hit = self._cache_get(key)
+        if hit is not None:
+            return hit
+        rows = super().list_customers(tenant_id=tenant_id, all_tenants=all_tenants)
+        self._cache_put(key, rows)
+        return rows
+
+    def list_edges(self, *, tenant_id: str | None = None,  # type: ignore[override]
+                   all_tenants: bool = False) -> list[dict[str, Any]]:
+        key = ("list_edges", str(tenant_id or ""), bool(all_tenants))
+        hit = self._cache_get(key)
+        if hit is not None:
+            return hit
+        rows = super().list_edges(tenant_id=tenant_id, all_tenants=all_tenants)
+        self._cache_put(key, rows)
+        return rows
+
+    def list_licenses(self, *, tenant_id: str | None = None,  # type: ignore[override]
+                      all_tenants: bool = False) -> list[dict[str, Any]]:
+        key = ("list_licenses", str(tenant_id or ""), bool(all_tenants))
+        hit = self._cache_get(key)
+        if hit is not None:
+            return hit
+        rows = super().list_licenses(tenant_id=tenant_id, all_tenants=all_tenants)
+        self._cache_put(key, rows)
+        return rows
+
+    def list_users(self, *, tenant_id: str | None = None,  # type: ignore[override]
+                   all_tenants: bool = False) -> list[dict[str, Any]]:
+        key = ("list_users", str(tenant_id or ""), bool(all_tenants))
+        hit = self._cache_get(key)
+        if hit is not None:
+            return hit
+        rows = super().list_users(tenant_id=tenant_id, all_tenants=all_tenants)
+        self._cache_put(key, rows)
+        return rows
+
+    def tenant_summary(self, *, tenant_id: str) -> dict[str, Any]:  # type: ignore[override]
+        key = ("tenant_summary", str(tenant_id or ""))
+        hit = self._cache_get(key)
+        if hit is not None:
+            return hit
+        result = super().tenant_summary(tenant_id=tenant_id)
+        self._cache_put(key, result)
+        return result
+
+    # Writes: invalidate cache so the next read sees fresh data.
+
+    def upsert_customer(self, *, tenant_id: str, customer_id: str, company_name: str,  # type: ignore[override]
+                        contact_email: str = "", status: str = "active",
+                        metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        result = super().upsert_customer(
+            tenant_id=tenant_id, customer_id=customer_id, company_name=company_name,
+            contact_email=contact_email, status=status, metadata=metadata,
+        )
+        self._cache_invalidate("list_customers", "tenant_summary")
+        # Also invalidate the customer_tenant_id cache for this id since
+        # the row was just rewritten.
+        with self._lock:
+            self._customer_tenant_lookup_cache.pop(str(customer_id or "").strip(), None)
+        return result
+
+    def delete_customer(self, *, tenant_id: str, customer_id: str) -> bool:  # type: ignore[override]
+        out = super().delete_customer(tenant_id=tenant_id, customer_id=customer_id)
+        self._cache_invalidate("list_customers", "tenant_summary", "list_edges", "list_licenses")
+        with self._lock:
+            self._customer_tenant_lookup_cache.pop(str(customer_id or "").strip(), None)
+        return out
+
+    def upsert_edge(self, *, tenant_id: str, edge_id: str, edge_name: str,  # type: ignore[override]
+                    customer_id: str = "", site: str = "", area: str = "",
+                    equipment: str = "", status: str = "inactive",
+                    metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        result = super().upsert_edge(
+            tenant_id=tenant_id, edge_id=edge_id, edge_name=edge_name,
+            customer_id=customer_id, site=site, area=area, equipment=equipment,
+            status=status, metadata=metadata,
+        )
+        self._cache_invalidate("list_edges", "tenant_summary")
+        return result
+
+    def delete_edge(self, *, tenant_id: str, edge_id: str) -> bool:  # type: ignore[override]
+        out = super().delete_edge(tenant_id=tenant_id, edge_id=edge_id)
+        self._cache_invalidate("list_edges", "tenant_summary")
+        return out
+
+    def delete_license(self, *, tenant_id: str, license_id: str) -> bool:  # type: ignore[override]
+        out = super().delete_license(tenant_id=tenant_id, license_id=license_id)
+        self._cache_invalidate("list_licenses", "tenant_summary")
+        return out
+
+    def delete_user(self, *, tenant_id: str, username: str) -> bool:  # type: ignore[override]
+        out = super().delete_user(tenant_id=tenant_id, username=username)
+        self._cache_invalidate("list_users", "tenant_summary")
+        return out
+
+    def issue_activation_code(self, **kwargs) -> dict[str, Any]:  # type: ignore[override]
+        result = super().issue_activation_code(**kwargs)
+        self._cache_invalidate("list_activation_codes")
+        return result
+
     def list_activation_codes(self, *, tenant_id: str | None = None,  # type: ignore[override]
                               customer_id: str = "",
                               all_tenants: bool = False) -> list[dict[str, Any]]:
         """The Postgres `cp_edge_activation_codes` PK is `code_hash`, not
         `id` (the SQLite parent uses rowid → id). Use code_hash AS id so
-        downstream code that expects an `id` column still works."""
+        downstream code that expects an `id` column still works.
+
+        Also cached against the burst-shield TTL — the portal Activation
+        Codes page hits this on every page load."""
+        cache_key = ("list_activation_codes", str(tenant_id or ""),
+                     str(customer_id or ""), bool(all_tenants))
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+        result = self._list_activation_codes_uncached(
+            tenant_id=tenant_id, customer_id=customer_id, all_tenants=all_tenants,
+        )
+        self._cache_put(cache_key, result)
+        return result
+
+    def _list_activation_codes_uncached(self, *, tenant_id: str | None,
+                                        customer_id: str, all_tenants: bool) -> list[dict[str, Any]]:
         from app.tenant import normalize_tenant_id
         cid = str(customer_id or "").strip()
         cols = ("code_hash AS id, activation_code, tenant_id, customer_id, "
