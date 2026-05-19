@@ -280,8 +280,18 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
         # (method_name, frozen_kwargs); values are (timestamp, result).
         self._burst_cache: dict[tuple, tuple[float, Any]] = {}
         self._burst_cache_lock = threading.Lock()
-        # Defer engine binding until first call so import order doesn't matter.
+        # Engine init is lazy AND serialized — but we proactively prime it
+        # on the first __init__ call if env vars are present so the first
+        # request doesn't hit cold engine creation under burst load.
         self._engine = None
+        self._engine_init_lock = threading.Lock()
+        # Eager prime so 12 parallel first-requests don't all race to
+        # build the engine at once.
+        try:
+            self._get_engine()
+        except Exception:
+            # Failing here is fine — we'll retry on first real call.
+            pass
 
     # -- Burst-shield cache helpers --------------------------------------
 
@@ -331,39 +341,45 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
         """
         if self._engine is not None:
             return self._engine
-        from app.state import app_store as _app_store
-        cloud = _app_store._get_cloud_database_target()  # type: ignore[attr-defined]
-        if not cloud:
-            raise RuntimeError(
-                "ControlPlaneStoreCloud: no cloud database target configured. "
-                "Set TRUSTNODE_CLOUD_DB_HOST/USER/PASSWORD via systemd 10-secrets.conf or .env."
+        # Serialize engine creation: under burst, many threads may hit
+        # _connect at once; without this lock they'd all try to build the
+        # engine in parallel (and likely all fail in the same way).
+        with self._engine_init_lock:
+            if self._engine is not None:
+                return self._engine
+            # Read cloud target from env DIRECTLY rather than going through
+            # app_store._get_cloud_database_target — the latter touches the
+            # local SQLite which adds startup risk and isn't necessary here.
+            host = str(os.environ.get("TRUSTNODE_CLOUD_DB_HOST", "") or "").strip()
+            port = int(os.environ.get("TRUSTNODE_CLOUD_DB_PORT", "5432") or "5432")
+            database = str(os.environ.get("TRUSTNODE_CLOUD_DB_NAME", "postgres") or "postgres").strip() or "postgres"
+            username = str(os.environ.get("TRUSTNODE_CLOUD_DB_USER", "") or "").strip()
+            password = str(os.environ.get("TRUSTNODE_CLOUD_DB_PASSWORD", "") or "")
+            sslmode = str(os.environ.get("TRUSTNODE_CLOUD_DB_SSLMODE", "require") or "require").strip().lower() or "require"
+            if not host or not username:
+                raise RuntimeError(
+                    "ControlPlaneStoreCloud: missing TRUSTNODE_CLOUD_DB_HOST or _USER "
+                    "in the process environment."
+                )
+            from sqlalchemy import create_engine  # type: ignore
+            from urllib.parse import quote_plus as _q
+            url = f"postgresql+psycopg://{_q(username)}:{_q(password)}@{host}:{port}/{database}"
+            connect_args = {
+                "sslmode": sslmode,
+                "connect_timeout": int(os.environ.get("TRUSTNODE_CP_DB_CONNECT_TIMEOUT_SECONDS", "8") or "8"),
+                "prepare_threshold": None,
+                "options": "-c lock_timeout=400ms -c statement_timeout=2500ms",
+            }
+            self._engine = create_engine(
+                url,
+                pool_pre_ping=True,
+                pool_size=int(os.environ.get("TRUSTNODE_CP_DB_POOL_SIZE", "6") or "6"),
+                max_overflow=int(os.environ.get("TRUSTNODE_CP_DB_MAX_OVERFLOW", "10") or "10"),
+                pool_recycle=300,
+                pool_timeout=5,
+                connect_args=connect_args,
             )
-        from sqlalchemy import create_engine  # type: ignore
-        host = str(cloud.get("host") or "").strip()
-        port = int(cloud.get("port") or 5432)
-        database = str(cloud.get("database") or "postgres").strip() or "postgres"
-        username = str(cloud.get("username") or "").strip()
-        password = str(cloud.get("password") or "")
-        schema = str(cloud.get("schema") or "public")
-        from urllib.parse import quote_plus as _q
-        url = f"postgresql+psycopg://{_q(username)}:{_q(password)}@{host}:{port}/{database}"
-        connect_args = {
-            "sslmode": "require" if cloud.get("tls", True) else "disable",
-            "connect_timeout": int(os.environ.get("TRUSTNODE_CP_DB_CONNECT_TIMEOUT_SECONDS", "8") or "8"),
-            "prepare_threshold": None,  # transaction-pooler incompat with auto-prepare
-            # Short timeouts for cp_* reads — they're tiny lookups.
-            "options": "-c lock_timeout=400ms -c statement_timeout=2500ms",
-        }
-        self._engine = create_engine(
-            url,
-            pool_pre_ping=True,
-            pool_size=int(os.environ.get("TRUSTNODE_CP_DB_POOL_SIZE", "6") or "6"),
-            max_overflow=int(os.environ.get("TRUSTNODE_CP_DB_MAX_OVERFLOW", "10") or "10"),
-            pool_recycle=300,
-            pool_timeout=5,  # don't hang requests waiting on pool
-            connect_args=connect_args,
-        )
-        return self._engine
+            return self._engine
 
     def _connect(self) -> _Conn:  # type: ignore[override]
         engine = self._get_engine()
