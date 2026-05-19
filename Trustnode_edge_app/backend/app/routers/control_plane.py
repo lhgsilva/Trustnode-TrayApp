@@ -1973,9 +1973,25 @@ def edge_link_unlink(request: Request) -> dict[str, Any]:
         "endpoint_mode": "local",
         "cloud_auto_sync_enabled": False,
     }
-    app_store.save_bootstrap({"app_settings": reset_settings}, actor=f"edge_unlink:{payload.get('sub') or 'admin'}")
-    telemetry_service.configure_from_bootstrap({"data": app_store.get_bootstrap(prefer_cloud_reads=False)})
-    _audit(request, tenant_id=tenant_id, action="edge_link.unlink", outcome="ok", details={"edge_id": edge_id})
+    # Save the reset settings — this is the only step that MUST succeed
+    # for unlink to be considered complete. If save_bootstrap raises,
+    # the local edge is still "linked" and we surface 500.
+    try:
+        app_store.save_bootstrap({"app_settings": reset_settings}, actor=f"edge_unlink:{payload.get('sub') or 'admin'}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"unlink_save_failed: {exc}") from exc
+    # Reconfigure telemetry + audit are best-effort. A failure here
+    # (e.g. control_plane_store backed by an unreachable Supabase)
+    # shouldn't keep the edge in a half-unlinked state — the local
+    # bootstrap is already cleared.
+    try:
+        telemetry_service.configure_from_bootstrap({"data": app_store.get_bootstrap(prefer_cloud_reads=False)})
+    except Exception:
+        pass
+    try:
+        _audit(request, tenant_id=tenant_id, action="edge_link.unlink", outcome="ok", details={"edge_id": edge_id})
+    except Exception:
+        pass
     return {"ok": True, "tenant_id": tenant_id, "edge_id": edge_id}
 
 
