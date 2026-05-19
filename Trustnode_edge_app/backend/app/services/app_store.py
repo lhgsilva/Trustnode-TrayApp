@@ -186,6 +186,14 @@ class AppStore:
             self._reconcile_lite_mirror_tables_once()
         except Exception:
             pass
+        # Seed demo report templates + push the local templates list to the
+        # cloud once on boot. Each demo is keyed by a stable id so seeding
+        # is idempotent — re-running it on subsequent boots won't duplicate
+        # rows or overwrite a customer-edited copy.
+        try:
+            self._seed_and_reconcile_report_templates_once()
+        except Exception:
+            pass
         self._scheduler_thread = threading.Thread(target=self._retention_scheduler_loop, daemon=True)
         self._live_sync_thread = threading.Thread(target=self._live_sync_loop, daemon=True)
         self._cloud_live_cache_thread = threading.Thread(target=self._cloud_live_cache_loop, daemon=True)
@@ -865,6 +873,45 @@ class AppStore:
         with self._cloud_target_cache_lock:
             self._cloud_target_cache_value = None
             self._cloud_target_cache_ts = 0.0
+
+    def _seed_and_reconcile_report_templates_once(self) -> None:
+        """Boot-time helper: install the demo templates for the locally-
+        active tenant if missing, then push every report_templates row to
+        Supabase so the Lite app sees them.
+
+        Runs on a daemon thread because app.state.reports_store is created
+        AFTER app_store during module import — importing it synchronously
+        here would form a cycle. The seed work doesn't need to block boot.
+        """
+        def _do_seed() -> None:
+            try:
+                # state module finishes initialising shortly after
+                # app_store; a short sleep avoids racing the singleton
+                # creation. We don't busy-wait because import order is
+                # deterministic — 0.5s is comfortably enough.
+                import time as _t
+                _t.sleep(0.5)
+                from app.state import reports_store as _rs  # late import
+            except Exception:
+                return
+            settings = {}
+            try:
+                settings = self._get_app_settings()
+            except Exception:
+                settings = {}
+            tenant_id = str(settings.get("tenant_id") or "").strip() or "default"
+            try:
+                _rs.seed_demo_templates(tenant_id=tenant_id, created_by="system_demo_seed")
+            except Exception:
+                pass
+            try:
+                _rs.reconcile_templates_to_cloud()
+            except Exception:
+                pass
+        try:
+            threading.Thread(target=_do_seed, name="tn-demo-templates-seed", daemon=True).start()
+        except Exception:
+            pass
 
     def _reconcile_sync_targets_with_config(self) -> None:
         """Align the sync_targets row with whatever database_configurations

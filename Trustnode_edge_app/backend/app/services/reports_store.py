@@ -207,6 +207,114 @@ class ReportsStore:
         except Exception:
             pass
 
+    def reconcile_templates_to_cloud(self, tenant_id: str | None = None) -> int:
+        """Bulk-push every local report_template row to Supabase.
+
+        The per-save mirror (`_mirror_template_to_cloud`) can drop writes
+        when the cloud target is unreachable at the moment of save. This
+        catch-up runs on backend startup and re-upserts everything so the
+        Lite app doesn't keep showing yesterday's template list after a
+        local edit cycle. Idempotent — uses ON CONFLICT DO UPDATE.
+
+        Returns the count of templates attempted.
+        """
+        from .app_store import app_store  # local import to avoid cycle
+        try:
+            cloud = app_store._get_cloud_database_target()  # noqa: SLF001
+        except Exception:
+            cloud = None
+        if not cloud:
+            return 0
+        with self._connect() as conn:
+            if tenant_id:
+                rows = conn.execute(
+                    "SELECT id, tenant_id, name, description, definition_json, created_utc, updated_utc, created_by "
+                    "FROM report_templates WHERE tenant_id = ?",
+                    (str(tenant_id),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, tenant_id, name, description, definition_json, created_utc, updated_utc, created_by "
+                    "FROM report_templates"
+                ).fetchall()
+        if not rows:
+            return 0
+        try:
+            from sqlalchemy import text  # type: ignore
+            schema = str(cloud.get("schema") or "public")
+            engine, _ = app_store._get_or_create_cloud_engine(cloud, schema)  # noqa: SLF001
+        except Exception:
+            return 0
+        upserted = 0
+        for r in rows:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."report_templates"
+                              (id, tenant_id, name, description, definition_json, created_utc, updated_utc, created_by)
+                            VALUES
+                              (:id, :tenant_id, :name, :description, :definition_json::jsonb,
+                               :created_utc, :updated_utc, :author)
+                            ON CONFLICT (tenant_id, id) DO UPDATE SET
+                              name            = EXCLUDED.name,
+                              description     = EXCLUDED.description,
+                              definition_json = EXCLUDED.definition_json,
+                              updated_utc     = EXCLUDED.updated_utc,
+                              created_by      = EXCLUDED.created_by
+                            """
+                        ),
+                        {
+                            "id": str(r["id"]),
+                            "tenant_id": str(r["tenant_id"]),
+                            "name": str(r["name"] or ""),
+                            "description": str(r["description"] or ""),
+                            "definition_json": str(r["definition_json"] or "{}"),
+                            "created_utc": str(r["created_utc"] or _utc_now()),
+                            "updated_utc": str(r["updated_utc"] or _utc_now()),
+                            "author": str(r["created_by"] or "") or None,
+                        },
+                    )
+                upserted += 1
+            except Exception:
+                # Skip one bad row; keep going for the rest.
+                continue
+        return upserted
+
+    def seed_demo_templates(self, tenant_id: str, created_by: str = "system") -> int:
+        """Install the 5 demo report templates for a tenant if it doesn't
+        already own them. Used to give customers a visible "look what the
+        analytics tools can do" set the first time they reach the Reporting
+        page. Idempotent — we key each demo by a stable id, so a re-run
+        won't duplicate or overwrite a user-customised copy."""
+        tid = str(tenant_id or "default").strip() or "default"
+        demos = _build_demo_templates()
+        installed = 0
+        with self._write_lock:
+            with self._connect() as conn:
+                for tpl in demos:
+                    tpl_id = str(tpl["id"])
+                    existing = conn.execute(
+                        "SELECT 1 FROM report_templates WHERE tenant_id = ? AND id = ?",
+                        (tid, tpl_id),
+                    ).fetchone()
+                    if existing:
+                        continue
+                    now = _utc_now()
+                    conn.execute(
+                        "INSERT INTO report_templates (id, tenant_id, name, description, definition_json, "
+                        "created_utc, updated_utc, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            tpl_id, tid, str(tpl["name"]), str(tpl.get("description") or ""),
+                            json.dumps(tpl["definition"], ensure_ascii=False, separators=(",", ":")),
+                            now, now, created_by,
+                        ),
+                    )
+                    installed += 1
+                conn.commit()
+        return installed
+
     def delete_template(self, template_id: str, tenant_id: str | None = None) -> bool:
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
         with self._write_lock:
@@ -697,3 +805,235 @@ class ReportsStore:
                 )
                 moved_schedules += 1
         return {"templates": moved_templates, "schedules": moved_schedules}
+
+
+# ---------------------------------------------------------------------------
+# Demo templates
+# ---------------------------------------------------------------------------
+#
+# Ship a small set of high-quality report templates so a fresh edge has
+# something to show in customer demos without anyone having to assemble
+# them by hand. Each template is keyed by a stable `tpl-demo-*` id so
+# seed_demo_templates() is idempotent across restarts and won't overwrite
+# whatever the customer customises after the fact.
+#
+# Tag/gateway placeholders use "DEMO_*" identifiers — the Reporting UI
+# already shows an editor where the customer maps the demo series to
+# their actual tag names; until they do that the chart panels render
+# empty but the layout is the visual proof of capability.
+
+def _demo_series(label: str, tag_name: str, color: str, *, axis: str = "left",
+                 chart_type: str = "", unit: str = "",
+                 multiplier: float = 1, offset: float = 0,
+                 gateway_id: str = "") -> dict[str, Any]:
+    return {
+        "id": _new_id("ser"),
+        "label": label,
+        "gateway_id": gateway_id or "DEMO_GATEWAY",
+        "tag_name": tag_name,
+        "color": color,
+        "axis": axis,
+        "chart_type": chart_type,
+        "unit": unit,
+        "multiplier": multiplier,
+        "offset": offset,
+    }
+
+
+def _build_demo_templates() -> list[dict[str, Any]]:
+    teal = "#14a89a"
+    teal_dark = "#0e8479"
+    amber = "#d39d3a"
+    red = "#d35454"
+    blue = "#1f78d1"
+    purple = "#7c3aed"
+    grey = "#6b7280"
+
+    process_batch = {
+        "id": "tpl-demo-process-batch",
+        "name": "Process Batch Summary",
+        "description": "End-to-end record of one production batch — setpoints vs actuals, time-in-spec, deviations.",
+        "definition": {
+            "sections": [
+                {"type": "header", "title": "Process Batch Report", "subtitle": "Batch traceability + quality at a glance"},
+                {"type": "text", "text": "This template captures the full lifecycle of a single batch: temperature/pressure trends versus setpoints, KPIs for in-spec time, and a deviation log so QA can audit the run in one page."},
+                {"type": "kpi_grid", "title": "Batch KPIs", "columns": 4, "items": [
+                    {"label": "Batch duration (min)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_BATCH_DURATION_MIN", "operator": "any", "aggregation": "max"},
+                    {"label": "Avg temp (°C)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_PROCESS_TEMP_C", "operator": "any", "aggregation": "avg"},
+                    {"label": "Time in spec (%)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_PROCESS_TEMP_C", "operator": "between", "value1": 78, "value2": 82, "aggregation": "percent"},
+                    {"label": "Deviations", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_PROCESS_TEMP_C", "operator": "outside", "value1": 78, "value2": 82, "aggregation": "count"},
+                ]},
+                {"type": "line_chart", "title": "Process temperature vs setpoint", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_PROCESS_TEMP_C", "time_range": {"preset": "8h"}, "readings_count": 480, "series": [
+                    _demo_series("Process temp (°C)", "DEMO_PROCESS_TEMP_C", teal),
+                    _demo_series("Setpoint (°C)", "DEMO_PROCESS_SETPOINT_C", amber, chart_type="line"),
+                ]},
+                {"type": "line_chart", "title": "Pressure and flow", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_PROCESS_PRESSURE_BAR", "time_range": {"preset": "8h"}, "readings_count": 480, "series": [
+                    _demo_series("Pressure (bar)", "DEMO_PROCESS_PRESSURE_BAR", blue),
+                    _demo_series("Flow (L/min)", "DEMO_PROCESS_FLOW_LPM", purple, axis="right"),
+                ]},
+                {"type": "table_list", "title": "Top deviations during batch", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_PROCESS_TEMP_C", "list_limit": 12, "time_range": {"preset": "8h"}},
+            ]
+        },
+    }
+
+    oee = {
+        "id": "tpl-demo-oee",
+        "name": "OEE — Availability · Performance · Quality",
+        "description": "Classic OEE breakdown with stop-cause Pareto and shift comparison.",
+        "definition": {
+            "sections": [
+                {"type": "header", "title": "OEE Report", "subtitle": "Availability × Performance × Quality"},
+                {"type": "text", "text": "Industry-standard OEE view: the three contributing factors, their product, the dominant stop causes, and a shift-by-shift comparison so supervisors can spot the worst-performing window."},
+                {"type": "kpi_grid", "title": "OEE breakdown", "columns": 4, "items": [
+                    {"label": "OEE (%)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_OEE_TOTAL", "operator": "any", "aggregation": "avg"},
+                    {"label": "Availability (%)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_OEE_AVAILABILITY", "operator": "any", "aggregation": "avg"},
+                    {"label": "Performance (%)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_OEE_PERFORMANCE", "operator": "any", "aggregation": "avg"},
+                    {"label": "Quality (%)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_OEE_QUALITY", "operator": "any", "aggregation": "avg"},
+                ]},
+                {"type": "bar_chart", "title": "OEE by shift", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_OEE_TOTAL", "time_range": {"preset": "7d"}, "readings_count": 21, "series": [
+                    _demo_series("Shift A", "DEMO_OEE_SHIFT_A", teal),
+                    _demo_series("Shift B", "DEMO_OEE_SHIFT_B", teal_dark),
+                    _demo_series("Shift C", "DEMO_OEE_SHIFT_C", amber),
+                ]},
+                {"type": "pie_chart", "title": "Downtime by cause (last 7 days)", "data_source_type": "computed", "gateway_id": "DEMO_GATEWAY", "compute_rules": [
+                    {"id": "r1", "label": "Mechanical", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_STOP_REASON_CODE", "operator": "eq", "value1": 1, "aggregation": "count", "color": red},
+                    {"id": "r2", "label": "Material starvation", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_STOP_REASON_CODE", "operator": "eq", "value1": 2, "aggregation": "count", "color": amber},
+                    {"id": "r3", "label": "Changeover", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_STOP_REASON_CODE", "operator": "eq", "value1": 3, "aggregation": "count", "color": blue},
+                    {"id": "r4", "label": "Operator", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_STOP_REASON_CODE", "operator": "eq", "value1": 4, "aggregation": "count", "color": purple},
+                    {"id": "r5", "label": "Other", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_STOP_REASON_CODE", "operator": "eq", "value1": 5, "aggregation": "count", "color": grey},
+                ]},
+                {"type": "line_chart", "title": "OEE trend (rolling)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_OEE_TOTAL", "time_range": {"preset": "30d"}, "readings_count": 720, "series": [
+                    _demo_series("OEE (%)", "DEMO_OEE_TOTAL", teal),
+                    _demo_series("Target (%)", "DEMO_OEE_TARGET", amber),
+                ]},
+            ]
+        },
+    }
+
+    energy = {
+        "id": "tpl-demo-energy",
+        "name": "Energy Consumption Report",
+        "description": "Power, energy, peak demand and cost per kWh broken down by line/machine.",
+        "definition": {
+            "sections": [
+                {"type": "header", "title": "Energy Report", "subtitle": "Active power, demand peaks and cost attribution"},
+                {"type": "text", "text": "How much energy each line is consuming, when peak demand spikes, and where money is being spent. Pairs naturally with the power-meter gateway."},
+                {"type": "kpi_grid", "title": "Energy KPIs (24h)", "columns": 4, "items": [
+                    {"label": "Total kWh", "gateway_id": "DEMO_POWER_METER", "tag_name": "DEMO_ENERGY_KWH", "operator": "any", "aggregation": "sum"},
+                    {"label": "Peak demand (kW)", "gateway_id": "DEMO_POWER_METER", "tag_name": "DEMO_ACTIVE_POWER_KW", "operator": "any", "aggregation": "max"},
+                    {"label": "Avg power factor", "gateway_id": "DEMO_POWER_METER", "tag_name": "DEMO_POWER_FACTOR", "operator": "any", "aggregation": "avg"},
+                    {"label": "Cost @ 0.18 €/kWh", "gateway_id": "DEMO_POWER_METER", "tag_name": "DEMO_ENERGY_KWH", "operator": "any", "aggregation": "sum", "multiplier": 0.18},
+                ]},
+                {"type": "line_chart", "title": "Active power trend (24h)", "gateway_id": "DEMO_POWER_METER", "tag_name": "DEMO_ACTIVE_POWER_KW", "time_range": {"preset": "24h"}, "readings_count": 1440, "series": [
+                    _demo_series("Line 1 (kW)", "DEMO_LINE1_POWER_KW", teal),
+                    _demo_series("Line 2 (kW)", "DEMO_LINE2_POWER_KW", blue),
+                    _demo_series("Compressor (kW)", "DEMO_COMPRESSOR_POWER_KW", purple),
+                ]},
+                {"type": "bar_chart", "title": "Energy by line (last 7 days, kWh)", "gateway_id": "DEMO_POWER_METER", "tag_name": "DEMO_ENERGY_KWH", "time_range": {"preset": "7d"}, "readings_count": 7, "series": [
+                    _demo_series("Line 1", "DEMO_LINE1_ENERGY_KWH", teal),
+                    _demo_series("Line 2", "DEMO_LINE2_ENERGY_KWH", blue),
+                    _demo_series("Utilities", "DEMO_UTILITIES_ENERGY_KWH", purple),
+                ]},
+                {"type": "line_chart", "title": "Voltage / current / power factor", "gateway_id": "DEMO_POWER_METER", "tag_name": "DEMO_VOLTAGE_V", "time_range": {"preset": "24h"}, "readings_count": 1440, "series": [
+                    _demo_series("Voltage (V)", "DEMO_VOLTAGE_V", teal),
+                    _demo_series("Current (A)", "DEMO_CURRENT_A", amber, axis="right"),
+                    _demo_series("Power factor", "DEMO_POWER_FACTOR", purple, axis="right"),
+                ]},
+            ]
+        },
+    }
+
+    multi_series = {
+        "id": "tpl-demo-multi-series",
+        "name": "Multi-Series Comparison",
+        "description": "Compare any 6 tags on dual axes — temperatures, flows, pressures, vibration, you name it.",
+        "definition": {
+            "sections": [
+                {"type": "header", "title": "Multi-Series Comparison", "subtitle": "Side-by-side overlay of up to six signals"},
+                {"type": "text", "text": "When the root cause of a deviation isn't obvious, overlay every plausible signal at the same time-scale. This template ships with six placeholder series on a dual-axis chart you can re-map to your tags in seconds."},
+                {"type": "kpi_grid", "title": "Series headlines", "columns": 3, "items": [
+                    {"label": "Series 1 avg", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_SIGNAL_A", "operator": "any", "aggregation": "avg"},
+                    {"label": "Series 2 avg", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_SIGNAL_B", "operator": "any", "aggregation": "avg"},
+                    {"label": "Series 3 avg", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_SIGNAL_C", "operator": "any", "aggregation": "avg"},
+                    {"label": "Series 4 avg", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_SIGNAL_D", "operator": "any", "aggregation": "avg"},
+                    {"label": "Series 5 avg", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_SIGNAL_E", "operator": "any", "aggregation": "avg"},
+                    {"label": "Series 6 avg", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_SIGNAL_F", "operator": "any", "aggregation": "avg"},
+                ]},
+                {"type": "line_chart", "title": "Dual-axis overlay (24h)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_SIGNAL_A", "time_range": {"preset": "24h"}, "readings_count": 480, "series": [
+                    _demo_series("Signal A", "DEMO_SIGNAL_A", teal),
+                    _demo_series("Signal B", "DEMO_SIGNAL_B", blue),
+                    _demo_series("Signal C", "DEMO_SIGNAL_C", purple),
+                    _demo_series("Signal D (right axis)", "DEMO_SIGNAL_D", amber, axis="right"),
+                    _demo_series("Signal E (right axis)", "DEMO_SIGNAL_E", red, axis="right"),
+                    _demo_series("Signal F (right axis)", "DEMO_SIGNAL_F", grey, axis="right"),
+                ]},
+                {"type": "table_list", "title": "Most recent values across all series", "gateway_id": "DEMO_GATEWAY", "tag_name": "", "list_limit": 30, "time_range": {"preset": "1h"}},
+            ]
+        },
+    }
+
+    quality = {
+        "id": "tpl-demo-quality-yield",
+        "name": "Quality & Yield",
+        "description": "First-pass yield, reject reasons Pareto, SPC-style limits on the key dimension.",
+        "definition": {
+            "sections": [
+                {"type": "header", "title": "Quality & Yield Report", "subtitle": "First-pass yield, reject drivers, dimensional control"},
+                {"type": "text", "text": "What the line produced, how much of it passed first time, and where the rejects came from. Includes an SPC-style chart with upper/lower control limits on the critical dimension."},
+                {"type": "kpi_grid", "title": "Quality KPIs", "columns": 4, "items": [
+                    {"label": "Units produced", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_UNITS_PRODUCED", "operator": "any", "aggregation": "sum"},
+                    {"label": "First-pass yield (%)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_FIRST_PASS_YIELD", "operator": "any", "aggregation": "avg"},
+                    {"label": "Scrap (units)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_SCRAP_UNITS", "operator": "any", "aggregation": "sum"},
+                    {"label": "Cpk (estimated)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_CPK", "operator": "any", "aggregation": "avg"},
+                ]},
+                {"type": "pie_chart", "title": "Reject reasons (Pareto)", "data_source_type": "computed", "gateway_id": "DEMO_GATEWAY", "compute_rules": [
+                    {"id": "q1", "label": "Dimensional", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_REJECT_CODE", "operator": "eq", "value1": 1, "aggregation": "count", "color": red},
+                    {"id": "q2", "label": "Surface defect", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_REJECT_CODE", "operator": "eq", "value1": 2, "aggregation": "count", "color": amber},
+                    {"id": "q3", "label": "Weight", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_REJECT_CODE", "operator": "eq", "value1": 3, "aggregation": "count", "color": blue},
+                    {"id": "q4", "label": "Label / barcode", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_REJECT_CODE", "operator": "eq", "value1": 4, "aggregation": "count", "color": purple},
+                    {"id": "q5", "label": "Other", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_REJECT_CODE", "operator": "eq", "value1": 5, "aggregation": "count", "color": grey},
+                ]},
+                {"type": "line_chart", "title": "Critical dimension vs UCL/LCL", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_KEY_DIMENSION_MM", "time_range": {"preset": "24h"}, "readings_count": 720, "series": [
+                    _demo_series("Measured (mm)", "DEMO_KEY_DIMENSION_MM", teal),
+                    _demo_series("Target", "DEMO_KEY_DIMENSION_TARGET_MM", blue),
+                    _demo_series("UCL", "DEMO_KEY_DIMENSION_UCL_MM", red, chart_type="line"),
+                    _demo_series("LCL", "DEMO_KEY_DIMENSION_LCL_MM", red, chart_type="line"),
+                ]},
+                {"type": "bar_chart", "title": "Yield by shift (last 7 days)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_FIRST_PASS_YIELD", "time_range": {"preset": "7d"}, "readings_count": 21, "series": [
+                    _demo_series("Shift A", "DEMO_YIELD_SHIFT_A", teal),
+                    _demo_series("Shift B", "DEMO_YIELD_SHIFT_B", blue),
+                    _demo_series("Shift C", "DEMO_YIELD_SHIFT_C", purple),
+                ]},
+            ]
+        },
+    }
+
+    downtime = {
+        "id": "tpl-demo-downtime-mttr",
+        "name": "Downtime & MTTR",
+        "description": "Mean-time-between-failure, mean-time-to-repair, top offending assets and a stops timeline.",
+        "definition": {
+            "sections": [
+                {"type": "header", "title": "Downtime & MTTR", "subtitle": "Where the line stops, for how long, and how fast it recovers"},
+                {"type": "text", "text": "Reliability-engineering view: MTBF / MTTR per asset, total stop minutes by line, and a timeline showing exactly when each stop happened over the last week. Pairs with the alarm event log."},
+                {"type": "kpi_grid", "title": "Reliability KPIs", "columns": 4, "items": [
+                    {"label": "Stops (7d)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_LINE_STOP", "operator": "eq", "value1": 1, "aggregation": "count"},
+                    {"label": "MTBF (h)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_MTBF_HOURS", "operator": "any", "aggregation": "avg"},
+                    {"label": "MTTR (min)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_MTTR_MINUTES", "operator": "any", "aggregation": "avg"},
+                    {"label": "Total downtime (min)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_DOWNTIME_MINUTES", "operator": "any", "aggregation": "sum"},
+                ]},
+                {"type": "bar_chart", "title": "Downtime minutes by asset (7d)", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_DOWNTIME_MINUTES", "time_range": {"preset": "7d"}, "readings_count": 7, "series": [
+                    _demo_series("Filler", "DEMO_DOWNTIME_FILLER", red),
+                    _demo_series("Capper", "DEMO_DOWNTIME_CAPPER", amber),
+                    _demo_series("Labeller", "DEMO_DOWNTIME_LABELLER", blue),
+                    _demo_series("Palletiser", "DEMO_DOWNTIME_PALLETISER", purple),
+                ]},
+                {"type": "line_chart", "title": "Line state timeline", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_LINE_STATE", "time_range": {"preset": "7d"}, "readings_count": 1000, "series": [
+                    _demo_series("Line state (0 = down, 1 = up)", "DEMO_LINE_STATE", teal, chart_type="area"),
+                ]},
+                {"type": "table_list", "title": "Recent stops with duration", "gateway_id": "DEMO_GATEWAY", "tag_name": "DEMO_LINE_STOP", "list_limit": 20, "time_range": {"preset": "7d"}},
+            ]
+        },
+    }
+
+    return [process_batch, oee, energy, multi_series, quality, downtime]
