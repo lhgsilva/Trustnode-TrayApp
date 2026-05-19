@@ -3054,11 +3054,14 @@ function AppShell() {
     }
     if (Array.isArray(data.devices)) setDevices(data.devices);
     if (Array.isArray(data.gateway_configurations)) setGatewayConfigs(data.gateway_configurations);
-    // Always mark the first bootstrap apply as completed. The single-stub
-    // seed effect uses this to avoid clobbering a saved gateway list when
-    // the legacy `config` object becomes available before bootstrap has
-    // finished loading.
+    // The bootstrap is the source of truth — if we got here at all, the
+    // saved gateway list (even an empty one) wins over any legacy seed.
+    // Setting BOTH refs synchronously closes the React-state-update race
+    // window where the seed effect could fire after we'd queued a
+    // setGatewayConfigs() but before the new value was readable from the
+    // ref, and end up writing [gw-primary] back over the real list.
     gatewayBootstrapAppliedRef.current = true;
+    gatewaySeedAttemptedRef.current = true;
     if (Array.isArray(data.database_configurations)) setDbConnections(normalizeDbConnections(data.database_configurations));
     if (Array.isArray(triggers.collection_triggers)) setCollectionTriggers(triggers.collection_triggers);
     if (triggers.collection_trigger_mode === "any" || triggers.collection_trigger_mode === "all") {

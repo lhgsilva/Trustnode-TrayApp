@@ -1580,6 +1580,7 @@ class AppStore:
         next_bulk_sync_mono = 0.0
         next_mirror_reconcile_mono = 0.0
         next_target_reconcile_mono = 0.0
+        next_report_templates_reconcile_mono = 0.0
         while not self._stop_event.is_set():
             try:
                 if self._is_cloud_auto_sync_enabled():
@@ -1617,6 +1618,21 @@ class AppStore:
                     except Exception:
                         pass
                     next_target_reconcile_mono = now_mono + 10.0  # every 10s
+                # Bulk re-push of report_templates to Supabase. The per-save
+                # mirror handles the steady-state case, but a one-shot
+                # startup hook can miss the window if the cloud target
+                # wasn't resolvable yet. Periodic reconcile guarantees
+                # eventual consistency for Lite — we cap the cadence at
+                # 30 s because each invocation reads + upserts every local
+                # template row (only a few KB), and Lite reads cache for
+                # the operator session anyway.
+                if self._is_cloud_auto_sync_enabled() and now_mono >= next_report_templates_reconcile_mono:
+                    try:
+                        from app.state import reports_store as _rs  # late import
+                        _rs.reconcile_templates_to_cloud()
+                    except Exception:
+                        pass
+                    next_report_templates_reconcile_mono = now_mono + 30.0  # every 30s
             except Exception as exc:
                 self._upsert_sync_target_state(enabled=True, config={}, last_error=f"Config sync loop error: {exc}")
             self._sync_wakeup_event.wait(timeout=self._sync_interval_seconds)
