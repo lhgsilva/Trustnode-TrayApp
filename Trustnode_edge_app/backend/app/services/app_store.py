@@ -4455,7 +4455,7 @@ class AppStore:
         with self._lock:
             with self._connect() as conn:
                 prev = conn.execute(
-                    "SELECT version, payload_json FROM config_documents WHERE domain = ?",
+                    "SELECT version, payload_json, updated_utc FROM config_documents WHERE domain = ?",
                     (domain,),
                 ).fetchone()
                 old_version = int(prev["version"]) if prev else 0
