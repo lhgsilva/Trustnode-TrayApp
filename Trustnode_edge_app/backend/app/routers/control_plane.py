@@ -484,13 +484,35 @@ def delete_edge_post(request: Request, edge_id: str, tenant_id: str | None = Non
 
 @router.post("/edges/heartbeat")
 def heartbeat_edge(request: Request, edge_id: str, payload: dict[str, Any] | None = None, tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _scoped_tenant(request, tenant_id)
-    row = control_plane_store.heartbeat_edge(tenant_id=tid, edge_id=edge_id, payload=payload or {})
+    # Heartbeat tolerates a cross-tenant lookup for master admin: edges
+    # created on per-customer tenants (e.g. tenant-smoke-customer-XXXX)
+    # still need to receive heartbeats sent with tenant_id=default by the
+    # post-deploy smoke test. For non-master callers we keep the strict
+    # tenant scoping.
+    auth_payload = getattr(request.state, "user_payload", {}) or {}
+    is_master = _is_global_admin(auth_payload)
+    requested = _scoped_tenant(request, tenant_id)
+    # Try the heartbeat with the requested tenant first
+    row = control_plane_store.heartbeat_edge(tenant_id=requested, edge_id=edge_id, payload=payload or {})
+    if not row and is_master:
+        # Master: find the edge across tenants and retry
+        try:
+            all_edges = control_plane_store.list_edges(all_tenants=True)
+            owner = next((r for r in all_edges if str(r.get("edge_id") or "") == str(edge_id or "")), None)
+            if owner:
+                actual_tid = normalize_tenant_id(str(owner.get("tenant_id") or "default"))
+                row = control_plane_store.heartbeat_edge(tenant_id=actual_tid, edge_id=edge_id, payload=payload or {})
+                if row:
+                    _audit(request, tenant_id=actual_tid, action="edge.heartbeat", outcome="ok",
+                           details={"edge_id": edge_id, "resolved_tenant": actual_tid})
+                    return {"ok": True, "tenant_id": actual_tid, "row": row}
+        except Exception:
+            pass
     if not row:
-        _audit(request, tenant_id=tid, action="edge.heartbeat", outcome="not_found", details={"edge_id": edge_id})
+        _audit(request, tenant_id=requested, action="edge.heartbeat", outcome="not_found", details={"edge_id": edge_id})
         raise HTTPException(status_code=404, detail="edge_not_found")
-    _audit(request, tenant_id=tid, action="edge.heartbeat", outcome="ok", details={"edge_id": edge_id})
-    return {"ok": True, "tenant_id": tid, "row": row}
+    _audit(request, tenant_id=requested, action="edge.heartbeat", outcome="ok", details={"edge_id": edge_id})
+    return {"ok": True, "tenant_id": requested, "row": row}
 
 
 @router.get("/licenses")

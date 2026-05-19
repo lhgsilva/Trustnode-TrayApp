@@ -27,12 +27,34 @@ class UISourceTestResult(BaseModel):
 
 
 def _get_user_ui_source_path() -> str:
+    """Return the persisted ui-source config path.
+
+    Resolution order:
+      1. TRUSTNODE_UI_SOURCE_PATH env var (explicit override)
+      2. Windows: %APPDATA%/trustnode-edge-desktop/ui-source.json
+      3. Linux / cloud VPS: $TRUSTNODE_DATA_DIR/ui-source.json,
+         falling back to ~/.trustnode_edge/ui-source.json
+    """
+    explicit = os.getenv("TRUSTNODE_UI_SOURCE_PATH", "").strip()
+    if explicit:
+        os.makedirs(os.path.dirname(explicit) or ".", exist_ok=True)
+        return explicit
+
     appdata = os.getenv("APPDATA")
-    if not appdata:
-        raise RuntimeError("APPDATA not available")
-    target_dir = os.path.join(appdata, "trustnode-edge-desktop")
-    os.makedirs(target_dir, exist_ok=True)
-    return os.path.join(target_dir, "ui-source.json")
+    if appdata:
+        target_dir = os.path.join(appdata, "trustnode-edge-desktop")
+        os.makedirs(target_dir, exist_ok=True)
+        return os.path.join(target_dir, "ui-source.json")
+
+    # Non-Windows path (the cloud VPS). The endpoint was previously
+    # raising 500 on every portal page-load and triggering smoke-test
+    # alert emails. Resolve to a stable location under the user's
+    # trustnode data dir.
+    data_dir = os.getenv("TRUSTNODE_DATA_DIR", "").strip()
+    if not data_dir:
+        data_dir = os.path.join(os.path.expanduser("~"), ".trustnode_edge")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "ui-source.json")
 
 
 @router.get("/config", response_model=UISourceConfig)
