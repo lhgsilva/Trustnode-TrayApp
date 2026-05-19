@@ -1781,7 +1781,7 @@ body {
 
 .historian-table .thead,
 .historian-table .trow {
-  grid-template-columns: 1.35fr 1.3fr .8fr .9fr 1fr 1fr 1fr 1fr;
+  grid-template-columns: 1.35fr 1.3fr .8fr .9fr 1fr 1fr 1fr 1fr .7fr;
 }
 
 .logs-table .thead,

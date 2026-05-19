@@ -5128,10 +5128,25 @@ class AppStore:
         # the (tenant_id, ts_utc DESC) covering index in order — otherwise
         # it falls back to "USE TEMP B-TREE FOR ORDER BY" and full-sorts the
         # entire tenant slice (~1.4M rows on a busy edge = ~400ms per call).
+        # Snapshot the last id the cloud-sync worker has pushed so each
+        # returned row can be tagged "pushed" vs "pending cloud forward".
+        # The Historian page exposes this so the operator can see at a
+        # glance which rows are still buffered locally — exactly the
+        # store-and-forward semantics that exist if the cloud goes down.
+        last_pushed_id = 0
+        try:
+            with self._connect() as conn_state:
+                state_row = conn_state.execute(
+                    "SELECT last_historian_id FROM data_sync_state WHERE id = 1"
+                ).fetchone()
+                if state_row is not None:
+                    last_pushed_id = int(state_row[0] or 0)
+        except Exception:
+            last_pushed_id = 0
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                SELECT id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                        tag_name, value, value_text, quality, quality_label
                 FROM historian_readings
                 {where}
@@ -5142,8 +5157,10 @@ class AppStore:
             ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
+            row_id = int(r["id"] or 0)
             out.append(
                 {
+                    "id": row_id,
                     "ts": r["ts_utc"],
                     "tenant_id": str(r["tenant_id"] or tenant_id),
                     "source": r["source"] or "",
@@ -5157,6 +5174,11 @@ class AppStore:
                     "value_text": r["value_text"] if "value_text" in r.keys() else None,
                     "quality": r["quality"],
                     "quality_label": r["quality_label"] or "",
+                    # True until the cloud sync worker advances last_historian_id
+                    # past this row. While the cloud is unreachable or sync is
+                    # paused, the count of "pending" rows is the store-forward
+                    # buffer the operator can watch grow/drain.
+                    "pending_cloud_push": row_id > last_pushed_id,
                 }
             )
         out = self._filter_rows_by_edge(out, edge_filter)
@@ -5246,6 +5268,18 @@ class AppStore:
         # Read-only path: SQLite WAL allows concurrent readers without serializing.
         # We deliberately do NOT acquire self._lock here so dashboard widgets and
         # other queries can run in parallel instead of queueing on a single mutex.
+        # Same store-and-forward visibility as get_historian_rows: tag each
+        # row pending vs pushed against the cloud-sync watermark.
+        last_pushed_id = 0
+        try:
+            with self._connect() as conn_state:
+                state_row = conn_state.execute(
+                    "SELECT last_historian_id FROM data_sync_state WHERE id = 1"
+                ).fetchone()
+                if state_row is not None:
+                    last_pushed_id = int(state_row[0] or 0)
+        except Exception:
+            last_pushed_id = 0
         with self._connect() as conn:
             # ORDER BY ts_utc DESC alone matches idx_hist_tenant_gw_tag_ts so
             # SQLite can stream the LIMIT N most recent rows in index order
@@ -5254,7 +5288,7 @@ class AppStore:
             # practice and visually identical on the chart.
             rows = conn.execute(
                 f"""
-                SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                SELECT id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                        tag_name, value, value_text, quality, quality_label
                 FROM historian_readings
                 {where}
@@ -5268,7 +5302,7 @@ class AppStore:
                 # after tenant migrations or historical data imported without tenant tags.
                 rows = conn.execute(
                     f"""
-                    SELECT tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                    SELECT id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                            tag_name, value, quality, quality_label
                     FROM historian_readings
                     {where_unscoped}
@@ -5279,8 +5313,10 @@ class AppStore:
                 ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
+            row_id = int(r["id"] or 0)
             out.append(
                 {
+                    "id": row_id,
                     "ts": r["ts_utc"],
                     "tenant_id": str(r["tenant_id"] or tenant_id),
                     "source": r["source"] or "",
@@ -5294,6 +5330,7 @@ class AppStore:
                     "value_text": r["value_text"] if "value_text" in r.keys() else None,
                     "quality": r["quality"],
                     "quality_label": r["quality_label"] or "",
+                    "pending_cloud_push": row_id > last_pushed_id,
                 }
             )
         out = self._filter_rows_by_edge(out, edge_filter)

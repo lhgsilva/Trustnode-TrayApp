@@ -17734,6 +17734,67 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "historian" || activePage === "storian" ? (
             <div className="page-fill">
+              {/* Store-and-forward visibility: how many rows are buffered
+                  locally waiting to be pushed to the cloud, and when the
+                  last successful push happened. Operators use this to tell
+                  "cloud is down but local logging still safe" from "cloud
+                  is fine and backlog is empty". */}
+              {(() => {
+                const s = cloudSyncStatus || {};
+                const backlog = Number(s.historian_backlog || 0);
+                const lastUtc = String(s.last_data_sync_utc || "").trim();
+                const cloudEnabled = Boolean(s?.cloud_target?.enabled);
+                const lastDataError = String(s.last_data_error || "").trim();
+                if (!cloudEnabled && !lastDataError && backlog === 0 && !lastUtc) {
+                  return null;
+                }
+                const ageSeconds = (() => {
+                  if (!lastUtc) return null;
+                  try {
+                    let txt = lastUtc.replace("Z", "+00:00");
+                    if (txt.indexOf(" ") >= 0 && txt.indexOf("T") < 0) txt = txt.replace(" ", "T");
+                    const ms = Date.parse(txt);
+                    if (!Number.isFinite(ms)) return null;
+                    return Math.max(0, Math.floor((Date.now() - ms) / 1000));
+                  } catch (_) { return null; }
+                })();
+                const verdict = lastDataError
+                  ? "error"
+                  : !cloudEnabled
+                    ? "muted"
+                    : (backlog > 1000 || (ageSeconds != null && ageSeconds > 300) ? "warn" : "ok");
+                const verdictColor = {
+                  ok: "var(--accent, #14a89a)",
+                  warn: "#d39d3a",
+                  error: "#d35454",
+                  muted: "var(--muted, #5a5a5a)"
+                }[verdict];
+                const verdictLabel = {
+                  ok: "Forwarding to cloud",
+                  warn: "Buffering — slow / delayed push",
+                  error: "Forwarding paused",
+                  muted: "Cloud sync disabled"
+                }[verdict];
+                return (
+                  <section className="card" style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
+                    <span className="status-pill" style={{ background: verdictColor, color: "#fff" }}>
+                      {verdictLabel}
+                    </span>
+                    <span>
+                      Cloud backlog: <b>{backlog.toLocaleString()}</b> row{backlog === 1 ? "" : "s"}
+                    </span>
+                    <span>
+                      Last push: <b>{lastUtc ? fmtTs(lastUtc) : "never"}</b>
+                      {ageSeconds != null ? ` (${ageSeconds < 60 ? `${ageSeconds}s` : `${Math.floor(ageSeconds / 60)}m`} ago)` : ""}
+                    </span>
+                    {lastDataError ? (
+                      <span style={{ color: "#d35454", fontSize: 12 }} title={lastDataError}>
+                        Error: {lastDataError.slice(0, 100)}
+                      </span>
+                    ) : null}
+                  </section>
+                );
+              })()}
               <section className="card">
                 <div className="form-grid">
                   <label>
@@ -17837,20 +17898,36 @@ const getGatewayHealth = (gateway) => {
                 <div className="table-scroll fill-scroll">
                   <div className="table historian-table">
                     <div className="thead">
-                      <span>Timestamp</span><span>Tag</span><span>Value</span><span>Quality</span><span>Device</span><span>Gateway</span><span>Database</span><span>PLC</span>
+                      <span>Timestamp</span><span>Tag</span><span>Value</span><span>Quality</span><span>Device</span><span>Gateway</span><span>Database</span><span>PLC</span><span>Cloud</span>
                     </div>
-                    {historianRowsSliced.map((row, idx) => (
-                      <div key={`${row.ts}-${row.tag}-${idx}`} className="trow">
-                        <span>{fmtTs(row.ts)}</span>
-                        <span>{formatTagForDisplay(row.tag)}</span>
-                        <span>{formatStandardValue(row.value, 3)}</span>
-                        <span>{row.quality_label} ({row.quality})</span>
-                        <span>{row.device_name || "-"}</span>
-                        <span>{row.gateway_name || row.gateway_id || "-"}</span>
-                        <span>{row.database_name || "-"}</span>
-                        <span>{row.plc_ip || "-"}</span>
-                      </div>
-                    ))}
+                    {historianRowsSliced.map((row, idx) => {
+                      const pending = Boolean(row.pending_cloud_push);
+                      return (
+                        <div key={`${row.ts}-${row.tag}-${idx}`} className="trow">
+                          <span>{fmtTs(row.ts)}</span>
+                          <span>{formatTagForDisplay(row.tag)}</span>
+                          <span>{formatStandardValue(row.value, 3)}</span>
+                          <span>{row.quality_label} ({row.quality})</span>
+                          <span>{row.device_name || "-"}</span>
+                          <span>{row.gateway_name || row.gateway_id || "-"}</span>
+                          <span>{row.database_name || "-"}</span>
+                          <span>{row.plc_ip || "-"}</span>
+                          <span title={pending ? "Buffered locally; waiting for cloud push" : "Forwarded to cloud"}>
+                            <span
+                              className="status-pill"
+                              style={{
+                                background: pending ? "#d39d3a" : "var(--accent, #14a89a)",
+                                color: "#fff",
+                                fontSize: 11,
+                                padding: "1px 8px"
+                              }}
+                            >
+                              {pending ? "Pending" : "Pushed"}
+                            </span>
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
                 {/* Render-cap footer: shows the slice we're displaying vs
