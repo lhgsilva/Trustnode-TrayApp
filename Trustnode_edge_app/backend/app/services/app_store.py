@@ -176,6 +176,16 @@ class AppStore:
             self._reconcile_sync_targets_with_config()
         except Exception:
             pass
+        # Best-effort one-shot push of the Lite-readable mirror tables on
+        # startup. The periodic loop will do this every 5s anyway, but
+        # kicking it once at boot means a freshly-started backend doesn't
+        # leave the Lite app showing "no dashboards yet" for the first
+        # five-second window after a restart. Errors are swallowed; the
+        # periodic loop will retry.
+        try:
+            self._reconcile_lite_mirror_tables_once()
+        except Exception:
+            pass
         self._scheduler_thread = threading.Thread(target=self._retention_scheduler_loop, daemon=True)
         self._live_sync_thread = threading.Thread(target=self._live_sync_loop, daemon=True)
         self._cloud_live_cache_thread = threading.Thread(target=self._cloud_live_cache_loop, daemon=True)
@@ -4646,8 +4656,29 @@ class AppStore:
                             "total_logs_synced": int(ds_row["total_logs_synced"] or 0),
                         }
                     )
-                data_sync["historian_backlog"] = max(0, int(data_sync["local_historian_rows"]) - int(data_sync["last_historian_id"]))
-                data_sync["logs_backlog"] = max(0, int(data_sync["local_log_rows"]) - int(data_sync["last_log_id"]))
+                # Backlog must compare apples to apples: data_sync_state stores
+                # the LAST AUTO-INCREMENT id we pushed, not a row count. After
+                # retention deletes old rows, COUNT(*) drops below that id and
+                # the old formula went negative, getting clamped to 0 — which
+                # was the "backlog always 0" the operator saw. Use MAX(id)
+                # (the current high-water-mark on the table) instead. Cheap:
+                # SQLite reads it via the PK index in O(log N).
+                max_hist_id = 0
+                max_log_id = 0
+                try:
+                    row_max = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM historian_readings").fetchone()
+                    max_hist_id = int(row_max["m"] if row_max else 0)
+                except Exception:
+                    max_hist_id = 0
+                try:
+                    row_max_l = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM app_logs").fetchone()
+                    max_log_id = int(row_max_l["m"] if row_max_l else 0)
+                except Exception:
+                    max_log_id = 0
+                data_sync["max_historian_id"] = max_hist_id
+                data_sync["max_log_id"] = max_log_id
+                data_sync["historian_backlog"] = max(0, max_hist_id - int(data_sync["last_historian_id"]))
+                data_sync["logs_backlog"] = max(0, max_log_id - int(data_sync["last_log_id"]))
 
         cloud = self._get_cloud_database_target()
         if cloud:
