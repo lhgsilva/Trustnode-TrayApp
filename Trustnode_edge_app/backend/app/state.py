@@ -1,3 +1,4 @@
+import os
 import threading
 from typing import Any
 
@@ -19,7 +20,39 @@ ingest_store = IngestStore()
 plc_manager = PLCManager()
 app_store = AppStore()
 power_manager = PowerManager(app_store)
-control_plane_store = ControlPlaneStore()
+
+
+def _build_control_plane_store():
+    """Pick the control-plane backend based on TRUSTNODE_CONTROL_PLANE_BACKEND.
+
+      - 'cloud': Supabase-canonical. All cp_* reads/writes go to the
+        cloud Postgres project via the existing engine cache.
+        Smoke-tested 2026-05-19.
+      - 'local' (or anything else): the legacy SQLite-backed store on the
+        VPS's local trustnode_app_store.db. Today's default.
+
+    Wired here at import time so every caller (routers + workers + auth)
+    transparently gets the right backend; no per-call branching needed.
+    """
+    backend = os.environ.get("TRUSTNODE_CONTROL_PLANE_BACKEND", "").strip().lower()
+    if backend == "cloud":
+        try:
+            from app.services.control_plane_store_cloud import ControlPlaneStoreCloud
+            return ControlPlaneStoreCloud()
+        except Exception as exc:  # pragma: no cover
+            # Fall back to local on any import failure so the service keeps
+            # running rather than refusing to boot. The exception is logged
+            # via stderr — visible in journalctl.
+            import logging
+            logging.getLogger(__name__).exception(
+                "control_plane_store: cloud backend failed to initialise, "
+                "falling back to local SQLite. error=%s", exc,
+            )
+            return ControlPlaneStore()
+    return ControlPlaneStore()
+
+
+control_plane_store = _build_control_plane_store()
 reports_store = ReportsStore()
 
 # cp_users puller is created lazily on startup (main.py) once app_settings
