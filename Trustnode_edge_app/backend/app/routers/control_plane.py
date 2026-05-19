@@ -660,6 +660,38 @@ def upsert_user(payload: UserUpsertRequest, request: Request, tenant_id: str | N
         )
     except Exception:
         pass
+    # Cloud cp_users mirror — only when this edge runs in `local`
+    # control-plane mode (cloud-mode already writes directly to Supabase
+    # via control_plane_store_cloud). Without this hop, edge-created
+    # users never propagate to OTHER edges in the same tenant via their
+    # cp_users_puller. Best-effort, never blocks the local save.
+    try:
+        import os as _os, requests as _rq
+        backend_mode = str(_os.environ.get("TRUSTNODE_CONTROL_PLANE_BACKEND", "")).strip().lower()
+        cloud_url = _resolve_cloud_control_plane_base(request)
+        if backend_mode != "cloud" and cloud_url and not _is_same_origin_as_request(cloud_url, request):
+            _rq.post(
+                f"{cloud_url}/api/control-plane/users",
+                params={"tenant_id": assigned_tenant},
+                json={
+                    "customer_id": payload.customer_id,
+                    "username": payload.username,
+                    "password": payload.password,
+                    "role": payload.role,
+                    "status": payload.status,
+                    "email": payload.email,
+                    "mfa_enabled": payload.mfa_enabled,
+                    "modules": payload.modules,
+                    "permissions": payload.permissions,
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": request.headers.get("Authorization", ""),
+                },
+                timeout=8,
+            )
+    except Exception:
+        pass
     return {"ok": True, "tenant_id": assigned_tenant, "row": row}
 
 
@@ -678,6 +710,21 @@ def delete_user(request: Request, username: str, tenant_id: str | None = None) -
     try:
         from app.services.lite_user_mirror import mirror_user_delete
         mirror_user_delete(tenant_id=tid, username=username)
+    except Exception:
+        pass
+    # Cloud cp_users delete in local-mode control plane (same rationale
+    # as upsert): keeps other edges' cp_users_puller views consistent.
+    try:
+        import os as _os, requests as _rq
+        backend_mode = str(_os.environ.get("TRUSTNODE_CONTROL_PLANE_BACKEND", "")).strip().lower()
+        cloud_url = _resolve_cloud_control_plane_base(request)
+        if backend_mode != "cloud" and cloud_url and not _is_same_origin_as_request(cloud_url, request):
+            _rq.delete(
+                f"{cloud_url}/api/control-plane/users/{username}",
+                params={"tenant_id": tid},
+                headers={"Authorization": request.headers.get("Authorization", "")},
+                timeout=8,
+            )
     except Exception:
         pass
     return {"ok": True, "tenant_id": tid, "username": username}

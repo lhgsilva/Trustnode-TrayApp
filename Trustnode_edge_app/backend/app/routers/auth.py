@@ -17,6 +17,39 @@ _LOGIN_MAX = 10
 _LOGIN_WINDOW = 60  # seconds
 
 
+def _verify_against_supabase_auth(username: str, password: str) -> bool:
+    """Best-effort check: does Supabase Auth accept this username/password?
+
+    Edge users created by the portal/master flow land in Supabase Auth as
+    `<username>@trustnode.local`. The local cp_users row mirrored down by
+    cp_users_puller has no password_hash (puller can't read the cloud
+    hash), so the user couldn't otherwise log into the edge UI. We exchange
+    the credentials for a session via the Auth password grant; on 200 we
+    accept the local login, on anything else we reject.
+
+    Requires TRUSTNODE_SUPABASE_URL + a Supabase **anon** key (anon is the
+    correct key for /auth/v1 password grant — service_role bypasses Auth).
+    Returns False silently on any failure so the login flow continues.
+    """
+    import os
+    import requests
+    sb_url = (os.environ.get("TRUSTNODE_SUPABASE_URL") or "").strip().rstrip("/")
+    sb_anon = (os.environ.get("TRUSTNODE_SUPABASE_ANON_KEY") or "").strip()
+    if not sb_url or not sb_anon:
+        return False
+    email = f"{username}@trustnode.local"
+    try:
+        r = requests.post(
+            f"{sb_url}/auth/v1/token?grant_type=password",
+            headers={"apikey": sb_anon, "Content-Type": "application/json"},
+            json={"email": email, "password": password},
+            timeout=6,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def _check_rate_limit(ip: str):
     now = time.time()
     attempts = _login_attempts[ip]
@@ -257,6 +290,33 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
             hit = _match_user(cloud_users_access, username, password)
             if hit:
                 users_access = cloud_users_access
+        except Exception:
+            hit = None
+    if not hit:
+        # Last resort: portal/master may have created this user via the
+        # cloud control-plane and the local cp_users row arrived from
+        # cp_users_puller WITHOUT a usable password_hash (puller sets
+        # password=None on the first sync). The user's real credential
+        # lives in Supabase Auth as `<username>@trustnode.local`. Verify
+        # the password against Auth, and on success accept the login
+        # using the cp_users metadata for permissions/role/tenant.
+        try:
+            tid = normalize_tenant_id(get_current_tenant())
+            cp_rows = control_plane_store.list_users(tenant_id=tid)
+            cp_local = next(
+                (u for u in (cp_rows or [])
+                 if str(u.get("username") or "").lower() == username.lower()),
+                None,
+            )
+            if cp_local and _verify_against_supabase_auth(username, password):
+                hit = {
+                    "username": cp_local.get("username"),
+                    "role": cp_local.get("role"),
+                    "permissions": cp_local.get("permissions") or {},
+                    "modules": cp_local.get("modules") or [],
+                    "tenant_id": cp_local.get("tenant_id"),
+                    "must_change_password": cp_local.get("must_change_password"),
+                }
         except Exception:
             hit = None
     if not hit:
