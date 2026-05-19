@@ -3928,21 +3928,38 @@ class AppStore:
         if not skey:
             return self.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
         out = self.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
+        # Legacy-key fallback: edges activated before linked_customer_id was
+        # threaded into edge_profile saved scoped docs under
+        # `tenant|-|edge` (2-segment). After the fix the running EXE
+        # resolves scope to `tenant|customer|edge` (3-segment) and an
+        # otherwise-unmigrated install would see empty arrays for the
+        # picker dropdowns. Probe both and overlay so the operator never
+        # loses data because of a scope-key shape change.
+        legacy_skey = ""
+        parts = skey.split("|")
+        if len(parts) >= 3 and parts[1] and parts[1] != "-":
+            # 3-segment shared scope: legacy is the same with '-' for customer.
+            legacy_skey = "|".join([parts[0], "-", *parts[2:]])
+        candidate_keys = [skey]
+        if legacy_skey and legacy_skey != skey:
+            # Read legacy FIRST so the current-scope row overlays it.
+            candidate_keys.insert(0, legacy_skey)
         with self._lock:
             with self._connect() as conn:
-                rows = conn.execute(
-                    "SELECT domain, payload_json FROM config_documents_scoped WHERE scope_key = ?",
-                    (skey,),
-                ).fetchall()
-        for row in rows:
-            domain = str(row["domain"] or "").strip()
-            if not domain:
-                continue
-            payload_text = str(row["payload_json"] or "null")
-            try:
-                out[domain] = json.loads(payload_text)
-            except Exception:
-                out[domain] = None
+                for k in candidate_keys:
+                    rows = conn.execute(
+                        "SELECT domain, payload_json FROM config_documents_scoped WHERE scope_key = ?",
+                        (k,),
+                    ).fetchall()
+                    for row in rows:
+                        domain = str(row["domain"] or "").strip()
+                        if not domain:
+                            continue
+                        payload_text = str(row["payload_json"] or "null")
+                        try:
+                            out[domain] = json.loads(payload_text)
+                        except Exception:
+                            out[domain] = None
         if isinstance(out.get("metadata"), dict):
             out["metadata"]["scope_key"] = skey
         return out
