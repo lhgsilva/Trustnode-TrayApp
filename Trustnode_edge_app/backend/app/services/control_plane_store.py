@@ -491,7 +491,19 @@ class ControlPlaneStore:
         except Exception:
             pass
 
-        # ---- 3. Cloud Supabase (last-resort, capped at ~2s wall clock) ----
+        # ---- 3. Cloud Supabase fallback ----
+        # Only consult Supabase when the runtime is in cloud-canonical mode
+        # (TRUSTNODE_CONTROL_PLANE_BACKEND=cloud). Otherwise the local
+        # SQLite IS the source of truth and a missing row means "doesn't
+        # exist", not "ask cloud". The earlier cloud-first lookup added a
+        # 2s round-trip to every POST /customers when running in local
+        # mode and Supabase didn't have the row — which is exactly the
+        # case for every newly-created customer.
+        backend_mode = os.environ.get("TRUSTNODE_CONTROL_PLANE_BACKEND", "").strip().lower()
+        if backend_mode != "cloud":
+            cache[cid] = ("", now)
+            return ""
+
         cloud_tid = ""
         try:
             import threading
@@ -506,8 +518,6 @@ class ControlPlaneStore:
                     schema = str(cloud.get("schema") or "public")
                     engine, _key = _app_store._get_or_create_cloud_engine(cloud, schema)  # type: ignore[attr-defined]
                     with engine.connect() as conn:
-                        # Server-side timeout in case the connection
-                        # itself succeeds but the query stalls.
                         try:
                             conn.execute(text("SET LOCAL statement_timeout = 1000"))
                         except Exception:
@@ -534,9 +544,8 @@ class ControlPlaneStore:
             cache[cid] = (cloud_tid, now)
             return cloud_tid
 
-        # Cache the negative result too (shorter TTL via the same field)
-        # so a flood of "create new customer" calls doesn't hammer the
-        # cloud for non-existent IDs.
+        # Cache the negative result too so a flood of "create new customer"
+        # calls doesn't hammer the cloud for non-existent IDs.
         cache[cid] = ("", now)
         return ""
 
