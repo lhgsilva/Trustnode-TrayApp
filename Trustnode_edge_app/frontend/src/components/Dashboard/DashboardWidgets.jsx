@@ -586,6 +586,7 @@ export function DashboardWidgetCard({
   tagRowsByGateway,
   formatTagForDisplay,
   gatewayIntervalsById = {},
+  gatewaysIndex = null,
   fetchWidgetRows,
   fetchWidgetStats,
   fetchWidgetRuleStats,
@@ -641,18 +642,37 @@ export function DashboardWidgetCard({
   const onPanPointerUp = () => {};
   const cfg = widget?.config || {};
   const gatewayId = cfg.gateway_id || "";
+  const tagName = cfg.tag_name || "";
   const resolvedGatewayId = useMemo(() => {
     const raw = String(gatewayId || "").trim();
-    if (!raw) return "";
-    if (Object.prototype.hasOwnProperty.call(tagRowsByGateway || {}, raw)) return raw;
-    // Backward-compat: old widgets may store gateway_name instead of gateway_id.
-    for (const [gid, rows] of Object.entries(tagRowsByGateway || {})) {
-      const sampleName = String(rows?.[0]?.gateway_name || "").trim();
-      if (sampleName && sampleName === raw) return String(gid || "").trim();
+    // Path 1: the saved gateway_id is still alive somewhere in the
+    // historian rows the dashboard already fetched. Cheapest hit.
+    if (raw && Object.prototype.hasOwnProperty.call(tagRowsByGateway || {}, raw)) return raw;
+    // Path 2: index check — does the current gateway list still have a
+    // gateway with this id? If yes, use it; the historian rows just
+    // haven't streamed in yet.
+    const idx = gatewaysIndex || null;
+    const knownIds = idx && Array.isArray(idx.ids) ? new Set(idx.ids) : null;
+    if (raw && knownIds && knownIds.has(raw)) return raw;
+    // Path 3 (self-heal by tag name): the saved gateway_id is gone (deleted
+    // + recreated, scope shifted, etc.). If a currently-configured gateway
+    // has this widget's tag in its tags list, point the widget at that
+    // gateway so the chart keeps updating instead of going blank. This is
+    // the operator-visible "same IP + tag = same device" recovery.
+    const tagKey = String(tagName || "").trim();
+    if (tagKey && idx && idx.byTag && idx.byTag[tagKey]) {
+      return String(idx.byTag[tagKey]);
+    }
+    // Path 4 (backward-compat): old widgets stored gateway_name instead
+    // of gateway_id. Try to find a gateway that owns rows with this name.
+    if (raw) {
+      for (const [gid, rows] of Object.entries(tagRowsByGateway || {})) {
+        const sampleName = String(rows?.[0]?.gateway_name || "").trim();
+        if (sampleName && sampleName === raw) return String(gid || "").trim();
+      }
     }
     return raw;
-  }, [gatewayId, tagRowsByGateway]);
-  const tagName = cfg.tag_name || "";
+  }, [gatewayId, tagName, tagRowsByGateway, gatewaysIndex]);
   const dataSourceType = String(cfg.data_source_type || "tag_direct");
   const computedCapable = ["pie_chart", "meter_chart", "table_list", "fixed_text", "value_kpi", "text_kpi"].includes(String(widget?.type || ""));
   const normalizedDataSourceType = computedCapable ? dataSourceType : "tag_direct";

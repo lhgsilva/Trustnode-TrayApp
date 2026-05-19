@@ -487,6 +487,7 @@ export function DashboardDesigner({
   gatewayCatalog,
   tagsByGateway,
   gatewayIntervalsById = {},
+  gatewaysIndex = null,
   showGridMeta = true,
   onOpenTagMonitor,
   widgetLatencyById = {},
@@ -1707,6 +1708,7 @@ export function DashboardDesigner({
               tagRowsByGateway={dashboardTagRowsByGateway}
               formatTagForDisplay={formatTagForDisplay}
               gatewayIntervalsById={gatewayIntervalsById}
+              gatewaysIndex={gatewaysIndex}
               fetchWidgetRows={fetchWidgetRows}
               fetchWidgetStats={fetchWidgetStats}
               fetchWidgetRuleStats={fetchWidgetRuleStats}

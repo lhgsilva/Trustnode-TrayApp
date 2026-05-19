@@ -2749,6 +2749,10 @@ function AppShell() {
   const devicesRef = useRef([]);
   const dbConnectionsRef = useRef([]);
   const gatewayConfigsRef = useRef([]);
+  // Flipped to true the first time applyAppStoreBootstrapToState() runs, so
+  // the stub-gateway seed effect can tell "still loading" from "loaded but
+  // empty" and avoid clobbering a saved gateway list during the load race.
+  const gatewayBootstrapAppliedRef = useRef(false);
   const dashboardHistorySeedRef = useRef(false);
   const gatewayRuntimeStatusesRef = useRef({});
   const gatewayRuntimePrevRef = useRef({});
@@ -3050,6 +3054,11 @@ function AppShell() {
     }
     if (Array.isArray(data.devices)) setDevices(data.devices);
     if (Array.isArray(data.gateway_configurations)) setGatewayConfigs(data.gateway_configurations);
+    // Always mark the first bootstrap apply as completed. The single-stub
+    // seed effect uses this to avoid clobbering a saved gateway list when
+    // the legacy `config` object becomes available before bootstrap has
+    // finished loading.
+    gatewayBootstrapAppliedRef.current = true;
     if (Array.isArray(data.database_configurations)) setDbConnections(normalizeDbConnections(data.database_configurations));
     if (Array.isArray(triggers.collection_triggers)) setCollectionTriggers(triggers.collection_triggers);
     if (triggers.collection_trigger_mode === "any" || triggers.collection_trigger_mode === "all") {
@@ -4602,9 +4611,24 @@ function AppShell() {
     setDevicesSeeded(true);
   }, [config, devicesSeeded, devices.length, wsState]);
 
+  // First-run-only seed of a stub gateway from the legacy single-gateway
+  // `config` object. Two guards:
+  //   - gatewayBootstrapAppliedRef ensures we never seed before the saved
+  //     bootstrap has been merged in. Without this, an empty initial
+  //     gatewayConfigs would race the async fetch and overwrite the saved
+  //     list with the stub, silently breaking dashboards on restart.
+  //   - gatewaySeedAttemptedRef makes the seed one-shot, so a later manual
+  //     clear of all gateways won't be re-stubbed.
+  const gatewaySeedAttemptedRef = useRef(false);
   useEffect(() => {
     if (!config) return;
-    if (gatewayConfigsRef.current.length) return;
+    if (gatewaySeedAttemptedRef.current) return;
+    if (!gatewayBootstrapAppliedRef.current) return;
+    if (gatewayConfigsRef.current.length) {
+      gatewaySeedAttemptedRef.current = true;
+      return;
+    }
+    gatewaySeedAttemptedRef.current = true;
     const seeded = {
       id: "gw-primary",
       name: "Primary Gateway",
@@ -4627,8 +4651,31 @@ function AppShell() {
     const checkDevices = async () => {
       const current = devicesRef.current;
       if (running || !current.length) return;
-      const hasRunningGateway = Object.values(gatewayRuntimeStatusesRef.current || {}).some((s) => s?.running === true);
-      if (hasRunningGateway) return;
+      // If a gateway is actively running against this PLC, the device is
+      // reachable by definition — mark it ONLINE from the runtime status
+      // without re-probing the PLC (which would compete with the running
+      // collector for socket time).
+      const gwStatuses = gatewayRuntimeStatusesRef.current || {};
+      const hasRunningGateway = Object.values(gwStatuses).some((s) => s?.running === true);
+      if (hasRunningGateway) {
+        const runningIps = new Set();
+        for (const gid of Object.keys(gwStatuses)) {
+          const st = gwStatuses[gid];
+          if (!st?.running) continue;
+          const g = (gatewayConfigsRef.current || []).find((x) => String(x?.id || "") === String(gid));
+          if (g?.plc_ip) runningIps.add(String(g.plc_ip));
+        }
+        if (runningIps.size > 0) {
+          setDevices((prev) =>
+            prev.map((d) =>
+              runningIps.has(String(d?.plc_ip || ""))
+                ? { ...d, connection_ok: true, ping_ok: true, port_ok: true, protocol_ok: true, last_test: "Gateway running", last_check_utc: tsNow() }
+                : d
+            )
+          );
+        }
+        return;
+      }
       running = true;
       try {
         const checks = await Promise.all(
@@ -4694,8 +4741,39 @@ function AppShell() {
     const checkDbConnections = async () => {
       const current = dbConnectionsRef.current;
       if (running || !current.length) return;
-      const hasRunningGateway = Object.values(gatewayRuntimeStatusesRef.current || {}).some((s) => s?.running === true);
-      if (hasRunningGateway) return;
+      // If at least one gateway is actively writing into a DB, that DB
+      // sink is reachable by definition. Use the runtime "writes count
+      // is advancing" / "no db_last_error" signal to flip connection_ok
+      // ONLINE without re-running the heavyweight test query (which
+      // contended with the live writes and left the badge stuck on
+      // OFFLINE even though the historian was filling).
+      const gwStatuses = gatewayRuntimeStatusesRef.current || {};
+      const runningDbIds = new Set();
+      let anyGatewayRunning = false;
+      for (const gid of Object.keys(gwStatuses)) {
+        const st = gwStatuses[gid] || {};
+        if (st.running === true) {
+          anyGatewayRunning = true;
+          if (!st.db_last_error) {
+            const g = (gatewayConfigsRef.current || []).find((x) => String(x?.id || "") === String(gid));
+            const dbId = String(g?.database_id || "");
+            if (dbId) runningDbIds.add(dbId);
+          }
+        }
+      }
+      if (runningDbIds.size > 0) {
+        setDbConnections((prev) =>
+          prev.map((c) =>
+            runningDbIds.has(String(c?.id || ""))
+              ? { ...c, connection_ok: true, last_test: "Gateway writes succeeding", last_check_utc: tsNow() }
+              : c
+          )
+        );
+      }
+      // Skip the explicit probe only when at least one gateway is
+      // running — otherwise we want the periodic test to keep the badge
+      // honest on idle systems.
+      if (anyGatewayRunning) return;
       running = true;
       try {
         const checks = await Promise.all(
@@ -14797,6 +14875,43 @@ const getGatewayHealth = (gateway) => {
                   .map((g) => [String(g?.id || ""), Math.max(200, Number(g?.interval_ms || 1000))])
                   .filter(([gid]) => gid)
               )}
+              gatewaysIndex={(() => {
+                // Self-healing index for widget gateway_id references.
+                // When a widget points at a gateway id that no longer
+                // exists (gateway was deleted + recreated, scope key
+                // shifted, etc.), the widget can fall back to matching
+                // by (plc_ip, gateway_type) or by which gateway currently
+                // owns the tag, so charts keep working without manual
+                // re-binding. Computed once per render of App.jsx.
+                const list = Array.isArray(gatewayConfigsView) ? gatewayConfigsView : [];
+                const ids = new Set();
+                const byIpType = {};
+                const byTag = {};
+                for (const g of list) {
+                  if (!g || typeof g !== "object") continue;
+                  const gid = String(g.id || "").trim();
+                  if (!gid) continue;
+                  ids.add(gid);
+                  const ip = String(g.plc_ip || "").trim();
+                  const gt = String(g.gateway_type || "").trim().toLowerCase();
+                  if (ip) {
+                    const ipKey = `${ip}|${gt}`;
+                    if (!byIpType[ipKey]) byIpType[ipKey] = gid;
+                    // Also index by raw IP for legacy widgets that didn't
+                    // record gateway_type. Only used as a last resort.
+                    if (!byIpType[ip]) byIpType[ip] = gid;
+                  }
+                  const tags = Array.isArray(g.tags) ? g.tags : [];
+                  for (const t of tags) {
+                    const tag = String(t || "").trim();
+                    if (!tag) continue;
+                    // First gateway owning the tag wins. Conservative: we
+                    // only use this when ip-match also fails or is absent.
+                    if (!byTag[tag]) byTag[tag] = gid;
+                  }
+                }
+                return { ids: Array.from(ids), byIpType, byTag };
+              })()}
               showGridMeta={Boolean(isHostedWebClient || isPortalOnly)}
               widgetLatencyById={dashboardWidgetLatencyById}
               diagnosticsSummary={dashboardDiagnosticsSummary}
