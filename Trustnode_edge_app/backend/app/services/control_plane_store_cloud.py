@@ -61,9 +61,14 @@ def _translate_sql(sql: str) -> str:
     if _SQLITE_INSERT_OR_REPLACE.search(out):
         raise NotImplementedError("INSERT OR REPLACE not supported in cloud store; rewrite as INSERT ... ON CONFLICT DO UPDATE")
 
-    # rowid -> id. Every cp_* table uses an explicit `id` column where
-    # the SQLite path leans on rowid, so this swap is safe.
-    out = _SQLITE_ROWID.sub("id", out)
+    # rowid -> id. Most cp_* tables expose an explicit `id` column where
+    # the SQLite path leans on rowid. cp_edge_activation_codes is the
+    # exception — its PK is code_hash. Special-case that one before the
+    # generic rewrite so SELECTs from that table use a real column.
+    if "cp_edge_activation_codes" in out:
+        out = _SQLITE_ROWID.sub("code_hash", out)
+    else:
+        out = _SQLITE_ROWID.sub("id", out)
 
     # LIMIT -1 -> remove (sqlite treats as unlimited)
     out = _SQLITE_LIMIT_NEG1.sub("", out)
