@@ -1,13 +1,16 @@
-"""Append a <style> override to /var/www/trustnode/portal/v1/index.html
-that constrains the giant banner card.
+"""Inject a CSS override into the ASSEMBLED portal HTML.
 
-Strategy: insert a <style id="trustnode-portal-overrides"> block right
-before </head> in the bundler stub. The bundler later writes the real
-portal HTML over document.body, but our <style> in <head> survives and
-its CSS rules apply because they target the same class names the
-portal uses.
+The bundler stub at /var/www/trustnode/portal/v1/index.html does
+`document.documentElement.replaceWith(doc.documentElement)` so any
+<style> we put in the original <head> gets blown away when the real
+portal HTML loads.
 
-Idempotent: re-running replaces the previous override block.
+Strategy: patch the bundler script itself to do a `template.replace`
+on the assembled HTML template (a string) right before DOMParser
+parses it. Our CSS lands inside the NEW <head> that replaces the
+old document, so it survives.
+
+Idempotent: re-running replaces the previous patch.
 """
 from pathlib import Path
 import paramiko
@@ -107,27 +110,62 @@ stdin, stdout, _ = c.exec_command(
 stdout.read()
 _ps("backup created")
 
+# 1b. If an older oldest backup exists, restore from it so we patch a
+# pristine bundler stub (the previous run inserted a dead <style> in
+# the original <head> that gets blown away anyway, but cluttering
+# the file with leftover patches is bad).
+stdin, stdout, _ = c.exec_command(
+    "ls -1tr /var/www/trustnode/portal/v1/index.html.bak-* 2>/dev/null | head -1"
+)
+oldest_bak = stdout.read().decode().strip()
+if oldest_bak:
+    _ps(f"restoring from oldest backup: {oldest_bak}")
+    stdin, stdout, _ = c.exec_command(
+        f"cp {oldest_bak} /var/www/trustnode/portal/v1/index.html && echo OK"
+    )
+    _ps(stdout.read().decode().strip())
+
 # 2. Read current file
 sftp = c.open_sftp()
 remote = "/var/www/trustnode/portal/v1/index.html"
 with sftp.open(remote, "r") as f:
     html = f.read().decode("utf-8", errors="replace")
 
-# 3. Remove any previous override block (idempotency)
+# 3. Remove any previous patch (idempotency)
 import re
+# Drop earlier-style <style> injection if it was applied
 html = re.sub(
     r'<style id="trustnode-portal-overrides">.*?</style>',
     "",
     html,
     flags=re.DOTALL,
 )
+# Drop earlier in-bundler patch if present
+html = re.sub(
+    r"// >>>> TRUSTNODE PORTAL OVERRIDES START.*?// <<<< TRUSTNODE PORTAL OVERRIDES END\n",
+    "",
+    html,
+    flags=re.DOTALL,
+)
 
-# 4. Inject the new override before </head>
-inject = f'<style id="trustnode-portal-overrides">{CSS}</style>\n</head>'
-if "</head>" not in html:
-    _ps("[FATAL] no </head> tag found")
+# 4. Find the line `const doc = new DOMParser().parseFromString(template, 'text/html');`
+#    and inject a template.replace() call right before it.
+import json as _json
+css_js_literal = _json.dumps("<style id='trustnode-portal-overrides'>" + CSS + "</style>")
+inject_js = (
+    "    // >>>> TRUSTNODE PORTAL OVERRIDES START (2026-05-19)\n"
+    "    // Patches the assembled portal HTML to constrain the workspace card.\n"
+    "    // Idempotent: removes any prior override before re-injecting.\n"
+    "    template = template.replace(/<style id=['\\\"]trustnode-portal-overrides['\\\"]>[\\s\\S]*?<\\/style>/g, '');\n"
+    f"    template = template.replace('</head>', {css_js_literal} + '</head>');\n"
+    "    // <<<< TRUSTNODE PORTAL OVERRIDES END\n"
+)
+
+marker = "const doc = new DOMParser().parseFromString(template, 'text/html');"
+if marker not in html:
+    _ps("[FATAL] could not find DOMParser parseFromString line — bundler stub changed?")
     raise SystemExit(1)
-html = html.replace("</head>", inject, 1)
+html = html.replace(marker, inject_js + "    " + marker, 1)
 
 # 5. Write back
 with sftp.open(remote + ".new", "w") as f:
@@ -141,11 +179,15 @@ stdin, stdout, _ = c.exec_command(
 result = stdout.read().decode().strip()
 _ps(f"\n=== install result: {result} ===")
 
-# 6. Verify
+# 6. Verify the patch landed
+stdin, stdout, _ = c.exec_command(
+    "grep -c 'TRUSTNODE PORTAL OVERRIDES START' /var/www/trustnode/portal/v1/index.html"
+)
+_ps(f"patch markers in file: {stdout.read().decode().strip()}")
 stdin, stdout, _ = c.exec_command(
     "grep -c 'trustnode-portal-overrides' /var/www/trustnode/portal/v1/index.html"
 )
-_ps(f"override blocks now in file: {stdout.read().decode().strip()}")
+_ps(f"override id references: {stdout.read().decode().strip()}")
 
 c.close()
 _ps("\n[ok] CSS override injected. Hard-refresh the portal (Ctrl+Shift+R).")
