@@ -2078,22 +2078,29 @@ function useAlarmEvents(enabled = true) {
   return { events, error };
 }
 
+// Shared window for "what counts as currently active on Lite". Used by both
+// the header bell badge and the Alarms → Active tab.
+const ACTIVE_ALARM_WINDOW_MS = 15 * 60_000;
+
 // Returns the number of active, unacknowledged alarms — used by the header
-// bell icon to show a red badge with the count.
+// bell icon to show a red badge with the count. Matches ActiveAlarmsList's
+// 15-minute recent-firing window so the bell and the tab agree.
 function useActiveAlarmCount() {
   const { events } = useAlarmEvents(true);
   return useMemo(() => {
-    // Same "latest event per alert_key" logic as ActiveAlarmsList so the
-    // header bell badge and the alarms tab agree on what's active.
     if (!Array.isArray(events)) return 0;
+    const cutoff = Date.now() - ACTIVE_ALARM_WINDOW_MS;
     const byKey = new Map();
     for (const a of events) {
       if (!a || typeof a !== "object") continue;
+      if (a.event_type !== "active" || a.acknowledged) continue;
+      const tsMs = Date.parse(String(a.ts || ""));
+      if (!Number.isFinite(tsMs) || tsMs < cutoff) continue;
       const key = String(a.alert_key || a.id || `${a.gateway_id || ""}|${a.tag || ""}`);
       const prev = byKey.get(key);
-      if (!prev || String(a.ts || "") > String(prev.ts || "")) byKey.set(key, a);
+      if (!prev || tsMs > Date.parse(String(prev.ts || ""))) byKey.set(key, a);
     }
-    return [...byKey.values()].filter((a) => a && a.event_type === "active" && !a.acknowledged).length;
+    return byKey.size;
   }, [events]);
 }
 
@@ -2117,27 +2124,35 @@ function AlarmsView({ liveRows }) {
   );
 }
 
-// Active alarms list: events with event_type === 'active' AND !acknowledged.
+// Active alarms list: shows every UNACKNOWLEDGED `active` event that fired
+// within the last 15 minutes, deduped to one row per alert_key (the most
+// recent active firing wins). This matches what operators see on the edge
+// alarms screen — a flat log of recent activations — instead of the
+// "latest-event-per-key" model which silently went to zero whenever the
+// alarm oscillated below the threshold between sync ticks.
+//
 // Read-only on Lite — acknowledging is an edge-side action because that's
 // where the rule engine lives.
 function ActiveAlarmsList() {
   const { events, error } = useAlarmEvents(true);
   const [showAll, setShowAll] = useState(false);  // when true include cleared/acknowledged
 
-  // "Currently active" means: for each alert_key, look at its MOST
-  // RECENT event. If that event is `active` and not acknowledged, the
-  // alarm is live. The naïve `event_type === "active"` filter showed
-  // historical activations even after the edge had already cleared
-  // them — so the user would see "active" alarms in Lite long after
-  // they'd been resolved on the edge.
-  const latestPerKey = useMemo(() => {
+  // For each alert_key, keep the MOST RECENT `active` (unacknowledged) firing
+  // within the last 15 minutes. Older actives age out automatically — once a
+  // rule stops firing for 15 min it disappears from the Active view even if
+  // the edge never explicitly cleared it.
+  const recentActivesByKey = useMemo(() => {
     if (!Array.isArray(events)) return [];
-    const byKey = new Map(); // alert_key -> most recent event
+    const cutoff = Date.now() - ACTIVE_ALARM_WINDOW_MS;
+    const byKey = new Map();
     for (const a of events) {
       if (!a || typeof a !== "object") continue;
+      if (a.event_type !== "active" || a.acknowledged) continue;
+      const tsMs = Date.parse(String(a.ts || ""));
+      if (!Number.isFinite(tsMs) || tsMs < cutoff) continue;
       const key = String(a.alert_key || a.id || `${a.gateway_id || ""}|${a.tag || ""}`);
       const prev = byKey.get(key);
-      if (!prev || String(a.ts || "") > String(prev.ts || "")) {
+      if (!prev || tsMs > Date.parse(String(prev.ts || ""))) {
         byKey.set(key, a);
       }
     }
@@ -2148,13 +2163,10 @@ function ActiveAlarmsList() {
 
   const filtered = useMemo(() => {
     if (showAll) return events || [];
-    return latestPerKey.filter((a) => a && a.event_type === "active" && !a.acknowledged);
-  }, [latestPerKey, events, showAll]);
+    return recentActivesByKey;
+  }, [recentActivesByKey, events, showAll]);
 
-  const activeCount = useMemo(
-    () => latestPerKey.filter((a) => a && a.event_type === "active" && !a.acknowledged).length,
-    [latestPerKey]
-  );
+  const activeCount = recentActivesByKey.length;
 
   const sevClass = (s) => {
     const k = String(s || "").toLowerCase();
