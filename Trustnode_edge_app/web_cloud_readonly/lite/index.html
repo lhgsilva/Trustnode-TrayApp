@@ -285,6 +285,22 @@ function useDashboardProfiles(enabled = true) {
     let stopped = false;
     let channel = null;
     const load = async () => {
+      // Resolve friendly names for edges (and customers) so the
+      // dashboard picker shows "local-A" instead of "edge-7b56310a92".
+      // cp_edges has the operator-set edge_name; cp_customers has the
+      // company_name. Both lookups are cheap, RLS-scoped to the tenant.
+      const edgeNameById = {};
+      try {
+        const { data: edgeRows } = await applyTenantScope(
+          supabase.from("cp_edges").select("edge_id, edge_name, tenant_id"),
+          pickedTenantId,
+        );
+        for (const e of (edgeRows || [])) {
+          const id = String(e.edge_id || "").trim();
+          if (id) edgeNameById[id] = String(e.edge_name || "").trim() || id;
+        }
+      } catch (_) {}
+
       const { data, error: e } = await applyTenantScope(
         supabase
           .from("dashboard_configurations")
@@ -296,28 +312,15 @@ function useDashboardProfiles(enabled = true) {
       if (stopped) return;
       if (e) { setError(e.message); return; }
       setError("");
-      // Build a clean profile list:
-      //   * drop the legacy unscoped empty row (scope_key = '') — every
-      //     install has one as a bootstrap leftover with zero widgets,
-      //     and it confuses operators who saved several real dashboards.
-      //   * drop rows with zero widgets unless they're the only choice
-      //     (an empty dashboard is rarely what the user wants to see).
-      //   * dedupe by scope_key just in case the realtime channel
-      //     delivers duplicates.
       const seen = new Set();
       const raw = (data || []).map((r) => ({
         key: r.scope_key || "",
-        label: profileLabel(r.scope_key || ""),
+        label: profileLabel(r.scope_key || "", edgeNameById),
         payload: r.payload_json || {},
         widgetCount: Array.isArray(r.payload_json?.widgets) ? r.payload_json.widgets.length : 0,
         tenant_id: r.tenant_id || "",
       })).filter((p) => {
-        // Drop the legacy unscoped bootstrap row (scope_key='') — every
-        // install carries one from initial bootstrap and its widgets
-        // point at stale gateway_ids no longer present on the edge.
-        // Real per-user profiles always have a scope_key.
         if (!p.key) return false;
-        // Dedupe.
         if (seen.has(p.key)) return false;
         seen.add(p.key);
         return true;
@@ -351,13 +354,17 @@ function useDashboardProfiles(enabled = true) {
   return { profiles, active, activeKey: active?.key || "", setActiveKey: setActive, error };
 }
 
-function profileLabel(scopeKey) {
+function profileLabel(scopeKey, edgeNameById = {}) {
   if (!scopeKey) return "Default";
   const parts = String(scopeKey).split("|");
   const edge = parts[2] || "";
   const user = parts[3] || "";
-  if (edge && user) return `${edge} / ${user}`;
-  if (edge) return edge;
+  // Friendly name resolution: prefer the operator-set edge_name (e.g.
+  // "local-A") over the cryptic "edge-7b56310a92". Falls back to the
+  // raw id only when no name has been set yet.
+  const friendlyEdge = (edge && edgeNameById && edgeNameById[edge]) ? edgeNameById[edge] : edge;
+  if (friendlyEdge && user) return `${friendlyEdge} · ${user}`;
+  if (friendlyEdge) return friendlyEdge;
   return scopeKey;
 }
 
