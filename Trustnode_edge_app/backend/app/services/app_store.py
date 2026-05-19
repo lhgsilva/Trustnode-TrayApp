@@ -230,6 +230,100 @@ class AppStore:
             return [self._strip_runtime_fields_for_config_sync(v) for v in payload]
         return payload
 
+    def _load_previous_scoped_payload(self, scope_key: str, domain: str) -> Any:
+        """Read the previous payload for (scope_key, domain) without mutating
+        anything. Returns parsed JSON or None when there's no prior row.
+        Used by stabilisers that need to compare new-vs-old shape before
+        committing a write."""
+        try:
+            with self._lock:
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT payload_json FROM config_documents_scoped "
+                        "WHERE scope_key = ? AND domain = ?",
+                        (str(scope_key or ""), str(domain or "")),
+                    ).fetchone()
+            if not row:
+                return None
+            return json.loads(str(row["payload_json"] or "null"))
+        except Exception:
+            return None
+
+    def _stabilise_gateway_ids_by_plc_ip(
+        self,
+        *,
+        new_payload: Any,
+        prev_payload: Any,
+    ) -> Any:
+        """When the operator deletes a gateway and adds one back at the same
+        plc_ip (+ gateway_type), reuse the previous id. Widgets, alarms and
+        triggers reference gateways by id; without this, every re-create
+        leaves dashboards pointing at a dead id.
+
+        Conservative — only rewrites the id when there's exactly one
+        unambiguous match on (plc_ip, gateway_type). Same-id passthrough is
+        preserved, so editing an existing gateway never triggers a rewrite.
+        """
+        if not isinstance(new_payload, list) or not isinstance(prev_payload, list):
+            return new_payload
+        prev_by_id: Dict[str, Dict[str, Any]] = {}
+        for g in prev_payload:
+            if isinstance(g, dict):
+                gid = str(g.get("id") or "").strip()
+                if gid:
+                    prev_by_id[gid] = g
+        new_ids = {str(g.get("id") or "").strip() for g in new_payload if isinstance(g, dict)}
+        # A "removed" gateway is one whose id is in prev but not in new.
+        removed: list[Dict[str, Any]] = []
+        for gid, g in prev_by_id.items():
+            if gid not in new_ids:
+                removed.append(g)
+        if not removed:
+            return new_payload
+
+        def _norm_ip(x: Any) -> str:
+            return str(x or "").strip()
+
+        def _norm_type(x: Any) -> str:
+            return str(x or "").strip().lower()
+
+        # Group removed by (plc_ip, gateway_type) for ambiguity check.
+        removed_by_key: Dict[Tuple[str, str], list[str]] = {}
+        for g in removed:
+            ip = _norm_ip(g.get("plc_ip"))
+            gt = _norm_type(g.get("gateway_type"))
+            if not ip:
+                continue
+            removed_by_key.setdefault((ip, gt), []).append(str(g.get("id") or "").strip())
+
+        # Walk new entries; for each one whose id is NOT in prev (truly new),
+        # check whether a single removed gateway matches the same key.
+        result: list[Any] = []
+        for g in new_payload:
+            if not isinstance(g, dict):
+                result.append(g)
+                continue
+            gid = str(g.get("id") or "").strip()
+            if gid and gid in prev_by_id:
+                result.append(g)
+                continue
+            ip = _norm_ip(g.get("plc_ip"))
+            gt = _norm_type(g.get("gateway_type"))
+            if not ip:
+                result.append(g)
+                continue
+            candidates = removed_by_key.get((ip, gt)) or []
+            if len(candidates) == 1:
+                stable_id = candidates[0]
+                rewritten = dict(g)
+                rewritten["id"] = stable_id
+                # Drop the consumed removed id so we don't re-use it twice.
+                removed_by_key[(ip, gt)] = []
+                result.append(rewritten)
+            else:
+                result.append(g)
+        return result
+
     def _get_or_create_cloud_engine(self, cloud: dict[str, Any], schema: str) -> tuple[Any, str]:
         from sqlalchemy import create_engine  # type: ignore
 
@@ -1052,6 +1146,77 @@ class AppStore:
         if "cloud_auto_sync_enabled" in settings:
             return bool(settings.get("cloud_auto_sync_enabled"))
         return True
+
+    # Runtime-control flags that the background sync worker reads from the
+    # unscoped app_settings doc. The UI saves these into a user-scoped doc,
+    # so the scoped writer mirrors them into the unscoped doc to keep the
+    # two views in sync without disturbing UI-only preferences (theme,
+    # palette, ui-source mode, etc.).
+    _RUNTIME_FLAGS_MIRRORED = (
+        "cloud_auto_sync_enabled",
+        "endpoint_mode",
+        "cloud_url",
+        "tenant_login_realm",
+        "tenant_web_client_url",
+    )
+
+    def _mirror_runtime_flags_to_unscoped_app_settings(self, scoped_payload: Any) -> None:
+        if not isinstance(scoped_payload, dict):
+            return
+        diff: Dict[str, Any] = {}
+        for k in self._RUNTIME_FLAGS_MIRRORED:
+            if k in scoped_payload:
+                diff[k] = scoped_payload.get(k)
+        if not diff:
+            return
+        # Read unscoped, merge, write back only if changed.
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT version, payload_json FROM config_documents WHERE domain = ?",
+                    ("app_settings",),
+                ).fetchone()
+                current: Dict[str, Any] = {}
+                old_version = 0
+                if row:
+                    old_version = int(row["version"] or 0)
+                    try:
+                        loaded = json.loads(str(row["payload_json"] or "{}"))
+                        if isinstance(loaded, dict):
+                            current = loaded
+                    except Exception:
+                        current = {}
+                changed = False
+                for k, v in diff.items():
+                    if current.get(k) != v:
+                        current[k] = v
+                        changed = True
+                if not changed:
+                    return
+                payload_json = self._canonical_json(current)
+                now = self._utc_now()
+                new_version = old_version + 1
+                conn.execute(
+                    """
+                    INSERT INTO config_documents(domain, payload_json, version, updated_utc)
+                    VALUES(?, ?, ?, ?)
+                    ON CONFLICT(domain) DO UPDATE SET
+                      payload_json = excluded.payload_json,
+                      version = excluded.version,
+                      updated_utc = excluded.updated_utc
+                    """,
+                    ("app_settings", payload_json, new_version, now),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO config_audit(domain, actor, old_version, new_version, changed_utc)
+                    VALUES('app_settings', 'runtime_flag_mirror', ?, ?, ?)
+                    """,
+                    (old_version if old_version > 0 else None, new_version, now),
+                )
+        # Wake the sync worker so the new flag (often cloud_auto_sync_enabled)
+        # takes effect on the next tick instead of after the next interval.
+        self._sync_wakeup_event.set()
 
     def _mark_outbox_row_sent(self, row_id: int, when_utc: str) -> None:
         with self._lock:
@@ -4543,6 +4708,17 @@ class AppStore:
                     "power_management_config",
                 }:
                     payload_to_store = self._strip_runtime_fields_for_config_sync(payload_to_store)
+                if domain_name == "gateway_configurations":
+                    # Same stabiliser as scoped path: re-create at same plc_ip
+                    # keeps the previous gateway id so widgets/alarms/triggers
+                    # don't go blank.
+                    try:
+                        payload_to_store = self._stabilise_gateway_ids_by_plc_ip(
+                            new_payload=payload_to_store,
+                            prev_payload=prev_payload_obj,
+                        )
+                    except Exception:
+                        pass
                 payload_json = self._canonical_json(payload_to_store)
                 prev_payload_json = ""
                 if prev:
@@ -4663,6 +4839,19 @@ class AppStore:
             "power_management_config",
         }:
             payload_to_store = self._strip_runtime_fields_for_config_sync(payload_to_store)
+        # Stabilise gateway ids across re-create. If the operator deletes a
+        # gateway and re-adds one at the same plc_ip + gateway_type, reuse
+        # the old id so dashboards/widgets that reference it keep working
+        # instead of going blank.
+        if domain_name == "gateway_configurations":
+            try:
+                prev_payload_for_stab = self._load_previous_scoped_payload(skey, domain_name)
+                payload_to_store = self._stabilise_gateway_ids_by_plc_ip(
+                    new_payload=payload_to_store,
+                    prev_payload=prev_payload_for_stab,
+                )
+            except Exception:
+                pass
         payload_json = self._canonical_json(payload_to_store)
         with self._lock:
             with self._connect() as conn:
@@ -4710,6 +4899,18 @@ class AppStore:
             self._invalidate_cloud_target_cache()
             try:
                 self._reconcile_sync_targets_with_config()
+            except Exception:
+                pass
+        if domain_name == "app_settings":
+            # Runtime-control flags live on the user-scoped app_settings doc
+            # (because the UI saves there), but the background sync worker
+            # reads from the unscoped doc. Without mirroring, the user can
+            # tick "Auto Sync" in the UI and the worker never sees it.
+            #
+            # Mirror only the small set of flags the worker actually reads;
+            # leave UI-only preferences (theme, palette, ui-source) alone.
+            try:
+                self._mirror_runtime_flags_to_unscoped_app_settings(payload_to_store)
             except Exception:
                 pass
         if domain_name in ("dashboard_configurations", "alarms_setup", "triggers_limits"):
