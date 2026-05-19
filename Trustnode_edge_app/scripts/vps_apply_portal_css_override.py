@@ -30,69 +30,127 @@ def _ps(s):
 
 
 CSS = """
-/* TrustNode portal banner-shrink overrides
-   Added 2026-05-19. The portal-bundle CSS sets min-height:calc(100vh - 140px)
-   on .control-plane-page-fill / .control-plane-main, so the workspace card
-   that holds the saved/error banner stretches to fill the viewport. Override
-   those to size to content, and apply a compact look + dismiss-button hook
-   to the info/error notes inside. */
+/* TrustNode portal banner-shrink overrides (2026-05-19).
+
+   The portal-bundle CSS sets min-height:calc(100vh - 140px) on several
+   page containers, which makes any sibling note element stretch via
+   flexbox/grid even though the note itself has no min-height. Override
+   those containers to size-to-content, and constrain the note classes
+   directly so a single-line confirmation can't take 40vh.
+
+   We intentionally use very high specificity + !important because the
+   portal stylesheet ships several copies of .error/.info-note at
+   different specificities and we have to win all of them. */
 
 .control-plane-page-fill,
 .control-plane-layout,
-.control-plane-main { min-height: 0 !important; }
+.control-plane-main,
+.control-plane-activation-card,
+.control-plane-workspace,
+.control-plane-workspace-card,
+.portal-page,
+.workspace-page {
+  min-height: 0 !important;
+  height: auto !important;
+  align-content: start !important;
+}
 
-.control-plane-activation-card { min-height: 0 !important; align-content: start !important; }
-
-.control-plane-workspace-card { width: 100%; }
-
-/* The banner panel inside the workspace card */
-.control-plane-workspace-card > .info-note,
-.control-plane-workspace-card > .ok-note,
-.control-plane-workspace-card > .error,
-.info-note, .ok-note, .error {
-  padding: 8px 36px 8px 12px !important;
+/* The notice panels themselves: hard-cap height, no min, padding for X */
+body .info-note,
+body .ok-note,
+body .error,
+body .control-plane-workspace-card > div.info-note,
+body .control-plane-workspace-card > div.ok-note,
+body .control-plane-workspace-card > div.error {
+  padding: 8px 40px 8px 12px !important;
   margin: 6px 0 !important;
   line-height: 1.3 !important;
   font-size: 13px !important;
   position: relative !important;
   min-height: 0 !important;
-  max-height: none !important;
+  max-height: 80px !important;        /* enough for 3 wrapped lines */
+  overflow-y: auto !important;
+  display: block !important;
+  align-self: flex-start !important;
 }
 
-/* Append a dismiss button. Pure CSS: an ::after pseudo-element acts as
-   the close affordance. JS isn't needed — we use the :target trick:
-   each banner is a normal <div> in the portal, so clicking the X only
-   visually hides the immediate notice via :has + sibling selector
-   below. If the portal renders multiple notices stacked, each gets its
-   own. This is a best-effort UX fix until the portal frontend code is
-   updated properly. */
-.info-note::after,
-.ok-note::after,
-.error::after {
-  content: "\\00D7";       /* multiplication sign as 'close' glyph */
+/* Dismiss-X — wired up by JS below so click actually hides the notice */
+body .info-note[data-tn-dismissible="1"]::after,
+body .ok-note[data-tn-dismissible="1"]::after,
+body .error[data-tn-dismissible="1"]::after {
+  content: "\\00D7";
   position: absolute;
-  top: 4px;
-  right: 8px;
-  width: 22px;
-  height: 22px;
+  top: 2px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   font-size: 18px;
   font-weight: 700;
-  opacity: 0.7;
+  opacity: 0.65;
   user-select: none;
   border-radius: 4px;
-  pointer-events: auto;
+  pointer-events: none;       /* the JS shim handles clicks on the parent */
 }
-.info-note:hover::after,
-.ok-note:hover::after,
-.error:hover::after { opacity: 1; background: rgba(0,0,0,0.08); }
+"""
 
-/* When the user clicks the X area, hide the notice. We can't do this
-   purely in CSS without JS, so the dismiss button is currently visual
-   only. The portal frontend's next iteration should add an onclick. */
+# Tiny JS shim that:
+#   1. tags every .info-note/.ok-note/.error with data-tn-dismissible="1"
+#      so the CSS ::after pseudo paints the X
+#   2. listens for clicks in the upper-right 30x30 corner and hides the
+#      clicked notice
+#   3. runs again whenever the portal mutates the DOM (single
+#      MutationObserver on document.body)
+JS = r"""
+(function tnPortalNoticeDismiss() {
+  function tag(el) {
+    if (!el || el.getAttribute('data-tn-dismissible') === '1') return;
+    el.setAttribute('data-tn-dismissible', '1');
+  }
+  function scan(root) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('.info-note, .ok-note, .error').forEach(tag);
+  }
+  function init() {
+    scan(document);
+    // Click handler: if the click was in the top-right corner of a
+    // dismissible notice, hide that notice.
+    document.addEventListener('click', function(ev) {
+      var t = ev.target;
+      var el = t && t.closest ? t.closest('[data-tn-dismissible="1"]') : null;
+      if (!el) return;
+      var rect = el.getBoundingClientRect();
+      // top-right 30x30 hit area
+      if (ev.clientX >= rect.right - 30 && ev.clientY <= rect.top + 30) {
+        el.style.display = 'none';
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+    }, true);
+    // Watch for portal renders that add new notices
+    var mo = new MutationObserver(function(mutations) {
+      for (var i = 0; i < mutations.length; i++) {
+        var m = mutations[i];
+        for (var j = 0; j < m.addedNodes.length; j++) {
+          var n = m.addedNodes[j];
+          if (n.nodeType === 1) {
+            tag(n);
+            scan(n);
+          }
+        }
+      }
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
 """
 
 
@@ -151,13 +209,17 @@ html = re.sub(
 # 4. Find the line `const doc = new DOMParser().parseFromString(template, 'text/html');`
 #    and inject a template.replace() call right before it.
 import json as _json
-css_js_literal = _json.dumps("<style id='trustnode-portal-overrides'>" + CSS + "</style>")
+style_literal = _json.dumps("<style id='trustnode-portal-overrides'>" + CSS + "</style>")
+script_literal = _json.dumps("<script id='trustnode-portal-dismiss-js'>" + JS + "</script>")
 inject_js = (
     "    // >>>> TRUSTNODE PORTAL OVERRIDES START (2026-05-19)\n"
-    "    // Patches the assembled portal HTML to constrain the workspace card.\n"
+    "    // Patches the assembled portal HTML to constrain the workspace card\n"
+    "    // and add an X-to-dismiss handler on .info-note / .ok-note / .error.\n"
     "    // Idempotent: removes any prior override before re-injecting.\n"
     "    template = template.replace(/<style id=['\\\"]trustnode-portal-overrides['\\\"]>[\\s\\S]*?<\\/style>/g, '');\n"
-    f"    template = template.replace('</head>', {css_js_literal} + '</head>');\n"
+    "    template = template.replace(/<script id=['\\\"]trustnode-portal-dismiss-js['\\\"]>[\\s\\S]*?<\\/script>/g, '');\n"
+    f"    template = template.replace('</head>', {style_literal} + '</head>');\n"
+    f"    template = template.replace('</body>', {script_literal} + '</body>');\n"
     "    // <<<< TRUSTNODE PORTAL OVERRIDES END\n"
 )
 

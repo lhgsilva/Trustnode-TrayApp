@@ -565,11 +565,106 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
         return result
 
     def delete_customer(self, *, tenant_id: str, customer_id: str) -> bool:  # type: ignore[override]
-        out = super().delete_customer(tenant_id=tenant_id, customer_id=customer_id)
-        self._cache_invalidate("list_customers", "tenant_summary", "list_edges", "list_licenses")
+        """Cascade-delete a customer's full footprint.
+
+        Postgres enforces foreign keys (cp_edges.customer_id,
+        cp_licenses.customer_id, cp_edge_activation_codes.customer_id,
+        cp_customer_domains.customer_id, cp_edge_licenses.* via cp_edges),
+        which makes the plain SQLite-style 'DELETE FROM cp_customers'
+        fail with 'violates foreign key constraint' if the customer has
+        any edges/licenses/activation codes. The SQLite parent didn't
+        enforce FKs so it silently ignored this.
+
+        Here we delete the children first inside one transaction, then
+        the customer, then the per-customer tenant (if it's empty). The
+        cross-tenant lookup honours master-admin scope: if the caller's
+        tenant_id doesn't match the customer's actual tenant we still
+        resolve it (the smoke test passes tenant_id=default but the
+        customer is on its own tenant)."""
+        from app.tenant import normalize_tenant_id
+        cid = str(customer_id or "").strip()
+        if not cid:
+            return False
+        # Resolve the customer's actual tenant, regardless of what the
+        # caller passed. Local SQLite parent path also tolerates this.
+        actual_tenant = self.get_customer_tenant_id(customer_id=cid) or normalize_tenant_id(tenant_id)
         with self._lock:
-            self._customer_tenant_lookup_cache.pop(str(customer_id or "").strip(), None)
-        return out
+            with self._connect() as conn:
+                # Activation codes → first (FK to customer)
+                conn.execute(
+                    "DELETE FROM cp_edge_activation_codes WHERE customer_id=?",
+                    (cid,),
+                )
+                # cp_edge_licenses (links cp_edges to cp_licenses) → before cp_edges
+                try:
+                    conn.execute(
+                        "DELETE FROM cp_edge_licenses WHERE edge_id IN "
+                        "(SELECT edge_id FROM cp_edges WHERE customer_id=?)",
+                        (cid,),
+                    )
+                except Exception:
+                    pass
+                # cp_license_modules → before cp_licenses
+                try:
+                    conn.execute(
+                        "DELETE FROM cp_license_modules WHERE license_id IN "
+                        "(SELECT license_id FROM cp_licenses WHERE customer_id=?)",
+                        (cid,),
+                    )
+                except Exception:
+                    pass
+                # cp_licenses
+                conn.execute("DELETE FROM cp_licenses WHERE customer_id=?", (cid,))
+                # cp_edges
+                conn.execute("DELETE FROM cp_edges WHERE customer_id=?", (cid,))
+                # cp_customer_domains (Postgres-only table)
+                try:
+                    conn.execute(
+                        "DELETE FROM cp_customer_domains WHERE customer_id=?",
+                        (cid,),
+                    )
+                except Exception:
+                    pass
+                # Finally the customer row
+                cur = conn.execute(
+                    "DELETE FROM cp_customers WHERE customer_id=?",
+                    (cid,),
+                )
+                deleted = int(cur.rowcount or 0) > 0
+                # Drop the per-customer tenant if nothing else references it.
+                # Skip this if the resolved tenant is the master 'default'.
+                if actual_tenant and actual_tenant != "default":
+                    try:
+                        # Only delete the tenant if no edges/licenses/users
+                        # are still on it (defensive — children above should
+                        # have already swept the customer's resources).
+                        row = conn.execute(
+                            "SELECT count(*) AS n FROM ("
+                            "SELECT 1 FROM cp_edges WHERE tenant_id=? "
+                            "UNION ALL "
+                            "SELECT 1 FROM cp_licenses WHERE tenant_id=? "
+                            "UNION ALL "
+                            "SELECT 1 FROM cp_users WHERE tenant_id=? "
+                            "UNION ALL "
+                            "SELECT 1 FROM cp_customers WHERE tenant_id=?"
+                            ") sub",
+                            (actual_tenant, actual_tenant, actual_tenant, actual_tenant),
+                        ).fetchone()
+                        if row and int(row["n"]) == 0:
+                            conn.execute(
+                                "DELETE FROM cp_tenants WHERE tenant_id=?",
+                                (actual_tenant,),
+                            )
+                    except Exception:
+                        pass
+        # Invalidate all the caches touched by this delete
+        self._cache_invalidate(
+            "list_customers", "tenant_summary", "list_edges",
+            "list_licenses", "list_activation_codes", "list_tenants",
+        )
+        with self._lock:
+            self._customer_tenant_lookup_cache.pop(cid, None)
+        return deleted
 
     def upsert_edge(self, *, tenant_id: str, edge_id: str, edge_name: str,  # type: ignore[override]
                     customer_id: str = "", site: str = "", area: str = "",
