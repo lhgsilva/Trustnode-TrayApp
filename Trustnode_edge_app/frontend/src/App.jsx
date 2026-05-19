@@ -3621,26 +3621,21 @@ function AppShell() {
     }
   }, [users]);
 
+  // Same race fix as gatewayConfigs: legacy localStorage seed used to
+  // wipe dbConnections to [] on a fresh install before the backend
+  // bootstrap repopulated them. Backend config_documents is now the
+  // authoritative source; we only mirror writes to localStorage so any
+  // legacy tooling that reads it stays current.
   useEffect(() => {
     if (isHostedWebClient) {
       setDbConnections([]);
-      return;
     }
-    try {
-      const saved = localStorage.getItem(DB_CONNECTIONS_STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          setDbConnections(normalizeDbConnections(parsed));
-          return;
-        }
-      }
-    } catch {}
-    setDbConnections([]);
-  }, []);
+  }, [isHostedWebClient]);
 
   useEffect(() => {
-    localStorage.setItem(DB_CONNECTIONS_STORAGE_KEY, JSON.stringify(dbConnections));
+    try {
+      localStorage.setItem(DB_CONNECTIONS_STORAGE_KEY, JSON.stringify(dbConnections));
+    } catch {}
   }, [dbConnections]);
 
   useEffect(() => {
@@ -3796,26 +3791,27 @@ function AppShell() {
     }
   }, [gatewayForm.gateway_type, gatewayForm.plc_ip, gatewayForm.opc_url, gatewayForm.tags_text, gatewayOpcValidatedFor]);
 
+  // Legacy localStorage-based gateway persistence — DISABLED. This effect
+  // used to seed gatewayConfigs from localStorage on mount, and as a side
+  // effect called setGatewayConfigs([]) when nothing was cached. On a fresh
+  // Setup install (Chromium profile has no entry) this wiped the array to
+  // empty BEFORE the backend bootstrap had a chance to populate the real
+  // list, then the next saveBootstrap persisted [] back to disk. The
+  // app-store config_documents_scoped row is now the only source of truth
+  // for gateways; the bootstrap fetch hydrates state and the user's saves
+  // overwrite it. Kept the localStorage mirror write (next effect) so any
+  // tooling still reading the cached value sees a current copy.
   useEffect(() => {
     if (isHostedWebClient) {
       setGatewayConfigs([]);
-      return;
     }
-    try {
-      const saved = localStorage.getItem(GATEWAY_CONFIGS_STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          setGatewayConfigs(parsed);
-          return;
-        }
-      }
-    } catch {}
-    setGatewayConfigs([]);
+    // No localStorage seed — bootstrap is authoritative.
   }, [isHostedWebClient]);
 
   useEffect(() => {
-    localStorage.setItem(GATEWAY_CONFIGS_STORAGE_KEY, JSON.stringify(gatewayConfigs));
+    try {
+      localStorage.setItem(GATEWAY_CONFIGS_STORAGE_KEY, JSON.stringify(gatewayConfigs));
+    } catch {}
   }, [gatewayConfigs]);
 
   useEffect(() => {
@@ -3930,26 +3926,19 @@ function AppShell() {
     triggerRulesRef.current = triggerRules;
   }, [triggerRules]);
 
+  // Same race fix as gatewayConfigs / dbConnections: the legacy
+  // localStorage seed wiped devices to [] on fresh installs and the
+  // ensuing save persisted []. Bootstrap is now authoritative.
   useEffect(() => {
     if (isHostedWebClient) {
       setDevices([]);
-      return;
     }
-    try {
-      const saved = localStorage.getItem(DEVICES_STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          setDevices(parsed);
-          return;
-        }
-      }
-    } catch {}
-    setDevices([]);
   }, [isHostedWebClient]);
 
   useEffect(() => {
-    localStorage.setItem(DEVICES_STORAGE_KEY, JSON.stringify(devices));
+    try {
+      localStorage.setItem(DEVICES_STORAGE_KEY, JSON.stringify(devices));
+    } catch {}
   }, [devices]);
 
   useEffect(() => {

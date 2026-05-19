@@ -2135,7 +2135,6 @@ function AlarmsView({ liveRows }) {
 // where the rule engine lives.
 function ActiveAlarmsList() {
   const { events, error } = useAlarmEvents(true);
-  const [showAll, setShowAll] = useState(false);  // when true include cleared/acknowledged
 
   // For each alert_key, keep the MOST RECENT `active` (unacknowledged) firing
   // within the last 15 minutes. Older actives age out automatically — once a
@@ -2161,10 +2160,24 @@ function ActiveAlarmsList() {
     );
   }, [events]);
 
-  const filtered = useMemo(() => {
-    if (showAll) return events || [];
-    return recentActivesByKey;
-  }, [recentActivesByKey, events, showAll]);
+  // Build the History list as every event NOT already shown in the
+  // Active section (or as a duplicate of an active event that has since
+  // been cleared/acknowledged). Sorted newest first, capped at 200 to
+  // keep DOM small on noisy edges.
+  const activeIds = useMemo(
+    () => new Set(recentActivesByKey.map((a) => a.id || `${a.alert_key}|${a.ts}`)),
+    [recentActivesByKey]
+  );
+  const historyList = useMemo(() => {
+    if (!Array.isArray(events)) return [];
+    return events
+      .filter((a) => {
+        if (!a) return false;
+        const id = a.id || `${a.alert_key}|${a.ts}`;
+        return !activeIds.has(id);
+      })
+      .slice(0, 200);
+  }, [events, activeIds]);
 
   const activeCount = recentActivesByKey.length;
 
@@ -2175,55 +2188,72 @@ function ActiveAlarmsList() {
     return "status-muted";
   };
 
+  const renderEvent = (a) => h("div", {
+    key: a.id || `${a.tag}-${a.ts}`,
+    className: `alarm-event ${a.event_type === "active" && !a.acknowledged ? "is-active" : "is-cleared"}`,
+  },
+    h("div", { className: "alarm-event-head" },
+      h("span", { className: `status-pill ${sevClass(a.severity)}` },
+        h("span", { className: "pill-dot" }),
+        h("span", null, (a.severity || "info").toUpperCase())
+      ),
+      h("span", { className: "alarm-event-ts" }, fmtTs(a.ts)),
+      a.acknowledged ? h("span", { className: "status-pill status-online" },
+        h("span", { className: "pill-dot" }),
+        h("span", null, "ACK")
+      ) : null
+    ),
+    h("div", { className: "alarm-event-msg" }, a.message || `${a.tag} = ${fmtVal(a.value)}`),
+    h("div", { className: "alarm-event-meta" },
+      a.tag ? h("span", null, h("strong", null, "Tag: "), a.tag) : null,
+      (a.gateway_name || a.gateway_id) ? h("span", null,
+        h("strong", null, "Gateway: "), a.gateway_name || a.gateway_id) : null,
+      a.value != null ? h("span", null, h("strong", null, "Value: "), fmtVal(a.value)) : null,
+      h("span", null, h("strong", null, "State: "),
+        a.event_type === "clear" ? "cleared" : (a.acknowledged ? "acknowledged" : "active"))
+    )
+  );
+
   return h("div", null,
     h("div", { className: "section-sub" },
       h("span", { className: "meta" },
         events == null ? "" :
-        `${activeCount} active${activeCount === 1 ? "" : ""} · ${events.length} total in history`),
-      h("button", {
-        className: "btn-ghost",
-        style: { marginLeft: "auto" },
-        onClick: () => setShowAll((s) => !s),
-      }, showAll ? "Active only" : "Show history")
+        `${activeCount} active in the last 15 min · ${events.length} total events`)
     ),
     error ? h("div", { className: "banner" }, error) : null,
     events == null
       ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…")
-      : !filtered.length
-        ? h("div", { className: "card", style: { textAlign: "center", padding: "32px 20px" } },
-            h("div", { style: { fontSize: 14, fontWeight: 600, marginBottom: 8 } },
-              showAll ? "No alarm events recorded yet." : "No active alarms."),
-            h("div", { className: "muted", style: { fontSize: 12 } },
-              showAll
-                ? "When a configured limit rule fires on the edge, the event will appear here."
-                : "Everything is within limits right now."))
-        : h("div", { className: "alarm-events" },
-            ...filtered.map((a) => h("div", {
-              key: a.id || `${a.tag}-${a.ts}`,
-              className: `alarm-event ${a.event_type === "active" && !a.acknowledged ? "is-active" : "is-cleared"}`,
-            },
-              h("div", { className: "alarm-event-head" },
-                h("span", { className: `status-pill ${sevClass(a.severity)}` },
-                  h("span", { className: "pill-dot" }),
-                  h("span", null, (a.severity || "info").toUpperCase())
-                ),
-                h("span", { className: "alarm-event-ts" }, fmtTs(a.ts)),
-                a.acknowledged ? h("span", { className: "status-pill status-online" },
-                  h("span", { className: "pill-dot" }),
-                  h("span", null, "ACK")
-                ) : null
+      : h("div", null,
+          // Active section — always rendered (placeholder if empty) so the
+          // operator can tell the difference between "everything fine" and
+          // "alarms tab broken / never loaded".
+          h("div", { className: "section-sub", style: { marginTop: 18 } },
+            h("h3", { style: { margin: "0 8px 0 0", fontSize: 14 } }, "Active"),
+            h("span", { className: "meta" },
+              `${recentActivesByKey.length} firing in last 15 min`)
+          ),
+          recentActivesByKey.length
+            ? h("div", { className: "alarm-events" }, ...recentActivesByKey.map(renderEvent))
+            : h("div", { className: "card", style: { textAlign: "center", padding: "20px 16px" } },
+                h("div", { className: "muted", style: { fontSize: 12 } },
+                  "No alarms currently firing — everything within limits.")
               ),
-              h("div", { className: "alarm-event-msg" }, a.message || `${a.tag} = ${fmtVal(a.value)}`),
-              h("div", { className: "alarm-event-meta" },
-                a.tag ? h("span", null, h("strong", null, "Tag: "), a.tag) : null,
-                (a.gateway_name || a.gateway_id) ? h("span", null,
-                  h("strong", null, "Gateway: "), a.gateway_name || a.gateway_id) : null,
-                a.value != null ? h("span", null, h("strong", null, "Value: "), fmtVal(a.value)) : null,
-                h("span", null, h("strong", null, "State: "),
-                  a.event_type === "clear" ? "cleared" : (a.acknowledged ? "acknowledged" : "active"))
+          // History section — every past event, including cleared and
+          // acknowledged. Capped at 200 rows to keep the DOM small.
+          h("div", { className: "section-sub", style: { marginTop: 24 } },
+            h("h3", { style: { margin: "0 8px 0 0", fontSize: 14 } }, "History"),
+            h("span", { className: "meta" },
+              historyList.length >= 200
+                ? "Showing latest 200 events"
+                : `${historyList.length} event${historyList.length === 1 ? "" : "s"}`)
+          ),
+          historyList.length
+            ? h("div", { className: "alarm-events" }, ...historyList.map(renderEvent))
+            : h("div", { className: "card", style: { textAlign: "center", padding: "20px 16px" } },
+                h("div", { className: "muted", style: { fontSize: 12 } },
+                  "No past events to show yet.")
               )
-            ))
-          )
+        )
   );
 }
 
