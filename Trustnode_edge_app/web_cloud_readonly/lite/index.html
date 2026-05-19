@@ -1872,8 +1872,49 @@ function HistorianView() {
       else { setRows(data || []); setError(""); }
     };
     f();
-    const t = setInterval(f, 5000);
-    return () => { stop = true; clearInterval(t); };
+    // Faster cadence than before (was 5 s) so the table feels live even
+    // when the realtime channel is interrupted by Supabase free-tier
+    // backpressure. Cheap query — server-side index seek on (tenant_id,
+    // ts_utc DESC) with the row limit.
+    const t = setInterval(f, 2000);
+    // Live append: every historian_readings INSERT for the scoped tenant
+    // is prepended into the table immediately. The 2 s poller above stays
+    // as a safety net to catch up if the realtime socket drops a window.
+    const gwNeedle = gwFilter.trim().toLowerCase();
+    const tagNeedle = tagFilter.trim().toLowerCase();
+    const liveHandler = (r) => {
+      if (!r) return;
+      const rowTenant = String(r.tenant_id || "");
+      if (pickedTenantId && rowTenant && rowTenant !== pickedTenantId) return;
+      if (gwNeedle) {
+        const gid = String(r.gateway_id || "").toLowerCase();
+        if (!gid.includes(gwNeedle)) return;
+      }
+      if (tagNeedle) {
+        const tag = String(r.tag_name || "").toLowerCase();
+        if (!tag.includes(tagNeedle)) return;
+      }
+      // Respect the active time window — only prepend rows newer than the
+      // configured `from` bound so an "Last 1h" view doesn't suddenly start
+      // showing rows from outside the range.
+      if (rangeMs > 0) {
+        const fromMs = Date.now() - rangeMs;
+        const tsMs = Date.parse(String(r.ts_utc || ""));
+        if (Number.isFinite(tsMs) && tsMs < fromMs) return;
+      }
+      setRows((prev) => {
+        const cap = Math.max(20, Math.min(5000, Number(limit) || 300));
+        const next = [r, ...(Array.isArray(prev) ? prev : [])];
+        return next.length > cap ? next.slice(0, cap) : next;
+      });
+    };
+    historianSubscribers.add(liveHandler);
+    ensureHistorianChannel();
+    return () => {
+      stop = true;
+      clearInterval(t);
+      historianSubscribers.delete(liveHandler);
+    };
   }, [gwFilter, tagFilter, rangeMs, limit, pickedTenantId]);
 
   return h("div", null,
