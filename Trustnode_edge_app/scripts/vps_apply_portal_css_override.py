@@ -168,20 +168,12 @@ stdin, stdout, _ = c.exec_command(
 stdout.read()
 _ps("backup created")
 
-# 1b. If an older oldest backup exists, restore from it so we patch a
-# pristine bundler stub (the previous run inserted a dead <style> in
-# the original <head> that gets blown away anyway, but cluttering
-# the file with leftover patches is bad).
-stdin, stdout, _ = c.exec_command(
-    "ls -1tr /var/www/trustnode/portal/v1/index.html.bak-* 2>/dev/null | head -1"
-)
-oldest_bak = stdout.read().decode().strip()
-if oldest_bak:
-    _ps(f"restoring from oldest backup: {oldest_bak}")
-    stdin, stdout, _ = c.exec_command(
-        f"cp {oldest_bak} /var/www/trustnode/portal/v1/index.html && echo OK"
-    )
-    _ps(stdout.read().decode().strip())
+# 1b. NOTE: previously we restored from the oldest backup here to wipe
+# accumulated patches. That's now harmful because the rebundle script
+# (_rebundle_portal_pngs.py) shrinks the embedded image assets and we'd
+# lose that work. Step 3 below removes any previous patch markers from
+# the current file before re-injecting, so we no longer need a hard
+# restore.
 
 # 2. Read current file
 sftp = c.open_sftp()
