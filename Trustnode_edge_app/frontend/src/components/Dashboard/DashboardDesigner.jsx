@@ -1796,26 +1796,11 @@ export function DashboardDesigner({
                     </select>
                   </label>
                 ) : null}
-                <label>
-                  Width (cols)
-                  <input
-                    type="number"
-                    min="1"
-                    max={DASHBOARD_GRID_COLS}
-                    value={form.w}
-                    onChange={(e) => setForm((p) => ({ ...p, w: clamp(e.target.value, 1, DASHBOARD_GRID_COLS) }))}
-                  />
-                </label>
-                <label>
-                  Height (rows)
-                  <input
-                    type="number"
-                    min="1"
-                    max={DASHBOARD_GRID_ROWS}
-                    value={form.h}
-                    onChange={(e) => setForm((p) => ({ ...p, h: clamp(e.target.value, 1, DASHBOARD_GRID_ROWS) }))}
-                  />
-                </label>
+                {/* Width / Height inputs removed: the widget is resized
+                    by dragging the corner handle directly on the grid,
+                    so a redundant numeric input cluttered the dialog
+                    without providing extra capability. The grid state
+                    (form.w / form.h) is still persisted on save. */}
                 {["line_chart", "line_area_chart", "bar_chart", "meter_chart", "text_kpi", "value_kpi", "pie_chart", "table_list"].includes(form.type) ? (
                   <>
                     <label>

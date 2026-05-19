@@ -1177,6 +1177,16 @@ export async function forceAppStoreSyncNow(payload = {}) {
   return res.json();
 }
 
+export async function repairAppStoreScopeNow(payload = {}) {
+  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store/sync/repair_scope`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!res.ok) throw new Error("Repair scope failed");
+  return res.json();
+}
+
 export async function manualPeriodSyncAppStore(payload) {
   const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store/sync/manual-period`, {
     method: "POST",
@@ -1432,6 +1442,25 @@ export async function deleteControlPlaneCustomer(customerId, tenantId = "") {
     res = await fetchWithTimeout(postFallbackUrl, { method: "POST" });
   }
   await ensureOk(res, "Control-plane customer delete failed");
+  return res.json();
+}
+
+export async function listControlPlaneDashboardProfiles(tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/dashboard-profiles${suffix}`);
+  await ensureOk(res, "Dashboard profiles fetch failed");
+  return res.json();
+}
+
+export async function deleteControlPlaneDashboardProfile(scopeKey, tenantId = "") {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/dashboard-profiles/delete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope_key: String(scopeKey || ""), tenant_id: String(tenantId || "") }),
+  });
+  await ensureOk(res, "Dashboard profile delete failed");
   return res.json();
 }
 

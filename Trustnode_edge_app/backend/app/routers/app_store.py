@@ -484,6 +484,27 @@ def force_sync(payload: ForceSyncRequest) -> dict:
     return app_store.force_sync_now(actor=payload.actor)
 
 
+@router.post("/sync/repair_scope")
+def repair_scope(payload: ForceSyncRequest) -> dict:
+    """Lightweight one-shot recovery endpoint. Repairs stale 'tenant|-|edge'
+    scope keys to 'tenant|customer|edge' and re-mirrors Lite-visible scoped
+    docs to the cloud. Does NOT run config/live/data outbox flushes, so the
+    edge's auto-recovery doesn't pile work onto the periodic sync loop and
+    doesn't slow Lite's realtime channel.
+    """
+    out = {"ok": True, "actor": payload.actor, "errors": []}
+    try:
+        app_store._repair_scope_keys_with_customer_id()
+    except Exception as exc:
+        out["errors"].append(f"repair_scope: {exc}")
+    try:
+        app_store._remirror_scoped_docs_to_cloud()
+    except Exception as exc:
+        out["errors"].append(f"remirror_scoped: {exc}")
+    out["ok"] = not out["errors"]
+    return out
+
+
 @router.get("/sync/status")
 def get_sync_status() -> dict:
     """Read-only summary of the cloud sync worker state.

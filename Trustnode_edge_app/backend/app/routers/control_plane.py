@@ -2601,3 +2601,160 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
         or ""
     ).strip()
     return {"ok": bool(out.get("ok")), "tenant_id": resolved_tenant, "edge_id": resolved_edge_id, **out}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard profile management (portal admin)
+# ---------------------------------------------------------------------------
+#
+# The portal needs to manage the dashboard_configurations rows that live in
+# Supabase — operators sometimes accumulate stale profiles (renamed edges,
+# deactivated users) that clutter the Lite picker. These endpoints proxy
+# to the cloud Postgres mirror; the edge's local SQLite is also cleaned up
+# so the next mirror cycle doesn't resurrect the deleted row.
+
+def _cloud_engine_for_portal():
+    """Build a SQLAlchemy engine against the cloud Postgres target.
+    Returns (engine, schema) or (None, None) when no cloud DB is configured
+    (e.g. running on an isolated edge with no Supabase credentials)."""
+    cloud = app_store._get_cloud_database_target()
+    if not cloud:
+        return None, None
+    try:
+        from sqlalchemy import create_engine  # type: ignore
+    except Exception:
+        return None, None
+    schema = str(cloud.get("schema") or "public")
+    url = app_store._build_pg_sqlalchemy_url(
+        str(cloud.get("host") or ""),
+        int(cloud.get("port") or 5432),
+        str(cloud.get("database") or "postgres"),
+        str(cloud.get("username") or ""),
+        str(cloud.get("password") or ""),
+    )
+    connect_args = {
+        "sslmode": "require" if cloud.get("tls", True) else "disable",
+        "connect_timeout": 6,
+        "prepare_threshold": None,
+        "options": "-c lock_timeout=1200ms -c statement_timeout=4500ms",
+    }
+    engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+    return engine, schema
+
+
+@router.get("/dashboard-profiles")
+def list_dashboard_profiles(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    """List dashboard_configurations rows from the Supabase mirror.
+    Master admin sees all tenants; tenant admin sees only their tenant."""
+    tid = _scoped_tenant(request, tenant_id)
+    engine, schema = _cloud_engine_for_portal()
+    if not engine:
+        return {"ok": True, "tenant_id": tid, "rows": []}
+    try:
+        from sqlalchemy import text  # type: ignore
+        # Master admin (no specific tenant requested) sees everything; tenant
+        # admin sees only their tenant's profiles. _scoped_tenant returns
+        # 'default' for master when tenant_id query param is absent.
+        is_master = (tid == "default" and not (tenant_id or "").strip())
+        with engine.connect() as conn:
+            if is_master:
+                rows = conn.execute(
+                    text(
+                        f'SELECT tenant_id, scope_key, version, updated_utc, '
+                        f'jsonb_array_length(COALESCE(payload_json->\'widgets\', \'[]\'::jsonb)) AS widget_count '
+                        f'FROM "{schema}"."dashboard_configurations" ORDER BY updated_utc DESC'
+                    )
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text(
+                        f'SELECT tenant_id, scope_key, version, updated_utc, '
+                        f'jsonb_array_length(COALESCE(payload_json->\'widgets\', \'[]\'::jsonb)) AS widget_count '
+                        f'FROM "{schema}"."dashboard_configurations" '
+                        f'WHERE tenant_id = :tid ORDER BY updated_utc DESC'
+                    ),
+                    {"tid": tid},
+                ).fetchall()
+        out = []
+        for r in rows or []:
+            out.append({
+                "tenant_id": str(r[0] or ""),
+                "scope_key": str(r[1] or ""),
+                "version": int(r[2] or 0),
+                "updated_utc": str(r[3] or ""),
+                "widget_count": int(r[4] or 0),
+            })
+        return {"ok": True, "tenant_id": tid, "rows": out}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"cloud_query_failed: {exc}")
+    finally:
+        try:
+            engine.dispose()
+        except Exception:
+            pass
+
+
+class DashboardProfileDeleteRequest(BaseModel):
+    tenant_id: str = ""
+    scope_key: str
+
+
+@router.post("/dashboard-profiles/delete")
+def delete_dashboard_profile(request: Request, payload: DashboardProfileDeleteRequest) -> dict[str, Any]:
+    """Delete a dashboard profile row from the Supabase mirror, then drop
+    the matching local row on the edge so the next mirror reconcile won't
+    re-publish it. Master admin can delete any tenant; tenant admin only
+    their own."""
+    tid = _scoped_tenant(request, payload.tenant_id, require_admin_write=True)
+    skey = str(payload.scope_key or "").strip()
+    if not skey:
+        raise HTTPException(status_code=400, detail="scope_key_required")
+    target_tenant = str(payload.tenant_id or tid).strip() or tid
+    # Cloud delete first (the user-facing source of truth for Lite).
+    engine, schema = _cloud_engine_for_portal()
+    cloud_deleted = 0
+    if engine:
+        try:
+            from sqlalchemy import text  # type: ignore
+            with engine.begin() as conn:
+                result = conn.execute(
+                    text(
+                        f'DELETE FROM "{schema}"."dashboard_configurations" '
+                        f'WHERE tenant_id = :tid AND scope_key = :sk'
+                    ),
+                    {"tid": target_tenant, "sk": skey},
+                )
+                cloud_deleted = int(result.rowcount or 0)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"cloud_delete_failed: {exc}")
+        finally:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
+    # Local delete so the edge stops re-mirroring it. Best-effort.
+    local_deleted = 0
+    try:
+        with app_store._lock:
+            with app_store._connect() as conn:
+                result = conn.execute(
+                    "DELETE FROM config_documents_scoped WHERE scope_key = ? AND domain = ?",
+                    (skey, "dashboard_configurations"),
+                )
+                local_deleted = int(result.rowcount or 0)
+    except Exception:
+        pass
+    _audit(
+        request,
+        tenant_id=target_tenant,
+        action="dashboard_profile.delete",
+        outcome="ok" if (cloud_deleted or local_deleted) else "not_found",
+        details={"scope_key": skey, "cloud_deleted": cloud_deleted, "local_deleted": local_deleted},
+    )
+    return {
+        "ok": True,
+        "tenant_id": target_tenant,
+        "scope_key": skey,
+        "cloud_deleted": cloud_deleted,
+        "local_deleted": local_deleted,
+    }

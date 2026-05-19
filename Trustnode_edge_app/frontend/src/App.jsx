@@ -44,6 +44,7 @@ import {
   deleteAppStoreBackup,
   cleanupAppStoreData,
   forceAppStoreSyncNow,
+  repairAppStoreScopeNow,
   manualPeriodSyncAppStore,
   clearAppStoreSyncQueue,
   dropAppStoreSyncBacklog,
@@ -79,6 +80,8 @@ import {
   upsertControlPlaneCustomer,
   deleteControlPlaneCustomer,
   getControlPlaneEdges,
+  listControlPlaneDashboardProfiles,
+  deleteControlPlaneDashboardProfile,
   upsertControlPlaneEdge,
   deleteControlPlaneEdge,
   heartbeatControlPlaneEdge,
@@ -2387,6 +2390,15 @@ function AppShell() {
   const [tenantLoginRealm, setTenantLoginRealm] = useState("");
   const [linkedCustomerId, setLinkedCustomerId] = useState("");
   const [linkedLicenseId, setLinkedLicenseId] = useState("");
+  // Refs mirror the linked-id state so the license-poll self-heal can read
+  // the latest value without re-running the effect. The poll runs every few
+  // seconds; reading from state would either restart the interval (slow) or
+  // see stale values (false-positive recovery firing).
+  const linkedCustomerIdRef = useRef("");
+  const linkedLicenseIdRef = useRef("");
+  const customerIdRecoveryDoneRef = useRef(false);
+  useEffect(() => { linkedCustomerIdRef.current = String(linkedCustomerId || ""); }, [linkedCustomerId]);
+  useEffect(() => { linkedLicenseIdRef.current = String(linkedLicenseId || ""); }, [linkedLicenseId]);
   const [edgeProfile, setEdgeProfile] = useState({
     edge_id: "edge-01",
     edge_name: "Primary Edge",
@@ -2706,6 +2718,9 @@ function AppShell() {
   const [cpEdges, setCpEdges] = useState([]);
   const [cpLicenses, setCpLicenses] = useState([]);
   const [cpUsers, setCpUsers] = useState([]);
+  const [cpDashboardProfiles, setCpDashboardProfiles] = useState([]);
+  const [cpDashboardProfilesBusy, setCpDashboardProfilesBusy] = useState(false);
+  const [cpDashboardProfilesFilter, setCpDashboardProfilesFilter] = useState("");
   const [cpActivationCodes, setCpActivationCodes] = useState([]);
   const [cpModuleCatalog, setCpModuleCatalog] = useState([]);
   const [cpTenantForm, setCpTenantForm] = useState({
@@ -3772,6 +3787,37 @@ function AppShell() {
   useEffect(() => {
     dbConnectionsRef.current = dbConnections;
   }, [dbConnections]);
+
+  // Auto-refresh dbConnections from the bootstrap when gateway rows reference
+  // a database_id that isn't in our local list yet. Fixes the "DB linked to
+  // gateway lost on reopen" symptom on the gateway list page — the column
+  // would render "Unknown DB" until the user opened the edit modal (which
+  // already calls refreshDbConnectionsIfEmpty).
+  const dbAutoRefreshInFlightRef = useRef(false);
+  useEffect(() => {
+    if (dbAutoRefreshInFlightRef.current) return;
+    const gws = Array.isArray(gatewayConfigs) ? gatewayConfigs : [];
+    if (gws.length === 0) return;
+    const knownIds = new Set((dbConnections || []).map((c) => String(c?.id || "")));
+    const missing = gws.some((g) => {
+      const dbid = String(g?.database_id || "").trim();
+      return dbid && !knownIds.has(dbid);
+    });
+    if (!missing) return;
+    dbAutoRefreshInFlightRef.current = true;
+    (async () => {
+      try {
+        const res = await getAppStoreBootstrap();
+        const list = res?.data?.database_configurations;
+        if (Array.isArray(list) && list.length > 0) {
+          setDbConnections(normalizeDbConnections(list));
+        }
+      } catch (_) {
+      } finally {
+        dbAutoRefreshInFlightRef.current = false;
+      }
+    })();
+  }, [gatewayConfigs, dbConnections]);
 
   useEffect(() => {
     const nextMap = gatewayRuntimeStatuses || {};
@@ -7737,6 +7783,57 @@ function AppShell() {
       const out = await checkControlPlaneEdgeLicense(edgeId, currentTenantId || "default");
       setEdgeLicenseSnapshot(out || null);
       const reason = String(out?.reason || "");
+      // Self-heal once per session: if the cloud probe carries a customer_id
+      // that we don't have locally, mirror it back into app_settings so the
+      // scope key resolves to 'tenant|customer|edge'. Use a ref guard so it
+      // fires exactly once per session — the license poll runs every few
+      // seconds and we MUST NOT call force_sync_now() on every tick (that
+      // was slowing the Lite refresh down).
+      try {
+        const refreshedCustomerId = String(
+          out?.edge?.customer_id || out?.license?.customer_id || ""
+        ).trim();
+        const refreshedLicenseId = String(
+          out?.edge?.license_id || out?.license?.license_id || ""
+        ).trim();
+        const localCustomer = String(linkedCustomerIdRef.current || "").trim();
+        const localLicense = String(linkedLicenseIdRef.current || "").trim();
+        const needsRecovery =
+          (refreshedCustomerId && refreshedCustomerId !== localCustomer) ||
+          (refreshedLicenseId && refreshedLicenseId !== localLicense);
+        if (needsRecovery && !customerIdRecoveryDoneRef.current) {
+          customerIdRecoveryDoneRef.current = true;
+          await saveAppStoreDomain(
+            "app_settings",
+            {
+              ...(refreshedCustomerId ? { customer_id: refreshedCustomerId } : {}),
+              ...(refreshedLicenseId ? { license_id: refreshedLicenseId } : {}),
+              edge_linked: true,
+            },
+            currentUser?.username || "system",
+          );
+          if (refreshedCustomerId) {
+            linkedCustomerIdRef.current = refreshedCustomerId;
+            setLinkedCustomerId(refreshedCustomerId);
+          }
+          if (refreshedLicenseId) {
+            linkedLicenseIdRef.current = refreshedLicenseId;
+            setLinkedLicenseId(refreshedLicenseId);
+          }
+          // Lightweight repair: rewrites stale 'tenant|-|edge' scope_keys
+          // to 'tenant|customer|edge' and re-mirrors Lite-visible scoped
+          // docs. Does NOT trigger the full force_sync_now (which would
+          // hammer historian/live outboxes on boot and slow Lite for
+          // everyone). Bounded to a couple of cheap SELECT/UPSERT pairs.
+          try {
+            await repairAppStoreScopeNow({ actor: "auto_recovery_customer_id_restored" });
+          } catch {
+            // non-fatal; next click of Push Sync will repair
+          }
+        }
+      } catch {
+        // best-effort; next poll will retry
+      }
       if (!out?.ok) {
         if (localLicenseLooksActive) {
           // Keep app usable from persisted local state; cloud check will run again on schedule.
@@ -7989,7 +8086,11 @@ function AppShell() {
   }, []);
   const openPortalPage = useCallback((page) => {
     setActivePage("control_plane");
-    setCpPortalPage(String(page || "workspace"));
+    const next = String(page || "workspace");
+    setCpPortalPage(next);
+    if (next === "dashboard_profiles") {
+      refreshCpDashboardProfiles();
+    }
   }, []);
   const toUtcStartOfDay = useCallback((dateTxt) => {
     const txt = String(dateTxt || "").trim();
@@ -13364,6 +13465,41 @@ const getGatewayHealth = (gateway) => {
     }
   };
 
+  const refreshCpDashboardProfiles = async (tenantId = "") => {
+    setCpDashboardProfilesBusy(true);
+    try {
+      // Master admin (tenantId omitted/blank) sees every tenant's profiles;
+      // tenant admin sees only their own. The backend enforces this — we
+      // just forward the active scope.
+      const scoped = String(tenantId || (isMasterAdmin ? "" : (currentTenantId || "")));
+      const res = await listControlPlaneDashboardProfiles(scoped);
+      setCpDashboardProfiles(Array.isArray(res?.rows) ? res.rows : []);
+    } catch (err) {
+      setCpResult(`Dashboard profiles load failed: ${String(err?.message || err)}`);
+      setCpDashboardProfiles([]);
+    } finally {
+      setCpDashboardProfilesBusy(false);
+    }
+  };
+
+  const deleteCpDashboardProfile = async (row) => {
+    if (!row || !row.scope_key) return;
+    const ok = window.confirm(
+      `Delete dashboard profile?\n\nScope: ${row.scope_key}\nTenant: ${row.tenant_id}\nWidgets: ${row.widget_count}\n\nThis removes it from the cloud and the originating edge.`
+    );
+    if (!ok) return;
+    setCpDashboardProfilesBusy(true);
+    try {
+      await deleteControlPlaneDashboardProfile(row.scope_key, row.tenant_id);
+      setCpDashboardProfiles((prev) => prev.filter((r) => r.scope_key !== row.scope_key));
+      setCpResult(`Dashboard profile deleted: ${row.scope_key}`);
+    } catch (err) {
+      setCpResult(`Dashboard profile delete failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpDashboardProfilesBusy(false);
+    }
+  };
+
   const refreshControlPlaneData = async (tenantId = "") => {
     const scopedTenantId = String(tenantId || currentTenantId || "default");
     try {
@@ -14446,6 +14582,17 @@ const getGatewayHealth = (gateway) => {
       const authoritativeEdgeId = String(
         out?.edge?.edge_id || out?.edge_id || bootstrapSettings?.edge_id || edgeProfile?.edge_id || ""
       ).trim();
+      // Recovery: re-mirror customer_id / license_id from the cloud snapshot
+      // into app_settings. Older app_settings docs (before the scoped-path
+      // merge fix shipped) sometimes lost these on unrelated saves, which
+      // collapsed the scope key to 'tenant|-|edge' and stopped cloud mirror
+      // writes. Whenever the license refresh succeeds, restore them.
+      const refreshedCustomerId = String(
+        out?.edge?.customer_id || out?.license?.customer_id || out?.customer_id || ""
+      ).trim();
+      const refreshedLicenseId = String(
+        out?.edge?.license_id || out?.license?.license_id || out?.license_id || ""
+      ).trim();
       if (authoritativeEdgeId && authoritativeEdgeId !== String(edgeProfile?.edge_id || "").trim()) {
         const nextProfile = {
           edge_id: authoritativeEdgeId,
@@ -14453,14 +14600,45 @@ const getGatewayHealth = (gateway) => {
           location: String(edgeProfile?.location || ""),
           machine_group: String(edgeProfile?.machine_group || ""),
           description: String(edgeProfile?.description || ""),
+          linked_customer_id: refreshedCustomerId || edgeProfile?.linked_customer_id || "",
+          linked_license_id: refreshedLicenseId || edgeProfile?.linked_license_id || "",
         };
         setEdgeProfile(nextProfile);
         try {
-          await saveAppStoreDomain("app_settings", { edge_profile: nextProfile }, currentUser?.username || "system");
+          await saveAppStoreDomain(
+            "app_settings",
+            {
+              edge_profile: nextProfile,
+              edge_id: authoritativeEdgeId,
+              edge_name: nextProfile.edge_name,
+              ...(refreshedCustomerId ? { customer_id: refreshedCustomerId } : {}),
+              ...(refreshedLicenseId ? { license_id: refreshedLicenseId } : {}),
+              edge_linked: true,
+            },
+            currentUser?.username || "system",
+          );
           setEdgeProfileSaveResult(`Edge ID synchronized to control-plane value: ${authoritativeEdgeId}`);
         } catch {
           // runtime update already applied
         }
+      } else if (refreshedCustomerId || refreshedLicenseId) {
+        // Same authoritative edge id but link fields may be missing locally.
+        // Persist them so the scope key stops collapsing.
+        try {
+          await saveAppStoreDomain(
+            "app_settings",
+            {
+              ...(refreshedCustomerId ? { customer_id: refreshedCustomerId } : {}),
+              ...(refreshedLicenseId ? { license_id: refreshedLicenseId } : {}),
+              edge_linked: true,
+            },
+            currentUser?.username || "system",
+          );
+        } catch {
+          // best-effort recovery
+        }
+        if (refreshedCustomerId) setLinkedCustomerId(refreshedCustomerId);
+        if (refreshedLicenseId) setLinkedLicenseId(refreshedLicenseId);
       }
 
       setEdgeLicenseSnapshot(out || null);
@@ -14995,6 +15173,7 @@ const getGatewayHealth = (gateway) => {
                     <button className={`nav-item nav-subitem ${cpPortalPage === "modules" ? "active" : ""}`} onClick={() => openPortalPage("modules")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Modules</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "licenses" ? "active" : ""}`} onClick={() => openPortalPage("licenses")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Licenses</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "edges" ? "active" : ""}`} onClick={() => openPortalPage("edges")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Edge Apps</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "dashboard_profiles" ? "active" : ""}`} onClick={() => openPortalPage("dashboard_profiles")}><span className="nav-icon"><MenuIcon page="dashboard" /></span><span>Dashboard Profiles</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "users" ? "active" : ""}`} onClick={() => openPortalPage("users")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Users</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "activation" ? "active" : ""}`} onClick={() => openPortalPage("activation")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Activation</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "interface" ? "active" : ""}`} onClick={() => openPortalPage("interface")}><span className="nav-icon"><MenuIcon page="interface" /></span><span>Interface</span></button>
@@ -18469,6 +18648,7 @@ const getGatewayHealth = (gateway) => {
                     <button className={`btn ${cpPortalPage === "modules" ? "btn-primary" : ""}`} onClick={() => openPortalPage("modules")}>Modules</button>
                     <button className={`btn ${cpPortalPage === "licenses" ? "btn-primary" : ""}`} onClick={() => openPortalPage("licenses")}>Licenses</button>
                     <button className={`btn ${cpPortalPage === "edges" ? "btn-primary" : ""}`} onClick={() => openPortalPage("edges")}>Edge Apps</button>
+                    <button className={`btn ${cpPortalPage === "dashboard_profiles" ? "btn-primary" : ""}`} onClick={() => openPortalPage("dashboard_profiles")}>Dashboard Profiles</button>
                     <button className={`btn ${cpPortalPage === "users" ? "btn-primary" : ""}`} onClick={() => openPortalPage("users")}>Users</button>
                     <button className={`btn ${cpPortalPage === "activation" ? "btn-primary" : ""}`} onClick={() => openPortalPage("activation")}>Activation</button>
                     <button className={`btn ${cpPortalPage === "interface" ? "btn-primary" : ""}`} onClick={() => openPortalPage("interface")}>Interface</button>
@@ -18822,6 +19002,76 @@ const getGatewayHealth = (gateway) => {
                             </div>
                           ))}
                           {!cpEdgesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No edges yet</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                        </div>
+                      </div>
+                    </section>
+                  ) : null}
+
+                  {cpPortalPage === "dashboard_profiles" ? (
+                    <section className="card">
+                      <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                        <h4 style={{ margin: 0 }}>Dashboard Profiles</h4>
+                        <div className="row">
+                          <button
+                            className="btn"
+                            onClick={() => refreshCpDashboardProfiles()}
+                            disabled={cpDashboardProfilesBusy}
+                          >Refresh</button>
+                        </div>
+                      </div>
+                      <div className="form-grid" style={{ marginTop: 10 }}>
+                        <label>
+                          Filter
+                          <input
+                            value={cpDashboardProfilesFilter}
+                            onChange={(e) => setCpDashboardProfilesFilter(e.target.value)}
+                            placeholder="Search by tenant, scope, edge id..."
+                          />
+                        </label>
+                      </div>
+                      <div className="table-scroll" style={{ marginTop: 10 }}>
+                        <div className="table" style={{ "--cols": isMasterAdmin ? "1.4fr 2.4fr 0.6fr 0.6fr 1.2fr 0.6fr" : "2.4fr 0.6fr 0.6fr 1.2fr 0.6fr" }}>
+                          <div className="thead">
+                            {isMasterAdmin ? <span>Tenant</span> : null}
+                            <span>Scope Key</span>
+                            <span>Version</span>
+                            <span>Widgets</span>
+                            <span>Updated (UTC)</span>
+                            <span style={{ textAlign: "right" }}>Actions</span>
+                          </div>
+                          {(cpDashboardProfiles || [])
+                            .filter((row) => {
+                              const q = String(cpDashboardProfilesFilter || "").trim().toLowerCase();
+                              if (!q) return true;
+                              return (
+                                String(row.tenant_id || "").toLowerCase().includes(q) ||
+                                String(row.scope_key || "").toLowerCase().includes(q)
+                              );
+                            })
+                            .map((row, idx) => (
+                              <div className="trow" key={`cp-dp-${idx}-${row.scope_key}`}>
+                                {isMasterAdmin ? <span>{String(row.tenant_id || "-")}</span> : null}
+                                <span title={row.scope_key}>{row.scope_key}</span>
+                                <span>{row.version}</span>
+                                <span>{row.widget_count}</span>
+                                <span>{String(row.updated_utc || "").replace("T", " ").slice(0, 19)}</span>
+                                <span className="row-actions">
+                                  <button
+                                    className="icon-btn danger table-action-btn"
+                                    onClick={() => deleteCpDashboardProfile(row)}
+                                    disabled={cpDashboardProfilesBusy || !canEditPage("control_plane")}
+                                    title="Delete this dashboard profile from cloud and the originating edge"
+                                  ><DeleteIcon /></button>
+                                </span>
+                              </div>
+                            ))}
+                          {!cpDashboardProfiles?.length ? (
+                            <div className="trow">
+                              {Array.from({ length: isMasterAdmin ? 6 : 5 }).map((_, i) => (
+                                <span key={i}>{i === 1 ? "No dashboard profiles found" : "-"}</span>
+                              ))}
+                            </div>
+                          ) : null}
                         </div>
                       </div>
                     </section>

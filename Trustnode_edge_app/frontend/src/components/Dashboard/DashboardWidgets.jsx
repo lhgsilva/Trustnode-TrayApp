@@ -1525,6 +1525,26 @@ export function DashboardWidgetCard({
       return { def, pts, ptr: 0, lastVal: null };
     });
 
+    // No primary configured (empty gateway/tag): build the X axis from the
+    // union of all extra-series timestamps so the chart still renders the
+    // configured series alone.
+    if (primaryPts.length === 0) {
+      const tsSet = new Set();
+      for (const st of extraSorted) for (const p of st.pts) tsSet.add(p.tsMs);
+      const allTs = Array.from(tsSet).sort((a, b) => a - b);
+      return allTs.map((tsMs, i) => {
+        const row = { idx: i + 1, ts: new Date(tsMs).toISOString() };
+        for (const st of extraSorted) {
+          while (st.ptr < st.pts.length && st.pts[st.ptr].tsMs <= tsMs) {
+            st.lastVal = st.pts[st.ptr].value;
+            st.ptr += 1;
+          }
+          row[`s_${st.def.id}`] = st.lastVal;
+        }
+        return row;
+      });
+    }
+
     // Walk primary once. For each row advance each extra series's pointer
     // up to the primary timestamp; the last value scanned is the carry-
     // forward value for that primary tick.
@@ -1827,24 +1847,28 @@ export function DashboardWidgetCard({
         return counts;
       })();
       const tooltipLabelFmt = (v) => data.find((p) => p.idx === v)?.ts || String(v);
+      // Hide the primary trace when the user left gateway/tag blank — they're
+      // building a chart from series_extra only. Without this gate the chart
+      // would draw an empty "Value" line in the legend with no data.
+      const hasPrimary = Boolean(String(resolvedGatewayId || "").trim() && String(tagName || "").trim());
       const seriesDescriptors = [
-        {
-          id: "_primary",
-          dataKey: "value",
-          kind: primaryKind,
-          name: primaryLabel,
-          color: primaryColor,
-          axis: "left",
-          unit: primaryUnit,
-          suffix: primarySuffix,
-          // Primary inherits the widget-wide style defaults (since the
-          // editor has no per-row entry for the primary trace).
-          line_width: styleLineWidth,
-          line_dot: dotPreset,
-          bar_width: barWidthPx,
-          bar_pattern: barPatternKind,
-          bar_opacity: barOpacity,
-        },
+        ...(hasPrimary
+          ? [{
+              id: "_primary",
+              dataKey: "value",
+              kind: primaryKind,
+              name: primaryLabel,
+              color: primaryColor,
+              axis: "left",
+              unit: primaryUnit,
+              suffix: primarySuffix,
+              line_width: styleLineWidth,
+              line_dot: dotPreset,
+              bar_width: barWidthPx,
+              bar_pattern: barPatternKind,
+              bar_opacity: barOpacity,
+            }]
+          : []),
         ...extraSeriesDefs.map((def, idx) => {
           const fallbackPalette = ["#f97316", "#3b82f6", "#a855f7", "#dc2626", "#10b981", "#f59e0b"];
           // Per-series style overrides. Fall back to the widget defaults

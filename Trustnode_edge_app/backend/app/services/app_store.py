@@ -1028,6 +1028,114 @@ class AppStore:
     def _mirror_dashboard_configurations_to_cloud(self, **kwargs) -> None:
         self._mirror_config_doc_to_cloud("dashboard_configurations", **kwargs)
 
+    def _repair_scope_keys_with_customer_id(self) -> None:
+        """One-time repair: scoped docs saved when customer_id was missing
+        from app_settings ended up with a scope_key shaped 'tenant|-|edge[|user]'.
+        Once customer_id is populated, rewrite those rows to the correct
+        'tenant|customer|edge[|user]' shape so Lite's customer view finds them.
+
+        Only repairs rows where the customer segment is literally '-'. Safe
+        to run on every force_sync_now() — it's a no-op once repaired.
+        """
+        settings = self._get_app_settings()
+        customer_id = str(settings.get("customer_id") or "").strip().lower()
+        if not customer_id:
+            return
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT scope_key, domain FROM config_documents_scoped"
+                ).fetchall()
+                for r in rows or []:
+                    old_key = str(r["scope_key"] or "")
+                    domain = str(r["domain"] or "")
+                    parts = old_key.split("|")
+                    if len(parts) < 3 or parts[1] != "-":
+                        continue
+                    parts[1] = customer_id
+                    new_key = "|".join(parts)
+                    if new_key == old_key:
+                        continue
+                    # If a row already exists at the repaired key, drop the
+                    # old one (the new one is canonical). Otherwise rename.
+                    exists = conn.execute(
+                        "SELECT 1 FROM config_documents_scoped WHERE scope_key=? AND domain=?",
+                        (new_key, domain),
+                    ).fetchone()
+                    if exists:
+                        conn.execute(
+                            "DELETE FROM config_documents_scoped WHERE scope_key=? AND domain=?",
+                            (old_key, domain),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE config_documents_scoped SET scope_key=? WHERE scope_key=? AND domain=?",
+                            (new_key, old_key, domain),
+                        )
+
+    def _remirror_scoped_docs_to_cloud(self) -> None:
+        """Walk every config_documents_scoped row whose domain is mirrored to
+        Supabase and re-publish it. Called from force_sync_now() so the
+        operator's manual "push sync" actually re-uploads existing dashboards/
+        alarms/triggers — not only the ones edited since boot.
+
+        Synchronous on this thread (push sync is a foreground operator action)
+        but each row is upserted in its own short transaction so a single
+        failure doesn't abort the batch.
+        """
+        mirrored_domains = ("dashboard_configurations", "alarms_setup", "triggers_limits")
+        cloud = self._get_cloud_database_target()
+        if not cloud:
+            return
+        try:
+            from sqlalchemy import text  # type: ignore
+        except Exception:
+            return
+        schema = str(cloud.get("schema") or "public")
+        engine, _ = self._get_or_create_cloud_engine(cloud, schema)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT scope_key, domain, payload_json, version, updated_utc
+                    FROM config_documents_scoped
+                    WHERE domain IN (?, ?, ?)
+                    """,
+                    mirrored_domains,
+                ).fetchall()
+        for r in rows or []:
+            scope_key = str(r["scope_key"] or "")
+            domain = str(r["domain"] or "")
+            payload_json = str(r["payload_json"] or "null")
+            version = int(r["version"] or 1)
+            updated_utc = str(r["updated_utc"] or self._utc_now())
+            tenant_from_scope = (scope_key.split("|") or ["default"])[0] or "default"
+            try:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema}"."{domain}"
+                              (tenant_id, scope_key, payload_json, version, updated_utc)
+                            VALUES (:tenant_id, :scope_key, :payload_json::jsonb, :version, :updated_utc)
+                            ON CONFLICT (tenant_id, scope_key) DO UPDATE SET
+                              payload_json = EXCLUDED.payload_json,
+                              version      = EXCLUDED.version,
+                              updated_utc  = EXCLUDED.updated_utc
+                            """
+                        ),
+                        {
+                            "tenant_id": tenant_from_scope,
+                            "scope_key": scope_key,
+                            "payload_json": payload_json,
+                            "version": version,
+                            "updated_utc": updated_utc,
+                        },
+                    )
+            except Exception:
+                # best-effort per-row; the batch continues
+                continue
+
     def _cloud_target_from_env(self) -> Dict[str, Any] | None:
         """Build a cloud target dict purely from environment variables.
 
@@ -4197,6 +4305,21 @@ class AppStore:
             self._flush_config_outbox_once()
         except Exception as exc:
             errors.append(f"push_config: {exc}")
+        # One-time repair: scope_keys stuck at 'tenant|-|edge' get rewritten
+        # to 'tenant|customer|edge' once customer_id is back in app_settings.
+        try:
+            self._repair_scope_keys_with_customer_id()
+        except Exception as exc:
+            errors.append(f"repair_scope: {exc}")
+        # Re-mirror every scoped config_documents_scoped row that targets the
+        # Lite-visible tables. The fire-and-forget mirror only triggers on
+        # save; a manual "push sync" must republish historical rows too —
+        # otherwise edges that lost their scope (customer_id missing) won't
+        # appear in Lite even after the scope key is repaired.
+        try:
+            self._remirror_scoped_docs_to_cloud()
+        except Exception as exc:
+            errors.append(f"remirror_scoped: {exc}")
         try:
             self._flush_live_outbox_once()
         except Exception as exc:
@@ -4950,6 +5073,18 @@ class AppStore:
             "power_management_config",
         }:
             payload_to_store = self._strip_runtime_fields_for_config_sync(payload_to_store)
+        # app_settings on the scoped path is also partial-patched from the UI
+        # (e.g. Edge Identity saves only { edge_profile }). Merge with the
+        # previous scoped doc so activation fields — customer_id, license_id,
+        # edge_linked — survive unrelated saves. Without this the 3-segment
+        # scope key collapses back to 'tenant|-|edge' on reopen and cloud
+        # mirror writes drop out of the Lite customer view.
+        if domain_name == "app_settings":
+            try:
+                prev_for_merge = self._load_previous_scoped_payload(skey, domain_name)
+            except Exception:
+                prev_for_merge = None
+            payload_to_store = self._normalize_app_settings_payload(payload_to_store, prev_for_merge)
         # Stabilise gateway ids across re-create. If the operator deletes a
         # gateway and re-adds one at the same plc_ip + gateway_type, reuse
         # the old id so dashboards/widgets that reference it keep working

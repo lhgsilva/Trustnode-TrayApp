@@ -249,6 +249,10 @@ function useLiveLatest(enabled = true) {
     let stopped = false;
     let channel = null;
     let pollTimer = null;
+    // Clear stale rows immediately when the tenant changes. Without this
+    // the header latency pill briefly mixes the previous tenant's age
+    // with the new one until the next fetchAll lands.
+    setRows([]);
 
     const fetchAll = async () => {
       const t0 = performance.now();
@@ -282,8 +286,11 @@ function useLiveLatest(enabled = true) {
         (payload) => {
           const r = payload.new || payload.record || null;
           if (!r || !r.tag_name) return;
-          // Discard rows from other tenants when the master picked one.
-          if (pickedTenantId && r.tenant_id && r.tenant_id !== pickedTenantId) return;
+          // Tenant guard: when a tenant is picked, ONLY accept rows that
+          // explicitly match it. Rows with empty/missing tenant_id are
+          // dropped — better to lose a row than to leak another tenant's
+          // value into the selected customer's view.
+          if (pickedTenantId && r.tenant_id !== pickedTenantId) return;
           setRows((prev) => {
             const key = `${r.gateway_id || ""}|${r.tag_name}`;
             const next = prev.filter((p) => `${p.gateway_id || ""}|${p.tag_name}` !== key);
@@ -471,6 +478,11 @@ function useChartSeries(gw, tag, sampleCount, plcEndpoint = "") {
     // its (plc_ip, tag_name) matches the widget's endpoint.
     const handler = (row) => {
       if (!row || row.tag_name !== tag) return;
+      // Tenant guard: Supabase realtime delivers ALL inserts to the
+      // channel regardless of RLS. Without this filter Customer A's
+      // historian rows would update Customer B's charts whenever a
+      // gateway_id/tag_name pair collided across tenants.
+      if (pickedTenantId && row.tenant_id && row.tenant_id !== pickedTenantId) return;
       const gatewayMatch = row.gateway_id === gw;
       const endpointMatch = plcEndpoint && row.plc_ip && row.plc_ip === plcEndpoint;
       if (!gatewayMatch && !endpointMatch) return;
@@ -1528,9 +1540,15 @@ function saveDashPrefs(p) {
 // Header + Sidebar + Tabs
 // ============================================================
 function StatusPill({ liveRows, transport }) {
-  // Find newest ts.
+  // Belt-and-braces: when a tenant is picked, the badge MUST only reflect
+  // that tenant's freshness. Even though useLiveLatest already filters
+  // liveRows, a race during tenant switching can briefly leak rows from
+  // the previous tenant. Re-filter here so the header age never flickers
+  // between two customers.
+  const { pickedTenantId } = useContext(TenantScopeCtx);
   let newest = 0;
   for (const r of liveRows) {
+    if (pickedTenantId && r.tenant_id !== pickedTenantId) continue;
     const t = Date.parse(r.ts_utc || 0);
     if (Number.isFinite(t) && t > newest) newest = t;
   }
@@ -2572,6 +2590,7 @@ function _LegacyAppLogsAlarmsView() {
         (payload) => {
           const r = payload.new || payload.record || null;
           if (!r) return;
+          if (pickedTenantId && r.tenant_id !== pickedTenantId) return;
           if (levelFilter && r.level !== levelFilter) return;
           if (categoryFilter && r.category !== categoryFilter) return;
           if (gwFilter.trim() && !String(r.gateway_id || "").toLowerCase().includes(gwFilter.trim().toLowerCase())) return;
