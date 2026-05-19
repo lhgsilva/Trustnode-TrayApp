@@ -24,6 +24,7 @@ in the day.
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 from typing import Any, Iterable, Sequence
@@ -317,6 +318,17 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
     # -- Connection management ---------------------------------------------
 
     def _get_engine(self) -> Any:
+        """Return a dedicated SQLAlchemy engine for cp_* operations.
+
+        Critical: do NOT share with app_store._get_or_create_cloud_engine.
+        That engine is held long by the data-sync worker (lock_timeout
+        1200ms + statement_timeout 4500ms + frequent multi-second batch
+        inserts), so the portal's burst of cp_* reads ends up queueing
+        behind data-sync writes and times out at the Pooler connect.
+
+        We own our own engine with our own pool sizing tuned for short
+        bursty reads.
+        """
         if self._engine is not None:
             return self._engine
         from app.state import app_store as _app_store
@@ -326,10 +338,32 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
                 "ControlPlaneStoreCloud: no cloud database target configured. "
                 "Set TRUSTNODE_CLOUD_DB_HOST/USER/PASSWORD via systemd 10-secrets.conf or .env."
             )
+        from sqlalchemy import create_engine  # type: ignore
+        host = str(cloud.get("host") or "").strip()
+        port = int(cloud.get("port") or 5432)
+        database = str(cloud.get("database") or "postgres").strip() or "postgres"
+        username = str(cloud.get("username") or "").strip()
+        password = str(cloud.get("password") or "")
         schema = str(cloud.get("schema") or "public")
-        engine, _key = _app_store._get_or_create_cloud_engine(cloud, schema)  # type: ignore[attr-defined]
-        self._engine = engine
-        return engine
+        from urllib.parse import quote_plus as _q
+        url = f"postgresql+psycopg://{_q(username)}:{_q(password)}@{host}:{port}/{database}"
+        connect_args = {
+            "sslmode": "require" if cloud.get("tls", True) else "disable",
+            "connect_timeout": int(os.environ.get("TRUSTNODE_CP_DB_CONNECT_TIMEOUT_SECONDS", "8") or "8"),
+            "prepare_threshold": None,  # transaction-pooler incompat with auto-prepare
+            # Short timeouts for cp_* reads — they're tiny lookups.
+            "options": "-c lock_timeout=400ms -c statement_timeout=2500ms",
+        }
+        self._engine = create_engine(
+            url,
+            pool_pre_ping=True,
+            pool_size=int(os.environ.get("TRUSTNODE_CP_DB_POOL_SIZE", "6") or "6"),
+            max_overflow=int(os.environ.get("TRUSTNODE_CP_DB_MAX_OVERFLOW", "10") or "10"),
+            pool_recycle=300,
+            pool_timeout=5,  # don't hang requests waiting on pool
+            connect_args=connect_args,
+        )
+        return self._engine
 
     def _connect(self) -> _Conn:  # type: ignore[override]
         engine = self._get_engine()
