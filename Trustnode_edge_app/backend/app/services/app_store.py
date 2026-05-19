@@ -160,6 +160,22 @@ class AppStore:
         if not self._disable_config_push:
             self._compact_sync_outbox_for_domains()
             self._backfill_outbox_for_existing_domains()
+        # Operator diagnostics: when a portable EXE runs with a different
+        # working directory than expected, two app_store DBs can exist
+        # in parallel. Logging the absolute path on every startup makes
+        # the active DB unambiguous in support sessions.
+        try:
+            print(f"[trustnode] app_store_db = {os.path.abspath(self._db_path)}", flush=True)
+        except Exception:
+            pass
+        # Reconcile the sync_targets row against the actual cloud target
+        # resolved from database_configurations once at startup, so a
+        # stale "no enabled cloud target" error from a previous run gets
+        # cleared as soon as a valid cloud config is present.
+        try:
+            self._reconcile_sync_targets_with_config()
+        except Exception:
+            pass
         self._scheduler_thread = threading.Thread(target=self._retention_scheduler_loop, daemon=True)
         self._live_sync_thread = threading.Thread(target=self._live_sync_loop, daemon=True)
         self._cloud_live_cache_thread = threading.Thread(target=self._cloud_live_cache_loop, daemon=True)
@@ -746,6 +762,44 @@ class AppStore:
             self._cloud_target_cache_value = None
             self._cloud_target_cache_ts = 0.0
 
+    def _reconcile_sync_targets_with_config(self) -> None:
+        """Align the sync_targets row with whatever database_configurations
+        currently resolves to. Two failure modes this fixes:
+
+        1. A previous boot recorded `last_error="No enabled PostgreSQL cloud
+           target configured"` and `enabled=0`. The UI later saved a valid
+           cloud DB row, but `_set_data_sync_state` never cleared the
+           sync_targets row, so the worker kept short-circuiting.
+        2. The UI list-DBs view and the sync worker read different sources
+           (UI may show ENABLED while sync_targets.enabled=0).
+
+        Cheap and idempotent. Safe to call from startup and from the sync
+        loop every few seconds.
+        """
+        # Force a fresh read — caller is recovering from a possibly-stale
+        # cache state.
+        self._invalidate_cloud_target_cache()
+        try:
+            cloud = self._get_cloud_database_target()
+        except Exception:
+            cloud = None
+        if cloud:
+            self._upsert_sync_target_state(
+                enabled=True,
+                config={
+                    "name": str(cloud.get("name") or ""),
+                    "host": str(cloud.get("host") or ""),
+                    "schema": str(cloud.get("schema") or "public"),
+                },
+                last_error="",
+            )
+        else:
+            self._upsert_sync_target_state(
+                enabled=False,
+                config={},
+                last_error="No enabled PostgreSQL cloud target configured",
+            )
+
     def _mirror_config_doc_to_cloud(
         self,
         table_name: str,
@@ -1303,6 +1357,7 @@ class AppStore:
         next_config_pull_mono = 0.0
         next_bulk_sync_mono = 0.0
         next_mirror_reconcile_mono = 0.0
+        next_target_reconcile_mono = 0.0
         while not self._stop_event.is_set():
             try:
                 if self._is_cloud_auto_sync_enabled():
@@ -1331,6 +1386,15 @@ class AppStore:
                         # Reconciler is best-effort; never poison the loop.
                         pass
                     next_mirror_reconcile_mono = now_mono + 5.0  # every 5s
+                # Re-align sync_targets row with database_configurations.
+                # Picks up UI toggles without a backend restart and clears
+                # stale "no target" errors after the user adds a cloud DB.
+                if now_mono >= next_target_reconcile_mono:
+                    try:
+                        self._reconcile_sync_targets_with_config()
+                    except Exception:
+                        pass
+                    next_target_reconcile_mono = now_mono + 10.0  # every 10s
             except Exception as exc:
                 self._upsert_sync_target_state(enabled=True, config={}, last_error=f"Config sync loop error: {exc}")
             self._sync_wakeup_event.wait(timeout=self._sync_interval_seconds)
@@ -2624,6 +2688,7 @@ class AppStore:
                 enabled=True,
                 config={"name": cloud.get("name"), "host": cloud.get("host"), "schema": schema},
                 last_sync_utc=self._utc_now(),
+                last_error="",
             )
             return len(hist_rows) + len(log_rows)
         except Exception as exc:
@@ -4545,6 +4610,13 @@ class AppStore:
         self._sync_wakeup_event.set()
         if domain == "database_configurations":
             self._invalidate_cloud_target_cache()
+            # Reflect the new config into sync_targets immediately so the
+            # sync worker doesn't have to wait up to 10s for the periodic
+            # reconcile to pick it up.
+            try:
+                self._reconcile_sync_targets_with_config()
+            except Exception:
+                pass
         if domain == "dashboard_configurations":
             self._mirror_config_doc_to_cloud(
                 "dashboard_configurations",
@@ -4636,6 +4708,10 @@ class AppStore:
                 )
         if domain_name == "database_configurations":
             self._invalidate_cloud_target_cache()
+            try:
+                self._reconcile_sync_targets_with_config()
+            except Exception:
+                pass
         if domain_name in ("dashboard_configurations", "alarms_setup", "triggers_limits"):
             # scope_key shape on the edge is 'tenant|-|edge_id|user'; the
             # leading segment is the tenant. RLS in Supabase uses tenant_id,

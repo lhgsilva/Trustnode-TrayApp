@@ -526,6 +526,79 @@ def get_sync_status() -> dict:
     }
 
 
+@router.get("/sync/health")
+def get_sync_health() -> dict:
+    """Operator-friendly health summary of the cloud data plane.
+
+    Designed for monitoring UIs (and humans during incident triage). Wraps
+    /sync/status with a 'healthy'/'degraded'/'down' verdict so you don't
+    have to interpret half a dozen counters at once. Also returns the
+    absolute app_store_db path so support sessions can immediately tell
+    which DB the running backend is using — the portable EXE / install
+    split-state issue was diagnosed entirely by hunting for the live DB
+    among temp directories.
+    """
+    import os as _os
+    snap = app_store.get_inspector_snapshot(preview_limit=0) or {}
+    data_sync = snap.get("data_sync") or {}
+    sync_target = snap.get("sync_target") or {}
+    outbox = snap.get("sync_outbox_status") or {}
+
+    cloud_enabled = bool(sync_target.get("enabled"))
+    data_err = str(data_sync.get("last_data_error") or "")
+    cfg_err = str(sync_target.get("last_error") or "")
+    backlog = int(data_sync.get("historian_backlog") or 0)
+    last_sync_utc = str(data_sync.get("last_data_sync_utc") or "")
+
+    age_seconds: int | None = None
+    if last_sync_utc:
+        try:
+            from datetime import datetime, timezone
+            txt = last_sync_utc.replace("Z", "+00:00")
+            if " " in txt and "T" not in txt:
+                txt = txt.replace(" ", "T")
+            dt = datetime.fromisoformat(txt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_seconds = int((datetime.now(timezone.utc) - dt).total_seconds())
+        except Exception:
+            age_seconds = None
+
+    # Verdict heuristic — generous on first-boot windows where last_sync is
+    # empty but no errors are recorded either.
+    if not cloud_enabled and not data_err and not cfg_err:
+        verdict = "disabled"
+    elif data_err or cfg_err:
+        verdict = "degraded"
+    elif backlog > 0 and age_seconds is not None and age_seconds > 300:
+        verdict = "degraded"
+    else:
+        verdict = "healthy"
+
+    db_path = ""
+    try:
+        db_path = _os.path.abspath(getattr(app_store, "_db_path", "") or "")
+    except Exception:
+        db_path = ""
+
+    return {
+        "ok": True,
+        "verdict": verdict,
+        "cloud_target_enabled": cloud_enabled,
+        "cloud_target_name": str(sync_target.get("name") or ""),
+        "cloud_target_host": str(sync_target.get("host") or ""),
+        "historian_backlog": backlog,
+        "logs_backlog": int(data_sync.get("logs_backlog") or 0),
+        "config_pending": int(outbox.get("pending") or 0),
+        "last_data_sync_utc": last_sync_utc,
+        "last_data_sync_age_seconds": age_seconds,
+        "last_data_error": data_err,
+        "last_config_error": cfg_err,
+        "total_historian_synced": int(data_sync.get("total_historian_synced") or 0),
+        "app_store_db_path": db_path,
+    }
+
+
 @router.post("/sync/manual-period")
 def manual_period_sync(payload: ManualDataSyncRequest) -> dict:
     return app_store.manual_sync_data_period(
