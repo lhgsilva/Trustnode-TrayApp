@@ -4638,46 +4638,19 @@ function AppShell() {
   }, [config, devicesSeeded, devices.length, wsState]);
 
   // First-run-only seed of a stub gateway from the legacy single-gateway
-  // `config` object. Two guards:
-  //   - gatewayBootstrapAppliedRef ensures we never seed before the saved
-  //     bootstrap has been merged in. Without this, an empty initial
-  //     gatewayConfigs would race the async fetch and overwrite the saved
-  //     list with the stub, silently breaking dashboards on restart.
-  //   - gatewaySeedAttemptedRef makes the seed one-shot, so a later manual
-  //     clear of all gateways won't be re-stubbed.
-  const gatewaySeedAttemptedRef = useRef(false);
-  useEffect(() => {
-    if (!config) return;
-    if (gatewaySeedAttemptedRef.current) return;
-    // The bootstrap is the source of truth — once it has run we must
-    // NEVER inject the legacy single-stub gateway, regardless of whether
-    // it found a saved list or not. (Empty after bootstrap means the
-    // user truly has no gateways yet.) Previously the condition was
-    // inverted: the seed only ran AFTER bootstrap, allowing it to
-    // overwrite the freshly-loaded list on every restart.
-    if (gatewayBootstrapAppliedRef.current) {
-      gatewaySeedAttemptedRef.current = true;
-      return;
-    }
-    if (gatewayConfigsRef.current.length) {
-      gatewaySeedAttemptedRef.current = true;
-      return;
-    }
-    gatewaySeedAttemptedRef.current = true;
-    const seeded = {
-      id: "gw-primary",
-      name: "Primary Gateway",
-      device_id: "",
-      gateway_type: config.gateway_type || "allen_bradley",
-      plc_ip: config.plc_ip || "",
-      opc_url: config.opc_url || "",
-      database_id: "",
-      interval_ms: Number(config.interval_ms || 1000),
-      tags: Array.isArray(config.tags) ? config.tags : []
-    };
-    setGatewayConfigs([seeded]);
-    setSelectedGatewayId(seeded.id);
-  }, [config]);
+  // Legacy single-gateway seed REMOVED. It used to inject a
+  // [{id:"gw-primary"}] stub into gatewayConfigs whenever the array was
+  // empty when the legacy `config` endpoint resolved. With both the
+  // bootstrap fetch and the legacy config fetch racing on startup, the
+  // seed would invariably win the race once per restart, clobber the
+  // saved gateway list, and the debounced auto-save would persist the
+  // stub back to the DB on top of the user's real configuration.
+  // Every previous attempt to "guard" the seed against this race had a
+  // window where it still fired (refs lag setState by a render, the
+  // legacy config can arrive before the bootstrap apply, etc.). The
+  // only correct fix is to not have the seed at all — the bootstrap
+  // (or a user adding their first gateway via the UI) is the only
+  // legitimate source of gatewayConfigs entries.
 
   useEffect(() => {
     if (isHostedWebClient && endpointMode === "cloud") return;
