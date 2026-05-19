@@ -3058,7 +3058,19 @@ function AppShell() {
     // ref, and end up writing [gw-primary] back over the real list.
     gatewayBootstrapAppliedRef.current = true;
     gatewaySeedAttemptedRef.current = true;
-    if (Array.isArray(data.database_configurations)) setDbConnections(normalizeDbConnections(data.database_configurations));
+    if (Array.isArray(data.database_configurations) && data.database_configurations.length > 0) {
+      setDbConnections(normalizeDbConnections(data.database_configurations));
+    } else if (Array.isArray(data.database_configurations)) {
+      // Bootstrap returned an EMPTY array — distinct from "missing key".
+      // Don't overwrite a populated dbConnections with [] mid-session; it
+      // wipes the dropdown the operator just used to pick a sink. The
+      // backend bootstrap can legitimately return [] when the user-scoped
+      // doc has no overlay yet AND the legacy scope fallback hasn't
+      // resolved data — in either case the existing in-memory list is
+      // closer to the truth than the empty payload.
+      // (If you genuinely want to clear all DBs, do it through the
+      // Database Overview UI which calls setDbConnections([]) directly.)
+    }
     if (Array.isArray(triggers.collection_triggers)) setCollectionTriggers(triggers.collection_triggers);
     if (triggers.collection_trigger_mode === "any" || triggers.collection_trigger_mode === "all") {
       setCollectionTriggerMode(triggers.collection_trigger_mode);
