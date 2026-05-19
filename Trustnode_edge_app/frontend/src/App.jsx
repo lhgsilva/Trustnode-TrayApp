@@ -4611,6 +4611,103 @@ function AppShell() {
     };
   }, [appStoreHydrated, isHostedWebClient, currentUser, collectionTriggers, collectionTriggerMode, triggerRules]);
 
+  // ---------------------------------------------------------------------
+  // Per-domain immediate-save effects for the "operator-edited" config
+  // domains. The old whole-bootstrap save catches everything eventually
+  // but had two problems:
+  //   1. One stale state slot would clobber every other domain because
+  //      the payload bundled them all.
+  //   2. A 2.5 s debounce + quit-during-window meant a fast Add-then-
+  //      Close flow could land the change in DB ZERO times.
+  //
+  // Per-domain saves at 600–800 ms are cheap, atomic, and idempotent
+  // (the backend skips no-op upserts). They land BEFORE the user can
+  // realistically close the window.
+  // ---------------------------------------------------------------------
+  const gatewayConfigsSaveTimerRef = useRef(null);
+  const gatewayConfigsPersistInFlightRef = useRef(false);
+  const gatewayConfigsLastPersistSignatureRef = useRef("");
+  useEffect(() => {
+    if (!appStoreHydrated) return;
+    if (isHostedWebClient) return;
+    if (gatewayConfigsSaveTimerRef.current) clearTimeout(gatewayConfigsSaveTimerRef.current);
+    gatewayConfigsSaveTimerRef.current = setTimeout(async () => {
+      if (gatewayConfigsPersistInFlightRef.current) return;
+      const payload = Array.isArray(gatewayConfigs) ? gatewayConfigs : [];
+      const signature = JSON.stringify(payload);
+      if (!gatewayConfigsLastPersistSignatureRef.current) {
+        gatewayConfigsLastPersistSignatureRef.current = signature;
+        return;
+      }
+      if (signature === gatewayConfigsLastPersistSignatureRef.current) return;
+      gatewayConfigsPersistInFlightRef.current = true;
+      try {
+        await saveAppStoreDomain("gateway_configurations", payload, currentUser?.username || "system");
+        gatewayConfigsLastPersistSignatureRef.current = signature;
+      } catch (_) {}
+      finally { gatewayConfigsPersistInFlightRef.current = false; }
+    }, 700);
+    return () => {
+      if (gatewayConfigsSaveTimerRef.current) clearTimeout(gatewayConfigsSaveTimerRef.current);
+    };
+  }, [appStoreHydrated, isHostedWebClient, currentUser, gatewayConfigs]);
+
+  const devicesSaveTimerRef = useRef(null);
+  const devicesPersistInFlightRef = useRef(false);
+  const devicesLastPersistSignatureRef = useRef("");
+  useEffect(() => {
+    if (!appStoreHydrated) return;
+    if (isHostedWebClient) return;
+    if (devicesSaveTimerRef.current) clearTimeout(devicesSaveTimerRef.current);
+    devicesSaveTimerRef.current = setTimeout(async () => {
+      if (devicesPersistInFlightRef.current) return;
+      const payload = Array.isArray(devices) ? devices : [];
+      const signature = JSON.stringify(payload);
+      if (!devicesLastPersistSignatureRef.current) {
+        devicesLastPersistSignatureRef.current = signature;
+        return;
+      }
+      if (signature === devicesLastPersistSignatureRef.current) return;
+      devicesPersistInFlightRef.current = true;
+      try {
+        await saveAppStoreDomain("devices", payload, currentUser?.username || "system");
+        devicesLastPersistSignatureRef.current = signature;
+      } catch (_) {}
+      finally { devicesPersistInFlightRef.current = false; }
+    }, 700);
+    return () => {
+      if (devicesSaveTimerRef.current) clearTimeout(devicesSaveTimerRef.current);
+    };
+  }, [appStoreHydrated, isHostedWebClient, currentUser, devices]);
+
+  const dbConnectionsSaveTimerRef = useRef(null);
+  const dbConnectionsPersistInFlightRef = useRef(false);
+  const dbConnectionsLastPersistSignatureRef = useRef("");
+  useEffect(() => {
+    if (!appStoreHydrated) return;
+    if (isHostedWebClient) return;
+    if (dbConnectionsSaveTimerRef.current) clearTimeout(dbConnectionsSaveTimerRef.current);
+    dbConnectionsSaveTimerRef.current = setTimeout(async () => {
+      if (dbConnectionsPersistInFlightRef.current) return;
+      const payload = Array.isArray(dbConnections) ? dbConnections : [];
+      const signature = JSON.stringify(payload);
+      if (!dbConnectionsLastPersistSignatureRef.current) {
+        dbConnectionsLastPersistSignatureRef.current = signature;
+        return;
+      }
+      if (signature === dbConnectionsLastPersistSignatureRef.current) return;
+      dbConnectionsPersistInFlightRef.current = true;
+      try {
+        await saveAppStoreDomain("database_configurations", payload, currentUser?.username || "system");
+        dbConnectionsLastPersistSignatureRef.current = signature;
+      } catch (_) {}
+      finally { dbConnectionsPersistInFlightRef.current = false; }
+    }, 700);
+    return () => {
+      if (dbConnectionsSaveTimerRef.current) clearTimeout(dbConnectionsSaveTimerRef.current);
+    };
+  }, [appStoreHydrated, isHostedWebClient, currentUser, dbConnections]);
+
   useEffect(() => {
     const timer = setInterval(() => {
       flushAppStoreOutbox();
