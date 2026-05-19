@@ -82,6 +82,11 @@ import {
   upsertControlPlaneEdge,
   deleteControlPlaneEdge,
   heartbeatControlPlaneEdge,
+  getEdgeViewLink,
+  createEdgeViewLink,
+  rotateEdgeViewLink,
+  revokeEdgeViewLink,
+  buildEdgeViewLinkUrl,
   getControlPlaneLicenses,
   upsertControlPlaneLicense,
   deleteControlPlaneLicense,
@@ -1973,6 +1978,124 @@ function ClientMobileNav({ items, activePage, onPick, currentUser, onLogout }) {
         </>
       ) : null}
     </>
+  );
+}
+
+// Portal Edge Apps row — Client View cell.
+// Fetches (or mints) a per-edge read-only Lite share-link token. Renders
+// three actions: Open (new tab), Copy URL, Rotate. Anyone with the URL
+// can view the Lite app scoped to this edge without logging in.
+function EdgeClientViewCell({ row, tenantScope }) {
+  const edgeId = String(row?.edge_id || "").trim();
+  const [link, setLink] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [justCopied, setJustCopied] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!edgeId) return;
+      try {
+        const res = await getEdgeViewLink(edgeId, tenantScope);
+        if (cancelled) return;
+        setLink(res?.link || null);
+      } catch (e) {
+        if (!cancelled) setError(String(e?.message || e));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [edgeId, tenantScope]);
+
+  const ensureLink = async () => {
+    if (link) return link;
+    setBusy(true);
+    setError("");
+    try {
+      const res = await createEdgeViewLink(edgeId, tenantScope);
+      const next = res?.link || null;
+      setLink(next);
+      return next;
+    } catch (e) {
+      setError(String(e?.message || e));
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onOpen = async () => {
+    const lk = await ensureLink();
+    if (!lk?.token) return;
+    const url = buildEdgeViewLinkUrl(lk.token);
+    try { window.open(url, "_blank", "noopener,noreferrer"); } catch (_) {}
+  };
+
+  const onCopy = async () => {
+    const lk = await ensureLink();
+    if (!lk?.token) return;
+    const url = buildEdgeViewLinkUrl(lk.token);
+    try {
+      await navigator.clipboard.writeText(url);
+      setJustCopied(true);
+      setTimeout(() => setJustCopied(false), 1500);
+    } catch (_) {
+      // Fallback for environments without clipboard permission
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = url;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        setJustCopied(true);
+        setTimeout(() => setJustCopied(false), 1500);
+      } catch (_) {}
+    }
+  };
+
+  const onRotate = async () => {
+    if (!edgeId) return;
+    if (!window.confirm("Rotate the Client View link?\n\nThe current URL stops working immediately and a new one is generated. Anyone with the old link will lose access.")) return;
+    setBusy(true);
+    setError("");
+    try {
+      const res = await rotateEdgeViewLink(edgeId, tenantScope);
+      setLink(res?.link || null);
+      setJustCopied(false);
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!edgeId) return <span>-</span>;
+  return (
+    <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+      <button
+        type="button"
+        className="btn btn-secondary btn-sm"
+        onClick={onOpen}
+        disabled={busy}
+        title="Open the read-only Lite view in a new tab"
+      >Open</button>
+      <button
+        type="button"
+        className="btn btn-secondary btn-sm"
+        onClick={onCopy}
+        disabled={busy}
+        title="Copy the shareable URL to clipboard"
+      >{justCopied ? "Copied!" : "Copy"}</button>
+      <button
+        type="button"
+        className="btn btn-danger btn-sm"
+        onClick={onRotate}
+        disabled={busy || !link}
+        title="Invalidate the current link and mint a new one"
+      >Rotate</button>
+      {error ? <span style={{ color: "#d35454", fontSize: 11, marginLeft: 4 }} title={error}>!</span> : null}
+    </span>
   );
 }
 
@@ -18687,14 +18810,10 @@ const getGatewayHealth = (gateway) => {
                               <span>{`${String(row?.site || "-")} / ${String(row?.area || "-")} / ${String(row?.equipment || "-")}`}</span>
                               <span>{String(row?.status || "-")}</span>
                               <span>
-                                {(() => {
-                                  const edgeId = String(row?.edge_id || "").trim();
-                                  const cid = String(row?.customer_id || "").trim();
-                                  const domain = String(customerDomainById.get(cid) || "").trim();
-                                  const baseHost = domain || String(window.location.host || "").trim();
-                                  const href = `https://${baseHost}/client/client_test.html?edge=${encodeURIComponent(edgeId)}&customer_id=${encodeURIComponent(cid)}`;
-                                  return <a href={href} target="_blank" rel="noreferrer">Open</a>;
-                                })()}
+                                <EdgeClientViewCell
+                                  row={row}
+                                  tenantScope={getRowTenantScope(row)}
+                                />
                               </span>
                               <span className="row-actions">
                                 <button className="icon-btn table-action-btn" onClick={() => openCpEdgeEdit(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Edit"><EditIcon /></button>

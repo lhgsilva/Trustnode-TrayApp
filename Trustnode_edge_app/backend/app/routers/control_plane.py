@@ -482,6 +482,154 @@ def delete_edge_post(request: Request, edge_id: str, tenant_id: str | None = Non
     return delete_edge(request=request, edge_id=edge_id, tenant_id=tenant_id)
 
 
+# ---------------------------------------------------------------------------
+# Per-edge read-only Client View share links
+# ---------------------------------------------------------------------------
+#
+# A "client view link" is a long random URL token that lets anyone (without
+# logging in) open a read-only Lite view of a single edge. Created by master
+# / portal admins so they can share live monitoring with customers, partners
+# and field engineers who shouldn't get a full account.
+#
+# Lifecycle:
+#   * `POST /edges/{edge_id}/view-link`   — create-or-return active token.
+#   * `POST /edges/{edge_id}/view-link/rotate` — revoke current + mint new.
+#   * `DELETE /edges/{edge_id}/view-link` — revoke (no new token).
+#   * `GET /edges/{edge_id}/view-link`    — fetch active token (or null).
+#   * `GET /lite-view/resolve/{token}`    — PUBLIC. Resolves a token to
+#     {tenant_id, customer_id, edge_id}; the Lite app uses this to scope
+#     the read-only render. No JWT/auth required.
+
+def _new_view_link_token() -> str:
+    import secrets
+    return secrets.token_urlsafe(24)
+
+
+def _view_link_for_edge(tenant_id: str, edge_id: str) -> dict[str, Any] | None:
+    """Return the active view-link row for an edge, or None."""
+    try:
+        rows = getattr(control_plane_store, "list_edge_view_links", None)
+        if callable(rows):
+            for row in rows(tenant_id=tenant_id, edge_id=edge_id) or []:
+                if str(row.get("status") or "active") == "active":
+                    return row
+    except Exception:
+        pass
+    return None
+
+
+@router.get("/edges/{edge_id}/view-link")
+def get_edge_view_link(request: Request, edge_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=False)
+    eid = str(edge_id or "").strip()
+    if not eid:
+        raise HTTPException(status_code=400, detail="edge_id_required")
+    row = _view_link_for_edge(tid, eid)
+    return {"ok": True, "tenant_id": tid, "edge_id": eid, "link": row}
+
+
+@router.post("/edges/{edge_id}/view-link")
+def create_edge_view_link(request: Request, edge_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    """Create a view-link token for an edge. Idempotent — if an active
+    token already exists we return it instead of minting a duplicate."""
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    eid = str(edge_id or "").strip()
+    if not eid:
+        raise HTTPException(status_code=400, detail="edge_id_required")
+    existing = _view_link_for_edge(tid, eid)
+    if existing:
+        return {"ok": True, "tenant_id": tid, "edge_id": eid, "link": existing}
+    # Resolve customer_id from the edge row so the link carries the right
+    # scope. The Lite read-only view scopes its queries to this tenant.
+    customer_id = ""
+    try:
+        for e in control_plane_store.list_edges(tenant_id=tid) or []:
+            if str(e.get("edge_id") or "") == eid:
+                customer_id = str(e.get("customer_id") or "")
+                break
+    except Exception:
+        customer_id = ""
+    payload = getattr(request.state, "user_payload", {}) or {}
+    actor = str(payload.get("sub") or "admin")
+    token = _new_view_link_token()
+    row: dict[str, Any] = {
+        "token": token,
+        "tenant_id": tid,
+        "customer_id": customer_id,
+        "edge_id": eid,
+        "status": "active",
+        "created_by": actor,
+    }
+    try:
+        if hasattr(control_plane_store, "upsert_edge_view_link"):
+            control_plane_store.upsert_edge_view_link(**row)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"view_link_create_failed: {exc}") from exc
+    _audit(request, tenant_id=tid, action="edge.view_link.create", outcome="ok",
+           details={"edge_id": eid, "token_prefix": token[:8]})
+    return {"ok": True, "tenant_id": tid, "edge_id": eid, "link": row}
+
+
+@router.post("/edges/{edge_id}/view-link/rotate")
+def rotate_edge_view_link(request: Request, edge_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    """Revoke the current view-link (if any) and mint a fresh token."""
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    eid = str(edge_id or "").strip()
+    if not eid:
+        raise HTTPException(status_code=400, detail="edge_id_required")
+    try:
+        if hasattr(control_plane_store, "revoke_edge_view_links"):
+            control_plane_store.revoke_edge_view_links(tenant_id=tid, edge_id=eid)
+    except Exception:
+        pass
+    return create_edge_view_link(request=request, edge_id=eid, tenant_id=tid)
+
+
+@router.delete("/edges/{edge_id}/view-link")
+def revoke_edge_view_link(request: Request, edge_id: str, tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    eid = str(edge_id or "").strip()
+    if not eid:
+        raise HTTPException(status_code=400, detail="edge_id_required")
+    revoked = 0
+    try:
+        if hasattr(control_plane_store, "revoke_edge_view_links"):
+            revoked = int(control_plane_store.revoke_edge_view_links(tenant_id=tid, edge_id=eid) or 0)
+    except Exception:
+        revoked = 0
+    _audit(request, tenant_id=tid, action="edge.view_link.revoke", outcome="ok",
+           details={"edge_id": eid, "revoked_count": revoked})
+    return {"ok": True, "tenant_id": tid, "edge_id": eid, "revoked": revoked}
+
+
+# Public resolver — NO auth. Returns the scope a Lite share-link viewer is
+# allowed to see. Defined outside the auth-protected router via a fresh
+# APIRouter-less callable mounted at the FastAPI app root in main.py.
+def resolve_edge_view_link_public(token: str) -> dict[str, Any]:
+    t = str(token or "").strip()
+    if not t:
+        raise HTTPException(status_code=400, detail="token_required")
+    row = None
+    try:
+        if hasattr(control_plane_store, "get_edge_view_link_by_token"):
+            row = control_plane_store.get_edge_view_link_by_token(token=t)
+    except Exception:
+        row = None
+    if not row or str(row.get("status") or "") != "active":
+        raise HTTPException(status_code=404, detail="view_link_not_found")
+    try:
+        if hasattr(control_plane_store, "touch_edge_view_link"):
+            control_plane_store.touch_edge_view_link(token=t)
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "tenant_id": str(row.get("tenant_id") or ""),
+        "customer_id": str(row.get("customer_id") or ""),
+        "edge_id": str(row.get("edge_id") or ""),
+    }
+
+
 @router.post("/edges/heartbeat")
 def heartbeat_edge(request: Request, edge_id: str, payload: dict[str, Any] | None = None, tenant_id: str | None = None) -> dict[str, Any]:
     # Heartbeat tolerates a cross-tenant lookup for master admin: edges

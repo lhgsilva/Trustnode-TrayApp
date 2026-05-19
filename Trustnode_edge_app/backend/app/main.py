@@ -90,7 +90,7 @@ from app.routers.ui_source import router as ui_source_router
 from app.routers.notifications import router as notifications_router
 from app.routers.telemetry_v1 import router as telemetry_v1_router
 from app.routers.power import router as power_router
-from app.routers.control_plane import router as control_plane_router
+from app.routers.control_plane import router as control_plane_router, resolve_edge_view_link_public
 from app.routers.reports import router as reports_router
 from app.routers.cloud_live import router as cloud_live_router
 from app.state import (
@@ -214,6 +214,15 @@ app.include_router(notifications_router)
 app.include_router(telemetry_v1_router)
 app.include_router(power_router)
 app.include_router(control_plane_router)
+
+
+# Public resolver for read-only Lite share links. Mounted directly on the
+# app (not inside a prefixed router) so it lives at /api/lite-view/resolve/
+# which the auth middleware allow-lists by prefix. Returns the tenant +
+# edge scope a view-link viewer is allowed to see.
+@app.get("/api/lite-view/resolve/{token}")
+def _lite_view_resolve(token: str):
+    return resolve_edge_view_link_public(token)
 app.include_router(reports_router)
 
 # The cloud-live SSE endpoint lives in a SEPARATE FastAPI app so it does
@@ -341,6 +350,11 @@ async def auth_middleware(request: Request, call_next):
     if path.startswith("/api/v1/"):
         return _apply_no_cache_headers(await call_next(request))
     if request.url.path in PUBLIC_PATHS:
+        return _apply_no_cache_headers(await call_next(request))
+    # Read-only Lite share-link resolver. Anyone with the URL token can
+    # convert it to {tenant_id, customer_id, edge_id} so the no-login Lite
+    # view can scope its queries. No JWT/auth required by design.
+    if request.url.path.startswith("/api/lite-view/resolve/"):
         return _apply_no_cache_headers(await call_next(request))
     auth = request.headers.get("Authorization", "")
     token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""

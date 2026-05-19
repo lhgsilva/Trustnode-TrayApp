@@ -2989,7 +2989,13 @@ function LoginCard({ theme, onToggleTheme, onSignedIn }) {
 // ============================================================
 // App
 // ============================================================
-function App() {
+function App({ viewLink = null }) {
+  // viewLink = { tenant_id, customer_id, edge_id } when this load came
+  // from a /lite/view/<token> URL. In that mode there is no Supabase
+  // Auth session — the App runs anonymous, scoped to the resolved
+  // tenant, with all mutating actions (Acknowledge, Generate, etc.)
+  // hidden by the components that consume `readOnlyMode` from context.
+  const isViewLinkMode = !!viewLink;
   const [session, setSession] = useState(null);
   const [theme, setTheme] = useState(readTheme());
   const [tab, setTab] = useState("dashboard");
@@ -3005,6 +3011,9 @@ function App() {
   // list shown in the picker dropdown — built from cp_customers so the
   // master sees human-readable company names, not raw slugs.
   const [pickedTenantId, setPickedTenantId] = useState(() => {
+    // In view-link mode the tenant is pinned by the resolved scope —
+    // there's no master picker and no localStorage seed.
+    if (viewLink?.tenant_id) return viewLink.tenant_id;
     try { return localStorage.getItem("tnlite-picked-tenant") || ""; }
     catch (_) { return ""; }
   });
@@ -3029,15 +3038,34 @@ function App() {
   }, [sidebarVisible]);
 
   useEffect(() => {
+    // Share-link mode skips Supabase Auth entirely; anonymous viewers
+    // can't (and shouldn't) authenticate. Cloud reads still work because
+    // the existing public storage / table policies cover the data set
+    // the viewer is allowed to see; queries are scoped by pickedTenantId.
+    if (isViewLinkMode) return;
     supabase.auth.getSession().then(({ data }) => setSession(data.session || null));
     const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s || null));
     return () => sub.subscription.unsubscribe();
-  }, []);
+  }, [isViewLinkMode]);
 
   // Tenant label from lite_profiles once signed in. Non-admin users see
   // their own assignment. Master-admin sees whichever tenant they've
-  // picked (or 'All tenants' as a fallback).
+  // picked (or 'All tenants' as a fallback). In view-link mode we
+  // resolve the company name from cp_customers directly using the
+  // tenant pinned by the share token.
   useEffect(() => {
+    if (isViewLinkMode) {
+      const tid = viewLink?.tenant_id || "";
+      if (!tid) { setTenantLabel("Read-only view"); return; }
+      supabase.from("cp_customers")
+        .select("company_name, tenant_id")
+        .eq("tenant_id", tid)
+        .limit(1).maybeSingle()
+        .then(({ data }) => {
+          setTenantLabel((data?.company_name || tid) + " · read-only");
+        }).catch(() => setTenantLabel(tid + " · read-only"));
+      return;
+    }
     if (!session) return;
     if (isGlobalAdmin) {
       // For master, label follows the picker. We resolve the picked
@@ -3137,7 +3165,9 @@ function App() {
 
   const toggleTheme = () => setTheme(theme === "dark" ? "light" : "dark");
 
-  if (!session) {
+  // Skip the login gate in share-link mode — anonymous viewers don't
+  // have a Supabase Auth session and shouldn't be asked to sign in.
+  if (!session && !isViewLinkMode) {
     return h(LoginCard, { theme, onToggleTheme: toggleTheme, onSignedIn: setSession });
   }
 
@@ -3195,6 +3225,38 @@ function App() {
 // ============================================================
 // Boot
 // ============================================================
+// Read-only Client View share link detection. URL shape:
+//   /lite/view/<token>
+// The token resolves (via a public API on the control-plane backend) to
+// a {tenant_id, customer_id, edge_id} scope the anonymous viewer is
+// allowed to see. App renders in read-only mode pinned to that tenant.
+function _detectViewLink() {
+  try {
+    const path = String(window.location.pathname || "");
+    const m = path.match(/\/lite\/view\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  } catch (_) { return ""; }
+}
+
+async function _resolveViewLink(token) {
+  if (!token) return null;
+  // Resolver is mounted at the same origin (nginx proxies /api/* to the
+  // backend). Public — no Authorization header required.
+  try {
+    const res = await fetch(`/api/lite-view/resolve/${encodeURIComponent(token)}`, {
+      credentials: "omit",
+    });
+    if (res.status !== 200) return null;
+    const body = await res.json();
+    if (!body?.ok) return null;
+    return {
+      tenant_id: String(body.tenant_id || ""),
+      customer_id: String(body.customer_id || ""),
+      edge_id: String(body.edge_id || ""),
+    };
+  } catch (_) { return null; }
+}
+
 (async () => {
   applyTheme(readTheme());
   try {
@@ -3214,10 +3276,31 @@ function App() {
   if ("serviceWorker" in navigator) {
     try { navigator.serviceWorker.register("./sw.js"); } catch (_) {}
   }
+  // Resolve share-link before mounting so the App component knows from
+  // its first render whether to enter read-only mode and skip the login
+  // gate entirely.
+  const viewToken = _detectViewLink();
+  let viewLink = null;
+  if (viewToken) {
+    viewLink = await _resolveViewLink(viewToken);
+    if (!viewLink) {
+      const root = document.getElementById("app");
+      root.innerHTML = "";
+      const r = createRoot(root);
+      r.render(h("div", { className: "login-container theme-light" },
+        h("div", { className: "auth-card" },
+          h("div", { className: "auth-subtitle" }, "Link expired or invalid"),
+          h("div", { className: "auth-error" },
+            "This Client View link is no longer active. Ask the admin to share a new one."),
+        )
+      ));
+      return;
+    }
+  }
   const root = document.getElementById("app");
   root.innerHTML = "";
   const r = createRoot(root);
-  r.render(h(App));
+  r.render(h(App, { viewLink }));
 })();
   </script>
 </body>

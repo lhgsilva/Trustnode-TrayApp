@@ -310,11 +310,24 @@ class ControlPlaneStore:
                       details_json TEXT NOT NULL DEFAULT '{}'
                     );
 
+                    CREATE TABLE IF NOT EXISTS cp_edge_view_links (
+                      token TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL,
+                      customer_id TEXT,
+                      edge_id TEXT NOT NULL,
+                      status TEXT NOT NULL DEFAULT 'active',
+                      created_by TEXT,
+                      created_utc TEXT NOT NULL,
+                      last_used_utc TEXT,
+                      metadata_json TEXT NOT NULL DEFAULT '{}'
+                    );
+
                     CREATE INDEX IF NOT EXISTS ix_cp_customers_tenant ON cp_customers(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_edges_tenant ON cp_edges(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_users_tenant ON cp_users(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_licenses_tenant ON cp_licenses(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_audit_tenant_ts ON cp_security_audit_log(tenant_id, ts_utc DESC);
+                    CREATE INDEX IF NOT EXISTS ix_cp_view_links_edge ON cp_edge_view_links(tenant_id, edge_id);
                     """
                 )
                 cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(cp_edge_activation_codes)").fetchall()}
@@ -641,6 +654,100 @@ class ControlPlaneStore:
                 cur = conn.execute("DELETE FROM cp_edges WHERE tenant_id=? AND edge_id=?", (tid, eid))
                 conn.commit()
                 return int(cur.rowcount or 0) > 0
+
+    # ----- Read-only Client View share links -----
+    # A "view link" is a long random URL token that grants read-only access
+    # to a single edge's Lite app without requiring a login. Used by master
+    # admins to share live monitoring with customers and partners.
+
+    def list_edge_view_links(self, *, tenant_id: str, edge_id: str | None = None,
+                             include_revoked: bool = False) -> list[dict[str, Any]]:
+        tid = normalize_tenant_id(tenant_id)
+        with self._lock:
+            with self._connect() as conn:
+                if edge_id:
+                    rows = conn.execute(
+                        "SELECT * FROM cp_edge_view_links WHERE tenant_id=? AND edge_id=? ORDER BY created_utc DESC",
+                        (tid, str(edge_id)),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM cp_edge_view_links WHERE tenant_id=? ORDER BY created_utc DESC",
+                        (tid,),
+                    ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if not include_revoked and str(d.get("status") or "active") != "active":
+                continue
+            out.append(d)
+        return out
+
+    def upsert_edge_view_link(self, *, token: str, tenant_id: str, edge_id: str,
+                              customer_id: str = "", status: str = "active",
+                              created_by: str = "system") -> dict[str, Any]:
+        tid = normalize_tenant_id(tenant_id)
+        eid = str(edge_id or "").strip()
+        if not eid or not token:
+            raise ValueError("token_and_edge_required")
+        now = self._utc_now()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO cp_edge_view_links(token, tenant_id, customer_id, edge_id, status, created_by, created_utc, last_used_utc, metadata_json)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, NULL, '{}')
+                    ON CONFLICT(token) DO UPDATE SET
+                      tenant_id=excluded.tenant_id,
+                      customer_id=excluded.customer_id,
+                      edge_id=excluded.edge_id,
+                      status=excluded.status
+                    """,
+                    (str(token), tid, str(customer_id or ""), eid, str(status or "active"), str(created_by or "system"), now),
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT * FROM cp_edge_view_links WHERE token=?", (str(token),),
+                ).fetchone()
+        return dict(row) if row else {}
+
+    def get_edge_view_link_by_token(self, *, token: str) -> dict[str, Any] | None:
+        t = str(token or "").strip()
+        if not t:
+            return None
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM cp_edge_view_links WHERE token=?", (t,),
+                ).fetchone()
+        return dict(row) if row else None
+
+    def revoke_edge_view_links(self, *, tenant_id: str, edge_id: str) -> int:
+        tid = normalize_tenant_id(tenant_id)
+        eid = str(edge_id or "").strip()
+        if not eid:
+            return 0
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE cp_edge_view_links SET status='revoked' WHERE tenant_id=? AND edge_id=? AND status='active'",
+                    (tid, eid),
+                )
+                conn.commit()
+                return int(cur.rowcount or 0)
+
+    def touch_edge_view_link(self, *, token: str) -> None:
+        t = str(token or "").strip()
+        if not t:
+            return
+        now = self._utc_now()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE cp_edge_view_links SET last_used_utc=? WHERE token=?",
+                    (now, t),
+                )
+                conn.commit()
 
     def heartbeat_edge(self, *, tenant_id: str, edge_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)

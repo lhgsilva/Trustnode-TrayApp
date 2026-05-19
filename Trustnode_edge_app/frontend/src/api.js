@@ -1479,6 +1479,68 @@ export async function deleteControlPlaneEdge(edgeId, tenantId = "") {
   return res.json();
 }
 
+// --- Read-only Client View share links ---
+// A view link grants no-login read-only Lite access to a single edge.
+// The portal "Client View" column drives create/rotate/revoke.
+
+function _viewLinkUrl(token) {
+  // Resolves to the Lite app's read-only viewer route. The link is opened
+  // by anonymous browsers so we anchor at the host the portal was loaded
+  // from (which is also where Lite is served from).
+  const host = String(window.location.origin || "").replace(/\/+$/, "");
+  return `${host}/lite/view/${encodeURIComponent(token)}`;
+}
+
+export async function getEdgeViewLink(edgeId, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const eid = encodeURIComponent(String(edgeId || ""));
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges/${eid}/view-link${suffix}`);
+  await ensureOk(res, "Fetching edge view link failed");
+  return res.json();
+}
+
+export async function createEdgeViewLink(edgeId, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const eid = encodeURIComponent(String(edgeId || ""));
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges/${eid}/view-link${suffix}`, {
+    method: "POST",
+  });
+  await ensureOk(res, "Creating edge view link failed");
+  return res.json();
+}
+
+export async function rotateEdgeViewLink(edgeId, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const eid = encodeURIComponent(String(edgeId || ""));
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges/${eid}/view-link/rotate${suffix}`, {
+    method: "POST",
+  });
+  await ensureOk(res, "Rotating edge view link failed");
+  return res.json();
+}
+
+export async function revokeEdgeViewLink(edgeId, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const eid = encodeURIComponent(String(edgeId || ""));
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges/${eid}/view-link${suffix}`, {
+    method: "DELETE",
+  });
+  await ensureOk(res, "Revoking edge view link failed");
+  return res.json();
+}
+
+export function buildEdgeViewLinkUrl(token) {
+  return token ? _viewLinkUrl(token) : "";
+}
+
 export async function heartbeatControlPlaneEdge(edgeId, payload = {}, tenantId = "") {
   const params = new URLSearchParams();
   params.set("edge_id", String(edgeId || ""));
