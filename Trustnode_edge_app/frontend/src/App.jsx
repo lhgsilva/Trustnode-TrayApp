@@ -4649,7 +4649,16 @@ function AppShell() {
   useEffect(() => {
     if (!config) return;
     if (gatewaySeedAttemptedRef.current) return;
-    if (!gatewayBootstrapAppliedRef.current) return;
+    // The bootstrap is the source of truth — once it has run we must
+    // NEVER inject the legacy single-stub gateway, regardless of whether
+    // it found a saved list or not. (Empty after bootstrap means the
+    // user truly has no gateways yet.) Previously the condition was
+    // inverted: the seed only ran AFTER bootstrap, allowing it to
+    // overwrite the freshly-loaded list on every restart.
+    if (gatewayBootstrapAppliedRef.current) {
+      gatewaySeedAttemptedRef.current = true;
+      return;
+    }
     if (gatewayConfigsRef.current.length) {
       gatewaySeedAttemptedRef.current = true;
       return;
