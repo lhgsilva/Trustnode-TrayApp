@@ -999,6 +999,37 @@ class AppStore:
                     cloud, str(cloud.get("schema") or "public")
                 )
                 schema = str(cloud.get("schema") or "public")
+                # Auto-provision the mirror table the first time we write to
+                # it from this process. Lets an edge come online with a fresh
+                # Supabase project without requiring the DBA to run every
+                # migration up-front. Cheap idempotent DDL; cached in a per-
+                # process set so subsequent writes skip it.
+                ensured_set = getattr(self, "_mirror_tables_ensured", None)
+                if ensured_set is None:
+                    ensured_set = set()
+                    setattr(self, "_mirror_tables_ensured", ensured_set)
+                if table_name not in ensured_set:
+                    try:
+                        with engine.begin() as conn:
+                            conn.execute(
+                                text(
+                                    f'CREATE TABLE IF NOT EXISTS "{schema}"."{table_name}" ('
+                                    f"  tenant_id    text NOT NULL,"
+                                    f"  scope_key    text NOT NULL DEFAULT '',"
+                                    f"  payload_json jsonb NOT NULL DEFAULT '[]'::jsonb,"
+                                    f"  version      integer NOT NULL DEFAULT 1,"
+                                    f"  updated_utc  timestamptz NOT NULL DEFAULT now(),"
+                                    f"  PRIMARY KEY (tenant_id, scope_key)"
+                                    f")"
+                                )
+                            )
+                        ensured_set.add(table_name)
+                    except Exception:
+                        # If we can't create it (e.g. permissions), let the
+                        # upsert below try anyway — the DBA may have created
+                        # it manually with a different shape we can still
+                        # write to.
+                        pass
                 with engine.begin() as conn:
                     conn.execute(
                         text(
@@ -1083,7 +1114,13 @@ class AppStore:
         but each row is upserted in its own short transaction so a single
         failure doesn't abort the batch.
         """
-        mirrored_domains = ("dashboard_configurations", "alarms_setup", "triggers_limits")
+        mirrored_domains = (
+            "dashboard_configurations",
+            "alarms_setup",
+            "triggers_limits",
+            "gateway_configurations",
+            "devices",
+        )
         cloud = self._get_cloud_database_target()
         if not cloud:
             return
@@ -1093,14 +1130,12 @@ class AppStore:
             return
         schema = str(cloud.get("schema") or "public")
         engine, _ = self._get_or_create_cloud_engine(cloud, schema)
+        placeholders = ",".join("?" * len(mirrored_domains))
         with self._lock:
             with self._connect() as conn:
                 rows = conn.execute(
-                    """
-                    SELECT scope_key, domain, payload_json, version, updated_utc
-                    FROM config_documents_scoped
-                    WHERE domain IN (?, ?, ?)
-                    """,
+                    f"SELECT scope_key, domain, payload_json, version, updated_utc "
+                    f"FROM config_documents_scoped WHERE domain IN ({placeholders})",
                     mirrored_domains,
                 ).fetchall()
         for r in rows or []:
@@ -1760,13 +1795,22 @@ class AppStore:
         cloud = self._get_cloud_database_target()
         if not cloud:
             return
-        domains = ("alarms_setup", "triggers_limits", "dashboard_configurations")
-        # Pull local rows for all three in one trip
+        domains = (
+            "alarms_setup",
+            "triggers_limits",
+            "dashboard_configurations",
+            "gateway_configurations",
+            "devices",
+        )
+        # Pull local rows for all mirrored domains in one trip. SQLite expects
+        # one '?' per element, so we build the placeholders dynamically rather
+        # than hard-coding a 3-tuple as before.
+        placeholders = ",".join("?" * len(domains))
         with self._lock:
             with self._connect() as conn:
                 rows = conn.execute(
-                    "SELECT scope_key, domain, payload_json, version, updated_utc "
-                    "FROM config_documents_scoped WHERE domain IN (?, ?, ?)",
+                    f"SELECT scope_key, domain, payload_json, version, updated_utc "
+                    f"FROM config_documents_scoped WHERE domain IN ({placeholders})",
                     domains,
                 ).fetchall()
         if not rows:
@@ -5027,27 +5071,15 @@ class AppStore:
                 self._reconcile_sync_targets_with_config()
             except Exception:
                 pass
-        if domain == "dashboard_configurations":
+        if domain in (
+            "dashboard_configurations",
+            "alarms_setup",
+            "triggers_limits",
+            "gateway_configurations",
+            "devices",
+        ):
             self._mirror_config_doc_to_cloud(
-                "dashboard_configurations",
-                tenant_id=self._current_tenant_id(),
-                scope_key="",
-                payload_json=payload_json,
-                version=new_version,
-                updated_utc=now,
-            )
-        if domain == "alarms_setup":
-            self._mirror_config_doc_to_cloud(
-                "alarms_setup",
-                tenant_id=self._current_tenant_id(),
-                scope_key="",
-                payload_json=payload_json,
-                version=new_version,
-                updated_utc=now,
-            )
-        if domain == "triggers_limits":
-            self._mirror_config_doc_to_cloud(
-                "triggers_limits",
+                domain,
                 tenant_id=self._current_tenant_id(),
                 scope_key="",
                 payload_json=payload_json,
@@ -5159,7 +5191,19 @@ class AppStore:
                 self._mirror_runtime_flags_to_unscoped_app_settings(payload_to_store)
             except Exception:
                 pass
-        if domain_name in ("dashboard_configurations", "alarms_setup", "triggers_limits"):
+        if domain_name in (
+            "dashboard_configurations",
+            "alarms_setup",
+            "triggers_limits",
+            # 2026-06-10: extend mirror to the operational config domains
+            # so Lite can label widgets with the gateway's friendly name,
+            # show device metadata, and the portal can review what's
+            # actually deployed at each edge. The historian view already
+            # needs gateway_id → gateway_name resolution and was falling
+            # back to the raw id when the local edge moved offline.
+            "gateway_configurations",
+            "devices",
+        ):
             # scope_key shape on the edge is 'tenant|-|edge_id|user'; the
             # leading segment is the tenant. RLS in Supabase uses tenant_id,
             # so we propagate it. The scope_key is preserved as-is so the

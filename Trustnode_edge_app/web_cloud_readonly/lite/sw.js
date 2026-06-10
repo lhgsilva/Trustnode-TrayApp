@@ -9,7 +9,7 @@
  * evicted on activate. Browsers re-check the service worker on each navigation
  * so users pick the new shell up automatically next time they open the app.
  */
-const CACHE_VERSION = "tnlite-v35-statuspill-tenant-scope";
+const CACHE_VERSION = "tnlite-v36-live-poll-gated";
 const SHELL = [
   "./",
   "./index.html",

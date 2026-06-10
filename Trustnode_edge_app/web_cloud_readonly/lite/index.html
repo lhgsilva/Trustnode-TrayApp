@@ -254,6 +254,11 @@ function useLiveLatest(enabled = true) {
     // with the new one until the next fetchAll lands.
     setRows([]);
 
+    // Cap the seed fetch tighter than before (was 400). Dashboards rarely
+    // need more than the most recent value per tag — a couple of hundred
+    // rows is plenty for the largest customer today and cuts the round
+    // trip enough to noticeably lower the StatusPill "ms" reading.
+    const LIVE_SEED_LIMIT = Math.max(50, Math.min(400, Number(cfg?.live_seed_limit || 200)));
     const fetchAll = async () => {
       const t0 = performance.now();
       const { data, error: e } = await applyTenantScope(
@@ -266,7 +271,7 @@ function useLiveLatest(enabled = true) {
         pickedTenantId,
       )
         .order("ts_utc", { ascending: false })
-        .limit(400);
+        .limit(LIVE_SEED_LIMIT);
       if (stopped) return;
       if (e) { setError(e.message); return; }
       // Defense in depth: drop any row whose tenant_id doesn't match.
@@ -280,6 +285,7 @@ function useLiveLatest(enabled = true) {
 
     fetchAll();
     // Realtime: append/update in place.
+    let realtimeHealthy = false;
     channel = supabase.channel("lite-live-rt")
       .on("postgres_changes",
         { event: "*", schema: "public", table: "live_latest" },
@@ -295,18 +301,32 @@ function useLiveLatest(enabled = true) {
             const key = `${r.gateway_id || ""}|${r.tag_name}`;
             const next = prev.filter((p) => `${p.gateway_id || ""}|${p.tag_name}` !== key);
             next.unshift(r);
-            return next.slice(0, 400);
+            return next.slice(0, LIVE_SEED_LIMIT);
           });
         })
       .subscribe((status) => {
-        if (status === "SUBSCRIBED") setTransport("realtime");
+        if (status === "SUBSCRIBED") {
+          setTransport("realtime");
+          realtimeHealthy = true;
+          // Stop the belt-and-braces poll when realtime is healthy — every
+          // fetchAll() while realtime is delivering deltas is a wasted round
+          // trip that competes with the actual data update and inflates the
+          // StatusPill latency reading.
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
         else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
           setTransport("polling");
+          realtimeHealthy = false;
           if (!pollTimer) pollTimer = setInterval(fetchAll, Number(cfg?.live_poll_ms || 2000));
         }
       });
-    // Belt-and-braces refresh every few seconds — picks up any missed events.
-    pollTimer = setInterval(fetchAll, Math.max(4000, Number(cfg?.live_poll_ms || 1000) * 4));
+    // Slow belt-and-braces poll only while realtime hasn't subscribed yet.
+    // Once SUBSCRIBED fires above, we clear this timer. A new failure also
+    // restarts it via the CHANNEL_ERROR/TIMED_OUT branch.
+    pollTimer = setInterval(() => {
+      if (realtimeHealthy) return; // safety net for older browsers
+      fetchAll();
+    }, Math.max(8000, Number(cfg?.live_poll_ms || 1000) * 8));
 
     return () => {
       stopped = true;
