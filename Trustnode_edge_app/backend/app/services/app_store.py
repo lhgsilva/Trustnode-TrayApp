@@ -5205,6 +5205,50 @@ class AppStore:
                         prev_payload_json = prev_raw
                 # No-op write: avoid audit/outbox churn when payload is unchanged.
                 if prev and prev_payload_json == payload_json:
+                    # Still fire the cloud mirror even on no-op — same
+                    # reason as the scoped path above. Older edges saved
+                    # configs to the unscoped table before the mirror
+                    # existed; once they upgrade, every save is a no-op
+                    # and nothing reaches Lite. Synthesize a scope_key
+                    # from app_settings so the mirror lands in a row
+                    # Lite can actually read.
+                    if domain in (
+                        "dashboard_configurations",
+                        "alarms_setup",
+                        "triggers_limits",
+                        "gateway_configurations",
+                        "devices",
+                    ):
+                        try:
+                            settings_row = conn.execute(
+                                "SELECT payload_json FROM config_documents WHERE domain='app_settings'"
+                            ).fetchone()
+                            settings = {}
+                            if settings_row and settings_row["payload_json"]:
+                                settings = json.loads(str(settings_row["payload_json"] or "{}")) or {}
+                            edge_profile = settings.get("edge_profile") if isinstance(settings.get("edge_profile"), dict) else {}
+                            edge_id = (
+                                str(edge_profile.get("edge_id") or "").strip().lower()
+                                or str(settings.get("edge_id") or "").strip().lower()
+                            )
+                            tenant_id = str(settings.get("tenant_id") or "default").strip().lower() or "default"
+                            customer_id = (
+                                str(edge_profile.get("linked_customer_id") or "").strip().lower()
+                                or str(settings.get("customer_id") or "").strip().lower()
+                                or "-"
+                            )
+                            if edge_id:
+                                synthetic_scope = f"{tenant_id}|{customer_id}|{edge_id}"
+                                self._mirror_config_doc_to_cloud(
+                                    domain,
+                                    tenant_id=tenant_id,
+                                    scope_key=synthetic_scope,
+                                    payload_json=str(prev["payload_json"] or "null"),
+                                    version=int(old_version),
+                                    updated_utc=str(prev["updated_utc"] or now),
+                                )
+                        except Exception:
+                            pass
                     return {
                         "domain": domain,
                         "tenant_id": self._current_tenant_id(),
@@ -5344,6 +5388,34 @@ class AppStore:
                     except Exception:
                         prev_payload_json = prev_raw
                 if prev and prev_payload_json == payload_json:
+                    # No-op local write — BUT we still need to fire the
+                    # cloud mirror for Lite-visible domains. Older edges
+                    # saved dashboards locally before the mirror code
+                    # existed; once they upgraded, every save was a no-op
+                    # and the dashboard never reached cloud because the
+                    # mirror was wired AFTER this early-return. The mirror
+                    # is itself idempotent (versioned UPSERT), so firing
+                    # it here is safe and finally lets historical edges
+                    # backfill on the next operator save.
+                    if domain_name in (
+                        "dashboard_configurations",
+                        "alarms_setup",
+                        "triggers_limits",
+                        "gateway_configurations",
+                        "devices",
+                    ):
+                        try:
+                            tenant_from_scope = (skey.split("|") or ["default"])[0] or "default"
+                            self._mirror_config_doc_to_cloud(
+                                domain_name,
+                                tenant_id=tenant_from_scope,
+                                scope_key=skey,
+                                payload_json=str(prev["payload_json"] or "null"),
+                                version=int(old_version),
+                                updated_utc=str(prev["updated_utc"] or now),
+                            )
+                        except Exception:
+                            pass
                     return {
                         "domain": domain_name,
                         "scope_key": skey,
