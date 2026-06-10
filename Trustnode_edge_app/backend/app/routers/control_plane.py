@@ -757,11 +757,14 @@ def list_users(request: Request, tenant_id: str | None = None) -> dict[str, Any]
       - tenant_id=<specific tenant>: existing tenant-scoped behaviour.
         Falls back to the caller's own tenant from the JWT if omitted.
     """
-    requested = str(tenant_id or "").strip()
-    if requested in ("__all__", "*"):
-        payload = _require_auth_payload(request)
-        if not _is_global_admin(payload):
-            raise HTTPException(status_code=403, detail="Global admin required")
+    # Bring /users in line with /customers, /edges, /licenses, /activation-codes:
+    # the master admin gets all-tenant rows whenever they ask for `__all__`
+    # OR send the legacy `default` (which the portal still sends from cards
+    # that pre-date per-customer tenancy). Without this branch, a master
+    # opening the workspace right after activating a customer edge sees no
+    # admin user for that customer — the customer's admin lives on
+    # tenant-cust-..., but the call was scoped to `default`.
+    if _master_wants_all_tenants(request, tenant_id):
         rows = control_plane_store.list_users(all_tenants=True)
         return {"ok": True, "tenant_id": "__all__", "rows": rows}
     tid = _scoped_tenant(request, tenant_id)

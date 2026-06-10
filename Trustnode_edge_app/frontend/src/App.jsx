@@ -1341,6 +1341,18 @@ function ExpandIcon() {
   );
 }
 
+function CopyIcon() {
+  // Two-rectangle clipboard glyph. Matches the visual weight of AddIcon /
+  // CollapseIcon so the inline copy button on the activation code input
+  // reads as part of the same control set.
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <rect x="9" y="9" width="13" height="13" rx="2" />
+      <path d="M5 15V5a2 2 0 0 1 2-2h10" />
+    </svg>
+  );
+}
+
 function EditIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -2828,6 +2840,17 @@ function AppShell() {
     area: "",
     equipment: "",
   });
+  // Independent collapse state for each of the two activation-page cards
+  // (Activation Flow / Issued Activation Codes). Lets the operator stack
+  // them tightly when they only need one of the two.
+  const [cpActivationCardsCollapsed, setCpActivationCardsCollapsed] = useState({
+    flow: false,
+    issued: false,
+  });
+  // The currently-open Edit popover on the Issued Codes table. When set,
+  // the floating dialog shows the code's metadata plus action buttons
+  // (Copy / Share / Re-issue / Revoke). null = closed.
+  const [cpActivationEditTarget, setCpActivationEditTarget] = useState(null);
   const [cpIssuedActivationCode, setCpIssuedActivationCode] = useState("");
   const [cpPasswordResetIssueForm, setCpPasswordResetIssueForm] = useState({
     username: "",
@@ -19247,12 +19270,23 @@ const getGatewayHealth = (gateway) => {
                   ) : null}
 
                   {cpPortalPage === "activation" ? (
-                    <>
-                    <section className="card">
-                      <h4 style={{ marginTop: 0 }}>Activation Flow</h4>
-                      <div className="form-grid">
-                        <label>
-                          Customer
+                    <div className="portal-activation-stack">
+                    <section className="card portal-activation-card">
+                      <div className="portal-card-head">
+                        <h4>Activation Flow</h4>
+                        <button
+                          className="icon-btn portal-card-btn"
+                          onClick={() => setCpActivationCardsCollapsed((p) => ({ ...p, flow: !p.flow }))}
+                          aria-label={cpActivationCardsCollapsed.flow ? "Expand" : "Collapse"}
+                          title={cpActivationCardsCollapsed.flow ? "Expand" : "Collapse"}
+                        >{cpActivationCardsCollapsed.flow ? <ExpandIcon /> : <CollapseIcon />}</button>
+                      </div>
+                      {!cpActivationCardsCollapsed.flow ? (
+                      <>
+                      {/* First row: every issue form field + the Issue button itself. */}
+                      <div className="portal-activation-issue-row">
+                        <label className="portal-activation-field">
+                          <span>Customer</span>
                           <select
                             value={cpActivationIssueForm.customer_id}
                             onChange={(e) =>
@@ -19273,8 +19307,8 @@ const getGatewayHealth = (gateway) => {
                             ))}
                           </select>
                         </label>
-                        <label>
-                          Edge App
+                        <label className="portal-activation-field">
+                          <span>Edge App</span>
                           <select
                             value={cpActivationIssueForm.edge_id}
                             onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, edge_id: e.target.value }))}
@@ -19288,8 +19322,8 @@ const getGatewayHealth = (gateway) => {
                             ))}
                           </select>
                         </label>
-                        <label>
-                          License
+                        <label className="portal-activation-field">
+                          <span>License</span>
                           <select
                             value={cpActivationIssueForm.license_id}
                             onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, license_id: e.target.value }))}
@@ -19303,55 +19337,93 @@ const getGatewayHealth = (gateway) => {
                             ))}
                           </select>
                         </label>
-                        <label>
-                          Activation Edge Name
+                        <label className="portal-activation-field">
+                          <span>Edge Name</span>
                           <input value={cpActivationIssueForm.edge_name} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, edge_name: e.target.value }))} />
                         </label>
-                        <label>
-                          Activation TTL (min)
+                        <label className="portal-activation-field portal-activation-field-narrow">
+                          <span>TTL (min)</span>
                           <input type="number" min="1" value={cpActivationIssueForm.ttl_minutes} onChange={(e) => setCpActivationIssueForm((p) => ({ ...p, ttl_minutes: Number(e.target.value || 30) }))} />
                         </label>
+                        <button
+                          className="btn btn-success portal-activation-issue-btn"
+                          onClick={issueTenantActivationCode}
+                          disabled={cpBusy || !canEditPage("control_plane")}
+                          title="Issue activation code"
+                        >Issue Code</button>
                       </div>
-                      <div className="row">
-                        <button className="btn btn-success" onClick={issueTenantActivationCode} disabled={cpBusy || !canEditPage("control_plane")}>Issue Activation Code</button>
-                        <input readOnly value={cpIssuedActivationCode} placeholder="Activation code will appear here" style={{ minWidth: 280 }} />
-                      </div>
-                      <div className="form-grid" style={{ marginTop: 12 }}>
-                        <label>
-                          Activation Code
-                          <input value={cpActivationApplyForm.activation_code} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, activation_code: e.target.value }))} />
+                      {/* Second row: the issued code itself (read-only with
+                          copy), Edge ID + Edge Name to validate against,
+                          and the Validate button — all aligned. The old
+                          separate "Activation Code will appear here" input
+                          on its own line is gone; the code lands directly
+                          here for the operator to copy or hand to the
+                          edge for validation. */}
+                      <div className="portal-activation-apply-row">
+                        <label className="portal-activation-field portal-activation-field-grow">
+                          <span>Activation Code</span>
+                          <div className="portal-activation-code-input">
+                            <input
+                              value={cpActivationApplyForm.activation_code || cpIssuedActivationCode || ""}
+                              onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, activation_code: e.target.value }))}
+                              placeholder="Issue or paste an activation code"
+                            />
+                            <button
+                              type="button"
+                              className="icon-btn portal-card-btn"
+                              onClick={() => {
+                                const v = String(cpActivationApplyForm.activation_code || cpIssuedActivationCode || "");
+                                if (v) { try { navigator.clipboard.writeText(v); } catch (_) {} }
+                              }}
+                              title="Copy activation code"
+                              aria-label="Copy activation code"
+                            ><CopyIcon /></button>
+                          </div>
                         </label>
-                        <label>
-                          Edge ID
+                        <label className="portal-activation-field">
+                          <span>Edge ID</span>
                           <input value={cpActivationApplyForm.edge_id} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, edge_id: e.target.value }))} />
                         </label>
-                        <label>
-                          Edge Name
+                        <label className="portal-activation-field">
+                          <span>Edge Name</span>
                           <input value={cpActivationApplyForm.edge_name} onChange={(e) => setCpActivationApplyForm((p) => ({ ...p, edge_name: e.target.value }))} />
                         </label>
-                      </div>
-                      <div className="row">
-                        <button className="btn btn-primary" onClick={applyTenantActivationCode} disabled={cpBusy || !canEditPage("control_plane")}>Validate Activation</button>
-                      </div>
-                    </section>
-                    <section className="card">
-                      <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-                        <h4 style={{ marginTop: 0, marginBottom: 0 }}>Issued Activation Codes</h4>
                         <button
-                          className="btn btn-danger"
-                          onClick={() => bulkDeleteCpItems(
-                            "activation",
-                            cpActivationCodesFiltered,
-                            (row) => row?.id,
-                            async (row) => deleteControlPlaneActivationCode(Number(row?.id || 0), getRowTenantScope(row)),
-                            "activation codes"
-                          )}
+                          className="btn btn-primary portal-activation-issue-btn"
+                          onClick={applyTenantActivationCode}
                           disabled={cpBusy || !canEditPage("control_plane")}
-                        >
-                          Delete Selected
-                        </button>
+                          title="Validate activation"
+                        >Validate</button>
                       </div>
-                      <div className="form-grid" style={{ marginTop: 10 }}>
+                      </>
+                      ) : null}
+                    </section>
+                    <section className="card portal-activation-card">
+                      <div className="portal-card-head">
+                        <h4>Issued Activation Codes</h4>
+                        <div className="row">
+                          <button
+                            className="btn btn-danger btn-sm"
+                            onClick={() => bulkDeleteCpItems(
+                              "activation",
+                              cpActivationCodesFiltered,
+                              (row) => row?.id,
+                              async (row) => deleteControlPlaneActivationCode(Number(row?.id || 0), getRowTenantScope(row)),
+                              "activation codes"
+                            )}
+                            disabled={cpBusy || !canEditPage("control_plane")}
+                          >Delete Selected</button>
+                          <button
+                            className="icon-btn portal-card-btn"
+                            onClick={() => setCpActivationCardsCollapsed((p) => ({ ...p, issued: !p.issued }))}
+                            aria-label={cpActivationCardsCollapsed.issued ? "Expand" : "Collapse"}
+                            title={cpActivationCardsCollapsed.issued ? "Expand" : "Collapse"}
+                          >{cpActivationCardsCollapsed.issued ? <ExpandIcon /> : <CollapseIcon />}</button>
+                        </div>
+                      </div>
+                      {!cpActivationCardsCollapsed.issued ? (
+                      <>
+                      <div className="form-grid" style={{ marginTop: 8 }}>
                         <label>
                           Filter
                           <input
@@ -19362,31 +19434,135 @@ const getGatewayHealth = (gateway) => {
                         </label>
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
-                        <div className="table cp-activation-table">
-                          <div className="thead"><span><input type="checkbox" checked={cpActivationCodesFiltered.length > 0 && cpActivationCodesFiltered.every((row) => isCpRowSelected("activation", row?.id))} onChange={(e) => setCpRowsSelectedAll("activation", cpActivationCodesFiltered, (row) => row?.id, e.target.checked)} /></span><span>ID</span><span>Activation Code</span><span>Customer</span><span>Edge ID</span><span>License</span><span>Status</span><span>Expires</span><span>Used</span><span>Actions</span></div>
-                          {cpActivationCodesFiltered.map((row, idx) => (
-                            <div className="trow" key={`cp-main-ac-${idx}`}>
-                              <span><input type="checkbox" checked={isCpRowSelected("activation", row?.id)} onChange={(e) => setCpRowSelected("activation", row?.id, e.target.checked)} /></span>
-                              <span>{String(row?.id || "-")}</span>
-                              <span title={String(row?.activation_code || "-")}>{String(row?.activation_code || "-")}</span>
-                              <span>{String(row?.customer_id || "-")}</span>
-                              <span>{String(row?.edge_id || "-")}</span>
-                              <span>{String(row?.license_id || "-")}</span>
-                              <span>{String(row?.status || "-")}</span>
-                              <span>{fmtTs(String(row?.expires_utc || "")) || "-"}</span>
-                              <span>{fmtTs(String(row?.used_utc || "")) || "-"}</span>
-                              <span className="row-actions">
-                                <button className="btn btn-sm" onClick={() => updateActivationCodeStatus(row, "issued")} disabled={cpBusy || !canEditPage("control_plane")}>Re-issue</button>
-                                <button className="btn btn-sm btn-danger" onClick={() => updateActivationCodeStatus(row, "revoked")} disabled={cpBusy || !canEditPage("control_plane")}>Revoke</button>
-                                <button className="icon-btn danger table-action-btn" onClick={() => deleteCpActivationCode(row)} disabled={cpBusy || !canEditPage("control_plane")} title="Delete"><DeleteIcon /></button>
-                              </span>
-                            </div>
-                          ))}
-                          {!cpActivationCodesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No activation codes</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
+                        <div className="table cp-activation-table-v2">
+                          <div className="thead">
+                            <span><input type="checkbox" checked={cpActivationCodesFiltered.length > 0 && cpActivationCodesFiltered.every((row) => isCpRowSelected("activation", row?.id))} onChange={(e) => setCpRowsSelectedAll("activation", cpActivationCodesFiltered, (row) => row?.id, e.target.checked)} /></span>
+                            <span>ID</span>
+                            <span>Activation Code</span>
+                            <span>Customer</span>
+                            <span>Edge</span>
+                            <span>License</span>
+                            <span>Activated</span>
+                            <span>Expires</span>
+                            <span>Actions</span>
+                          </div>
+                          {cpActivationCodesFiltered.map((row, idx) => {
+                            const customerLabel = customerNameById.get(String(row?.customer_id || "").trim())
+                              || (row?.customer_id ? String(row.customer_id) : "-");
+                            const activationCode = String(row?.activation_code || "-");
+                            return (
+                              <div className="trow" key={`cp-main-ac-${idx}`}>
+                                <span><input type="checkbox" checked={isCpRowSelected("activation", row?.id)} onChange={(e) => setCpRowSelected("activation", row?.id, e.target.checked)} /></span>
+                                <span>{String(row?.id || "-")}</span>
+                                <span className="portal-activation-code-cell" title={activationCode}>{activationCode}</span>
+                                <span title={customerLabel}>{customerLabel}</span>
+                                <span title={String(row?.edge_id || "")}>{String(row?.edge_id || "-")}</span>
+                                <span title={String(row?.license_id || "")}>{String(row?.license_id || "-")}</span>
+                                <span>{fmtTs(String(row?.used_utc || "")) || "-"}</span>
+                                <span>{fmtTs(String(row?.expires_utc || "")) || "-"}</span>
+                                <span className="row-actions">
+                                  <button
+                                    className="icon-btn table-action-btn"
+                                    onClick={() => setCpActivationEditTarget(row)}
+                                    disabled={cpBusy || !canEditPage("control_plane")}
+                                    title="Edit (open / copy / share / re-issue / revoke)"
+                                  ><EditIcon /></button>
+                                  <button
+                                    className="icon-btn danger table-action-btn"
+                                    onClick={() => deleteCpActivationCode(row)}
+                                    disabled={cpBusy || !canEditPage("control_plane")}
+                                    title="Delete"
+                                  ><DeleteIcon /></button>
+                                </span>
+                              </div>
+                            );
+                          })}
+                          {!cpActivationCodesFiltered.length ? <div className="trow"><span>-</span><span>-</span><span>No activation codes</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span><span>-</span></div> : null}
                         </div>
                       </div>
+                      </>
+                      ) : null}
                     </section>
-                    </>
+                    {cpActivationEditTarget ? (
+                      <div className="portal-activation-edit-overlay" onClick={() => setCpActivationEditTarget(null)}>
+                        <div className="portal-activation-edit-dialog" onClick={(e) => e.stopPropagation()}>
+                          <div className="portal-activation-edit-head">
+                            <h4>Activation Code #{cpActivationEditTarget?.id}</h4>
+                            <button
+                              className="icon-btn portal-card-btn"
+                              onClick={() => setCpActivationEditTarget(null)}
+                              aria-label="Close"
+                              title="Close"
+                            ><CollapseIcon /></button>
+                          </div>
+                          <div className="portal-activation-edit-body">
+                            <div className="portal-activation-edit-row">
+                              <span className="portal-activation-edit-label">Code</span>
+                              <input readOnly value={String(cpActivationEditTarget?.activation_code || "")} />
+                            </div>
+                            <div className="portal-activation-edit-row">
+                              <span className="portal-activation-edit-label">Customer</span>
+                              <span>{customerNameById.get(String(cpActivationEditTarget?.customer_id || "").trim()) || String(cpActivationEditTarget?.customer_id || "-")}</span>
+                            </div>
+                            <div className="portal-activation-edit-row">
+                              <span className="portal-activation-edit-label">Edge</span>
+                              <span>{String(cpActivationEditTarget?.edge_id || "-")}</span>
+                            </div>
+                            <div className="portal-activation-edit-row">
+                              <span className="portal-activation-edit-label">License</span>
+                              <span>{String(cpActivationEditTarget?.license_id || "-")}</span>
+                            </div>
+                            <div className="portal-activation-edit-row">
+                              <span className="portal-activation-edit-label">Status</span>
+                              <span>{String(cpActivationEditTarget?.status || "-")}</span>
+                            </div>
+                            <div className="portal-activation-edit-row">
+                              <span className="portal-activation-edit-label">Activated</span>
+                              <span>{fmtTs(String(cpActivationEditTarget?.used_utc || "")) || "-"}</span>
+                            </div>
+                            <div className="portal-activation-edit-row">
+                              <span className="portal-activation-edit-label">Expires</span>
+                              <span>{fmtTs(String(cpActivationEditTarget?.expires_utc || "")) || "-"}</span>
+                            </div>
+                          </div>
+                          <div className="portal-activation-edit-actions">
+                            <button
+                              className="btn btn-sm"
+                              onClick={() => {
+                                const v = String(cpActivationEditTarget?.activation_code || "");
+                                if (v) { try { navigator.clipboard.writeText(v); } catch (_) {} }
+                              }}
+                              title="Copy activation code to clipboard"
+                            >Copy</button>
+                            <button
+                              className="btn btn-sm"
+                              onClick={async () => {
+                                const v = String(cpActivationEditTarget?.activation_code || "");
+                                if (!v) return;
+                                try {
+                                  if (navigator.share) await navigator.share({ title: "TrustNode Activation Code", text: v });
+                                  else { try { await navigator.clipboard.writeText(v); } catch (_) {} alert("Activation code copied to clipboard. Share it with the operator."); }
+                                } catch (_) {}
+                              }}
+                              title="Share activation code"
+                            >Share</button>
+                            <button
+                              className="btn btn-sm"
+                              onClick={() => { updateActivationCodeStatus(cpActivationEditTarget, "issued"); setCpActivationEditTarget(null); }}
+                              disabled={cpBusy || !canEditPage("control_plane")}
+                              title="Re-issue this code (return to status 'issued')"
+                            >Re-issue</button>
+                            <button
+                              className="btn btn-sm btn-danger"
+                              onClick={() => { updateActivationCodeStatus(cpActivationEditTarget, "revoked"); setCpActivationEditTarget(null); }}
+                              disabled={cpBusy || !canEditPage("control_plane")}
+                              title="Revoke this code"
+                            >Revoke</button>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+                    </div>
                   ) : null}
 
                   {cpPortalPage === "interface" ? (

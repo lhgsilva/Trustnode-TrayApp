@@ -2311,6 +2311,141 @@ body {
 .cp-dashboard-profiles-table.without-tenant .thead,
 .cp-dashboard-profiles-table.without-tenant .trow { grid-template-columns: 2.4fr .55fr .55fr 1fr 56px; }
 
+/* ===== Activation page (Portal -> Activation) ===== */
+.portal-activation-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.portal-activation-card {
+  margin: 0;
+}
+.portal-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.portal-card-head h4 {
+  margin: 0;
+}
+
+/* Both rows on the Activation Flow card use the same flex layout so the
+   issue form, the issued-code field, and the Validate row line up. */
+.portal-activation-issue-row,
+.portal-activation-apply-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.portal-activation-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1 1 160px;
+  min-width: 140px;
+  font-size: 12px;
+}
+.portal-activation-field-narrow { flex: 0 1 110px; min-width: 90px; }
+.portal-activation-field-grow { flex: 2 1 280px; }
+.portal-activation-field > span {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.portal-activation-field input,
+.portal-activation-field select {
+  width: 100%;
+}
+.portal-activation-issue-btn {
+  flex: 0 0 auto;
+  height: 34px;
+  white-space: nowrap;
+}
+.portal-activation-code-input {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.portal-activation-code-input input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Issued Activation Codes table — 9 columns (one row, no wrapping). */
+.cp-activation-table-v2 .thead,
+.cp-activation-table-v2 .trow {
+  display: grid;
+  grid-template-columns: 36px .35fr 1.5fr 1fr .9fr .9fr .9fr .9fr 84px;
+  gap: 8px;
+  align-items: center;
+}
+.cp-activation-table-v2 .thead > span:last-child { text-align: right; }
+.cp-activation-table-v2 .portal-activation-code-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+/* Edit popover (Open / Copy / Share / Re-issue / Revoke). Centered
+   modal overlay so the operator can review the code's metadata before
+   taking a destructive action. */
+.portal-activation-edit-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+.portal-activation-edit-dialog {
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 14px 16px;
+  width: min(540px, 92vw);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+}
+.portal-activation-edit-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.portal-activation-edit-head h4 { margin: 0; }
+.portal-activation-edit-body {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin: 6px 0 12px;
+}
+.portal-activation-edit-row {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.portal-activation-edit-row input {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+}
+.portal-activation-edit-label { color: var(--muted); }
+.portal-activation-edit-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
 /* Light-mode form controls inside the portal. The desktop edge uses
    dark inputs/selects because the whole shell is dark; in the cloud
    portal's light theme that left every <input>/<select> with a dark
