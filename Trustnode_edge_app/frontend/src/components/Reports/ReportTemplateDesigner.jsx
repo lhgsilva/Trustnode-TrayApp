@@ -42,6 +42,7 @@ const SECTION_PRESETS = [
   { type: "bar_chart", label: "Bar chart", description: "Tag samples as bars" },
   { type: "pie_chart", label: "Pie chart", description: "Distribution (direct or computed rules)" },
   { type: "table", label: "Data table", description: "Historian rows with custom columns" },
+  { type: "image", label: "Image", description: "Embed an uploaded picture (logo, photo, diagram)" },
   { type: "spacer", label: "Spacer", description: "Vertical gap" },
   { type: "page_break", label: "Page break", description: "Force a new page" },
 ];
@@ -394,6 +395,20 @@ function defaultSection(type) {
       return { id: makeId("sec"), type, height: 8 };
     case "page_break":
       return { id: makeId("sec"), type };
+    case "image":
+      return {
+        id: makeId("sec"),
+        type,
+        title: "",
+        caption: "",
+        // Either a base64 data URL (operator pasted / uploaded directly
+        // into the template) or a filename relative to TRUSTNODE_DATA_DIR
+        // for hand-managed assets shared across templates.
+        data_url: "",
+        path: "",
+        align: "center",
+        width_mm: 0, // 0 = auto (~70 % of printable width)
+      };
     default:
       return { id: makeId("sec"), type };
   }
@@ -1193,6 +1208,73 @@ function SectionEditor({
               placeholder="Plain text paragraph; line breaks are preserved."
             />
           </label>
+        </div>
+      ) : null}
+
+      {type === "image" ? (
+        <div className="tn-section-form">
+          <div className="tn-row tn-row-2">
+            <label>Title<input value={section.title || ""} onChange={(e) => onChange({ title: e.target.value })} /></label>
+            <label>Caption<input value={section.caption || ""} onChange={(e) => onChange({ caption: e.target.value })} /></label>
+          </div>
+          <div className="tn-row tn-row-3">
+            <label>Alignment
+              <select value={section.align || "center"} onChange={(e) => onChange({ align: e.target.value })}>
+                <option value="left">Left</option>
+                <option value="center">Center</option>
+                <option value="right">Right</option>
+              </select>
+            </label>
+            <label>Width (mm)
+              <input
+                type="number"
+                min={0}
+                max={180}
+                value={Number(section.width_mm || 0)}
+                onChange={(e) => onChange({ width_mm: Math.max(0, Math.min(180, Number(e.target.value || 0))) })}
+                placeholder="0 = auto"
+                title="0 = automatic (70% of page width). Otherwise width in millimeters, capped at the printable area."
+              />
+            </label>
+            <label>Saved file name
+              <input
+                value={section.path || ""}
+                onChange={(e) => onChange({ path: e.target.value, data_url: e.target.value ? "" : section.data_url })}
+                placeholder="e.g. site_diagram.png"
+                title="Optional. Relative file under ~/.trustnode_edge/data/ on the edge."
+              />
+            </label>
+          </div>
+          <label className="tn-row">
+            Upload image
+            <input
+              type="file"
+              accept="image/png,image/jpeg,image/gif,image/svg+xml"
+              onChange={(e) => {
+                const file = e.target.files && e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = () => {
+                  const dataUrl = String(reader.result || "");
+                  onChange({ data_url: dataUrl, path: "" });
+                };
+                reader.readAsDataURL(file);
+                e.target.value = "";
+              }}
+            />
+          </label>
+          {section.data_url ? (
+            <div className="tn-image-preview" style={{ marginTop: 8, textAlign: section.align || "center" }}>
+              <img
+                src={section.data_url}
+                alt={section.title || "preview"}
+                style={{ maxWidth: "100%", maxHeight: 200, border: "1px solid var(--stroke)", borderRadius: 6 }}
+              />
+              <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+                Embedded ({Math.round(section.data_url.length / 1024)} KB). The image travels with the template — no file path required.
+              </div>
+            </div>
+          ) : null}
         </div>
       ) : null}
 

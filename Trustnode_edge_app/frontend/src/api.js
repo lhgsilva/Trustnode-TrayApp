@@ -2185,6 +2185,32 @@ export async function listReportTemplates() {
   return res.json();
 }
 
+export async function getCompanyLogo() {
+  const res = await fetchWithTimeout(withNoCache(`${_reportApiBase()}/api/reports/branding/company-logo`), {
+    headers: { "Cache-Control": "no-store, no-cache, max-age=0" },
+  });
+  await ensureOk(res, "Get company logo failed");
+  return res.json();
+}
+
+export async function setCompanyLogo(dataUrl) {
+  const res = await fetchWithTimeout(`${_reportApiBase()}/api/reports/branding/company-logo`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ data_url: String(dataUrl || "") }),
+  });
+  await ensureOk(res, "Save company logo failed");
+  return res.json();
+}
+
+export async function deleteCompanyLogo() {
+  const res = await fetchWithTimeout(`${_reportApiBase()}/api/reports/branding/company-logo`, {
+    method: "DELETE",
+  });
+  await ensureOk(res, "Delete company logo failed");
+  return res.json();
+}
+
 export async function getReportTemplate(templateId) {
   const res = await fetchWithTimeout(withNoCache(`${_reportApiBase()}/api/reports/templates/${encodeURIComponent(templateId)}`));
   await ensureOk(res, "Get report template failed");

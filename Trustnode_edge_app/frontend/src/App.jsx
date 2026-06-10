@@ -115,6 +115,9 @@ import {
   applyPublicPasswordReset,
   provisionControlPlaneCustomerBundle,
   pushSchedulerEmailSettings,
+  getCompanyLogo,
+  setCompanyLogo,
+  deleteCompanyLogo,
 } from "./api";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, ComposedChart, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
@@ -2402,6 +2405,36 @@ function AppShell() {
   const [websiteEnvText, setWebsiteEnvText] = useState("");
   const [displayTimeZone, setDisplayTimeZone] = useState(DEFAULT_DISPLAY_TIMEZONE);
   const [displayTimestampFormat, setDisplayTimestampFormat] = useState(DEFAULT_DISPLAY_TIMESTAMP_FORMAT);
+  // Company-logo state for the Interface > Company Branding card. Loaded
+  // once on first visit of the page and refreshed after upload/delete.
+  const [companyLogoState, setCompanyLogo_State] = useState({
+    present: false,
+    dataUrl: "",
+    filename: "",
+    sizeBytes: 0,
+  });
+  const [companyLogoBusy, setCompanyLogoBusy] = useState(false);
+  useEffect(() => {
+    if (activePage !== "interface") return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const fresh = await getCompanyLogo();
+        if (cancelled) return;
+        setCompanyLogo_State({
+          present: !!fresh?.present,
+          dataUrl: String(fresh?.data_url || ""),
+          filename: String(fresh?.filename || ""),
+          sizeBytes: Number(fresh?.size_bytes || 0),
+        });
+      } catch (_) {
+        if (!cancelled) {
+          setCompanyLogo_State({ present: false, dataUrl: "", filename: "", sizeBytes: 0 });
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activePage]);
   const [websiteStatusResult, setWebsiteStatusResult] = useState("");
   const [databaseOverviewResult, setDatabaseOverviewResult] = useState("");
   const [databaseInspector, setDatabaseInspector] = useState(null);
@@ -17691,6 +17724,91 @@ const getGatewayHealth = (gateway) => {
                     Use Browser Timezone
                   </button>
                   <span className="lock-note">Preview: {fmtTs(tsNow())}</span>
+                </div>
+              </section>
+
+              <section className="card">
+                <div className="row interface-header-row">
+                  <h3 className="card-title" style={{ margin: 0 }}>Company Branding (PDF reports)</h3>
+                </div>
+                <div className="form-grid" style={{ alignItems: "start" }}>
+                  <div>
+                    <label className="lock-note" style={{ display: "block", marginBottom: 6 }}>
+                      Company logo (PNG, JPG, GIF or SVG &mdash; up to 5 MB)
+                    </label>
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/gif,image/svg+xml"
+                      disabled={!canEditPage("interface") || companyLogoBusy}
+                      onChange={(e) => {
+                        const file = e.target.files && e.target.files[0];
+                        if (!file) return;
+                        const reader = new FileReader();
+                        reader.onload = async () => {
+                          setCompanyLogoBusy(true);
+                          try {
+                            await setCompanyLogo(String(reader.result || ""));
+                            const fresh = await getCompanyLogo();
+                            setCompanyLogo_State({
+                              present: !!fresh?.present,
+                              dataUrl: String(fresh?.data_url || ""),
+                              filename: String(fresh?.filename || ""),
+                              sizeBytes: Number(fresh?.size_bytes || 0),
+                            });
+                          } catch (err) {
+                            setError(`Company logo upload failed: ${String(err?.message || err)}`);
+                          } finally {
+                            setCompanyLogoBusy(false);
+                            e.target.value = "";
+                          }
+                        };
+                        reader.readAsDataURL(file);
+                      }}
+                    />
+                    <div className="lock-note" style={{ marginTop: 8, fontSize: 12 }}>
+                      Appears on the left side of every PDF report header, opposite the TrustNode brand logo.
+                    </div>
+                    {companyLogoState.present ? (
+                      <div className="row" style={{ marginTop: 12, gap: 8, alignItems: "center" }}>
+                        <span style={{ fontSize: 12 }}>
+                          Saved: <code>{companyLogoState.filename}</code> ({Math.round(companyLogoState.sizeBytes / 1024)} KB)
+                        </span>
+                        <button
+                          className="btn btn-danger btn-sm"
+                          disabled={!canEditPage("interface") || companyLogoBusy}
+                          onClick={async () => {
+                            setCompanyLogoBusy(true);
+                            try {
+                              await deleteCompanyLogo();
+                              setCompanyLogo_State({ present: false, dataUrl: "", filename: "", sizeBytes: 0 });
+                            } catch (err) {
+                              setError(`Company logo delete failed: ${String(err?.message || err)}`);
+                            } finally {
+                              setCompanyLogoBusy(false);
+                            }
+                          }}
+                        >
+                          Remove logo
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="lock-note" style={{ marginTop: 12, fontSize: 12 }}>
+                        No company logo configured yet &mdash; the PDF header will show only the TrustNode brand on the right.
+                      </div>
+                    )}
+                  </div>
+                  <div>
+                    {companyLogoState.dataUrl ? (
+                      <div style={{ border: "1px solid var(--stroke)", borderRadius: 8, padding: 12, background: "var(--card-2)" }}>
+                        <div className="lock-note" style={{ marginBottom: 8 }}>Preview</div>
+                        <img
+                          src={companyLogoState.dataUrl}
+                          alt="Company logo preview"
+                          style={{ maxWidth: 220, maxHeight: 120, display: "block" }}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               </section>
 

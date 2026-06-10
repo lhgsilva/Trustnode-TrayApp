@@ -561,3 +561,137 @@ def set_scheduler_email_settings(payload: dict[str, Any] = Body(...)) -> dict[st
         raise HTTPException(status_code=400, detail="Body must be an object")
     scheduler_email_settings_holder.set(payload)
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# branding (company logo on PDF reports)
+# --------------------------------------------------------------------------- #
+import base64 as _b64
+import os as _os
+from app.state import app_store as _app_store
+
+
+def _company_logo_dir() -> Path:
+    """Return the data directory where the company logo lives.
+    Matches the path the report renderer probes."""
+    base = Path(
+        _os.environ.get("TRUSTNODE_DATA_DIR")
+        or (Path.home() / ".trustnode_edge" / "data")
+    )
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+@router.get("/branding/company-logo")
+def get_company_logo() -> dict[str, Any]:
+    """Return the current company-logo metadata + a data URL the frontend
+    can use to preview the image. Designed to be cheap (a few KB at most;
+    the logo is intentionally small for PDF embedding)."""
+    base = _company_logo_dir()
+    candidate = None
+    for ext in (".png", ".jpg", ".jpeg", ".gif", ".svg"):
+        path = base / f"company_logo{ext}"
+        if path.is_file() and path.stat().st_size > 0:
+            candidate = path
+            break
+    if candidate is None:
+        return {"ok": True, "present": False}
+    try:
+        raw = candidate.read_bytes()
+    except Exception:
+        return {"ok": True, "present": False}
+    ext = candidate.suffix.lower().lstrip(".")
+    mime = "image/svg+xml" if ext == "svg" else f"image/{'jpeg' if ext == 'jpg' else ext}"
+    data_url = f"data:{mime};base64,{_b64.b64encode(raw).decode('ascii')}"
+    return {
+        "ok": True,
+        "present": True,
+        "filename": candidate.name,
+        "size_bytes": len(raw),
+        "data_url": data_url,
+    }
+
+
+@router.put("/branding/company-logo")
+def set_company_logo(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Replace the current company logo from a base64 data URL.
+    Payload: { data_url: 'data:image/png;base64,XXXX' }.
+
+    The image is saved as `company_logo.<ext>` under TRUSTNODE_DATA_DIR
+    where the report renderer auto-picks it up. We also stamp the
+    chosen path into app_settings.company_logo_path so the renderer
+    can still find it when the operator uses a non-default location."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be an object")
+    data_url = str(payload.get("data_url") or "").strip()
+    if not data_url.startswith("data:"):
+        raise HTTPException(status_code=400, detail="data_url must be a base64 data URL")
+    try:
+        header, b64data = data_url.split(",", 1)
+        mime = header.split(":", 1)[1].split(";", 1)[0]
+        raw = _b64.b64decode(b64data, validate=False)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"data_url decode failed: {exc}")
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty image payload")
+    if len(raw) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="logo file too large (>5 MB)")
+    ext_map = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/gif": ".gif",
+        "image/svg+xml": ".svg",
+    }
+    ext = ext_map.get(mime.lower())
+    if not ext:
+        raise HTTPException(status_code=400, detail=f"unsupported image type: {mime}")
+    base = _company_logo_dir()
+    # Drop any previous variants so /branding/company-logo doesn't
+    # return a stale extension match.
+    for old_ext in (".png", ".jpg", ".jpeg", ".gif", ".svg"):
+        old = base / f"company_logo{old_ext}"
+        try:
+            if old.is_file():
+                old.unlink()
+        except Exception:
+            pass
+    target = base / f"company_logo{ext}"
+    target.write_bytes(raw)
+    # Record the chosen path in app_settings so the renderer can pick it up
+    # even when TRUSTNODE_DATA_DIR points elsewhere. Best-effort: never
+    # block the upload on a settings save failure.
+    try:
+        _app_store.upsert_domain(
+            "app_settings",
+            {"company_logo_path": str(target)},
+            actor="branding.upload",
+        )
+    except Exception:
+        pass
+    return {"ok": True, "filename": target.name, "size_bytes": len(raw)}
+
+
+@router.delete("/branding/company-logo")
+def delete_company_logo() -> dict[str, Any]:
+    """Remove the company logo so PDFs return to the default layout
+    (TrustNode logo on the right only)."""
+    base = _company_logo_dir()
+    removed = []
+    for ext in (".png", ".jpg", ".jpeg", ".gif", ".svg"):
+        path = base / f"company_logo{ext}"
+        try:
+            if path.is_file():
+                path.unlink()
+                removed.append(path.name)
+        except Exception:
+            pass
+    try:
+        _app_store.upsert_domain(
+            "app_settings",
+            {"company_logo_path": ""},
+            actor="branding.delete",
+        )
+    except Exception:
+        pass
+    return {"ok": True, "removed": removed}

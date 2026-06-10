@@ -80,7 +80,7 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
-from reportlab.graphics.shapes import Drawing, Line, Rect, String
+from reportlab.graphics.shapes import Drawing, Group, Line, Rect, String
 from reportlab.graphics.charts.linecharts import HorizontalLineChart
 from reportlab.graphics.charts.lineplots import LinePlot
 from reportlab.graphics.charts.barcharts import VerticalBarChart
@@ -699,19 +699,78 @@ def _resolve_logo_path() -> Path | None:
     return None
 
 
+def _resolve_company_logo_path() -> Path | None:
+    """Find the operator-uploaded company logo to embed on the LEFT side of
+    PDF report headers. Reads app_settings.company_logo_path (set from the
+    Interface page); falls back to ~/.trustnode_edge/data/company_logo.* so
+    legacy installs that hand-dropped a file in the data dir still work.
+
+    Returns the resolved Path, or None if no readable file is found."""
+    try:
+        from app.state import app_store as _app_store_singleton
+        bootstrap = _app_store_singleton.get_bootstrap(prefer_cloud_reads=False) or {}
+    except Exception:
+        bootstrap = {}
+    settings = bootstrap.get("app_settings") if isinstance(bootstrap.get("app_settings"), dict) else {}
+    candidate_paths: list[Path] = []
+    explicit = str((settings or {}).get("company_logo_path") or "").strip()
+    if explicit:
+        candidate_paths.append(Path(explicit))
+    data_dir = Path(os.environ.get("TRUSTNODE_DATA_DIR") or
+                    (Path.home() / ".trustnode_edge" / "data"))
+    for ext in (".png", ".jpg", ".jpeg", ".gif"):
+        candidate_paths.append(data_dir / f"company_logo{ext}")
+    for p in candidate_paths:
+        try:
+            if p.is_file() and p.stat().st_size > 0:
+                return p
+        except Exception:
+            continue
+    return None
+
+
 def _on_page(canvas, doc, *, branding_title: str = "TrustNode") -> None:
     canvas.saveState()
+    from reportlab.lib.utils import ImageReader
 
-    # Top-right: brand logo image (same trustnode_logo.png used by the app
-    # header). Sized so the bottom of the logo sits just above the accent rule
-    # below. Graceful fallback to a text wordmark only when the file is missing.
-    logo_path = _resolve_logo_path()
     logo_h_mm = 12.0
     logo_top_mm = 4.0  # distance from page top to top of logo
+
+    # Top-left: company logo (operator-uploaded via the Interface page).
+    # When set, it sits in the same row as the TrustNode brand logo on the
+    # right, mirroring the layout. Operators can replace it without
+    # touching the bundled brand asset.
+    company_logo_path = _resolve_company_logo_path()
+    if company_logo_path is not None:
+        try:
+            reader = ImageReader(str(company_logo_path))
+            iw, ih = reader.getSize()
+            aspect = float(iw) / float(ih) if ih else 1.0
+            logo_h = logo_h_mm * mm
+            logo_w = logo_h * aspect
+            max_w = 42 * mm
+            if logo_w > max_w:
+                logo_w = max_w
+                logo_h = logo_w / aspect if aspect else logo_h
+            canvas.drawImage(
+                reader,
+                15 * mm,
+                A4[1] - logo_top_mm * mm - logo_h,
+                width=logo_w,
+                height=logo_h,
+                mask="auto",
+                preserveAspectRatio=True,
+            )
+        except Exception:
+            # Bad image; leave the left side empty so we still publish.
+            pass
+
+    # Top-right: TrustNode brand logo (same trustnode_logo.png used by the app
+    # header). Graceful fallback to a text wordmark only when the file is missing.
+    logo_path = _resolve_logo_path()
     drew_logo = False
     if logo_path is not None:
         try:
-            from reportlab.lib.utils import ImageReader
             reader = ImageReader(str(logo_path))
             iw, ih = reader.getSize()
             aspect = float(iw) / float(ih) if ih else 1.0
@@ -784,6 +843,86 @@ def _section_text(section: dict[str, Any], styles, story: list) -> None:
     # Treat as plain text; reportlab Paragraph escapes for safety.
     safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
     story.append(Paragraph(safe, styles["body"]))
+    story.append(Spacer(1, 3 * mm))
+
+
+def _section_image(section: dict[str, Any], styles, story: list) -> None:
+    """Embed an operator-supplied image in the report flow. The section
+    payload accepts either a local file path (path) or a base64-encoded
+    data URI (data_url). Width is capped at the printable page width;
+    aspect ratio is preserved. Use `align` ('left' / 'center' / 'right')
+    and `width_mm` (1 .. 180) to tune the placement."""
+    title = str(section.get("title") or "").strip()
+    if title:
+        story.append(Paragraph(title, styles["section_title"]))
+    caption = str(section.get("caption") or "").strip()
+
+    img_reader = None
+    try:
+        from reportlab.lib.utils import ImageReader
+        data_url = str(section.get("data_url") or "").strip()
+        if data_url.startswith("data:"):
+            # data:image/png;base64,XXXX
+            try:
+                _, payload = data_url.split(",", 1)
+            except ValueError:
+                payload = ""
+            if payload:
+                import base64 as _b64
+                img_bytes = _b64.b64decode(payload, validate=False)
+                img_reader = ImageReader(io.BytesIO(img_bytes))
+        if img_reader is None:
+            path_str = str(section.get("path") or "").strip()
+            if path_str:
+                path = Path(path_str).expanduser()
+                # When the operator types a relative filename, look in the
+                # standard data dir so they don't have to memorize an
+                # absolute path.
+                if not path.is_absolute():
+                    data_dir = Path(os.environ.get("TRUSTNODE_DATA_DIR") or
+                                    (Path.home() / ".trustnode_edge" / "data"))
+                    path = data_dir / path
+                if path.is_file():
+                    img_reader = ImageReader(str(path))
+    except Exception as exc:
+        story.append(Paragraph(f"Image failed to decode: {exc}", styles["section_caption"]))
+        return
+
+    if img_reader is None:
+        story.append(Paragraph("No image source configured.", styles["section_caption"]))
+        return
+
+    page_width = A4[0] - 30 * mm
+    try:
+        iw_px, ih_px = img_reader.getSize()
+    except Exception:
+        iw_px, ih_px = (1, 1)
+    aspect = float(iw_px) / float(ih_px) if ih_px else 1.0
+    width_mm = section.get("width_mm")
+    try:
+        width_mm = float(width_mm) if width_mm is not None and width_mm != "" else None
+    except Exception:
+        width_mm = None
+    if width_mm is None or width_mm <= 0:
+        # Default: 70 % of the printable width — feels at home next to
+        # adjacent KPI and chart blocks.
+        target_w = page_width * 0.7
+    else:
+        target_w = min(page_width, width_mm * mm)
+    target_h = target_w / aspect if aspect else target_w * 0.5
+    # Soft cap so a tall portrait image doesn't blow past a page.
+    max_h = 130 * mm
+    if target_h > max_h:
+        target_h = max_h
+        target_w = target_h * aspect
+
+    align = str(section.get("align") or "center").lower()
+    h_align = "RIGHT" if align == "right" else ("LEFT" if align == "left" else "CENTER")
+
+    img = Image(img_reader, width=target_w, height=target_h, hAlign=h_align)
+    story.append(img)
+    if caption:
+        story.append(Paragraph(caption, styles["section_caption"]))
     story.append(Spacer(1, 3 * mm))
 
 
@@ -1065,16 +1204,28 @@ def _section_chart(section: dict[str, Any], styles, story: list) -> None:
     if x_title:
         drawing.add(String((chart_left + chart_right) / 2, 4, x_title,
                            fontName="Helvetica-Bold", fontSize=8, textAnchor="middle", fillColor=colors.HexColor("#334155")))
+    # ReportLab's String shape does NOT carry a transform attribute, so the
+    # rotated axis title must live inside a Group. Older builds set
+    # title_drawing.transform on the String directly, which raised
+    # "illegal attribute 'transform' in class String" and made the WHOLE
+    # chart section render as a "[error rendering section: ...]" string in
+    # the PDF — the live preview was unaffected because it uses recharts.
+    def _add_rotated_label(text: str, cx: float, cy: float) -> None:
+        if not text:
+            return
+        label = String(0, 0, text,
+                       fontName="Helvetica-Bold", fontSize=8,
+                       textAnchor="middle", fillColor=colors.HexColor("#334155"))
+        # transform matrix (a, b, c, d, e, f) where (a, b, c, d) is the
+        # rotation/scale and (e, f) is the translation. (0, 1, -1, 0, x, y)
+        # rotates 90 degrees CCW and places the origin at (x, y).
+        group = Group(label, transform=(0, 1, -1, 0, cx, cy))
+        drawing.add(group)
+
     if y_title:
-        title_drawing = String(chart_left - 30, (chart_top + chart_bottom) / 2, y_title,
-                               fontName="Helvetica-Bold", fontSize=8, textAnchor="middle", fillColor=colors.HexColor("#334155"))
-        title_drawing.transform = (0, 1, -1, 0, title_drawing.x, title_drawing.y)
-        drawing.add(title_drawing)
+        _add_rotated_label(y_title, chart_left - 30, (chart_top + chart_bottom) / 2)
     if y_right_title and has_right_axis:
-        title_drawing = String(chart_right + 30, (chart_top + chart_bottom) / 2, y_right_title,
-                               fontName="Helvetica-Bold", fontSize=8, textAnchor="middle", fillColor=colors.HexColor("#334155"))
-        title_drawing.transform = (0, 1, -1, 0, title_drawing.x, title_drawing.y)
-        drawing.add(title_drawing)
+        _add_rotated_label(y_right_title, chart_right + 30, (chart_top + chart_bottom) / 2)
 
     # Legend
     if show_legend and len(series_meta) > 0:
@@ -1518,6 +1669,8 @@ def render_template_to_pdf(
                 _section_pie(section, styles, story)
             elif stype == "table":
                 _section_table(section, styles, story)
+            elif stype == "image":
+                _section_image(section, styles, story)
             elif stype == "page_break":
                 story.append(PageBreak())
             elif stype == "spacer":
