@@ -14346,6 +14346,7 @@ const getGatewayHealth = (gateway) => {
   const openEditCpUser = (row) => {
     if (!row) return;
     setCpEditUser({
+      _isNew: false,
       username: String(row.username || ""),
       role: String(row.role || "viewer"),
       status: String(row.status || "active"),
@@ -14356,41 +14357,91 @@ const getGatewayHealth = (gateway) => {
     });
   };
 
+  // Open the same dialog with a blank user. The dialog renders an extra
+  // Username field + Customer dropdown when `_isNew` is true. Used by the
+  // "+" Add button on the Users page so the master/admin can provision a
+  // Lite-capable login for any company in one step.
+  const openNewCpUser = () => {
+    setCpEditUser({
+      _isNew: true,
+      username: "",
+      role: "viewer",
+      status: "active",
+      email: "",
+      customer_id: "",
+      new_password: "",
+      must_change: true,
+    });
+  };
+
   // Save the edit-user modal.
   const saveEditCpUser = async () => {
-    if (!cpEditUser?.username) return;
+    const username = String(cpEditUser?.username || "").trim();
+    const isNew = !!cpEditUser?._isNew;
+    if (!username) {
+      setCpResult("Username is required.");
+      return;
+    }
+    if (isNew && (!cpEditUser?.new_password || String(cpEditUser.new_password).length < 6)) {
+      setCpResult("New user requires a password of at least 6 characters.");
+      return;
+    }
     setCpBusy(true);
     try {
+      // For a new user with a customer selected, route the upsert to that
+      // customer's tenant (so Lite RLS picks up the right tenant from the
+      // mirrored lite_profiles row). For an edit, keep the existing
+      // tenant scope so we don't accidentally re-home the user.
       const scopedTenant = getControlPlaneTenantScope();
-      // First upsert role/email/status/customer (no password — leave the
-      // existing one alone unless the admin explicitly typed a new one).
+      const customerId = String(cpEditUser?.customer_id || "").trim();
+      // First upsert role/email/status/customer. For new users the
+      // backend resolves the customer_id to the customer's per-customer
+      // tenant; for existing users the upsert keeps them under the same
+      // tenant they were saved on.
       await upsertControlPlaneUser(
         {
-          username: cpEditUser.username,
+          username,
+          // Send the password on new-user create so the lite_user_mirror
+          // can create the Supabase Auth account in the same call. For
+          // an edit we still install the password via the dedicated
+          // setControlPlaneUserPassword below to preserve the must_change
+          // semantics.
+          password: isNew ? String(cpEditUser.new_password || "") : null,
           role: cpEditUser.role,
           status: cpEditUser.status,
           email: cpEditUser.email,
-          customer_id: cpEditUser.customer_id,
+          customer_id: customerId,
           mfa_enabled: false,
         },
         scopedTenant,
       );
-      // If the admin typed a new password, install it (and optionally
-      // flag must_change_password so the user has to change on next
-      // login). This also mirrors to Supabase Auth via the backend.
-      if (cpEditUser.new_password && cpEditUser.new_password.length >= 6) {
+      // If editing (or re-setting a new user's password with must_change),
+      // call the dedicated password endpoint so must_change_password is set.
+      if (!isNew && cpEditUser.new_password && cpEditUser.new_password.length >= 6) {
         await setControlPlaneUserPassword(
-          cpEditUser.username,
+          username,
           cpEditUser.new_password,
           !!cpEditUser.must_change,
           scopedTenant,
         );
+      } else if (isNew && cpEditUser.must_change) {
+        try {
+          await setControlPlaneUserPassword(
+            username,
+            String(cpEditUser.new_password || ""),
+            true,
+            scopedTenant,
+          );
+        } catch (_) {
+          // password was already installed in the upsert above; the
+          // must_change flag is best-effort.
+        }
       }
-      setCpResult(`User '${cpEditUser.username}' updated.`);
+      setCpResult(`User '${username}' ${isNew ? "created" : "updated"}.`);
       setCpEditUser(null);
       await refreshControlPlaneUsers(scopedTenant);
     } catch (err) {
-      setCpResult(`User update failed: ${String(err?.message || err)}`);
+      setCpResult(`User ${isNew ? "create" : "update"} failed: ${String(err?.message || err)}`);
     } finally {
       setCpBusy(false);
     }
@@ -19193,9 +19244,13 @@ const getGatewayHealth = (gateway) => {
                             async (row) => deleteControlPlaneUser(String(row?.username || ""), getRowTenantScope(row)),
                             "users"
                           )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
-                          <button className="btn btn-primary" onClick={() => openPortalPage("users")}>
-                            Open Users and Access Control
-                          </button>
+                          <button
+                            className="icon-btn portal-card-btn portal-card-btn-add"
+                            onClick={openNewCpUser}
+                            disabled={cpBusy || !canEditPage("control_plane")}
+                            aria-label="Add user"
+                            title="Add user"
+                          ><AddIcon /></button>
                         </div>
                       </div>
                       <div className="form-grid" style={{ marginTop: 10 }}>
@@ -22546,12 +22601,38 @@ const getGatewayHealth = (gateway) => {
         </div>
       ) : null}
 
-      {/* Portal: edit user inline modal */}
+      {/* Portal: new/edit user inline modal */}
       {cpEditUser ? (
         <div className="modal-backdrop">
-          <div className="modal-card" style={{ minWidth: 420 }}>
-            <h3>Edit user — {cpEditUser.username}</h3>
+          <div className="modal-card" style={{ minWidth: 460 }}>
+            <h3>{cpEditUser._isNew ? "Add user" : `Edit user — ${cpEditUser.username}`}</h3>
             <div className="form-grid" style={{ marginTop: 8 }}>
+              {cpEditUser._isNew ? (
+                <label>
+                  Username
+                  <input
+                    type="text"
+                    value={cpEditUser.username}
+                    onChange={(e) => setCpEditUser((p) => ({ ...p, username: e.target.value.trim() }))}
+                    placeholder="username"
+                    autoComplete="off"
+                  />
+                </label>
+              ) : null}
+              <label>
+                Company
+                <select
+                  value={cpEditUser.customer_id}
+                  onChange={(e) => setCpEditUser((p) => ({ ...p, customer_id: e.target.value }))}
+                >
+                  <option value="">(none — staff account on caller's tenant)</option>
+                  {(cpCustomersView || []).map((c) => (
+                    <option key={`cp-new-user-cust-${String(c?.customer_id || "")}`} value={String(c?.customer_id || "")}>
+                      {String(c?.company_name || c?.customer_id || "-")}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <label>
                 Role
                 <select
@@ -22576,7 +22657,7 @@ const getGatewayHealth = (gateway) => {
                 </select>
               </label>
               <label>
-                Email
+                Email (also the Lite login)
                 <input
                   type="email"
                   value={cpEditUser.email}
@@ -22585,15 +22666,7 @@ const getGatewayHealth = (gateway) => {
                 />
               </label>
               <label>
-                Customer ID
-                <input
-                  type="text"
-                  value={cpEditUser.customer_id}
-                  onChange={(e) => setCpEditUser((p) => ({ ...p, customer_id: e.target.value }))}
-                />
-              </label>
-              <label>
-                New password (optional — leave blank to keep current)
+                {cpEditUser._isNew ? "Password" : "New password (optional — leave blank to keep current)"}
                 <input
                   type="password"
                   value={cpEditUser.new_password}
@@ -22607,13 +22680,15 @@ const getGatewayHealth = (gateway) => {
                   type="checkbox"
                   checked={!!cpEditUser.must_change}
                   onChange={(e) => setCpEditUser((p) => ({ ...p, must_change: e.target.checked }))}
-                  disabled={!cpEditUser.new_password}
+                  disabled={!cpEditUser._isNew && !cpEditUser.new_password}
                 />
                 <span style={{ fontSize: 12 }}>Force user to change this password on next login</span>
               </label>
             </div>
             <div className="row modal-actions">
-              <button className="btn btn-primary" onClick={saveEditCpUser} disabled={cpBusy}>Save</button>
+              <button className="btn btn-primary" onClick={saveEditCpUser} disabled={cpBusy}>
+                {cpEditUser._isNew ? "Create user" : "Save"}
+              </button>
               <button className="btn btn-danger" onClick={() => setCpEditUser(null)} disabled={cpBusy}>Cancel</button>
             </div>
           </div>

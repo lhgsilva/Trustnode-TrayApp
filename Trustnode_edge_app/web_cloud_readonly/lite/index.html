@@ -1719,8 +1719,27 @@ function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, 
         title: isFullscreen ? "Exit fullscreen" : "Enter fullscreen",
         onClick: toggleFullscreen,
       }, isFullscreen ? icMinimize() : icMaximize()),
-      // Sign-out is meaningless in share-link mode (no session); hide it.
-      isViewLinkMode ? null
+      // Sign-out is meaningless in share-link mode (no session). Instead
+      // show an Exit button so the operator embedded in the portal has a
+      // visible way to leave the read-only view — closes the tab when the
+      // page was opened in its own window, posts a message to the parent
+      // portal otherwise so the iframe host can hide the embed.
+      isViewLinkMode
+        ? h("button", {
+            className: "icon-btn",
+            title: "Exit Client View",
+            onClick: () => {
+              try {
+                if (window.parent && window.parent !== window) {
+                  window.parent.postMessage({ source: "tnlite", action: "close-view-link" }, "*");
+                }
+              } catch (_) {}
+              try { window.close(); } catch (_) {}
+              // Fallback for browsers that block window.close on tabs they
+              // didn't open: navigate to the public portal root.
+              try { window.location.replace("/portal/"); } catch (_) {}
+            },
+          }, icSignOut())
         : h("button", { className: "icon-btn", title: "Sign out", onClick: onSignOut }, icSignOut())
     )
   );
@@ -3415,13 +3434,25 @@ function App({ viewLink = null }) {
     const effective = isViewLinkMode
       ? String(viewLink?.tenant_id || "")
       : (isGlobalAdmin ? picked : String(userTenantId || ""));
+    // Edge scope:
+    //   - view-link mode: pin to the edge the share-link was generated
+    //     for. Without this, the embedded Client View would show every
+    //     profile published under the same tenant — including profiles
+    //     authored on a DIFFERENT edge. That's what produced the "wrong
+    //     dashboard, wrong edge id" symptom the portal admin reported.
+    //   - global admin: honor the master picker (empty = "all edges").
+    //   - regular signed-in user: empty (they see every edge in their
+    //     tenant, just like the previous behaviour).
+    const effEdge = isViewLinkMode
+      ? String(viewLink?.edge_id || "")
+      : (isGlobalAdmin ? String(pickedEdgeId || "") : "");
     return {
       pickedTenantId: picked,
       setPickedTenantId,
       isGlobalAdmin,
       userTenantId,
       effectiveTenantId: effective,
-      pickedEdgeId: isGlobalAdmin ? String(pickedEdgeId || "") : "",
+      pickedEdgeId: effEdge,
       setPickedEdgeId,
     };
   }, [isGlobalAdmin, pickedTenantId, userTenantId, isViewLinkMode, viewLink, pickedEdgeId]);
