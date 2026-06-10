@@ -818,6 +818,14 @@ export function DashboardWidgetCard({
     // Heartbeat cadence matches the gateway's configured poll interval. When the
     // gateway changes (or interval is reconfigured) we restart the timer so the
     // widget tracks the new cadence without waiting for the previous tick.
+    //
+    // Bump the tick once immediately on mount/restart so the extra-series
+    // fetcher (and every other effect keyed on refreshTickFast) fires NOW
+    // instead of after a full gateway interval. Previously a widget that
+    // mounted while the gateway interval was, say, 5 s sat blank for up
+    // to 5 s before showing any data — operators read that as a 30 s
+    // startup hang because they were running multi-second poll rates.
+    setQueryRefreshTick((v) => v + 1);
     const timer = setInterval(() => {
       setQueryRefreshTick((v) => v + 1);
     }, gatewayIntervalMs);
@@ -1549,18 +1557,25 @@ export function DashboardWidgetCard({
       return series.map((p, i) => ({ idx: i + 1, ts: p.ts || "", value: p.value ?? null }));
     }
 
-    // ─── Fixed-tick gateway-interval merge ────────────────────────────────
-    // Operator-reported failure mode: the old "carry forward last value"
-    // merge painted long flat segments whenever ONE series stopped emitting
-    // but the OTHER kept polling — Lucas dashboard showed a teal horizontal
-    // line from 22:50 to 22:55 because the previous teal sample was
-    // repeated for every primary tick in between.
+    // ─── Union-of-timestamps merge ────────────────────────────────────────
+    // The right approach for a live SCADA dashboard, learned the hard way
+    // after two failed attempts:
+    //   1) "Walk primary, carry the extra series' lastVal forward" → ugly
+    //      horizontal plateaus when one gateway paused.
+    //   2) "Fixed tick at the primary gateway interval, take closest sample
+    //      in window" → drops every real sample whose timestamp doesn't
+    //      land inside a narrow tick window, producing vertical white gaps
+    //      INSIDE a series that is in fact emitting continuously.
     //
-    // The user's mental model: the chart "ticks" at the primary gateway's
-    // configured poll interval. At every tick we sample each series'
-    // ACTUAL value if it has one inside the tick window (interval / 2 on
-    // either side); otherwise the slot is null and Recharts draws a gap.
-    // No invented values, no horizontal carry, no fake data.
+    // What actually works: build the chart from the UNION of every
+    // series' real timestamps. Each series fills its slot at every
+    // timestamp WHERE IT HAS A SAMPLE; null at every timestamp where
+    // OTHER series had a sample but this series did not. The X axis is
+    // time-scaled (see buildXAxisProps) so the chart spaces points by
+    // real elapsed time, AND we keep connectNulls=true on the series
+    // renderers so each series draws as a continuous line through its
+    // own real points — no carry-forward, no fake fills, no gaps inside
+    // a series that's still publishing.
     const tsToMs = (raw) => {
       const t = String(raw || "");
       if (!t) return NaN;
@@ -1573,10 +1588,9 @@ export function DashboardWidgetCard({
 
     const primaryPts = series
       .map((p) => ({ ts: p.ts || "", tsMs: tsToMs(p.ts), value: p.value }))
-      .filter((p) => Number.isFinite(p.tsMs))
-      .sort((a, b) => a.tsMs - b.tsMs);
+      .filter((p) => Number.isFinite(p.tsMs));
 
-    const extraSorted = extraSeriesDefs.map((def) => {
+    const extraNormalized = extraSeriesDefs.map((def) => {
       const rows = Array.isArray(extraSeriesRowsByDef[def.id]) ? extraSeriesRowsByDef[def.id] : [];
       const pts = rows
         .map((r) => {
@@ -1586,103 +1600,41 @@ export function DashboardWidgetCard({
             value: Number.isFinite(numeric) ? numeric * def.multiplier + def.offset : null,
           };
         })
-        .filter((p) => Number.isFinite(p.tsMs))
-        .sort((a, b) => a.tsMs - b.tsMs);
-      return { def, pts, ptr: 0 };
+        .filter((p) => Number.isFinite(p.tsMs));
+      return { def, pts };
     });
 
-    // tick interval: prefer the resolved gateway's configured poll rate so
-    // the chart ticks line up with how fast the PLC is being read; if that
-    // isn't available, fall back to the median primary-sample spacing so
-    // the chart still has a sensible cadence.
-    const fallbackInterval = (() => {
-      if (primaryPts.length < 3) return 1000;
-      const deltas = [];
-      for (let i = 1; i < primaryPts.length; i += 1) {
-        const d = primaryPts[i].tsMs - primaryPts[i - 1].tsMs;
-        if (Number.isFinite(d) && d > 0) deltas.push(d);
-      }
-      if (!deltas.length) return 1000;
-      deltas.sort((a, b) => a - b);
-      return Math.max(200, deltas[Math.floor(deltas.length / 2)]);
-    })();
-    const tickMs = Math.max(200, Number(gatewayIntervalMs || 0) || fallbackInterval);
-    const tickHalf = tickMs / 2;
-
-    // Determine the chart's time range from whichever series has data.
-    const rangeStarts = [];
-    const rangeEnds = [];
-    if (primaryPts.length) {
-      rangeStarts.push(primaryPts[0].tsMs);
-      rangeEnds.push(primaryPts[primaryPts.length - 1].tsMs);
+    // Union of every distinct timestamp across all series. A Map keyed by
+    // tsMs collects which series carries which value at that exact time.
+    const byTs = new Map();
+    for (const p of primaryPts) {
+      let row = byTs.get(p.tsMs);
+      if (!row) { row = { tsMs: p.tsMs }; byTs.set(p.tsMs, row); }
+      row.value = p.value;
     }
-    for (const st of extraSorted) {
-      if (st.pts.length) {
-        rangeStarts.push(st.pts[0].tsMs);
-        rangeEnds.push(st.pts[st.pts.length - 1].tsMs);
+    for (const st of extraNormalized) {
+      const key = `s_${st.def.id}`;
+      for (const p of st.pts) {
+        let row = byTs.get(p.tsMs);
+        if (!row) { row = { tsMs: p.tsMs }; byTs.set(p.tsMs, row); }
+        row[key] = p.value;
       }
     }
-    if (!rangeStarts.length) return [];
-    const startMs = Math.min(...rangeStarts);
-    const endMs = Math.max(...rangeEnds);
-    const totalSpan = Math.max(tickMs, endMs - startMs);
-    // Hard ceiling so a stale endpoint with a huge time span doesn't
-    // generate tens of thousands of empty ticks.
-    const maxTicks = 5000;
-    const ticksDesired = Math.min(maxTicks, Math.max(2, Math.ceil(totalSpan / tickMs) + 1));
-    const actualTick = ticksDesired >= maxTicks ? Math.max(tickMs, totalSpan / (maxTicks - 1)) : tickMs;
-    const actualHalf = actualTick / 2;
-
-    // For each series build a sorted array of tsMs (binary searchable) so
-    // we can find the closest sample within a tick window in O(log n).
-    const seriesPtsMap = new Map();
-    seriesPtsMap.set("__primary", primaryPts);
-    for (const st of extraSorted) seriesPtsMap.set(st.def.id, st.pts);
-
-    // Binary search the index of the rightmost point with tsMs <= target.
-    const upperBoundIdx = (pts, target) => {
-      let lo = 0, hi = pts.length;
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (pts[mid].tsMs <= target) lo = mid + 1;
-        else hi = mid;
-      }
-      return lo - 1;
-    };
-
-    const pickClosestInWindow = (pts, tickTs, halfWindow) => {
-      if (!pts.length) return null;
-      // index of last point at or before tickTs
-      const idxLeft = upperBoundIdx(pts, tickTs);
-      const left = idxLeft >= 0 ? pts[idxLeft] : null;
-      const right = idxLeft + 1 < pts.length ? pts[idxLeft + 1] : null;
-      let best = null;
-      let bestDelta = Infinity;
-      if (left) {
-        const d = tickTs - left.tsMs;
-        if (d <= halfWindow && d < bestDelta) { best = left; bestDelta = d; }
-      }
-      if (right) {
-        const d = right.tsMs - tickTs;
-        if (d <= halfWindow && d < bestDelta) { best = right; bestDelta = d; }
-      }
-      return best ? best.value : null;
-    };
-
-    const out = [];
-    for (let i = 0; i < ticksDesired; i += 1) {
-      const tickTs = startMs + i * actualTick;
-      const row = { idx: i + 1, ts: new Date(tickTs).toISOString() };
-      // primary value at this tick (may be null if there's no sample
-      // inside the window — produces a real gap in the chart).
-      row.value = primaryPts.length ? pickClosestInWindow(primaryPts, tickTs, actualHalf) : null;
-      for (const st of extraSorted) {
-        row[`s_${st.def.id}`] = pickClosestInWindow(st.pts, tickTs, actualHalf);
-      }
-      out.push(row);
-    }
-    return out;
-  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, gatewayIntervalMs]);
+    if (byTs.size === 0) return [];
+    const sortedTs = Array.from(byTs.keys()).sort((a, b) => a - b);
+    return sortedTs.map((tsMs, i) => {
+      const row = byTs.get(tsMs);
+      return {
+        idx: i + 1,
+        ts: new Date(tsMs).toISOString(),
+        value: row.value ?? null,
+        ...extraNormalized.reduce((acc, st) => {
+          acc[`s_${st.def.id}`] = row[`s_${st.def.id}`] ?? null;
+          return acc;
+        }, {}),
+      };
+    });
+  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length]);
 
   const hasMultiSeries = extraSeriesDefs.length > 0 || resolvedLimitLines.length > 0;
   const anyRightAxis =
@@ -2196,7 +2148,7 @@ export function DashboardWidgetCard({
                           dot={seriesDot}
                           activeDot={seriesActiveDot}
                           isAnimationActive={false}
-                          connectNulls={false}
+                          connectNulls
                         />
                       );
                     }
@@ -2212,7 +2164,7 @@ export function DashboardWidgetCard({
                         dot={seriesDot}
                         activeDot={seriesActiveDot}
                         isAnimationActive={false}
-                        connectNulls={false}
+                        connectNulls
                       />
                     );
                   })}
