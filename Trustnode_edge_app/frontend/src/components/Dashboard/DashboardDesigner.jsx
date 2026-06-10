@@ -2742,6 +2742,142 @@ export function DashboardDesigner({
                       />
                     </label>
                   </div>
+                  {/* Y axis range: auto (recharts computes from the data) or
+                      manual (operator sets min, max and an optional tick
+                      step the way Excel does). Empty / invalid manual
+                      values fall back to auto so the chart never blanks
+                      mid-edit. */}
+                  <div className="dashboard-query-grid" style={{ marginTop: 6 }}>
+                    <label className="dashboard-query-field">
+                      <span>Left Y axis</span>
+                      <select
+                        value={String(form.config?.y_axis_mode || "auto").toLowerCase()}
+                        onChange={(e) =>
+                          setForm((p) => ({
+                            ...p,
+                            config: { ...p.config, y_axis_mode: e.target.value === "manual" ? "manual" : "auto" },
+                          }))
+                        }
+                      >
+                        <option value="auto">Auto (from data)</option>
+                        <option value="manual">Manual (min / max / step)</option>
+                      </select>
+                    </label>
+                    {String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual" ? (
+                      <>
+                        <label className="dashboard-query-field">
+                          <span>Min</span>
+                          <input
+                            type="number"
+                            step="any"
+                            value={form.config?.y_min ?? ""}
+                            onChange={(e) =>
+                              setForm((p) => ({
+                                ...p,
+                                config: { ...p.config, y_min: e.target.value === "" ? "" : Number(e.target.value) },
+                              }))
+                            }
+                          />
+                        </label>
+                        <label className="dashboard-query-field">
+                          <span>Max</span>
+                          <input
+                            type="number"
+                            step="any"
+                            value={form.config?.y_max ?? ""}
+                            onChange={(e) =>
+                              setForm((p) => ({
+                                ...p,
+                                config: { ...p.config, y_max: e.target.value === "" ? "" : Number(e.target.value) },
+                              }))
+                            }
+                          />
+                        </label>
+                        <label className="dashboard-query-field">
+                          <span>Tick step (optional)</span>
+                          <input
+                            type="number"
+                            step="any"
+                            min="0"
+                            value={form.config?.y_tick_step ?? ""}
+                            placeholder="e.g. 50"
+                            onChange={(e) =>
+                              setForm((p) => ({
+                                ...p,
+                                config: { ...p.config, y_tick_step: e.target.value === "" ? "" : Number(e.target.value) },
+                              }))
+                            }
+                            title="Spacing between Y-axis grid lines. Leave empty for auto ticks."
+                          />
+                        </label>
+                      </>
+                    ) : null}
+                  </div>
+                  <div className="dashboard-query-grid" style={{ marginTop: 6 }}>
+                    <label className="dashboard-query-field">
+                      <span>Right Y axis</span>
+                      <select
+                        value={String(form.config?.y_right_axis_mode || "auto").toLowerCase()}
+                        onChange={(e) =>
+                          setForm((p) => ({
+                            ...p,
+                            config: { ...p.config, y_right_axis_mode: e.target.value === "manual" ? "manual" : "auto" },
+                          }))
+                        }
+                      >
+                        <option value="auto">Auto (from data)</option>
+                        <option value="manual">Manual (min / max / step)</option>
+                      </select>
+                    </label>
+                    {String(form.config?.y_right_axis_mode || "auto").toLowerCase() === "manual" ? (
+                      <>
+                        <label className="dashboard-query-field">
+                          <span>Right Min</span>
+                          <input
+                            type="number"
+                            step="any"
+                            value={form.config?.y_right_min ?? ""}
+                            onChange={(e) =>
+                              setForm((p) => ({
+                                ...p,
+                                config: { ...p.config, y_right_min: e.target.value === "" ? "" : Number(e.target.value) },
+                              }))
+                            }
+                          />
+                        </label>
+                        <label className="dashboard-query-field">
+                          <span>Right Max</span>
+                          <input
+                            type="number"
+                            step="any"
+                            value={form.config?.y_right_max ?? ""}
+                            onChange={(e) =>
+                              setForm((p) => ({
+                                ...p,
+                                config: { ...p.config, y_right_max: e.target.value === "" ? "" : Number(e.target.value) },
+                              }))
+                            }
+                          />
+                        </label>
+                        <label className="dashboard-query-field">
+                          <span>Right tick step</span>
+                          <input
+                            type="number"
+                            step="any"
+                            min="0"
+                            value={form.config?.y_right_tick_step ?? ""}
+                            placeholder="e.g. 5"
+                            onChange={(e) =>
+                              setForm((p) => ({
+                                ...p,
+                                config: { ...p.config, y_right_tick_step: e.target.value === "" ? "" : Number(e.target.value) },
+                              }))
+                            }
+                          />
+                        </label>
+                      </>
+                    ) : null}
+                  </div>
                   {/* Per-widget styling: line thickness, dot marker, bar fill / width.
                       Placed inside the Series & Axes fieldset (instead of the
                       separate Chart Display section above) so operators see

@@ -1549,14 +1549,18 @@ export function DashboardWidgetCard({
       return series.map((p, i) => ({ idx: i + 1, ts: p.ts || "", value: p.value ?? null }));
     }
 
-    // ─── Simple multi-series merge ────────────────────────────────────────
-    // The primary series owns the X axis: one chart row per primary sample.
-    // For each extra series, look up its **most recent value at-or-before**
-    // the primary's timestamp — same rule the historian uses ("show the last
-    // value as of this moment"). No buckets, no median estimation, no
-    // intersection windowing. The chart's length is exactly the primary's
-    // length so the X range never "zooms in/out" when a secondary gateway's
-    // history is longer or shorter.
+    // ─── Fixed-tick gateway-interval merge ────────────────────────────────
+    // Operator-reported failure mode: the old "carry forward last value"
+    // merge painted long flat segments whenever ONE series stopped emitting
+    // but the OTHER kept polling — Lucas dashboard showed a teal horizontal
+    // line from 22:50 to 22:55 because the previous teal sample was
+    // repeated for every primary tick in between.
+    //
+    // The user's mental model: the chart "ticks" at the primary gateway's
+    // configured poll interval. At every tick we sample each series'
+    // ACTUAL value if it has one inside the tick window (interval / 2 on
+    // either side); otherwise the slot is null and Recharts draws a gap.
+    // No invented values, no horizontal carry, no fake data.
     const tsToMs = (raw) => {
       const t = String(raw || "");
       if (!t) return NaN;
@@ -1572,7 +1576,6 @@ export function DashboardWidgetCard({
       .filter((p) => Number.isFinite(p.tsMs))
       .sort((a, b) => a.tsMs - b.tsMs);
 
-    // Pre-sort each extra series ascending so we can walk with a pointer.
     const extraSorted = extraSeriesDefs.map((def) => {
       const rows = Array.isArray(extraSeriesRowsByDef[def.id]) ? extraSeriesRowsByDef[def.id] : [];
       const pts = rows
@@ -1585,49 +1588,101 @@ export function DashboardWidgetCard({
         })
         .filter((p) => Number.isFinite(p.tsMs))
         .sort((a, b) => a.tsMs - b.tsMs);
-      return { def, pts, ptr: 0, lastVal: null };
+      return { def, pts, ptr: 0 };
     });
 
-    // No primary configured (empty gateway/tag): build the X axis from the
-    // union of all extra-series timestamps so the chart still renders the
-    // configured series alone.
-    if (primaryPts.length === 0) {
-      const tsSet = new Set();
-      for (const st of extraSorted) for (const p of st.pts) tsSet.add(p.tsMs);
-      const allTs = Array.from(tsSet).sort((a, b) => a - b);
-      return allTs.map((tsMs, i) => {
-        const row = { idx: i + 1, ts: new Date(tsMs).toISOString() };
-        for (const st of extraSorted) {
-          while (st.ptr < st.pts.length && st.pts[st.ptr].tsMs <= tsMs) {
-            st.lastVal = st.pts[st.ptr].value;
-            st.ptr += 1;
-          }
-          row[`s_${st.def.id}`] = st.lastVal;
-        }
-        return row;
-      });
-    }
-
-    // Walk primary once. For each row advance each extra series's pointer
-    // up to the primary timestamp; the last value scanned is the carry-
-    // forward value for that primary tick.
-    const merged = primaryPts.map((p, i) => {
-      const row = { idx: i + 1, ts: p.ts, value: p.value };
-      for (const st of extraSorted) {
-        while (st.ptr < st.pts.length && st.pts[st.ptr].tsMs <= p.tsMs) {
-          st.lastVal = st.pts[st.ptr].value;
-          st.ptr += 1;
-        }
-        // If no extra sample is at-or-before this primary tick, leave it
-        // null — Recharts skips nulls with connectNulls so the line starts
-        // when real data appears. This avoids inventing flat-line tails.
-        row[`s_${st.def.id}`] = st.lastVal;
+    // tick interval: prefer the resolved gateway's configured poll rate so
+    // the chart ticks line up with how fast the PLC is being read; if that
+    // isn't available, fall back to the median primary-sample spacing so
+    // the chart still has a sensible cadence.
+    const fallbackInterval = (() => {
+      if (primaryPts.length < 3) return 1000;
+      const deltas = [];
+      for (let i = 1; i < primaryPts.length; i += 1) {
+        const d = primaryPts[i].tsMs - primaryPts[i - 1].tsMs;
+        if (Number.isFinite(d) && d > 0) deltas.push(d);
       }
-      return row;
-    });
+      if (!deltas.length) return 1000;
+      deltas.sort((a, b) => a - b);
+      return Math.max(200, deltas[Math.floor(deltas.length / 2)]);
+    })();
+    const tickMs = Math.max(200, Number(gatewayIntervalMs || 0) || fallbackInterval);
+    const tickHalf = tickMs / 2;
 
-    return merged;
-  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length]);
+    // Determine the chart's time range from whichever series has data.
+    const rangeStarts = [];
+    const rangeEnds = [];
+    if (primaryPts.length) {
+      rangeStarts.push(primaryPts[0].tsMs);
+      rangeEnds.push(primaryPts[primaryPts.length - 1].tsMs);
+    }
+    for (const st of extraSorted) {
+      if (st.pts.length) {
+        rangeStarts.push(st.pts[0].tsMs);
+        rangeEnds.push(st.pts[st.pts.length - 1].tsMs);
+      }
+    }
+    if (!rangeStarts.length) return [];
+    const startMs = Math.min(...rangeStarts);
+    const endMs = Math.max(...rangeEnds);
+    const totalSpan = Math.max(tickMs, endMs - startMs);
+    // Hard ceiling so a stale endpoint with a huge time span doesn't
+    // generate tens of thousands of empty ticks.
+    const maxTicks = 5000;
+    const ticksDesired = Math.min(maxTicks, Math.max(2, Math.ceil(totalSpan / tickMs) + 1));
+    const actualTick = ticksDesired >= maxTicks ? Math.max(tickMs, totalSpan / (maxTicks - 1)) : tickMs;
+    const actualHalf = actualTick / 2;
+
+    // For each series build a sorted array of tsMs (binary searchable) so
+    // we can find the closest sample within a tick window in O(log n).
+    const seriesPtsMap = new Map();
+    seriesPtsMap.set("__primary", primaryPts);
+    for (const st of extraSorted) seriesPtsMap.set(st.def.id, st.pts);
+
+    // Binary search the index of the rightmost point with tsMs <= target.
+    const upperBoundIdx = (pts, target) => {
+      let lo = 0, hi = pts.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (pts[mid].tsMs <= target) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo - 1;
+    };
+
+    const pickClosestInWindow = (pts, tickTs, halfWindow) => {
+      if (!pts.length) return null;
+      // index of last point at or before tickTs
+      const idxLeft = upperBoundIdx(pts, tickTs);
+      const left = idxLeft >= 0 ? pts[idxLeft] : null;
+      const right = idxLeft + 1 < pts.length ? pts[idxLeft + 1] : null;
+      let best = null;
+      let bestDelta = Infinity;
+      if (left) {
+        const d = tickTs - left.tsMs;
+        if (d <= halfWindow && d < bestDelta) { best = left; bestDelta = d; }
+      }
+      if (right) {
+        const d = right.tsMs - tickTs;
+        if (d <= halfWindow && d < bestDelta) { best = right; bestDelta = d; }
+      }
+      return best ? best.value : null;
+    };
+
+    const out = [];
+    for (let i = 0; i < ticksDesired; i += 1) {
+      const tickTs = startMs + i * actualTick;
+      const row = { idx: i + 1, ts: new Date(tickTs).toISOString() };
+      // primary value at this tick (may be null if there's no sample
+      // inside the window — produces a real gap in the chart).
+      row.value = primaryPts.length ? pickClosestInWindow(primaryPts, tickTs, actualHalf) : null;
+      for (const st of extraSorted) {
+        row[`s_${st.def.id}`] = pickClosestInWindow(st.pts, tickTs, actualHalf);
+      }
+      out.push(row);
+    }
+    return out;
+  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, gatewayIntervalMs]);
 
   const hasMultiSeries = extraSeriesDefs.length > 0 || resolvedLimitLines.length > 0;
   const anyRightAxis =
@@ -1673,7 +1728,59 @@ export function DashboardWidgetCard({
     return evaluateComputedRules(computedRowsTimeFiltered, rules, queryOptions);
   }, [serverRuleStats, lastGoodServerRuleStats, computedRowsTimeFiltered, rulesDepKey, queryOptions]);
   const displayTag = formatTagForDisplay ? formatTagForDisplay(tagName) : tagName;
-  const yDomain = useMemo(() => buildAutoYDomain(series), [series]);
+  // Y axis range: auto (computed from the data) or manual (operator
+  // specifies min, max, optional tick step). Empty / invalid manual values
+  // fall back to auto so the chart never goes blank when the operator
+  // leaves a field empty mid-edit.
+  const yAxisMode = String(cfg?.y_axis_mode || "auto").toLowerCase();
+  const manualY = useMemo(() => {
+    if (yAxisMode !== "manual") return null;
+    const lo = Number(cfg?.y_min);
+    const hi = Number(cfg?.y_max);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+    return { lo, hi };
+  }, [yAxisMode, cfg?.y_min, cfg?.y_max]);
+  const manualYTicks = useMemo(() => {
+    if (!manualY) return null;
+    const step = Number(cfg?.y_tick_step);
+    if (!Number.isFinite(step) || step <= 0) return null;
+    const ticks = [];
+    // Cap at 50 ticks so a tiny step on a huge range can't render thousands
+    // of grid lines and lock the browser.
+    const maxTicks = 50;
+    for (let v = manualY.lo, i = 0; v <= manualY.hi + step * 1e-9 && i < maxTicks; v += step, i += 1) {
+      ticks.push(Number(v.toFixed(10)));
+    }
+    return ticks;
+  }, [manualY, cfg?.y_tick_step]);
+  const yDomain = useMemo(() => {
+    if (manualY) return [manualY.lo, manualY.hi];
+    return buildAutoYDomain(series);
+  }, [manualY, series]);
+
+  const yRightAxisMode = String(cfg?.y_right_axis_mode || "auto").toLowerCase();
+  const manualYRight = useMemo(() => {
+    if (yRightAxisMode !== "manual") return null;
+    const lo = Number(cfg?.y_right_min);
+    const hi = Number(cfg?.y_right_max);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+    return { lo, hi };
+  }, [yRightAxisMode, cfg?.y_right_min, cfg?.y_right_max]);
+  const manualYRightTicks = useMemo(() => {
+    if (!manualYRight) return null;
+    const step = Number(cfg?.y_right_tick_step);
+    if (!Number.isFinite(step) || step <= 0) return null;
+    const ticks = [];
+    const maxTicks = 50;
+    for (let v = manualYRight.lo, i = 0; v <= manualYRight.hi + step * 1e-9 && i < maxTicks; v += step, i += 1) {
+      ticks.push(Number(v.toFixed(10)));
+    }
+    return ticks;
+  }, [manualYRight, cfg?.y_right_tick_step]);
+  const yRightDomain = useMemo(() => {
+    if (manualYRight) return [manualYRight.lo, manualYRight.hi];
+    return undefined; // recharts auto-domain on the right axis when undefined
+  }, [manualYRight]);
   const chartMargin = { top: 4, right: 8, left: 0, bottom: 0 };
   const interpolation = getChartInterpolation(widget);
   const chartValueFormat = String(cfg.chart_value_format || "auto");
@@ -1815,7 +1922,7 @@ export function DashboardWidgetCard({
                     <AreaChart data={series} margin={chartMargin}>
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
                       <XAxis {...buildXAxisProps(series)} />
-                      <YAxis {...yAxisPresetProps} domain={yDomain} />
+                      <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
                         formatter={(v) => fmtValueByUnit(v, primaryUnit, primarySuffix)}
@@ -1842,7 +1949,7 @@ export function DashboardWidgetCard({
                       {renderBarPattern(primaryColor)}
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
                       <XAxis {...buildXAxisProps(series)} />
-                      <YAxis {...yAxisPresetProps} domain={yDomain} />
+                      <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
                         formatter={(v) => fmtValueByUnit(v, primaryUnit, primarySuffix)}
@@ -1866,7 +1973,7 @@ export function DashboardWidgetCard({
                     <LineChart data={series} margin={chartMargin}>
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
                       <XAxis {...buildXAxisProps(series)} />
-                      <YAxis {...yAxisPresetProps} domain={yDomain} />
+                      <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
                         formatter={(v) => fmtValueByUnit(v, primaryUnit, primarySuffix)}
@@ -1985,6 +2092,8 @@ export function DashboardWidgetCard({
                     yAxisId="left"
                     {...yAxisPresetProps}
                     domain={yDomain}
+                    ticks={manualYTicks || undefined}
+                    allowDataOverflow={!!manualY}
                     label={primaryAxisLabel ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined}
                   />
                   {anyRightAxis ? (
@@ -1992,6 +2101,9 @@ export function DashboardWidgetCard({
                       yAxisId="right"
                       orientation="right"
                       {...yAxisPresetProps}
+                      domain={yRightDomain}
+                      ticks={manualYRightTicks || undefined}
+                      allowDataOverflow={!!manualYRight}
                       label={rightAxisLabel ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined}
                     />
                   ) : null}
@@ -2084,7 +2196,7 @@ export function DashboardWidgetCard({
                           dot={seriesDot}
                           activeDot={seriesActiveDot}
                           isAnimationActive={false}
-                          connectNulls
+                          connectNulls={false}
                         />
                       );
                     }
@@ -2100,7 +2212,7 @@ export function DashboardWidgetCard({
                         dot={seriesDot}
                         activeDot={seriesActiveDot}
                         isAnimationActive={false}
-                        connectNulls
+                        connectNulls={false}
                       />
                     );
                   })}
