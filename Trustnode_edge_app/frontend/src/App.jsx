@@ -4204,7 +4204,11 @@ function AppShell() {
       }
     };
     refresh();
-    const timer = setInterval(refresh, 5000);
+    // 30s is plenty for portal mode — the operator isn't editing PLC
+    // configs on the portal, they're managing customers/edges/licenses.
+    // Previously this fired every 5s and was hammering the backend
+    // bootstrap path together with the diagnostics + sync/status polls.
+    const timer = setInterval(refresh, 30000);
     return () => {
       cancelled = true;
       clearInterval(timer);
@@ -4372,6 +4376,10 @@ function AppShell() {
 
   useEffect(() => {
     if (!appStoreHydrated || !currentUser) return;
+    // Edge-ingest diagnostics polling makes no sense in the cloud portal
+    // (there is no local PLC pipeline to diagnose); it was the biggest
+    // single source of background traffic on the portal page.
+    if (isHostedWebClient) return;
     let stopped = false;
     const run = async () => {
       if (stopped) return;
@@ -4383,13 +4391,16 @@ function AppShell() {
       stopped = true;
       clearInterval(timer);
     };
-  }, [appStoreHydrated, currentUser, endpointMode]);
+  }, [appStoreHydrated, currentUser, endpointMode, isHostedWebClient]);
 
   // Poll the lighter /api/app-store/sync/status every 2s. Drives the new
   // sync-status card and the backlog-too-big popup. Cheap call — backend
   // just reads counters from the in-memory inspector snapshot.
+  // Cloud portal mode has no local sync backlog, so this poll is pure noise
+  // there — gate it on isHostedWebClient to keep the portal API thread free.
   useEffect(() => {
     if (!appStoreHydrated || !currentUser) return;
+    if (isHostedWebClient) return;
     let stopped = false;
     const run = async () => {
       if (stopped) return;
@@ -4401,7 +4412,7 @@ function AppShell() {
       stopped = true;
       clearInterval(timer);
     };
-  }, [appStoreHydrated, currentUser, endpointMode]);
+  }, [appStoreHydrated, currentUser, endpointMode, isHostedWebClient]);
 
   // Backlog-too-big popup gate. Threshold defaults to 10,000 pending rows
   // OR 1 hour of oldest unsynced data. We only ever show the popup ONCE
@@ -13523,10 +13534,14 @@ const getGatewayHealth = (gateway) => {
       setCpActivationCodes(activationRes?.status === "fulfilled" && Array.isArray(activationRes.value?.rows) ? activationRes.value.rows : []);
       setCpUsers(usersRes?.status === "fulfilled" && Array.isArray(usersRes.value?.rows) ? usersRes.value.rows : []);
 
-      const failed = results.filter((r) => r.status === "rejected");
-      if (failed.length) {
-        const msg = String(failed[0]?.reason?.message || failed[0]?.reason || "some sections failed");
-        setCpResult(`Control-plane partially loaded: ${msg}`);
+      const labels = ["summary", "tenants", "customers", "edges", "licenses", "modules", "activation-codes", "users"];
+      const failedLabels = results
+        .map((r, i) => (r.status === "rejected" ? labels[i] : null))
+        .filter(Boolean);
+      if (failedLabels.length) {
+        const firstReason = results.find((r) => r.status === "rejected")?.reason;
+        const msg = String(firstReason?.message || firstReason || "request failed");
+        setCpResult(`Could not load: ${failedLabels.join(", ")} (${msg})`);
       } else {
         setCpResult("");
       }
