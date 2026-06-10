@@ -1833,6 +1833,46 @@ export function DashboardDesigner({
                   Title
                   <input value={form.title} onChange={(e) => setForm((p) => ({ ...p, title: e.target.value }))} />
                 </label>
+                {/* Universal card-display controls — apply to every widget
+                    type (charts, KPIs, dividers, fixed text, tables).
+                    Lets the operator strip the card chrome so the body
+                    uses the full footprint, which is what an industrial
+                    HMI usually wants. */}
+                <label className="dashboard-query-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(form.config?.hide_widget_header)}
+                    onChange={(e) =>
+                      setForm((p) => ({
+                        ...p,
+                        config: { ...p.config, hide_widget_header: e.target.checked },
+                      }))
+                    }
+                  />
+                  <span>Hide widget title bar</span>
+                </label>
+                {/* Body text scale used by dividers / fixed_text / table_list
+                    captions / KPI labels. Range 0.6..2.5 covers the usual
+                    "shrink to fit a card" and "make this label readable
+                    from across the room" cases. */}
+                {["fixed_text", "divider", "table_list", "value_kpi", "text_kpi"].includes(form.type) ? (
+                  <label>
+                    Body text size
+                    <input
+                      type="number"
+                      min="0.6"
+                      max="2.5"
+                      step="0.1"
+                      value={Number(form.config?.body_text_scale || 1).toFixed(1)}
+                      onChange={(e) =>
+                        setForm((p) => ({
+                          ...p,
+                          config: { ...p.config, body_text_scale: clamp(e.target.value, 0.6, 2.5) },
+                        }))
+                      }
+                    />
+                  </label>
+                ) : null}
                 {["line_chart", "line_area_chart"].includes(form.type) ? (
                   <label>
                     Interpolation
@@ -2644,11 +2684,6 @@ export function DashboardDesigner({
                     {[
                       { key: "chart_show_legend", label: "Show legend" },
                       { key: "chart_show_point_labels", label: "Show point labels" },
-                      // Hide the entire widget title strip (the value | tag |
-                      // type bar at the top of the card) so the chart body
-                      // gets the full card height. Useful for KPIs and
-                      // historical-only charts where the title is noise.
-                      { key: "hide_widget_header", label: "Hide widget title bar" },
                     ].map((opt) => (
                       <label key={opt.key} className="dashboard-query-checkbox">
                         <input

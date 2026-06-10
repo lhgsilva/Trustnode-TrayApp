@@ -341,6 +341,47 @@ function getPiePalette(widget) {
 function buildXAxisProps(series) {
   const sample = Array.isArray(series) ? series.length : 0;
   if (!sample) return { dataKey: "idx" };
+  // Prefer a real time axis (epoch ms) so gaps in the data render
+  // proportionally to elapsed time. The old idx-based axis spaced every
+  // sample evenly regardless of real-world gap size, which made a 5-minute
+  // gap look identical to a 1-second gap and made multi-series carry-
+  // forward look like a "broken" chart. When ts is missing we fall back to
+  // the index so this stays a no-op for legacy series.
+  const tsMsLookup = new Map();
+  let hasReal = false;
+  for (const p of series) {
+    const raw = String(p?.ts || "");
+    if (!raw) continue;
+    const ms = Date.parse(raw.includes("T") ? raw : raw.replace(" ", "T"));
+    if (Number.isFinite(ms)) {
+      tsMsLookup.set(p.idx, ms);
+      hasReal = true;
+    }
+  }
+  if (hasReal) {
+    const tsValues = Array.from(tsMsLookup.values()).sort((a, b) => a - b);
+    return {
+      dataKey: (row) => tsMsLookup.get(row?.idx) ?? row?.idx ?? 0,
+      type: "number",
+      scale: "time",
+      domain: tsValues.length ? [tsValues[0], tsValues[tsValues.length - 1]] : ["auto", "auto"],
+      // 4-6 evenly spaced ticks across the visible range — Recharts auto
+      // generates them. Use a HH:MM:SS tick format that matches the old
+      // formatter so the operator sees the same kind of label.
+      tickFormatter: (ms) => {
+        if (!Number.isFinite(ms)) return "";
+        try {
+          const d = new Date(ms);
+          return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+        } catch (_) { return ""; }
+      },
+      minTickGap: 24,
+      tick: { fill: "var(--ink-soft, #8a98ab)", fontSize: 11 },
+      axisLine: { stroke: "var(--line, rgba(255,255,255,0.07))" },
+      tickLine: false,
+      height: 18,
+    };
+  }
   return {
     dataKey: "idx",
     tickFormatter: (idx) => {
@@ -442,8 +483,16 @@ function renderActiveDonutShape(props) {
 }
 
 function computeWidgetTextScale(widget, minPx, maxPx) {
-  const baseScale = Number(widget?.config?.text_font_scale);
-  const scale = Number.isFinite(baseScale) ? baseScale : 1;
+  // body_text_scale is the universal control exposed by the widget
+  // editor for every widget type (divider / fixed_text / table_list /
+  // KPI). text_font_scale is the legacy chart-specific control kept for
+  // backward compat with saved widgets. We multiply them together when
+  // both are set so a divider with body_text_scale=1.5 inside a chart
+  // template that also bumped text_font_scale=1.2 ends up at 1.8.
+  const bodyScale = Number(widget?.config?.body_text_scale);
+  const legacyScale = Number(widget?.config?.text_font_scale);
+  const scale = (Number.isFinite(bodyScale) ? bodyScale : 1)
+    * (Number.isFinite(legacyScale) ? legacyScale : 1);
   const w = Number(widget?.w || 4);
   const h = Number(widget?.h || 3);
   const areaFactor = Math.max(0.75, Math.min(1.65, Math.sqrt(Math.max(1, (w * h) / 12))));
