@@ -636,6 +636,37 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
                     (cid,),
                 )
                 deleted = int(cur.rowcount or 0) > 0
+                # ---- Cloud-mirror cleanup ----
+                # 2026-06-10: when a customer is deleted from the portal,
+                # also drop their cloud mirror rows (dashboards, alarms,
+                # triggers, gateways, devices, live data, audit logs).
+                # Without this, "deleted" customers' dashboards persist as
+                # orphans in Supabase. The Lite app's tenant RLS hides
+                # them from regular users but a global admin would still
+                # see them in the picker, and they keep counting against
+                # storage. Best-effort per table — anything that fails
+                # silently is caught at the next force_sync_now.
+                if actual_tenant:
+                    for table in (
+                        "dashboard_configurations",
+                        "alarms_setup",
+                        "triggers_limits",
+                        "gateway_configurations",
+                        "devices",
+                        "live_latest",
+                        "historian_readings",
+                        "app_logs",
+                        "report_templates",
+                        "generated_reports",
+                        "cp_edge_view_links",
+                    ):
+                        try:
+                            conn.execute(
+                                f"DELETE FROM {table} WHERE tenant_id=?",
+                                (actual_tenant,),
+                            )
+                        except Exception:
+                            pass
                 # Drop the per-customer tenant if nothing else references it.
                 # Skip this if the resolved tenant is the master 'default'.
                 if actual_tenant and actual_tenant != "default":

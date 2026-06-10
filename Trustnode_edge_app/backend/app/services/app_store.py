@@ -194,6 +194,20 @@ class AppStore:
             self._seed_and_reconcile_report_templates_once()
         except Exception:
             pass
+        # Boot-time mirror: republish every Lite-visible scoped doc so an
+        # edge that just upgraded to a build with cloud-mirror support
+        # backfills its history into Supabase WITHOUT requiring the
+        # operator to open and save each dashboard / alarm / trigger one
+        # by one. Idempotent (re-mirror is a versioned UPSERT) and runs in
+        # a background thread so it never delays boot.
+        try:
+            threading.Thread(
+                target=self._boot_remirror_scoped_docs_safe,
+                name="tn-boot-remirror",
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
         self._scheduler_thread = threading.Thread(target=self._retention_scheduler_loop, daemon=True)
         self._live_sync_thread = threading.Thread(target=self._live_sync_loop, daemon=True)
         self._cloud_live_cache_thread = threading.Thread(target=self._cloud_live_cache_loop, daemon=True)
@@ -1103,6 +1117,36 @@ class AppStore:
                             "UPDATE config_documents_scoped SET scope_key=? WHERE scope_key=? AND domain=?",
                             (new_key, old_key, domain),
                         )
+
+    def _boot_remirror_scoped_docs_safe(self) -> None:
+        """Background task: wait for the cloud target to be resolvable,
+        then republish every Lite-visible scoped doc. Lets a freshly
+        upgraded edge backfill dashboards/alarms/triggers/gateways/
+        devices without the operator having to save them again.
+
+        The previous edge_app build only mirrored on save, so an edge
+        that ran for weeks without a config change had nothing in cloud
+        even though it was happily publishing live_latest. This boot
+        pulse closes that gap.
+        """
+        try:
+            # Wait up to ~30 s for the cloud target + sync_targets row to
+            # come up. The sync worker hasn't booted yet on this thread,
+            # so we just poll _get_cloud_database_target.
+            import time as _t
+            for _ in range(30):
+                try:
+                    if self._get_cloud_database_target() is not None:
+                        break
+                except Exception:
+                    pass
+                _t.sleep(1.0)
+            else:
+                return
+            self._remirror_scoped_docs_to_cloud()
+        except Exception:
+            # Best-effort; the periodic reconciler will catch anything we miss.
+            return
 
     def _remirror_scoped_docs_to_cloud(self) -> None:
         """Walk every config_documents_scoped row whose domain is mirrored to
