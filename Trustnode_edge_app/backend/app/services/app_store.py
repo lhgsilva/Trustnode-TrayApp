@@ -1006,7 +1006,20 @@ class AppStore:
             updated_utc=updated_utc,
         )
 
+        # Track the most recent mirror error per table so the operator can
+        # see what's wrong from a diagnostic endpoint. Background threads
+        # were swallowing every exception before this, which is why the
+        # operator stared at an empty cloud table for a week without
+        # knowing the upsert was being rejected.
+        mirror_state = getattr(self, "_mirror_state", None)
+        if mirror_state is None:
+            mirror_state = {"last_error": {}, "last_success_utc": {}, "attempts": {}}
+            setattr(self, "_mirror_state", mirror_state)
+
         def _do_upsert() -> None:
+            import logging
+            log = logging.getLogger("trustnode.mirror")
+            mirror_state["attempts"][table_name] = mirror_state["attempts"].get(table_name, 0) + 1
             try:
                 from sqlalchemy import text  # type: ignore
                 engine, _ = self._get_or_create_cloud_engine(
@@ -1038,12 +1051,12 @@ class AppStore:
                                 )
                             )
                         ensured_set.add(table_name)
-                    except Exception:
+                    except Exception as ddl_exc:
+                        log.warning("mirror %s: table-ensure failed: %s", table_name, ddl_exc)
                         # If we can't create it (e.g. permissions), let the
                         # upsert below try anyway — the DBA may have created
                         # it manually with a different shape we can still
                         # write to.
-                        pass
                 with engine.begin() as conn:
                     conn.execute(
                         text(
@@ -1059,8 +1072,14 @@ class AppStore:
                         ),
                         kwargs,
                     )
-            except Exception:
-                pass
+                mirror_state["last_success_utc"][table_name] = self._utc_now()
+                mirror_state["last_error"].pop(table_name, None)
+                log.info("mirror %s: ok tenant=%s scope=%s", table_name,
+                         kwargs.get("tenant_id"), kwargs.get("scope_key"))
+            except Exception as exc:
+                mirror_state["last_error"][table_name] = f"{type(exc).__name__}: {exc}"
+                log.warning("mirror %s: upsert failed tenant=%s scope=%s err=%s",
+                            table_name, kwargs.get("tenant_id"), kwargs.get("scope_key"), exc)
 
         try:
             import threading

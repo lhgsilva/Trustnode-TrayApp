@@ -505,6 +505,38 @@ def repair_scope(payload: ForceSyncRequest) -> dict:
     return out
 
 
+@router.get("/sync/mirror-state")
+def get_mirror_state() -> dict:
+    """Diagnose the per-table config mirror. Returns the last_error,
+    last_success_utc and total attempts for each Lite-mirrored domain
+    (dashboard_configurations, alarms_setup, triggers_limits,
+    gateway_configurations, devices). Lets the operator see exactly why
+    a mirror upsert is failing without grepping the backend log.
+
+    Output:
+      {
+        "ok": true,
+        "cloud_target_configured": true,
+        "attempts": { "dashboard_configurations": 12, ... },
+        "last_success_utc": { "alarms_setup": "...", ... },
+        "last_error": { "dashboard_configurations": "ProgrammingError: ..." }
+      }
+    """
+    state = getattr(app_store, "_mirror_state", None) or {}
+    try:
+        cloud = app_store._get_cloud_database_target()
+    except Exception:
+        cloud = None
+    return {
+        "ok": True,
+        "cloud_target_configured": bool(cloud),
+        "cloud_target_host": str((cloud or {}).get("host") or ""),
+        "attempts": dict(state.get("attempts") or {}),
+        "last_success_utc": dict(state.get("last_success_utc") or {}),
+        "last_error": dict(state.get("last_error") or {}),
+    }
+
+
 @router.get("/sync/status")
 def get_sync_status() -> dict:
     """Read-only summary of the cloud sync worker state.
