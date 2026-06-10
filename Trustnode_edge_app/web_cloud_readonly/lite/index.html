@@ -314,52 +314,93 @@ function useLiveLatest(enabled = true) {
     };
 
     fetchAll();
-    // Realtime: append/update in place.
+    // Realtime: append/update in place. The channel + reconnect cycle is
+    // explicit because previous builds leaked timers on CHANNEL_ERROR and
+    // then never reconnected — the page silently "went polling" without
+    // re-subscribing, and the StatusPill froze at the last age it had.
     let realtimeHealthy = false;
-    channel = supabase.channel("lite-live-rt")
-      .on("postgres_changes",
-        { event: "*", schema: "public", table: "live_latest" },
-        (payload) => {
-          const r = payload.new || payload.record || null;
-          if (!r || !r.tag_name) return;
-          // Strict tenant gate: drop foreign rows AND drop rows with
-          // empty/missing tenant_id (cannot prove they belong to us).
-          if (effectiveTenantId && (!r.tenant_id || r.tenant_id !== effectiveTenantId)) return;
-          setRows((prev) => {
-            const key = `${r.gateway_id || ""}|${r.tag_name}`;
-            const next = prev.filter((p) => `${p.gateway_id || ""}|${p.tag_name}` !== key);
-            next.unshift(r);
-            return next.slice(0, LIVE_SEED_LIMIT);
-          });
-        })
-      .subscribe((status) => {
-        if (status === "SUBSCRIBED") {
-          setTransport("realtime");
-          realtimeHealthy = true;
-          // Stop the belt-and-braces poll when realtime is healthy — every
-          // fetchAll() while realtime is delivering deltas is a wasted round
-          // trip that competes with the actual data update and inflates the
-          // StatusPill latency reading.
-          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    let backoffMs = 2000;          // current reconnect delay
+    let reconnectTimer = null;     // pending reconnect
+    let safetyPollTimer = null;    // last-resort fallback poll
+    const stopAllTimers = () => {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      if (safetyPollTimer) { clearInterval(safetyPollTimer); safetyPollTimer = null; }
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    };
+    const startFallbackPolls = () => {
+      // Active poll while we're disconnected from realtime.
+      if (!pollTimer) {
+        pollTimer = setInterval(fetchAll, Math.max(1000, Number(cfg?.live_poll_ms || 2000)));
+      }
+      // Safety-net poll fires regardless so the StatusPill always sees a
+      // fresh state every ~5 s even if the active poll above was killed.
+      if (!safetyPollTimer) {
+        safetyPollTimer = setInterval(fetchAll, 5000);
+      }
+    };
+    const reconnect = () => {
+      if (stopped) return;
+      if (reconnectTimer) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (stopped) return;
+        // Tear down the dead channel and open a fresh one. Without this
+        // the subscription stays in CHANNEL_ERROR forever and we just
+        // poll until the operator refreshes the page.
+        if (channel) {
+          try { supabase.removeChannel(channel).catch(() => {}); } catch (_) {}
+          channel = null;
         }
-        else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          setTransport("polling");
-          realtimeHealthy = false;
-          if (!pollTimer) pollTimer = setInterval(fetchAll, Number(cfg?.live_poll_ms || 2000));
-        }
-      });
-    // Slow belt-and-braces poll only while realtime hasn't subscribed yet.
-    // Once SUBSCRIBED fires above, we clear this timer. A new failure also
-    // restarts it via the CHANNEL_ERROR/TIMED_OUT branch.
-    pollTimer = setInterval(() => {
-      if (realtimeHealthy) return; // safety net for older browsers
-      fetchAll();
-    }, Math.max(8000, Number(cfg?.live_poll_ms || 1000) * 8));
+        openChannel();
+        // Exponential-ish backoff capped at 30 s so a long Supabase
+        // outage doesn't hammer the API.
+        backoffMs = Math.min(30000, backoffMs * 2);
+      }, backoffMs);
+    };
+    const openChannel = () => {
+      if (stopped) return;
+      channel = supabase.channel("lite-live-rt")
+        .on("postgres_changes",
+          { event: "*", schema: "public", table: "live_latest" },
+          (payload) => {
+            const r = payload.new || payload.record || null;
+            if (!r || !r.tag_name) return;
+            // Strict tenant gate: drop foreign rows AND drop rows with
+            // empty/missing tenant_id (cannot prove they belong to us).
+            if (effectiveTenantId && (!r.tenant_id || r.tenant_id !== effectiveTenantId)) return;
+            setRows((prev) => {
+              const key = `${r.gateway_id || ""}|${r.tag_name}`;
+              const next = prev.filter((p) => `${p.gateway_id || ""}|${p.tag_name}` !== key);
+              next.unshift(r);
+              return next.slice(0, LIVE_SEED_LIMIT);
+            });
+          })
+        .subscribe((status) => {
+          if (status === "SUBSCRIBED") {
+            setTransport("realtime");
+            realtimeHealthy = true;
+            backoffMs = 2000;                // reset backoff on success
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+            // Keep the 5 s safety-net poll running so the StatusPill
+            // reflects gateway death within ~5 s even if realtime keeps
+            // saying "subscribed" but the server stopped sending rows.
+            if (!safetyPollTimer) safetyPollTimer = setInterval(fetchAll, 5000);
+          } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+            setTransport("polling");
+            realtimeHealthy = false;
+            startFallbackPolls();
+            reconnect();
+          }
+        });
+    };
+    openChannel();
+    // Always start the safety-net poll so we never go blind.
+    if (!safetyPollTimer) safetyPollTimer = setInterval(fetchAll, 5000);
 
     return () => {
       stopped = true;
       if (channel) supabase.removeChannel(channel).catch(() => {});
-      if (pollTimer) clearInterval(pollTimer);
+      stopAllTimers();
     };
   }, [enabled, pickedTenantId, effectiveTenantId, pickedEdgeId]);
 
@@ -1603,25 +1644,49 @@ function saveDashPrefs(p) {
 // ============================================================
 // Header + Sidebar + Tabs
 // ============================================================
-function StatusPill({ liveRows, transport }) {
+function StatusPill({ liveRows, transport, gatewayLastSeen }) {
   // Belt-and-braces: when a tenant is picked, the badge MUST only reflect
   // that tenant's freshness. Even though useLiveLatest already filters
   // liveRows, a race during tenant switching can briefly leak rows from
   // the previous tenant. Re-filter here so the header age never flickers
   // between two customers.
   const { pickedTenantId } = useContext(TenantScopeCtx);
+  // Self-tick once a second so the displayed age advances even when no
+  // new realtime row has arrived. Without this, the StatusPill froze at
+  // the last fetched timestamp and the operator had to refresh the page
+  // to see whether the edge was still alive.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
   let newest = 0;
   for (const r of liveRows) {
     if (pickedTenantId && r.tenant_id !== pickedTenantId) continue;
     const t = Date.parse(r.ts_utc || 0);
     if (Number.isFinite(t) && t > newest) newest = t;
   }
-  const age = newest ? Math.max(0, Date.now() - newest) : null;
+  // Count how many gateways have ever reported. If zero, this tenant has
+  // no active edge — show OFFLINE instead of STALE so the operator can
+  // distinguish "edge is dead" from "edge is slow".
+  const gatewayCount = gatewayLastSeen ? Object.keys(gatewayLastSeen).length : 0;
+  const age = newest ? Math.max(0, nowMs - newest) : null;
   let label = "LIVE", cls = "status-online";
-  if (age == null) { label = "LOADING"; cls = "status-muted"; }
-  else if (age > 3000) { label = "STALE"; cls = "status-offline"; }
-  else if (age > 1000) { label = "DELAYED"; cls = "status-warning"; }
-  else if (transport !== "realtime") { label = "POLLING"; cls = "status-online"; }
+  if (gatewayCount === 0 && age == null) {
+    label = "OFFLINE"; cls = "status-offline";
+  } else if (age == null) {
+    label = "LOADING"; cls = "status-muted";
+  } else if (age > 60000) {
+    // No new sample for more than a minute on ANY gateway → treat the
+    // edge as offline rather than stale.
+    label = "OFFLINE"; cls = "status-offline";
+  } else if (age > 3000) {
+    label = "STALE"; cls = "status-offline";
+  } else if (age > 1000) {
+    label = "DELAYED"; cls = "status-warning";
+  } else if (transport !== "realtime") {
+    label = "POLLING"; cls = "status-online";
+  }
   const fmt = (v) => v == null ? "—" : v < 1000 ? `${Math.round(v)} ms` : `${(v / 1000).toFixed(1)} s`;
   return h("span", { className: `status-pill ${cls}` },
     h("span", { className: "pill-dot" }),
@@ -1629,7 +1694,7 @@ function StatusPill({ liveRows, transport }) {
   );
 }
 
-function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, transport, onJumpAlarms, sidebarVisible, onToggleSidebar,
+function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, transport, gatewayLastSeen, onJumpAlarms, sidebarVisible, onToggleSidebar,
                   isViewLinkMode = false,
                   // Tenant-picker plumbing is still passed through but no
                   // longer rendered here — the picker moved into the
@@ -1695,7 +1760,7 @@ function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, 
         // reachable on mobile, where the header has no room for a
         // dropdown.
         h("span", { style: { fontWeight: 600, fontSize: 13 } }, tenantLabel),
-        h(StatusPill, { liveRows, transport })
+        h(StatusPill, { liveRows, transport, gatewayLastSeen })
       )
     ),
     h("div", { className: "header-right" },
@@ -1812,7 +1877,15 @@ const icGear = () => h("span", { dangerouslySetInnerHTML: { __html:
 // move behind a gear button that opens a popover (matches the edge's
 // dashboard configurator gear).
 function DashboardToolbar({ widgetCount, profiles, activeKey, setActiveKey, prefs, setPrefs, gatewayLastSeen, settingsOpen, setSettingsOpen }) {
-  const onlineCount = Object.entries(gatewayLastSeen).filter(([_, t]) => Date.now() - t < 30_000).length;
+  // Self-tick so the "Gateways: N/M" pill flips to STALE/OFFLINE within
+  // seconds of the edge dying, even if no new realtime row has arrived
+  // to trigger a parent re-render. The 30 s threshold below is unchanged.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const onlineCount = Object.entries(gatewayLastSeen).filter(([_, t]) => nowMs - t < 30_000).length;
   const totalCount = Object.keys(gatewayLastSeen).length;
   const activeProfile = profiles.find((p) => p.key === activeKey);
   return h("div", { className: "dash-toolbar" },
@@ -3527,7 +3600,7 @@ function App({ viewLink = null }) {
     h("div", { className: "app-shell" },
       h(Header, {
         user, tenantLabel, theme, onToggleTheme: toggleTheme,
-        liveRows, transport,
+        liveRows, transport, gatewayLastSeen,
         sidebarVisible,
         onToggleSidebar: () => setSidebarVisible((v) => !v),
         onJumpAlarms: () => setTab("alarms"),
