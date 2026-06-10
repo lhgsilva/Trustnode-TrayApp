@@ -1248,6 +1248,25 @@ function MenuIcon({ page }) {
       return <svg {...common}><path d="M3 12h6l3-8 3 16 3-8h3" /></svg>;
     case "users_and_access_control":
       return <svg {...common}><circle cx="9" cy="8" r="3" /><path d="M3 20a6 6 0 0 1 12 0" /><circle cx="18" cy="8" r="2" /><path d="M15 20a4 4 0 0 1 6 0" /></svg>;
+    // -- Portal section pages ---------------------------------------------
+    case "portal_overview":
+      return <svg {...common}><rect x="3" y="3" width="7" height="9" rx="1" /><rect x="14" y="3" width="7" height="5" rx="1" /><rect x="14" y="12" width="7" height="9" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /></svg>;
+    case "portal_customers":
+      return <svg {...common}><path d="M3 21V10l9-7 9 7v11" /><path d="M9 21v-6h6v6" /><path d="M3 13h18" /></svg>;
+    case "portal_modules":
+      return <svg {...common}><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></svg>;
+    case "portal_licenses":
+      return <svg {...common}><path d="M6 3h12a2 2 0 0 1 2 2v14l-4-2-4 2-4-2-4 2V5a2 2 0 0 1 2-2z" /><path d="M9 8h6M9 12h6M9 16h4" /></svg>;
+    case "portal_edges":
+      return <svg {...common}><rect x="2" y="7" width="20" height="10" rx="2" /><path d="M6 11h2M10 11h2M14 11h2M6 14h12" /></svg>;
+    case "portal_dashboard_profiles":
+      return <svg {...common}><rect x="3" y="3" width="18" height="14" rx="2" /><path d="M3 9h18" /><circle cx="7" cy="6" r="1" /><circle cx="10" cy="6" r="1" /><path d="M7 13l3-3 4 4 3-2" /></svg>;
+    case "portal_users":
+      return <svg {...common}><circle cx="9" cy="8" r="3" /><path d="M3 20a6 6 0 0 1 12 0" /><circle cx="18" cy="8" r="2" /><path d="M15 20a4 4 0 0 1 6 0" /></svg>;
+    case "portal_activation":
+      return <svg {...common}><rect x="3" y="11" width="18" height="10" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /><circle cx="12" cy="16" r="1.5" /></svg>;
+    case "portal_interface":
+      return <svg {...common}><rect x="3" y="4" width="18" height="14" rx="2" /><path d="M3 9h18" /><path d="M8 21h8" /><path d="M12 18v3" /></svg>;
     default:
       return <svg {...common}><circle cx="12" cy="12" r="8" /></svg>;
   }
@@ -1293,6 +1312,27 @@ function HamburgerIcon() {
 }
 
 function AddIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M12 5v14" />
+      <path d="M5 12h14" />
+    </svg>
+  );
+}
+
+function CollapseIcon() {
+  // Minus glyph in a thin rounded box — matches AddIcon's visual weight so
+  // the pair reads as collapsed / expanded controls.
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M5 12h14" />
+    </svg>
+  );
+}
+
+function ExpandIcon() {
+  // Same path as AddIcon (a plus sign). Used when a card is currently
+  // collapsed so the operator clicks to expand.
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
       <path d="M12 5v14" />
@@ -15183,36 +15223,44 @@ const getGatewayHealth = (gateway) => {
                 </button>
                 {!sidebarCollapsed && expandedSections.portal ? (
                   <>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "workspace" ? "active" : ""}`} onClick={() => openPortalPage("workspace")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Workspace</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "customers" ? "active" : ""}`} onClick={() => openPortalPage("customers")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Customers</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "modules" ? "active" : ""}`} onClick={() => openPortalPage("modules")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Modules</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "licenses" ? "active" : ""}`} onClick={() => openPortalPage("licenses")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Licenses</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "edges" ? "active" : ""}`} onClick={() => openPortalPage("edges")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Edge Apps</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "dashboard_profiles" ? "active" : ""}`} onClick={() => openPortalPage("dashboard_profiles")}><span className="nav-icon"><MenuIcon page="dashboard" /></span><span>Dashboard Profiles</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "users" ? "active" : ""}`} onClick={() => openPortalPage("users")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Users</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "activation" ? "active" : ""}`} onClick={() => openPortalPage("activation")}><span className="nav-icon"><MenuIcon page="control_plane" /></span><span>Activation</span></button>
-                    <button className={`nav-item nav-subitem ${cpPortalPage === "interface" ? "active" : ""}`} onClick={() => openPortalPage("interface")}><span className="nav-icon"><MenuIcon page="interface" /></span><span>Interface</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "workspace" ? "active" : ""}`} onClick={() => openPortalPage("workspace")}><span className="nav-icon"><MenuIcon page="portal_overview" /></span><span>Overview</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "customers" ? "active" : ""}`} onClick={() => openPortalPage("customers")}><span className="nav-icon"><MenuIcon page="portal_customers" /></span><span>Customers</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "modules" ? "active" : ""}`} onClick={() => openPortalPage("modules")}><span className="nav-icon"><MenuIcon page="portal_modules" /></span><span>Modules</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "licenses" ? "active" : ""}`} onClick={() => openPortalPage("licenses")}><span className="nav-icon"><MenuIcon page="portal_licenses" /></span><span>Licenses</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "edges" ? "active" : ""}`} onClick={() => openPortalPage("edges")}><span className="nav-icon"><MenuIcon page="portal_edges" /></span><span>Edge Apps</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "dashboard_profiles" ? "active" : ""}`} onClick={() => openPortalPage("dashboard_profiles")}><span className="nav-icon"><MenuIcon page="portal_dashboard_profiles" /></span><span>Dashboard Profiles</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "users" ? "active" : ""}`} onClick={() => openPortalPage("users")}><span className="nav-icon"><MenuIcon page="portal_users" /></span><span>Users</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "activation" ? "active" : ""}`} onClick={() => openPortalPage("activation")}><span className="nav-icon"><MenuIcon page="portal_activation" /></span><span>Activation</span></button>
+                    <button className={`nav-item nav-subitem ${cpPortalPage === "interface" ? "active" : ""}`} onClick={() => openPortalPage("interface")}><span className="nav-icon"><MenuIcon page="portal_interface" /></span><span>Interface</span></button>
                     <div className="portal-filter-block">
                       <label style={{ fontSize: 12, color: "var(--muted)" }}>Customer</label>
-                      <select
-                        value={cpCustomerFilter}
-                        onChange={(e) => setCpCustomerFilter(e.target.value)}
-                        disabled={!isMasterAdmin}
-                        title={isMasterAdmin ? "" : "Tenant admins see their own customer only — locked to your tenant"}
-                      >
-                        {/* Only master admin (the developer / default-tenant
-                            admin) can switch between customers. Tenant
-                            admins see only their company. */}
-                        {isMasterAdmin ? <option value="__all__">All customers</option> : null}
-                        {cpCustomerOptions.map((c) => (
-                          <option key={`cp-side-filter-${c.customer_id}`} value={c.customer_id}>
-                            {c.company_name || c.customer_id}
-                          </option>
-                        ))}
-                      </select>
-                      <button className="btn btn-primary" style={{ marginTop: 8 }} onClick={() => { openPortalPage("workspace"); refreshControlPlaneData(currentTenantId || "default"); }} disabled={cpBusy}>
-                        Load
-                      </button>
+                      <div className="portal-filter-row">
+                        <select
+                          className="portal-filter-select"
+                          value={cpCustomerFilter}
+                          onChange={(e) => setCpCustomerFilter(e.target.value)}
+                          disabled={!isMasterAdmin}
+                          title={isMasterAdmin ? "" : "Tenant admins see their own customer only — locked to your tenant"}
+                        >
+                          {/* Only master admin (the developer / default-tenant
+                              admin) can switch between customers. Tenant
+                              admins see only their company. */}
+                          {isMasterAdmin ? <option value="__all__">All customers</option> : null}
+                          {cpCustomerOptions.map((c) => (
+                            <option key={`cp-side-filter-${c.customer_id}`} value={c.customer_id}>
+                              {c.company_name || c.customer_id}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          className="btn btn-primary portal-filter-load"
+                          onClick={() => { openPortalPage("workspace"); refreshControlPlaneData(currentTenantId || "default"); }}
+                          disabled={cpBusy}
+                          title="Reload control-plane data"
+                        >
+                          Load
+                        </button>
+                      </div>
                     </div>
                   </>
                 ) : null}
@@ -15331,11 +15379,17 @@ const getGatewayHealth = (gateway) => {
               Use "Stop All" to stop every worker.
             </div>
           ) : null}
-          <section className="page-title-row">
-            <h1>
-              {pageTitle(activePage)} {renderLock(activePage)}
-            </h1>
-          </section>
+          {/* Hide the global "Control Plane" page title in the cloud portal
+              — every card already has its own section heading, the h1 just
+              adds noise (and the user asked to drop it). The h1 is still
+              shown for every non-portal page. */}
+          {!(activePage === "control_plane" && isPortalOnly) ? (
+            <section className="page-title-row">
+              <h1>
+                {pageTitle(activePage)} {renderLock(activePage)}
+              </h1>
+            </section>
+          ) : null}
 
           {activePage === "dashboard" ? (
             <DashboardDesigner
@@ -18658,7 +18712,7 @@ const getGatewayHealth = (gateway) => {
                 <aside className="card" style={{ width: 280, minWidth: 260 }}>
                   <h4 style={{ marginTop: 0 }}>Portal Navigation</h4>
                   <div className="stacked-inputs">
-                    <button className={`btn ${cpPortalPage === "workspace" ? "btn-primary" : ""}`} onClick={() => openPortalPage("workspace")}>Workspace</button>
+                    <button className={`btn ${cpPortalPage === "workspace" ? "btn-primary" : ""}`} onClick={() => openPortalPage("workspace")}>Overview</button>
                     <button className={`btn ${cpPortalPage === "customers" ? "btn-primary" : ""}`} onClick={() => openPortalPage("customers")}>Customers</button>
                     <button className={`btn ${cpPortalPage === "modules" ? "btn-primary" : ""}`} onClick={() => openPortalPage("modules")}>Modules</button>
                     <button className={`btn ${cpPortalPage === "licenses" ? "btn-primary" : ""}`} onClick={() => openPortalPage("licenses")}>Licenses</button>
@@ -18726,7 +18780,7 @@ const getGatewayHealth = (gateway) => {
                             async (row) => deleteControlPlaneCustomer(String(row?.customer_id || ""), getRowTenantScope(row)),
                             "customers"
                           )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
-                          <button className="btn btn-success" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Customer</button>
+                          <button className="icon-btn portal-card-btn portal-card-btn-add" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")} aria-label="Add customer" title="Add customer"><AddIcon /></button>
                         </div>
                       </div>
                       <div className="form-grid" style={{ marginTop: 10 }}>
@@ -18768,8 +18822,8 @@ const getGatewayHealth = (gateway) => {
                         <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                           <h4 style={{ margin: 0 }}>Customers</h4>
                           <div className="row">
-                            <button className="btn btn-success btn-sm" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
-                            <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("customers")}>{cpWorkspaceCollapsed.customers ? "Expand" : "Collapse"}</button>
+                            <button className="icon-btn portal-card-btn" onClick={openCpCustomerCreate} disabled={cpBusy || !canEditPage("control_plane")} aria-label="Add customer" title="Add customer"><AddIcon /></button>
+                            <button className="icon-btn portal-card-btn" onClick={() => toggleCpWorkspaceCard("customers")} aria-label={cpWorkspaceCollapsed.customers ? "Expand" : "Collapse"} title={cpWorkspaceCollapsed.customers ? "Expand" : "Collapse"}>{cpWorkspaceCollapsed.customers ? <ExpandIcon /> : <CollapseIcon />}</button>
                           </div>
                         </div>
                         {!cpWorkspaceCollapsed.customers ? (
@@ -18796,8 +18850,8 @@ const getGatewayHealth = (gateway) => {
                         <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                           <h4 style={{ margin: 0 }}>Licenses</h4>
                           <div className="row">
-                            <button className="btn btn-success btn-sm" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
-                            <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("licenses")}>{cpWorkspaceCollapsed.licenses ? "Expand" : "Collapse"}</button>
+                            <button className="icon-btn portal-card-btn" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")} aria-label="Add license" title="Add license"><AddIcon /></button>
+                            <button className="icon-btn portal-card-btn" onClick={() => toggleCpWorkspaceCard("licenses")} aria-label={cpWorkspaceCollapsed.licenses ? "Expand" : "Collapse"} title={cpWorkspaceCollapsed.licenses ? "Expand" : "Collapse"}>{cpWorkspaceCollapsed.licenses ? <ExpandIcon /> : <CollapseIcon />}</button>
                           </div>
                         </div>
                         {!cpWorkspaceCollapsed.licenses ? (
@@ -18823,8 +18877,8 @@ const getGatewayHealth = (gateway) => {
                         <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                           <h4 style={{ margin: 0 }}>Edge Apps</h4>
                           <div className="row">
-                            <button className="btn btn-success btn-sm" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add</button>
-                            <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("edges")}>{cpWorkspaceCollapsed.edges ? "Expand" : "Collapse"}</button>
+                            <button className="icon-btn portal-card-btn" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")} aria-label="Add edge" title="Add edge"><AddIcon /></button>
+                            <button className="icon-btn portal-card-btn" onClick={() => toggleCpWorkspaceCard("edges")} aria-label={cpWorkspaceCollapsed.edges ? "Expand" : "Collapse"} title={cpWorkspaceCollapsed.edges ? "Expand" : "Collapse"}>{cpWorkspaceCollapsed.edges ? <ExpandIcon /> : <CollapseIcon />}</button>
                           </div>
                         </div>
                         {!cpWorkspaceCollapsed.edges ? (
@@ -18851,7 +18905,7 @@ const getGatewayHealth = (gateway) => {
                           <h4 style={{ margin: 0 }}>Users</h4>
                           <div className="row">
                             <button className="btn btn-primary btn-sm" onClick={() => openPortalPage("users")}>Open Access</button>
-                            <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("users")}>{cpWorkspaceCollapsed.users ? "Expand" : "Collapse"}</button>
+                            <button className="icon-btn portal-card-btn" onClick={() => toggleCpWorkspaceCard("users")} aria-label={cpWorkspaceCollapsed.users ? "Expand" : "Collapse"} title={cpWorkspaceCollapsed.users ? "Expand" : "Collapse"}>{cpWorkspaceCollapsed.users ? <ExpandIcon /> : <CollapseIcon />}</button>
                           </div>
                         </div>
                         {!cpWorkspaceCollapsed.users ? (
@@ -18876,7 +18930,7 @@ const getGatewayHealth = (gateway) => {
                       <section className="card control-plane-workspace-card">
                         <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                           <h4 style={{ margin: 0 }}>Activation</h4>
-                          <button className="btn btn-ghost btn-sm" onClick={() => toggleCpWorkspaceCard("activation")}>{cpWorkspaceCollapsed.activation ? "Expand" : "Collapse"}</button>
+                          <button className="icon-btn portal-card-btn" onClick={() => toggleCpWorkspaceCard("activation")} aria-label={cpWorkspaceCollapsed.activation ? "Expand" : "Collapse"} title={cpWorkspaceCollapsed.activation ? "Expand" : "Collapse"}>{cpWorkspaceCollapsed.activation ? <ExpandIcon /> : <CollapseIcon />}</button>
                         </div>
                         {!cpWorkspaceCollapsed.activation ? (
                         <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
@@ -18943,7 +18997,7 @@ const getGatewayHealth = (gateway) => {
                             async (row) => deleteControlPlaneLicense(String(row?.license_id || ""), getRowTenantScope(row)),
                             "licenses"
                           )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
-                          <button className="btn btn-success" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add License</button>
+                          <button className="icon-btn portal-card-btn portal-card-btn-add" onClick={openCpLicenseCreate} disabled={cpBusy || !canEditPage("control_plane")} aria-label="Add license" title="Add license"><AddIcon /></button>
                         </div>
                       </div>
                       <div className="form-grid" style={{ marginTop: 10 }}>
@@ -18992,7 +19046,7 @@ const getGatewayHealth = (gateway) => {
                             async (row) => deleteControlPlaneEdge(String(row?.edge_id || ""), getRowTenantScope(row)),
                             "edges"
                           )} disabled={cpBusy || !canEditPage("control_plane")}>Delete Selected</button>
-                          <button className="btn btn-success" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")}>+ Add Edge</button>
+                          <button className="icon-btn portal-card-btn portal-card-btn-add" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")} aria-label="Add edge" title="Add edge"><AddIcon /></button>
                         </div>
                       </div>
                       <div className="form-grid" style={{ marginTop: 10 }}>
@@ -19057,7 +19111,7 @@ const getGatewayHealth = (gateway) => {
                         </label>
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
-                        <div className="table" style={{ "--cols": isMasterAdmin ? "1.4fr 2.4fr 0.6fr 0.6fr 1.2fr 0.6fr" : "2.4fr 0.6fr 0.6fr 1.2fr 0.6fr" }}>
+                        <div className={`table cp-dashboard-profiles-table ${isMasterAdmin ? "" : "without-tenant"}`}>
                           <div className="thead">
                             {isMasterAdmin ? <span>Tenant</span> : null}
                             <span>Scope Key</span>

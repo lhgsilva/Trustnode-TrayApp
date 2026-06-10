@@ -2218,6 +2218,133 @@ body {
 }
 .portal-banner-close:hover { opacity: 1; background: color-mix(in srgb, currentColor 12%, transparent); }
 
+/* Portal sidebar customer-filter: select + Load on the same row. */
+.portal-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+.portal-filter-row .portal-filter-select {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.portal-filter-row .portal-filter-load {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  white-space: nowrap;
+}
+
+/* Compact icon-button for the card-header +Add / Collapse controls.
+   Replaces the wider "+ Add Customer" / "Collapse" text buttons that
+   were eating header space. */
+.portal-card-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid var(--stroke);
+  background: var(--card-2);
+  color: var(--text);
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, color 120ms;
+}
+.portal-card-btn:hover {
+  background: color-mix(in srgb, var(--accent) 14%, var(--card-2));
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--stroke));
+}
+.portal-card-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.portal-card-btn-add {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.portal-card-btn-add:hover {
+  background: color-mix(in srgb, var(--accent) 88%, #000);
+  border-color: color-mix(in srgb, var(--accent) 88%, #000);
+}
+
+/* Actions column: tight, right-aligned across every portal table.
+   Previously several tables declared a 120-200 px Actions column with
+   left-aligned content; the user wants them all right-aligned with the
+   minimum width needed for the visible icons. */
+.control-plane-main .row-actions,
+.cp-customers-table .row-actions,
+.cp-licenses-table .row-actions,
+.cp-edges-table .row-actions,
+.cp-activation-table .row-actions,
+.cp-workspace-table .row-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  justify-content: flex-end;
+}
+.control-plane-main .thead > span:last-child,
+.cp-customers-table .thead > span:last-child,
+.cp-licenses-table .thead > span:last-child,
+.cp-edges-table .thead > span:last-child,
+.cp-activation-table .thead > span:last-child,
+.cp-workspace-table .thead > span:last-child {
+  text-align: right;
+}
+/* Squeeze the Actions column on every portal table grid. Each grid
+   already declares N columns ending with a fixed pixel width — we
+   simply override that last track to 84-120 px (2 icons / 3 icons). */
+.cp-customers-table .thead,
+.cp-customers-table .trow { grid-template-columns: 40px 1fr 1fr 1.2fr 1fr .7fr 84px; }
+.cp-licenses-table .thead,
+.cp-licenses-table .trow { grid-template-columns: 40px 1fr .95fr .9fr .9fr 1.35fr .7fr 84px; }
+.cp-edges-table .thead,
+.cp-edges-table .trow { grid-template-columns: 40px 1fr 1fr .95fr 1.4fr .65fr .75fr 84px; }
+.cp-activation-table .thead,
+.cp-activation-table .trow { grid-template-columns: 40px .45fr 1.2fr .8fr .85fr .85fr .65fr .95fr .95fr 120px; }
+.cp-workspace-table .thead,
+.cp-workspace-table .trow { grid-template-columns: 1.2fr 1.2fr .8fr .7fr 84px; }
+.cp-dashboard-profiles-table .thead,
+.cp-dashboard-profiles-table .trow { grid-template-columns: 1fr 2.2fr .55fr .55fr 1fr 56px; }
+.cp-dashboard-profiles-table.without-tenant .thead,
+.cp-dashboard-profiles-table.without-tenant .trow { grid-template-columns: 2.4fr .55fr .55fr 1fr 56px; }
+
+/* Light-mode form controls inside the portal. The desktop edge uses
+   dark inputs/selects because the whole shell is dark; in the cloud
+   portal's light theme that left every <input>/<select> with a dark
+   slab against a white card. Override here scoped to .control-plane-main
+   so the local edge UI stays untouched. */
+:root[data-theme="light"] .control-plane-main input[type="text"],
+:root[data-theme="light"] .control-plane-main input[type="search"],
+:root[data-theme="light"] .control-plane-main input[type="email"],
+:root[data-theme="light"] .control-plane-main input[type="password"],
+:root[data-theme="light"] .control-plane-main input[type="number"],
+:root[data-theme="light"] .control-plane-main input[type="date"],
+:root[data-theme="light"] .control-plane-main input:not([type]),
+:root[data-theme="light"] .control-plane-main select,
+:root[data-theme="light"] .control-plane-main textarea,
+:root[data-theme="light"] .sidebar .portal-filter-select,
+:root[data-theme="light"] .sidebar .portal-filter-block input,
+:root[data-theme="light"] .sidebar .portal-filter-block select {
+  background: #ffffff;
+  color: #0f172a;
+  border: 1px solid #cbd5e1;
+}
+:root[data-theme="light"] .control-plane-main input::placeholder,
+:root[data-theme="light"] .sidebar .portal-filter-block input::placeholder {
+  color: #94a3b8;
+}
+:root[data-theme="light"] .control-plane-main input:focus,
+:root[data-theme="light"] .control-plane-main select:focus,
+:root[data-theme="light"] .control-plane-main textarea:focus,
+:root[data-theme="light"] .sidebar .portal-filter-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
 .control-plane-main > .card {
   flex: 1 1 auto;
   border: 1px solid color-mix(in srgb, var(--stroke) 84%, transparent);
