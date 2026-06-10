@@ -2167,6 +2167,57 @@ body {
   min-height: calc(100vh - 170px);
 }
 
+/* Compact dismissible status banner for the portal pages. Replaces the
+   full-card error/info box that used to dominate the workspace. */
+.portal-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--stroke);
+  background: var(--card);
+  font-size: 12.5px;
+  line-height: 1.35;
+  min-height: 30px;
+}
+.portal-banner.is-error {
+  border-color: color-mix(in srgb, #dc2626 60%, var(--stroke));
+  background: color-mix(in srgb, #dc2626 12%, var(--card));
+  color: color-mix(in srgb, #fca5a5 70%, var(--text));
+}
+.portal-banner.is-warning {
+  border-color: color-mix(in srgb, #f59e0b 60%, var(--stroke));
+  background: color-mix(in srgb, #f59e0b 10%, var(--card));
+  color: color-mix(in srgb, #fcd34d 70%, var(--text));
+}
+.portal-banner.is-info {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--stroke));
+  background: color-mix(in srgb, var(--accent) 8%, var(--card));
+  color: var(--text);
+}
+.portal-banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.portal-banner-close {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  opacity: 0.75;
+}
+.portal-banner-close:hover { opacity: 1; background: color-mix(in srgb, currentColor 12%, transparent); }
+
 .control-plane-main > .card {
   flex: 1 1 auto;
   border: 1px solid color-mix(in srgb, var(--stroke) 84%, transparent);

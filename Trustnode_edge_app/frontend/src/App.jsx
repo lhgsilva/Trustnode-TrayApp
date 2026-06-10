@@ -18678,13 +18678,25 @@ const getGatewayHealth = (gateway) => {
                 ) : null}
 
                 <div className="control-plane-main" style={{ flex: 1, minWidth: 0 }}>
-                  {cpResult ? <section className="card">{cpResult ? <div className={`status ${cpResult.toLowerCase().includes("failed") ? "error" : "ok"}`}>{cpResult}</div> : null}</section> : null}
+                  {cpResult ? (
+                    <div
+                      className={`portal-banner ${cpResult.toLowerCase().includes("failed") || cpResult.toLowerCase().includes("error") ? "is-error" : "is-info"}`}
+                      role="status"
+                    >
+                      <span className="portal-banner-text" title={cpResult}>{cpResult}</span>
+                      <button
+                        type="button"
+                        className="portal-banner-close"
+                        onClick={() => setCpResult("")}
+                        aria-label="Dismiss"
+                        title="Dismiss"
+                      >×</button>
+                    </div>
+                  ) : null}
                   {!canEditPage("control_plane") ? (
-                    <section className="card">
-                      <div className="status warning">
-                        Read-only portal mode: this user cannot add, edit, or delete control-plane records.
-                      </div>
-                    </section>
+                    <div className="portal-banner is-warning" role="status">
+                      <span className="portal-banner-text">Read-only portal mode: this user cannot add, edit, or delete control-plane records.</span>
+                    </div>
                   ) : null}
 
                   {cpPortalPage === "customers" ? (

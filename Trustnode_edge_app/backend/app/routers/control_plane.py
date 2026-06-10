@@ -2609,89 +2609,88 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
 #
 # The portal needs to manage the dashboard_configurations rows that live in
 # Supabase — operators sometimes accumulate stale profiles (renamed edges,
-# deactivated users) that clutter the Lite picker. These endpoints proxy
-# to the cloud Postgres mirror; the edge's local SQLite is also cleaned up
-# so the next mirror cycle doesn't resurrect the deleted row.
+# deactivated users) that clutter the Lite picker. We talk to Supabase via
+# PostgREST (HTTPS REST) using the service-role key instead of opening a
+# direct Postgres connection, because the VPS hits Supabase's session
+# pooler (port 5432) and intermittently times out under load. The rest of
+# this router already uses the same HTTPS path for cp_* tables.
+#
+# The edge's local SQLite is also cleaned up so the next mirror reconcile
+# won't resurrect the deleted row.
 
-def _cloud_engine_for_portal():
-    """Build a SQLAlchemy engine against the cloud Postgres target.
-    Returns (engine, schema) or (None, None) when no cloud DB is configured
-    (e.g. running on an isolated edge with no Supabase credentials)."""
-    cloud = app_store._get_cloud_database_target()
-    if not cloud:
-        return None, None
-    try:
-        from sqlalchemy import create_engine  # type: ignore
-    except Exception:
-        return None, None
-    schema = str(cloud.get("schema") or "public")
-    url = app_store._build_pg_sqlalchemy_url(
-        str(cloud.get("host") or ""),
-        int(cloud.get("port") or 5432),
-        str(cloud.get("database") or "postgres"),
-        str(cloud.get("username") or ""),
-        str(cloud.get("password") or ""),
-    )
-    connect_args = {
-        "sslmode": "require" if cloud.get("tls", True) else "disable",
-        "connect_timeout": 6,
-        "prepare_threshold": None,
-        "options": "-c lock_timeout=1200ms -c statement_timeout=4500ms",
+def _supabase_rest_target() -> tuple[str, str, str] | None:
+    """Return (url, service_key, schema) for Supabase PostgREST, or None
+    when this backend isn't configured to talk to Supabase (e.g. an
+    isolated edge without cloud credentials)."""
+    base = str(os.environ.get("TRUSTNODE_SUPABASE_URL") or "").strip().rstrip("/")
+    key = str(os.environ.get("TRUSTNODE_SUPABASE_SERVICE_KEY") or "").strip()
+    if not base or not key:
+        return None
+    schema = str(os.environ.get("TRUSTNODE_CLOUD_DB_SCHEMA") or "public").strip() or "public"
+    return base, key, schema
+
+
+def _supabase_rest_headers(key: str, schema: str) -> dict[str, str]:
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+        "Accept-Profile": schema,
+        "Content-Profile": schema,
     }
-    engine = create_engine(url, pool_pre_ping=True, connect_args=connect_args)
-    return engine, schema
 
 
 @router.get("/dashboard-profiles")
 def list_dashboard_profiles(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
     """List dashboard_configurations rows from the Supabase mirror.
-    Master admin sees all tenants; tenant admin sees only their tenant."""
+    Master admin sees all tenants; tenant admin sees only their tenant.
+    Uses PostgREST so we never block on the Supabase Postgres pooler."""
     tid = _scoped_tenant(request, tenant_id)
-    engine, schema = _cloud_engine_for_portal()
-    if not engine:
+    target = _supabase_rest_target()
+    if not target:
         return {"ok": True, "tenant_id": tid, "rows": []}
+    base, key, schema = target
+    is_master = (tid == "default" and not (tenant_id or "").strip())
+    # PostgREST query: select the columns we render + a JSON path expression
+    # that lets us count widgets without round-tripping the whole payload.
+    params: dict[str, str] = {
+        "select": "tenant_id,scope_key,version,updated_utc,payload_json",
+        "order": "updated_utc.desc",
+    }
+    if not is_master:
+        params["tenant_id"] = f"eq.{tid}"
+    url = f"{base}/rest/v1/dashboard_configurations"
     try:
-        from sqlalchemy import text  # type: ignore
-        # Master admin (no specific tenant requested) sees everything; tenant
-        # admin sees only their tenant's profiles. _scoped_tenant returns
-        # 'default' for master when tenant_id query param is absent.
-        is_master = (tid == "default" and not (tenant_id or "").strip())
-        with engine.connect() as conn:
-            if is_master:
-                rows = conn.execute(
-                    text(
-                        f'SELECT tenant_id, scope_key, version, updated_utc, '
-                        f'jsonb_array_length(COALESCE(payload_json->\'widgets\', \'[]\'::jsonb)) AS widget_count '
-                        f'FROM "{schema}"."dashboard_configurations" ORDER BY updated_utc DESC'
-                    )
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    text(
-                        f'SELECT tenant_id, scope_key, version, updated_utc, '
-                        f'jsonb_array_length(COALESCE(payload_json->\'widgets\', \'[]\'::jsonb)) AS widget_count '
-                        f'FROM "{schema}"."dashboard_configurations" '
-                        f'WHERE tenant_id = :tid ORDER BY updated_utc DESC'
-                    ),
-                    {"tid": tid},
-                ).fetchall()
-        out = []
-        for r in rows or []:
-            out.append({
-                "tenant_id": str(r[0] or ""),
-                "scope_key": str(r[1] or ""),
-                "version": int(r[2] or 0),
-                "updated_utc": str(r[3] or ""),
-                "widget_count": int(r[4] or 0),
-            })
-        return {"ok": True, "tenant_id": tid, "rows": out}
+        resp = requests.get(
+            url,
+            headers=_supabase_rest_headers(key, schema),
+            params=params,
+            timeout=8,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"cloud_query_failed: {exc}")
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"cloud_query_failed: HTTP {resp.status_code} {resp.text[:200]}")
+    try:
+        data = resp.json()
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"cloud_query_failed: {exc}")
-    finally:
-        try:
-            engine.dispose()
-        except Exception:
-            pass
+    out: list[dict[str, Any]] = []
+    for r in data or []:
+        payload = r.get("payload_json") if isinstance(r, dict) else None
+        widgets = []
+        if isinstance(payload, dict):
+            w = payload.get("widgets")
+            if isinstance(w, list):
+                widgets = w
+        out.append({
+            "tenant_id": str(r.get("tenant_id") or ""),
+            "scope_key": str(r.get("scope_key") or ""),
+            "version": int(r.get("version") or 0),
+            "updated_utc": str(r.get("updated_utc") or ""),
+            "widget_count": len(widgets),
+        })
+    return {"ok": True, "tenant_id": tid, "rows": out}
 
 
 class DashboardProfileDeleteRequest(BaseModel):
@@ -2704,34 +2703,35 @@ def delete_dashboard_profile(request: Request, payload: DashboardProfileDeleteRe
     """Delete a dashboard profile row from the Supabase mirror, then drop
     the matching local row on the edge so the next mirror reconcile won't
     re-publish it. Master admin can delete any tenant; tenant admin only
-    their own."""
+    their own. Uses PostgREST (no Postgres pooler dependency)."""
     tid = _scoped_tenant(request, payload.tenant_id, require_admin_write=True)
     skey = str(payload.scope_key or "").strip()
     if not skey:
         raise HTTPException(status_code=400, detail="scope_key_required")
     target_tenant = str(payload.tenant_id or tid).strip() or tid
-    # Cloud delete first (the user-facing source of truth for Lite).
-    engine, schema = _cloud_engine_for_portal()
     cloud_deleted = 0
-    if engine:
+    target = _supabase_rest_target()
+    if target:
+        base, key, schema = target
+        url = f"{base}/rest/v1/dashboard_configurations"
         try:
-            from sqlalchemy import text  # type: ignore
-            with engine.begin() as conn:
-                result = conn.execute(
-                    text(
-                        f'DELETE FROM "{schema}"."dashboard_configurations" '
-                        f'WHERE tenant_id = :tid AND scope_key = :sk'
-                    ),
-                    {"tid": target_tenant, "sk": skey},
-                )
-                cloud_deleted = int(result.rowcount or 0)
-        except Exception as exc:
+            resp = requests.delete(
+                url,
+                headers={**_supabase_rest_headers(key, schema), "Prefer": "return=representation"},
+                params={
+                    "tenant_id": f"eq.{target_tenant}",
+                    "scope_key": f"eq.{skey}",
+                },
+                timeout=8,
+            )
+        except requests.exceptions.RequestException as exc:
             raise HTTPException(status_code=502, detail=f"cloud_delete_failed: {exc}")
-        finally:
-            try:
-                engine.dispose()
-            except Exception:
-                pass
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"cloud_delete_failed: HTTP {resp.status_code} {resp.text[:200]}")
+        try:
+            cloud_deleted = len(resp.json() or [])
+        except Exception:
+            cloud_deleted = 0
     # Local delete so the edge stops re-mirroring it. Best-effort.
     local_deleted = 0
     try:
