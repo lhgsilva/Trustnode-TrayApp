@@ -208,6 +208,20 @@ def _normalize_one_series(s: dict[str, Any], section: dict[str, Any]) -> dict[st
         except Exception:
             return None
 
+    def _safe_float(value: Any, default: float) -> float:
+        """Normalize a series multiplier/offset to a float. The frontend can
+        save these as empty strings if the operator clears the input, which
+        used to crash float() and abort the whole _section_chart render —
+        the PDF then either dropped the section entirely or printed the
+        catch-all "[error rendering section: ...]" message even though the
+        preview rendered fine."""
+        if value is None or value == "":
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     return {
         "id": str(s.get("id") or uuid.uuid4().hex[:8]),
         "label": str(s.get("label") or s.get("tag_name") or ""),
@@ -217,8 +231,8 @@ def _normalize_one_series(s: dict[str, Any], section: dict[str, Any]) -> dict[st
         "axis": "right" if str(s.get("axis") or "left").lower() == "right" else "left",
         "chart_type": str(s.get("chart_type") or "").lower() or None,
         "unit": str(s.get("unit") or section.get("unit") or ""),
-        "multiplier": float(s.get("multiplier") if s.get("multiplier") is not None else 1.0),
-        "offset": float(s.get("offset") if s.get("offset") is not None else 0.0),
+        "multiplier": _safe_float(s.get("multiplier"), 1.0),
+        "offset": _safe_float(s.get("offset"), 0.0),
         "aggregation": aggregation,
         "operator": operator,
         "value1": _to_num(s.get("value1")),

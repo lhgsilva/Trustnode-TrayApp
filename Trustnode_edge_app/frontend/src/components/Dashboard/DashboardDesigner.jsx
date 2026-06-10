@@ -840,7 +840,34 @@ export function DashboardDesigner({
     const plcTag = formatTagForDisplay ? formatTagForDisplay(tagName) : tagName || "-";
     const lastTsMs = toTsMs(latest?.last_ts || "");
     const liveLatencyMs = Number.isFinite(lastTsMs) ? Math.max(0, Date.now() - lastTsMs) : null;
-    return { latestValue, plcTag, typeLabel, liveLatencyMs };
+    // Build a list of every visible series (primary + series_extra data
+    // traces, skip limit-lines) so the title strip can show one
+    // "value | tag" pair per series — including when the primary
+    // gateway/tag is unset and the widget is series-only.
+    const seriesItems = [];
+    if (gatewayId && tagName) {
+      seriesItems.push({ value: latestValue, tag: plcTag, color: String(widget?.color || "#14a89a") });
+    }
+    const extras = Array.isArray(cfg.series_extra) ? cfg.series_extra : [];
+    const fallbackPalette = ["#f97316", "#3b82f6", "#a855f7", "#dc2626", "#10b981", "#f59e0b"];
+    let paletteIdx = 0;
+    for (const s of extras) {
+      const chartType = String(s?.chart_type || "").toLowerCase();
+      if (chartType === "limit") continue;
+      const sTag = String(s?.tag_name || "").trim();
+      if (!sTag) continue;
+      const sGw = String(s?.gateway_id || gatewayId || "").trim();
+      const sLatest = getLatestTagRow(dashboardRows, sGw, sTag);
+      const sValue = formatHeaderValue(sLatest?.last_value);
+      const sLabel = String(s?.label || "").trim() || (formatTagForDisplay ? formatTagForDisplay(sTag) : sTag);
+      seriesItems.push({
+        value: sValue,
+        tag: sLabel,
+        color: String(s?.color || "").trim() || fallbackPalette[paletteIdx % fallbackPalette.length],
+      });
+      paletteIdx += 1;
+    }
+    return { latestValue, plcTag, typeLabel, liveLatencyMs, seriesItems };
   };
 
   const formatLatencyLabel = (msValue) => {
@@ -1589,7 +1616,7 @@ export function DashboardDesigner({
         {normalizedWidgets.map((widget) => (
           <article
             key={widget.id}
-            className={`card dashboard-widget-shell ${draggingId === widget.id ? "is-dragging" : ""}`}
+            className={`card dashboard-widget-shell ${draggingId === widget.id ? "is-dragging" : ""} ${Boolean(widget?.config?.hide_widget_header) && !canEdit ? "is-headerless" : ""}`}
             style={{
               gridColumn: `${widget.x + 1} / span ${widget.w}`,
               gridRow: `${widget.y + 1} / span ${widget.h}`,
@@ -1602,11 +1629,36 @@ export function DashboardDesigner({
             onDragEnter={() => onDragOverWidget(widget.id)}
             onDrop={onDropOn}
           >
-            <div className="dashboard-widget-head">
+            {/* Hide-header is a render-only effect; keep the head in
+                editor mode so the operator can still reach Edit/Delete
+                while configuring. Once the operator switches to a
+                non-editing role, the title bar disappears and the chart
+                gets the full card height. */}
+            <div className="dashboard-widget-head" style={Boolean(widget?.config?.hide_widget_header) && !canEdit ? { display: "none" } : undefined}>
               <strong>
                 {(() => {
                   const parts = widgetHeaderParts(widget);
                   if (!parts) return String(getWidgetMeta(widget.type)?.label || widget.type);
+                  const items = Array.isArray(parts.seriesItems) ? parts.seriesItems : [];
+                  if (items.length > 1) {
+                    // Multi-series widget: render one "value | tag" pair
+                    // per visible series so the operator can read every
+                    // current value without opening the chart legend.
+                    return (
+                      <span className="dashboard-widget-head-text">
+                        {items.map((it, idx) => (
+                          <React.Fragment key={`hd-${idx}`}>
+                            {idx > 0 ? <span className="dashboard-widget-head-sep">·</span> : null}
+                            <span className="dashboard-widget-head-value" style={{ color: it.color }}>{it.value}</span>
+                            <span className="dashboard-widget-head-sep">|</span>
+                            <span>{it.tag}</span>
+                          </React.Fragment>
+                        ))}
+                        <span className="dashboard-widget-head-sep">|</span>
+                        <span>{parts.typeLabel}</span>
+                      </span>
+                    );
+                  }
                   return (
                     <span className="dashboard-widget-head-text">
                       <span className="dashboard-widget-head-value" style={{ color: String(widget?.color || "#14a89a") }}>{parts.latestValue}</span>
@@ -1867,6 +1919,36 @@ export function DashboardDesigner({
                           config: { ...p.config, readings_count: clamp(e.target.value, 20, 500) },
                         }))
                       }
+                    />
+                  </label>
+                ) : null}
+
+                {/* Independent reading count for the extra series. Lets the
+                    operator configure a multi-series chart that pulls a
+                    different history depth than the primary tag — including
+                    series-only widgets where the primary gateway/tag is left
+                    blank. Empty / 0 falls back to readings_count * 8. */}
+                {["line_chart", "line_area_chart", "bar_chart"].includes(form.type)
+                  && Array.isArray(form.config?.series_extra)
+                  && form.config.series_extra.length > 0 ? (
+                  <label>
+                    Series reading points
+                    <input
+                      type="number"
+                      min="0"
+                      max="5000"
+                      value={Number(form.config?.series_readings_count || 0)}
+                      placeholder="(follow Reading points)"
+                      onChange={(e) =>
+                        setForm((p) => ({
+                          ...p,
+                          config: {
+                            ...p.config,
+                            series_readings_count: Math.max(0, Math.min(5000, Number(e.target.value || 0))),
+                          },
+                        }))
+                      }
+                      title="Number of historical points fetched for each extra series. 0 = follow the primary Reading points field."
                     />
                   </label>
                 ) : null}
@@ -2562,6 +2644,11 @@ export function DashboardDesigner({
                     {[
                       { key: "chart_show_legend", label: "Show legend" },
                       { key: "chart_show_point_labels", label: "Show point labels" },
+                      // Hide the entire widget title strip (the value | tag |
+                      // type bar at the top of the card) so the chart body
+                      // gets the full card height. Useful for KPIs and
+                      // historical-only charts where the title is noise.
+                      { key: "hide_widget_header", label: "Hide widget title bar" },
                     ].map((opt) => (
                       <label key={opt.key} className="dashboard-query-checkbox">
                         <input

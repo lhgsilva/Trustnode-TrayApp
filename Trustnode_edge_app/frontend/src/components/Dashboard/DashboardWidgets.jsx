@@ -1355,7 +1355,21 @@ export function DashboardWidgetCard({
     const localRange = resolveTimeFilterRange(cfg);
     const fetchAll = async () => {
       const next = {};
-      const reads = Math.max(50, Math.min(5000, Number(cfgReadingsCount || 120) * 8));
+      // Series readings count is independent from the primary widget
+      // readings_count. When the operator hasn't set it, we still fall
+      // back to cfgReadingsCount * 8 so existing widgets keep behaving
+      // exactly as before. A multi-series-only widget (no primary tag)
+      // gets a sensible default of 200.
+      const explicitSeriesReads = Number(cfg?.series_readings_count || 0);
+      const reads = Math.max(
+        50,
+        Math.min(
+          5000,
+          explicitSeriesReads > 0
+            ? explicitSeriesReads
+            : Number(cfgReadingsCount || 120) * 8,
+        ),
+      );
       for (const def of extraSeriesDefs) {
         try {
           let rows = await fetcher({

@@ -9083,7 +9083,18 @@ const getGatewayHealth = (gateway) => {
     const hasFreshRuntimeWrite =
       (Number.isFinite(lastWriteMs) && (nowMs - lastWriteMs) <= 45000) ||
       (Number.isFinite(lastCheckMs) && (nowMs - lastCheckMs) <= 30000);
+    // Honor the user's most recent intent. The optimistic flip in
+    // stopGatewayProfile sets running=false AND stamps userStoppedAtRef.
+    // Without this guard, the 45 s "fresh db write" grace window kept
+    // returning true and the footer button stayed on RUNNING for tens of
+    // seconds after the user clicked Stop. The grace window is meant to
+    // bridge transient stale-timestamp gaps WHILE the gateway is supposed
+    // to be running — never to overrule a user-issued Stop.
+    const gid = String(gateway?.id || "");
+    const stoppedAtMs = Number(userStoppedAtRef.current?.[gid] || 0);
+    const recentlyStoppedByUser = stoppedAtMs > 0 && (nowMs - stoppedAtMs) <= 10000;
     if (runtimeStatus && typeof runtimeStatus.running === "boolean") {
+      if (recentlyStoppedByUser && runtimeStatus.running === false) return false;
       if (runtimeStatus.running === true) return true;
       if (hasFreshRuntimeWrite) return true;
       // If live points are still arriving for this gateway, keep UI state RUNNING.
@@ -17773,6 +17784,12 @@ const getGatewayHealth = (gateway) => {
                   Saved interface and palette settings are independent per UI environment (local edge UI and cloud web client).
                 </div>
               </section>
+              {/* Power Meter Gateways card removed from the Interface page
+                  (operator request 2026-06-10). The same management UI is
+                  reachable from the Power Configuration page; surfacing it
+                  here only confused users who arrived looking for theme
+                  and palette settings. */}
+              {false ? (
               <section className="card">
                 <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
                   <h3 style={{ marginTop: 0, marginBottom: 8 }}>Power Meter Gateways</h3>
@@ -17837,6 +17854,7 @@ const getGatewayHealth = (gateway) => {
                   })}
                 </div>
               </section>
+              ) : null}
             </>
           ) : null}
 
@@ -18407,7 +18425,7 @@ const getGatewayHealth = (gateway) => {
                 );
               })()}
               <section className="card">
-                <div className="form-grid">
+                <div className="historian-filter-row">
                   <label>
                     From
                     <input
