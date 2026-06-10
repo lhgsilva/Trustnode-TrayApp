@@ -1134,16 +1134,49 @@ class AppStore:
             # come up. The sync worker hasn't booted yet on this thread,
             # so we just poll _get_cloud_database_target.
             import time as _t
+            import logging
+            log = logging.getLogger("trustnode.boot-mirror")
+            cloud = None
             for _ in range(30):
                 try:
-                    if self._get_cloud_database_target() is not None:
+                    cloud = self._get_cloud_database_target()
+                    if cloud is not None:
                         break
                 except Exception:
                     pass
                 _t.sleep(1.0)
-            else:
+            if cloud is None:
+                # No cloud target configured locally — dashboards / alarms
+                # will only ever be local. Log this so the operator can see
+                # WHY the Lite view isn't picking them up.
+                log.warning(
+                    "boot-mirror: no cloud database target resolvable after 30 s; "
+                    "Lite view will not receive dashboards or configs until a "
+                    "postgresql sink with cloud_sync_enabled=true is configured."
+                )
                 return
+            # Count what we're about to push so the log line is actionable.
+            try:
+                with self._lock:
+                    with self._connect() as conn:
+                        rows = conn.execute(
+                            "SELECT domain, COUNT(*) AS n FROM config_documents_scoped "
+                            "WHERE domain IN "
+                            "('dashboard_configurations','alarms_setup','triggers_limits',"
+                            " 'gateway_configurations','devices') "
+                            "GROUP BY domain"
+                        ).fetchall()
+                summary = ", ".join(
+                    f"{r['domain']}={int(r['n'])}" for r in (rows or [])
+                ) or "(no scoped docs to mirror)"
+                log.info(
+                    "boot-mirror: cloud target reachable (%s:%s/%s); republishing %s",
+                    cloud.get("host"), cloud.get("port"), cloud.get("database"), summary,
+                )
+            except Exception:
+                pass
             self._remirror_scoped_docs_to_cloud()
+            log.info("boot-mirror: republish pass complete.")
         except Exception:
             # Best-effort; the periodic reconciler will catch anything we miss.
             return
@@ -1784,18 +1817,27 @@ class AppStore:
                         self._flush_config_outbox_once()
                     next_config_pull_mono = now_mono + float(self._config_pull_interval_seconds)
                 # Reconcile Lite-readable mirror tables (alarms_setup,
-                # triggers_limits, dashboard_configurations). The per-save
-                # daemon-thread mirror occasionally drops writes; this
-                # idempotent catch-up compares local vs cloud version and
-                # re-pushes anything stale. Cheap when nothing has changed
-                # (one SELECT per domain).
+                # triggers_limits, dashboard_configurations, gateway_configurations,
+                # devices). The per-save daemon-thread mirror occasionally
+                # drops writes; this idempotent catch-up compares local vs
+                # cloud version and re-pushes anything stale. Cheap when
+                # nothing has changed (one SELECT per domain).
+                #
+                # Cadence: every 2 s. The previous 5 s window meant a
+                # dashboard edit on the desktop could lag the Lite view by
+                # up to 5 s even when the per-save mirror landed
+                # immediately. 2 s is fast enough to feel "live" without
+                # turning the reconcile into a hot loop (each tick is one
+                # SELECT per domain on Supabase + at most one UPSERT per
+                # stale row, plus the historical-data sync is unaffected
+                # because it runs on its own thread).
                 if self._is_cloud_auto_sync_enabled() and now_mono >= next_mirror_reconcile_mono:
                     try:
                         self._reconcile_lite_mirror_tables_once()
                     except Exception:
                         # Reconciler is best-effort; never poison the loop.
                         pass
-                    next_mirror_reconcile_mono = now_mono + 5.0  # every 5s
+                    next_mirror_reconcile_mono = now_mono + 2.0  # every 2s
                 # Re-align sync_targets row with database_configurations.
                 # Picks up UI toggles without a backend restart and clears
                 # stale "no target" errors after the user adds a cloud DB.
