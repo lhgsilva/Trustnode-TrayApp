@@ -1210,11 +1210,61 @@ class AppStore:
         placeholders = ",".join("?" * len(mirrored_domains))
         with self._lock:
             with self._connect() as conn:
-                rows = conn.execute(
+                rows = list(conn.execute(
                     f"SELECT scope_key, domain, payload_json, version, updated_utc "
                     f"FROM config_documents_scoped WHERE domain IN ({placeholders})",
                     mirrored_domains,
-                ).fetchall()
+                ).fetchall())
+                # ─── Fallback: pick up unscoped configs too ───────────────────
+                # Older edge builds (or any path that hit upsert_domain instead
+                # of upsert_domain_scoped) wrote dashboards / alarms / triggers
+                # / gateways / devices into config_documents WITHOUT a scope
+                # key. The Lite mirror only reads scoped rows, so those edges
+                # stayed invisible. Build a synthetic scope_key from
+                # app_settings (tenant | customer | edge) so the unscoped doc
+                # can finally land in cloud. If no edge_id is known we skip —
+                # there's nothing meaningful to push a config under.
+                covered_domains = {str(r["domain"] or "") for r in rows}
+                missing_domains = [d for d in mirrored_domains if d not in covered_domains]
+                if missing_domains:
+                    try:
+                        settings_row = conn.execute(
+                            "SELECT payload_json FROM config_documents WHERE domain='app_settings'"
+                        ).fetchone()
+                        settings = {}
+                        if settings_row and settings_row["payload_json"]:
+                            settings = json.loads(str(settings_row["payload_json"] or "{}")) or {}
+                        edge_profile = settings.get("edge_profile") if isinstance(settings.get("edge_profile"), dict) else {}
+                        edge_id = (
+                            str(edge_profile.get("edge_id") or "").strip().lower()
+                            or str(settings.get("edge_id") or "").strip().lower()
+                        )
+                        tenant_id = str(settings.get("tenant_id") or "default").strip().lower() or "default"
+                        customer_id = (
+                            str(edge_profile.get("linked_customer_id") or "").strip().lower()
+                            or str(settings.get("customer_id") or "").strip().lower()
+                            or "-"
+                        )
+                        synthetic_scope = f"{tenant_id}|{customer_id}|{edge_id}" if edge_id else ""
+                        if synthetic_scope:
+                            qmark = ",".join("?" * len(missing_domains))
+                            unscoped_rows = conn.execute(
+                                f"SELECT domain, payload_json, version, updated_utc "
+                                f"FROM config_documents WHERE domain IN ({qmark})",
+                                missing_domains,
+                            ).fetchall()
+                            for ur in unscoped_rows or []:
+                                rows.append({
+                                    "scope_key": synthetic_scope,
+                                    "domain": ur["domain"],
+                                    "payload_json": ur["payload_json"],
+                                    "version": ur["version"],
+                                    "updated_utc": ur["updated_utc"],
+                                })
+                    except Exception:
+                        # Best-effort fallback; the upgraded edge will start
+                        # producing scoped rows once the operator saves once.
+                        pass
         for r in rows or []:
             scope_key = str(r["scope_key"] or "")
             domain = str(r["domain"] or "")
@@ -1894,11 +1944,54 @@ class AppStore:
         placeholders = ",".join("?" * len(domains))
         with self._lock:
             with self._connect() as conn:
-                rows = conn.execute(
+                rows = list(conn.execute(
                     f"SELECT scope_key, domain, payload_json, version, updated_utc "
                     f"FROM config_documents_scoped WHERE domain IN ({placeholders})",
                     domains,
-                ).fetchall()
+                ).fetchall())
+                # Fallback for older edges that only ever wrote unscoped
+                # config_documents rows. Resolve a synthetic scope_key from
+                # app_settings so the missing domains can finally land in
+                # cloud. Once the operator hits Save in the new UI the
+                # scoped writer takes over and this branch is a no-op.
+                covered = {str(r["domain"] or "") for r in rows}
+                missing = [d for d in domains if d not in covered]
+                if missing:
+                    try:
+                        srow = conn.execute(
+                            "SELECT payload_json FROM config_documents WHERE domain='app_settings'"
+                        ).fetchone()
+                        settings = {}
+                        if srow and srow["payload_json"]:
+                            settings = json.loads(str(srow["payload_json"] or "{}")) or {}
+                        edge_profile = settings.get("edge_profile") if isinstance(settings.get("edge_profile"), dict) else {}
+                        edge_id = (
+                            str(edge_profile.get("edge_id") or "").strip().lower()
+                            or str(settings.get("edge_id") or "").strip().lower()
+                        )
+                        tenant_id = str(settings.get("tenant_id") or "default").strip().lower() or "default"
+                        customer_id = (
+                            str(edge_profile.get("linked_customer_id") or "").strip().lower()
+                            or str(settings.get("customer_id") or "").strip().lower()
+                            or "-"
+                        )
+                        synthetic_scope = f"{tenant_id}|{customer_id}|{edge_id}" if edge_id else ""
+                        if synthetic_scope:
+                            qmark = ",".join("?" * len(missing))
+                            for ur in conn.execute(
+                                f"SELECT domain, payload_json, version, updated_utc "
+                                f"FROM config_documents WHERE domain IN ({qmark})",
+                                missing,
+                            ).fetchall() or []:
+                                rows.append({
+                                    "scope_key": synthetic_scope,
+                                    "domain": ur["domain"],
+                                    "payload_json": ur["payload_json"],
+                                    "version": ur["version"],
+                                    "updated_utc": ur["updated_utc"],
+                                })
+                    except Exception:
+                        pass
         if not rows:
             return
         try:

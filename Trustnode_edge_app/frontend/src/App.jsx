@@ -4792,10 +4792,13 @@ function AppShell() {
             : {},
       };
       const signature = JSON.stringify(payload);
-      if (!dashboardDomainLastPersistSignatureRef.current) {
-        dashboardDomainLastPersistSignatureRef.current = signature;
-        return;
-      }
+      // Always save on the first run (previously this branch returned
+      // early to avoid an idempotent hydration round-trip). The "skip"
+      // meant a fresh launch never re-mirrored the dashboard to Supabase
+      // until the operator edited a widget — Lite share-links stayed
+      // blank for hours on installs whose only change was upgrading the
+      // EXE. The backend save path is already idempotent: a no-op write
+      // returns {unchanged: true} and skips the cloud mirror.
       if (signature === dashboardDomainLastPersistSignatureRef.current) return;
       dashboardDomainPersistInFlightRef.current = true;
       try {
