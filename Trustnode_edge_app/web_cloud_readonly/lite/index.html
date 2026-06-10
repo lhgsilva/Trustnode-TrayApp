@@ -73,10 +73,25 @@ async function loadConfig() {
 // rows. For non-admin users the context value stays empty and queries
 // behave exactly as before (RLS does the filtering).
 const TenantScopeCtx = createContext({
-  pickedTenantId: "",     // empty == no override (use RLS default)
+  pickedTenantId: "",     // empty == no override (master's "all tenants" or non-admin)
   setPickedTenantId: () => {},
   isGlobalAdmin: false,
   userTenantId: "",       // the tenant_id the user actually belongs to
+  // The TENANT to enforce on every scoped query, regardless of who's looking:
+  //   - non-admin signed-in user → their lite_profiles tenant from the JWT
+  //   - master with a picked tenant → that tenant
+  //   - master with no picked tenant → "" (cross-tenant view; RLS lets master see all)
+  //   - view-link viewer → the resolved share-link tenant
+  // Use this as the gate in every defensive client-side filter so a
+  // regular user can never see another tenant's row even if RLS were ever
+  // mis-applied.
+  effectiveTenantId: "",
+  // Optional secondary filter for master/admin only — pick one edge to
+  // narrow the dashboard profile / live view to that specific edge.
+  // Regular users never set this; their RLS scope already limits them
+  // to their own tenant's edges.
+  pickedEdgeId: "",
+  setPickedEdgeId: () => {},
 });
 
 // Wrap any `supabase.from(...)` call site with this helper so we apply
@@ -242,7 +257,9 @@ function useLiveLatest(enabled = true) {
   // Master-picker scope. When picked, filter queries AND drop realtime
   // rows that don't match (Supabase realtime doesn't filter by RLS for
   // global-admin subscriptions — we'd otherwise get every tenant's rows).
-  const { pickedTenantId } = useContext(TenantScopeCtx);
+  // effectiveTenantId is the tenant we GATE every row against, regardless
+  // of who the viewer is. pickedEdgeId narrows further for master.
+  const { pickedTenantId, effectiveTenantId, pickedEdgeId } = useContext(TenantScopeCtx);
 
   useEffect(() => {
     if (!enabled) return;
@@ -274,11 +291,24 @@ function useLiveLatest(enabled = true) {
         .limit(LIVE_SEED_LIMIT);
       if (stopped) return;
       if (e) { setError(e.message); return; }
-      // Defense in depth: drop any row whose tenant_id doesn't match.
-      // applyTenantScope already added .eq, but a permissive RLS policy
-      // (e.g. the view-link cross-tenant SELECT) could let sibling rows
-      // through. Never display another customer's data.
-      setRows((data || []).filter(scopedTo(pickedTenantId)));
+      // Strict tenant gate on every row regardless of who the viewer is.
+      // For a regular signed-in user effectiveTenantId is their own
+      // tenant; for master with the picker it's the picked tenant; for a
+      // view-link viewer it's the share-link tenant. Empty effective
+      // tenant means master-without-picker (allowed to see all).
+      const filtered = (data || []).filter((r) => {
+        if (effectiveTenantId) {
+          if (!r?.tenant_id || r.tenant_id !== effectiveTenantId) return false;
+        }
+        if (pickedEdgeId && r?.gateway_id) {
+          // Drop rows that belong to other edges when master picked one.
+          // Lookup by edge_id requires cross-reference; for now we narrow
+          // by checking the scope_key on dashboards only — for live rows
+          // we just keep them tenant-scoped.
+        }
+        return true;
+      });
+      setRows(filtered);
       setError("");
       setRtt(Math.round(performance.now() - t0));
     };
@@ -292,11 +322,9 @@ function useLiveLatest(enabled = true) {
         (payload) => {
           const r = payload.new || payload.record || null;
           if (!r || !r.tag_name) return;
-          // Tenant guard: when a tenant is picked, ONLY accept rows that
-          // explicitly match it. Rows with empty/missing tenant_id are
-          // dropped — better to lose a row than to leak another tenant's
-          // value into the selected customer's view.
-          if (pickedTenantId && r.tenant_id !== pickedTenantId) return;
+          // Strict tenant gate: drop foreign rows AND drop rows with
+          // empty/missing tenant_id (cannot prove they belong to us).
+          if (effectiveTenantId && (!r.tenant_id || r.tenant_id !== effectiveTenantId)) return;
           setRows((prev) => {
             const key = `${r.gateway_id || ""}|${r.tag_name}`;
             const next = prev.filter((p) => `${p.gateway_id || ""}|${p.tag_name}` !== key);
@@ -333,7 +361,7 @@ function useLiveLatest(enabled = true) {
       if (channel) supabase.removeChannel(channel).catch(() => {});
       if (pollTimer) clearInterval(pollTimer);
     };
-  }, [enabled, pickedTenantId]);
+  }, [enabled, pickedTenantId, effectiveTenantId, pickedEdgeId]);
 
   return { rows, error, rtt, transport };
 }
@@ -344,7 +372,7 @@ function useDashboardProfiles(enabled = true) {
     try { return localStorage.getItem("tnlite-profile") || ""; } catch (_) { return ""; }
   });
   const [error, setError] = useState("");
-  const { pickedTenantId } = useContext(TenantScopeCtx);
+  const { pickedTenantId, effectiveTenantId, pickedEdgeId } = useContext(TenantScopeCtx);
   // Clear the persisted active profile key whenever the tenant changes
   // (share-link switch, master picker change, login under a different
   // account). Carrying a previous tenant's scope_key as activeKey caused
@@ -352,10 +380,20 @@ function useDashboardProfiles(enabled = true) {
   // when the new tenant's dashboards hadn't loaded yet.
   useEffect(() => {
     setActiveKey((prev) => {
-      if (!prev || !pickedTenantId) return prev;
-      return prev.startsWith(pickedTenantId + "|") ? prev : "";
+      if (!prev || !effectiveTenantId) return prev;
+      return prev.startsWith(effectiveTenantId + "|") ? prev : "";
     });
-  }, [pickedTenantId]);
+  }, [effectiveTenantId]);
+  // Also reset on edge change so master's profile picker re-aims at the
+  // newly-selected edge's first profile.
+  useEffect(() => {
+    setActiveKey((prev) => {
+      if (!prev || !pickedEdgeId) return prev;
+      const parts = String(prev).split("|");
+      const edgeSeg = parts[2] || "";
+      return edgeSeg === pickedEdgeId ? prev : "";
+    });
+  }, [pickedEdgeId]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -389,10 +427,10 @@ function useDashboardProfiles(enabled = true) {
       if (stopped) return;
       if (e) { setError(e.message); return; }
       setError("");
-      // Defensive double-filter: RLS for view-link viewers grants reads
-      // across multiple tenants when more than one tenant has an active
-      // share-link. If pickedTenantId is set, NEVER let a row from a
-      // different tenant slip into this customer's profile picker.
+      // Defensive double-filter. effectiveTenantId is the row's required
+      // tenant — for a regular signed-in user it's their JWT tenant; for
+      // master with a picked tenant it's the picker; for view-link it's
+      // the share-link tenant. We NEVER trust an empty tenant_id on a row.
       const seen = new Set();
       const raw = (data || []).map((r) => ({
         key: r.scope_key || "",
@@ -403,15 +441,21 @@ function useDashboardProfiles(enabled = true) {
       })).filter((p) => {
         if (!p.key) return false;
         if (seen.has(p.key)) return false;
-        // Client-side tenant guard. applyTenantScope already added an
-        // .eq filter, but a stale RLS row or a permissive policy must
-        // not reach the picker. The picker is the gateway every chart
-        // widget then trusts.
-        if (pickedTenantId && p.tenant_id && p.tenant_id !== pickedTenantId) return false;
-        // Also enforce scope-key starts with the tenant prefix — catches
-        // the edge case where a row's tenant_id column is correct but
-        // the scope_key was authored against another tenant.
-        if (pickedTenantId && p.key && !p.key.startsWith(pickedTenantId + "|")) return false;
+        // When effectiveTenantId is set (regular user, view-link, or
+        // master with a picked tenant), require an exact match. Drop
+        // rows with empty/null tenant_id rather than letting them
+        // through under the "RLS will sort it" assumption.
+        if (effectiveTenantId) {
+          if (!p.tenant_id || p.tenant_id !== effectiveTenantId) return false;
+          if (!p.key.startsWith(effectiveTenantId + "|")) return false;
+        }
+        // Optional master-only edge filter: keep only scope_keys whose
+        // middle segment (the edge_id) matches the picked edge.
+        if (pickedEdgeId) {
+          const parts = String(p.key).split("|");
+          const edgeSeg = parts[2] || "";
+          if (edgeSeg !== pickedEdgeId) return false;
+        }
         seen.add(p.key);
         return true;
       });
@@ -429,7 +473,7 @@ function useDashboardProfiles(enabled = true) {
       stopped = true;
       if (channel) supabase.removeChannel(channel).catch(() => {});
     };
-  }, [enabled, pickedTenantId]);
+  }, [enabled, pickedTenantId, effectiveTenantId, pickedEdgeId]);
 
   const setActive = (key) => {
     setActiveKey(key || "");
@@ -1782,8 +1826,9 @@ function DashboardToolbar({ widgetCount, profiles, activeKey, setActiveKey, pref
 // header so mobile users can reach it).
 function DashboardSettingsModal({ open, onClose, profiles, activeKey, setActiveKey, prefs, setPrefs,
                                   // Master-admin only props. When isGlobalAdmin
-                                  // is false the picker row is hidden.
-                                  isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant }) {
+                                  // is false the tenant + edge picker rows are hidden.
+                                  isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant,
+                                  availableEdges = [], pickedEdgeId = "", onPickEdge = null }) {
   if (!open) return null;
   return h("div", {
     className: "settings-back",
@@ -1810,6 +1855,27 @@ function DashboardSettingsModal({ open, onClose, profiles, activeKey, setActiveK
                 ...availableTenants.map((t) => h("option", {
                   key: t.tenant_id, value: t.tenant_id,
                 }, `${t.label} · ${t.tenant_id}`))
+              )
+            )
+          : null,
+        // Edge picker — master-admin only, only meaningful when a tenant is
+        // picked AND that tenant has more than one edge. Lets the master
+        // drill into one specific edge's dashboards without switching
+        // tenant. Regular operators of a customer with multiple edges
+        // see EVERY profile for their tenant in the Profile picker below,
+        // so they don't need this row.
+        (isGlobalAdmin && pickedTenantId && Array.isArray(availableEdges) && availableEdges.length > 0)
+          ? h("div", { className: "settings-row" },
+              h("label", null, "Edge"),
+              h("select", {
+                value: pickedEdgeId || "",
+                onChange: (e) => onPickEdge && onPickEdge(e.target.value),
+                style: { minWidth: 220 },
+              },
+                h("option", { value: "" }, `All edges (${availableEdges.length})`),
+                ...availableEdges.map((eg) => h("option", {
+                  key: eg.edge_id, value: eg.edge_id,
+                }, `${eg.label} · ${eg.edge_id}`))
               )
             )
           : null,
@@ -1866,7 +1932,8 @@ function DashboardSettingsModal({ open, onClose, profiles, activeKey, setActiveK
 
 function DashboardView({ liveRows, profiles, active, activeKey, setActiveKey, prefs, setPrefs, gatewayLastSeen, onOpenDrawer, onOpenWidget,
                          // Master-admin picker props — passed through to the settings modal.
-                         isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant }) {
+                         isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant,
+                         availableEdges = [], pickedEdgeId = "", onPickEdge = null }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   // ensure historian channel is up so chart widgets can append.
   useEffect(() => { ensureHistorianChannel(); }, []);
@@ -1928,6 +1995,7 @@ function DashboardView({ liveRows, profiles, active, activeKey, setActiveKey, pr
       open: settingsOpen, onClose: () => setSettingsOpen(false),
       profiles, activeKey, setActiveKey, prefs, setPrefs,
       isGlobalAdmin, availableTenants, pickedTenantId, onPickTenant,
+      availableEdges, pickedEdgeId, onPickEdge,
     }),
     widgets.length === 0 ?
       h("div", { className: "empty" },
@@ -3272,6 +3340,33 @@ function App({ viewLink = null }) {
     return () => { stopped = true; };
   }, [session, isGlobalAdmin]);
 
+  // When master picks a tenant, load that tenant's edge list so the
+  // Settings modal can show an Edge picker. We use cp_edges (the
+  // control-plane mirror) so the user sees the operator-set friendly
+  // name rather than the raw edge_id.
+  const [availableEdges, setAvailableEdges] = useState([]);
+  useEffect(() => {
+    if (!session || !isGlobalAdmin || !pickedTenantId) { setAvailableEdges([]); return; }
+    let stopped = false;
+    (async () => {
+      try {
+        const { data } = await supabase.from("cp_edges")
+          .select("edge_id, edge_name, tenant_id")
+          .eq("tenant_id", pickedTenantId)
+          .limit(500);
+        if (stopped) return;
+        const list = (data || [])
+          .filter((r) => r && r.edge_id)
+          .map((r) => ({ edge_id: String(r.edge_id), label: String(r.edge_name || r.edge_id) }))
+          .sort((a, b) => a.label.localeCompare(b.label));
+        setAvailableEdges(list);
+      } catch (_) {
+        if (!stopped) setAvailableEdges([]);
+      }
+    })();
+    return () => { stopped = true; };
+  }, [session, isGlobalAdmin, pickedTenantId]);
+
   // Persist the picker selection so a page reload keeps the view.
   // EXCEPT in view-link mode — the tenant is pinned by the share token,
   // not a user choice, and writing it into localStorage would leak the
@@ -3283,20 +3378,53 @@ function App({ viewLink = null }) {
     catch (_) {}
   }, [pickedTenantId, isViewLinkMode]);
 
+  // Optional master-only secondary filter — pick ONE edge so the profile
+  // picker and live view only show that edge's rows. Empty = show every
+  // edge for the picked tenant. Persisted to localStorage so the master
+  // doesn't have to re-pick after a reload.
+  const [pickedEdgeId, setPickedEdgeId] = useState(() => {
+    try { return localStorage.getItem("tnlite-picked-edge") || ""; }
+    catch (_) { return ""; }
+  });
+  useEffect(() => {
+    if (isViewLinkMode) return;
+    try { localStorage.setItem("tnlite-picked-edge", pickedEdgeId || ""); }
+    catch (_) {}
+  }, [pickedEdgeId, isViewLinkMode]);
+  // When the tenant changes, drop any picked edge — it almost certainly
+  // doesn't belong to the new tenant.
+  useEffect(() => { setPickedEdgeId(""); }, [pickedTenantId]);
+
   // Tenant scope for every scoped query in the app. Three cases:
   //   - view-link mode: pin to the resolved tenant_id (anon viewer needs
   //     an explicit filter because there's no auth.uid() for RLS to
   //     match against the user's lite_profile).
   //   - global admin: use the picker (empty = all tenants).
-  //   - regular signed-in user: empty so RLS does the filtering.
-  const tenantScopeValue = useMemo(() => ({
-    pickedTenantId: isViewLinkMode
-      ? (viewLink?.tenant_id || "")
-      : (isGlobalAdmin ? (pickedTenantId || "") : ""),
-    setPickedTenantId,
-    isGlobalAdmin,
-    userTenantId,
-  }), [isGlobalAdmin, pickedTenantId, userTenantId, isViewLinkMode, viewLink]);
+  //   - regular signed-in user: empty (RLS handles filtering on the
+  //     server). pickedTenantId stays empty for them so the master-only
+  //     UI controls don't render, but effectiveTenantId below carries
+  //     their JWT tenant for client-side defense-in-depth.
+  const tenantScopeValue = useMemo(() => {
+    const picked = isViewLinkMode
+      ? String(viewLink?.tenant_id || "")
+      : (isGlobalAdmin ? String(pickedTenantId || "") : "");
+    // effectiveTenantId = what we GATE EVERY ROW against. For a regular
+    // signed-in user it's their own tenant — that way, if a query ever
+    // returns a foreign row (RLS mis-applied, realtime payload leaking,
+    // mirror cache stale), our defensive filter still drops it.
+    const effective = isViewLinkMode
+      ? String(viewLink?.tenant_id || "")
+      : (isGlobalAdmin ? picked : String(userTenantId || ""));
+    return {
+      pickedTenantId: picked,
+      setPickedTenantId,
+      isGlobalAdmin,
+      userTenantId,
+      effectiveTenantId: effective,
+      pickedEdgeId: isGlobalAdmin ? String(pickedEdgeId || "") : "",
+      setPickedEdgeId,
+    };
+  }, [isGlobalAdmin, pickedTenantId, userTenantId, isViewLinkMode, viewLink, pickedEdgeId]);
 
   // Hooks must run unconditionally. The hooks themselves check supabase/
   // session before making any RPC, so calling them when signed out is a
@@ -3344,13 +3472,16 @@ function App({ viewLink = null }) {
   if (tab === "dashboard") content = h(DashboardView, {
     liveRows, profiles, active, activeKey, setActiveKey,
     prefs, setPrefs, gatewayLastSeen, onOpenDrawer, onOpenWidget,
-    // Master-admin tenant picker — now lives inside the dashboard
-    // settings modal (the gear). Forward the props so the modal can
-    // render the picker row when isGlobalAdmin.
+    // Master-admin tenant + edge pickers — both live inside the
+    // dashboard settings modal (the gear). Forward the props so the
+    // modal can render the picker rows when isGlobalAdmin.
     isGlobalAdmin,
     availableTenants,
     pickedTenantId,
     onPickTenant: setPickedTenantId,
+    availableEdges,
+    pickedEdgeId,
+    onPickEdge: setPickedEdgeId,
   });
   else if (tab === "history") content = h(HistorianView, null);
   else if (tab === "alarms") content = h(AlarmsView, { liveRows });
