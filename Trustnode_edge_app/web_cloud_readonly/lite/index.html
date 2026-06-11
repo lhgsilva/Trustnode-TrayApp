@@ -1653,9 +1653,85 @@ function Widget({ widget, liveByKey, onOpen, onOpenWidget, gridStyle }) {
   // chart the full card area. Mirror that here so headerless widgets
   // look identical between edge and Lite.
   const hideHeader = !!cfg.hide_widget_header;
+  // Edge dashboards show "<value> | <tag> | <type>" in the title bar
+  // (one pair per series for multi-series charts). Reproduce that here
+  // by resolving every series's current value from liveByKey, applying
+  // the same multiplier/offset that the chart uses, and rendering each
+  // value in its own series color. Operator-reported gap 2026-06-11.
+  const headerBuild = (() => {
+    if (!isChart || hideHeader) return null;
+    const palette = ["#14a89a", "#f97316", "#6e8dd2", "#e2585d", "#a855f7", "#0e8479", "#22c55e", "#fbbf24"];
+    const typeLabel = (
+      widget?.title && String(widget.title).trim()
+    ) || (
+      type === "line_chart" ? "Line Chart" :
+      type === "line_area_chart" ? "Area Chart" :
+      type === "bar_chart" ? "Bar Chart" :
+      String(type || "Chart")
+    );
+    const items = [];
+    const fmtHead = (v) => {
+      if (v == null || !Number.isFinite(Number(v))) return "—";
+      return Number(v).toLocaleString(undefined, { maximumFractionDigits: 3 });
+    };
+    const scale = (raw, mul, off) => {
+      const v = Number(raw);
+      if (!Number.isFinite(v)) return null;
+      const m = Number.isFinite(Number(mul)) && Number(mul) !== 0 ? Number(mul) : 1;
+      const o = Number.isFinite(Number(off)) ? Number(off) : 0;
+      return v * m + o;
+    };
+    // Primary
+    if (cfg.tag_name) {
+      const row = liveByKey?.lookup ? liveByKey.lookup({
+        gateway_id: cfg.gateway_id,
+        tag_name: cfg.tag_name,
+        plc_endpoint: cfg.plc_endpoint || cfg.plc_ip,
+      }) : null;
+      const v = row ? scale(row.value, cfg.multiplier, cfg.offset) : null;
+      items.push({
+        value: fmtHead(v),
+        tag: String(cfg.tag_name),
+        color: String(widget?.color || "#14a89a"),
+      });
+    }
+    // Extras (skip limits)
+    const extras = Array.isArray(cfg.series_extra) ? cfg.series_extra : [];
+    extras.forEach((s, i) => {
+      if (!s || !s.tag_name) return;
+      if (String(s.chart_type || "").toLowerCase() === "limit") return;
+      const row = liveByKey?.lookup ? liveByKey.lookup({
+        gateway_id: s.gateway_id || cfg.gateway_id,
+        tag_name: s.tag_name,
+        plc_endpoint: s.plc_endpoint || s.plc_ip || cfg.plc_endpoint,
+      }) : null;
+      const v = row ? scale(row.value, s.multiplier, s.offset) : null;
+      items.push({
+        value: fmtHead(v),
+        tag: String(s.label || s.tag_name),
+        color: String(s.color || palette[(i + 1) % palette.length]),
+      });
+    });
+    if (!items.length) return { typeLabel, items: [] };
+    return { typeLabel, items };
+  })();
+  const renderHeader = () => {
+    if (!headerBuild) return h("div", { className: "widget-title" }, widgetTitle(widget) || cfg.tag_name || "—");
+    const { items, typeLabel } = headerBuild;
+    const children = [];
+    items.forEach((it, idx) => {
+      if (idx > 0) children.push(h("span", { key: `sep-${idx}`, className: "widget-head-sep" }, "·"));
+      children.push(h("span", { key: `v-${idx}`, className: "widget-head-value", style: { color: it.color } }, it.value));
+      children.push(h("span", { key: `b-${idx}`, className: "widget-head-sep" }, "|"));
+      children.push(h("span", { key: `t-${idx}`, className: "widget-head-tag" }, it.tag));
+    });
+    if (items.length) children.push(h("span", { key: "tsep", className: "widget-head-sep" }, "|"));
+    children.push(h("span", { key: "typ", className: "widget-head-type" }, typeLabel));
+    return h("div", { className: "widget-head-text" }, ...children);
+  };
   const titleBar = (isChart && !hideHeader)
     ? h("div", { className: "widget-title-row" },
-        h("div", { className: "widget-title" }, widgetTitle(widget) || cfg.tag_name || "—"),
+        renderHeader(),
         onOpenWidget ? h("button", {
           className: "widget-expand",
           title: "Open in Tag Monitor",
