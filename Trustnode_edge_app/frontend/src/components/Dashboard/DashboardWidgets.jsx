@@ -644,6 +644,436 @@ function renderPieSliceLabelFactory({ showCount, showPercent }) {
   };
 }
 
+// =====================================================================
+// LiveTagChart — minimal, reliable live trend renderer.
+//
+// Design (based on the Grafana Live / ThingsBoard / Ignition pattern
+// the research phase confirmed is universal):
+//
+//   1. ONE seed REST fetch on mount → fills the ring buffer with the
+//      last N samples per series from local historian.
+//   2. Subscribe to dataLogView (the WebSocket-fed in-memory log the
+//      whole app already maintains). On every render, append samples
+//      whose ts > last-seen ts to the ring buffer.
+//   3. NO heartbeat re-fetches. WebSocket is the only steady-state
+//      writer. This kills the race between the per-widget REST fetcher
+//      and the WS stream that produced every "loaded then frozen"
+//      and "chart blank but historian has data" symptom.
+//   4. Reseed once if the WS stream reconnects after a drop (we detect
+//      this via a long gap in incoming samples).
+//   5. Gap rendering: if delta-t between consecutive ring-buffer
+//      samples > pollInterval × 1.5, insert a null so Recharts breaks
+//      the line. No internal carry-forward.
+//
+// Used for the LIVE case — no time range, no grouping. The complex
+// fetcher path stays for historical + grouping.
+// =====================================================================
+function LiveTagChart({
+  widget,
+  dataLogView,
+  fetchWidgetRows,
+  gatewayIntervalMs,
+  resolvedGatewayId,
+  tagName,
+  formatTagForDisplay,
+}) {
+  const cfg = widget?.config || {};
+  const widgetType = String(widget?.type || "line_chart");
+  const capacity = Math.max(5, Math.min(5000, Number(cfg?.readings_count || 60)));
+  const pollMs = Math.max(200, Number(gatewayIntervalMs || 1000));
+  const gapThresholdMs = pollMs * 1.5;
+
+  // Series definitions: primary + non-limit extras. Recomputed only when
+  // the operator changes the tag or extras (cheap memo key).
+  const seriesDefs = useMemo(() => {
+    const out = [];
+    if (tagName) {
+      out.push({
+        id: "primary",
+        gatewayId: String(resolvedGatewayId || cfg.gateway_id || ""),
+        tagName: String(tagName),
+        label: String(widget?.title || tagName).trim() || tagName,
+        color: String(widget?.color || "#14a89a"),
+        multiplier: Number.isFinite(Number(cfg.multiplier)) && Number(cfg.multiplier) !== 0
+          ? Number(cfg.multiplier) : 1,
+        offset: Number.isFinite(Number(cfg.offset)) ? Number(cfg.offset) : 0,
+        unit: String(cfg.primary_unit || ""),
+        suffix: String(cfg.primary_suffix || ""),
+        axis: "left",
+        chartKind: widgetType === "bar_chart" ? "bar"
+          : widgetType === "line_area_chart" ? "area"
+          : "line",
+      });
+    }
+    const extras = Array.isArray(cfg.series_extra) ? cfg.series_extra : [];
+    const palette = ["#14a89a", "#f97316", "#3b82f6", "#a855f7", "#22c55e", "#eab308"];
+    extras.forEach((s, i) => {
+      if (!s || !s.tag_name) return;
+      if (String(s.chart_type || "").toLowerCase() === "limit") return;
+      out.push({
+        id: String(s.id || `extra_${i}`),
+        gatewayId: String(s.gateway_id || resolvedGatewayId || ""),
+        tagName: String(s.tag_name),
+        label: String(s.label || s.tag_name),
+        color: String(s.color || palette[(i + 1) % palette.length]),
+        multiplier: Number.isFinite(Number(s.multiplier)) && Number(s.multiplier) !== 0
+          ? Number(s.multiplier) : 1,
+        offset: Number.isFinite(Number(s.offset)) ? Number(s.offset) : 0,
+        unit: String(s.unit || ""),
+        suffix: String(s.suffix || ""),
+        axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
+        chartKind: (() => {
+          const t = String(s.chart_type || "").toLowerCase();
+          if (t === "bar") return "bar";
+          if (t === "area") return "area";
+          if (t === "line") return "line";
+          // fall back to widget type
+          return widgetType === "bar_chart" ? "bar"
+            : widgetType === "line_area_chart" ? "area"
+            : "line";
+        })(),
+      });
+    });
+    return out;
+  }, [
+    widget?.title,
+    widget?.color,
+    widgetType,
+    resolvedGatewayId,
+    tagName,
+    cfg.multiplier,
+    cfg.offset,
+    cfg.primary_unit,
+    cfg.primary_suffix,
+    cfg.gateway_id,
+    JSON.stringify(cfg.series_extra || []),
+  ]);
+
+  // Ring buffers — one Map per series. Map<tsMs, scaledValue> so dedupe
+  // is automatic. We never mutate; we replace the ref on each update so
+  // the render derivation can rely on identity changes.
+  const buffersRef = useRef(null);
+  // Track the highest ts we've ingested per series so we can append
+  // only strictly newer WS rows.
+  const lastSeenTsRef = useRef(null);
+  // Identity-keyed last seen timestamp for detecting WS drops + reseed.
+  const lastIngestWallclockRef = useRef(Date.now());
+  // Force re-render tick. Bumped whenever ring buffer changes.
+  const [tick, setTick] = useState(0);
+  const [seedError, setSeedError] = useState("");
+  const [seedReady, setSeedReady] = useState(false);
+
+  // Reset buffers + reseed when the set of series identity changes.
+  const seriesKey = useMemo(
+    () => seriesDefs.map((s) => `${s.gatewayId}|${s.tagName}`).join("||"),
+    [seriesDefs]
+  );
+
+  useEffect(() => {
+    const fresh = new Map();
+    const fresh2 = new Map();
+    for (const s of seriesDefs) {
+      fresh.set(s.id, new Map());
+      fresh2.set(s.id, -Infinity);
+    }
+    buffersRef.current = fresh;
+    lastSeenTsRef.current = fresh2;
+    setSeedReady(false);
+    setSeedError("");
+    setTick((t) => t + 1);
+
+    if (!seriesDefs.length || typeof fetchWidgetRows !== "function") {
+      setSeedReady(true);
+      return undefined;
+    }
+    // Seed each series in parallel. Local SQLite read for last N rows
+    // is fast; even 4 series × 60 rows = 240 rows total comes back in
+    // well under 200 ms on a populated edge.
+    let cancelled = false;
+    Promise.all(seriesDefs.map(async (s) => {
+      try {
+        const rows = await fetchWidgetRows({
+          fromUtc: "",
+          toUtc: "",
+          limit: capacity,
+          offset: 0,
+          gateway: s.gatewayId || "",
+          tag: s.tagName,
+          timeoutMs: 8000,
+          maxAttempts: 2,
+        });
+        if (cancelled) return;
+        const buf = buffersRef.current?.get(s.id);
+        if (!buf) return;
+        let newest = -Infinity;
+        for (const r of Array.isArray(rows) ? rows : []) {
+          const tsMs = Date.parse(String(r?.ts || r?.ts_utc || ""));
+          const raw = Number(r?.value);
+          if (!Number.isFinite(tsMs) || !Number.isFinite(raw)) continue;
+          buf.set(tsMs, raw * s.multiplier + s.offset);
+          if (tsMs > newest) newest = tsMs;
+        }
+        if (newest > -Infinity) {
+          lastSeenTsRef.current?.set(s.id, newest);
+        }
+      } catch (err) {
+        if (!cancelled) setSeedError(String(err?.message || err));
+      }
+    })).then(() => {
+      if (!cancelled) {
+        setSeedReady(true);
+        setTick((t) => t + 1);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [seriesKey, capacity, fetchWidgetRows]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Ingest WS samples: append rows from dataLogView whose ts is strictly
+  // newer than the last seen ts for that series. Runs on every parent
+  // re-render — that's cheap because lastSeenTs makes the per-series
+  // scan O(new rows) and the ring buffer cap stays bounded.
+  useEffect(() => {
+    if (!seedReady || !seriesDefs.length || !Array.isArray(dataLogView) || dataLogView.length === 0) return;
+    const buffers = buffersRef.current;
+    const lastSeen = lastSeenTsRef.current;
+    if (!buffers || !lastSeen) return;
+    let didAppend = false;
+    for (const s of seriesDefs) {
+      const buf = buffers.get(s.id);
+      if (!buf) continue;
+      const last = lastSeen.get(s.id) || -Infinity;
+      let newest = last;
+      // dataLogView is sorted newest-first by mergeHistorianRowsStable.
+      for (const r of dataLogView) {
+        const tag = String(r?.tag || r?.tag_name || "");
+        if (tag !== s.tagName) continue;
+        // Match by gateway_id OR fall through if not strict (tag-only widgets).
+        const gid = String(r?.gateway_id || "");
+        if (s.gatewayId && gid && gid !== s.gatewayId) continue;
+        const tsMs = Date.parse(String(r?.ts || r?.ts_utc || ""));
+        if (!Number.isFinite(tsMs) || tsMs <= last) continue;
+        const raw = Number(r?.value);
+        if (!Number.isFinite(raw)) continue;
+        buf.set(tsMs, raw * s.multiplier + s.offset);
+        if (tsMs > newest) newest = tsMs;
+        didAppend = true;
+      }
+      if (newest > last) {
+        lastSeen.set(s.id, newest);
+        lastIngestWallclockRef.current = Date.now();
+      }
+      // Cap ring buffer at 2× capacity so we always have a small tail
+      // for gap detection without unbounded memory growth.
+      if (buf.size > capacity * 2) {
+        const sorted = [...buf.keys()].sort((a, b) => a - b);
+        for (let i = 0; i < sorted.length - capacity * 2; i += 1) buf.delete(sorted[i]);
+      }
+    }
+    if (didAppend) setTick((t) => t + 1);
+  }, [dataLogView, seedReady, seriesDefs, capacity]);
+
+  // Re-seed when the WS appears to have stalled — heuristic: if no new
+  // sample has hit the buffer for 3× the poll interval (and we ARE
+  // ready), the stream is probably reconnecting. Re-pull the missing
+  // tail so we recover without the operator opening DevTools.
+  useEffect(() => {
+    if (!seedReady || !seriesDefs.length || typeof fetchWidgetRows !== "function") return undefined;
+    const checkMs = Math.max(2000, pollMs * 3);
+    const id = setInterval(() => {
+      const stalledFor = Date.now() - (lastIngestWallclockRef.current || 0);
+      if (stalledFor < pollMs * 3) return;
+      // Stall: fetch the tail since the last seen ts for each series.
+      const lastSeen = lastSeenTsRef.current;
+      if (!lastSeen) return;
+      seriesDefs.forEach(async (s) => {
+        try {
+          const since = lastSeen.get(s.id) || 0;
+          const rows = await fetchWidgetRows({
+            fromUtc: since > 0 ? new Date(since).toISOString() : "",
+            toUtc: "",
+            limit: capacity,
+            offset: 0,
+            gateway: s.gatewayId || "",
+            tag: s.tagName,
+            timeoutMs: 6000,
+            maxAttempts: 1,
+          });
+          const buf = buffersRef.current?.get(s.id);
+          if (!buf) return;
+          let newest = lastSeen.get(s.id) || -Infinity;
+          for (const r of Array.isArray(rows) ? rows : []) {
+            const tsMs = Date.parse(String(r?.ts || r?.ts_utc || ""));
+            const raw = Number(r?.value);
+            if (!Number.isFinite(tsMs) || !Number.isFinite(raw)) continue;
+            if (tsMs <= newest) continue;
+            buf.set(tsMs, raw * s.multiplier + s.offset);
+            if (tsMs > newest) newest = tsMs;
+          }
+          if (newest > (lastSeen.get(s.id) || -Infinity)) {
+            lastSeen.set(s.id, newest);
+            lastIngestWallclockRef.current = Date.now();
+            setTick((t) => t + 1);
+          }
+        } catch (_) { /* will retry on next stall tick */ }
+      });
+    }, checkMs);
+    return () => clearInterval(id);
+  }, [seedReady, seriesDefs, pollMs, capacity, fetchWidgetRows]);
+
+  // Build the rendered dataset: union of timestamps across all series,
+  // last `capacity` rows, with null gap inserts. O(N log N).
+  const renderedData = useMemo(() => {
+    const buffers = buffersRef.current;
+    if (!buffers) return { rows: [], hasRightAxis: false };
+    const tsSet = new Set();
+    for (const s of seriesDefs) {
+      const buf = buffers.get(s.id);
+      if (!buf) continue;
+      for (const ts of buf.keys()) tsSet.add(ts);
+    }
+    let sorted = [...tsSet].sort((a, b) => a - b);
+    if (sorted.length > capacity) sorted = sorted.slice(-capacity);
+
+    const rows = [];
+    for (let i = 0; i < sorted.length; i += 1) {
+      const tsMs = sorted[i];
+      const row = { idx: rows.length + 1, tsMs, ts: new Date(tsMs).toISOString() };
+      for (const s of seriesDefs) {
+        const buf = buffers.get(s.id);
+        if (!buf) { row[s.id] = null; continue; }
+        // exact-match; if this series didn't emit at this ts, null
+        row[s.id] = buf.has(tsMs) ? buf.get(tsMs) : null;
+      }
+      rows.push(row);
+      // Gap insert
+      const next = sorted[i + 1];
+      if (next !== undefined && (next - tsMs) > gapThresholdMs) {
+        const midTs = tsMs + Math.floor((next - tsMs) / 2);
+        const gapRow = { idx: rows.length + 1, tsMs: midTs, ts: new Date(midTs).toISOString() };
+        for (const s of seriesDefs) gapRow[s.id] = null;
+        rows.push(gapRow);
+      }
+    }
+    const hasRightAxis = seriesDefs.some((s) => s.axis === "right");
+    return { rows, hasRightAxis };
+    // tick changes are the signal that buffers mutated.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tick, seriesDefs, capacity, gapThresholdMs]);
+
+  // Y axis: auto (data-fit) or manual (operator's min/max anchored at 0
+  // unless they typed a negative min — same rules the heavy widget uses).
+  const manualY = (() => {
+    if (String(cfg.y_axis_mode || "auto").toLowerCase() !== "manual") return null;
+    const lo = Number(cfg.y_min);
+    const hi = Number(cfg.y_max);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+    return { lo: lo < 0 ? lo : 0, hi };
+  })();
+  const yDomain = manualY
+    ? [manualY.lo, manualY.hi]
+    : [
+        (dataMin) => {
+          const n = Number.isFinite(dataMin) ? dataMin : 0;
+          return n - Math.abs(n) * 0.02 - 0.001;
+        },
+        (dataMax) => {
+          const n = Number.isFinite(dataMax) ? dataMax : 1;
+          return n + Math.abs(n) * 0.05 + 0.001;
+        },
+      ];
+
+  const xTickFormatter = (v) => {
+    const r = renderedData.rows.find((p) => p.idx === v);
+    if (!r) return "";
+    const d = new Date(r.tsMs);
+    if (!Number.isFinite(d.getTime())) return "";
+    return d.toLocaleTimeString();
+  };
+  const labelFmt = (v) => {
+    const r = renderedData.rows.find((p) => p.idx === v);
+    if (!r) return String(v);
+    return new Date(r.tsMs).toLocaleString();
+  };
+  const fmtVal = (v, name) => {
+    if (v == null || !Number.isFinite(Number(v))) return ["—", name];
+    const s = seriesDefs.find((x) => x.id === name) || seriesDefs.find((x) => x.label === name);
+    const base = Number(v).toLocaleString(undefined, { maximumFractionDigits: 3 });
+    if (s?.suffix) return [`${base}${s.suffix}`, s.label];
+    if (s?.unit) return [`${base} ${s.unit}`, s.label];
+    return [base, s?.label || name];
+  };
+  const margin = { top: 4, right: 8, left: 0, bottom: 18 };
+
+  if (seedError && renderedData.rows.length === 0) {
+    return (
+      <div className="dashboard-widget-block dashboard-widget-block-chart">
+        <div className="dashboard-widget-empty warn">
+          Historian fetch failed: {seedError.slice(0, 140)}
+        </div>
+      </div>
+    );
+  }
+  if (!seedReady) {
+    return (
+      <div className="dashboard-widget-block dashboard-widget-block-chart">
+        <div className="dashboard-widget-empty muted">Loading…</div>
+      </div>
+    );
+  }
+  if (renderedData.rows.length === 0) {
+    return (
+      <div className="dashboard-widget-block dashboard-widget-block-chart">
+        <div className="dashboard-widget-empty muted">
+          No points yet — waiting for the gateway to publish samples for{" "}
+          <code>{tagName || "(no tag)"}</code>.
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="dashboard-widget-block dashboard-widget-block-chart">
+      <div className="dashboard-widget-chart">
+        <ResponsiveContainer width="100%" height="100%">
+          <ComposedChart data={renderedData.rows} margin={margin}>
+            <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+            <XAxis
+              dataKey="idx"
+              tickFormatter={xTickFormatter}
+              fontSize={10}
+              interval="preserveStartEnd"
+            />
+            <YAxis yAxisId="left" domain={yDomain} fontSize={10} />
+            {renderedData.hasRightAxis ? (
+              <YAxis yAxisId="right" orientation="right" domain={yDomain} fontSize={10} />
+            ) : null}
+            <Tooltip labelFormatter={labelFmt} formatter={fmtVal} />
+            {seriesDefs.length > 1 ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
+            {seriesDefs.map((s) => {
+              const yId = s.axis === "right" ? "right" : "left";
+              const common = {
+                key: s.id,
+                dataKey: s.id,
+                name: s.label,
+                yAxisId: yId,
+                stroke: s.color,
+                isAnimationActive: false,
+                connectNulls: false,
+              };
+              if (s.chartKind === "bar") {
+                return <Bar {...common} fill={s.color} />;
+              }
+              if (s.chartKind === "area") {
+                return <Area {...common} type="monotone" fill={s.color + "33"} strokeWidth={2} dot={false} />;
+              }
+              return <Line {...common} type="monotone" strokeWidth={2} dot={false} />;
+            })}
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+    </div>
+  );
+}
+
 export function DashboardWidgetCard({
   widget,
   dataLogView,
@@ -1920,6 +2350,38 @@ export function DashboardWidgetCard({
     case "line_chart":
     case "line_area_chart":
     case "bar_chart": {
+      // ── LIVE FAST PATH ──────────────────────────────────────────────
+      // When no time range, no grouping, and not in historical mode,
+      // route the chart through LiveTagChart. It uses the
+      // research-validated pattern: ONE seed REST fetch on mount, then
+      // append from the shared WebSocket-fed dataLogView, with a stall
+      // detector that re-fetches the tail when the WS drops a sample.
+      // No per-heartbeat REST polling, no merge race, no "loaded then
+      // frozen" symptom. The heavy path below stays for historical
+      // ranges and grouping / aggregation use-cases.
+      const hasGrouping = String(cfg?.query_group_interval || "none").toLowerCase() !== "none";
+      const hasTimePreset = String(cfg?.query_time_filter_preset || "none").toLowerCase() !== "none";
+      const hasTimeRange = !!(cfg?.query_time_filter_from || cfg?.query_time_filter_to);
+      const liveModeEligible =
+        !historicalMode
+        && !hasGrouping
+        && !hasTimePreset
+        && !hasTimeRange
+        && (resolvedLimitLines || []).length === 0;
+      if (liveModeEligible) {
+        return (
+          <LiveTagChart
+            widget={widget}
+            dataLogView={dataLogView}
+            fetchWidgetRows={typeof fetchWidgetRowsRef.current === "function" ? fetchWidgetRowsRef.current : null}
+            gatewayIntervalMs={gatewayIntervalMs}
+            resolvedGatewayId={resolvedGatewayId}
+            tagName={tagName}
+            formatTagForDisplay={formatTagForDisplay}
+          />
+        );
+      }
+
       // Multi-series-aware renderer. When `series_extra` is configured we draw
       // every series on a ComposedChart so primary + extras can coexist with
       // independent axes / chart types. Single-series widgets still flow
