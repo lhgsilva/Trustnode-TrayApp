@@ -9,7 +9,7 @@
  * evicted on activate. Browsers re-check the service worker on each navigation
  * so users pick the new shell up automatically next time they open the app.
  */
-const CACHE_VERSION = "tnlite-v43-widget-head-values";
+const CACHE_VERSION = "tnlite-v44-mobile-readings-hover-monitor";
 const SHELL = [
   "./",
   "./index.html",

@@ -2348,12 +2348,35 @@ function DashboardSettingsModal({ open, onClose, profiles, activeKey, setActiveK
             }, "2 columns")
           )
         ),
+        // Number-of-readings control. On mobile a plain <select> often
+        // misbehaves inside a modal (iOS native picker collides with the
+        // overlay), and operators told us they want to type ANY value not
+        // just a preset. We expose both: a number input bound to the
+        // shared sampleCount preference, plus the quick-pick segmented
+        // buttons below.  font-size: 16px keeps iOS from
+        // zoom-on-focusing the field.
         h("div", { className: "settings-row" },
           h("label", null, "Samples per chart"),
-          h("select", {
+          h("input", {
+            type: "number",
+            inputMode: "numeric",
+            min: 5,
+            max: 5000,
+            step: 1,
             value: String(prefs.sampleCount),
-            onChange: (e) => setPrefs({ ...prefs, sampleCount: Number(e.target.value) }),
-          }, ...[10, 20, 50, 100, 250, 500, 1000].map((n) => h("option", { key: n, value: String(n) }, String(n))))
+            style: { fontSize: 16 },
+            onChange: (e) => {
+              const v = Math.max(5, Math.min(5000, Math.round(Number(e.target.value) || 0)));
+              setPrefs({ ...prefs, sampleCount: v });
+            },
+          }),
+          h("div", { className: "seg seg-readings" },
+            ...[10, 20, 50, 100, 250, 500, 1000].map((n) => h("button", {
+              key: n,
+              className: `seg-btn ${Number(prefs.sampleCount) === n ? "active" : ""}`,
+              onClick: () => setPrefs({ ...prefs, sampleCount: n }),
+            }, String(n)))
+          )
         ),
         h("div", { className: "settings-row" },
           h("label", { title: "When on, the Y axis hugs the actual min/max so small variations stay visible." }, "Auto-fit Y axis"),

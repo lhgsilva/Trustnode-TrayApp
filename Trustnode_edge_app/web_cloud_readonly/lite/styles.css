@@ -1596,7 +1596,23 @@ main {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  transition: color .15s ease, border-color .15s ease;
+  /* Operator request: keep the "open in tag monitor" button out of the
+     way until the cursor enters the widget. We fade it in on hover and
+     keep it visible while focused (so keyboard users can still reach
+     it) and on touch devices (no hover -> always visible). */
+  opacity: 0;
+  transition: opacity .15s ease, color .15s ease, border-color .15s ease;
+}
+.widget:hover .widget-expand,
+.widget:focus-within .widget-expand,
+.widget-expand:focus,
+.widget-expand:focus-visible {
+  opacity: 1;
+}
+@media (hover: none) and (pointer: coarse) {
+  /* Touch-only devices (phones, most tablets) don't have a hover state,
+     so the icon would never appear. Show it permanently there. */
+  .widget-expand { opacity: 1; }
 }
 .widget-expand:hover { color: var(--teal); border-color: var(--teal); }
 
@@ -1800,13 +1816,32 @@ main {
 .settings-row input[type="range"] {
   width: 100%;
 }
-.settings-row select {
+.settings-row select,
+.settings-row input[type="number"] {
   background: var(--surface-elev);
   color: var(--text);
   border: 1px solid var(--stroke);
   border-radius: 8px;
   padding: 8px 10px;
-  font-size: 13px;
+  /* iOS Safari auto-zooms on any focusable form control whose font-size
+     is < 16 px. That zoom collided with the modal overlay layout and made
+     the operator look like the control was "stuck". 16 px is the safe
+     floor that keeps zoom-on-focus off. */
+  font-size: 16px;
+  width: 100%;
+}
+/* Compact horizontal segmented quick-pick row under the number input,
+   so a thumb can still hit a preset value in one tap on mobile. */
+.seg-readings {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.seg-readings .seg-btn {
+  flex: 0 0 auto;
+  min-width: 48px;
 }
 .settings-row-inline {
   display: flex;
