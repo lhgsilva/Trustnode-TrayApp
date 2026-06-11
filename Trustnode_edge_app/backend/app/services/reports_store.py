@@ -569,21 +569,26 @@ class ReportsStore:
         tenant_id: str | None = None,
         limit: int = 200,
         schedule_id: str | None = None,
+        template_id: str | None = None,
     ) -> list[dict[str, Any]]:
         tid = (tenant_id or get_current_tenant() or "default").strip() or "default"
         lim = max(1, min(int(limit or 200), 2000))
+        clauses = ["tenant_id = ?"]
+        params: list[Any] = [tid]
+        if schedule_id:
+            clauses.append("schedule_id = ?")
+            params.append(str(schedule_id))
+        if template_id:
+            clauses.append("template_id = ?")
+            params.append(str(template_id))
+        sql = (
+            "SELECT * FROM generated_reports WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_utc DESC LIMIT ?"
+        )
+        params.append(lim)
         with self._connect() as conn:
-            if schedule_id:
-                rows = conn.execute(
-                    "SELECT * FROM generated_reports WHERE tenant_id = ? AND schedule_id = ? "
-                    "ORDER BY created_utc DESC LIMIT ?",
-                    (tid, str(schedule_id), lim),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM generated_reports WHERE tenant_id = ? ORDER BY created_utc DESC LIMIT ?",
-                    (tid, lim),
-                ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [self._row_to_generated(r) for r in rows]
 
     def get_generated(self, generated_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:

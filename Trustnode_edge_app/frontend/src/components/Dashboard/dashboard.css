@@ -1562,3 +1562,41 @@
   text-overflow: ellipsis;
 }
 
+
+/* Report Card widget — dashboard surface for picking + triggering one
+   saved report template, with a link to the last generated PDF. */
+.dashboard-report-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 4px;
+  height: 100%;
+  justify-content: space-between;
+}
+.dashboard-report-card-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.dashboard-report-schedule {
+  font-size: 11px;
+  color: var(--muted, #8a98ab);
+  background: var(--card-2, rgba(20, 24, 32, 0.5));
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.dashboard-report-filename {
+  font-weight: 600;
+  word-break: break-all;
+  font-size: 13px;
+}
+.dashboard-report-meta {
+  font-size: 11px;
+  color: var(--muted, #8a98ab);
+}
+.dashboard-report-empty {
+  color: var(--muted, #8a98ab);
+  font-style: italic;
+}

@@ -1,4 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  listReportTemplates,
+  listGeneratedReports,
+  listScheduledReports,
+  runReportTemplateNow,
+  openGeneratedReport,
+} from "../../api";
 import {
   ResponsiveContainer,
   LineChart,
@@ -1380,15 +1387,33 @@ export function DashboardWidgetCard({
   }, [cfg?.offset]);
   const series = useMemo(() => {
     const raw = getTagSeriesFiltered(directScopedRowsAggregated, resolvedGatewayId, tagName, cfgReadingsCount);
-    if (primaryMultiplier === 1 && primaryOffset === 0) return raw;
-    return raw.map((p) => {
-      const v = Number(p?.value);
-      return {
-        ...p,
-        value: Number.isFinite(v) ? v * primaryMultiplier + primaryOffset : p?.value,
-      };
-    });
-  }, [directScopedRowsAggregated, resolvedGatewayId, tagName, cfgReadingsCount, primaryMultiplier, primaryOffset]);
+    const scaled = (primaryMultiplier === 1 && primaryOffset === 0)
+      ? raw
+      : raw.map((p) => {
+          const v = Number(p?.value);
+          return { ...p, value: Number.isFinite(v) ? v * primaryMultiplier + primaryOffset : p?.value };
+        });
+    // Insert null rows at gateway-down gaps so the chart line BREAKS
+    // visibly instead of drawing a diagonal across hours of downtime.
+    // Threshold = 3 × gateway poll interval (anything longer than that
+    // means the PLC stopped reporting, not just normal jitter).
+    if (scaled.length < 2) return scaled;
+    const tickMs = Math.max(500, Number(gatewayIntervalMs || 1000));
+    const gapThresholdMs = tickMs * 3;
+    const out = [];
+    for (let i = 0; i < scaled.length; i += 1) {
+      const cur = scaled[i];
+      out.push(cur);
+      const next = scaled[i + 1];
+      if (!next) continue;
+      const a = Date.parse(String(cur.ts || ""));
+      const b = Date.parse(String(next.ts || ""));
+      if (Number.isFinite(a) && Number.isFinite(b) && (b - a) > gapThresholdMs) {
+        out.push({ idx: cur.idx + 0.5, ts: new Date(a + Math.floor((b - a) / 2)).toISOString(), value: null });
+      }
+    }
+    return out;
+  }, [directScopedRowsAggregated, resolvedGatewayId, tagName, cfgReadingsCount, primaryMultiplier, primaryOffset, gatewayIntervalMs]);
 
   // -------- multi-series support --------------------------------------------
   // Additional series for trend charts. Each extra entry is rendered alongside
@@ -1667,20 +1692,48 @@ export function DashboardWidgetCard({
       }
     }
     if (byTs.size === 0) return [];
-    const sortedTs = Array.from(byTs.keys()).sort((a, b) => a - b);
-    return sortedTs.map((tsMs, i) => {
+    // Sort timestamps and clamp to the operator's Readings field so the
+    // chart NEVER renders more rows than they asked for. Previously the
+    // union of primary + extra timestamps could blow past
+    // cfgReadingsCount when an extra series had a longer history,
+    // producing a 7-hour chart from a "120 readings" widget.
+    let sortedTs = Array.from(byTs.keys()).sort((a, b) => a - b);
+    const readingsCap = Math.max(10, Number(cfgReadingsCount || 120));
+    if (sortedTs.length > readingsCap) {
+      sortedTs = sortedTs.slice(-readingsCap);
+    }
+    // Detect "gateway-stopped" gaps. Anything bigger than 3 × gateway
+    // poll interval gets a null row inserted in the middle so Recharts'
+    // connectNulls=true does NOT bridge the gap. Without this the chart
+    // drew a straight diagonal across hours of downtime, which made
+    // every stopped-gateway period look like a smooth drift.
+    const tickMs = Math.max(500, Number(gatewayIntervalMs || 1000));
+    const gapThresholdMs = tickMs * 3;
+    const out = [];
+    for (let i = 0; i < sortedTs.length; i += 1) {
+      const tsMs = sortedTs[i];
       const row = byTs.get(tsMs);
-      return {
-        idx: i + 1,
+      out.push({
+        idx: out.length + 1,
         ts: new Date(tsMs).toISOString(),
         value: row.value ?? null,
         ...extraNormalized.reduce((acc, st) => {
           acc[`s_${st.def.id}`] = row[`s_${st.def.id}`] ?? null;
           return acc;
         }, {}),
-      };
-    });
-  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length]);
+      });
+      const next = sortedTs[i + 1];
+      if (next !== undefined && (next - tsMs) > gapThresholdMs) {
+        // Insert a midpoint null row. Every series's value goes null
+        // so connectNulls=true visually breaks each line at the gap.
+        const gapMs = tsMs + Math.floor((next - tsMs) / 2);
+        const nullRow = { idx: out.length + 1, ts: new Date(gapMs).toISOString(), value: null };
+        for (const st of extraNormalized) nullRow[`s_${st.def.id}`] = null;
+        out.push(nullRow);
+      }
+    }
+    return out;
+  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, cfgReadingsCount, gatewayIntervalMs]);
 
   const hasMultiSeries = extraSeriesDefs.length > 0 || resolvedLimitLines.length > 0;
   const anyRightAxis =
@@ -2209,7 +2262,7 @@ export function DashboardWidgetCard({
                           dot={seriesDot}
                           activeDot={seriesActiveDot}
                           isAnimationActive={false}
-                          connectNulls
+                          connectNulls={false}
                         />
                       );
                     }
@@ -2225,7 +2278,7 @@ export function DashboardWidgetCard({
                         dot={seriesDot}
                         activeDot={seriesActiveDot}
                         isAnimationActive={false}
-                        connectNulls
+                        connectNulls={false}
                       />
                     );
                   })}
@@ -2999,7 +3052,117 @@ export function DashboardWidgetCard({
       );
     case "cloud_sync_status":
       return <CloudSyncStatusWidget widget={widget} />;
+    case "report_card":
+      return <ReportCardWidget widget={widget} />;
     default:
       return renderEmpty("Unsupported widget");
   }
+}
+
+// =====================================================================
+// ReportCardWidget — pick a saved template, see the last generated PDF
+// for it, and trigger an on-demand render directly from the dashboard.
+// Schedule / trigger configuration lives on the Scheduled Reports page;
+// this widget links there rather than duplicate the form.
+// =====================================================================
+function ReportCardWidget({ widget }) {
+  const cfg = widget?.config || {};
+  const templateId = String(cfg.report_template_id || "").trim();
+  const [templates, setTemplates] = useState([]);
+  const [generated, setGenerated] = useState(null);
+  const [scheduleSummary, setScheduleSummary] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [statusMsg, setStatusMsg] = useState("");
+
+  const reload = useCallback(async () => {
+    try {
+      const tpls = await listReportTemplates();
+      // Backend returns { templates: [...] } from /api/reports/templates
+      const rows = Array.isArray(tpls?.templates) ? tpls.templates
+        : (Array.isArray(tpls?.rows) ? tpls.rows : []);
+      setTemplates(rows);
+    } catch (_) { /* keep last value */ }
+    if (!templateId) { setGenerated(null); setScheduleSummary(""); return; }
+    try {
+      const list = await listGeneratedReports({ templateId, limit: 1 });
+      const rows = Array.isArray(list?.generated) ? list.generated
+        : (Array.isArray(list?.rows) ? list.rows : []);
+      setGenerated(rows[0] || null);
+    } catch (err) { setError(String(err?.message || err)); }
+    try {
+      const schedules = await listScheduledReports();
+      const rows = Array.isArray(schedules?.schedules) ? schedules.schedules
+        : (Array.isArray(schedules?.rows) ? schedules.rows : []);
+      const matches = rows.filter((s) => String(s.template_id || "") === templateId);
+      if (matches.length === 0) setScheduleSummary("No schedule");
+      else if (matches.length === 1) {
+        const m = matches[0];
+        setScheduleSummary(m.trigger_kind === "tag"
+          ? `Tag trigger · ${m.trigger_tag_name || "(unset)"}`
+          : `Every ${m.trigger_interval_minutes || "?"} min`);
+      } else setScheduleSummary(`${matches.length} schedules`);
+    } catch (_) { /* leave previous summary */ }
+  }, [templateId]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  const runNow = async () => {
+    if (!templateId) return;
+    setBusy(true); setError(""); setStatusMsg("Generating…");
+    try {
+      await runReportTemplateNow(templateId);
+      setStatusMsg("Generated.");
+      // small delay so the new row is indexed before re-listing
+      setTimeout(() => { reload(); setStatusMsg(""); }, 800);
+    } catch (err) {
+      setError(String(err?.message || err));
+      setStatusMsg("");
+    } finally { setBusy(false); }
+  };
+
+  const downloadLast = () => {
+    if (!generated?.id) return;
+    openGeneratedReport(generated.id);
+  };
+
+  const activeTpl = templates.find((t) => String(t.id || "") === templateId);
+
+  return (
+    <div className="dashboard-widget-block dashboard-report-card">
+      <div className="dashboard-report-card-row">
+        <strong>{activeTpl?.name || "Report"}</strong>
+        {scheduleSummary ? <span className="dashboard-report-schedule">{scheduleSummary}</span> : null}
+      </div>
+      {generated ? (
+        <div className="dashboard-report-card-row dashboard-report-last">
+          <div>
+            <div className="dashboard-report-filename">{generated.filename || `report-${generated.id}.pdf`}</div>
+            <div className="dashboard-report-meta">
+              {generated.generated_utc
+                ? new Date(generated.generated_utc).toLocaleString()
+                : "—"}
+              {Number.isFinite(Number(generated.size_bytes))
+                ? ` · ${Math.round(Number(generated.size_bytes) / 1024)} KB`
+                : ""}
+            </div>
+          </div>
+          <button type="button" className="btn btn-primary btn-sm" onClick={downloadLast}>
+            Open last PDF
+          </button>
+        </div>
+      ) : (
+        <div className="dashboard-report-card-row dashboard-report-empty">
+          {templateId ? "No reports generated yet." : "Pick a template in the widget editor."}
+        </div>
+      )}
+      <div className="dashboard-report-card-row">
+        <button type="button" className="btn btn-secondary btn-sm" disabled={!templateId || busy} onClick={runNow}>
+          {busy ? "Generating…" : "Generate now"}
+        </button>
+        {statusMsg ? <span className="muted">{statusMsg}</span> : null}
+        {error ? <span className="warn">{error}</span> : null}
+      </div>
+    </div>
+  );
 }

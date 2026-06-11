@@ -15,6 +15,11 @@ export const WIDGET_TYPES = [
   { key: "image", label: "Pictures", group: "Media", defaultSize: { w: 4, h: 4 } },
   { key: "ip_camera", label: "IP Camera (Live Feed)", group: "Media", defaultSize: { w: 5, h: 4 } },
   { key: "cloud_sync_status", label: "Cloud Sync Status", group: "System", defaultSize: { w: 8, h: 4 } },
+  // Report card: pick a saved template, see the last generated PDF for
+  // it, and trigger an on-demand render straight from the dashboard.
+  // Trigger / schedule configuration lives in Scheduled Reports — the
+  // widget links there so we don't duplicate that UI.
+  { key: "report_card", label: "Report Card", group: "Reports", defaultSize: { w: 5, h: 3 } },
 ];
 
 export function getWidgetMeta(type) {

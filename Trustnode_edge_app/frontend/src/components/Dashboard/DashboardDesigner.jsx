@@ -9,9 +9,10 @@ import {
 } from "./widgetRegistry";
 import { compactWidgets, findFirstFreeSpot, normalizeWidgets, reflowWidgetsForMove, reflowWidgetsForMoveToPoint, reflowWidgetsForResize } from "./layoutUtils";
 import { filterRowsByRange, getLatestTagRow, toTsMs } from "./dashboardAnalytics";
+import { listReportTemplates } from "../../api";
 import "./dashboard.css";
 
-const TYPE_GROUPS = ["Charts", "KPI", "Content", "Layout", "Media", "System"];
+const TYPE_GROUPS = ["Charts", "KPI", "Content", "Layout", "Media", "Reports", "System"];
 const DASHBOARD_TIME_MODE_KEY = "trustnode_dashboard_time_mode";
 const DASHBOARD_TIME_RANGE_KEY = "trustnode_dashboard_time_range";
 const DASHBOARD_PROFILES_KEY = "trustnode_dashboard_profiles";
@@ -206,6 +207,52 @@ function parseLegendLayoutLike(v, fallback = "side") {
   const t = String(v || "").trim().toLowerCase();
   if (!t) return fallback;
   return t.includes("bottom") ? "bottom" : "side";
+}
+
+// =====================================================================
+// ReportCardEditor — picks a saved report template for the dashboard's
+// Report Card widget. Schedule + trigger configuration lives in
+// Scheduled Reports; the editor links there so we don't duplicate the
+// form here.
+// =====================================================================
+function ReportCardEditor({ config, onChange }) {
+  const [templates, setTemplates] = useState([]);
+  const [loadErr, setLoadErr] = useState("");
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await listReportTemplates();
+        const rows = Array.isArray(res?.templates) ? res.templates
+          : (Array.isArray(res?.rows) ? res.rows : []);
+        setTemplates(rows);
+      } catch (err) {
+        setLoadErr(String(err?.message || err));
+      }
+    })();
+  }, []);
+  const value = String(config?.report_template_id || "");
+  return (
+    <>
+      <label className="dashboard-full-row">
+        Report template
+        <select
+          value={value}
+          onChange={(e) => onChange({ report_template_id: e.target.value })}
+        >
+          <option value="">(pick a template)</option>
+          {templates.map((t) => (
+            <option key={t.id} value={t.id}>{t.name || t.id}</option>
+          ))}
+        </select>
+      </label>
+      <p className="dashboard-query-hint">
+        Pick one of the templates saved in the Reporting page. Trigger
+        (time-based or tag-based) and email delivery are configured per
+        template under Scheduled Reports.
+      </p>
+      {loadErr ? <p className="dashboard-query-hint warn">{loadErr}</p> : null}
+    </>
+  );
 }
 
 function newMeterRange(existingRules = []) {
@@ -2220,6 +2267,13 @@ export function DashboardDesigner({
                       onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, camera_url: e.target.value } }))}
                     />
                   </label>
+                ) : null}
+
+                {form.type === "report_card" ? (
+                  <ReportCardEditor
+                    config={form.config || {}}
+                    onChange={(patch) => setForm((p) => ({ ...p, config: { ...p.config, ...patch } }))}
+                  />
                 ) : null}
 
                 {form.type === "cloud_sync_status" ? (

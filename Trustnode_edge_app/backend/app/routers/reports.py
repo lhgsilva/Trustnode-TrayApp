@@ -270,8 +270,16 @@ def run_schedule_now(
 # generated reports
 # --------------------------------------------------------------------------- #
 @router.get("/generated")
-def list_generated(limit: int = Query(default=200, ge=1, le=2000), schedule_id: str = "") -> dict[str, Any]:
-    rows = reports_store.list_generated(limit=limit, schedule_id=schedule_id or None)
+def list_generated(
+    limit: int = Query(default=200, ge=1, le=2000),
+    schedule_id: str = "",
+    template_id: str = "",
+) -> dict[str, Any]:
+    rows = reports_store.list_generated(
+        limit=limit,
+        schedule_id=schedule_id or None,
+        template_id=template_id or None,
+    )
     return {"ok": True, "tenant_id": get_current_tenant(), "generated": rows}
 
 
@@ -495,6 +503,33 @@ def export_section_txt(payload: dict[str, Any] = Body(...)) -> Response:
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.post("/templates/{template_id}/generate")
+def generate_template(template_id: str) -> dict[str, Any]:
+    """Render a saved template by id and store it as a generated report.
+    Used by the dashboard's Report Card widget to give operators a
+    one-click "Generate now" button. Returns the new generated record so
+    the widget can immediately surface the file name and download link.
+    """
+    template = reports_store.get_template(template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    try:
+        from app.services.report_renderer import render_template_to_pdf
+        path, byte_count, sha = render_template_to_pdf(template)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Render failed: {exc}")
+    record = reports_store.insert_generated({
+        "template_id": template.get("id"),
+        "template_name": template.get("name"),
+        "triggered_by": "dashboard-manual",
+        "file_path": str(path),
+        "file_name": path.name,
+        "file_bytes": byte_count,
+        "file_sha256": sha,
+    })
+    return {"ok": True, "generated": record}
 
 
 @router.post("/render")

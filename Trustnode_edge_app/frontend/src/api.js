@@ -2330,10 +2330,11 @@ export async function getReportSchedulerStatus() {
   return res.json();
 }
 
-export async function listGeneratedReports({ limit = 200, scheduleId = "" } = {}) {
+export async function listGeneratedReports({ limit = 200, scheduleId = "", templateId = "" } = {}) {
   const params = new URLSearchParams();
   params.set("limit", String(limit));
   if (scheduleId) params.set("schedule_id", String(scheduleId));
+  if (templateId) params.set("template_id", String(templateId));
   const res = await fetchWithTimeout(
     withNoCache(`${_reportApiBase()}/api/reports/generated?${params.toString()}`),
     { headers: { "Cache-Control": "no-store, no-cache, max-age=0" } },
@@ -2396,6 +2397,22 @@ export async function exportSectionTxt(section) {
   }, 60000);
   if (!res.ok) throw new Error(`TXT export failed (HTTP ${res.status})`);
   return res.blob();
+}
+
+export async function runReportTemplateNow(templateId) {
+  const res = await fetchWithTimeout(
+    `${_reportApiBase()}/api/reports/templates/${encodeURIComponent(templateId)}/generate`,
+    { method: "POST", headers: { "Content-Type": "application/json" } },
+    60000,
+  );
+  await ensureOk(res, "Generate report failed");
+  return res.json();
+}
+
+export function openGeneratedReport(generatedId, { inline = true } = {}) {
+  const url = getGeneratedReportFileUrl(generatedId, { inline });
+  try { window.open(url, "_blank", "noopener,noreferrer"); }
+  catch (_) { window.location.href = url; }
 }
 
 export async function renderReportPreview(template) {

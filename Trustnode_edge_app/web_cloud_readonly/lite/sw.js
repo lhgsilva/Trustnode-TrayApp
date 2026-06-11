@@ -9,7 +9,7 @@
  * evicted on activate. Browsers re-check the service worker on each navigation
  * so users pick the new shell up automatically next time they open the app.
  */
-const CACHE_VERSION = "tnlite-v46-prefetch-1000-and-index";
+const CACHE_VERSION = "tnlite-v47-gap-nulls-no-carry-forward";
 const SHELL = [
   "./",
   "./index.html",

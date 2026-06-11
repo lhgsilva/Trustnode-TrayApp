@@ -1041,44 +1041,69 @@ function useMultiSeries(widget, sampleCount) {
     return () => { stopped = true; };
   }, [sampleCount, seriesDefs, pickedTenantId]);
 
-  // Build the merged dataset. Take the union of all timestamps across
-  // every series, sort, then for each timestamp emit a row carrying each
-  // series's most recent value at-or-before that timestamp (carry-forward
-  // resample). Without this, two series sampled on slightly different
-  // clocks render as alternating null/value rows and the line never
-  // appears even with connectNulls.
+  // Build the merged dataset using the UNION of every series's real
+  // timestamps. Each series fills its slot ONLY where it actually has
+  // a sample — no carry-forward across gaps. When the gap between two
+  // consecutive timestamps exceeds the gateway poll interval × 3 we
+  // insert an explicit null row in the middle so connectNulls=false on
+  // the Recharts series visually breaks the line at the gap. Operators
+  // reading the chart can now see exactly when the PLC stopped
+  // publishing instead of being misled by a smooth diagonal across
+  // hours of downtime.
   const merged = useMemo(() => {
     if (!seriesDefs.length) return [];
-    const tsSet = new Set();
+    // Union of every distinct timestamp + per-series value at that ts
+    // (no carry-forward).
+    const byTs = new Map(); // tsMs -> { ts, perSeries }
     for (const def of seriesDefs) {
       const buf = buffersRef.current.get(def.id);
       if (!buf) continue;
-      for (const ts of buf.keys()) tsSet.add(ts);
-    }
-    const sortedTs = [...tsSet].sort();
-    if (!sortedTs.length) return [];
-    const cap = Math.max(2, Number(sampleCount) || 20);
-    const window = sortedTs.slice(-cap);
-
-    // For each series, pre-sort its entries; walk the window in lockstep
-    // with each series's pointer to forward-fill the current value.
-    const seriesEntries = seriesDefs.map((def) => {
-      const buf = buffersRef.current.get(def.id);
-      const entries = buf ? [...buf.entries()].sort((a, b) => a[0] < b[0] ? -1 : 1) : [];
-      return { def, entries, ptr: 0, last: null };
-    });
-
-    return window.map((ts, idx) => {
-      const row = { idx, ts };
-      for (const st of seriesEntries) {
-        while (st.ptr < st.entries.length && st.entries[st.ptr][0] <= ts) {
-          st.last = st.entries[st.ptr][1];
-          st.ptr += 1;
-        }
-        row[st.def.id] = (st.last === undefined ? null : st.last);
+      for (const [ts, value] of buf.entries()) {
+        const tsMs = Date.parse(ts);
+        if (!Number.isFinite(tsMs)) continue;
+        let row = byTs.get(tsMs);
+        if (!row) { row = { ts, perSeries: {} }; byTs.set(tsMs, row); }
+        row.perSeries[def.id] = value;
       }
-      return row;
-    });
+    }
+    if (byTs.size === 0) return [];
+    let sortedTs = [...byTs.keys()].sort((a, b) => a - b);
+    const cap = Math.max(2, Number(sampleCount) || 20);
+    if (sortedTs.length > cap) sortedTs = sortedTs.slice(-cap);
+    // Median spacing between consecutive timestamps stands in for the
+    // gateway poll interval (which Lite doesn't have direct access to).
+    let gapThresholdMs = 30000; // 30 s fallback
+    if (sortedTs.length >= 4) {
+      const deltas = [];
+      for (let i = 1; i < sortedTs.length; i += 1) {
+        const d = sortedTs[i] - sortedTs[i - 1];
+        if (d > 0) deltas.push(d);
+      }
+      if (deltas.length) {
+        deltas.sort((a, b) => a - b);
+        const median = deltas[Math.floor(deltas.length / 2)];
+        gapThresholdMs = Math.max(2000, median * 3);
+      }
+    }
+    const out = [];
+    for (let i = 0; i < sortedTs.length; i += 1) {
+      const tsMs = sortedTs[i];
+      const row = byTs.get(tsMs);
+      const r = { idx: out.length, ts: row.ts };
+      for (const def of seriesDefs) {
+        const v = row.perSeries[def.id];
+        r[def.id] = v == null ? null : v;
+      }
+      out.push(r);
+      const next = sortedTs[i + 1];
+      if (next !== undefined && (next - tsMs) > gapThresholdMs) {
+        const mid = tsMs + Math.floor((next - tsMs) / 2);
+        const nullRow = { idx: out.length, ts: new Date(mid).toISOString() };
+        for (const def of seriesDefs) nullRow[def.id] = null;
+        out.push(nullRow);
+      }
+    }
+    return out;
     // tick triggers re-build on any new sample.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seriesDefs, sampleCount, tick]);
@@ -1340,7 +1365,7 @@ function renderSeriesElement(s, widgetType, interpolation = "monotone") {
       key: s.id, dataKey: s.id, name: s.label,
       yAxisId: s.axis === "right" ? "right" : "left",
       type: interpolation, stroke: s.color, fill: s.color + "33",
-      strokeWidth, dot: dotProp, isAnimationActive: false, connectNulls: true,
+      strokeWidth, dot: dotProp, isAnimationActive: false, connectNulls: false,
     });
   }
   // default: line
@@ -1348,7 +1373,7 @@ function renderSeriesElement(s, widgetType, interpolation = "monotone") {
     key: s.id, dataKey: s.id, name: s.label,
     yAxisId: s.axis === "right" ? "right" : "left",
     type: interpolation, stroke: s.color, strokeWidth,
-    dot: dotProp, isAnimationActive: false, connectNulls: true,
+    dot: dotProp, isAnimationActive: false, connectNulls: false,
   });
 }
 
