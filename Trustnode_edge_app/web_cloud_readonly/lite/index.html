@@ -38,6 +38,7 @@ import {
   ResponsiveContainer, LineChart, AreaChart, BarChart, ComposedChart,
   PieChart, Pie, Cell,
   Line, Area, Bar, CartesianGrid, XAxis, YAxis, Tooltip, Legend,
+  ReferenceLine,
 } from "recharts";
 
 // ============================================================
@@ -794,6 +795,58 @@ function pickPaletteColor(i) {
   return palette[i % palette.length];
 }
 
+// Extract limit lines from a widget's series_extra rows and resolve each
+// to its current numeric value. Constants use the typed number; tag-bound
+// limits read the latest sample of the named tag from the live broadcast
+// so the line "moves" with the PLC value — same rule the edge uses.
+//
+// Returns { value, color, axis, label, style, dash } per limit, plus the
+// already-rescaled value (multiplier + offset) so it lines up with the
+// scaled series the chart draws.
+function widgetLimitLines(widget, liveByKey, liveRows) {
+  const cfg = widget?.config || {};
+  const extras = Array.isArray(cfg.series_extra) ? cfg.series_extra : [];
+  const out = [];
+  extras.forEach((s, idx) => {
+    if (!s || String(s.chart_type || "").toLowerCase() !== "limit") return;
+    const mul = (() => { const n = Number(s.multiplier); return Number.isFinite(n) && n !== 0 ? n : 1; })();
+    const off = (() => { const n = Number(s.offset); return Number.isFinite(n) ? n : 0; })();
+    let raw = null;
+    const constant = Number(s.limit_value);
+    const constantText = String(s.limit_value ?? "").trim();
+    if (constantText !== "" && Number.isFinite(constant)) {
+      raw = constant;
+    } else if (s.tag_name) {
+      // Latest sample of the bound tag — try the lookup map first,
+      // then walk the raw live rows as a fallback so the legacy
+      // tag-only widget shape keeps working.
+      const gw = String(s.gateway_id || cfg.gateway_id || "");
+      const tag = String(s.tag_name);
+      const hit = (liveByKey?.lookup ? liveByKey.lookup({ gateway_id: gw, tag_name: tag }) : null)
+        || (Array.isArray(liveRows)
+              ? liveRows.find((r) => String(r?.tag_name || "") === tag
+                  && (!gw || String(r?.gateway_id || "") === gw))
+              : null);
+      const num = Number(hit?.value);
+      if (Number.isFinite(num)) raw = num;
+    }
+    if (raw == null) return;
+    const value = raw * mul + off;
+    const dashByStyle = { solid: undefined, dashed: "4 4", dotted: "1 4" };
+    const style = String(s.limit_line_style || s.line_style || "dashed").toLowerCase();
+    out.push({
+      id: String(s.id || `limit${idx + 1}`),
+      value,
+      color: String(s.color || "#e2585d"),
+      axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
+      label: String(s.label || s.tag_name || `Limit ${idx + 1}`),
+      dash: dashByStyle[style] || "4 4",
+      width: (() => { const n = Number(s.line_width); return Number.isFinite(n) && n > 0 ? n : 2; })(),
+    });
+  });
+  return out;
+}
+
 // Hook: fetch + realtime-append every series for a chart widget at once,
 // then merge them into a single Recharts dataset keyed by index.
 //
@@ -933,31 +986,157 @@ function useMultiSeries(widget, sampleCount) {
   return { merged, seriesDefs };
 }
 
-function ChartWidget({ widget }) {
+// Time-grouping intervals — same labels and bucket sizes the edge
+// dashboard exposes. "none" returns the input untouched.
+const GROUP_INTERVAL_MS = {
+  none: 0,
+  "1s": 1000, "5s": 5000, "10s": 10000, "30s": 30000,
+  "1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000,
+};
+
+// Apply query_group_interval + query_result_aggregation to a merged
+// dataset (output of useMultiSeries). Each series's values get bucketed
+// by tickMs and reduced (last/avg/min/max/sum) inside each bucket.
+// Mirrors the edge's bucketAndAggregateRows so the chart looks the
+// same on Lite as it does on the desktop.
+function bucketMergedRows(merged, seriesDefs, groupKey, aggKey) {
+  const bucketMs = GROUP_INTERVAL_MS[String(groupKey || "none").toLowerCase()] || 0;
+  if (!bucketMs || !merged?.length) return merged;
+  const reducer = String(aggKey || "last").toLowerCase();
+  const buckets = new Map(); // bucketStartMs -> { ts, lastTs, valuesById: { id -> [..] }, lastById }
+  for (const row of merged) {
+    const tsMs = Date.parse(row.ts || "");
+    if (!Number.isFinite(tsMs)) continue;
+    const key = Math.floor(tsMs / bucketMs) * bucketMs;
+    let b = buckets.get(key);
+    if (!b) {
+      b = { ts: new Date(key + Math.floor(bucketMs / 2)).toISOString(),
+            lastTs: tsMs, valuesById: {}, lastById: {} };
+      buckets.set(key, b);
+    }
+    for (const def of seriesDefs) {
+      const v = row[def.id];
+      if (v == null || !Number.isFinite(Number(v))) continue;
+      if (!b.valuesById[def.id]) b.valuesById[def.id] = [];
+      b.valuesById[def.id].push(Number(v));
+      if (tsMs >= b.lastTs) { b.lastById[def.id] = Number(v); }
+    }
+    if (tsMs > b.lastTs) b.lastTs = tsMs;
+  }
+  const reduce = (vals) => {
+    if (!vals?.length) return null;
+    if (reducer === "avg" || reducer === "mean" || reducer === "average") {
+      return vals.reduce((a, b) => a + b, 0) / vals.length;
+    }
+    if (reducer === "min") return Math.min(...vals);
+    if (reducer === "max") return Math.max(...vals);
+    if (reducer === "sum") return vals.reduce((a, b) => a + b, 0);
+    if (reducer === "first") return vals[0];
+    if (reducer === "count") return vals.length;
+    // default + "last"
+    return vals[vals.length - 1];
+  };
+  const out = [];
+  const sortedKeys = [...buckets.keys()].sort((a, b) => a - b);
+  sortedKeys.forEach((k, idx) => {
+    const b = buckets.get(k);
+    const row = { idx, ts: b.ts };
+    for (const def of seriesDefs) {
+      if (reducer === "last") {
+        row[def.id] = (def.id in b.lastById) ? b.lastById[def.id] : null;
+      } else {
+        row[def.id] = reduce(b.valuesById[def.id]);
+      }
+    }
+    out.push(row);
+  });
+  return out;
+}
+
+function ChartWidget({ widget, liveByKey }) {
   const cfg = widget?.config || {};
   const widgetType = String(widget?.type || "line_chart");
   const sampleCount = useDashSamples();
   const { yAxisAutoFit } = useDashPrefs();
   const yProps = buildYAxisProps(!!yAxisAutoFit);
-  const { merged, seriesDefs } = useMultiSeries(widget, sampleCount);
+  const { merged: rawMerged, seriesDefs } = useMultiSeries(widget, sampleCount);
+
+  // Apply the operator's time-grouping + aggregation so Lite respects
+  // the same Time grouping / Result aggregation settings the edge does.
+  const merged = useMemo(
+    () => bucketMergedRows(rawMerged, seriesDefs, cfg.query_group_interval, cfg.query_result_aggregation),
+    [rawMerged, seriesDefs, cfg.query_group_interval, cfg.query_result_aggregation]
+  );
 
   if (!seriesDefs.length) return h("div", { className: "widget-empty muted" }, "no tag");
   if (!merged.length) return h("div", { className: "widget-empty muted" }, "no samples");
 
-  const labelFmt = (v) => merged.find((p) => p.idx === v)?.ts || String(v);
-  const hasRightAxis = seriesDefs.some((s) => s.axis === "right");
+  // Resolve limit lines (constant or tag-bound) from the widget's
+  // series_extra. Done here every render so tag-bound limits track
+  // the latest live broadcast tick without an explicit re-fetch.
+  const limitLines = useMemo(
+    () => widgetLimitLines(widget, liveByKey, null),
+    [widget?.config?.series_extra, liveByKey?.lookup, merged.length]
+  );
 
-  // Pick the right Recharts root for the primary chart type, then overlay
-  // each series as a Line/Area/Bar child within it.
+  // Primary unit / suffix flow through to the tooltip so the value
+  // appears with its physical units (e.g. "12.5 bar"). The edge has
+  // had these for months; Lite now mirrors the formatting.
+  const primaryUnit = String(cfg.primary_unit || "");
+  const primarySuffix = String(cfg.primary_suffix || "");
+  const fmtPrimary = (v) => {
+    const base = fmtVal(v);
+    if (primarySuffix) return `${base}${primarySuffix}`;
+    if (primaryUnit) return `${base} ${primaryUnit}`;
+    return base;
+  };
+
+  const labelFmt = (v) => merged.find((p) => p.idx === v)?.ts || String(v);
+  const hasRightAxis = seriesDefs.some((s) => s.axis === "right")
+    || limitLines.some((l) => l.axis === "right");
+
+  // Extra bottom space so the X-axis tick labels don't overlap the
+  // card edge. Operator complaint 2026-06-11: "we need a little bit
+  // of space below the charts for the time labels".
+  const margin = { ...getChartMargin(), bottom: 22 };
+
   return h(ResponsiveContainer, { width: "100%", height: "100%" },
-    h(buildChartRoot(widgetType, seriesDefs.length), { data: merged, margin: getChartMargin() },
+    h(buildChartRoot(widgetType, seriesDefs.length), { data: merged, margin },
       h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
       h(XAxis, buildXAxisProps(merged)),
       h(YAxis, { ...yProps, yAxisId: "left" }),
       hasRightAxis ? h(YAxis, { ...yProps, yAxisId: "right", orientation: "right" }) : null,
-      h(Tooltip, { ...chartTooltipProps, labelFormatter: labelFmt, formatter: (v, name) => [fmtVal(v), name] }),
+      h(Tooltip, {
+        ...chartTooltipProps,
+        labelFormatter: labelFmt,
+        formatter: (v, name) => {
+          // Match the per-series label so the primary picks up its
+          // configured unit/suffix and extras keep their own value.
+          if (name && name === (widget?.title || cfg.tag_name)) return [fmtPrimary(v), name];
+          return [fmtVal(v), name];
+        },
+      }),
       seriesDefs.length > 1 ? h(Legend, { wrapperStyle: { fontSize: 11, color: "var(--muted, #8a98ab)" } }) : null,
-      ...seriesDefs.map((s) => renderSeriesElement(s, widgetType))
+      ...seriesDefs.map((s) => renderSeriesElement(s, widgetType)),
+      // Limit lines render on top of every series. Each one targets
+      // its configured axis (left or right) and labels itself with a
+      // short caption near the right edge.
+      ...limitLines.map((ll) =>
+        h(ReferenceLine, {
+          key: ll.id,
+          y: ll.value,
+          yAxisId: ll.axis,
+          stroke: ll.color,
+          strokeWidth: ll.width,
+          strokeDasharray: ll.dash,
+          label: {
+            value: `${ll.label}: ${fmtVal(ll.value)}`,
+            position: "right",
+            fill: ll.color,
+            fontSize: 10,
+          },
+        })
+      )
     )
   );
 }
@@ -1367,7 +1546,7 @@ function Widget({ widget, liveByKey, onOpen, onOpenWidget, gridStyle }) {
   const isChart = type === "line_chart" || type === "line_area_chart" || type === "bar_chart";
   const isKpi   = type === "value_kpi" || type === "text_kpi";
   const inner =
-    isChart        ? h(ChartWidget,  { widget }) :
+    isChart        ? h(ChartWidget,  { widget, liveByKey }) :
     isKpi          ? h(KpiWidget,    { widget, liveByKey, onOpen }) :
     type === "meter_chart" ? h(MeterWidget, { widget, liveByKey, onOpen }) :
     type === "pie_chart"   ? h(PieWidget,   { widget, liveByKey }) :

@@ -3057,14 +3057,41 @@ export function DashboardDesigner({
                               ))}
                             </select>
                             {isLimit ? (
-                              <input
-                                type="number"
-                                step="any"
-                                value={row.limit_value ?? ""}
-                                placeholder="constant value"
-                                onChange={(e) => update({ limit_value: e.target.value })}
-                                title="Threshold value drawn as a horizontal line"
-                              />
+                              // Limit lines support two modes:
+                              //   1. Constant — operator types a number here.
+                              //   2. Follow tag — picks a tag below; runtime
+                              //      reads its most recent value every poll
+                              //      cycle so the limit "moves" with the
+                              //      live PLC value (e.g. a set-point from
+                              //      another tag).
+                              // When the operator selects a tag we clear
+                              // limit_value, and vice-versa. Both inputs
+                              // are visible so the choice is obvious.
+                              <div className="dashboard-limit-source">
+                                <input
+                                  type="number"
+                                  step="any"
+                                  value={row.limit_value ?? ""}
+                                  placeholder="constant value"
+                                  onChange={(e) => update({ limit_value: e.target.value, tag_name: "" })}
+                                  title="Constant threshold drawn as a horizontal line"
+                                  disabled={!!row.tag_name}
+                                />
+                                <span className="dashboard-limit-or">or</span>
+                                <select
+                                  value={row.tag_name || ""}
+                                  onChange={(e) => update({ tag_name: e.target.value, limit_value: "" })}
+                                  title="Follow a tag (limit moves with the latest tag value)"
+                                  disabled={String(row.limit_value || "").trim() !== ""}
+                                >
+                                  <option value="">(follow tag)</option>
+                                  {allowedTags.map((tag) => (
+                                    <option key={tag} value={tag}>
+                                      {formatTagForDisplay ? formatTagForDisplay(tag) : tag}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
                             ) : (
                               <select
                                 value={row.tag_name || ""}

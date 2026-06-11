@@ -1790,7 +1790,11 @@ export function DashboardWidgetCard({
     }
     return undefined; // recharts auto-domain on the right axis when undefined
   }, [manualYRight]);
-  const chartMargin = { top: 4, right: 8, left: 0, bottom: 0 };
+  // Bottom margin = breathing room for X-axis tick labels. Without this
+  // the time labels ("01:18:57") were clipped against the card edge —
+  // operator request 2026-06-11: "we need a little bit of space below
+  // the charts for the time labels".
+  const chartMargin = { top: 4, right: 8, left: 0, bottom: 18 };
   const interpolation = getChartInterpolation(widget);
   const chartValueFormat = String(cfg.chart_value_format || "auto");
   const showChartLegend = cfg.chart_show_legend === true;
