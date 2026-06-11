@@ -592,27 +592,31 @@ function withBackendParam(url, backendUrl) {
 //     "Starting backend…" → "Waiting for service…" → "Loading UI…".
 //   * Auto-closes the moment the main window's ready-to-show fires.
 // ---------------------------------------------------------------------------
-function readSplashLogoDataUri() {
-  // Use the bundled .ico because it's already in resources for both
-  // packaged and dev. Reading is fast (≤ 50 KB) and we embed it inline
-  // so the splash HTML has no external dependencies / network calls.
-  try {
-    const iconPath = app.isPackaged
-      ? path.join(process.resourcesPath, "trustnode_logo.ico")
-      : path.resolve(__dirname, "assets", "trustnode_logo.ico");
-    if (!fs.existsSync(iconPath)) return "";
-    const buf = fs.readFileSync(iconPath);
-    return `data:image/x-icon;base64,${buf.toString("base64")}`;
-  } catch (_) {
-    return "";
-  }
-}
+// Inline TrustNode wordmark SVG so the splash has no external asset
+// dependency at all (the ICO read had silently failed on some packaged
+// installs and the splash never opened). Coloured to match the
+// in-app brand mark.
+const SPLASH_LOGO_SVG = `
+  <svg viewBox="0 0 64 64" width="64" height="64" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#14a89a"/>
+        <stop offset="100%" stop-color="#0d5b54"/>
+      </linearGradient>
+    </defs>
+    <rect x="6" y="6" width="52" height="52" rx="12" fill="url(#g)"/>
+    <path d="M19 38 L29 28 L37 36 L46 22" stroke="#fff" stroke-width="3"
+      stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    <circle cx="29" cy="28" r="2.6" fill="#fff"/>
+    <circle cx="37" cy="36" r="2.6" fill="#fff"/>
+    <circle cx="46" cy="22" r="2.6" fill="#fff"/>
+  </svg>
+`;
 
 function buildSplashHtml() {
-  const logoUri = readSplashLogoDataUri();
-  const logoTag = logoUri
-    ? `<img src="${logoUri}" alt="TrustNode" />`
-    : "";
+  const version = (() => { try { return app.getVersion(); } catch (_) { return "0.1.0"; } })();
+  // SAFE escaping: no template substitution attacks possible here, but
+  // keep braces literal in the CSS by not using ${...} for them.
   return `<!doctype html>
 <html><head><meta charset="utf-8"/><title>TrustNode</title>
 <style>
@@ -622,22 +626,21 @@ function buildSplashHtml() {
     background: linear-gradient(160deg, #0e1a2b 0%, #14283f 65%, #0d1726 100%);
     overflow: hidden; }
   .stage { display: flex; flex-direction: column; align-items: center;
-    justify-content: center; height: 100%; padding: 24px 32px; gap: 18px;
-    -webkit-app-region: drag; }
-  .logo { width: 88px; height: 88px; border-radius: 18px;
-    background: rgba(255,255,255,0.05); display: flex; align-items: center;
-    justify-content: center; box-shadow: 0 6px 24px rgba(0,0,0,0.35),
+    justify-content: center; height: 100%; padding: 24px 32px; gap: 14px;
+    -webkit-app-region: drag; position: relative; }
+  .logo { width: 96px; height: 96px; border-radius: 22px;
+    background: rgba(255,255,255,0.04); display: flex; align-items: center;
+    justify-content: center; box-shadow: 0 8px 28px rgba(0,0,0,0.4),
       inset 0 0 0 1px rgba(255,255,255,0.06); }
-  .logo img { width: 64px; height: 64px; object-fit: contain; }
-  .brand { font-size: 22px; font-weight: 700; letter-spacing: 0.04em;
-    color: #ffffff; }
-  .tagline { font-size: 12px; color: #8aa0bd; margin-top: -10px;
-    letter-spacing: 0.08em; text-transform: uppercase; }
-  .status { font-size: 13px; color: #cfd8e6; margin-top: 4px; min-height: 18px;
-    text-align: center; max-width: 360px; }
+  .brand { font-size: 24px; font-weight: 700; letter-spacing: 0.04em;
+    color: #ffffff; margin-top: 4px; }
+  .tagline { font-size: 11px; color: #8aa0bd; margin-top: -4px;
+    letter-spacing: 0.12em; text-transform: uppercase; }
+  .status { font-size: 13px; color: #cfd8e6; margin-top: 4px;
+    min-height: 18px; text-align: center; max-width: 360px; }
   .bar { width: 220px; height: 4px; border-radius: 999px;
     background: rgba(255,255,255,0.08); overflow: hidden; position: relative; }
-  .bar::after { content: ""; position: absolute; left: -40%;
+  .bar::after { content: ""; position: absolute; left: -40%; top: 0;
     width: 40%; height: 100%; border-radius: 999px;
     background: linear-gradient(90deg, transparent, #14a89a, transparent);
     animation: slide 1.4s ease-in-out infinite; }
@@ -648,59 +651,84 @@ function buildSplashHtml() {
 </style>
 </head><body>
   <div class="stage">
-    <div class="logo">${logoTag}</div>
+    <div class="logo">${SPLASH_LOGO_SVG}</div>
     <div class="brand">TrustNode</div>
     <div class="tagline">Industrial Edge</div>
     <div class="bar"></div>
     <div class="status" id="status">Starting up…</div>
+    <div class="footer">v${version}</div>
   </div>
-  <div class="footer">v${app.getVersion()}</div>
   <script>
-    // Receive status updates from the main process. We use a global
-    // function the IPC bridge can invoke directly without preload.
-    if (window.electronAPI && window.electronAPI.onSplashStatus) {
-      window.electronAPI.onSplashStatus((msg) => {
-        const el = document.getElementById('status');
-        if (el && typeof msg === 'string') el.textContent = msg;
-      });
+    // Plain ipcRenderer would be unavailable under contextIsolation,
+    // so the preload exposes window.electronAPI.onSplashStatus.
+    function bind() {
+      if (window.electronAPI && window.electronAPI.onSplashStatus) {
+        window.electronAPI.onSplashStatus(function(msg) {
+          var el = document.getElementById('status');
+          if (el && typeof msg === 'string') el.textContent = msg;
+        });
+      } else {
+        // contextIsolation may resolve a tick later — retry briefly.
+        setTimeout(bind, 50);
+      }
     }
+    bind();
   </script>
 </body></html>`;
 }
 
 function createSplashWindow() {
   if (splashWindow && !splashWindow.isDestroyed()) return;
-  splashWindow = new BrowserWindow({
-    width: 420,
-    height: 340,
-    resizable: false,
-    movable: true,
-    minimizable: false,
-    maximizable: false,
-    fullscreenable: false,
-    closable: false,
-    frame: false,
-    transparent: false,
-    alwaysOnTop: false,
-    skipTaskbar: false,
-    show: false,
-    backgroundColor: "#0e1a2b",
-    title: "TrustNode",
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false,
-      preload: path.join(__dirname, "preload.js"),
-    },
-  });
-  splashWindow.setMenu(null);
-  splashWindow.loadURL(
-    "data:text/html;charset=utf-8," + encodeURIComponent(buildSplashHtml())
-  );
-  splashWindow.once("ready-to-show", () => {
-    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.show();
-  });
-  splashWindow.on("closed", () => { splashWindow = null; });
+  try {
+    splashWindow = new BrowserWindow({
+      width: 420,
+      height: 340,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      frame: false,
+      transparent: false,
+      // Center on the primary display so the user can't miss it even
+      // with multi-monitor setups.
+      center: true,
+      // SHOW IMMEDIATELY — previously we waited for ready-to-show,
+      // which on some Windows installs never fired for data: URLs and
+      // the splash never appeared. The backgroundColor below paints
+      // the gradient base before HTML renders so the user sees the
+      // window instantly even if the inline content races to load.
+      show: true,
+      alwaysOnTop: true,
+      skipTaskbar: false,
+      backgroundColor: "#0e1a2b",
+      title: "TrustNode",
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: false,
+        preload: path.join(__dirname, "preload.js"),
+      },
+    });
+    splashWindow.setMenu(null);
+    // After the splash is visible, drop alwaysOnTop so the user can
+    // alt-tab away normally (e.g. if backend startup hangs and they
+    // want to open another app).
+    setTimeout(() => {
+      try {
+        if (splashWindow && !splashWindow.isDestroyed()) {
+          splashWindow.setAlwaysOnTop(false);
+        }
+      } catch (_) {}
+    }, 1500);
+    splashWindow.loadURL(
+      "data:text/html;charset=utf-8," + encodeURIComponent(buildSplashHtml())
+    );
+    splashWindow.on("closed", () => { splashWindow = null; });
+    logBackend("Splash window created");
+  } catch (err) {
+    logBackend(`Splash window failed to create: ${err}`);
+    splashWindow = null;
+  }
 }
 
 function updateSplashStatus(message) {
@@ -716,8 +744,6 @@ function closeSplash() {
     return;
   }
   try {
-    // Re-enable closable for the actual close call.
-    splashWindow.setClosable(true);
     splashWindow.close();
   } catch (_) {
     try { splashWindow.destroy(); } catch (__) {}
