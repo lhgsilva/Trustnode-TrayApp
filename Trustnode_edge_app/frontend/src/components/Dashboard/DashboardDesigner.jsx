@@ -1999,42 +1999,29 @@ export function DashboardDesigner({
                       onChange={(e) =>
                         setForm((p) => ({
                           ...p,
-                          config: { ...p.config, readings_count: clamp(e.target.value, 20, 500) },
+                          config: {
+                            ...p.config,
+                            readings_count: clamp(e.target.value, 20, 500),
+                            // Reset any saved override so the new value
+                            // applies to extras too. Operator wants ONE
+                            // knob to control the chart's depth.
+                            series_readings_count: 0,
+                          },
                         }))
                       }
                     />
                   </label>
                 ) : null}
 
-                {/* Independent reading count for the extra series. Lets the
-                    operator configure a multi-series chart that pulls a
-                    different history depth than the primary tag — including
-                    series-only widgets where the primary gateway/tag is left
-                    blank. Empty / 0 falls back to readings_count * 8. */}
-                {["line_chart", "line_area_chart", "bar_chart"].includes(form.type)
-                  && Array.isArray(form.config?.series_extra)
-                  && form.config.series_extra.length > 0 ? (
-                  <label>
-                    Series reading points
-                    <input
-                      type="number"
-                      min="0"
-                      max="5000"
-                      value={Number(form.config?.series_readings_count || 0)}
-                      placeholder="(follow Reading points)"
-                      onChange={(e) =>
-                        setForm((p) => ({
-                          ...p,
-                          config: {
-                            ...p.config,
-                            series_readings_count: Math.max(0, Math.min(5000, Number(e.target.value || 0))),
-                          },
-                        }))
-                      }
-                      title="Number of historical points fetched for each extra series. 0 = follow the primary Reading points field."
-                    />
-                  </label>
-                ) : null}
+                {/* Series reading points was a separate field on older
+                    builds. Operator request 2026-06-11: "we should have
+                    a interlock to have one one number of the reading
+                    field doesn't matter if multi or single". The single
+                    "Reading points" above now drives every series in the
+                    widget; we keep the saved series_readings_count for
+                    backward compat (the runtime still respects an
+                    explicit non-zero value) but no longer expose the
+                    second input. */}
 
                 {["line_chart", "line_area_chart", "bar_chart", "pie_chart", "meter_chart"].includes(form.type) ? (
                   <label>

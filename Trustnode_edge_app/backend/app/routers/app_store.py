@@ -516,6 +516,28 @@ def repair_scope(payload: ForceSyncRequest) -> dict:
     return out
 
 
+@router.post("/sync/force-resync")
+def force_resync() -> dict:
+    """Synchronously re-run the boot remirror so the operator can push
+    every locally-saved dashboard / alarm / trigger / gateway / device
+    to cloud on demand. Returns the per-domain success / error breakdown
+    AFTER the batch completes so the operator immediately sees what
+    landed and what failed."""
+    # Reset state so the response only reflects THIS batch.
+    setattr(app_store, "_mirror_state", {"last_error": {}, "last_success_utc": {}, "attempts": {}})
+    try:
+        app_store._remirror_scoped_docs_to_cloud()  # synchronous
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    state = getattr(app_store, "_mirror_state", None) or {}
+    return {
+        "ok": True,
+        "attempts": dict(state.get("attempts") or {}),
+        "last_success_utc": dict(state.get("last_success_utc") or {}),
+        "last_error": dict(state.get("last_error") or {}),
+    }
+
+
 @router.get("/sync/mirror-state")
 def get_mirror_state() -> dict:
     """Diagnose the per-table config mirror. Returns the last_error,

@@ -1285,6 +1285,17 @@ class AppStore:
                         # Best-effort fallback; the upgraded edge will start
                         # producing scoped rows once the operator saves once.
                         pass
+        # Mirror-state tracking so a failed batch shows up in the diagnostic
+        # endpoint exactly like the daemon-thread mirror does. Without this
+        # a boot-remirror failure was invisible.
+        mirror_state = getattr(self, "_mirror_state", None)
+        if mirror_state is None:
+            mirror_state = {"last_error": {}, "last_success_utc": {}, "attempts": {}}
+            setattr(self, "_mirror_state", mirror_state)
+        import logging
+        log = logging.getLogger("trustnode.boot-mirror")
+        batch_ok = 0
+        batch_err = 0
         for r in rows or []:
             scope_key = str(r["scope_key"] or "")
             domain = str(r["domain"] or "")
@@ -1292,6 +1303,7 @@ class AppStore:
             version = int(r["version"] or 1)
             updated_utc = str(r["updated_utc"] or self._utc_now())
             tenant_from_scope = (scope_key.split("|") or ["default"])[0] or "default"
+            mirror_state["attempts"][domain] = mirror_state["attempts"].get(domain, 0) + 1
             try:
                 with engine.begin() as conn:
                     conn.execute(
@@ -1314,9 +1326,17 @@ class AppStore:
                             "updated_utc": updated_utc,
                         },
                     )
-            except Exception:
-                # best-effort per-row; the batch continues
+                mirror_state["last_success_utc"][domain] = self._utc_now()
+                mirror_state["last_error"].pop(domain, None)
+                batch_ok += 1
+            except Exception as exc:
+                mirror_state["last_error"][domain] = f"{type(exc).__name__}: {exc}"
+                log.warning("boot-mirror upsert failed domain=%s scope=%s tenant=%s err=%s",
+                            domain, scope_key, tenant_from_scope, exc)
+                batch_err += 1
                 continue
+        log.info("boot-mirror batch complete: ok=%d err=%d (total_rows=%d)",
+                 batch_ok, batch_err, len(rows or []))
 
     def _cloud_target_from_env(self) -> Dict[str, Any] | None:
         """Build a cloud target dict purely from environment variables.
