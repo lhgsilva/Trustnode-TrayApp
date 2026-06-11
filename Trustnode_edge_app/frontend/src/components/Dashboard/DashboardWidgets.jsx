@@ -763,6 +763,28 @@ function LiveTagChart({
   const [seedError, setSeedError] = useState("");
   const [seedReady, setSeedReady] = useState(false);
 
+  // CRITICAL: fetchWidgetRows is an inline async function the parent
+  // recreates on every render. If we put it in any useEffect's dep
+  // array directly, the seed effect re-runs forever — buffers reset,
+  // "Loading..." flashes back, the chart never gets to render the
+  // accumulated samples. We stash the latest callable in a ref and
+  // read from there inside effects; only the SERIES IDENTITY (which
+  // is stable) drives the seed.
+  const fetchRowsRef = useRef(fetchWidgetRows);
+  useEffect(() => { fetchRowsRef.current = fetchWidgetRows; }, [fetchWidgetRows]);
+  // Same treatment for the dataLogView snapshot used by the stall
+  // detector. The ingest effect reads dataLogView directly (it must,
+  // to fire on new samples) but anything inside an interval timer
+  // must go through the ref to stay current without re-binding the
+  // timer.
+  const dataLogViewRef = useRef(dataLogView);
+  useEffect(() => { dataLogViewRef.current = dataLogView; });
+  // Track the latest seriesDefs in a ref so effects can read the
+  // current value without taking it as a dep (which would re-bind on
+  // every parent render and reset every timer / cause flickering).
+  const seriesDefsRef = useRef(seriesDefs);
+  useEffect(() => { seriesDefsRef.current = seriesDefs; });
+
   // Reset buffers + reseed when the set of series identity changes.
   const seriesKey = useMemo(
     () => seriesDefs.map((s) => `${s.gatewayId}|${s.tagName}`).join("||"),
@@ -782,7 +804,8 @@ function LiveTagChart({
     setSeedError("");
     setTick((t) => t + 1);
 
-    if (!seriesDefs.length || typeof fetchWidgetRows !== "function") {
+    const fetcher = fetchRowsRef.current;
+    if (!seriesDefs.length || typeof fetcher !== "function") {
       setSeedReady(true);
       return undefined;
     }
@@ -792,7 +815,7 @@ function LiveTagChart({
     let cancelled = false;
     Promise.all(seriesDefs.map(async (s) => {
       try {
-        const rows = await fetchWidgetRows({
+        const rows = await fetcher({
           fromUtc: "",
           toUtc: "",
           limit: capacity,
@@ -826,7 +849,13 @@ function LiveTagChart({
       }
     });
     return () => { cancelled = true; };
-  }, [seriesKey, capacity, fetchWidgetRows]);  // eslint-disable-line react-hooks/exhaustive-deps
+  // ONLY seriesKey + capacity drive reseeding. The fetcher is read from
+  // a ref so its unstable identity doesn't restart the seed on every
+  // parent render. seriesDefs is intentionally excluded — seriesKey
+  // captures the relevant identity (gw + tag list) and seriesDefs
+  // changes whenever the widget object changes by reference.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seriesKey, capacity]);
 
   // Ingest WS samples: append rows from dataLogView whose ts is strictly
   // newer than the last seen ts for that series. Runs on every parent
@@ -837,8 +866,12 @@ function LiveTagChart({
     const buffers = buffersRef.current;
     const lastSeen = lastSeenTsRef.current;
     if (!buffers || !lastSeen) return;
+    // Read seriesDefs from the ref so this effect doesn't re-bind on
+    // every parent render (which would just reset the loop counter
+    // without actually changing what we ingest).
+    const seriesNow = seriesDefsRef.current || [];
     let didAppend = false;
-    for (const s of seriesDefs) {
+    for (const s of seriesNow) {
       const buf = buffers.get(s.id);
       if (!buf) continue;
       const last = lastSeen.get(s.id) || -Infinity;
@@ -870,14 +903,22 @@ function LiveTagChart({
       }
     }
     if (didAppend) setTick((t) => t + 1);
-  }, [dataLogView, seedReady, seriesDefs, capacity]);
+  // seriesDefs intentionally omitted; we read its current value via
+  // the ref. dataLogView and seedReady are the only signals that drive
+  // ingest.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataLogView, seedReady, capacity]);
 
   // Re-seed when the WS appears to have stalled — heuristic: if no new
   // sample has hit the buffer for 3× the poll interval (and we ARE
   // ready), the stream is probably reconnecting. Re-pull the missing
   // tail so we recover without the operator opening DevTools.
+  // seriesDefsRef + fetchRowsRef declared above keep this interval from
+  // re-binding on every parent render.
   useEffect(() => {
-    if (!seedReady || !seriesDefs.length || typeof fetchWidgetRows !== "function") return undefined;
+    if (!seedReady) return undefined;
+    const fetcher = fetchRowsRef.current;
+    if (!seriesDefsRef.current.length || typeof fetcher !== "function") return undefined;
     const checkMs = Math.max(2000, pollMs * 3);
     const id = setInterval(() => {
       const stalledFor = Date.now() - (lastIngestWallclockRef.current || 0);
@@ -885,10 +926,12 @@ function LiveTagChart({
       // Stall: fetch the tail since the last seen ts for each series.
       const lastSeen = lastSeenTsRef.current;
       if (!lastSeen) return;
-      seriesDefs.forEach(async (s) => {
+      const currentSeries = seriesDefsRef.current;
+      const currentFetcher = fetchRowsRef.current;
+      currentSeries.forEach(async (s) => {
         try {
           const since = lastSeen.get(s.id) || 0;
-          const rows = await fetchWidgetRows({
+          const rows = await currentFetcher({
             fromUtc: since > 0 ? new Date(since).toISOString() : "",
             toUtc: "",
             limit: capacity,
@@ -918,7 +961,7 @@ function LiveTagChart({
       });
     }, checkMs);
     return () => clearInterval(id);
-  }, [seedReady, seriesDefs, pollMs, capacity, fetchWidgetRows]);
+  }, [seedReady, pollMs, capacity]);
 
   // Build the rendered dataset: union of timestamps across all series,
   // last `capacity` rows, with null gap inserts. O(N log N).
