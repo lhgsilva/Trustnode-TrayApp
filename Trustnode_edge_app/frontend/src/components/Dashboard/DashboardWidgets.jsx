@@ -821,6 +821,23 @@ function LiveTagChart({
     [seriesDefs]
   );
 
+  // Time-grouping configuration. Declared HERE (before the seed
+  // effect) so the seed effect's dependency array can read them
+  // without a temporal dead zone — the JSX evaluation order matters
+  // even though the effect body itself runs later. The renderedData
+  // useMemo below also reads these; it executes after this block so
+  // it's never in TDZ.
+  const groupKey = String(cfg.query_group_interval || "none").toLowerCase();
+  const groupBucketMs = (() => {
+    const map = {
+      none: 0,
+      "1s": 1000, "5s": 5000, "10s": 10000, "30s": 30000,
+      "1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000,
+    };
+    return map[groupKey] || 0;
+  })();
+  const reducerKey = String(cfg.query_result_aggregation || "last").toLowerCase();
+
   useEffect(() => {
     const fresh = new Map();
     const fresh2 = new Map();
@@ -1003,20 +1020,8 @@ function LiveTagChart({
     return () => clearInterval(id);
   }, [seedReady, pollMs, capacity]);
 
-  // Time-grouping configuration. The operator can ask for the chart
-  // to bucket samples (1s / 5s / 10s / 30s / 1m / 5m / 15m / 1h) and
-  // pick a reduction (last / avg / min / max / sum / first). Empty /
-  // "none" passes the raw samples through.
-  const groupKey = String(cfg.query_group_interval || "none").toLowerCase();
-  const groupBucketMs = (() => {
-    const map = {
-      none: 0,
-      "1s": 1000, "5s": 5000, "10s": 10000, "30s": 30000,
-      "1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000,
-    };
-    return map[groupKey] || 0;
-  })();
-  const reducerKey = String(cfg.query_result_aggregation || "last").toLowerCase();
+  // (groupKey / groupBucketMs / reducerKey are declared above before
+  // the seed effect to avoid a temporal dead zone in its dep array.)
 
   // Build the rendered dataset: union of timestamps across all series,
   // optional bucketing/aggregation, last `capacity` rows, with null
