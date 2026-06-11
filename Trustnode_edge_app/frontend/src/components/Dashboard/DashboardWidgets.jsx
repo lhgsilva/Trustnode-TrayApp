@@ -703,6 +703,9 @@ function LiveTagChart({
         chartKind: widgetType === "bar_chart" ? "bar"
           : widgetType === "line_area_chart" ? "area"
           : "line",
+        lineWidth: 0,   // 0 means "use widget-wide chart_line_width"
+        lineDot: "",    // "" means "use widget-wide chart_line_dot"
+        barWidth: 0,
       });
     }
     const extras = Array.isArray(cfg.series_extra) ? cfg.series_extra : [];
@@ -732,6 +735,9 @@ function LiveTagChart({
             : widgetType === "line_area_chart" ? "area"
             : "line";
         })(),
+        lineWidth: Number(s.line_width || 0),
+        lineDot: String(s.line_dot || ""),
+        barWidth: Number(s.bar_width || 0),
       });
     });
     return out;
@@ -747,6 +753,25 @@ function LiveTagChart({
     cfg.primary_suffix,
     cfg.gateway_id,
     JSON.stringify(cfg.series_extra || []),
+    // Style knobs that affect what each series looks like even though
+    // they don't change the IDENTITY of the series (gw/tag). Including
+    // them here lets the chart pick up live edits without reseeding.
+    cfg.chart_line_width,
+    cfg.chart_line_dot,
+    cfg.chart_show_legend,
+    cfg.chart_show_point_labels,
+    cfg.chart_value_format,
+    cfg.interpolation,
+    cfg.y_axis_label,
+    cfg.y_axis_right_label,
+    cfg.y_axis_mode,
+    cfg.y_min,
+    cfg.y_max,
+    cfg.y_tick_step,
+    cfg.y_right_axis_mode,
+    cfg.y_right_min,
+    cfg.y_right_max,
+    cfg.y_right_tick_step,
   ]);
 
   // Ring buffers — one Map per series. Map<tsMs, scaledValue> so dedupe
@@ -809,6 +834,15 @@ function LiveTagChart({
       setSeedReady(true);
       return undefined;
     }
+    // Bucket-aware fetch size: when grouping is on we need
+    // approximately `capacity × bucket_size / poll_ms` raw rows so
+    // bucketAndAggregateRows can yield `capacity` filled buckets.
+    // Hard ceiling of 5000 to keep the SQLite read snappy.
+    const seedLimit = (() => {
+      if (!groupBucketMs) return capacity;
+      const rowsPerBucket = Math.max(1, Math.ceil(groupBucketMs / pollMs));
+      return Math.min(5000, capacity * rowsPerBucket);
+    })();
     // Seed each series in parallel. Local SQLite read for last N rows
     // is fast; even 4 series × 60 rows = 240 rows total comes back in
     // well under 200 ms on a populated edge.
@@ -818,7 +852,7 @@ function LiveTagChart({
         const rows = await fetcher({
           fromUtc: "",
           toUtc: "",
-          limit: capacity,
+          limit: seedLimit,
           offset: 0,
           gateway: s.gatewayId || "",
           tag: s.tagName,
@@ -849,13 +883,14 @@ function LiveTagChart({
       }
     });
     return () => { cancelled = true; };
-  // ONLY seriesKey + capacity drive reseeding. The fetcher is read from
-  // a ref so its unstable identity doesn't restart the seed on every
-  // parent render. seriesDefs is intentionally excluded — seriesKey
-  // captures the relevant identity (gw + tag list) and seriesDefs
-  // changes whenever the widget object changes by reference.
+  // Re-seed when series identity, capacity, or grouping changes.
+  // groupBucketMs / pollMs affect how many raw rows we need to pull
+  // so a different bucket size DOES require a fresh fetch — but
+  // changing the reducer doesn't (we can re-bucket existing rows).
+  // The fetcher is read from a ref so its unstable identity doesn't
+  // restart the seed on every parent render.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [seriesKey, capacity]);
+  }, [seriesKey, capacity, groupBucketMs, pollMs]);
 
   // Ingest WS samples: append rows from dataLogView whose ts is strictly
   // newer than the last seen ts for that series. Runs on every parent
@@ -963,34 +998,92 @@ function LiveTagChart({
     return () => clearInterval(id);
   }, [seedReady, pollMs, capacity]);
 
+  // Time-grouping configuration. The operator can ask for the chart
+  // to bucket samples (1s / 5s / 10s / 30s / 1m / 5m / 15m / 1h) and
+  // pick a reduction (last / avg / min / max / sum / first). Empty /
+  // "none" passes the raw samples through.
+  const groupKey = String(cfg.query_group_interval || "none").toLowerCase();
+  const groupBucketMs = (() => {
+    const map = {
+      none: 0,
+      "1s": 1000, "5s": 5000, "10s": 10000, "30s": 30000,
+      "1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000,
+    };
+    return map[groupKey] || 0;
+  })();
+  const reducerKey = String(cfg.query_result_aggregation || "last").toLowerCase();
+
   // Build the rendered dataset: union of timestamps across all series,
-  // last `capacity` rows, with null gap inserts. O(N log N).
+  // optional bucketing/aggregation, last `capacity` rows, with null
+  // gap inserts. O(N log N).
   const renderedData = useMemo(() => {
     const buffers = buffersRef.current;
     if (!buffers) return { rows: [], hasRightAxis: false };
-    const tsSet = new Set();
+
+    // Per-series effective entries: when grouping is on, replace each
+    // series with a Map of bucketStart→reducedValue. When off, use the
+    // raw ring-buffer map.
+    const reduce = (vals) => {
+      if (!vals.length) return null;
+      if (reducerKey === "avg" || reducerKey === "mean" || reducerKey === "average") {
+        return vals.reduce((a, b) => a + b, 0) / vals.length;
+      }
+      if (reducerKey === "min") return Math.min(...vals);
+      if (reducerKey === "max") return Math.max(...vals);
+      if (reducerKey === "sum") return vals.reduce((a, b) => a + b, 0);
+      if (reducerKey === "first") return vals[0];
+      if (reducerKey === "count") return vals.length;
+      // default "last"
+      return vals[vals.length - 1];
+    };
+    const perSeries = new Map();
     for (const s of seriesDefs) {
       const buf = buffers.get(s.id);
-      if (!buf) continue;
-      for (const ts of buf.keys()) tsSet.add(ts);
+      if (!buf) { perSeries.set(s.id, new Map()); continue; }
+      if (!groupBucketMs) {
+        perSeries.set(s.id, buf);
+        continue;
+      }
+      const grouped = new Map(); // bucketTs (center) → reduced value
+      const tmp = new Map();    // bucketStart → [values...] sorted by ts
+      const sortedKeys = [...buf.keys()].sort((a, b) => a - b);
+      for (const ts of sortedKeys) {
+        const bucketStart = Math.floor(ts / groupBucketMs) * groupBucketMs;
+        if (!tmp.has(bucketStart)) tmp.set(bucketStart, []);
+        tmp.get(bucketStart).push(buf.get(ts));
+      }
+      for (const [bucketStart, vals] of tmp.entries()) {
+        const center = bucketStart + Math.floor(groupBucketMs / 2);
+        const r = reduce(vals);
+        if (Number.isFinite(r)) grouped.set(center, r);
+      }
+      perSeries.set(s.id, grouped);
+    }
+
+    const tsSet = new Set();
+    for (const s of seriesDefs) {
+      const m = perSeries.get(s.id);
+      if (!m) continue;
+      for (const ts of m.keys()) tsSet.add(ts);
     }
     let sorted = [...tsSet].sort((a, b) => a - b);
     if (sorted.length > capacity) sorted = sorted.slice(-capacity);
+
+    // Gap threshold scales with the bucket size when grouping is on.
+    const effectiveGapMs = groupBucketMs > 0 ? groupBucketMs * 1.5 : gapThresholdMs;
 
     const rows = [];
     for (let i = 0; i < sorted.length; i += 1) {
       const tsMs = sorted[i];
       const row = { idx: rows.length + 1, tsMs, ts: new Date(tsMs).toISOString() };
       for (const s of seriesDefs) {
-        const buf = buffers.get(s.id);
-        if (!buf) { row[s.id] = null; continue; }
-        // exact-match; if this series didn't emit at this ts, null
-        row[s.id] = buf.has(tsMs) ? buf.get(tsMs) : null;
+        const m = perSeries.get(s.id);
+        if (!m) { row[s.id] = null; continue; }
+        row[s.id] = m.has(tsMs) ? m.get(tsMs) : null;
       }
       rows.push(row);
-      // Gap insert
       const next = sorted[i + 1];
-      if (next !== undefined && (next - tsMs) > gapThresholdMs) {
+      if (next !== undefined && (next - tsMs) > effectiveGapMs) {
         const midTs = tsMs + Math.floor((next - tsMs) / 2);
         const gapRow = { idx: rows.length + 1, tsMs: midTs, ts: new Date(midTs).toISOString() };
         for (const s of seriesDefs) gapRow[s.id] = null;
@@ -1001,29 +1094,88 @@ function LiveTagChart({
     return { rows, hasRightAxis };
     // tick changes are the signal that buffers mutated.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, seriesDefs, capacity, gapThresholdMs]);
+  }, [tick, seriesDefs, capacity, gapThresholdMs, groupBucketMs, reducerKey]);
 
   // Y axis: auto (data-fit) or manual (operator's min/max anchored at 0
   // unless they typed a negative min — same rules the heavy widget uses).
-  const manualY = (() => {
-    if (String(cfg.y_axis_mode || "auto").toLowerCase() !== "manual") return null;
-    const lo = Number(cfg.y_min);
-    const hi = Number(cfg.y_max);
+  const buildManualDomain = (modeKey, minKey, maxKey, stepKey) => {
+    if (String(cfg[modeKey] || "auto").toLowerCase() !== "manual") return null;
+    const lo = Number(cfg[minKey]);
+    const hi = Number(cfg[maxKey]);
     if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
-    return { lo: lo < 0 ? lo : 0, hi };
+    const step = Number(cfg[stepKey]);
+    let ticks;
+    if (Number.isFinite(step) && step > 0) {
+      ticks = [];
+      const maxTicks = 50;
+      for (let v = lo, i = 0; v <= hi + step * 1e-9 && i < maxTicks; v += step, i += 1) {
+        ticks.push(Number(v.toFixed(10)));
+      }
+    }
+    return { lo: lo < 0 ? lo : 0, hi, ticks };
+  };
+  const manualY = buildManualDomain("y_axis_mode", "y_min", "y_max", "y_tick_step");
+  const manualYRight = buildManualDomain("y_right_axis_mode", "y_right_min", "y_right_max", "y_right_tick_step");
+  const autoDomain = [
+    (dataMin) => {
+      const n = Number.isFinite(dataMin) ? dataMin : 0;
+      return n - Math.abs(n) * 0.02 - 0.001;
+    },
+    (dataMax) => {
+      const n = Number.isFinite(dataMax) ? dataMax : 1;
+      return n + Math.abs(n) * 0.05 + 0.001;
+    },
+  ];
+  const yDomainLeft = manualY ? [manualY.lo, manualY.hi] : autoDomain;
+  const yDomainRight = manualYRight ? [manualYRight.lo, manualYRight.hi] : autoDomain;
+
+  // Numeric format preset matches the heavy widget: int / 2dp / 3dp /
+  // scientific / auto. Applied to tooltip values + optional point labels.
+  const chartValueFormat = String(cfg.chart_value_format || "auto");
+  const formatNumber = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "—";
+    switch (chartValueFormat) {
+      case "int": return n.toFixed(0);
+      case "2dp": return n.toFixed(2);
+      case "3dp": return n.toFixed(3);
+      case "scientific": return n.toExponential(2);
+      case "auto":
+      default: return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
+    }
+  };
+
+  // Axis labels (rotated 90° inside the chart) — same as the heavy
+  // widget so saved widgets look identical after the routing change.
+  const primaryAxisLabel = String(cfg.y_axis_label || cfg.primary_unit || "");
+  const rightAxisLabel = String(cfg.y_axis_right_label || "");
+
+  // Style knobs the editor exposes — legend, point labels, line width,
+  // line dot. Per-series overrides on extras win at render time; the
+  // widget-level values are used as defaults.
+  const showLegend = cfg.chart_show_legend === true || seriesDefs.length > 1;
+  const showPointLabels = cfg.chart_show_point_labels === true;
+  const widgetLineWidth = (() => {
+    const n = Number(cfg.chart_line_width);
+    return Number.isFinite(n) && n > 0 ? n : 2;
   })();
-  const yDomain = manualY
-    ? [manualY.lo, manualY.hi]
-    : [
-        (dataMin) => {
-          const n = Number.isFinite(dataMin) ? dataMin : 0;
-          return n - Math.abs(n) * 0.02 - 0.001;
-        },
-        (dataMax) => {
-          const n = Number.isFinite(dataMax) ? dataMax : 1;
-          return n + Math.abs(n) * 0.05 + 0.001;
-        },
-      ];
+  const widgetDotPreset = String(cfg.chart_line_dot || "none");
+  const dotByPreset = { none: 0, small: 2, medium: 4, large: 6 };
+  const dotForSeries = (color, perSeriesDot) => {
+    const preset = perSeriesDot && perSeriesDot !== "" ? perSeriesDot : widgetDotPreset;
+    const r = dotByPreset[preset] || 0;
+    if (!r) return false;
+    return { r, fill: color, stroke: color, strokeWidth: 0 };
+  };
+  const interpolation = (() => {
+    const t = String(cfg.interpolation || "monotone").toLowerCase();
+    if (["linear", "monotone", "step", "stepafter", "stepbefore", "basis", "natural"].includes(t)) {
+      if (t === "stepafter") return "stepAfter";
+      if (t === "stepbefore") return "stepBefore";
+      return t;
+    }
+    return "monotone";
+  })();
 
   const xTickFormatter = (v) => {
     const r = renderedData.rows.find((p) => p.idx === v);
@@ -1040,12 +1192,19 @@ function LiveTagChart({
   const fmtVal = (v, name) => {
     if (v == null || !Number.isFinite(Number(v))) return ["—", name];
     const s = seriesDefs.find((x) => x.id === name) || seriesDefs.find((x) => x.label === name);
-    const base = Number(v).toLocaleString(undefined, { maximumFractionDigits: 3 });
+    const base = formatNumber(v);
     if (s?.suffix) return [`${base}${s.suffix}`, s.label];
     if (s?.unit) return [`${base} ${s.unit}`, s.label];
     return [base, s?.label || name];
   };
-  const margin = { top: 4, right: 8, left: 0, bottom: 18 };
+  // Bottom margin reserves room for x-axis tick labels. Left bump when
+  // there's an axis label so the rotated text doesn't overlap ticks.
+  const margin = {
+    top: 4,
+    right: rightAxisLabel ? 32 : 8,
+    left: primaryAxisLabel ? 12 : 0,
+    bottom: 18,
+  };
 
   if (seedError && renderedData.rows.length === 0) {
     return (
@@ -1085,14 +1244,45 @@ function LiveTagChart({
               fontSize={10}
               interval="preserveStartEnd"
             />
-            <YAxis yAxisId="left" domain={yDomain} fontSize={10} />
+            <YAxis
+              yAxisId="left"
+              domain={yDomainLeft}
+              ticks={manualY?.ticks}
+              allowDataOverflow={!!manualY}
+              tickFormatter={formatNumber}
+              fontSize={10}
+              label={primaryAxisLabel
+                ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 }
+                : undefined}
+            />
             {renderedData.hasRightAxis ? (
-              <YAxis yAxisId="right" orientation="right" domain={yDomain} fontSize={10} />
+              <YAxis
+                yAxisId="right"
+                orientation="right"
+                domain={yDomainRight}
+                ticks={manualYRight?.ticks}
+                allowDataOverflow={!!manualYRight}
+                tickFormatter={formatNumber}
+                fontSize={10}
+                label={rightAxisLabel
+                  ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 }
+                  : undefined}
+              />
             ) : null}
             <Tooltip labelFormatter={labelFmt} formatter={fmtVal} />
-            {seriesDefs.length > 1 ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
+            {showLegend ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
             {seriesDefs.map((s) => {
               const yId = s.axis === "right" ? "right" : "left";
+              // Per-series style overrides win when set; fall through to the
+              // widget-wide defaults pulled out at the top of the render.
+              const perSeriesLine = Number(s.lineWidth);
+              const lineStrokeWidth = Number.isFinite(perSeriesLine) && perSeriesLine > 0
+                ? perSeriesLine
+                : widgetLineWidth;
+              const dotProp = dotForSeries(s.color, s.lineDot);
+              const labelProp = showPointLabels
+                ? { fill: "var(--ink-soft, #8a98ab)", fontSize: 10, formatter: (v) => formatNumber(v) }
+                : false;
               const common = {
                 key: s.id,
                 dataKey: s.id,
@@ -1103,12 +1293,33 @@ function LiveTagChart({
                 connectNulls: false,
               };
               if (s.chartKind === "bar") {
-                return <Bar {...common} fill={s.color} />;
+                const barProps = { ...common, fill: s.color };
+                if (Number.isFinite(Number(s.barWidth)) && Number(s.barWidth) > 0) {
+                  barProps.barSize = Number(s.barWidth);
+                }
+                return <Bar {...barProps} label={labelProp} />;
               }
               if (s.chartKind === "area") {
-                return <Area {...common} type="monotone" fill={s.color + "33"} strokeWidth={2} dot={false} />;
+                return (
+                  <Area
+                    {...common}
+                    type={interpolation}
+                    fill={s.color + "33"}
+                    strokeWidth={lineStrokeWidth}
+                    dot={dotProp}
+                    label={labelProp}
+                  />
+                );
               }
-              return <Line {...common} type="monotone" strokeWidth={2} dot={false} />;
+              return (
+                <Line
+                  {...common}
+                  type={interpolation}
+                  strokeWidth={lineStrokeWidth}
+                  dot={dotProp}
+                  label={labelProp}
+                />
+              );
             })}
           </ComposedChart>
         </ResponsiveContainer>
@@ -2402,12 +2613,16 @@ export function DashboardWidgetCard({
       // No per-heartbeat REST polling, no merge race, no "loaded then
       // frozen" symptom. The heavy path below stays for historical
       // ranges and grouping / aggregation use-cases.
-      const hasGrouping = String(cfg?.query_group_interval || "none").toLowerCase() !== "none";
+      // Grouping is now handled INSIDE LiveTagChart so the operator
+      // can pick "5s avg over the last 60 buckets" and stay on the
+      // light path. Only fall back to the heavy aggregator path when
+      // the operator explicitly asks for historical data (time preset
+      // or absolute time range) or when the dashboard is in Historical
+      // mode — those need the full server-side query pipeline.
       const hasTimePreset = String(cfg?.query_time_filter_preset || "none").toLowerCase() !== "none";
       const hasTimeRange = !!(cfg?.query_time_filter_from || cfg?.query_time_filter_to);
       const liveModeEligible =
         !historicalMode
-        && !hasGrouping
         && !hasTimePreset
         && !hasTimeRange
         && (resolvedLimitLines || []).length === 0;
