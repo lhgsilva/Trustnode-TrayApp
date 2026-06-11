@@ -445,7 +445,12 @@ function buildDefaultForm(type = "line_chart") {
       camera_url: "",
       list_limit: 8,
       query_group_interval: "none",
-      query_result_aggregation: "count",
+      // Default to "last" for chart widgets so picking a time grouping
+      // shows actual values not sample counts. "count" is only useful
+      // for rule-based widgets.
+      query_result_aggregation: ["line_chart", "line_area_chart", "bar_chart", "value_kpi", "meter_chart"].includes(String(type))
+        ? "last"
+        : "count",
       query_row_selection: "all",
       query_row_limit: 200,
       query_rule_logic: "any",
@@ -1210,9 +1215,14 @@ export function DashboardDesigner({
         query_group_interval: QUERY_GROUP_OPTIONS.some((opt) => opt.value === form?.config?.query_group_interval)
           ? form?.config?.query_group_interval
           : "none",
+        // Chart widgets default to "last" so picking a time grouping
+        // produces a chart with real values (most recent in bucket),
+        // not sample counts. Rule widgets keep "count".
         query_result_aggregation: RULE_AGGREGATIONS.some((opt) => opt.value === form?.config?.query_result_aggregation)
           ? form?.config?.query_result_aggregation
-          : "count",
+          : (["line_chart", "line_area_chart", "bar_chart", "value_kpi", "meter_chart"].includes(String(form?.type || ""))
+              ? "last"
+              : "count"),
         query_row_selection: QUERY_SELECTION_OPTIONS.some((opt) => opt.value === form?.config?.query_row_selection)
           ? form?.config?.query_row_selection
           : "all",

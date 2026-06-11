@@ -413,19 +413,26 @@ const yAxisProps = {
 };
 
 function buildAutoYDomain(series) {
+  // Auto-fit Y axis — same shape Lite uses (5 % top pad, 2 % bottom pad)
+  // so the operator gets a tightly framed curve instead of recharts'
+  // default 0-anchored padded range. Returning dataMin/dataMax callbacks
+  // lets recharts re-evaluate the domain on every data update — which is
+  // what makes the chart "follow" the value as it moves up and down,
+  // even when the user hasn't picked manual mode.
   const values = (Array.isArray(series) ? series : [])
     .map((p) => Number(p?.value))
     .filter((n) => Number.isFinite(n));
   if (!values.length) return ["auto", "auto"];
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  if (min === max) {
-    const pad = Math.max(Math.abs(min || 1) * 0.05, 0.5);
-    return [min - pad, max + pad];
-  }
-  const span = max - min;
-  const pad = Math.max(span * 0.1, 0.25);
-  return [min - pad, max + pad];
+  return [
+    (dataMin) => {
+      const n = Number.isFinite(dataMin) ? dataMin : 0;
+      return n - Math.abs(n) * 0.02 - 0.001;
+    },
+    (dataMax) => {
+      const n = Number.isFinite(dataMax) ? dataMax : 1;
+      return n + Math.abs(n) * 0.05 + 0.001;
+    },
+  ];
 }
 
 function formatByPreset(value, preset = "auto") {
@@ -1745,7 +1752,15 @@ export function DashboardWidgetCard({
     return ticks;
   }, [manualY, cfg?.y_tick_step]);
   const yDomain = useMemo(() => {
-    if (manualY) return [manualY.lo, manualY.hi];
+    if (manualY) {
+      // Operator request: manual mode should start from 0 by default
+      // unless they explicitly typed a negative min. Industrial values
+      // are almost always non-negative so anchoring at 0 makes the
+      // chart trivially comparable across widgets. The operator's
+      // typed max becomes the top of the axis.
+      const lo = manualY.lo < 0 ? manualY.lo : 0;
+      return [lo, manualY.hi];
+    }
     return buildAutoYDomain(series);
   }, [manualY, series]);
 
@@ -1769,7 +1784,10 @@ export function DashboardWidgetCard({
     return ticks;
   }, [manualYRight, cfg?.y_right_tick_step]);
   const yRightDomain = useMemo(() => {
-    if (manualYRight) return [manualYRight.lo, manualYRight.hi];
+    if (manualYRight) {
+      const lo = manualYRight.lo < 0 ? manualYRight.lo : 0;
+      return [lo, manualYRight.hi];
+    }
     return undefined; // recharts auto-domain on the right axis when undefined
   }, [manualYRight]);
   const chartMargin = { top: 4, right: 8, left: 0, bottom: 0 };
