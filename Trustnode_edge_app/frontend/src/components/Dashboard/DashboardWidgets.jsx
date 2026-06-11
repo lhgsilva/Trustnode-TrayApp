@@ -1261,19 +1261,43 @@ export function DashboardWidgetCard({
   const effectiveRows = useMemo(() => {
     const hasHistorianFetcher = typeof fetchWidgetRowsRef.current === "function";
     if (!hasHistorianFetcher) return Array.isArray(dataLogView) ? dataLogView : [];
+    // Resolve the historian / cached row set first.
+    let baseRows = null;
     if (Array.isArray(serverQueryRows) && !serverQueryError) {
-      return serverQueryRows;
+      baseRows = serverQueryRows;
+    } else if (Array.isArray(lastGoodServerQueryRows) && lastGoodServerQueryRows.length > 0) {
+      baseRows = lastGoodServerQueryRows;
+    } else {
+      const wid = String(widget?.id || "");
+      if (wid && Array.isArray(LAST_WIDGET_ROWS_CACHE.get(wid))) {
+        baseRows = LAST_WIDGET_ROWS_CACHE.get(wid);
+      }
     }
-    if (Array.isArray(lastGoodServerQueryRows) && lastGoodServerQueryRows.length > 0) {
-      return lastGoodServerQueryRows;
+    if (!baseRows) baseRows = [];
+    // Operator-reported failure mode: header value updates every gateway
+    // tick (it reads dataLogView at parent re-render rate), but the
+    // CHART only moves when serverQueryRows comes back from the heartbeat
+    // fetch — so the line stayed frozen between fetches even though the
+    // value at the top of the card had already moved.
+    // Fix: top up baseRows with any live broadcast samples NEWER than
+    // baseRows' newest ts. Each new row in dataLogView is real PLC data,
+    // so appending it is safe and keeps the chart moving in lockstep
+    // with the header value.
+    const live = Array.isArray(dataLogView) ? dataLogView : [];
+    if (live.length === 0) return baseRows;
+    // Find baseRows' newest ts so we only append strictly fresher rows.
+    let newestTs = -Infinity;
+    for (let i = 0; i < baseRows.length; i += 1) {
+      const ts = Date.parse(String(baseRows[i]?.ts || baseRows[i]?.ts_utc || ""));
+      if (Number.isFinite(ts) && ts > newestTs) newestTs = ts;
     }
-    const wid = String(widget?.id || "");
-    if (wid && Array.isArray(LAST_WIDGET_ROWS_CACHE.get(wid))) {
-      return LAST_WIDGET_ROWS_CACHE.get(wid);
+    const append = [];
+    for (let i = 0; i < live.length; i += 1) {
+      const r = live[i];
+      const ts = Date.parse(String(r?.ts || r?.ts_utc || ""));
+      if (Number.isFinite(ts) && ts > newestTs) append.push(r);
     }
-    // Deterministic behavior: when historian query fetchers exist, do not mix with in-memory
-    // stream fallback because that can collapse counts across widgets/tags.
-    return [];
+    return append.length ? baseRows.concat(append) : baseRows;
   }, [serverQueryRows, serverQueryError, lastGoodServerQueryRows, dataLogView, widget?.id]);
 
   const directScopedRows = useMemo(
@@ -1412,19 +1436,23 @@ export function DashboardWidgetCard({
     const localRange = resolveTimeFilterRange(cfg);
     const fetchAll = async () => {
       const next = {};
-      // Series readings count is independent from the primary widget
-      // readings_count. When the operator hasn't set it, we still fall
-      // back to cfgReadingsCount * 8 so existing widgets keep behaving
-      // exactly as before. A multi-series-only widget (no primary tag)
-      // gets a sensible default of 200.
+      // Operator request: every series in the chart should pull the SAME
+      // number of points as the primary. Previously the extras fetched
+      // cfgReadingsCount * 8 (so a 20-point primary loaded 160 extra-
+      // series points) which made the multi-series chart's secondary
+      // curves stretch way past the primary's time window — confusing
+      // and visually wrong. Now extras inherit cfgReadingsCount unless
+      // the operator explicitly overrode it via series_readings_count
+      // (kept for backward compatibility with widgets that already
+      // saved a non-zero value).
       const explicitSeriesReads = Number(cfg?.series_readings_count || 0);
       const reads = Math.max(
-        50,
+        20,
         Math.min(
           5000,
           explicitSeriesReads > 0
             ? explicitSeriesReads
-            : Number(cfgReadingsCount || 120) * 8,
+            : Number(cfgReadingsCount || 200),
         ),
       );
       for (const def of extraSeriesDefs) {

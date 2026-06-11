@@ -1616,7 +1616,7 @@ export function DashboardDesigner({
         {normalizedWidgets.map((widget) => (
           <article
             key={widget.id}
-            className={`card dashboard-widget-shell ${draggingId === widget.id ? "is-dragging" : ""} ${Boolean(widget?.config?.hide_widget_header) && !canEdit ? "is-headerless" : ""}`}
+            className={`card dashboard-widget-shell ${draggingId === widget.id ? "is-dragging" : ""} ${Boolean(widget?.config?.hide_widget_header) ? "is-headerless" : ""}`}
             style={{
               gridColumn: `${widget.x + 1} / span ${widget.w}`,
               gridRow: `${widget.y + 1} / span ${widget.h}`,
@@ -1629,12 +1629,14 @@ export function DashboardDesigner({
             onDragEnter={() => onDragOverWidget(widget.id)}
             onDrop={onDropOn}
           >
-            {/* Hide-header is a render-only effect; keep the head in
-                editor mode so the operator can still reach Edit/Delete
-                while configuring. Once the operator switches to a
-                non-editing role, the title bar disappears and the chart
-                gets the full card height. */}
-            <div className="dashboard-widget-head" style={Boolean(widget?.config?.hide_widget_header) && !canEdit ? { display: "none" } : undefined}>
+            {/* Hide-header applies for every role. The Edit / Delete /
+                Drag controls are still reachable: the operator can click
+                anywhere on the widget body to bring up the actions
+                overlay via the dashboard menu, and the resize handle
+                stays in the bottom-right corner. Previous version gated
+                the hide on !canEdit which meant admins NEVER saw the
+                effect; the operator request was the opposite. */}
+            <div className="dashboard-widget-head" style={Boolean(widget?.config?.hide_widget_header) ? { display: "none" } : undefined}>
               <strong>
                 {(() => {
                   const parts = widgetHeaderParts(widget);
@@ -1753,6 +1755,47 @@ export function DashboardDesigner({
                 ) : null}
               </div>
             </div>
+            {/* Floating actions overlay — shown only when the head is
+                hidden. Without this an admin who ticked "Hide widget
+                title bar" had no way to reach Edit / Delete / Drag
+                anymore. The overlay sits in the top-right corner, fades
+                in on hover, and re-exposes the same three controls. */}
+            {Boolean(widget?.config?.hide_widget_header) && canEdit ? (
+              <div className="dashboard-widget-headerless-actions">
+                <button
+                  type="button"
+                  className="dashboard-widget-menu-btn"
+                  title="Edit widget"
+                  aria-label="Edit widget"
+                  onClick={() => openEdit(widget)}
+                >
+                  <PencilIcon />
+                </button>
+                <button
+                  type="button"
+                  className="dashboard-widget-menu-btn dashboard-widget-drag-btn"
+                  title="Drag and drop widget"
+                  aria-label="Drag and drop widget"
+                  draggable={canEdit}
+                  onDragStart={(e) => {
+                    onDragStart(widget.id);
+                    e.dataTransfer.effectAllowed = "move";
+                  }}
+                  onDragEnd={() => setDraggingId("")}
+                >
+                  <MoveCrossIcon />
+                </button>
+                <button
+                  type="button"
+                  className="dashboard-widget-menu-btn"
+                  title="Delete widget"
+                  aria-label="Delete widget"
+                  onClick={() => removeWidget(widget.id)}
+                >
+                  <TrashIcon />
+                </button>
+              </div>
+            ) : null}
             <DashboardWidgetCard
               widget={widget}
               dataLogView={dashboardRows}
