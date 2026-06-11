@@ -7,6 +7,7 @@ const net = require("net");
 const { URL } = require("url");
 
 let mainWindow = null;
+let splashWindow = null;
 let tray = null;
 let backendProc = null;
 let backendExited = false;
@@ -580,6 +581,150 @@ function withBackendParam(url, backendUrl) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Splash screen — shown the moment the user double-clicks the EXE, before
+// the (slow) backend boot and the (large) frontend bundle load. Without
+// this the user sees nothing for 5-20 s on a cold start, especially on
+// SmartScreen-scanning fresh installs. The splash is a frameless 420×340
+// window that:
+//   * Displays the TrustNode logo + product name immediately.
+//   * Shows a status line we update via IPC as the backend transitions
+//     "Starting backend…" → "Waiting for service…" → "Loading UI…".
+//   * Auto-closes the moment the main window's ready-to-show fires.
+// ---------------------------------------------------------------------------
+function readSplashLogoDataUri() {
+  // Use the bundled .ico because it's already in resources for both
+  // packaged and dev. Reading is fast (≤ 50 KB) and we embed it inline
+  // so the splash HTML has no external dependencies / network calls.
+  try {
+    const iconPath = app.isPackaged
+      ? path.join(process.resourcesPath, "trustnode_logo.ico")
+      : path.resolve(__dirname, "assets", "trustnode_logo.ico");
+    if (!fs.existsSync(iconPath)) return "";
+    const buf = fs.readFileSync(iconPath);
+    return `data:image/x-icon;base64,${buf.toString("base64")}`;
+  } catch (_) {
+    return "";
+  }
+}
+
+function buildSplashHtml() {
+  const logoUri = readSplashLogoDataUri();
+  const logoTag = logoUri
+    ? `<img src="${logoUri}" alt="TrustNode" />`
+    : "";
+  return `<!doctype html>
+<html><head><meta charset="utf-8"/><title>TrustNode</title>
+<style>
+  * { box-sizing: border-box; -webkit-user-select: none; user-select: none; }
+  html, body { margin: 0; padding: 0; height: 100%; width: 100%;
+    font-family: 'Segoe UI', Roboto, sans-serif; color: #e9edf2;
+    background: linear-gradient(160deg, #0e1a2b 0%, #14283f 65%, #0d1726 100%);
+    overflow: hidden; }
+  .stage { display: flex; flex-direction: column; align-items: center;
+    justify-content: center; height: 100%; padding: 24px 32px; gap: 18px;
+    -webkit-app-region: drag; }
+  .logo { width: 88px; height: 88px; border-radius: 18px;
+    background: rgba(255,255,255,0.05); display: flex; align-items: center;
+    justify-content: center; box-shadow: 0 6px 24px rgba(0,0,0,0.35),
+      inset 0 0 0 1px rgba(255,255,255,0.06); }
+  .logo img { width: 64px; height: 64px; object-fit: contain; }
+  .brand { font-size: 22px; font-weight: 700; letter-spacing: 0.04em;
+    color: #ffffff; }
+  .tagline { font-size: 12px; color: #8aa0bd; margin-top: -10px;
+    letter-spacing: 0.08em; text-transform: uppercase; }
+  .status { font-size: 13px; color: #cfd8e6; margin-top: 4px; min-height: 18px;
+    text-align: center; max-width: 360px; }
+  .bar { width: 220px; height: 4px; border-radius: 999px;
+    background: rgba(255,255,255,0.08); overflow: hidden; position: relative; }
+  .bar::after { content: ""; position: absolute; left: -40%;
+    width: 40%; height: 100%; border-radius: 999px;
+    background: linear-gradient(90deg, transparent, #14a89a, transparent);
+    animation: slide 1.4s ease-in-out infinite; }
+  @keyframes slide { 0% { left: -40%; } 100% { left: 100%; } }
+  .footer { position: absolute; bottom: 14px; left: 0; right: 0;
+    text-align: center; font-size: 10px; color: #5b6d86;
+    letter-spacing: 0.08em; }
+</style>
+</head><body>
+  <div class="stage">
+    <div class="logo">${logoTag}</div>
+    <div class="brand">TrustNode</div>
+    <div class="tagline">Industrial Edge</div>
+    <div class="bar"></div>
+    <div class="status" id="status">Starting up…</div>
+  </div>
+  <div class="footer">v${app.getVersion()}</div>
+  <script>
+    // Receive status updates from the main process. We use a global
+    // function the IPC bridge can invoke directly without preload.
+    if (window.electronAPI && window.electronAPI.onSplashStatus) {
+      window.electronAPI.onSplashStatus((msg) => {
+        const el = document.getElementById('status');
+        if (el && typeof msg === 'string') el.textContent = msg;
+      });
+    }
+  </script>
+</body></html>`;
+}
+
+function createSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) return;
+  splashWindow = new BrowserWindow({
+    width: 420,
+    height: 340,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    closable: false,
+    frame: false,
+    transparent: false,
+    alwaysOnTop: false,
+    skipTaskbar: false,
+    show: false,
+    backgroundColor: "#0e1a2b",
+    title: "TrustNode",
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      preload: path.join(__dirname, "preload.js"),
+    },
+  });
+  splashWindow.setMenu(null);
+  splashWindow.loadURL(
+    "data:text/html;charset=utf-8," + encodeURIComponent(buildSplashHtml())
+  );
+  splashWindow.once("ready-to-show", () => {
+    if (splashWindow && !splashWindow.isDestroyed()) splashWindow.show();
+  });
+  splashWindow.on("closed", () => { splashWindow = null; });
+}
+
+function updateSplashStatus(message) {
+  if (!splashWindow || splashWindow.isDestroyed() || !splashWindow.webContents) return;
+  try {
+    splashWindow.webContents.send("splash:status", String(message || ""));
+  } catch (_) { /* ignored */ }
+}
+
+function closeSplash() {
+  if (!splashWindow || splashWindow.isDestroyed()) {
+    splashWindow = null;
+    return;
+  }
+  try {
+    // Re-enable closable for the actual close call.
+    splashWindow.setClosable(true);
+    splashWindow.close();
+  } catch (_) {
+    try { splashWindow.destroy(); } catch (__) {}
+  }
+  splashWindow = null;
+}
+
 function createWindow() {
   const windowIconPath = app.isPackaged
     ? path.join(process.resourcesPath, "trustnode_logo.ico")
@@ -666,6 +811,12 @@ function createWindow() {
   mainWindow.once("ready-to-show", () => {
     applyOverlayTheme(currentOverlayTheme);
     mainWindow.show();
+    mainWindow.focus();
+    // Splash served its purpose — close it the moment the real UI is
+    // ready to paint. A small delay lets the OS finish swapping focus
+    // so the user doesn't see a brief blank gap between the splash
+    // disappearing and the main window appearing.
+    setTimeout(() => closeSplash(), 150);
   });
 
   mainWindow.on("close", async (event) => {
@@ -894,8 +1045,32 @@ app.whenReady().then(async () => {
     }
   }
   Menu.setApplicationMenu(null);
+  // Show the splash IMMEDIATELY so the user gets feedback the moment
+  // the EXE is launched. startBackend() can take 5–20 s on a fresh
+  // SmartScreen-scanning machine; without a splash the user sees a
+  // blank desktop and reasonably assumes nothing is happening.
+  createSplashWindow();
+  updateSplashStatus("Starting service…");
   await startBackend();
+  updateSplashStatus("Service started. Waiting for health…");
   startBackendSupervisor();
+  // Poll the backend health endpoint once so the splash transitions
+  // to "Loading UI…" only after the backend is actually responsive.
+  // 8 s ceiling so a slow backend doesn't hold the splash forever —
+  // monitorBackendStartup keeps polling once the main window is up.
+  const splashHealthDeadline = Date.now() + 8000;
+  while (Date.now() < splashHealthDeadline) {
+    try {
+      const alive = await checkBackendHealth(
+        currentBackendHost,
+        currentBackendPort,
+        1500,
+      );
+      if (alive) break;
+    } catch (_) { /* keep polling */ }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  updateSplashStatus("Loading interface…");
   createWindow();
   monitorBackendStartup();
   createTray();
