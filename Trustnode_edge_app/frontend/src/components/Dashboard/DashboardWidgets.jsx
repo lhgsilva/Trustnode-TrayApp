@@ -680,8 +680,13 @@ function LiveTagChart({
   const cfg = widget?.config || {};
   const widgetType = String(widget?.type || "line_chart");
   const capacity = Math.max(5, Math.min(5000, Number(cfg?.readings_count || 60)));
+  // pollMs is now ONLY used as a sanity floor on the per-series gap
+  // threshold (when we have fewer than 4 samples to measure cadence).
+  // The real gap threshold is derived per series from the median of
+  // actual sample deltas — so different gateways with different
+  // intervals on the same chart each get a sensible cadence-based
+  // threshold automatically.
   const pollMs = Math.max(200, Number(gatewayIntervalMs || 1000));
-  const gapThresholdMs = pollMs * 1.5;
 
   // Series definitions: primary + non-limit extras. Recomputed only when
   // the operator changes the tag or extras (cheap memo key).
@@ -1060,6 +1065,7 @@ function LiveTagChart({
       perSeries.set(s.id, grouped);
     }
 
+    // Union of timestamps across every series.
     const tsSet = new Set();
     for (const s of seriesDefs) {
       const m = perSeries.get(s.id);
@@ -1069,32 +1075,90 @@ function LiveTagChart({
     let sorted = [...tsSet].sort((a, b) => a - b);
     if (sorted.length > capacity) sorted = sorted.slice(-capacity);
 
-    // Gap threshold scales with the bucket size when grouping is on.
-    const effectiveGapMs = groupBucketMs > 0 ? groupBucketMs * 1.5 : gapThresholdMs;
+    // Per-series sorted entries so we can carry-forward by walking with
+    // a pointer. Operator request 2026-06-11: "the chart should print
+    // the last reading in the historian, should not matter if the last
+    // readings were once every 2 second or once a day". Carry-forward
+    // gives a continuous line even when one series ticks faster than
+    // another; we DO break the line at real downtime gaps (see below).
+    const perSeriesSorted = new Map();
+    for (const s of seriesDefs) {
+      const m = perSeries.get(s.id);
+      if (!m) { perSeriesSorted.set(s.id, []); continue; }
+      const entries = [...m.entries()].sort((a, b) => a[0] - b[0]);
+      perSeriesSorted.set(s.id, entries);
+    }
+
+    // Per-series "natural cadence" = median delta between adjacent
+    // samples. We use 5× that as the gap threshold so a series that
+    // genuinely ticks once a day doesn't trigger a gap; a series that
+    // normally ticks at 2 s only breaks the line if it stops for 10 s+.
+    // Operator's other point: "different gateways with different
+    // intervals" — so we derive this PER SERIES from the data itself,
+    // not from any single gateway interval.
+    const gapByIdMs = new Map();
+    for (const s of seriesDefs) {
+      const entries = perSeriesSorted.get(s.id) || [];
+      if (entries.length < 4) {
+        // Not enough history to estimate — be lenient: 10 × pollMs as
+        // a floor so single-shot tags don't get false breaks.
+        gapByIdMs.set(s.id, Math.max(60_000, pollMs * 10));
+        continue;
+      }
+      const deltas = [];
+      for (let i = 1; i < entries.length; i += 1) {
+        const d = entries[i][0] - entries[i - 1][0];
+        if (d > 0) deltas.push(d);
+      }
+      if (!deltas.length) {
+        gapByIdMs.set(s.id, Math.max(60_000, pollMs * 10));
+        continue;
+      }
+      deltas.sort((a, b) => a - b);
+      const median = deltas[Math.floor(deltas.length / 2)];
+      // 5× median, with a 5 s minimum so 1 s-interval noise doesn't
+      // trip the detector on a single missed sample.
+      gapByIdMs.set(s.id, Math.max(5000, median * 5));
+    }
+    // Bucket grouping override: when grouping is on, anything bigger
+    // than 1.5× the bucket size is a gap.
+    if (groupBucketMs > 0) {
+      for (const s of seriesDefs) gapByIdMs.set(s.id, groupBucketMs * 1.5);
+    }
+
+    // Per-series carry-forward walker.
+    const walkers = seriesDefs.map((s) => ({
+      def: s,
+      entries: perSeriesSorted.get(s.id) || [],
+      ptr: 0,
+      lastValue: null,
+      lastTs: -Infinity,
+    }));
 
     const rows = [];
     for (let i = 0; i < sorted.length; i += 1) {
       const tsMs = sorted[i];
       const row = { idx: rows.length + 1, tsMs, ts: new Date(tsMs).toISOString() };
-      for (const s of seriesDefs) {
-        const m = perSeries.get(s.id);
-        if (!m) { row[s.id] = null; continue; }
-        row[s.id] = m.has(tsMs) ? m.get(tsMs) : null;
+      for (const w of walkers) {
+        while (w.ptr < w.entries.length && w.entries[w.ptr][0] <= tsMs) {
+          w.lastValue = w.entries[w.ptr][1];
+          w.lastTs = w.entries[w.ptr][0];
+          w.ptr += 1;
+        }
+        // Carry-forward: if THIS series has emitted at-or-before tsMs,
+        // and that sample isn't older than the per-series gap
+        // threshold, use it. Otherwise null (line breaks).
+        const ageMs = tsMs - w.lastTs;
+        const cap = gapByIdMs.get(w.def.id) || (pollMs * 10);
+        row[w.def.id] = (w.lastTs > -Infinity && ageMs <= cap) ? w.lastValue : null;
       }
       rows.push(row);
-      const next = sorted[i + 1];
-      if (next !== undefined && (next - tsMs) > effectiveGapMs) {
-        const midTs = tsMs + Math.floor((next - tsMs) / 2);
-        const gapRow = { idx: rows.length + 1, tsMs: midTs, ts: new Date(midTs).toISOString() };
-        for (const s of seriesDefs) gapRow[s.id] = null;
-        rows.push(gapRow);
-      }
     }
     const hasRightAxis = seriesDefs.some((s) => s.axis === "right");
     return { rows, hasRightAxis };
     // tick changes are the signal that buffers mutated.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, seriesDefs, capacity, gapThresholdMs, groupBucketMs, reducerKey]);
+  }, [tick, seriesDefs, capacity, pollMs, groupBucketMs, reducerKey]);
 
   // Y axis: auto (data-fit) or manual (operator's min/max anchored at 0
   // unless they typed a negative min — same rules the heavy widget uses).
