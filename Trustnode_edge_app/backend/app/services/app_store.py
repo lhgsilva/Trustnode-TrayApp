@@ -1063,7 +1063,7 @@ class AppStore:
                             f"""
                             INSERT INTO "{schema}"."{table_name}"
                               (tenant_id, scope_key, payload_json, version, updated_utc)
-                            VALUES (:tenant_id, :scope_key, :payload_json::jsonb, :version, :updated_utc)
+                            VALUES (:tenant_id, :scope_key, CAST(:payload_json AS jsonb), :version, :updated_utc)
                             ON CONFLICT (tenant_id, scope_key) DO UPDATE SET
                               payload_json = EXCLUDED.payload_json,
                               version      = EXCLUDED.version,
@@ -1311,7 +1311,7 @@ class AppStore:
                             f"""
                             INSERT INTO "{schema}"."{domain}"
                               (tenant_id, scope_key, payload_json, version, updated_utc)
-                            VALUES (:tenant_id, :scope_key, :payload_json::jsonb, :version, :updated_utc)
+                            VALUES (:tenant_id, :scope_key, CAST(:payload_json AS jsonb), :version, :updated_utc)
                             ON CONFLICT (tenant_id, scope_key) DO UPDATE SET
                               payload_json = EXCLUDED.payload_json,
                               version      = EXCLUDED.version,
@@ -2087,7 +2087,7 @@ class AppStore:
                                         f"""
                                         INSERT INTO "{schema}"."{domain}"
                                           (tenant_id, scope_key, payload_json, version, updated_utc)
-                                        VALUES (:tenant_id, :scope_key, :payload_json::jsonb, :version, :updated_utc)
+                                        VALUES (:tenant_id, :scope_key, CAST(:payload_json AS jsonb), :version, :updated_utc)
                                         ON CONFLICT (tenant_id, scope_key) DO UPDATE SET
                                           payload_json = EXCLUDED.payload_json,
                                           version      = EXCLUDED.version,
