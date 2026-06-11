@@ -1051,9 +1051,17 @@ export function DashboardDesigner({
       x: widget.x,
       y: widget.y,
       config: {
+        // Spread the existing widget config first so EVERY field the
+        // operator ever saved (Y axis manual mode + min/max + tick
+        // step, right-axis variants, hide_widget_header, every chart
+        // styling knob, multiplier/offset, etc.) loads into the form
+        // intact. The explicit defaults below still normalize the
+        // known fields, but un-listed fields no longer get silently
+        // wiped on open.
+        ...(widget?.config || {}),
         gateway_id: widget?.config?.gateway_id || "",
         tag_name: widget?.config?.tag_name || "",
-        readings_count: clamp(widget?.config?.readings_count ?? 120, 20, 500),
+        readings_count: clamp(widget?.config?.readings_count ?? 120, 5, 5000),
         interpolation: CHART_INTERPOLATION_OPTIONS.some((opt) => opt.value === widget?.config?.interpolation)
           ? widget?.config?.interpolation
           : "stepAfter",
@@ -1247,9 +1255,20 @@ export function DashboardDesigner({
       x: Number.isFinite(Number(form.x)) ? clamp(form.x, 0, DASHBOARD_GRID_COLS - 1) : null,
       y: Number.isFinite(Number(form.y)) ? clamp(form.y, 0, DASHBOARD_GRID_ROWS - 1) : null,
       config: {
+        // Spread the form's full config first so ANY field the operator
+        // touched (Y axis mode/min/max/tick_step, right-axis variants,
+        // hide_widget_header, body_text_scale, chart_show_legend,
+        // multiplier/offset, plc_endpoint, etc.) survives the save.
+        // Previously saveWidget rebuilt the object from an explicit
+        // allowlist and silently DROPPED every field not in the list —
+        // that's why "configure Y axis manual + min/max" never took
+        // effect: the form held it, the save erased it. The explicit
+        // overrides below still sanitize the known fields (defaults,
+        // clamping, enum coercion).
+        ...form?.config,
         gateway_id: String(form?.config?.gateway_id || ""),
         tag_name: String(form?.config?.tag_name || ""),
-        readings_count: clamp(form?.config?.readings_count ?? 120, 20, 500),
+        readings_count: clamp(form?.config?.readings_count ?? 120, 5, 5000),
         interpolation: CHART_INTERPOLATION_OPTIONS.some((opt) => opt.value === form?.config?.interpolation)
           ? form?.config?.interpolation
           : "stepAfter",
@@ -2050,15 +2069,15 @@ export function DashboardDesigner({
                     Reading points
                     <input
                       type="number"
-                      min="20"
-                      max="500"
+                      min="5"
+                      max="5000"
                       value={form.config.readings_count}
                       onChange={(e) =>
                         setForm((p) => ({
                           ...p,
                           config: {
                             ...p.config,
-                            readings_count: clamp(e.target.value, 20, 500),
+                            readings_count: clamp(e.target.value, 5, 5000),
                             // Reset any saved override so the new value
                             // applies to extras too. Operator wants ONE
                             // knob to control the chart's depth.

@@ -917,9 +917,29 @@ export function DashboardWidgetCard({
       isTrendWidget && cfgRowSelection === "all"
         ? "last_n"
         : cfgRowSelection;
-    const requestedLimit = isTrendWidget
-      ? Math.max(cfgRowLimit, cfgReadingsCount * 4, 400)
-      : cfgRowLimit;
+    // Compute requested fetch size SO THAT after bucketing the chart
+    // ends up with at least cfgReadingsCount buckets. Without this,
+    // picking grouping="1m" + readings=20 produced 1 bucket (the chart
+    // went blank) because the fetcher only pulled 80 raw rows.
+    // Approach: rows_needed ≈ readings * (bucket_size_ms / poll_ms).
+    // The poll interval is the gateway's effective interval (defaults
+    // to 1 s when unknown). When grouping is "none" we keep the
+    // previous behaviour (4× readings, floor 400).
+    const computeBucketAwareLimit = () => {
+      if (!isTrendWidget) return cfgRowLimit;
+      const groupKey = String(cfgGroupInterval || "none").toLowerCase();
+      const bucketMs = bucketMsFromInterval(groupKey);
+      if (!bucketMs) {
+        return Math.max(cfgRowLimit, cfgReadingsCount * 4, 400);
+      }
+      const pollMs = Math.max(200, Number(gatewayIntervalMs || 1000));
+      const rowsPerBucket = Math.max(1, Math.ceil(bucketMs / pollMs));
+      const projected = cfgReadingsCount * rowsPerBucket;
+      // Hard ceilings: never punish the server with > 200k rows; never
+      // round down below the operator's explicit row_limit.
+      return Math.max(cfgRowLimit, projected, 400);
+    };
+    const requestedLimit = Math.min(200000, computeBucketAwareLimit());
     // Params-only key (no tick). Polling re-fires won't cancel an in-flight fetch
     // when SQL latency exceeds the refresh interval.
     const paramsKey = JSON.stringify({
