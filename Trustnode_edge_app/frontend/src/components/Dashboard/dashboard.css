@@ -745,7 +745,10 @@
 }
 
 .dashboard-widget-modal {
-  width: min(860px, 92vw);
+  /* Bumped from 860 → 960 so the Y axis manual editor (label + 3
+     number fields in a single row) fits without wrapping at default
+     desktop widths. 92vw still kicks in on narrow screens. */
+  width: min(960px, 92vw);
 }
 
 .dashboard-query-modal {
@@ -1702,4 +1705,43 @@
 }
 .dashboard-report-html-text {
   margin-bottom: 12px;
+}
+
+/* Force inline checkbox + label so the operator sees them on one
+   row instead of the global `label { display: grid }` stacking the
+   input above the text. Used by the Configure tab's Hide title bar
+   and Manual Y axis scale toggles. */
+.dashboard-inline-toggle {
+  display: flex !important;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.dashboard-inline-toggle > input[type="checkbox"] {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+.dashboard-inline-toggle > span {
+  flex: 0 1 auto;
+}
+
+/* Y axis manual range row: label + min + max + step on a single row.
+   The fields share the remaining width equally. */
+.dashboard-axis-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.dashboard-axis-row > span {
+  flex: 0 0 92px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted, #8a98ab);
+}
+.dashboard-axis-row > input {
+  flex: 1 1 0;
+  min-width: 0;
 }

@@ -1996,7 +1996,10 @@ export function DashboardDesigner({
                     Lets the operator strip the card chrome so the body
                     uses the full footprint, which is what an industrial
                     HMI usually wants. */}
-                <label className="dashboard-query-checkbox">
+                <label
+                  className="dashboard-inline-toggle dashboard-full-row"
+                  style={{ display: "flex", alignItems: "center", gap: 8, padding: "2px 0", cursor: "pointer" }}
+                >
                   <input
                     type="checkbox"
                     checked={Boolean(form.config?.hide_widget_header)}
@@ -2006,8 +2009,9 @@ export function DashboardDesigner({
                         config: { ...p.config, hide_widget_header: e.target.checked },
                       }))
                     }
+                    style={{ margin: 0, width: 16, height: 16 }}
                   />
-                  <span>Hide widget title bar</span>
+                  <span style={{ fontWeight: 600, fontSize: 13 }}>Hide widget title bar</span>
                 </label>
                 {/* Body text scale used by dividers / fixed_text / table_list
                     captions / KPI labels. Range 0.6..2.5 covers the usual
@@ -2142,87 +2146,84 @@ export function DashboardDesigner({
                     a slide toggle in the main Configure tab (similar to
                     the Lite view's auto-fit toggle) so the most common
                     axis decision is one click instead of opening the
-                    Series, Axes & Data Query inner modal. */}
-                {["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? (
-                  <div className="dashboard-full-row">
-                    <label className="dashboard-toggle-row" style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0" }}>
-                      <input
-                        type="checkbox"
-                        checked={String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual"}
-                        onChange={(e) => {
-                          const manual = e.target.checked;
-                          setForm((p) => ({
-                            ...p,
-                            config: {
-                              ...p.config,
-                              y_axis_mode: manual ? "manual" : "auto",
-                              // Apply the same flip to the right axis so
-                              // both axes follow the master toggle when
-                              // the operator hasn't explicitly diverged.
-                              y_right_axis_mode: manual ? "manual" : "auto",
-                            },
-                          }));
-                        }}
-                      />
-                      <span style={{ fontWeight: 600 }}>Manual Y axis scale</span>
-                      <span className="muted" style={{ fontSize: 11 }}>
-                        {String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual"
-                          ? "Custom range below — set min, max, tick step in Series & Axes."
-                          : "Auto-fit to live data (recommended)."}
-                      </span>
-                    </label>
-                    {String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual" ? (
-                      <div className="form-grid dashboard-form-grid" style={{ marginTop: 6 }}>
-                        <label>
-                          Left min
-                          <input
-                            type="number"
-                            step="any"
-                            value={form.config?.y_min ?? ""}
-                            onChange={(e) => setForm((p) => ({
+                    Series, Axes & Data Query inner modal.
+                    UI structure:
+                      Row 1: [checkbox] Manual Y axis scale  (one row)
+                      Row 2: Left axis  | min | max | tick step
+                      Row 3: Right axis | min | max | tick step (only
+                              when a right axis series exists). */}
+                {["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? (() => {
+                  const manualOn = String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual";
+                  const hasRightAxis = Array.isArray(form.config?.series_extra)
+                    && form.config.series_extra.some((s) => String(s?.axis || "left").toLowerCase() === "right");
+                  const numField = (key, placeholder) => (
+                    <input
+                      type="number"
+                      step="any"
+                      placeholder={placeholder}
+                      value={form.config?.[key] ?? ""}
+                      onChange={(e) => setForm((p) => ({
+                        ...p,
+                        config: {
+                          ...p.config,
+                          [key]: e.target.value === "" ? "" : Number(e.target.value),
+                        },
+                      }))}
+                      style={{ flex: 1, minWidth: 0 }}
+                    />
+                  );
+                  const axisRow = (label, kMin, kMax, kStep) => (
+                    <div className="dashboard-axis-row" style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      marginTop: 6,
+                    }}>
+                      <span className="muted" style={{ flex: "0 0 100px", fontSize: 12, fontWeight: 600 }}>{label}</span>
+                      {numField(kMin, "min")}
+                      {numField(kMax, "max")}
+                      {numField(kStep, "tick step")}
+                    </div>
+                  );
+                  return (
+                    <div className="dashboard-full-row">
+                      <label className="dashboard-inline-toggle" style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        padding: "2px 0",
+                        cursor: "pointer",
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={manualOn}
+                          onChange={(e) => {
+                            const manual = e.target.checked;
+                            setForm((p) => ({
                               ...p,
                               config: {
                                 ...p.config,
-                                y_min: e.target.value === "" ? "" : Number(e.target.value),
+                                y_axis_mode: manual ? "manual" : "auto",
+                                y_right_axis_mode: manual ? "manual" : "auto",
                               },
-                            }))}
-                          />
-                        </label>
-                        <label>
-                          Left max
-                          <input
-                            type="number"
-                            step="any"
-                            value={form.config?.y_max ?? ""}
-                            onChange={(e) => setForm((p) => ({
-                              ...p,
-                              config: {
-                                ...p.config,
-                                y_max: e.target.value === "" ? "" : Number(e.target.value),
-                              },
-                            }))}
-                          />
-                        </label>
-                        <label>
-                          Left tick step
-                          <input
-                            type="number"
-                            step="any"
-                            min="0"
-                            value={form.config?.y_tick_step ?? ""}
-                            onChange={(e) => setForm((p) => ({
-                              ...p,
-                              config: {
-                                ...p.config,
-                                y_tick_step: e.target.value === "" ? "" : Number(e.target.value),
-                              },
-                            }))}
-                          />
-                        </label>
-                      </div>
-                    ) : null}
-                  </div>
-                ) : null}
+                            }));
+                          }}
+                          style={{ margin: 0 }}
+                        />
+                        <span style={{ fontWeight: 600, fontSize: 13 }}>Manual Y axis scale</span>
+                        <span className="muted" style={{ fontSize: 11, marginLeft: 4 }}>
+                          {manualOn ? "Set min / max / step below." : "Auto-fit to live data."}
+                        </span>
+                      </label>
+                      {manualOn ? (
+                        <>
+                          {axisRow("Left axis", "y_min", "y_max", "y_tick_step")}
+                          {hasRightAxis ? axisRow("Right axis", "y_right_min", "y_right_max", "y_right_tick_step") : null}
+                        </>
+                      ) : null}
+                    </div>
+                  );
+                })() : null}
 
                 {["line_chart", "line_area_chart", "bar_chart", "pie_chart", "meter_chart"].includes(form.type) ? (
                   <label>

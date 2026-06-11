@@ -1165,13 +1165,28 @@ function LiveTagChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, seriesDefs, capacity, pollMs, groupBucketMs, reducerKey]);
 
-  // Y axis: auto (data-fit) or manual (operator's min/max anchored at 0
-  // unless they typed a negative min — same rules the heavy widget uses).
+  // Y axis: auto (data-fit) or manual. When manual is ON but the
+  // operator has not yet typed values, we still pin the axis to a
+  // sensible range so the toggle has an immediate visible effect:
+  //   - missing min → 0 (industrial values almost always start there)
+  //   - missing max → "auto" callback that hugs the data top
+  // That way the user sees the axis snap to a 0-anchored frame the
+  // moment they flip the toggle, then types min/max/step to refine.
   const buildManualDomain = (modeKey, minKey, maxKey, stepKey) => {
     if (String(cfg[modeKey] || "auto").toLowerCase() !== "manual") return null;
-    const lo = Number(cfg[minKey]);
-    const hi = Number(cfg[maxKey]);
-    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+    const loRaw = cfg[minKey];
+    const hiRaw = cfg[maxKey];
+    const loProvided = loRaw !== "" && loRaw !== null && loRaw !== undefined;
+    const hiProvided = hiRaw !== "" && hiRaw !== null && hiRaw !== undefined;
+    const lo = loProvided && Number.isFinite(Number(loRaw)) ? Number(loRaw) : 0;
+    const hi = hiProvided && Number.isFinite(Number(hiRaw)) ? Number(hiRaw) : null;
+    // hi is genuinely missing — let the auto-domain callback handle the
+    // top while still anchoring lo. We return an object so the chart
+    // can detect "anchor lo, auto hi" and use a mixed domain.
+    if (hi === null) {
+      return { lo: lo < 0 ? lo : 0, hi: null, ticks: undefined, partial: true };
+    }
+    if (hi <= lo) return null;
     const step = Number(cfg[stepKey]);
     let ticks;
     if (Number.isFinite(step) && step > 0) {
@@ -1181,7 +1196,7 @@ function LiveTagChart({
         ticks.push(Number(v.toFixed(10)));
       }
     }
-    return { lo: lo < 0 ? lo : 0, hi, ticks };
+    return { lo: lo < 0 ? lo : 0, hi, ticks, partial: false };
   };
   const manualY = buildManualDomain("y_axis_mode", "y_min", "y_max", "y_tick_step");
   const manualYRight = buildManualDomain("y_right_axis_mode", "y_right_min", "y_right_max", "y_right_tick_step");
@@ -1195,8 +1210,16 @@ function LiveTagChart({
       return n + Math.abs(n) * 0.05 + 0.001;
     },
   ];
-  const yDomainLeft = manualY ? [manualY.lo, manualY.hi] : autoDomain;
-  const yDomainRight = manualYRight ? [manualYRight.lo, manualYRight.hi] : autoDomain;
+  // domain: if manual & both values known → fixed; if manual & only lo
+  // → pin lo, let recharts auto-fit hi via the same callback used in
+  // auto mode; if auto → both callbacks.
+  const buildDomain = (m) => {
+    if (!m) return autoDomain;
+    if (m.partial) return [m.lo, autoDomain[1]];
+    return [m.lo, m.hi];
+  };
+  const yDomainLeft = buildDomain(manualY);
+  const yDomainRight = buildDomain(manualYRight);
 
   // Numeric format preset matches the heavy widget: int / 2dp / 3dp /
   // scientific / auto. Applied to tooltip values + optional point labels.
