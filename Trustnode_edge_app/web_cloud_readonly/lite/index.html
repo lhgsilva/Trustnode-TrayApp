@@ -754,6 +754,11 @@ function widgetAllSeries(widget) {
   // they just won't get the fallback until they're re-saved.
   const widgetEndpoint = String(cfg.plc_endpoint || cfg.plc_ip || "");
   const out = [];
+  // Top-level chart styling pulled in once so the primary series can
+  // inherit the widget's line thickness / dot setting same way the edge
+  // does. Per-series overrides on extras still win.
+  const widgetLineWidth = Number(cfg.chart_line_width);
+  const widgetLineDot = String(cfg.chart_line_dot || "none");
   if (cfg.tag_name) {
     out.push({
       id: "primary",
@@ -766,12 +771,18 @@ function widgetAllSeries(widget) {
       chart_type: primaryKind,
       multiplier: cleanMul(cfg.multiplier),
       offset: cleanOff(cfg.offset),
+      unit: String(cfg.primary_unit || ""),
+      suffix: String(cfg.primary_suffix || ""),
+      line_width: Number.isFinite(widgetLineWidth) && widgetLineWidth > 0 ? widgetLineWidth : 2,
+      line_dot: widgetLineDot,
     });
   }
   const extras = Array.isArray(cfg.series_extra) ? cfg.series_extra : [];
   extras.forEach((s, i) => {
     if (!s || !s.tag_name) return;
-    if (String(s.chart_type || "").toLowerCase() === "limit") return; // skip ref lines for now
+    if (String(s.chart_type || "").toLowerCase() === "limit") return; // limits handled separately
+    const sw = Number(s.line_width);
+    const bw = Number(s.bar_width);
     out.push({
       id: String(s.id || `s${i + 1}`),
       gateway_id: String(s.gateway_id || cfg.gateway_id || ""),
@@ -785,6 +796,13 @@ function widgetAllSeries(widget) {
       chart_type: String(s.chart_type || primaryKind).toLowerCase() || primaryKind,
       multiplier: cleanMul(s.multiplier),
       offset: cleanOff(s.offset),
+      unit: String(s.unit || ""),
+      suffix: String(s.suffix || ""),
+      line_width: Number.isFinite(sw) && sw > 0
+        ? sw
+        : (Number.isFinite(widgetLineWidth) && widgetLineWidth > 0 ? widgetLineWidth : 2),
+      bar_width: Number.isFinite(bw) && bw > 0 ? bw : null,
+      line_dot: String(s.line_dot || widgetLineDot),
     });
   });
   return out;
@@ -1068,32 +1086,88 @@ function ChartWidget({ widget, liveByKey }) {
     [rawMerged, seriesDefs, cfg.query_group_interval, cfg.query_result_aggregation]
   );
 
-  if (!seriesDefs.length) return h("div", { className: "widget-empty muted" }, "no tag");
-  if (!merged.length) return h("div", { className: "widget-empty muted" }, "no samples");
-
-  // Resolve limit lines (constant or tag-bound) from the widget's
-  // series_extra. Done here every render so tag-bound limits track
-  // the latest live broadcast tick without an explicit re-fetch.
+  // IMPORTANT: every hook call MUST run on every render — putting an
+  // early-return before useMemo violates React's rules-of-hooks and
+  // crashes with "Rendered more hooks than during the previous render"
+  // (React error #310) the moment a tag arrives. Keep all useMemo /
+  // useState / useEffect calls above the early returns below.
   const limitLines = useMemo(
     () => widgetLimitLines(widget, liveByKey, null),
     [widget?.config?.series_extra, liveByKey?.lookup, merged.length]
   );
 
-  // Primary unit / suffix flow through to the tooltip so the value
-  // appears with its physical units (e.g. "12.5 bar"). The edge has
-  // had these for months; Lite now mirrors the formatting.
-  const primaryUnit = String(cfg.primary_unit || "");
-  const primarySuffix = String(cfg.primary_suffix || "");
-  const fmtPrimary = (v) => {
-    const base = fmtVal(v);
-    if (primarySuffix) return `${base}${primarySuffix}`;
-    if (primaryUnit) return `${base} ${primaryUnit}`;
-    return base;
-  };
+  if (!seriesDefs.length) return h("div", { className: "widget-empty muted" }, "no tag");
+  if (!merged.length) return h("div", { className: "widget-empty muted" }, "no samples");
+
+  // Per-series unit/suffix lookup keyed by both label and id so the
+  // tooltip can format each value with its own physical units. Built
+  // from seriesDefs which already carried unit/suffix down.
+  const fmtByKey = {};
+  for (const s of seriesDefs) {
+    const u = String(s.unit || "");
+    const sx = String(s.suffix || "");
+    const fmt = (v) => {
+      const base = fmtVal(v);
+      if (sx) return `${base}${sx}`;
+      if (u) return `${base} ${u}`;
+      return base;
+    };
+    fmtByKey[s.label] = fmt;
+    fmtByKey[s.id] = fmt;
+  }
+  const fmtDefault = (v) => fmtVal(v);
 
   const labelFmt = (v) => merged.find((p) => p.idx === v)?.ts || String(v);
   const hasRightAxis = seriesDefs.some((s) => s.axis === "right")
     || limitLines.some((l) => l.axis === "right");
+
+  // Interpolation (linear / monotone / step / stepAfter / stepBefore /
+  // basis / natural) — same option set the edge designer offers. Default
+  // monotone matches what Recharts produced before this round.
+  const interpolation = (() => {
+    const t = String(cfg.interpolation || "monotone").toLowerCase();
+    const allowed = new Set(["linear", "monotone", "step", "stepafter", "stepbefore", "basis", "natural"]);
+    if (!allowed.has(t)) return "monotone";
+    if (t === "stepafter") return "stepAfter";
+    if (t === "stepbefore") return "stepBefore";
+    return t;
+  })();
+
+  // Manual Y axis (left + right): operator-typed [min, max] anchors the
+  // axis; otherwise yProps' auto domain is used. ticks are evenly spaced
+  // by y_tick_step when provided. Mirrors the edge's manual mode.
+  const buildManualY = (mode, lo, hi, step) => {
+    if (String(mode || "auto").toLowerCase() !== "manual") return null;
+    const a = Number(lo), b = Number(hi);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) return null;
+    const s = Number(step);
+    const ticks = Number.isFinite(s) && s > 0
+      ? (() => {
+          const out = [];
+          for (let v = a, i = 0; v <= b + s * 1e-9 && i < 50; v += s, i += 1) {
+            out.push(Number(v.toFixed(10)));
+          }
+          return out;
+        })()
+      : undefined;
+    // Manual mode starts at 0 unless the operator typed a negative min,
+    // matching the edge fix shipped earlier today.
+    const domainLo = a < 0 ? a : 0;
+    return { domain: [domainLo, b], ticks };
+  };
+  const manualLeft = buildManualY(cfg.y_axis_mode, cfg.y_min, cfg.y_max, cfg.y_tick_step);
+  const manualRight = buildManualY(cfg.y_right_axis_mode, cfg.y_right_min, cfg.y_right_max, cfg.y_right_tick_step);
+  const leftYProps = manualLeft
+    ? { ...yProps, domain: manualLeft.domain, ticks: manualLeft.ticks, allowDataOverflow: true }
+    : yProps;
+  const rightYProps = manualRight
+    ? { ...yProps, domain: manualRight.domain, ticks: manualRight.ticks, allowDataOverflow: true }
+    : yProps;
+
+  // Optional axis labels rotated 90° on the inside of each axis.
+  const leftAxisLabel = String(cfg.y_axis_label || cfg.primary_unit || "");
+  const rightAxisLabel = String(cfg.y_axis_right_label || "");
+  const showLegend = cfg.chart_show_legend === true || seriesDefs.length > 1;
 
   // Extra bottom space so the X-axis tick labels don't overlap the
   // card edge. Operator complaint 2026-06-11: "we need a little bit
@@ -1104,20 +1178,28 @@ function ChartWidget({ widget, liveByKey }) {
     h(buildChartRoot(widgetType, seriesDefs.length), { data: merged, margin },
       h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
       h(XAxis, buildXAxisProps(merged)),
-      h(YAxis, { ...yProps, yAxisId: "left" }),
-      hasRightAxis ? h(YAxis, { ...yProps, yAxisId: "right", orientation: "right" }) : null,
+      h(YAxis, {
+        ...leftYProps, yAxisId: "left",
+        label: leftAxisLabel
+          ? { value: leftAxisLabel, angle: -90, position: "insideLeft", fill: "var(--muted, #8a98ab)", fontSize: 11 }
+          : undefined,
+      }),
+      hasRightAxis ? h(YAxis, {
+        ...rightYProps, yAxisId: "right", orientation: "right",
+        label: rightAxisLabel
+          ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--muted, #8a98ab)", fontSize: 11 }
+          : undefined,
+      }) : null,
       h(Tooltip, {
         ...chartTooltipProps,
         labelFormatter: labelFmt,
         formatter: (v, name) => {
-          // Match the per-series label so the primary picks up its
-          // configured unit/suffix and extras keep their own value.
-          if (name && name === (widget?.title || cfg.tag_name)) return [fmtPrimary(v), name];
-          return [fmtVal(v), name];
+          const fmt = fmtByKey[name] || fmtDefault;
+          return [fmt(v), name];
         },
       }),
-      seriesDefs.length > 1 ? h(Legend, { wrapperStyle: { fontSize: 11, color: "var(--muted, #8a98ab)" } }) : null,
-      ...seriesDefs.map((s) => renderSeriesElement(s, widgetType)),
+      showLegend ? h(Legend, { wrapperStyle: { fontSize: 11, color: "var(--muted, #8a98ab)" } }) : null,
+      ...seriesDefs.map((s) => renderSeriesElement(s, widgetType, interpolation)),
       // Limit lines render on top of every series. Each one targets
       // its configured axis (left or right) and labels itself with a
       // short caption near the right edge.
@@ -1152,28 +1234,39 @@ function buildChartRoot(widgetType, seriesCount = 1) {
   return LineChart;
 }
 
-function renderSeriesElement(s, widgetType) {
+function renderSeriesElement(s, widgetType, interpolation = "monotone") {
+  const strokeWidth = Number.isFinite(s.line_width) && s.line_width > 0 ? s.line_width : 1.8;
+  const dotProp = (() => {
+    const d = String(s.line_dot || "none");
+    if (d === "none") return false;
+    if (d === "small") return { r: 1.5, fill: s.color };
+    if (d === "medium") return { r: 2.5, fill: s.color };
+    if (d === "large") return { r: 3.5, fill: s.color };
+    return false;
+  })();
   if (s.chart_type === "bar" || (widgetType === "bar_chart" && s.chart_type === "")) {
-    return h(Bar, {
+    const barProps = {
       key: s.id, dataKey: s.id, name: s.label,
       yAxisId: s.axis === "right" ? "right" : "left",
       isAnimationActive: false, fill: s.color,
-    });
+    };
+    if (Number.isFinite(s.bar_width) && s.bar_width > 0) barProps.barSize = s.bar_width;
+    return h(Bar, barProps);
   }
   if (s.chart_type === "area" || (widgetType === "line_area_chart" && s.chart_type === "")) {
     return h(Area, {
       key: s.id, dataKey: s.id, name: s.label,
       yAxisId: s.axis === "right" ? "right" : "left",
-      type: "monotone", stroke: s.color, fill: s.color + "33",
-      strokeWidth: 1.8, dot: false, isAnimationActive: false, connectNulls: true,
+      type: interpolation, stroke: s.color, fill: s.color + "33",
+      strokeWidth, dot: dotProp, isAnimationActive: false, connectNulls: true,
     });
   }
   // default: line
   return h(Line, {
     key: s.id, dataKey: s.id, name: s.label,
     yAxisId: s.axis === "right" ? "right" : "left",
-    type: "monotone", stroke: s.color, strokeWidth: 1.8,
-    dot: false, isAnimationActive: false, connectNulls: true,
+    type: interpolation, stroke: s.color, strokeWidth,
+    dot: dotProp, isAnimationActive: false, connectNulls: true,
   });
 }
 
@@ -1556,10 +1649,11 @@ function Widget({ widget, liveByKey, onOpen, onOpenWidget, gridStyle }) {
     type === "divider"     ? h("div", { className: "widget-divider" }, widget?.config?.text || "") :
                               h("div", { className: "widget-empty muted" }, type || "widget");
   const cfg = widget?.config || {};
-  // Chart widgets get a small maximize button in their title bar that
-  // opens the Tag Monitor modal with all of the widget's series. Mirrors
-  // the desktop edge's "monitor" button behaviour.
-  const titleBar = isChart
+  // Operator can hide the widget title bar on the edge to give the
+  // chart the full card area. Mirror that here so headerless widgets
+  // look identical between edge and Lite.
+  const hideHeader = !!cfg.hide_widget_header;
+  const titleBar = (isChart && !hideHeader)
     ? h("div", { className: "widget-title-row" },
         h("div", { className: "widget-title" }, widgetTitle(widget) || cfg.tag_name || "—"),
         onOpenWidget ? h("button", {

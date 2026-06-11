@@ -9,7 +9,7 @@
  * evicted on activate. Browsers re-check the service worker on each navigation
  * so users pick the new shell up automatically next time they open the app.
  */
-const CACHE_VERSION = "tnlite-v40-limits-grouping-unit-margin";
+const CACHE_VERSION = "tnlite-v42-chart-config-parity";
 const SHELL = [
   "./",
   "./index.html",
