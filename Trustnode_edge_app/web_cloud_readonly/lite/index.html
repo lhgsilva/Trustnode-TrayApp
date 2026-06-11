@@ -943,9 +943,27 @@ function useMultiSeries(widget, sampleCount) {
       setTick((t) => t + 1);
     };
 
+    // Initial seed strategy:
+    //   1) Fast seed at the current sample count so the chart fills
+    //      within ~1 network RTT of mount.
+    //   2) Then prefetch up to MAX_PREFETCH rows in the background so
+    //      every later samples-per-chart bump is instant from the
+    //      existing buffer (no second round trip).
+    // The DB now has ix_hist_tag_gw_ts so a 1000-row query is a
+    // bounded index scan that returns in <10 ms server-side; the user
+    // only feels the network latency, which is fine in the background.
+    const MAX_PREFETCH = 1000;
     Promise.all(
       seriesDefs.map((s) => fetchSeed(s, sampleCountRef.current))
-    ).catch(() => {});
+    ).then(() => {
+      if (stopped) return;
+      // Only deepen if there's headroom above what we already have.
+      const need = seriesDefs.filter((s) =>
+        (seededDepthRef.current.get(s.id) || 0) < MAX_PREFETCH
+      );
+      if (!need.length) return;
+      return Promise.all(need.map((s) => fetchSeed(s, MAX_PREFETCH)));
+    }).catch(() => {});
 
     // Register one realtime handler per (gw|tag) so each new row appends.
     for (const s of seriesDefs) {
