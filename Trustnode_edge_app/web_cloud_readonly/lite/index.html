@@ -881,19 +881,31 @@ function useMultiSeries(widget, sampleCount) {
   // Each series has its own running buffer keyed by ts_utc -> value.
   const [tick, setTick] = useState(0);
   const buffersRef = useRef(new Map()); // id -> Map<ts, value>
+  // Track the deepest seed size we've ever fetched per series so a later
+  // sampleCount bump only re-fetches when the new value EXCEEDS what we
+  // already have. Going from 100 → 20 keeps the buffer untouched and the
+  // chart just re-slices the last 20 in render — instant.
+  const seededDepthRef = useRef(new Map()); // id -> int
+  // Keep sampleCount fresh inside the realtime closure without re-running
+  // the subscription effect: we re-cap the buffer using sampleCountRef
+  // on every realtime row instead of binding it as a dep.
+  const sampleCountRef = useRef(sampleCount);
+  useEffect(() => { sampleCountRef.current = sampleCount; }, [sampleCount]);
 
+  // Subscription + initial seed effect. Runs ONLY when the series identity
+  // set changes (i.e. the operator switches the tag, gateway, or
+  // series_extra), or when the tenant changes. Crucially: changing
+  // sampleCount alone does NOT re-run this — see the deeper-seed effect
+  // below for handling that case.
   useEffect(() => {
     buffersRef.current = new Map(seriesDefs.map((s) => [s.id, new Map()]));
+    seededDepthRef.current = new Map(seriesDefs.map((s) => [s.id, 0]));
     setTick((t) => t + 1);
     if (!seriesDefs.length) return;
 
     let stopped = false;
     const subs = new Set();
-    const handlers = new Map(); // gw|tag -> handler
 
-    // Apply the series's multiplier + offset before storing so every
-    // downstream consumer (the chart, the tooltip, the live tile) sees
-    // already-scaled values. Same rule the edge applies.
     const scale = (s, raw) => {
       const v = Number(raw);
       if (!Number.isFinite(v)) return null;
@@ -902,34 +914,38 @@ function useMultiSeries(widget, sampleCount) {
       return v * m + o;
     };
 
-    const fetchSeed = async (s) => {
+    const fetchSeed = async (s, targetDepth) => {
       const base = applyTenantScope(
         supabase
           .from("historian_readings")
           .select("ts_utc, value, tenant_id, gateway_id, plc_ip"),
         pickedTenantId,
       ).eq("tag_name", s.tag_name);
-      // (gateway_id == s.gateway_id) OR (plc_ip == s.plc_endpoint), so a
-      // running gateway B with the same PLC IP can drive a chart wired
-      // to gateway A.
       const filtered = s.plc_endpoint
         ? base.or(`gateway_id.eq.${s.gateway_id},plc_ip.eq.${s.plc_endpoint}`)
         : base.eq("gateway_id", s.gateway_id);
+      const limit = Math.max(2, Math.min(5000, Number(targetDepth) || 20));
       const { data, error } = await filtered
         .order("ts_utc", { ascending: false })
-        .limit(Math.max(2, Math.min(2000, Number(sampleCount) || 20)));
+        .limit(limit);
       if (stopped || error) return;
       const buf = buffersRef.current.get(s.id);
       if (!buf) return;
-      buf.clear();
+      // Merge into the existing buffer instead of clearing it. Existing
+      // realtime appends that arrived during the fetch are preserved;
+      // the seed only inserts the older rows the buffer didn't have.
       (data || []).slice().reverse().forEach((r) => {
         buf.set(r.ts_utc, scale(s, r.value));
       });
+      seededDepthRef.current.set(s.id, Math.max(
+        seededDepthRef.current.get(s.id) || 0, limit
+      ));
       setTick((t) => t + 1);
     };
 
-    // Seed all series in parallel.
-    Promise.all(seriesDefs.map(fetchSeed)).catch(() => {});
+    Promise.all(
+      seriesDefs.map((s) => fetchSeed(s, sampleCountRef.current))
+    ).catch(() => {});
 
     // Register one realtime handler per (gw|tag) so each new row appends.
     for (const s of seriesDefs) {
@@ -941,8 +957,9 @@ function useMultiSeries(widget, sampleCount) {
         const buf = buffersRef.current.get(s.id);
         if (!buf) return;
         buf.set(row.ts_utc, scale(s, row.value));
-        // Cap each buffer at sampleCount * 2 entries.
-        const cap = Math.max(20, (Number(sampleCount) || 20) * 2);
+        // Cap each buffer at sampleCount * 2 entries so we always keep
+        // a bit of headroom for re-rendering at the larger preset.
+        const cap = Math.max(20, (Number(sampleCountRef.current) || 20) * 2);
         if (buf.size > cap) {
           const keys = [...buf.keys()].sort();
           for (let i = 0; i < keys.length - cap; i++) buf.delete(keys[i]);
@@ -951,13 +968,60 @@ function useMultiSeries(widget, sampleCount) {
       };
       historianSubscribers.add(fn);
       subs.add(fn);
-      handlers.set(`${s.gateway_id}|${s.tag_name}`, fn);
     }
     return () => {
       stopped = true;
       subs.forEach((fn) => historianSubscribers.delete(fn));
     };
-  }, [seriesDefs, sampleCount, pickedTenantId]);
+  // Deliberately omit sampleCount — see comment above. The
+  // deeper-seed effect below handles bumps without resetting the
+  // realtime channel.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seriesDefs, pickedTenantId]);
+
+  // Sample-count growth effect: when the operator picks a larger window
+  // (e.g. 20 → 500), fetch the extra history once and merge it into
+  // each series's existing buffer without clearing or re-subscribing.
+  // Picking a SMALLER window does nothing — the render just slices the
+  // last N from the existing buffer, which is instant.
+  useEffect(() => {
+    if (!seriesDefs.length) return;
+    let stopped = false;
+    const target = Math.max(2, Math.min(5000, Number(sampleCount) || 20));
+    const scale = (s, raw) => {
+      const v = Number(raw);
+      if (!Number.isFinite(v)) return null;
+      const m = Number.isFinite(s?.multiplier) && s.multiplier !== 0 ? s.multiplier : 1;
+      const o = Number.isFinite(s?.offset) ? s.offset : 0;
+      return v * m + o;
+    };
+    const deepen = async (s) => {
+      const have = seededDepthRef.current.get(s.id) || 0;
+      if (target <= have) return; // nothing to do; render will just slice
+      const base = applyTenantScope(
+        supabase
+          .from("historian_readings")
+          .select("ts_utc, value, tenant_id, gateway_id, plc_ip"),
+        pickedTenantId,
+      ).eq("tag_name", s.tag_name);
+      const filtered = s.plc_endpoint
+        ? base.or(`gateway_id.eq.${s.gateway_id},plc_ip.eq.${s.plc_endpoint}`)
+        : base.eq("gateway_id", s.gateway_id);
+      const { data, error } = await filtered
+        .order("ts_utc", { ascending: false })
+        .limit(target);
+      if (stopped || error) return;
+      const buf = buffersRef.current.get(s.id);
+      if (!buf) return;
+      (data || []).slice().reverse().forEach((r) => {
+        buf.set(r.ts_utc, scale(s, r.value));
+      });
+      seededDepthRef.current.set(s.id, target);
+      setTick((t) => t + 1);
+    };
+    Promise.all(seriesDefs.map(deepen)).catch(() => {});
+    return () => { stopped = true; };
+  }, [sampleCount, seriesDefs, pickedTenantId]);
 
   // Build the merged dataset. Take the union of all timestamps across
   // every series, sort, then for each timestamp emit a row carrying each
