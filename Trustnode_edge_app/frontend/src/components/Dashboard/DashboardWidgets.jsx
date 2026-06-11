@@ -798,7 +798,18 @@ export function DashboardWidgetCard({
   const cfgRowSelection = String(cfg?.query_row_selection || "all");
   const cfgRowLimit = Number(cfg?.query_row_limit || 200);
   const cfgGroupInterval = String(cfg?.query_group_interval || "none");
-  const cfgResultAggregation = String(cfg?.query_result_aggregation || "count");
+  // Default aggregation for chart widgets is "last" (use the most recent
+  // value in each bucket). Previously this defaulted to "count" which
+  // made the chart suddenly show tiny integers (sample counts) the
+  // moment the operator picked a non-"none" grouping — "grouping was
+  // broken" per the operator report. count only makes sense for
+  // rule-based widgets that genuinely want sample frequencies; chart
+  // widgets always want a real numeric reduction of the values.
+  const _isChartWidgetTypeForAggDefault = ["line_chart", "line_area_chart", "bar_chart", "value_kpi", "meter_chart"].includes(String(widget?.type || ""));
+  const cfgResultAggregation = String(
+    cfg?.query_result_aggregation
+    || (_isChartWidgetTypeForAggDefault ? "last" : "count")
+  );
   const cfgRuleLogic = String(cfg?.query_rule_logic || "any");
   const cfgTimePreset = String(cfg?.query_time_filter_preset || "none");
   const cfgTimeFrom = String(cfg?.query_time_filter_from || "");

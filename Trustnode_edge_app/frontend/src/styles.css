@@ -1214,26 +1214,33 @@ body {
    the widget (the browser already shows a ghost drag image) — we just dim
    the source slot so the operator sees what they're moving. The actual
    layout reflow happens once on drop, eliminating mid-drag overlap. */
-/* Widget cards drop the default .card padding so the chart fills the
-   card edge-to-edge. The widget head (.dashboard-widget-head) and the
-   body wrapper (.dashboard-widget-card) re-introduce their own padding,
-   but the chart body gets the full width — operator-reported issue
+/* Widget cards drop the default .card 14 px padding so the chart fills
+   the card edge-to-edge. Defined AFTER .card later in the file would
+   normally win the cascade, but .dashboard-widget-shell sits at line
+   1223 and .card at line 1487 so we use !important to guarantee the
+   override regardless of source order — operator-reported issue
    2026-06-11: "the charts should use all width spaces available in the
    card, we don't need extra spaces in the sides". */
 .dashboard-widget-shell {
-  padding: 0;
+  padding: 0 !important;
   overflow: hidden;
+  position: relative;
 }
+/* Re-introduce small breathing room around the head only. The chart
+   body itself runs edge-to-edge of the card (its only inset is the
+   recharts internal margin). */
 .dashboard-widget-shell > .dashboard-widget-head {
-  padding: 10px 12px 6px;
+  padding: 8px 12px 4px !important;
 }
-.dashboard-widget-shell > .dashboard-widget-card {
-  padding: 4px 6px 6px;
+/* Chart body wrappers fill the remaining card space with no extra
+   horizontal padding so the curve actually uses the full width. */
+.dashboard-widget-shell .dashboard-widget-block {
+  padding: 0;
+  margin: 0;
 }
-/* Headerless layout: the chart fills the whole card minus a 4 px
-   safety inset so the curve never touches the rounded corner. */
-.dashboard-widget-shell.is-headerless > .dashboard-widget-card {
-  padding: 4px;
+.dashboard-widget-shell .dashboard-widget-chart {
+  padding: 0;
+  margin: 0;
 }
 /* Floating action buttons shown in the top-right corner of a widget
    card when the title bar is hidden AND the user can edit. Fade in on

@@ -2523,7 +2523,10 @@ export function DashboardDesigner({
                   <label className="dashboard-query-field">
                     <span>Result aggregation</span>
                     <select
-                      value={form.config.query_result_aggregation || "count"}
+                      value={form.config.query_result_aggregation
+                        || (["line_chart", "line_area_chart", "bar_chart", "value_kpi", "meter_chart"].includes(String(form?.type || ""))
+                            ? "last"
+                            : "count")}
                       onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, query_result_aggregation: e.target.value } }))}
                     >
                       {RULE_AGGREGATIONS.map((opt) => (
