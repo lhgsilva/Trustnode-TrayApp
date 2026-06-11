@@ -2270,6 +2270,11 @@ function AppShell() {
     deviceName: "",
     quality: "all"
   });
+  // Persisted error from the most recent historian poll. Cleared on
+  // success. The Historian page reads this so the operator sees WHY the
+  // table is empty (timeout, backend 500, auth fail) instead of staring
+  // at a blank page.
+  const [historianPollError, setHistorianPollError] = useState("");
   const [logFilters, setLogFilters] = useState({
     from: "",
     to: "",
@@ -4333,12 +4338,18 @@ function AppShell() {
         if (cancelled) return;
         if (histRes?.ok && Array.isArray(histRes.rows)) {
           setDataLog((prev) => mergeHistorianRowsStable(histRes.rows, prev, 25000));
+          setHistorianPollError("");
         }
         if (logRes?.ok && Array.isArray(logRes.rows)) {
           setAppLogs(logRes.rows);
         }
-      } catch (_) {
-        // Keep current in-memory flow when DB history query is unavailable.
+      } catch (err) {
+        // Surface so the operator can see that the very first
+        // post-hydration fetch failed (often a startup race where the
+        // backend hadn't bound port yet, or a stuck SQLite write lock).
+        if (!cancelled) {
+          setHistorianPollError(String(err?.message || err));
+        }
       }
     };
     loadOperationalHistory();
@@ -4366,9 +4377,16 @@ function AppShell() {
         if (cancelled) return;
         if (res?.ok && Array.isArray(res.rows)) {
           setDataLog((prev) => mergeHistorianRowsStable(res.rows, prev, 25000));
+          setHistorianPollError("");
         }
-      } catch (_) {
-        // transient — next tick will retry
+      } catch (err) {
+        // Surface the error instead of swallowing it — operators were
+        // staring at an empty Historian table for hours with no clue
+        // why. Now the error appears inline above the filter row and
+        // the next tick still retries on its own.
+        if (!cancelled) {
+          setHistorianPollError(String(err?.message || err));
+        }
       } finally {
         running = false;
       }
@@ -5220,9 +5238,17 @@ function AppShell() {
               });
               return { id: c.id, connection_ok: Boolean(res.ok), last_test: res.message, last_check_utc: tsNow() };
             } catch (err) {
-              const msg = String(err || "");
-              const transient = /aborterror|signal is aborted|failed to fetch|networkerror|load failed/i.test(msg);
-              return { id: c.id, connection_ok: false, last_test: msg, last_check_utc: tsNow(), transient };
+              const rawMsg = String(err?.message || err || "");
+              const transient = /aborterror|signal is aborted|failed to fetch|networkerror|load failed/i.test(rawMsg);
+              // Replace the cryptic browser AbortError text with
+              // something the operator can act on. "Signal is aborted
+              // without reason" was triggering helpdesk tickets that
+              // turned out to be "Supabase pooler unreachable from
+              // this network" or "VPS firewall blocked our IP".
+              const friendly = transient
+                ? `Connection test timed out after ${c.engine === "postgresql" ? 5 : 3} s — server didn't respond. Likely causes: DB host unreachable, firewall, Supabase pooler offline, or wrong port.`
+                : rawMsg;
+              return { id: c.id, connection_ok: false, last_test: friendly, last_check_utc: tsNow(), transient };
             }
           })
         );
@@ -8499,10 +8525,20 @@ const getGatewayHealth = (gateway) => {
     const deviceProtocolOk = Boolean(device && (device.protocol_ok ?? device.port_ok));
     const plcOk = Boolean(device && device.ping_ok && deviceProtocolOk);
     const dbOk = Boolean(db && db.connection_ok);
-    if (!plcOk && !dbOk) return { ok: false, label: "Device + DB Fails" };
-    if (!plcOk) return { ok: false, label: "Device Fails" };
-    if (!dbOk) return { ok: false, label: "DB Fails" };
-    return { ok: true, label: "Ready" };
+    // Build a human-readable explanation of WHY each side failed so
+    // the operator can hover over the badge and see the actual cause
+    // instead of just "Device + DB Fails".
+    const reasons = [];
+    if (!device) reasons.push("No device linked to this gateway.");
+    else if (!device.ping_ok) reasons.push(`PLC ping to ${device.plc_ip || device.opc_url || "configured endpoint"} failed.`);
+    else if (!deviceProtocolOk) reasons.push(`Device IP responds but the ${gateway.gateway_type || "configured"} protocol port isn't open.`);
+    if (!db) reasons.push("No database connection assigned to this gateway.");
+    else if (!db.connection_ok) reasons.push(`DB "${db.name || db.id}" (${db.engine || ""}) test: ${(db.last_test || "no detail").slice(0, 200)}`);
+    const reasonText = reasons.join("\n") || "All checks passed.";
+    if (!plcOk && !dbOk) return { ok: false, label: "Device + DB Fails", reason: reasonText };
+    if (!plcOk) return { ok: false, label: "Device Fails", reason: reasonText };
+    if (!dbOk) return { ok: false, label: "DB Fails", reason: reasonText };
+    return { ok: true, label: "Ready", reason: reasonText };
   };
 
   const getDbWritingLabel = (dbId) => {
@@ -18595,6 +18631,22 @@ const getGatewayHealth = (gateway) => {
                   </section>
                 );
               })()}
+              {historianPollError ? (
+                <section className="card" style={{ background: "rgba(211, 84, 84, 0.08)", borderColor: "rgba(211, 84, 84, 0.4)" }}>
+                  <div className="row" style={{ gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                    <span className="status-pill status-offline">HISTORIAN POLL FAILED</span>
+                    <span style={{ fontSize: 13 }} title={historianPollError}>
+                      {historianPollError.slice(0, 240)}
+                    </span>
+                    <button className="btn btn-secondary btn-sm" onClick={() => setHistorianPollError("")}>
+                      Dismiss
+                    </button>
+                    <span className="muted" style={{ fontSize: 11 }}>
+                      Next retry on the regular poll tick — usually 5 s.
+                    </span>
+                  </div>
+                </section>
+              ) : null}
               <section className="card">
                 <div className="historian-filter-row">
                   <label>
@@ -20654,7 +20706,10 @@ const getGatewayHealth = (gateway) => {
                     <span className="gateway-footer-cell" title={g.name}>{g.name}</span>
                     <span className="gateway-footer-cell" title={getGatewayFooterAddress(g)}>{getGatewayFooterAddress(g)}</span>
                     <span className="gateway-footer-cell">
-                      <span className={`status-pill ${statusClass}`}>{statusLabel}</span>
+                      <span
+                        className={`status-pill ${statusClass}`}
+                        title={health?.reason || statusLabel}
+                      >{statusLabel}</span>
                     </span>
                     <span className="gateway-footer-cell">
                       <span className={intervalInfo.mismatch ? "gateway-interval-mismatch" : ""}>
