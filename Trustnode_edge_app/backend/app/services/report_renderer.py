@@ -1349,6 +1349,148 @@ def build_chart_section_rows(section: dict[str, Any]) -> tuple[list[str], list[l
     return header, body
 
 
+def build_template_render_data(template: dict[str, Any]) -> dict[str, Any]:
+    """Render a saved template to a JSON structure suitable for an HTML
+    preview in the dashboard. Walks the same sections the PDF renderer
+    walks, but instead of emitting reportlab flowables it emits plain
+    dicts the React layer can render directly.
+
+    Section shape (one per template section):
+      { type: "header" | "text" | "kpi_grid" | "line_chart" | "area_chart"
+              | "bar_chart" | "pie_chart" | "table" | "image" | "spacer"
+              | "page_break",
+        title: str, subtitle: str (header only),
+        ...type-specific keys (rows, items, slices, series, body, ...) }
+    """
+    definition = template.get("definition") if isinstance(template, dict) else None
+    if not isinstance(definition, dict):
+        definition = {}
+    sections = definition.get("sections")
+    if not isinstance(sections, list):
+        sections = []
+    out_sections: list[dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        stype = str(section.get("type") or "").strip().lower()
+        title = str(section.get("title") or "").strip()
+        try:
+            if stype == "header":
+                out_sections.append({
+                    "type": "header",
+                    "title": title or str(template.get("name") or "Report"),
+                    "subtitle": str(section.get("subtitle") or "").strip(),
+                    "show_generated_at": section.get("show_generated_at") is not False,
+                })
+            elif stype == "text":
+                out_sections.append({
+                    "type": "text",
+                    "title": title,
+                    "text": str(section.get("text") or section.get("html") or ""),
+                })
+            elif stype == "kpi_grid":
+                items = section.get("items") or []
+                rendered = []
+                for it in items if isinstance(items, list) else []:
+                    if not isinstance(it, dict):
+                        continue
+                    value, count, unit = _fetch_kpi_value(it)
+                    rendered.append({
+                        "label": str(it.get("label") or it.get("tag_name") or "—"),
+                        "value": None if value is None else float(value),
+                        "unit": str(unit or ""),
+                        "sample_count": int(count or 0),
+                        "aggregation": str(it.get("aggregation") or "avg"),
+                    })
+                cols = section.get("columns")
+                try:
+                    cols_n = int(cols) if cols is not None else 4
+                except Exception:
+                    cols_n = 4
+                out_sections.append({
+                    "type": "kpi_grid",
+                    "title": title,
+                    "columns": max(1, min(6, cols_n)),
+                    "items": rendered,
+                })
+            elif stype in ("line_chart", "area_chart", "bar_chart"):
+                series_meta, aligned = _fetch_multi_series(section)
+                series = []
+                for i, meta in enumerate(series_meta):
+                    pts = aligned[i] if i < len(aligned) else []
+                    series.append({
+                        "label": str(meta.get("label") or meta.get("tag_name") or f"Series {i + 1}"),
+                        "unit": str(meta.get("unit") or ""),
+                        "color": str(meta.get("color") or ""),
+                        # Compact point list: [ts_utc, value]. Cap to 500
+                        # samples per series so the JSON payload stays
+                        # reasonable when an operator picks a broad range.
+                        "points": [
+                            [str(p[0] or ""), (None if p[1] is None else float(p[1]))]
+                            for p in pts[-500:]
+                        ],
+                    })
+                out_sections.append({
+                    "type": stype,
+                    "title": title,
+                    "series": series,
+                })
+            elif stype == "pie_chart":
+                slices = _fetch_pie_data(section)
+                out_sections.append({
+                    "type": "pie_chart",
+                    "title": title,
+                    "slices": [
+                        {"label": str(s[0] or ""), "value": float(s[1] or 0), "color": str(s[2] or "")}
+                        for s in slices
+                    ],
+                })
+            elif stype == "table":
+                header, body = _build_data_table_rows(section)
+                out_sections.append({
+                    "type": "table",
+                    "title": title,
+                    "header": [str(h) for h in header],
+                    "rows": [[("" if c is None else str(c)) for c in r] for r in body[:200]],
+                    "row_count": len(body),
+                })
+            elif stype == "image":
+                # Image sections carry a data URL or a relative path. The
+                # data URL transports cleanly through the JSON envelope;
+                # path-based images can't be embedded here (we'd need to
+                # serve them from the backend) so we surface just the
+                # filename and let the operator know.
+                data_url = str(section.get("data_url") or "").strip()
+                path = str(section.get("path") or "").strip()
+                out_sections.append({
+                    "type": "image",
+                    "title": title,
+                    "caption": str(section.get("caption") or ""),
+                    "data_url": data_url if data_url.startswith("data:") else "",
+                    "path": path,
+                    "align": str(section.get("align") or "center"),
+                    "width_mm": section.get("width_mm") or 0,
+                })
+            elif stype == "spacer":
+                out_sections.append({"type": "spacer", "height": section.get("height") or 8})
+            elif stype == "page_break":
+                out_sections.append({"type": "page_break"})
+            else:
+                out_sections.append({"type": "unknown", "raw_type": stype, "title": title})
+        except Exception as exc:
+            out_sections.append({
+                "type": "error",
+                "title": title,
+                "section_type": stype,
+                "error": str(exc),
+            })
+    return {
+        "name": str(template.get("name") or "Report"),
+        "description": str(template.get("description") or ""),
+        "sections": out_sections,
+    }
+
+
 def build_template_dataset_files(template: dict[str, Any], output_dir: Path, base_name: str) -> dict[str, Path]:
     """Write CSV and TXT companion files for a template's data sections.
 

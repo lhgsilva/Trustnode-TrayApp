@@ -5,6 +5,8 @@ import {
   listScheduledReports,
   runReportTemplateNow,
   openGeneratedReport,
+  getReportTemplatePreviewData,
+  getGeneratedReportFileUrl,
 } from "../../api";
 import {
   ResponsiveContainer,
@@ -3080,29 +3082,44 @@ export function DashboardWidgetCard({
 }
 
 // =====================================================================
-// ReportCardWidget — pick a saved template, see the last generated PDF
-// for it, and trigger an on-demand render directly from the dashboard.
-// Schedule / trigger configuration lives on the Scheduled Reports page;
-// this widget links there rather than duplicate the form.
+// ReportCardWidget — three display modes:
+//   * summary       — template name + last generated PDF link +
+//                     Generate now button (the original behaviour).
+//   * pdf_preview   — embeds the most recent PDF inline using an
+//                     <iframe> so the operator sees the actual report.
+//   * html_preview  — renders the template's sections (header + KPI
+//                     grid + charts + tables + pies + text + image)
+//                     as live HTML so the layout matches what the PDF
+//                     prints, refreshes on every poll.
+// All modes share the "Generate now" button and the optional auto-
+// refresh interval (cfg.report_refresh_minutes), so scheduling stays
+// in Scheduled Reports while quick triggers stay on the widget.
 // =====================================================================
 function ReportCardWidget({ widget }) {
   const cfg = widget?.config || {};
   const templateId = String(cfg.report_template_id || "").trim();
+  const viewMode = (() => {
+    const m = String(cfg.report_view_mode || "").toLowerCase();
+    return ["summary", "pdf_preview", "html_preview"].includes(m) ? m : "summary";
+  })();
+  const refreshMin = Math.max(0, Math.min(1440, Number(cfg.report_refresh_minutes || 0)));
+
   const [templates, setTemplates] = useState([]);
   const [generated, setGenerated] = useState(null);
   const [scheduleSummary, setScheduleSummary] = useState("");
+  const [previewData, setPreviewData] = useState(null);
+  const [previewError, setPreviewError] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [statusMsg, setStatusMsg] = useState("");
 
-  const reload = useCallback(async () => {
+  const reloadMeta = useCallback(async () => {
     try {
       const tpls = await listReportTemplates();
-      // Backend returns { templates: [...] } from /api/reports/templates
       const rows = Array.isArray(tpls?.templates) ? tpls.templates
         : (Array.isArray(tpls?.rows) ? tpls.rows : []);
       setTemplates(rows);
-    } catch (_) { /* keep last value */ }
+    } catch (_) { /* keep last */ }
     if (!templateId) { setGenerated(null); setScheduleSummary(""); return; }
     try {
       const list = await listGeneratedReports({ templateId, limit: 1 });
@@ -3122,10 +3139,32 @@ function ReportCardWidget({ widget }) {
           ? `Tag trigger · ${m.trigger_tag_name || "(unset)"}`
           : `Every ${m.trigger_interval_minutes || "?"} min`);
       } else setScheduleSummary(`${matches.length} schedules`);
-    } catch (_) { /* leave previous summary */ }
+    } catch (_) { /* leave previous */ }
   }, [templateId]);
 
-  useEffect(() => { reload(); }, [reload]);
+  const reloadPreview = useCallback(async () => {
+    if (!templateId || viewMode !== "html_preview") { setPreviewData(null); setPreviewError(""); return; }
+    try {
+      const res = await getReportTemplatePreviewData(templateId);
+      setPreviewData(res?.data || null);
+      setPreviewError("");
+    } catch (err) {
+      setPreviewError(String(err?.message || err));
+    }
+  }, [templateId, viewMode]);
+
+  useEffect(() => { reloadMeta(); }, [reloadMeta]);
+  useEffect(() => { reloadPreview(); }, [reloadPreview]);
+
+  // Operator-configurable auto-refresh: each cycle re-fetches whichever
+  // view is active (PDF mode re-pulls the latest generated, HTML mode
+  // rebuilds the section payload). 0 disables.
+  useEffect(() => {
+    if (!refreshMin) return undefined;
+    const tick = () => { reloadMeta(); reloadPreview(); };
+    const id = setInterval(tick, Math.max(15, refreshMin) * 60 * 1000);
+    return () => clearInterval(id);
+  }, [refreshMin, reloadMeta, reloadPreview]);
 
   const runNow = async () => {
     if (!templateId) return;
@@ -3133,56 +3172,299 @@ function ReportCardWidget({ widget }) {
     try {
       await runReportTemplateNow(templateId);
       setStatusMsg("Generated.");
-      // small delay so the new row is indexed before re-listing
-      setTimeout(() => { reload(); setStatusMsg(""); }, 800);
+      setTimeout(() => { reloadMeta(); reloadPreview(); setStatusMsg(""); }, 800);
     } catch (err) {
       setError(String(err?.message || err));
       setStatusMsg("");
     } finally { setBusy(false); }
   };
 
-  const downloadLast = () => {
-    if (!generated?.id) return;
-    openGeneratedReport(generated.id);
-  };
+  const downloadLast = () => { if (generated?.id) openGeneratedReport(generated.id); };
 
   const activeTpl = templates.find((t) => String(t.id || "") === templateId);
+  const pdfUrl = generated?.id ? getGeneratedReportFileUrl(generated.id, { inline: true }) : "";
 
+  // ── Header — same shape in every mode so the operator always sees
+  //    the template name + a quick-action toolbar.
+  const headerStrip = (
+    <div className="dashboard-report-card-row">
+      <div style={{ minWidth: 0, flex: 1 }}>
+        <strong>{activeTpl?.name || "Report"}</strong>
+        {scheduleSummary ? <span className="dashboard-report-schedule" style={{ marginLeft: 8 }}>{scheduleSummary}</span> : null}
+      </div>
+      <div className="row" style={{ gap: 4 }}>
+        <button type="button" className="btn btn-secondary btn-sm" disabled={!templateId || busy} onClick={runNow}>
+          {busy ? "Generating…" : "Generate now"}
+        </button>
+        {generated ? <button type="button" className="btn btn-primary btn-sm" onClick={downloadLast}>Open PDF</button> : null}
+      </div>
+    </div>
+  );
+
+  const statusStrip = (
+    <div className="dashboard-report-card-row">
+      {statusMsg ? <span className="muted">{statusMsg}</span> : null}
+      {error ? <span className="warn">{error}</span> : null}
+      {generated && viewMode !== "summary" ? (
+        <span className="muted" style={{ fontSize: 11 }}>
+          Last: {generated.generated_utc ? new Date(generated.generated_utc).toLocaleString() : "—"}
+        </span>
+      ) : null}
+    </div>
+  );
+
+  if (!templateId) {
+    return (
+      <div className="dashboard-widget-block dashboard-report-card">
+        {headerStrip}
+        <div className="dashboard-report-card-row dashboard-report-empty">
+          Pick a template in the widget editor.
+        </div>
+      </div>
+    );
+  }
+
+  if (viewMode === "pdf_preview") {
+    return (
+      <div className="dashboard-widget-block dashboard-report-card">
+        {headerStrip}
+        <div className="dashboard-report-pdf-frame">
+          {pdfUrl ? (
+            <iframe
+              src={pdfUrl}
+              title={`Report preview — ${activeTpl?.name || templateId}`}
+              style={{ border: 0, width: "100%", height: "100%" }}
+            />
+          ) : (
+            <div className="dashboard-report-empty">No PDF generated yet — click <strong>Generate now</strong>.</div>
+          )}
+        </div>
+        {statusStrip}
+      </div>
+    );
+  }
+
+  if (viewMode === "html_preview") {
+    return (
+      <div className="dashboard-widget-block dashboard-report-card">
+        {headerStrip}
+        <div className="dashboard-report-html-frame">
+          {previewError ? <div className="warn">{previewError}</div> : null}
+          {previewData ? (
+            <ReportHtmlPreview data={previewData} />
+          ) : (
+            <div className="muted">Loading preview…</div>
+          )}
+        </div>
+        {statusStrip}
+      </div>
+    );
+  }
+
+  // summary (default)
   return (
     <div className="dashboard-widget-block dashboard-report-card">
-      <div className="dashboard-report-card-row">
-        <strong>{activeTpl?.name || "Report"}</strong>
-        {scheduleSummary ? <span className="dashboard-report-schedule">{scheduleSummary}</span> : null}
-      </div>
+      {headerStrip}
       {generated ? (
         <div className="dashboard-report-card-row dashboard-report-last">
           <div>
             <div className="dashboard-report-filename">{generated.filename || `report-${generated.id}.pdf`}</div>
             <div className="dashboard-report-meta">
-              {generated.generated_utc
-                ? new Date(generated.generated_utc).toLocaleString()
-                : "—"}
+              {generated.generated_utc ? new Date(generated.generated_utc).toLocaleString() : "—"}
               {Number.isFinite(Number(generated.size_bytes))
                 ? ` · ${Math.round(Number(generated.size_bytes) / 1024)} KB`
                 : ""}
             </div>
           </div>
-          <button type="button" className="btn btn-primary btn-sm" onClick={downloadLast}>
-            Open last PDF
-          </button>
         </div>
       ) : (
         <div className="dashboard-report-card-row dashboard-report-empty">
-          {templateId ? "No reports generated yet." : "Pick a template in the widget editor."}
+          No reports generated yet.
         </div>
       )}
-      <div className="dashboard-report-card-row">
-        <button type="button" className="btn btn-secondary btn-sm" disabled={!templateId || busy} onClick={runNow}>
-          {busy ? "Generating…" : "Generate now"}
-        </button>
-        {statusMsg ? <span className="muted">{statusMsg}</span> : null}
-        {error ? <span className="warn">{error}</span> : null}
-      </div>
+      {statusStrip}
+    </div>
+  );
+}
+
+// ─── HTML preview renderer ──────────────────────────────────────────
+// Walks the JSON section list returned by GET .../preview-data and
+// renders each section as inline HTML / Recharts. Layout intentionally
+// mirrors the PDF (header banner, KPI grid, chart-as-line, table, pie)
+// so the operator gets the same visual story in the dashboard as they
+// would in the printed report.
+function ReportHtmlPreview({ data }) {
+  if (!data) return null;
+  const sections = Array.isArray(data.sections) ? data.sections : [];
+  return (
+    <div className="dashboard-report-html-doc">
+      {sections.map((s, idx) => {
+        switch (s.type) {
+          case "header":
+            return (
+              <div key={idx} className="dashboard-report-html-header">
+                <h2>{s.title}</h2>
+                {s.subtitle ? <div className="muted">{s.subtitle}</div> : null}
+                {s.show_generated_at !== false ? <div className="muted" style={{ fontSize: 11 }}>
+                  Generated {new Date().toLocaleString()}
+                </div> : null}
+              </div>
+            );
+          case "text":
+            return (
+              <div key={idx} className="dashboard-report-html-text">
+                {s.title ? <h3>{s.title}</h3> : null}
+                <div style={{ whiteSpace: "pre-wrap" }}>{s.text}</div>
+              </div>
+            );
+          case "kpi_grid": {
+            const cols = Math.max(1, Math.min(6, Number(s.columns || 4)));
+            return (
+              <div key={idx} className="dashboard-report-html-section">
+                {s.title ? <h3>{s.title}</h3> : null}
+                <div className="dashboard-report-html-kpi-grid"
+                  style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
+                  {(s.items || []).map((it, i) => (
+                    <div key={i} className="dashboard-report-html-kpi-cell">
+                      <div className="kpi-label">{it.label}</div>
+                      <div className="kpi-value">
+                        {it.value == null ? "—" : Number(it.value).toLocaleString(undefined, { maximumFractionDigits: 3 })}
+                        {it.unit ? <span className="kpi-unit">{it.unit}</span> : null}
+                      </div>
+                      <div className="kpi-meta">{it.sample_count} samples · {it.aggregation}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          }
+          case "line_chart":
+          case "area_chart":
+          case "bar_chart": {
+            const series = Array.isArray(s.series) ? s.series : [];
+            if (!series.length) return (
+              <div key={idx} className="dashboard-report-html-section">
+                {s.title ? <h3>{s.title}</h3> : null}
+                <div className="muted">No samples in range.</div>
+              </div>
+            );
+            // Merge timestamps across series. Same union-of-ts approach
+            // the dashboard chart uses so multi-series stays aligned.
+            const byTs = new Map();
+            series.forEach((srs, sidx) => {
+              for (const [ts, v] of (srs.points || [])) {
+                let row = byTs.get(ts);
+                if (!row) { row = { ts }; byTs.set(ts, row); }
+                row[`s${sidx}`] = v;
+              }
+            });
+            const rows = [...byTs.values()].sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+            return (
+              <div key={idx} className="dashboard-report-html-section">
+                {s.title ? <h3>{s.title}</h3> : null}
+                <div style={{ width: "100%", height: 180 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <ComposedChart data={rows} margin={{ top: 4, right: 8, left: 0, bottom: 18 }}>
+                      <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                      <XAxis dataKey="ts" tickFormatter={(v) => String(v).slice(11, 19)} fontSize={10} />
+                      <YAxis fontSize={10} />
+                      <Tooltip labelFormatter={(v) => String(v)} />
+                      <Legend wrapperStyle={{ fontSize: 11 }} />
+                      {series.map((srs, sidx) => {
+                        const color = srs.color || ["#14a89a", "#f97316", "#3b82f6", "#a855f7"][sidx % 4];
+                        const props = {
+                          key: `s${sidx}`,
+                          type: "monotone",
+                          dataKey: `s${sidx}`,
+                          name: srs.label + (srs.unit ? ` (${srs.unit})` : ""),
+                          stroke: color,
+                          fill: s.type === "area_chart" ? color + "33" : color,
+                          isAnimationActive: false,
+                          connectNulls: true,
+                        };
+                        if (s.type === "bar_chart") return <Bar {...props} />;
+                        if (s.type === "area_chart") return <Area {...props} />;
+                        return <Line {...props} dot={false} />;
+                      })}
+                    </ComposedChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            );
+          }
+          case "pie_chart": {
+            const slices = Array.isArray(s.slices) ? s.slices : [];
+            if (!slices.length) return (
+              <div key={idx} className="dashboard-report-html-section">
+                {s.title ? <h3>{s.title}</h3> : null}
+                <div className="muted">No data.</div>
+              </div>
+            );
+            return (
+              <div key={idx} className="dashboard-report-html-section">
+                {s.title ? <h3>{s.title}</h3> : null}
+                <div style={{ width: "100%", height: 180 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie data={slices} dataKey="value" nameKey="label" outerRadius={70} isAnimationActive={false}>
+                        {slices.map((sl, i) => (
+                          <Cell key={i} fill={sl.color || ["#14a89a", "#f97316", "#3b82f6", "#a855f7", "#22c55e"][i % 5]} />
+                        ))}
+                      </Pie>
+                      <Tooltip />
+                      <Legend wrapperStyle={{ fontSize: 11 }} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            );
+          }
+          case "table": {
+            const header = Array.isArray(s.header) ? s.header : [];
+            const rows = Array.isArray(s.rows) ? s.rows : [];
+            return (
+              <div key={idx} className="dashboard-report-html-section">
+                {s.title ? <h3>{s.title}</h3> : null}
+                <div className="dashboard-report-html-table-wrap">
+                  <table className="dashboard-report-html-table">
+                    <thead>
+                      <tr>{header.map((h, i) => <th key={i}>{h}</th>)}</tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((r, ri) => (
+                        <tr key={ri}>
+                          {r.map((c, ci) => <td key={ci}>{c}</td>)}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {Number(s.row_count || 0) > rows.length ? (
+                    <div className="muted" style={{ fontSize: 11, padding: 4 }}>
+                      Showing {rows.length} of {s.row_count} rows.
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            );
+          }
+          case "image":
+            return (
+              <div key={idx} className="dashboard-report-html-section" style={{ textAlign: s.align || "center" }}>
+                {s.title ? <h3>{s.title}</h3> : null}
+                {s.data_url ? <img src={s.data_url} alt={s.title || ""} style={{ maxWidth: "100%" }} /> : null}
+                {s.caption ? <div className="muted" style={{ fontSize: 11 }}>{s.caption}</div> : null}
+              </div>
+            );
+          case "spacer":
+            return <div key={idx} style={{ height: Math.max(4, Number(s.height) * 2) }} />;
+          case "page_break":
+            return <hr key={idx} style={{ border: 0, borderTop: "2px dashed var(--stroke)" }} />;
+          case "error":
+            return <div key={idx} className="warn">Section error ({s.section_type}): {s.error}</div>;
+          default:
+            return <div key={idx} className="muted">Unsupported section: {s.type || s.raw_type}</div>;
+        }
+      })}
     </div>
   );
 }

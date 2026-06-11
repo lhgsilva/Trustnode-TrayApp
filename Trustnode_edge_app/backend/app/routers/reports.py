@@ -505,6 +505,25 @@ def export_section_txt(payload: dict[str, Any] = Body(...)) -> Response:
     )
 
 
+@router.get("/templates/{template_id}/preview-data")
+def template_preview_data(template_id: str) -> dict[str, Any]:
+    """Render a saved template's sections as a JSON structure ready for
+    an in-browser HTML preview (used by the Dashboard's Report Card
+    widget in 'html_preview' mode). Same data the PDF renderer pulls
+    — KPI values, chart series, table rows, pie slices — just expressed
+    as JSON instead of reportlab flowables. Refreshes whenever the
+    dashboard widget polls so the preview stays in sync with live data."""
+    template = reports_store.get_template(template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    try:
+        from app.services.report_renderer import build_template_render_data
+        data = build_template_render_data(template)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Preview build failed: {exc}")
+    return {"ok": True, "template_id": template_id, "data": data}
+
+
 @router.post("/templates/{template_id}/generate")
 def generate_template(template_id: str) -> dict[str, Any]:
     """Render a saved template by id and store it as a generated report.

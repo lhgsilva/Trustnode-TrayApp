@@ -2409,6 +2409,16 @@ export async function exportSectionTxt(section) {
   return res.blob();
 }
 
+export async function getReportTemplatePreviewData(templateId) {
+  const res = await fetchWithTimeout(
+    withNoCache(`${_reportApiBase()}/api/reports/templates/${encodeURIComponent(templateId)}/preview-data`),
+    { headers: { "Cache-Control": "no-store, no-cache, max-age=0" } },
+    20000,
+  );
+  await ensureOk(res, "Report preview data fetch failed");
+  return res.json();
+}
+
 export async function runReportTemplateNow(templateId) {
   const res = await fetchWithTimeout(
     `${_reportApiBase()}/api/reports/templates/${encodeURIComponent(templateId)}/generate`,

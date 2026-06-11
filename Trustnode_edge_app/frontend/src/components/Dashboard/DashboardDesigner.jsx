@@ -231,6 +231,8 @@ function ReportCardEditor({ config, onChange }) {
     })();
   }, []);
   const value = String(config?.report_template_id || "");
+  const viewMode = String(config?.report_view_mode || "summary");
+  const refreshMin = Number(config?.report_refresh_minutes || 0);
   return (
     <>
       <label className="dashboard-full-row">
@@ -245,10 +247,40 @@ function ReportCardEditor({ config, onChange }) {
           ))}
         </select>
       </label>
+      <label className="dashboard-full-row">
+        Widget view
+        <select
+          value={viewMode}
+          onChange={(e) => onChange({ report_view_mode: e.target.value })}
+        >
+          <option value="summary">Summary — name, last PDF, Generate button</option>
+          <option value="pdf_preview">Embed last PDF in the card</option>
+          <option value="html_preview">Render the report as live HTML</option>
+        </select>
+      </label>
+      <label className="dashboard-full-row">
+        Auto-refresh (minutes; 0 = manual only)
+        <input
+          type="number"
+          min={0}
+          max={1440}
+          value={refreshMin}
+          onChange={(e) => {
+            const n = Math.max(0, Math.min(1440, Math.round(Number(e.target.value || 0))));
+            onChange({ report_refresh_minutes: n });
+          }}
+          placeholder="0"
+        />
+      </label>
       <p className="dashboard-query-hint">
-        Pick one of the templates saved in the Reporting page. Trigger
-        (time-based or tag-based) and email delivery are configured per
-        template under Scheduled Reports.
+        <strong>Summary</strong> shows the template name, last generated
+        PDF, and a Generate-now button (best in a compact 5×3 slot).
+        {" "}<strong>Embed last PDF</strong> renders the latest PDF in
+        an iframe — re-run Generate to refresh. <strong>Render as live
+        HTML</strong> walks the template sections (KPIs, charts, tables)
+        and renders them inline so the report layout stays in sync with
+        live data. Trigger (time-based or tag-based) and email delivery
+        are still configured per template under Scheduled Reports.
       </p>
       {loadErr ? <p className="dashboard-query-hint warn">{loadErr}</p> : null}
     </>

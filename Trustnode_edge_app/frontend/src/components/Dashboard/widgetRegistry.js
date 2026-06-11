@@ -19,7 +19,7 @@ export const WIDGET_TYPES = [
   // it, and trigger an on-demand render straight from the dashboard.
   // Trigger / schedule configuration lives in Scheduled Reports — the
   // widget links there so we don't duplicate that UI.
-  { key: "report_card", label: "Report Card", group: "Reports", defaultSize: { w: 5, h: 3 } },
+  { key: "report_card", label: "Report Card", group: "Reports", defaultSize: { w: 10, h: 10 } },
 ];
 
 export function getWidgetMeta(type) {
