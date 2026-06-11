@@ -2383,7 +2383,9 @@ function AppShell() {
     use_gateway: true,
     use_app: false,
     use_backup: false,
-    cloud_sync_enabled: false
+    cloud_sync_enabled: false,
+    tag_filters: [],
+    gateway_filters: []
   });
   const [dbTestBusy, setDbTestBusy] = useState(false);
   const [dbTestResult, setDbTestResult] = useState(null);
@@ -10078,7 +10080,18 @@ const getGatewayHealth = (gateway) => {
       equipment: conn.equipment || "",
       schema: conn.schema || "public",
       table: conn.table || "plc_readings",
-      tls: Boolean(conn.tls)
+      tls: Boolean(conn.tls),
+      // CSV / TXT sinks can be scoped to specific tags + gateways so the
+      // operator can have ONE export file that captures, say, "all the
+      // OEE-relevant tags across every PLC". When empty, the sink keeps
+      // its legacy behaviour ("accept everything from every gateway it
+      // is attached to").
+      tag_filters: Array.isArray(conn.tag_filters)
+        ? conn.tag_filters.map((t) => String(t || "").trim()).filter(Boolean)
+        : [],
+      gateway_filters: Array.isArray(conn.gateway_filters)
+        ? conn.gateway_filters.map((g) => String(g || "").trim()).filter(Boolean)
+        : [],
     });
     const primarySink = toSink(db);
     const parallelSinks = dbConnectionsRef.current
@@ -11405,7 +11418,9 @@ const getGatewayHealth = (gateway) => {
       use_gateway: conn.use_gateway !== false,
       use_app: Boolean(conn.use_app),
       use_backup: Boolean(conn.use_backup),
-      cloud_sync_enabled: Boolean(conn.cloud_sync_enabled)
+      cloud_sync_enabled: Boolean(conn.cloud_sync_enabled),
+      tag_filters: Array.isArray(conn.tag_filters) ? conn.tag_filters : [],
+      gateway_filters: Array.isArray(conn.gateway_filters) ? conn.gateway_filters : []
     });
     setDbTestResult(
       conn.last_test
@@ -11616,6 +11631,14 @@ const getGatewayHealth = (gateway) => {
         schema: dbForm.schema.trim() || "public",
         table: dbForm.table.trim() || "plc_readings",
         tls: Boolean(dbForm.tls),
+        // Persist the file-sink filters so they survive reloads and
+        // get propagated through buildGatewayRuntimePayload's toSink.
+        tag_filters: Array.isArray(dbForm.tag_filters)
+          ? dbForm.tag_filters.map((s) => String(s || "").trim()).filter(Boolean)
+          : [],
+        gateway_filters: Array.isArray(dbForm.gateway_filters)
+          ? dbForm.gateway_filters.map((s) => String(s || "").trim()).filter(Boolean)
+          : [],
         connection_ok: true,
         last_test: provisionMsg
           ? `${dbTestResult?.message || existingRow?.last_test || "ok"} | ${provisionMsg}`
@@ -21789,6 +21812,61 @@ const getGatewayHealth = (gateway) => {
                         </div>
                         <small className="muted">
                           Click the folder icon to choose a directory — the file name is generated from this connection's name and extension. You can still edit the final path before saving.
+                        </small>
+                      </label>
+                    </div>
+                  </section>
+                  {/* Tag + gateway scoping. Lets the operator point ONE
+                      CSV/TXT sink at "just these tags from any
+                      gateway", instead of receiving every tag from
+                      every gateway it's attached to. Leaving both
+                      empty keeps the legacy "accept everything"
+                      behaviour. */}
+                  <section className="db-group">
+                    <div className="db-group-title">Tag &amp; Gateway Scope</div>
+                    <div className="db-grid-2">
+                      <label className="db-span-2">
+                        Tag names to export (one per line — leave empty for all)
+                        <textarea
+                          rows={4}
+                          value={Array.isArray(dbForm.tag_filters) ? dbForm.tag_filters.join("\n") : ""}
+                          onChange={(e) => setDbForm({
+                            ...dbForm,
+                            tag_filters: e.target.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
+                          })}
+                          placeholder={"SimREAL[3]\nSimDINT[2]\nSimDINT[4]"}
+                          disabled={!canEditPage("database")}
+                        />
+                        <small className="muted">
+                          Exact match against <code>tag_name</code> on incoming readings. Across every gateway the export covers.
+                        </small>
+                      </label>
+                      <label className="db-span-2">
+                        Restrict to these gateways (optional)
+                        <div className="db-tag-chip-grid">
+                          {gatewayConfigs.map((g) => {
+                            const active = Array.isArray(dbForm.gateway_filters)
+                              && dbForm.gateway_filters.includes(g.id);
+                            return (
+                              <button
+                                key={g.id}
+                                type="button"
+                                className={`btn btn-sm ${active ? "btn-primary" : "btn-secondary"}`}
+                                onClick={() => {
+                                  const cur = Array.isArray(dbForm.gateway_filters) ? [...dbForm.gateway_filters] : [];
+                                  const idx = cur.indexOf(g.id);
+                                  if (idx === -1) cur.push(g.id); else cur.splice(idx, 1);
+                                  setDbForm({ ...dbForm, gateway_filters: cur });
+                                }}
+                                disabled={!canEditPage("database")}
+                              >
+                                {g.name || g.id}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <small className="muted">
+                          Click a gateway chip to include it. None selected = include every gateway.
                         </small>
                       </label>
                     </div>

@@ -5227,3 +5227,19 @@ textarea {
   .recharts-cartesian-axis-tick text,
   .recharts-legend-item-text { fill: #111 !important; color: #111 !important; }
 }
+
+/* CSV / TXT file-sink gateway picker chips. Small wrap-grid so 20+
+   gateways still fit without horizontal scroll. */
+.db-tag-chip-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 6px 4px;
+  border: 1px dashed var(--stroke);
+  border-radius: 8px;
+  background: var(--card-2, rgba(20, 24, 32, 0.5));
+}
+.db-tag-chip-grid .btn {
+  flex: 0 0 auto;
+}

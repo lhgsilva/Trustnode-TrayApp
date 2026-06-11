@@ -1373,9 +1373,46 @@ class GatewayWorker:
                 # Parallel sinks are best-effort and should not block primary flow.
                 pass
 
+    def _filter_readings_for_sink(
+        self,
+        sink: Dict[str, Any],
+        readings: List[GatewayReading],
+    ) -> List[GatewayReading]:
+        """Apply per-sink tag filtering and per-sink gateway filtering.
+
+        Operators told us "the csv file is writing every tag", which is
+        what the previous fan-out path did. Now a csv_file / txt_file
+        sink can carry:
+
+        * `tag_filters`: list of tag names (case-sensitive). When set
+          and non-empty, only readings for those tags get written.
+        * `gateway_filters`: list of gateway ids. When set and the
+          current gateway's id isn't in the list, the sink writes
+          NOTHING for this fan-out call. Lets one CSV sink be reused
+          for tags from any gateway while excluding others.
+
+        Backwards compatible: an empty / missing list means "accept
+        everything", so existing sinks keep their current behaviour.
+        """
+        tag_filters = sink.get("tag_filters")
+        gateway_filters = sink.get("gateway_filters")
+        gateway_id = getattr(self.config, "gateway_id", None) or getattr(self.config, "id", "")
+        if gateway_filters:
+            allowed_gws = {str(g or "").strip() for g in gateway_filters if g}
+            if allowed_gws and str(gateway_id or "") not in allowed_gws:
+                return []
+        if tag_filters:
+            allowed_tags = {str(t or "").strip() for t in tag_filters if t}
+            if allowed_tags:
+                return [r for r in readings if str(r.tag_name or "") in allowed_tags]
+        return list(readings)
+
     def _persist_csv_file_for_sink(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> bool:
         import csv
-
+        filtered = self._filter_readings_for_sink(sink, readings)
+        if not filtered:
+            return True  # nothing to write but the sink itself is fine
+        sink_label = str((sink or {}).get("name") or (sink or {}).get("id") or "csv_file")
         try:
             file_path = self._resolve_output_file_path((sink or {}).get("file_path") or "", "trustnode_log.csv")
             write_header = (not os.path.exists(file_path)) or os.path.getsize(file_path) == 0
@@ -1383,7 +1420,7 @@ class GatewayWorker:
                 writer = csv.writer(f)
                 if write_header:
                     writer.writerow(["ts_local", "ts_utc", "tag_name", "value", "value_text", "quality", "quality_label", "source", "site", "area", "equipment"])
-                for r in readings:
+                for r in filtered:
                     writer.writerow([
                         _utc_str_to_local_iso(r.ts_utc),
                         r.ts_utc,
@@ -1398,21 +1435,50 @@ class GatewayWorker:
                         r.equipment,
                     ])
             return True
-        except Exception:
+        except Exception as exc:
+            # Bare `except: return False` here was hiding the actual
+            # cause from the operator for months. Surface it via the
+            # data-sync state so the UI tile shows what's wrong.
+            self._mark_db_write_error(
+                f"CSV sink '{sink_label}' write failed: {type(exc).__name__}: {exc}"
+            )
+            try:
+                import logging
+                logging.getLogger("trustnode.csv-sink").warning(
+                    "csv_file sink '%s' (file=%r) write failed: %s",
+                    sink_label, (sink or {}).get("file_path"), exc,
+                )
+            except Exception:
+                pass
             return False
 
     def _persist_txt_file_for_sink(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> bool:
+        filtered = self._filter_readings_for_sink(sink, readings)
+        if not filtered:
+            return True
+        sink_label = str((sink or {}).get("name") or (sink or {}).get("id") or "txt_file")
         try:
             file_path = self._resolve_output_file_path((sink or {}).get("file_path") or "", "trustnode_log.txt")
             with open(file_path, "a", encoding="utf-8") as f:
-                for r in readings:
+                for r in filtered:
                     txt = getattr(r, "value_text", "") or ""
                     f.write(
                         f"{_utc_str_to_local_iso(r.ts_utc)}|{r.ts_utc}|{r.tag_name}|{r.value}|{txt}|"
                         f"{r.quality}|{r.quality_label}|{r.source}|{r.site}|{r.area}|{r.equipment}\n"
                     )
             return True
-        except Exception:
+        except Exception as exc:
+            self._mark_db_write_error(
+                f"TXT sink '{sink_label}' write failed: {type(exc).__name__}: {exc}"
+            )
+            try:
+                import logging
+                logging.getLogger("trustnode.txt-sink").warning(
+                    "txt_file sink '%s' (file=%r) write failed: %s",
+                    sink_label, (sink or {}).get("file_path"), exc,
+                )
+            except Exception:
+                pass
             return False
 
     def _persist_sqlite_for_sink(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> bool:
