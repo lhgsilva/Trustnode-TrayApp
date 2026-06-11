@@ -5243,3 +5243,62 @@ textarea {
 .db-tag-chip-grid .btn {
   flex: 0 0 auto;
 }
+
+/* Tag selection grid for file-sink editor */
+.db-tag-checkbox-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 4px;
+  margin-top: 4px;
+  padding: 6px;
+  border: 1px dashed var(--stroke);
+  border-radius: 8px;
+  background: var(--card-2, rgba(20, 24, 32, 0.5));
+  max-height: 260px;
+  overflow-y: auto;
+}
+.db-tag-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  min-width: 0;
+}
+.db-tag-checkbox-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+.db-tag-checkbox-name {
+  flex: 1 1 auto;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.db-tag-checkbox-owner {
+  font-size: 10px;
+  color: var(--muted, #8a98ab);
+  flex: 0 0 auto;
+}
+
+/* CSV preview pane */
+.db-csv-preview-pre {
+  background: var(--card-2, rgba(20, 24, 32, 0.7));
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  padding: 8px;
+  margin: 0 0 6px 0;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-x: auto;
+}
+
+/* Quick on/off toggle on the database list row */
+.table-action-btn.is-off {
+  color: var(--muted, #8a98ab);
+  background: transparent;
+}

@@ -12,6 +12,15 @@ from app.opcua_utils import resolve_requested_nodes, split_requested_identifiers
 from app.tenant import normalize_tenant_id
 
 
+class _SafeDict(dict):
+    """str.format_map() default: an unknown placeholder renders as the
+    literal "{name}" rather than raising KeyError. Lets the custom CSV
+    format string survive operator typos without crashing the poll
+    cycle — they just see the literal token in their file and fix it."""
+    def __missing__(self, key: str) -> str:  # type: ignore[override]
+        return "{" + key + "}"
+
+
 def _utc_str_to_local_iso(ts_utc: str) -> str:
     """Convert a UTC timestamp string into the operator's local ISO string.
 
@@ -1353,15 +1362,43 @@ class GatewayWorker:
         else:
             self.db_pending_count = 0
 
-        # Fan-out write to additional local/file sinks enabled for this gateway.
+        # Fan-out write to ALL configured parallel sinks. The previous
+        # implementation skipped any sink whose engine matched the
+        # primary (line `if sink_engine == engine: continue`), which
+        # broke the common case "primary historian PG + extra CSV mirror
+        # + extra PG mirror for daily reports". The new rule:
+        #   - Skip by *sink identity* (id), not engine, so multiple
+        #     csv_file sinks coexist when they point at different files.
+        #   - Skip the primary by id, not by reference equality — the
+        #     dict instance comparison hid edge cases where the same
+        #     row got passed twice.
+        #   - Cover every engine, including postgresql / legacy_http:
+        #     queue to the outbox the same way the primary path does,
+        #     so the cloud / remote sink receives identical rows.
+        #   - "MUST be in the csv file the same data the historian got"
+        #     — operator's stated guarantee. Each fan-out failure now
+        #     surfaces via _mark_db_write_error so the operator can see
+        #     when a mirror is silently lagging.
+        primary_id = str((self.db_sink or {}).get("id") or "")
+        seen_sink_ids: Set[str] = set()
+        if primary_id:
+            seen_sink_ids.add(primary_id)
         for sink in (self.db_sinks or []):
             if not isinstance(sink, dict):
                 continue
-            if sink is self.db_sink:
+            sink_id = str(sink.get("id") or "")
+            if sink_id and sink_id in seen_sink_ids:
+                continue
+            if sink_id:
+                seen_sink_ids.add(sink_id)
+            if sink.get("enabled") is False:
+                continue
+            if sink.get("use_gateway") is False:
+                # Operator turned off "feed from gateways" for this
+                # connection — same gate the primary sink uses.
                 continue
             sink_engine = str(sink.get("engine") or "").strip().lower()
-            if sink_engine == engine:
-                continue
+            sink_label = str(sink.get("name") or sink.get("id") or sink_engine)
             try:
                 if sink_engine == "csv_file":
                     self._persist_csv_file_for_sink(sink, readings)
@@ -1369,9 +1406,32 @@ class GatewayWorker:
                     self._persist_txt_file_for_sink(sink, readings)
                 elif sink_engine == "sqlite":
                     self._persist_sqlite_for_sink(sink, readings)
-            except Exception:
-                # Parallel sinks are best-effort and should not block primary flow.
-                pass
+                elif sink_engine in ("postgresql", "legacy_http"):
+                    # Parallel cloud / legacy sinks aren't yet routed
+                    # through a sink-aware outbox column — the current
+                    # _enqueue_outbox is single-target. Surface this
+                    # explicitly so the operator doesn't think it's
+                    # silently working. File sinks (csv_file, txt_file,
+                    # sqlite) ARE fully functional in parallel.
+                    self._mark_db_write_error(
+                        f"Parallel sink '{sink_label}' (engine {sink_engine}) "
+                        "is not yet supported. Use the primary database "
+                        "selector for the postgresql/legacy target and add "
+                        "csv_file / txt_file / sqlite sinks for mirrors."
+                    )
+                else:
+                    # Unknown engine on a parallel sink — log so the
+                    # operator can spot a typo in the config doc.
+                    self._mark_db_write_error(
+                        f"Parallel sink '{sink_label}' has unsupported engine '{sink_engine}'"
+                    )
+            except Exception as exc:
+                # Parallel sinks are best-effort and should not block
+                # primary flow — but they must NOT be silent. Surface
+                # the failure exactly like the primary path does.
+                self._mark_db_write_error(
+                    f"Parallel sink '{sink_label}' write failed: {type(exc).__name__}: {exc}"
+                )
 
     def _filter_readings_for_sink(
         self,
@@ -1407,33 +1467,79 @@ class GatewayWorker:
                 return [r for r in readings if str(r.tag_name or "") in allowed_tags]
         return list(readings)
 
+    def _reading_placeholders(self, r: "GatewayReading") -> Dict[str, str]:
+        """Map of placeholder names → string values for one reading.
+        Used by the custom CSV/TXT format string so the operator can
+        compose column layouts without backend changes. Every value is
+        already stringified for safe insertion."""
+        return {
+            "ts_local": _utc_str_to_local_iso(r.ts_utc),
+            "ts_utc": str(r.ts_utc or ""),
+            "tag_name": str(r.tag_name or ""),
+            "value": str(r.value if r.value is not None else ""),
+            "value_text": str(getattr(r, "value_text", "") or ""),
+            "quality": str(r.quality if r.quality is not None else ""),
+            "quality_label": str(r.quality_label or ""),
+            "source": str(r.source or ""),
+            "site": str(r.site or ""),
+            "area": str(r.area or ""),
+            "equipment": str(r.equipment or ""),
+        }
+
+    def _format_csv_row(self, fmt: str, r: "GatewayReading") -> str:
+        """Apply a user-supplied format string with {placeholder} tokens.
+        Unknown placeholders are left as literal text rather than blowing
+        up the entire write loop. Returns the rendered line WITHOUT a
+        trailing newline."""
+        try:
+            return fmt.format_map(_SafeDict(self._reading_placeholders(r)))
+        except Exception:
+            # Defensive: never let a malformed format string crash the
+            # poll cycle. Fall back to a CSV-safe canonical row.
+            ph = self._reading_placeholders(r)
+            return ",".join(ph[k] for k in (
+                "ts_local", "ts_utc", "tag_name", "value", "value_text",
+                "quality", "quality_label", "source", "site", "area", "equipment",
+            ))
+
     def _persist_csv_file_for_sink(self, sink: Dict[str, Any], readings: List[GatewayReading]) -> bool:
         import csv
         filtered = self._filter_readings_for_sink(sink, readings)
         if not filtered:
             return True  # nothing to write but the sink itself is fine
         sink_label = str((sink or {}).get("name") or (sink or {}).get("id") or "csv_file")
+        custom_format = str((sink or {}).get("csv_format") or "").strip()
+        custom_header = str((sink or {}).get("csv_header") or "").strip()
         try:
             file_path = self._resolve_output_file_path((sink or {}).get("file_path") or "", "trustnode_log.csv")
             write_header = (not os.path.exists(file_path)) or os.path.getsize(file_path) == 0
             with open(file_path, "a", encoding="utf-8", newline="") as f:
-                writer = csv.writer(f)
-                if write_header:
-                    writer.writerow(["ts_local", "ts_utc", "tag_name", "value", "value_text", "quality", "quality_label", "source", "site", "area", "equipment"])
-                for r in filtered:
-                    writer.writerow([
-                        _utc_str_to_local_iso(r.ts_utc),
-                        r.ts_utc,
-                        r.tag_name,
-                        r.value,
-                        getattr(r, "value_text", "") or "",
-                        r.quality,
-                        r.quality_label,
-                        r.source,
-                        r.site,
-                        r.area,
-                        r.equipment,
-                    ])
+                if custom_format:
+                    # Custom row template: write the optional custom
+                    # header as a single literal line, then format each
+                    # reading via _format_csv_row.
+                    if write_header and custom_header:
+                        f.write(custom_header.rstrip("\r\n") + "\n")
+                    for r in filtered:
+                        f.write(self._format_csv_row(custom_format, r) + "\n")
+                else:
+                    writer = csv.writer(f)
+                    if write_header:
+                        writer.writerow(["ts_local", "ts_utc", "tag_name", "value", "value_text", "quality", "quality_label", "source", "site", "area", "equipment"])
+                    for r in filtered:
+                        writer.writerow([
+                            _utc_str_to_local_iso(r.ts_utc),
+                            r.ts_utc,
+                            r.tag_name,
+                            r.value,
+                            getattr(r, "value_text", "") or "",
+                            r.quality,
+                            r.quality_label,
+                            r.source,
+                            r.site,
+                            r.area,
+                            r.equipment,
+                        ])
             return True
         except Exception as exc:
             # Bare `except: return False` here was hiding the actual

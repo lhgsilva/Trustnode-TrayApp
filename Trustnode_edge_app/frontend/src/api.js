@@ -497,6 +497,16 @@ export async function browseOpcUaNodes(payload) {
   return res.json();
 }
 
+export async function previewCsvFormat({ csvFormat = "", csvHeader = "", sampleRows = 3 } = {}) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/database/csv-preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ csv_format: csvFormat, csv_header: csvHeader, sample_rows: sampleRows }),
+  }, 8000);
+  await ensureOk(res, "CSV preview failed");
+  return res.json();
+}
+
 export async function testDatabaseConnection(payload) {
   let res;
   const networkTimeoutMs = Math.max(15000, Number(payload?.timeout_ms || 0) + 3000);

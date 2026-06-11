@@ -17,6 +17,7 @@ import {
   provisionDatabaseObjects,
   setUiSourceConfig,
   testDatabaseConnection,
+  previewCsvFormat,
   testUiSourceRemoteUrl,
   testPlcConnection,
   getAppStoreBootstrap,
@@ -2385,7 +2386,9 @@ function AppShell() {
     use_backup: false,
     cloud_sync_enabled: false,
     tag_filters: [],
-    gateway_filters: []
+    gateway_filters: [],
+    csv_format: "",
+    csv_header: ""
   });
   const [dbTestBusy, setDbTestBusy] = useState(false);
   const [dbTestResult, setDbTestResult] = useState(null);
@@ -10092,6 +10095,12 @@ const getGatewayHealth = (gateway) => {
       gateway_filters: Array.isArray(conn.gateway_filters)
         ? conn.gateway_filters.map((g) => String(g || "").trim()).filter(Boolean)
         : [],
+      // Custom CSV / TXT row template + optional header line. When
+      // csv_format is set, the backend uses it verbatim instead of
+      // the canonical column list. Lets the operator align the file
+      // with downstream tooling that expects a specific layout.
+      csv_format: String(conn.csv_format || ""),
+      csv_header: String(conn.csv_header || ""),
     });
     const primarySink = toSink(db);
     const parallelSinks = dbConnectionsRef.current
@@ -11420,7 +11429,9 @@ const getGatewayHealth = (gateway) => {
       use_backup: Boolean(conn.use_backup),
       cloud_sync_enabled: Boolean(conn.cloud_sync_enabled),
       tag_filters: Array.isArray(conn.tag_filters) ? conn.tag_filters : [],
-      gateway_filters: Array.isArray(conn.gateway_filters) ? conn.gateway_filters : []
+      gateway_filters: Array.isArray(conn.gateway_filters) ? conn.gateway_filters : [],
+      csv_format: String(conn.csv_format || ""),
+      csv_header: String(conn.csv_header || "")
     });
     setDbTestResult(
       conn.last_test
@@ -11639,6 +11650,8 @@ const getGatewayHealth = (gateway) => {
         gateway_filters: Array.isArray(dbForm.gateway_filters)
           ? dbForm.gateway_filters.map((s) => String(s || "").trim()).filter(Boolean)
           : [],
+        csv_format: String(dbForm.csv_format || ""),
+        csv_header: String(dbForm.csv_header || ""),
         connection_ok: true,
         last_test: provisionMsg
           ? `${dbTestResult?.message || existingRow?.last_test || "ok"} | ${provisionMsg}`
@@ -16982,6 +16995,20 @@ const getGatewayHealth = (gateway) => {
                       </span>
                       <span className="db-cell db-last-check-cell" title={c.last_check_utc || ""}>{getDbSyncLastCheckLabel(c)}</span>
                       <span className="row-actions db-actions-cell">
+                        <button
+                          className={`icon-btn table-action-btn ${c.enabled !== false ? "" : "is-off"}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const next = dbConnections.map((row) => row.id === c.id
+                              ? { ...row, enabled: row.enabled === false }
+                              : row);
+                            setDbConnections(next);
+                          }}
+                          disabled={!isAdminDatabaseUser}
+                          title={c.enabled !== false ? "Click to disable this sink" : "Click to enable this sink"}
+                        >
+                          {c.enabled !== false ? "ON" : "OFF"}
+                        </button>
                         <button className="icon-btn table-action-btn" onClick={(e) => { e.stopPropagation(); openEditDbConnection(c); }} disabled={!isAdminDatabaseUser} title="Edit DB"><EditIcon /></button>
                         <button className="icon-btn table-action-btn danger" onClick={(e) => { e.stopPropagation(); removeDbConnection(c.id); }} disabled={!isAdminDatabaseUser} title="Delete DB"><DeleteIcon /></button>
                       </span>
@@ -21821,26 +21848,16 @@ const getGatewayHealth = (gateway) => {
                       gateway", instead of receiving every tag from
                       every gateway it's attached to. Leaving both
                       empty keeps the legacy "accept everything"
-                      behaviour. */}
+                      behaviour.
+
+                      Each tag chip is pre-checked when the operator opens
+                      a freshly created connection — they can then uncheck
+                      the ones they don't want. Tags discovered after the
+                      connection was first saved are also offered so the
+                      list stays current with the gateway configs. */}
                   <section className="db-group">
                     <div className="db-group-title">Tag &amp; Gateway Scope</div>
                     <div className="db-grid-2">
-                      <label className="db-span-2">
-                        Tag names to export (one per line — leave empty for all)
-                        <textarea
-                          rows={4}
-                          value={Array.isArray(dbForm.tag_filters) ? dbForm.tag_filters.join("\n") : ""}
-                          onChange={(e) => setDbForm({
-                            ...dbForm,
-                            tag_filters: e.target.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
-                          })}
-                          placeholder={"SimREAL[3]\nSimDINT[2]\nSimDINT[4]"}
-                          disabled={!canEditPage("database")}
-                        />
-                        <small className="muted">
-                          Exact match against <code>tag_name</code> on incoming readings. Across every gateway the export covers.
-                        </small>
-                      </label>
                       <label className="db-span-2">
                         Restrict to these gateways (optional)
                         <div className="db-tag-chip-grid">
@@ -21866,11 +21883,99 @@ const getGatewayHealth = (gateway) => {
                           })}
                         </div>
                         <small className="muted">
-                          Click a gateway chip to include it. None selected = include every gateway.
+                          Click a gateway chip to include it. None selected = include every gateway. The tag list below adapts to the selection.
                         </small>
+                      </label>
+                      <label className="db-span-2">
+                        Tags to export
+                        {(() => {
+                          // Union of tags across the relevant gateway configs.
+                          // When a gateway filter is set, only those gateways
+                          // contribute. Otherwise, all gateways contribute.
+                          const allowedGws = (Array.isArray(dbForm.gateway_filters) && dbForm.gateway_filters.length)
+                            ? new Set(dbForm.gateway_filters)
+                            : null;
+                          const seen = new Map(); // tag -> [gateway names]
+                          for (const g of gatewayConfigs) {
+                            if (allowedGws && !allowedGws.has(g.id)) continue;
+                            const tags = Array.isArray(g.tags) ? g.tags : [];
+                            for (const t of tags) {
+                              const name = String(t?.tag_name || t?.name || "").trim();
+                              if (!name) continue;
+                              if (!seen.has(name)) seen.set(name, []);
+                              seen.get(name).push(g.name || g.id);
+                            }
+                          }
+                          // Also keep tags the operator already saved but
+                          // which the gateway config no longer reports —
+                          // they get a "(orphan)" hint so the operator can
+                          // decide whether to drop them.
+                          const savedFilters = Array.isArray(dbForm.tag_filters) ? dbForm.tag_filters : [];
+                          for (const t of savedFilters) {
+                            if (!seen.has(t)) seen.set(t, ["(not in any gateway)"]);
+                          }
+                          const rows = [...seen.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+                          if (rows.length === 0) {
+                            return <div className="muted" style={{ padding: 8 }}>
+                              No tags found — add tags to your gateway configurations first.
+                            </div>;
+                          }
+                          // If the operator has NEVER saved any filter, treat
+                          // the list as "all selected" (legacy behaviour kept
+                          // intact). The first interaction explicitly picks a
+                          // subset which is then stored.
+                          const explicit = savedFilters.length > 0;
+                          const isChecked = (tag) => explicit ? savedFilters.includes(tag) : true;
+                          const toggle = (tag) => {
+                            const cur = explicit ? [...savedFilters] : rows.map(([n]) => n);
+                            const idx = cur.indexOf(tag);
+                            if (idx === -1) cur.push(tag); else cur.splice(idx, 1);
+                            setDbForm({ ...dbForm, tag_filters: cur });
+                          };
+                          const allChecked = rows.every(([n]) => isChecked(n));
+                          return (
+                            <>
+                              <div className="row" style={{ gap: 6, margin: "4px 0 6px" }}>
+                                <button type="button" className="btn btn-sm btn-secondary"
+                                  onClick={() => setDbForm({ ...dbForm, tag_filters: rows.map(([n]) => n) })}
+                                  disabled={!canEditPage("database")}>Select all</button>
+                                <button type="button" className="btn btn-sm btn-secondary"
+                                  onClick={() => setDbForm({ ...dbForm, tag_filters: [] })}
+                                  disabled={!canEditPage("database")}>Clear (= export every tag)</button>
+                                <span className="muted" style={{ marginLeft: 8 }}>
+                                  {explicit
+                                    ? `${savedFilters.length} of ${rows.length} selected`
+                                    : `${rows.length} tag${rows.length === 1 ? "" : "s"} discovered — all included by default`}
+                                </span>
+                              </div>
+                              <div className="db-tag-checkbox-grid">
+                                {rows.map(([tag, owners]) => (
+                                  <label key={tag} className="db-tag-checkbox-row" title={owners.join(", ")}>
+                                    <input
+                                      type="checkbox"
+                                      checked={isChecked(tag)}
+                                      onChange={() => toggle(tag)}
+                                      disabled={!canEditPage("database")}
+                                    />
+                                    <span className="db-tag-checkbox-name">{tag}</span>
+                                    <span className="db-tag-checkbox-owner">{owners.length === 1 ? owners[0] : `${owners.length} gateways`}</span>
+                                  </label>
+                                ))}
+                              </div>
+                            </>
+                          );
+                        })()}
                       </label>
                     </div>
                   </section>
+                  {/* Custom row template — operator can compose any
+                      column layout they want using {placeholder} tokens.
+                      Empty = canonical CSV (legacy behaviour). */}
+                  <CsvFormatSection
+                    dbForm={dbForm}
+                    setDbForm={setDbForm}
+                    canEdit={canEditPage("database")}
+                  />
                 </>
               ) : (
                 <>
@@ -23034,6 +23139,125 @@ const getGatewayHealth = (gateway) => {
         </div>
       ) : null}
     </div>
+  );
+}
+
+// =====================================================================
+// CsvFormatSection — operator-facing UI for the optional CSV/TXT custom
+// row template. Empty template = canonical CSV (legacy behaviour). When
+// set, every row is rendered through .format_map() on the backend with
+// placeholders like {ts_local}, {tag_name}, {value}, {quality}, etc.
+// A "Preview" button hits POST /api/database/csv-preview with synthetic
+// readings so the operator can see what the file will look like before
+// saving the connection.
+// =====================================================================
+function CsvFormatSection({ dbForm, setDbForm, canEdit }) {
+  const [preview, setPreview] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const csvFormat = String(dbForm.csv_format || "");
+  const csvHeader = String(dbForm.csv_header || "");
+
+  const runPreview = async () => {
+    setBusy(true); setErr("");
+    try {
+      const out = await previewCsvFormat({ csvFormat, csvHeader, sampleRows: 3 });
+      setPreview(out);
+    } catch (e) {
+      setErr(String(e?.message || e));
+    } finally { setBusy(false); }
+  };
+
+  const useDefaultTemplate = () => {
+    setDbForm({
+      ...dbForm,
+      csv_header: "ts_local,ts_utc,tag_name,value,value_text,quality,quality_label,source,site,area,equipment",
+      csv_format: "{ts_local},{ts_utc},{tag_name},{value},{value_text},{quality},{quality_label},{source},{site},{area},{equipment}",
+    });
+  };
+
+  const clearCustom = () => {
+    setDbForm({ ...dbForm, csv_format: "", csv_header: "" });
+    setPreview(null);
+  };
+
+  return (
+    <section className="db-group">
+      <div className="db-group-title">CSV / TXT Row Template (optional)</div>
+      <div className="db-grid-2">
+        <label className="db-span-2">
+          Header line (literal text — emitted once when the file is empty)
+          <input
+            value={csvHeader}
+            placeholder="(leave empty to use the canonical header)"
+            onChange={(e) => setDbForm({ ...dbForm, csv_header: e.target.value })}
+            disabled={!canEdit}
+          />
+        </label>
+        <label className="db-span-2">
+          Row template — placeholders use <code>{"{name}"}</code> syntax
+          <textarea
+            rows={3}
+            value={csvFormat}
+            placeholder={`{ts_local},{tag_name},{value},{quality_label}`}
+            onChange={(e) => setDbForm({ ...dbForm, csv_format: e.target.value })}
+            disabled={!canEdit}
+          />
+          <small className="muted">
+            Available placeholders:
+            {" "}
+            <code>{"{ts_local}"}</code>,
+            <code>{"{ts_utc}"}</code>,
+            <code>{"{tag_name}"}</code>,
+            <code>{"{value}"}</code>,
+            <code>{"{value_text}"}</code>,
+            <code>{"{quality}"}</code>,
+            <code>{"{quality_label}"}</code>,
+            <code>{"{source}"}</code>,
+            <code>{"{site}"}</code>,
+            <code>{"{area}"}</code>,
+            <code>{"{equipment}"}</code>.
+            Unknown placeholders render as the literal text. Leaving the row
+            template empty falls back to the canonical CSV columns.
+          </small>
+        </label>
+      </div>
+      <div className="row" style={{ gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+        <button type="button" className="btn btn-sm btn-primary" onClick={runPreview} disabled={busy}>
+          {busy ? "Generating…" : "Preview sample rows"}
+        </button>
+        <button type="button" className="btn btn-sm btn-secondary" onClick={useDefaultTemplate} disabled={!canEdit}>
+          Load canonical template
+        </button>
+        <button type="button" className="btn btn-sm btn-secondary" onClick={clearCustom} disabled={!canEdit}>
+          Reset (use defaults)
+        </button>
+      </div>
+      {err ? <div className="warn" style={{ marginTop: 6 }}>{err}</div> : null}
+      {preview ? (
+        <div className="db-csv-preview" style={{ marginTop: 8 }}>
+          <div className="muted" style={{ marginBottom: 4, fontSize: 11 }}>
+            Preview — these are the actual lines that would be written to the file.
+          </div>
+          <pre className="db-csv-preview-pre">
+{preview.header}{preview.header ? "\n" : ""}{(preview.rows || []).join("\n")}
+          </pre>
+          <button type="button" className="btn btn-sm btn-secondary"
+            onClick={() => {
+              const txt = [preview.header, ...(preview.rows || [])].filter(Boolean).join("\n") + "\n";
+              const blob = new Blob([txt], { type: "text/csv;charset=utf-8" });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = url; a.download = "trustnode_csv_sample.csv";
+              document.body.appendChild(a); a.click(); document.body.removeChild(a);
+              setTimeout(() => URL.revokeObjectURL(url), 2000);
+            }}>
+            Download sample CSV
+          </button>
+        </div>
+      ) : null}
+    </section>
   );
 }
 

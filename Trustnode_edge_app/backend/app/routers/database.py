@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import re
 from urllib.parse import quote_plus
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Body, HTTPException
 from pydantic import BaseModel
 
 from app.state import plc_manager
@@ -935,3 +935,72 @@ def recovery_repair(payload: RecoveryRequest) -> RecoveryResult:
         f"{sum(1 for r in results if not r.ok)} failed, {activated_count} activated."
     )
     return RecoveryResult(ok=ok, summary=summary, results=results)
+
+
+@router.post("/csv-preview")
+def csv_preview(payload: dict = Body(default={})) -> dict:
+    """Render a small CSV preview using the operator's custom format
+    string. Lets them see what the file will look like BEFORE saving
+    the connection.
+
+    Body: { csv_format: str (optional), csv_header: str (optional),
+            sample_rows: int (default 3) }
+
+    Returns: { ok: True, header: str, rows: [str, ...] }.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be an object")
+    custom_format = str(payload.get("csv_format") or "").strip()
+    custom_header = str(payload.get("csv_header") or "").strip()
+    n = max(1, min(int(payload.get("sample_rows") or 3), 20))
+
+    # Synthetic readings — never reach a PLC. Built directly so we don't
+    # depend on plc_manager internals from a request handler.
+    from datetime import datetime, timezone, timedelta
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    samples = []
+    for i in range(n):
+        ts = (now_utc - timedelta(seconds=(n - i - 1))).strftime("%Y-%m-%d %H:%M:%S.000")
+        val = round(100 + (i * 13.7) % 50, 3)
+        samples.append({
+            "ts_local": ts,
+            "ts_utc": ts,
+            "tag_name": ["SimREAL[3]", "SimDINT[2]", "SimREAL[4]"][i % 3],
+            "value": str(val),
+            "value_text": "",
+            "quality": "192",
+            "quality_label": "good",
+            "source": "siemens_opcua",
+            "site": "Limerick",
+            "area": "LineA",
+            "equipment": "MACHINE-01",
+        })
+
+    class _SafeDict(dict):
+        def __missing__(self, key):
+            return "{" + key + "}"
+
+    if custom_format:
+        header = custom_header
+        rows = []
+        for s in samples:
+            try:
+                rows.append(custom_format.format_map(_SafeDict(s)))
+            except Exception as exc:
+                rows.append(f"[format error: {exc}]")
+        return {"ok": True, "header": header, "rows": rows, "placeholders": list(samples[0].keys())}
+
+    # Default canonical CSV
+    import csv as _csv
+    import io as _io
+    buf = _io.StringIO()
+    w = _csv.writer(buf)
+    cols = ["ts_local", "ts_utc", "tag_name", "value", "value_text", "quality", "quality_label", "source", "site", "area", "equipment"]
+    w.writerow(cols)
+    header_line = buf.getvalue().rstrip("\r\n")
+    rows = []
+    for s in samples:
+        buf2 = _io.StringIO()
+        _csv.writer(buf2).writerow([s[c] for c in cols])
+        rows.append(buf2.getvalue().rstrip("\r\n"))
+    return {"ok": True, "header": header_line, "rows": rows, "placeholders": cols}
