@@ -1923,6 +1923,8 @@ export function DashboardDesigner({
               fetchWidgetStats={fetchWidgetStats}
               fetchWidgetRuleStats={fetchWidgetRuleStats}
               historicalMode={dashboardTimeMode === "historical"}
+              historicalFromLocal={dashboardFrom}
+              historicalToLocal={dashboardTo}
               onHistoricalPan={panHistoricalWindow}
             />
             {canEdit ? (
@@ -2919,6 +2921,45 @@ export function DashboardDesigner({
                         {VALUE_FORMAT_OPTIONS.map((opt) => (
                           <option key={opt.value} value={opt.value}>{opt.label}</option>
                         ))}
+                      </select>
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>X-axis time format</span>
+                      <select
+                        value={String(form.config.chart_x_time_format || "hh_mm_ss")}
+                        onChange={(e) =>
+                          setForm((p) => ({
+                            ...p,
+                            config: { ...p.config, chart_x_time_format: e.target.value },
+                          }))
+                        }
+                      >
+                        <option value="hh_mm">HH:MM (24 h)</option>
+                        <option value="hh_mm_ss">HH:MM:SS (24 h)</option>
+                        <option value="hh_mm_12h">hh:mm AM/PM</option>
+                        <option value="date_hh_mm">MM/DD HH:MM</option>
+                        <option value="date_hh_mm_ss">MM/DD HH:MM:SS</option>
+                        <option value="full_date_hh_mm">YYYY-MM-DD HH:MM</option>
+                      </select>
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>X-axis tick angle</span>
+                      <select
+                        value={String(form.config.chart_x_tick_angle ?? 0)}
+                        onChange={(e) =>
+                          setForm((p) => ({
+                            ...p,
+                            config: { ...p.config, chart_x_tick_angle: Number(e.target.value) },
+                          }))
+                        }
+                      >
+                        <option value="0">Horizontal (0°)</option>
+                        <option value="-30">Tilted -30°</option>
+                        <option value="-45">Tilted -45°</option>
+                        <option value="-60">Tilted -60°</option>
+                        <option value="-90">Vertical -90°</option>
+                        <option value="45">Tilted 45°</option>
+                        <option value="90">Vertical 90°</option>
                       </select>
                     </label>
                   </div>

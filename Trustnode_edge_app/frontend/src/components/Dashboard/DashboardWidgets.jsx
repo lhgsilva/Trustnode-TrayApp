@@ -347,15 +347,45 @@ function getPiePalette(widget) {
   ];
 }
 
-function buildXAxisProps(series) {
+function _formatChartTickTime(ms, formatKey) {
+  if (!Number.isFinite(ms)) return "";
+  try {
+    const d = new Date(ms);
+    const opts = (() => {
+      switch (String(formatKey || "hh_mm_ss").toLowerCase()) {
+        case "hh_mm":
+          return { hour: "2-digit", minute: "2-digit", hour12: false };
+        case "hh_mm_ss":
+          return { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
+        case "date_hh_mm":
+          return { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
+        case "date_hh_mm_ss":
+          return { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
+        case "full_date_hh_mm":
+          return { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
+        case "hh_mm_12h":
+          return { hour: "numeric", minute: "2-digit", hour12: true };
+        default:
+          return { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
+      }
+    })();
+    return d.toLocaleTimeString([], opts);
+  } catch (_) { return ""; }
+}
+
+function buildXAxisProps(series, cfg = {}) {
   const sample = Array.isArray(series) ? series.length : 0;
-  if (!sample) return { dataKey: "idx" };
-  // Prefer a real time axis (epoch ms) so gaps in the data render
-  // proportionally to elapsed time. The old idx-based axis spaced every
-  // sample evenly regardless of real-world gap size, which made a 5-minute
-  // gap look identical to a 1-second gap and made multi-series carry-
-  // forward look like a "broken" chart. When ts is missing we fall back to
-  // the index so this stays a no-op for legacy series.
+  const fmt = String(cfg?.chart_x_time_format || "hh_mm_ss");
+  const angleRaw = Number(cfg?.chart_x_tick_angle);
+  const angle = Number.isFinite(angleRaw) ? angleRaw : 0;
+  const rotatedProps = angle === 0
+    ? { height: 22 }
+    : {
+        angle,
+        textAnchor: angle < 0 ? "end" : "start",
+        height: Math.abs(angle) >= 75 ? 60 : 44,
+      };
+  if (!sample) return { dataKey: "idx", ...rotatedProps };
   const tsMsLookup = new Map();
   let hasReal = false;
   for (const p of series) {
@@ -374,21 +404,12 @@ function buildXAxisProps(series) {
       type: "number",
       scale: "time",
       domain: tsValues.length ? [tsValues[0], tsValues[tsValues.length - 1]] : ["auto", "auto"],
-      // 4-6 evenly spaced ticks across the visible range — Recharts auto
-      // generates them. Use a HH:MM:SS tick format that matches the old
-      // formatter so the operator sees the same kind of label.
-      tickFormatter: (ms) => {
-        if (!Number.isFinite(ms)) return "";
-        try {
-          const d = new Date(ms);
-          return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
-        } catch (_) { return ""; }
-      },
+      tickFormatter: (ms) => _formatChartTickTime(ms, fmt),
       minTickGap: 24,
       tick: { fill: "var(--ink-soft, #8a98ab)", fontSize: 11 },
       axisLine: { stroke: "var(--line, rgba(255,255,255,0.07))" },
       tickLine: false,
-      height: 18,
+      ...rotatedProps,
     };
   }
   return {
@@ -397,6 +418,8 @@ function buildXAxisProps(series) {
       const hit = series.find((p) => p?.idx === idx);
       const ts = String(hit?.ts || "");
       if (!ts) return String(idx);
+      const ms = Date.parse(ts.includes("T") ? ts : ts.replace(" ", "T"));
+      if (Number.isFinite(ms)) return _formatChartTickTime(ms, fmt);
       const t = ts.includes("T") ? ts.split("T")[1] : ts.split(" ")[1];
       return String(t || ts).slice(0, 8);
     },
@@ -404,7 +427,7 @@ function buildXAxisProps(series) {
     tick: { fill: "var(--ink-soft, #8a98ab)", fontSize: 11 },
     axisLine: { stroke: "var(--line, rgba(255,255,255,0.07))" },
     tickLine: false,
-    height: 18,
+    ...rotatedProps,
   };
 }
 
@@ -1269,13 +1292,42 @@ function LiveTagChart({
     return "monotone";
   })();
 
+  // Time format for X axis tick labels. Defaults to HH:MM:SS 24-hour
+  // (industrial convention). Operator can pick HH:MM, HH:MM:SS, or
+  // include the date in the editor.
+  const xTimeFormat = String(cfg.chart_x_time_format || "hh_mm_ss").toLowerCase();
+  const formatTickTime = (d) => {
+    if (!Number.isFinite(d.getTime())) return "";
+    const opts = (() => {
+      switch (xTimeFormat) {
+        case "hh_mm":
+          return { hour: "2-digit", minute: "2-digit", hour12: false };
+        case "hh_mm_ss":
+          return { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
+        case "date_hh_mm":
+          return { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
+        case "date_hh_mm_ss":
+          return { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
+        case "full_date_hh_mm":
+          return { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
+        case "hh_mm_12h":
+          return { hour: "numeric", minute: "2-digit", hour12: true };
+        default:
+          return { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
+      }
+    })();
+    return d.toLocaleTimeString([], opts);
+  };
   const xTickFormatter = (v) => {
     const r = renderedData.rows.find((p) => p.idx === v);
     if (!r) return "";
-    const d = new Date(r.tsMs);
-    if (!Number.isFinite(d.getTime())) return "";
-    return d.toLocaleTimeString();
+    return formatTickTime(new Date(r.tsMs));
   };
+  // X axis tick rotation. Empty / 0 = horizontal (default). 45 / 90 /
+  // -45 / -90 supported. Bottom margin auto-expands when rotated to
+  // give the labels room.
+  const xTickAngleRaw = Number(cfg.chart_x_tick_angle);
+  const xTickAngle = Number.isFinite(xTickAngleRaw) ? xTickAngleRaw : 0;
   const labelFmt = (v) => {
     const r = renderedData.rows.find((p) => p.idx === v);
     if (!r) return String(v);
@@ -1289,13 +1341,19 @@ function LiveTagChart({
     if (s?.unit) return [`${base} ${s.unit}`, s.label];
     return [base, s?.label || name];
   };
-  // Bottom margin reserves room for x-axis tick labels. Left bump when
-  // there's an axis label so the rotated text doesn't overlap ticks.
+  // Bottom margin reserves room for x-axis tick labels. Extra when the
+  // operator chose rotated ticks so 90° labels don't get clipped by the
+  // card edge. Left bump when there's an axis label.
+  const xBottom = (() => {
+    if (xTickAngle === 0) return 18;
+    if (Math.abs(xTickAngle) >= 75) return 60;
+    return 44;
+  })();
   const margin = {
     top: 4,
     right: rightAxisLabel ? 32 : 8,
     left: primaryAxisLabel ? 12 : 0,
-    bottom: 18,
+    bottom: xBottom,
   };
 
   if (seedError && renderedData.rows.length === 0) {
@@ -1335,6 +1393,9 @@ function LiveTagChart({
               tickFormatter={xTickFormatter}
               fontSize={10}
               interval="preserveStartEnd"
+              angle={xTickAngle}
+              textAnchor={xTickAngle === 0 ? "middle" : (xTickAngle < 0 ? "end" : "start")}
+              height={xTickAngle === 0 ? 22 : (Math.abs(xTickAngle) >= 75 ? 60 : 44)}
             />
             <YAxis
               yAxisId="left"
@@ -1432,6 +1493,8 @@ export function DashboardWidgetCard({
   fetchWidgetStats,
   fetchWidgetRuleStats,
   historicalMode = false,
+  historicalFromLocal = "",
+  historicalToLocal = "",
   onHistoricalPan = null,
 }) {
   // Drag-to-scroll: when the dashboard is in Historical mode, the chart
@@ -1654,7 +1717,21 @@ export function DashboardWidgetCard({
   }, [serverRuleStatsLoading]);
 
   useEffect(() => {
-    const range = resolveTimeFilterRange(cfg);
+    // When the dashboard is in HISTORICAL mode the global from/to date
+    // range owns the chart's data window. The per-widget time filter
+    // (cfg.query_time_filter_*) used to be the only signal the fetcher
+    // looked at, which meant switching the dashboard to Historical
+    // mode and picking a date range had ZERO effect on the chart —
+    // the widget kept fetching its own "live tail" and the filter
+    // bar above it lied. Now historical from/to wins when set.
+    let range = resolveTimeFilterRange(cfg);
+    if (historicalMode) {
+      const histFromMs = historicalFromLocal ? new Date(historicalFromLocal).getTime() : NaN;
+      const histToMs = historicalToLocal ? new Date(historicalToLocal).getTime() : NaN;
+      const fromIso = Number.isFinite(histFromMs) ? new Date(histFromMs).toISOString() : "";
+      const toIso = Number.isFinite(histToMs) ? new Date(histToMs).toISOString() : "";
+      if (fromIso || toIso) range = { fromUtc: fromIso, toUtc: toIso };
+    }
     // No-time-filter must still query historian DB (from/to empty),
     // otherwise widgets fall back to in-memory live buffer and counts drift.
     const canQuery = typeof fetchWidgetRowsRef.current === "function";
@@ -1873,6 +1950,9 @@ export function DashboardWidgetCard({
     cfgTimePreset,
     cfgTimeFrom,
     cfgTimeTo,
+    historicalMode,
+    historicalFromLocal,
+    historicalToLocal,
     rulesDepKey,
     refreshTickFast,
     refreshTickMedium,
@@ -2821,7 +2901,7 @@ export function DashboardWidgetCard({
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={series} margin={chartMargin}>
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                      <XAxis {...buildXAxisProps(series)} />
+                      <XAxis {...buildXAxisProps(series, cfg)} />
                       <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
@@ -2848,7 +2928,7 @@ export function DashboardWidgetCard({
                     <BarChart data={series} margin={chartMargin}>
                       {renderBarPattern(primaryColor)}
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                      <XAxis {...buildXAxisProps(series)} />
+                      <XAxis {...buildXAxisProps(series, cfg)} />
                       <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
@@ -2872,7 +2952,7 @@ export function DashboardWidgetCard({
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={series} margin={chartMargin}>
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                      <XAxis {...buildXAxisProps(series)} />
+                      <XAxis {...buildXAxisProps(series, cfg)} />
                       <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
@@ -2987,7 +3067,7 @@ export function DashboardWidgetCard({
                 <ComposedChart data={data} margin={{ ...chartMargin, right: anyRightAxis ? 32 : chartMargin.right }}>
                   {renderBarPattern(primaryColor)}
                   <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                  <XAxis {...buildXAxisProps(data)} />
+                  <XAxis {...buildXAxisProps(data, cfg)} />
                   <YAxis
                     yAxisId="left"
                     {...yAxisPresetProps}
