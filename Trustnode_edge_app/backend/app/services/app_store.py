@@ -1257,6 +1257,7 @@ class AppStore:
                         edge_id = (
                             str(edge_profile.get("edge_id") or "").strip().lower()
                             or str(settings.get("edge_id") or "").strip().lower()
+                            or str(getattr(self, "_local_edge_id", "") or "").strip().lower()
                         )
                         tenant_id = str(settings.get("tenant_id") or "default").strip().lower() or "default"
                         customer_id = (
@@ -1987,6 +1988,7 @@ class AppStore:
                         edge_id = (
                             str(edge_profile.get("edge_id") or "").strip().lower()
                             or str(settings.get("edge_id") or "").strip().lower()
+                            or str(getattr(self, "_local_edge_id", "") or "").strip().lower()
                         )
                         tenant_id = str(settings.get("tenant_id") or "default").strip().lower() or "default"
                         customer_id = (
@@ -5230,6 +5232,7 @@ class AppStore:
                             edge_id = (
                                 str(edge_profile.get("edge_id") or "").strip().lower()
                                 or str(settings.get("edge_id") or "").strip().lower()
+                                or str(getattr(self, "_local_edge_id", "") or "").strip().lower()
                             )
                             tenant_id = str(settings.get("tenant_id") or "default").strip().lower() or "default"
                             customer_id = (

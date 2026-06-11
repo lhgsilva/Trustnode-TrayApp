@@ -84,6 +84,17 @@ def _build_scope_key(request: Request, bootstrap_hint: Dict[str, Any] | None = N
         str(edge_profile.get("edge_id") or "").strip().lower()
         or str(app_settings.get("edge_id") or "").strip().lower()
     )
+    # Last-resort fallback to the hostname-derived edge id. Without this
+    # an edge whose app_settings hasn't been written yet (fresh install,
+    # bootstrap interrupted mid-save, etc.) returns scope_key="" which
+    # routes every save through the unscoped path and BREAKS the cloud
+    # mirror — that's exactly how Lucas's dashboards stayed invisible to
+    # Lite even after every other fix was applied.
+    if not edge_id:
+        try:
+            edge_id = str(getattr(app_store, "_local_edge_id", "") or "").strip().lower()
+        except Exception:
+            edge_id = ""
     # Read customer_id from edge_profile.linked_customer_id (canonical),
     # then fall back to app_settings.customer_id (set by activation but
     # historically missing from edge_profile), then the bootstrap root.
