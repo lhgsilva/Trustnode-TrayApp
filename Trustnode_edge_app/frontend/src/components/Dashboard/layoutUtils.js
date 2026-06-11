@@ -150,6 +150,23 @@ export function normalizeWidgets(rawWidgets) {
       w: pos.w,
       h: pos.h,
       config: {
+        // CRITICAL: spread the raw config first so any operator-set
+        // field that the explicit allowlist below DOESN'T enumerate
+        // survives normalization. Without this spread the allowlist
+        // below quietly DROPPED y_axis_mode / y_min / y_max /
+        // y_tick_step / y_right_* / chart_x_time_format /
+        // chart_x_tick_angle / hide_widget_header / multiplier /
+        // offset every time the widgets array passed through here —
+        // which happens on EVERY load, EVERY save, EVERY drag,
+        // EVERY layout reflow, EVERY memoized render. The save
+        // path already did the spread; this load/normalize path
+        // didn't, which is why the operator's axis settings showed
+        // for ~120 ms in the live preview (the debounced apply)
+        // then vanished the moment any UI operation re-ran
+        // normalizeWidgets. The explicit overrides BELOW the
+        // spread still validate, clamp, and default the known
+        // fields.
+        ...(raw?.config && typeof raw.config === "object" ? raw.config : {}),
         gateway_id: String(raw?.config?.gateway_id || raw?.gateway_id || ""),
         tag_name: String(raw?.config?.tag_name || raw?.tag_name || ""),
         readings_count: clamp(raw?.config?.readings_count ?? raw?.readings_count ?? 120, 20, 500),

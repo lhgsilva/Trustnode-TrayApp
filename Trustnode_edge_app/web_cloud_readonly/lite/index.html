@@ -655,23 +655,59 @@ const chartTooltipProps = {
   labelStyle: { color: "var(--text, #f2f4f7)", fontWeight: 600 },
   itemStyle: { color: "var(--text, #f2f4f7)" },
 };
-function buildXAxisProps(series) {
+function formatLiteTickTime(ts, formatKey) {
+  if (!ts) return "";
+  try {
+    const d = new Date(ts);
+    if (!Number.isFinite(d.getTime())) return "";
+    const opts = (() => {
+      switch (String(formatKey || "hh_mm_ss").toLowerCase()) {
+        case "hh_mm":
+          return { hour: "2-digit", minute: "2-digit", hour12: false };
+        case "hh_mm_ss":
+          return { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
+        case "date_hh_mm":
+          return { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
+        case "date_hh_mm_ss":
+          return { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
+        case "full_date_hh_mm":
+          return { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
+        case "hh_mm_12h":
+          return { hour: "numeric", minute: "2-digit", hour12: true };
+        default:
+          return { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
+      }
+    })();
+    return d.toLocaleTimeString([], opts);
+  } catch { return ""; }
+}
+function buildXAxisProps(series, cfg) {
   const mobile = isMobileViewport();
+  const fmt = String((cfg && cfg.chart_x_time_format) || "hh_mm_ss");
+  const angleRaw = Number((cfg && cfg.chart_x_tick_angle) || 0);
+  const angle = Number.isFinite(angleRaw) ? angleRaw : 0;
+  const rotated = angle === 0
+    ? { height: mobile ? 18 : undefined }
+    : {
+        angle,
+        textAnchor: angle < 0 ? "end" : "start",
+        height: Math.abs(angle) >= 75 ? 60 : 44,
+      };
   return {
     dataKey: "idx",
     tickFormatter: (v) => {
       const p = series.find((p) => p.idx === v);
       if (!p?.ts) return "";
-      try { return new Date(p.ts).toLocaleTimeString().slice(0, 5); } catch { return ""; }
+      return formatLiteTickTime(p.ts, fmt);
     },
     stroke: "var(--soft, #8a98ab)",
     tick: { fill: "var(--soft, #8a98ab)", fontSize: mobile ? 9 : 10 },
     // Wider tick gap on mobile so labels don't overlap when the plot
     // shrinks. Keeps the axis readable at single-column phone widths.
     minTickGap: mobile ? 40 : 28,
-    height: mobile ? 18 : undefined,
     axisLine: { stroke: "var(--line, rgba(138,152,171,0.25))" },
     tickLine: { stroke: "var(--line, rgba(138,152,171,0.25))" },
+    ...rotated,
   };
 }
 // Compact tick formatter: 2-decimal max, k/M/G suffixes for big numbers.
@@ -1284,7 +1320,7 @@ function ChartWidget({ widget, liveByKey }) {
   return h(ResponsiveContainer, { width: "100%", height: "100%" },
     h(buildChartRoot(widgetType, seriesDefs.length), { data: merged, margin },
       h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
-      h(XAxis, buildXAxisProps(merged)),
+      h(XAxis, buildXAxisProps(merged, cfg)),
       h(YAxis, {
         ...leftYProps, yAxisId: "left",
         label: leftAxisLabel
@@ -2035,7 +2071,7 @@ function TagMonitor({ open, payload, onClose }) {
           : h(ResponsiveContainer, { width: "100%", height: "100%" },
               h(buildChartRoot(widgetType, seriesDefs.length), { data, margin: getChartMargin() },
                 h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
-                h(XAxis, buildXAxisProps(data)),
+                h(XAxis, buildXAxisProps(data, payload?.widget?.config || {})),
                 h(YAxis, { ...monYProps, yAxisId: "left" }),
                 hasRight ? h(YAxis, { ...monYProps, yAxisId: "right", orientation: "right" }) : null,
                 h(Tooltip, { ...chartTooltipProps, labelFormatter: labelFmt, formatter: (v, n) => [fmtVal(v), n] }),
