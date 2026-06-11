@@ -1264,7 +1264,14 @@ export function DashboardDesigner({
   };
 
   useEffect(() => {
-    if (!canEdit || !editingId || !modalOpen) return;
+    // Fire while EITHER the main editor modal or the nested
+    // "Series, Axes & Data Query" modal is open. Previously the
+    // effect only fired with modalOpen=true — when the operator
+    // edited Y axis fields inside the nested query modal, the live
+    // preview behind it never picked up the change until they
+    // explicitly clicked Done.
+    if (!canEdit || !editingId) return;
+    if (!modalOpen && !queryModalOpen) return;
     if (liveApplyDebounceRef.current) clearTimeout(liveApplyDebounceRef.current);
     liveApplyDebounceRef.current = setTimeout(() => {
       applyCurrentFormConfigToEditingWidget();
@@ -1272,7 +1279,7 @@ export function DashboardDesigner({
     return () => {
       if (liveApplyDebounceRef.current) clearTimeout(liveApplyDebounceRef.current);
     };
-  }, [form?.config, editingId, canEdit, modalOpen]);
+  }, [form?.config, editingId, canEdit, modalOpen, queryModalOpen]);
 
   const saveWidget = () => {
     const next = normalizeWidgets(widgets);
@@ -2130,6 +2137,92 @@ export function DashboardDesigner({
                     backward compat (the runtime still respects an
                     explicit non-zero value) but no longer expose the
                     second input. */}
+
+                {/* Y-axis scale toggle — operator-requested 2026-06-11:
+                    a slide toggle in the main Configure tab (similar to
+                    the Lite view's auto-fit toggle) so the most common
+                    axis decision is one click instead of opening the
+                    Series, Axes & Data Query inner modal. */}
+                {["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? (
+                  <div className="dashboard-full-row">
+                    <label className="dashboard-toggle-row" style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0" }}>
+                      <input
+                        type="checkbox"
+                        checked={String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual"}
+                        onChange={(e) => {
+                          const manual = e.target.checked;
+                          setForm((p) => ({
+                            ...p,
+                            config: {
+                              ...p.config,
+                              y_axis_mode: manual ? "manual" : "auto",
+                              // Apply the same flip to the right axis so
+                              // both axes follow the master toggle when
+                              // the operator hasn't explicitly diverged.
+                              y_right_axis_mode: manual ? "manual" : "auto",
+                            },
+                          }));
+                        }}
+                      />
+                      <span style={{ fontWeight: 600 }}>Manual Y axis scale</span>
+                      <span className="muted" style={{ fontSize: 11 }}>
+                        {String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual"
+                          ? "Custom range below — set min, max, tick step in Series & Axes."
+                          : "Auto-fit to live data (recommended)."}
+                      </span>
+                    </label>
+                    {String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual" ? (
+                      <div className="form-grid dashboard-form-grid" style={{ marginTop: 6 }}>
+                        <label>
+                          Left min
+                          <input
+                            type="number"
+                            step="any"
+                            value={form.config?.y_min ?? ""}
+                            onChange={(e) => setForm((p) => ({
+                              ...p,
+                              config: {
+                                ...p.config,
+                                y_min: e.target.value === "" ? "" : Number(e.target.value),
+                              },
+                            }))}
+                          />
+                        </label>
+                        <label>
+                          Left max
+                          <input
+                            type="number"
+                            step="any"
+                            value={form.config?.y_max ?? ""}
+                            onChange={(e) => setForm((p) => ({
+                              ...p,
+                              config: {
+                                ...p.config,
+                                y_max: e.target.value === "" ? "" : Number(e.target.value),
+                              },
+                            }))}
+                          />
+                        </label>
+                        <label>
+                          Left tick step
+                          <input
+                            type="number"
+                            step="any"
+                            min="0"
+                            value={form.config?.y_tick_step ?? ""}
+                            onChange={(e) => setForm((p) => ({
+                              ...p,
+                              config: {
+                                ...p.config,
+                                y_tick_step: e.target.value === "" ? "" : Number(e.target.value),
+                              },
+                            }))}
+                          />
+                        </label>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
 
                 {["line_chart", "line_area_chart", "bar_chart", "pie_chart", "meter_chart"].includes(form.type) ? (
                   <label>
