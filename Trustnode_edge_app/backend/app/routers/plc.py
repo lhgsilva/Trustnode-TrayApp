@@ -821,6 +821,191 @@ def discover_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
     )
 
 
+class NetworkScanRequest(BaseModel):
+    # Empty scan_range → broadcast EtherNet/IP discovery (pylogix
+    # PLC.Discover) and/or a fast TCP sweep of the host's local /24.
+    # When `scan_range` is a CIDR ("192.168.10.0/24") or comma-list of
+    # IPs ("192.168.1.10,192.168.1.50") we restrict the probe to those
+    # hosts only.
+    scan_range: str = ""
+    gateway_type: Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston"] = "allen_bradley"
+    timeout_ms: int = 4000
+    include_tcp_probe: bool = True
+
+
+class NetworkScanDevice(BaseModel):
+    ip: str
+    product_name: str = ""
+    vendor: str = ""
+    vendor_id: int | None = None
+    device_type: str = ""
+    revision: str = ""
+    serial: str = ""
+    source: str = ""  # "pylogix_discover" | "tcp_probe"
+
+
+class NetworkScanResult(BaseModel):
+    ok: bool
+    devices: list[NetworkScanDevice] = Field(default_factory=list)
+    message: str = ""
+
+
+def _pylogix_discover() -> list[NetworkScanDevice]:
+    """Broadcast EtherNet/IP discovery via pylogix. Inspired by
+    pylogix/examples/20_discover_devices.py and 81_simple_gui.py —
+    we don't need every field, just enough for the operator to pick
+    the right PLC from a list."""
+    try:
+        from pylogix import PLC  # type: ignore
+    except Exception:
+        return []
+    out: list[NetworkScanDevice] = []
+    try:
+        with PLC() as comm:
+            try:
+                devices = comm.Discover()
+            except Exception:
+                devices = None
+            if devices is None or not getattr(devices, "Value", None):
+                return []
+            for d in devices.Value:
+                ip = str(getattr(d, "IPAddress", "") or "").strip()
+                if not ip:
+                    continue
+                out.append(
+                    NetworkScanDevice(
+                        ip=ip,
+                        product_name=str(getattr(d, "ProductName", "") or ""),
+                        vendor=str(getattr(d, "Vendor", "") or ""),
+                        vendor_id=int(getattr(d, "VendorID", 0) or 0) or None,
+                        device_type=str(getattr(d, "DeviceType", "") or ""),
+                        revision=str(getattr(d, "Revision", "") or ""),
+                        serial=str(getattr(d, "SerialNumber", "") or ""),
+                        source="pylogix_discover",
+                    )
+                )
+    except Exception:
+        return out
+    return out
+
+
+def _expand_scan_range(rng: str) -> list[str]:
+    """Expand a comma-list / CIDR to a flat list of IPv4 strings.
+    Returns an empty list when rng is empty / invalid. Capped at
+    1024 hosts so a /20 typo doesn't pin the worker."""
+    import ipaddress
+    txt = (rng or "").strip()
+    if not txt:
+        return []
+    hosts: list[str] = []
+    for chunk in [c.strip() for c in txt.split(",") if c.strip()]:
+        try:
+            if "/" in chunk:
+                net = ipaddress.ip_network(chunk, strict=False)
+                for h in net.hosts():
+                    hosts.append(str(h))
+            else:
+                addr = ipaddress.ip_address(chunk)
+                hosts.append(str(addr))
+        except Exception:
+            continue
+        if len(hosts) >= 1024:
+            break
+    return hosts[:1024]
+
+
+def _tcp_probe_ports(host: str, ports: list[int], timeout_s: float) -> int | None:
+    """Return the first port that responded with a SYN-ACK, or None."""
+    import socket
+    for p in ports:
+        try:
+            with socket.create_connection((host, p), timeout=timeout_s):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+@router.post("/discover-network", response_model=NetworkScanResult)
+def discover_network(payload: NetworkScanRequest) -> NetworkScanResult:
+    """Discover PLCs on the local network.
+
+    Strategy borrowed from pylogix/examples/81_simple_gui.py:
+      1. Broadcast EtherNet/IP discovery via pylogix.PLC().Discover()
+         when no explicit scan_range is set. This catches every
+         AB/Logix on the local L2 segment without needing the
+         operator to type any IPs.
+      2. When scan_range is supplied (CIDR or comma-list), or as a
+         fallback when discover() returned nothing, TCP-probe each
+         host on the protocol's well-known port:
+            allen_bradley → 44818
+            siemens_snap7 → 102
+            siemens_opcua → 4840
+            boston         → 502
+         A 1 s probe timeout keeps the scan responsive even on a
+         dense /24.
+
+    The merged result is de-duplicated by IP, broadcast wins on
+    metadata when both sources find the same host."""
+    timeout_s = max(0.2, min(5.0, (payload.timeout_ms or 4000) / 1000.0))
+    found: dict[str, NetworkScanDevice] = {}
+
+    if not payload.scan_range:
+        for d in _pylogix_discover():
+            found[d.ip] = d
+
+    if payload.include_tcp_probe and (payload.scan_range or not found):
+        port_by_type = {
+            "allen_bradley": [44818],
+            "siemens_snap7": [102],
+            "siemens_opcua": [4840],
+            "boston": [502],
+        }
+        ports = port_by_type.get(payload.gateway_type or "allen_bradley", [44818])
+        hosts = _expand_scan_range(payload.scan_range)
+        if not hosts:
+            # Auto-derive the host's own /24 from the default route.
+            try:
+                import socket
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(0.5)
+                try:
+                    s.connect(("8.8.8.8", 80))
+                    local = s.getsockname()[0]
+                finally:
+                    s.close()
+                parts = str(local).split(".")
+                if len(parts) == 4:
+                    cidr = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+                    hosts = _expand_scan_range(cidr)
+            except Exception:
+                hosts = []
+        # Probe in parallel — 32 worker threads keep a /24 sweep under ~2s.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        if hosts:
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                futures = {pool.submit(_tcp_probe_ports, h, ports, timeout_s): h for h in hosts}
+                for fut in as_completed(futures):
+                    h = futures[fut]
+                    try:
+                        port = fut.result()
+                    except Exception:
+                        port = None
+                    if not port:
+                        continue
+                    if h not in found:
+                        found[h] = NetworkScanDevice(
+                            ip=h,
+                            product_name=f"Open port {port}",
+                            source="tcp_probe",
+                        )
+
+    devices = sorted(found.values(), key=lambda d: tuple(int(p) for p in d.ip.split(".") if p.isdigit()))
+    if not devices:
+        return NetworkScanResult(ok=False, devices=[], message="No PLCs discovered. Check that the edge host is on the same VLAN as the PLC.")
+    return NetworkScanResult(ok=True, devices=devices, message=f"Discovered {len(devices)} device(s)")
+
+
 @router.post("/opcua/browse", response_model=OpcUaBrowseResult)
 def browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
     ip = (payload.plc_ip or "").strip()

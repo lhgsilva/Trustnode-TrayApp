@@ -447,6 +447,30 @@ export async function discoverPlcTags(payload) {
   return res.json();
 }
 
+export async function discoverPlcNetwork(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/discover-network`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = body?.detail || JSON.stringify(body);
+    } catch {
+      try { detail = await res.text(); } catch { detail = ""; }
+    }
+    if (res.status === 404) {
+      throw new Error(
+        "Network discovery endpoint not found (HTTP 404). Restart/rebuild the backend.",
+      );
+    }
+    throw new Error(`Network discovery failed (HTTP ${res.status})${detail ? `: ${detail}` : ""}`);
+  }
+  return res.json();
+}
+
 export async function browseOpcUaNodes(payload) {
   const request = {
     method: "POST",

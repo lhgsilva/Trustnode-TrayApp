@@ -11,6 +11,7 @@ import {
   getUiSourceConfig,
   getGatewayInstanceStatuses,
   discoverPlcTags,
+  discoverPlcNetwork,
   browseOpcUaNodes,
   getWsStreamUrl,
   getCloudWsStreamUrl,
@@ -3003,6 +3004,14 @@ function AppShell() {
   });
   const [deviceTestBusy, setDeviceTestBusy] = useState(false);
   const [deviceTestResult, setDeviceTestResult] = useState(null);
+  // Network-scan state for the Add PLC Device modal. The Scan
+  // Network button hits the new /api/plc/discover-network endpoint
+  // and lists everything it finds in a table; clicking a row fills
+  // the PLC IP field. Inspired by pylogix/examples/81_simple_gui.py.
+  const [deviceScanBusy, setDeviceScanBusy] = useState(false);
+  const [deviceScanResults, setDeviceScanResults] = useState([]);
+  const [deviceScanMessage, setDeviceScanMessage] = useState("");
+  const [deviceScanRange, setDeviceScanRange] = useState("");
   const [appStoreHydrated, setAppStoreHydrated] = useState(false);
   const reconnectTimerRef = useRef(null);
   const fileSinkPickerRef = useRef(null);
@@ -11512,6 +11521,33 @@ const getGatewayHealth = (gateway) => {
       "Are you sure you want to delete this device?",
       () => setDevices((prev) => prev.filter((d) => d.id !== deviceId))
     );
+  };
+
+  // Network discovery for the Add PLC Device modal. The operator can
+  // leave Range empty (broadcast EtherNet/IP discovery via pylogix)
+  // OR type a CIDR / comma list (e.g. "192.168.10.0/24" or
+  // "192.168.10.50,192.168.10.51") to constrain the probe. Click a
+  // result row to fill the PLC IP field.
+  const runDeviceNetworkScan = async () => {
+    if (!canEditPage("devices")) return;
+    setError("");
+    setDeviceScanBusy(true);
+    setDeviceScanMessage("");
+    setDeviceScanResults([]);
+    try {
+      const out = await discoverPlcNetwork({
+        scan_range: String(deviceScanRange || "").trim(),
+        gateway_type: deviceForm.gateway_type,
+        timeout_ms: 4000,
+        include_tcp_probe: true,
+      });
+      setDeviceScanResults(Array.isArray(out?.devices) ? out.devices : []);
+      setDeviceScanMessage(String(out?.message || ""));
+    } catch (err) {
+      setDeviceScanMessage(`Discovery failed: ${String(err?.message || err || "")}`);
+    } finally {
+      setDeviceScanBusy(false);
+    }
   };
 
   const runDeviceConnectionTest = async () => {
@@ -21920,16 +21956,33 @@ const getGatewayHealth = (gateway) => {
                               </p>
                             );
                           }
-                          return filtered.map((tag) => (
-                            <label key={tag} className="discovered-tag-item">
-                              <input
-                                type="checkbox"
-                                checked={gatewaySelectedTags.includes(tag)}
-                                onChange={() => toggleGatewayDiscoveredTag(tag)}
-                              />
-                              <span>{tag}</span>
-                            </label>
-                          ));
+                          // Operator request 2026-06-12: render AB
+                          // discovered tags as a multi-column checkbox
+                          // grid instead of a single-column list. We
+                          // override the parent .discovered-tags-list
+                          // grid template here via inline style so the
+                          // OPC-UA variant (which needs single-column
+                          // indented tree) keeps its layout untouched.
+                          return (
+                            <div className="discovered-tags-grid" style={{
+                              display: "grid",
+                              gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                              gap: "4px 12px",
+                              padding: "4px 8px",
+                              width: "100%",
+                            }}>
+                              {filtered.map((tag) => (
+                                <label key={tag} className="discovered-tag-item" style={{ minWidth: 0 }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={gatewaySelectedTags.includes(tag)}
+                                    onChange={() => toggleGatewayDiscoveredTag(tag)}
+                                  />
+                                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{tag}</span>
+                                </label>
+                              ))}
+                            </div>
+                          );
                         })()}
                   </div>
                 </div>
@@ -21994,7 +22047,19 @@ const getGatewayHealth = (gateway) => {
                 </select>
               </label>
               <label>
-                PLC IP
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+                  <span>PLC IP</span>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={runDeviceNetworkScan}
+                    disabled={!canEditPage("devices") || deviceScanBusy}
+                    title="Discover PLCs on the local network (EtherNet/IP broadcast + TCP probe)"
+                    style={{ padding: "2px 10px", fontSize: 12 }}
+                  >
+                    {deviceScanBusy ? "Scanning..." : "Scan Network"}
+                  </button>
+                </div>
                 <input
                   placeholder="192.168.0.10"
                   value={deviceForm.plc_ip}
@@ -22012,6 +22077,103 @@ const getGatewayHealth = (gateway) => {
                   disabled={!canEditPage("devices")}
                 />
               </label>
+              {(deviceScanBusy || deviceScanResults.length || deviceScanMessage) ? (
+                <div className="device-form-grid" style={{ gridColumn: "1 / -1", marginTop: -6 }}>
+                  <div className="discovered-tags-card" style={{ gridColumn: "1 / -1" }}>
+                    <div className="discovered-tags-toolbar" style={{ flexWrap: "wrap", gap: 8 }}>
+                      <strong style={{ flex: "0 0 auto" }}>
+                        {deviceScanBusy
+                          ? "Scanning network..."
+                          : deviceScanResults.length
+                            ? `Discovered Devices (${deviceScanResults.length})`
+                            : "Network Scan"}
+                      </strong>
+                      <input
+                        className="gateway-browse-search"
+                        placeholder="Scan range (CIDR e.g. 192.168.10.0/24) — empty for broadcast"
+                        value={deviceScanRange}
+                        onChange={(e) => setDeviceScanRange(e.target.value)}
+                        style={{ flex: "1 1 220px", minWidth: 0 }}
+                      />
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={runDeviceNetworkScan}
+                        disabled={deviceScanBusy || !canEditPage("devices")}
+                      >
+                        {deviceScanBusy ? "Scanning..." : "Rescan"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-danger btn-sm"
+                        onClick={() => { setDeviceScanResults([]); setDeviceScanMessage(""); }}
+                      >
+                        Clear
+                      </button>
+                    </div>
+                    {deviceScanMessage ? (
+                      <div className={deviceScanResults.length ? "ok-note" : "muted"} style={{ padding: "6px 12px", fontSize: 12 }}>
+                        {deviceScanMessage}
+                      </div>
+                    ) : null}
+                    {deviceScanResults.length ? (
+                      <div className="discovered-tags-list" style={{ maxHeight: 240 }}>
+                        <div className="device-scan-row device-scan-row--header" style={{
+                          display: "grid",
+                          gridTemplateColumns: "160px 1.4fr 1fr 100px 70px",
+                          gap: 8,
+                          padding: "4px 8px",
+                          fontWeight: 700,
+                          fontSize: 11,
+                          color: "var(--muted)",
+                          borderBottom: "1px solid var(--stroke)",
+                        }}>
+                          <span>IP Address</span>
+                          <span>Product</span>
+                          <span>Vendor</span>
+                          <span>Device</span>
+                          <span style={{ textAlign: "right" }}>Action</span>
+                        </div>
+                        {deviceScanResults.map((d, i) => (
+                          <div key={`${d.ip}-${i}`} className="device-scan-row" style={{
+                            display: "grid",
+                            gridTemplateColumns: "160px 1.4fr 1fr 100px 70px",
+                            gap: 8,
+                            padding: "6px 8px",
+                            alignItems: "center",
+                            fontSize: 12,
+                            borderBottom: "1px solid var(--stroke)",
+                          }}>
+                            <code>{d.ip}</code>
+                            <span title={d.product_name}>{d.product_name || "—"}</span>
+                            <span title={d.vendor}>{d.vendor || "—"}</span>
+                            <span className="muted">{d.device_type || d.source || ""}</span>
+                            <button
+                              type="button"
+                              className="btn btn-primary btn-sm"
+                              onClick={() => {
+                                setDeviceForm((prev) => ({
+                                  ...prev,
+                                  plc_ip: d.ip,
+                                  opc_url: prev.gateway_type === "siemens_opcua"
+                                    ? buildOpcUrlFromIp(d.ip)
+                                    : prev.opc_url,
+                                  // Auto-fill name only if empty so we don't
+                                  // clobber the operator's hand-typed name.
+                                  name: prev.name || d.product_name || "",
+                                }));
+                              }}
+                              style={{ padding: "2px 8px", fontSize: 11 }}
+                            >
+                              Use
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
               {deviceForm.gateway_type === "siemens_opcua" ? (
                 <>
                   <label>
