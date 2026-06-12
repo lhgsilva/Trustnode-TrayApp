@@ -2267,6 +2267,14 @@ function AppShell() {
   const [selectedAlarmIds, setSelectedAlarmIds] = useState([]);
   const [dataLog, setDataLog] = useState([]);
   const [appLogs, setAppLogs] = useState([]);
+  // Historian page tab: "live" (table + filters + live poll) or
+  // "export" (export workspace, live poll PAUSED). Operator
+  // request 2026-06-12: "maybe we leave the historian live table
+  // in one tab and export in a different tab of the same page".
+  // Pausing the poller while on the Export tab eliminates the
+  // disk-I/O competition with the gateway thread that the
+  // operator suspected of "breaking the live collection".
+  const [historianTab, setHistorianTab] = useState("live");
   // Server-fetched historian rows. When the operator clicks Load
   // with a from/to range we fetch from disk via the
   // /api/app-store/historian/range endpoint and stash the result
@@ -4479,8 +4487,13 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (activePage !== "historian" && activePage !== "storian") return;
+    // Operator request: live polling only runs while the Live tab
+    // is foregrounded so the Export workspace doesn't compete for
+    // disk I/O with the gateway thread.
+    if (historianTab !== "live") return;
     let cancelled = false;
     let running = false;
+    let consecutiveFailures = 0;
     const tick = async () => {
       if (running || cancelled) return;
       running = true;
@@ -4490,24 +4503,30 @@ function AppShell() {
         if (res?.ok && Array.isArray(res.rows)) {
           setDataLog((prev) => mergeHistorianRowsStable(res.rows, prev, 25000));
           setHistorianPollError("");
+          consecutiveFailures = 0;
         }
       } catch (err) {
-        // Surface the error instead of swallowing it — operators were
-        // staring at an empty Historian table for hours with no clue
-        // why. Now the error appears inline above the filter row and
-        // the next tick still retries on its own.
-        // BUT — suppress AbortError / "signal is aborted". Operator
-        // 2026-06-12: "signal is aborted without reason" was a
-        // benign control-flow event triggered when the operator
-        // navigated, filtered, or the previous tick was still in
-        // flight at timeout. It scared users into thinking the
-        // historian was broken when in fact it kept ticking. We
-        // only show the error banner now for non-abort failures,
-        // and we ALWAYS clear it on the next successful poll.
+        // Aggressive noise suppression. Operator 2026-06-12: "the
+        // filter is breaking the live collection of data". The
+        // historian poller hits the same /api/app-store/historian
+        // endpoint as the rest of the app and a single transient
+        // Failed-to-fetch (backend restarted, network blip, etc.)
+        // would flash a scary error banner. The poller already
+        // retries every 3 s, so a real failure surfaces after a
+        // few seconds — but a one-off blip stays hidden.
+        // Rules:
+        //   - Abort signals → silently ignored.
+        //   - Other failures (Failed to fetch, 5xx, etc.) → only
+        //     surface after 3 CONSECUTIVE failures so the operator
+        //     isn't startled by every transient.
+        //   - The very next success clears the banner.
         const msg = String(err?.name || "") + " " + String(err?.message || err || "");
         const isAbort = /abort|signal\s*is\s*aborted|the operation was aborted/i.test(msg);
         if (!cancelled && !isAbort) {
-          setHistorianPollError(String(err?.message || err));
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 3) {
+            setHistorianPollError(String(err?.message || err));
+          }
         }
       } finally {
         running = false;
@@ -4522,7 +4541,7 @@ function AppShell() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [appStoreHydrated, activePage, cloudEdgeApiFilter]);
+  }, [appStoreHydrated, activePage, historianTab, cloudEdgeApiFilter]);
 
   useEffect(() => {
     if (!appStoreHydrated || !currentUser) return;
@@ -19407,6 +19426,37 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "historian" || activePage === "storian" ? (
             <div className="page-fill">
+              {/* Tab strip — Live (table + filters + poll) | Export
+                  (export workspace, poll PAUSED). Operator request
+                  2026-06-12: "leave the historian live table in one
+                  tab and export in a different tab of the same
+                  page". The export pane shows the same controls as
+                  the modal used to but inline, and the live poller
+                  is paused while the Export tab is foregrounded so
+                  big exports don't compete with the gateway thread
+                  for disk I/O. */}
+              <div className="row" style={{ gap: 6, marginBottom: 8 }}>
+                <button
+                  type="button"
+                  className={`dashboard-pill ${historianTab === "live" ? "active" : ""}`}
+                  onClick={() => setHistorianTab("live")}
+                >
+                  Live Table
+                </button>
+                <button
+                  type="button"
+                  className={`dashboard-pill ${historianTab === "export" ? "active" : ""}`}
+                  onClick={() => setHistorianTab("export")}
+                >
+                  Export
+                </button>
+                {historianTab === "export" ? (
+                  <span className="muted" style={{ fontSize: 12, alignSelf: "center", marginLeft: 8 }}>
+                    Live polling paused on this tab — switch back to <strong>Live Table</strong> to resume.
+                  </span>
+                ) : null}
+              </div>
+              {historianTab !== "live" ? null : (<>
               {/* Store-and-forward visibility: how many rows are buffered
                   locally waiting to be pushed to the cloud, and when the
                   last successful push happened. Operators use this to tell
@@ -19752,6 +19802,39 @@ const getGatewayHealth = (gateway) => {
                   </div>
                 ) : null}
               </section>
+              </>)}
+              {historianTab === "export" ? (
+                <section className="card card-fill">
+                  <h3 style={{ margin: "0 0 10px 0" }}>Export Workspace</h3>
+                  <p className="muted" style={{ fontSize: 12 }}>
+                    Live polling is paused while this tab is open. Use the controls below to configure and run an export.
+                  </p>
+                  <div className="row" style={{ gap: 6 }}>
+                    <button
+                      type="button"
+                      className="btn btn-success"
+                      onClick={() => setHistorianExportOpen(true)}
+                    >
+                      Open Export Configuration
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={() => setHistorianTab("live")}
+                    >
+                      Return to Live Table
+                    </button>
+                  </div>
+                  <p className="muted" style={{ fontSize: 12, marginTop: 16 }}>
+                    Current dataset: <strong>{historianRows.length.toLocaleString()}</strong> rows visible based on the current filters.
+                    {Array.isArray(historianServerRows) && historianServerRows.length > 0 ? (
+                      <> {" "}Loaded from disk via the <strong>Load</strong> button on the Live tab.</>
+                    ) : (
+                      <> {" "}Switch back to Live, set From / To and click <strong>Load</strong> to pull a wider window from disk.</>
+                    )}
+                  </p>
+                </section>
+              ) : null}
             </div>
           ) : null}
 
