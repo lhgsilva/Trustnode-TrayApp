@@ -1109,6 +1109,27 @@ function LiveTagChart({
       for (const ts of m.keys()) tsSet.add(ts);
     }
     let sorted = [...tsSet].sort((a, b) => a - b);
+    // Real-time window enforcement. Operator request 2026-06-12:
+    // "if my chart X axis is every sec, my gateway stopped for 10
+    // min and my chart is configured to show 120 point, I should
+    // not show any point before / after I restarted, make sure you
+    // understand". Translation: the chart represents a sliding
+    // wall-clock window of capacity × pollMs seconds. Samples
+    // outside that window must drop out — even if the buffer still
+    // has them. So after a 10-min stall on a 1 s × 120 chart, the
+    // 60 pre-stall samples that USED to be in view are now too old
+    // to be in the [now - 120 s, now] window and the chart shows
+    // only the freshly arrived samples (with empty space behind
+    // them filling out the rest of the X axis).
+    //
+    // Bucketing exception: when grouping is on (groupBucketMs > 0)
+    // each "sample" already represents groupBucketMs of time, so
+    // the window is capacity × groupBucketMs.
+    const effectivePollMs = groupBucketMs > 0 ? groupBucketMs : pollMs;
+    const windowMs = Math.max(1, capacity) * effectivePollMs;
+    const nowMs = Date.now();
+    const windowStartMs = nowMs - windowMs;
+    sorted = sorted.filter((ts) => ts >= windowStartMs);
     if (sorted.length > capacity) sorted = sorted.slice(-capacity);
 
     // Per-series sorted entries so we can carry-forward by walking with

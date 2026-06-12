@@ -954,7 +954,12 @@ def _expand_scan_range(rng: str) -> list[str]:
 
 
 def _tcp_probe_ports(host: str, ports: list[int], timeout_s: float) -> int | None:
-    """Return the first port that responded with a SYN-ACK, or None."""
+    """Return the first port that responded with a SYN-ACK, or None.
+
+    Note: kept for the narrow per-type probe. The broader ANY-TCP
+    sweep submits (host, port) pairs to a parallel pool via
+    _tcp_probe_single below so probe latency is per-port not per-
+    host."""
     import socket
     for p in ports:
         try:
@@ -963,6 +968,85 @@ def _tcp_probe_ports(host: str, ports: list[int], timeout_s: float) -> int | Non
         except Exception:
             continue
     return None
+
+
+def _tcp_probe_single(host: str, port: int, timeout_s: float) -> int | None:
+    """Probe ONE (host, port). Returns the port on success, None
+    otherwise. Used by the ANY-TCP fan-out so 18 ports × 254 hosts
+    finishes quickly even when many hosts are dead."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return port
+    except Exception:
+        return None
+
+
+def _list_local_ipv4_subnets() -> list[str]:
+    """Enumerate every IPv4 /24 attached to the host. Operator
+    2026-06-12: the auto-derived range used the default-route trick
+    which on multi-NIC edge boxes picked the WAN interface and
+    missed the industrial VLAN where the PLCs live. Now we union
+    every active IPv4 address that's RFC1918 or otherwise private,
+    expand each to its /24, and probe them all. Returns a
+    deduplicated, capped list of CIDR strings."""
+    import socket as _socket
+    subnets: list[str] = []
+    seen: set[str] = set()
+
+    def _add_subnet(addr: str) -> None:
+        try:
+            parts = str(addr).split(".")
+            if len(parts) != 4:
+                return
+            o1, o2, o3 = int(parts[0]), int(parts[1]), int(parts[2])
+            # Skip loopback / link-local / multicast / non-private
+            # by default — we don't want to scan public WAN.
+            if o1 == 127 or o1 >= 224:
+                return
+            if o1 == 169 and o2 == 254:
+                return
+            # Accept anything RFC1918 OR plant-floor 192.168.* /
+                # 10.* etc. — basically all private space.
+            cidr = f"{o1}.{o2}.{o3}.0/24"
+            if cidr in seen:
+                return
+            seen.add(cidr)
+            subnets.append(cidr)
+        except Exception:
+            return
+
+    # Strategy A — Windows / Linux uses getaddrinfo on hostname.
+    try:
+        for info in _socket.getaddrinfo(_socket.gethostname(), None):
+            if info[0] == _socket.AF_INET:
+                ip = info[4][0]
+                _add_subnet(ip)
+    except Exception:
+        pass
+    # Strategy B — psutil if available (richer interface list).
+    try:
+        import psutil  # type: ignore
+        for nic, addrs in psutil.net_if_addrs().items():
+            for a in addrs:
+                fam = getattr(a, "family", None)
+                if fam is not None and int(fam) == int(_socket.AF_INET):
+                    _add_subnet(a.address)
+    except Exception:
+        pass
+    # Strategy C — default-route trick as a last resort.
+    if not subnets:
+        try:
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            try:
+                s.connect(("8.8.8.8", 80))
+                _add_subnet(s.getsockname()[0])
+            finally:
+                s.close()
+        except Exception:
+            pass
+    return subnets[:8]  # cap so a host with 50 interfaces doesn't DoS itself
 
 
 @router.post("/discover-network", response_model=NetworkScanResult)
@@ -1033,71 +1117,104 @@ def discover_network(payload: NetworkScanRequest) -> NetworkScanResult:
             ports = port_by_type.get(payload.gateway_type or "allen_bradley", [44818])
         hosts = _expand_scan_range(payload.scan_range)
         if not hosts:
-            # Auto-derive the host's own /24 from the default route.
-            try:
-                import socket
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.settimeout(0.5)
-                try:
-                    s.connect(("8.8.8.8", 80))
-                    local = s.getsockname()[0]
-                finally:
-                    s.close()
-                parts = str(local).split(".")
-                if len(parts) == 4:
-                    cidr = f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
-                    hosts = _expand_scan_range(cidr)
-            except Exception:
-                hosts = []
-        # Probe in parallel. We bump workers up to 128 for the broad
-        # ANY-TCP sweep so 254 hosts × 15 ports finishes in a few
-        # seconds instead of minutes. Per-port timeout drops to 0.5 s
-        # in any-TCP mode because we're probing 15 ports per host —
-        # an unreachable port at 4 s × 15 = 60 s of dead waiting.
+            # Auto-scan every IPv4 /24 attached to this host instead
+            # of only the default-route NIC. Operator 2026-06-12:
+            # "still not showing all devices connected that can be
+            # seen in network". On multi-NIC edge boxes (one VLAN
+            # for WAN, another for plant floor) the old default-
+            # route trick picked the wrong interface and the PLCs
+            # went undiscovered.
+            for cidr in _list_local_ipv4_subnets():
+                hosts.extend(_expand_scan_range(cidr))
+            # Dedup preserving order (so we don't probe the same /24 twice).
+            seen_hosts: set[str] = set()
+            uniq: list[str] = []
+            for h in hosts:
+                if h in seen_hosts:
+                    continue
+                seen_hosts.add(h)
+                uniq.append(h)
+            hosts = uniq[:1024]
+        # Probe in parallel. Fan out (host, port) pairs to the pool
+        # so the worst-case wall-clock is per-port not per-host.
+        # Operator 2026-06-12: per-host serial probe meant 1 dead
+        # host = 9 s of serial timeouts × 18 ports, choking the
+        # /24 sweep.
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        worker_count = 128 if payload.scan_any_tcp else 32
-        probe_timeout_s = 0.5 if payload.scan_any_tcp else timeout_s
+        worker_count = 256 if payload.scan_any_tcp else 32
+        probe_timeout_s = 0.4 if payload.scan_any_tcp else timeout_s
+        host_best_port: dict[str, int] = {}
         if hosts:
             with ThreadPoolExecutor(max_workers=worker_count) as pool:
-                futures = {pool.submit(_tcp_probe_ports, h, ports, probe_timeout_s): h for h in hosts}
-                for fut in as_completed(futures):
-                    h = futures[fut]
-                    try:
-                        port = fut.result()
-                    except Exception:
-                        port = None
-                    if not port:
-                        continue
-                    if h not in found:
-                        # Map a friendly hint to the responding port
-                        # so the operator can tell what answered.
-                        port_hints = {
-                            44818: "EtherNet/IP (Allen-Bradley)",
-                            102: "S7 (Siemens)",
-                            4840: "OPC-UA",
-                            502: "Modbus TCP",
-                            47808: "BACnet/IP",
-                            9600: "Omron FINS",
-                            80: "HTTP",
-                            443: "HTTPS",
-                            8080: "HTTP-alt",
-                            8443: "HTTPS-alt",
-                            22: "SSH",
-                            3389: "RDP (Windows)",
-                            445: "SMB (Windows)",
-                            135: "RPC (Windows)",
-                            5900: "VNC",
-                            161: "SNMP",
-                            23: "Telnet",
-                            21: "FTP",
-                        }
-                        hint = port_hints.get(int(port), f"port {port}")
-                        found[h] = NetworkScanDevice(
-                            ip=h,
-                            product_name=hint,
-                            device_type=f"tcp/{port}",
-                            source="tcp_probe",
-                        )
+                if payload.scan_any_tcp:
+                    # True (host, port) fan-out. Walking each (host, port)
+                    # as its own task means the worst-case wall-clock is
+                    # per-port not per-host — a /24 of dead addresses
+                    # finishes in ~probe_timeout × ceil(hosts*ports/workers)
+                    # ≈ 0.4 × 18 ≈ 7 s instead of 30+ s.
+                    pair_futures = {
+                        pool.submit(_tcp_probe_single, h, p, probe_timeout_s): (h, p)
+                        for h in hosts for p in ports
+                    }
+                    for fut in as_completed(pair_futures):
+                        h, p = pair_futures[fut]
+                        try:
+                            port = fut.result()
+                        except Exception:
+                            port = None
+                        if not port:
+                            continue
+                        # Keep the PRIORITY (lowest index in `ports`)
+                        # responder so industrial labels win over web
+                        # admin UIs on hosts that expose both.
+                        if h not in host_best_port:
+                            host_best_port[h] = port
+                        else:
+                            if ports.index(port) < ports.index(host_best_port[h]):
+                                host_best_port[h] = port
+                else:
+                    futures = {pool.submit(_tcp_probe_ports, h, ports, probe_timeout_s): h for h in hosts}
+                    for fut in as_completed(futures):
+                        h = futures[fut]
+                        try:
+                            port = fut.result()
+                        except Exception:
+                            port = None
+                        if not port:
+                            continue
+                        host_best_port[h] = port
+            # Promote into the `found` map; pylogix-discovered hosts
+            # already have richer metadata so we don't overwrite.
+            port_hints = {
+                44818: "EtherNet/IP (Allen-Bradley)",
+                102: "S7 (Siemens)",
+                4840: "OPC-UA",
+                502: "Modbus TCP",
+                47808: "BACnet/IP",
+                9600: "Omron FINS",
+                80: "HTTP",
+                443: "HTTPS",
+                8080: "HTTP-alt",
+                8443: "HTTPS-alt",
+                22: "SSH",
+                3389: "RDP (Windows)",
+                445: "SMB (Windows)",
+                135: "RPC (Windows)",
+                5900: "VNC",
+                161: "SNMP",
+                23: "Telnet",
+                21: "FTP",
+            }
+            for h, port in host_best_port.items():
+                if h in found:
+                    continue
+                hint = port_hints.get(int(port), f"port {port}")
+                found[h] = NetworkScanDevice(
+                    ip=h,
+                    product_name=hint,
+                    device_type=f"tcp/{port}",
+                    source="tcp_probe",
+                )
 
     devices = sorted(found.values(), key=lambda d: tuple(int(p) for p in d.ip.split(".") if p.isdigit()))
     if not devices:
