@@ -2321,6 +2321,19 @@ function AppShell() {
   const [historianExportXlsxTemplate, setHistorianExportXlsxTemplate] = useState(null);
   const historianXlsxFileRef = useRef(null);
   const historianTemplateFileRef = useRef(null);
+  // Export tab has its OWN filter set including From/To so the
+  // operator can compose an export window without disturbing the
+  // live-table view. Operator request 2026-06-12: filter / Load /
+  // Pivot / Export controls all moved to the Export tab; Live tab
+  // keeps only the in-memory live filters.
+  const [historianExportFilters, setHistorianExportFilters] = useState({
+    from: "",
+    to: "",
+    tag: "",
+    gatewayId: "",
+    deviceName: "",
+    quality: "all",
+  });
   const [historianFilters, setHistorianFilters] = useState({
     from: "",
     to: "",
@@ -10115,24 +10128,24 @@ const getGatewayHealth = (gateway) => {
     };
   }, [tagMonitorSeries, tagMonitorSelection, tagMonitorLatest, renderNowMs]);
 
+  // Shared row decorator — applied to BOTH the live filtered set
+  // and the export preview set so gateway-name resolution is
+  // consistent across tabs.
+  const decorateHistorianRow = useCallback((row) => {
+    const liveNameById = gatewayNameById[row.gateway_id];
+    const liveNameByIp = row.plc_ip ? gatewayNameByPlcIp[String(row.plc_ip)] : undefined;
+    const storedLooksLikeId = /^gw-\d/.test(String(row.gateway_name || ""));
+    const storedClean = storedLooksLikeId ? "" : String(row.gateway_name || "");
+    const friendlyName = liveNameById || liveNameByIp || storedClean || row.gateway_id || "-";
+    return { ...row, gateway_name: friendlyName };
+  }, [gatewayNameById, gatewayNameByPlcIp]);
+
   const historianRows = useMemo(() => {
-    // Prefer the server-loaded set when the operator clicked Load
-    // with a from/to range — otherwise fall back to the in-memory
-    // dataLogView so the page still shows fresh data on first
-    // open. The server set is already pre-filtered by from/to on
-    // the SQL side but we keep applying the in-memory filters too
-    // (tag substring, gateway, device, quality) so the operator
-    // can narrow further without re-querying.
-    const source = Array.isArray(historianServerRows) && historianServerRows.length
-      ? historianServerRows
-      : dataLogView;
-    return source.filter((row) => {
-      // If we're reading the server set, from/to was already
-      // applied at SQL level — skip the in-range check (it works
-      // off the local "from / to" inputs which the operator can
-      // change after Load too).
-      const skipRange = Array.isArray(historianServerRows) && historianServerRows.length;
-      if (!skipRange && !inRange(row.ts, historianFilters.from, historianFilters.to)) return false;
+    // LIVE TAB ONLY. Reads strictly from the in-memory dataLogView
+    // buffer (no server set, no from/to). Operator 2026-06-12: the
+    // Live tab keeps only the live filters; From/To + Load + Pivot
+    // + Export all live on the Export tab now.
+    return dataLogView.filter((row) => {
       if (historianFilters.tag) {
         const needle = String(historianFilters.tag || "").toLowerCase();
         const rawTag = String(row.tag || "").toLowerCase();
@@ -10143,34 +10156,31 @@ const getGatewayHealth = (gateway) => {
       if (historianFilters.deviceName && !String(row.device_name || "").toLowerCase().includes(historianFilters.deviceName.toLowerCase())) return false;
       if (historianFilters.quality !== "all" && String(row.quality_label || "").toUpperCase() !== historianFilters.quality) return false;
       return true;
-    }).map((row) => {
-      // Operator request 2026-06-12: "the gateway information to be
-      // shown should be the name and not the id, for the UI and
-      // exports". Historian rows can carry a stale gateway_name (if
-      // the gateway was renamed since the row was written) OR a raw
-      // "gw-1781..." string that LOOKS like an id.
-      // Resolution order:
-      //   1. Live name by gateway_id (most authoritative)
-      //   2. Live name by plc_ip (same physical PLC even if the
-      //      logical gateway was recreated with a fresh id)
-      //   3. Stored gateway_name, but ONLY if it doesn't look like
-      //      a synthetic id (matches /^gw-\d/)
-      //   4. Empty stored name = fall through to gateway_id
-      const liveNameById = gatewayNameById[row.gateway_id];
-      const liveNameByIp = row.plc_ip ? gatewayNameByPlcIp[String(row.plc_ip)] : undefined;
-      const storedLooksLikeId = /^gw-\d/.test(String(row.gateway_name || ""));
-      const storedClean = storedLooksLikeId ? "" : String(row.gateway_name || "");
-      const friendlyName = liveNameById
-        || liveNameByIp
-        || storedClean
-        || row.gateway_id
-        || "-";
-      return {
-        ...row,
-        gateway_name: friendlyName,
-      };
-    });
-  }, [dataLogView, historianServerRows, historianFilters, gatewayNameById, gatewayNameByPlcIp]);
+    }).map(decorateHistorianRow);
+  }, [dataLogView, historianFilters, decorateHistorianRow]);
+
+  // EXPORT TAB ONLY. Sourced from the server-loaded result set
+  // (the operator clicks Load on the Export tab to fill this) and
+  // then filtered by the export tab's own filter set. Empty until
+  // Load is clicked so the preview table starts blank, mirroring
+  // the operator's intent.
+  const historianExportRowsPreview = useMemo(() => {
+    const source = Array.isArray(historianServerRows) ? historianServerRows : [];
+    if (!source.length) return [];
+    const filt = historianExportFilters || {};
+    return source.filter((row) => {
+      if (filt.tag) {
+        const needle = String(filt.tag || "").toLowerCase();
+        const rawTag = String(row.tag || "").toLowerCase();
+        const displayTag = String(formatTagForDisplay(row.tag || "")).toLowerCase();
+        if (!rawTag.includes(needle) && !displayTag.includes(needle)) return false;
+      }
+      if (filt.gatewayId && row.gateway_id !== filt.gatewayId) return false;
+      if (filt.deviceName && !String(row.device_name || "").toLowerCase().includes(filt.deviceName.toLowerCase())) return false;
+      if (filt.quality && filt.quality !== "all" && String(row.quality_label || "").toUpperCase() !== filt.quality) return false;
+      return true;
+    }).map(decorateHistorianRow);
+  }, [historianServerRows, historianExportFilters, decorateHistorianRow]);
 
   // Render only the most recent N rows to keep DOM size bounded. Without
   // this cap React reconciles every row on every state change — opening
@@ -11700,6 +11710,14 @@ const getGatewayHealth = (gateway) => {
   // {{ts}} / {{#each}} / {{/each}} placeholders for fancy layouts.
   const buildHistorianExportRows = useCallback(() => {
     const enabledCols = (historianExportColumns || []).filter((c) => c.enabled !== false);
+    // Export reads from the Export tab's filtered server set so
+    // the preview the operator sees matches the bytes that go to
+    // the file. When the operator hasn't loaded anything we fall
+    // back to the live tab's rows (so an export from the Live tab
+    // still works during transition).
+    const sourceRows = (Array.isArray(historianExportRowsPreview) && historianExportRowsPreview.length)
+      ? historianExportRowsPreview
+      : historianRows;
 
     // ─── PIVOT (wide) mode ────────────────────────────────────────
     // Reshape from one-row-per-sample to one-row-per-timestamp,
@@ -11714,7 +11732,7 @@ const getGatewayHealth = (gateway) => {
       // collapse into the same output row.
       const byTs = new Map();
       const tagSet = new Set();
-      for (const r of historianRows) {
+      for (const r of sourceRows) {
         const ts = String(r.ts || "");
         const tag = String(r.tag || "");
         if (!ts || !tag) continue;
@@ -11765,7 +11783,7 @@ const getGatewayHealth = (gateway) => {
     }
 
     // ─── LONG (default) mode ──────────────────────────────────────
-    return historianRows.map((r) => {
+    return sourceRows.map((r) => {
       const out = {};
       for (const col of enabledCols) {
         switch (col.key) {
@@ -11786,7 +11804,7 @@ const getGatewayHealth = (gateway) => {
       }
       return out;
     });
-  }, [historianRows, historianExportColumns, historianExportPivot]);
+  }, [historianRows, historianExportRowsPreview, historianExportColumns, historianExportPivot]);
 
   const runHistorianExport = useCallback(async () => {
     setHistorianExportBusy(true);
@@ -19577,33 +19595,13 @@ const getGatewayHealth = (gateway) => {
                   </div>
                 </section>
               ) : null}
+              {/* LIVE TAB FILTERS — operator request 2026-06-12: the
+                  Live tab should only have *live* filters (tag,
+                  gateway, device, quality). From/To, Load, Clean,
+                  and Export all moved to the Export tab. Filtering
+                  here narrows the live dataLogView buffer in place. */}
               <section className="card">
-                {/* One-row filter strip: all fields share the same
-                    height. Action buttons (Load / Clean / Export) sit
-                    at the right end so the operator can run them
-                    after composing the filter. Operator request
-                    2026-06-12: "should be in one row with all same
-                    height size then in the end the actions buttons,
-                    load, clean and export". The historian-filter-row
-                    class already laid out 6 fields with grid; we add
-                    inline-end actions next to it. */}
-                <div className="historian-filter-row historian-filter-row-tight">
-                  <label>
-                    From
-                    <input
-                      type="datetime-local"
-                      value={historianFilters.from}
-                      onChange={(e) => setHistorianFilters((p) => ({ ...p, from: e.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    To
-                    <input
-                      type="datetime-local"
-                      value={historianFilters.to}
-                      onChange={(e) => setHistorianFilters((p) => ({ ...p, to: e.target.value }))}
-                    />
-                  </label>
+                <div className="historian-filter-row" style={{ gridTemplateColumns: "repeat(4, minmax(0, 1fr))" }}>
                   <label>
                     Tag
                     <input
@@ -19644,103 +19642,7 @@ const getGatewayHealth = (gateway) => {
                       <option value="BAD">BAD</option>
                     </select>
                   </label>
-                  {/* Actions wrap: CSS .historian-filter-row-tight >
-                      .historian-filter-actions-wrap sets
-                      align-self: center, so the buttons end up
-                      vertically centered in the same row as the
-                      filter (label + input) combos. */}
-                  <div className="historian-filter-actions-wrap">
-                    <div className="historian-filter-actions">
-                    <button
-                      type="button"
-                      className="btn btn-secondary"
-                      disabled={historianLoadBusy}
-                      onClick={async () => {
-                        // Fetch from disk via the app-store historian
-                        // range endpoint. Without an explicit Load
-                        // pass the chart relied on the in-memory
-                        // dataLogView buffer (≈25 000 rows of the
-                        // most recent samples) so old time windows
-                        // came back empty. Load now hits SQLite
-                        // directly and stashes the result in
-                        // historianServerRows.
-                        setHistorianLoadBusy(true);
-                        setHistorianLoadError("");
-                        try {
-                          const toIso = (txt) => {
-                            const s = String(txt || "").trim();
-                            if (!s) return "";
-                            const ms = new Date(s).getTime();
-                            return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
-                          };
-                          const res = await getAppStoreHistorianRange({
-                            fromUtc: toIso(historianFilters.from),
-                            toUtc: toIso(historianFilters.to),
-                            limit: 50000,
-                            offset: 0,
-                            gateway: String(historianFilters.gatewayId || ""),
-                            tag: "",
-                            timeoutMs: 60000,
-                            maxAttempts: 1,
-                          });
-                          const rows = Array.isArray(res?.rows) ? res.rows : [];
-                          setHistorianServerRows(rows);
-                          if (rows.length === 0) {
-                            setHistorianLoadError("No rows in the selected range.");
-                          }
-                        } catch (err) {
-                          setHistorianLoadError(`Load failed: ${String(err?.message || err || "")}`);
-                          setHistorianServerRows(null);
-                        } finally {
-                          setHistorianLoadBusy(false);
-                        }
-                      }}
-                      title="Re-load historian data from disk"
-                    >
-                      {historianLoadBusy ? "Loading..." : "Load"}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-secondary"
-                      onClick={() => {
-                        setHistorianFilters({
-                          from: "",
-                          to: "",
-                          tag: "",
-                          gatewayId: "",
-                          deviceName: "",
-                          quality: "all",
-                        });
-                        // Also drop the server-loaded set so the page
-                        // reverts to the live dataLogView buffer.
-                        setHistorianServerRows(null);
-                        setHistorianLoadError("");
-                      }}
-                      title="Reset every filter and clear the loaded set"
-                    >
-                      Clean
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-success"
-                      onClick={() => setHistorianExportOpen(true)}
-                      title="Open the export window"
-                    >
-                      Export
-                    </button>
-                    </div>
-                  </div>
                 </div>
-                {historianLoadError ? (
-                  <div className="muted" style={{ fontSize: 12, marginTop: 6, color: "#d35454" }}>
-                    {historianLoadError}
-                  </div>
-                ) : null}
-                {Array.isArray(historianServerRows) && historianServerRows.length > 0 ? (
-                  <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-                    Loaded {historianServerRows.length.toLocaleString()} row(s) from disk. Click <strong>Clean</strong> to return to the live buffer.
-                  </div>
-                ) : null}
               </section>
               <section className="card card-fill">
                 <div className="table-scroll fill-scroll">
@@ -19804,36 +19706,231 @@ const getGatewayHealth = (gateway) => {
               </section>
               </>)}
               {historianTab === "export" ? (
-                <section className="card card-fill">
-                  <h3 style={{ margin: "0 0 10px 0" }}>Export Workspace</h3>
-                  <p className="muted" style={{ fontSize: 12 }}>
-                    Live polling is paused while this tab is open. Use the controls below to configure and run an export.
-                  </p>
-                  <div className="row" style={{ gap: 6 }}>
-                    <button
-                      type="button"
-                      className="btn btn-success"
-                      onClick={() => setHistorianExportOpen(true)}
+                <>
+                  <section className="card">
+                    {/* Export-tab filter strip — full set including
+                        From/To. Operator request 2026-06-12: all the
+                        filter / Load / Clean / Pivot / Export controls
+                        live here now, the Live tab keeps only its
+                        in-memory filters. */}
+                    <div className="historian-filter-row historian-filter-row-tight">
+                      <label>
+                        From
+                        <input
+                          type="datetime-local"
+                          value={historianExportFilters.from}
+                          onChange={(e) => setHistorianExportFilters((p) => ({ ...p, from: e.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        To
+                        <input
+                          type="datetime-local"
+                          value={historianExportFilters.to}
+                          onChange={(e) => setHistorianExportFilters((p) => ({ ...p, to: e.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Tag
+                        <input
+                          placeholder="Filter by tag"
+                          value={historianExportFilters.tag}
+                          onChange={(e) => setHistorianExportFilters((p) => ({ ...p, tag: e.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Gateway
+                        <select
+                          value={historianExportFilters.gatewayId}
+                          onChange={(e) => setHistorianExportFilters((p) => ({ ...p, gatewayId: e.target.value }))}
+                        >
+                          <option value="">All gateways</option>
+                          {allGatewayOptions.map((g) => (
+                            <option key={g.id} value={g.id}>{g.power_meter ? `${g.name} (Power Meter)` : g.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Device
+                        <input
+                          placeholder="Filter by device"
+                          value={historianExportFilters.deviceName}
+                          onChange={(e) => setHistorianExportFilters((p) => ({ ...p, deviceName: e.target.value }))}
+                        />
+                      </label>
+                      <label>
+                        Quality
+                        <select
+                          value={historianExportFilters.quality}
+                          onChange={(e) => setHistorianExportFilters((p) => ({ ...p, quality: e.target.value }))}
+                        >
+                          <option value="all">All</option>
+                          <option value="GOOD">GOOD</option>
+                          <option value="UNCERTAIN">UNCERTAIN</option>
+                          <option value="BAD">BAD</option>
+                        </select>
+                      </label>
+                      <div className="historian-filter-actions-wrap">
+                        <div className="historian-filter-actions">
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            disabled={historianLoadBusy}
+                            onClick={async () => {
+                              setHistorianLoadBusy(true);
+                              setHistorianLoadError("");
+                              try {
+                                const toIso = (txt) => {
+                                  const s = String(txt || "").trim();
+                                  if (!s) return "";
+                                  const ms = new Date(s).getTime();
+                                  return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
+                                };
+                                const res = await getAppStoreHistorianRange({
+                                  fromUtc: toIso(historianExportFilters.from),
+                                  toUtc: toIso(historianExportFilters.to),
+                                  limit: 100000,
+                                  offset: 0,
+                                  gateway: String(historianExportFilters.gatewayId || ""),
+                                  tag: "",
+                                  timeoutMs: 90000,
+                                  maxAttempts: 1,
+                                });
+                                const rows = Array.isArray(res?.rows) ? res.rows : [];
+                                setHistorianServerRows(rows);
+                                if (rows.length === 0) {
+                                  setHistorianLoadError("No rows in the selected range.");
+                                }
+                              } catch (err) {
+                                setHistorianLoadError(`Load failed: ${String(err?.message || err || "")}`);
+                                setHistorianServerRows(null);
+                              } finally {
+                                setHistorianLoadBusy(false);
+                              }
+                            }}
+                            title="Pull rows from disk for the selected range"
+                          >
+                            {historianLoadBusy ? "Loading..." : "Load"}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            onClick={() => {
+                              setHistorianExportFilters({
+                                from: "",
+                                to: "",
+                                tag: "",
+                                gatewayId: "",
+                                deviceName: "",
+                                quality: "all",
+                              });
+                              setHistorianServerRows(null);
+                              setHistorianLoadError("");
+                            }}
+                            title="Reset every filter and clear the loaded preview"
+                          >
+                            Clean
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-success"
+                            onClick={() => setHistorianExportOpen(true)}
+                            disabled={!historianExportRowsPreview.length}
+                            title={historianExportRowsPreview.length
+                              ? "Open the export window"
+                              : "Click Load first to populate the preview"}
+                          >
+                            Export
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                    {/* Pivot pill — same slide-toggle component used
+                        in chart configuration. Toggles the preview
+                        AND the eventual export between long and wide
+                        layouts. */}
+                    <div
+                      className="dashboard-slide-toggle"
+                      onClick={() => setHistorianExportPivot((v) => !v)}
+                      role="switch"
+                      aria-checked={historianExportPivot}
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === " " || e.key === "Enter") {
+                          e.preventDefault();
+                          setHistorianExportPivot((v) => !v);
+                        }
+                      }}
+                      style={{ marginTop: 8 }}
                     >
-                      Open Export Configuration
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-secondary"
-                      onClick={() => setHistorianTab("live")}
-                    >
-                      Return to Live Table
-                    </button>
-                  </div>
-                  <p className="muted" style={{ fontSize: 12, marginTop: 16 }}>
-                    Current dataset: <strong>{historianRows.length.toLocaleString()}</strong> rows visible based on the current filters.
+                      <input type="checkbox" checked={historianExportPivot} onChange={() => {}} tabIndex={-1} aria-hidden="true" />
+                      <span className="slide-track" aria-hidden="true" />
+                      <span className="slide-label">Pivot mode — one column per tag, one row per timestamp</span>
+                    </div>
+                    {historianLoadError ? (
+                      <div className="muted" style={{ fontSize: 12, marginTop: 6, color: "#d35454" }}>
+                        {historianLoadError}
+                      </div>
+                    ) : null}
                     {Array.isArray(historianServerRows) && historianServerRows.length > 0 ? (
-                      <> {" "}Loaded from disk via the <strong>Load</strong> button on the Live tab.</>
+                      <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                        Loaded {historianServerRows.length.toLocaleString()} row(s) from disk · {historianExportRowsPreview.length.toLocaleString()} after filters · {historianExportPivot ? "Pivot" : "Long"} mode preview below.
+                      </div>
                     ) : (
-                      <> {" "}Switch back to Live, set From / To and click <strong>Load</strong> to pull a wider window from disk.</>
+                      <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                        Set filters and click <strong>Load</strong> to populate the preview.
+                      </div>
                     )}
-                  </p>
-                </section>
+                  </section>
+                  {/* Preview table — populated only after Load. Shows
+                      EITHER long-format or pivot-format depending on
+                      the Pivot toggle so the operator sees exactly
+                      what the export will contain. */}
+                  <section className="card card-fill">
+                    {historianExportRowsPreview.length === 0 ? (
+                      <p className="muted" style={{ textAlign: "center", padding: 20 }}>
+                        No rows loaded yet — set From / To and click <strong>Load</strong>.
+                      </p>
+                    ) : (() => {
+                      const previewBuilt = buildHistorianExportRows();
+                      const display = previewBuilt.slice(0, 200);
+                      const headers = display.length > 0 ? Object.keys(display[0]) : [];
+                      return (
+                        <div className="table-scroll fill-scroll">
+                          <div className="table" style={{ minWidth: "100%" }}>
+                            <div className="thead" style={{
+                              display: "grid",
+                              gridTemplateColumns: `repeat(${headers.length}, minmax(120px, 1fr))`,
+                            }}>
+                              {headers.map((h) => <span key={`h-${h}`}>{h}</span>)}
+                            </div>
+                            {display.map((row, ri) => (
+                              <div
+                                key={`pr-${ri}`}
+                                className="trow"
+                                style={{
+                                  display: "grid",
+                                  gridTemplateColumns: `repeat(${headers.length}, minmax(120px, 1fr))`,
+                                }}
+                              >
+                                {headers.map((h) => (
+                                  <span key={`c-${ri}-${h}`} title={String(row[h] ?? "")}>
+                                    {String(row[h] ?? "")}
+                                  </span>
+                                ))}
+                              </div>
+                            ))}
+                            <div className="row" style={{ padding: "6px 4px", color: "var(--muted, #5a5a5a)", fontSize: 12 }}>
+                              <span>
+                                Showing preview of <strong>{display.length.toLocaleString()}</strong> of <strong>{previewBuilt.length.toLocaleString()}</strong> rows. Full set goes to the export file.
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </section>
+                </>
               ) : null}
             </div>
           ) : null}
