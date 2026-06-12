@@ -993,7 +993,19 @@ def discover_network(payload: NetworkScanRequest) -> NetworkScanResult:
         for d in _pylogix_discover():
             found[d.ip] = d
 
-    if payload.include_tcp_probe and (payload.scan_range or not found):
+    # TCP probe rules — operator request 2026-06-12: "still not showing
+    # all devices connected that can be seen in network, I have at
+    # least other computer, one siemens plc and one energy meter".
+    # Previously the probe was skipped whenever pylogix broadcast
+    # already found something, so non-AB hosts (Siemens, PCs, meters)
+    # were ignored. Now the probe runs whenever the operator asked
+    # for it (include_tcp_probe) AND either scan_any_tcp is on, a
+    # scan_range was supplied, OR pylogix turned up nothing.
+    should_probe = (
+        payload.include_tcp_probe and
+        (payload.scan_any_tcp or payload.scan_range or not found)
+    )
+    if should_probe:
         port_by_type = {
             "allen_bradley": [44818],
             "siemens_snap7": [102],
@@ -1006,7 +1018,17 @@ def discover_network(payload: NetworkScanRequest) -> NetworkScanResult:
             # PLC gets labelled correctly when both 44818 AND 80 are
             # open), then general-purpose ports for printers / PCs /
             # cameras / SSH boxes / VNC.
-            ports = [44818, 102, 4840, 502, 80, 443, 22, 8080, 5900, 7000, 21, 23, 161]
+            # 18 ports cover:
+            #  - PLC protocols (44818, 102, 4840, 502, 47808 BACnet, 9600 Omron)
+            #  - Web admin UIs typical on energy meters / drives (80, 443, 8080, 8443)
+            #  - PC / server boxes (22 SSH, 3389 RDP, 445 SMB, 135 RPC)
+            #  - Discovery extras (5900 VNC, 161 SNMP, 23 Telnet)
+            ports = [
+                44818, 102, 4840, 502, 47808, 9600,
+                80, 443, 8080, 8443,
+                22, 3389, 445, 135,
+                5900, 161, 23, 21,
+            ]
         else:
             ports = port_by_type.get(payload.gateway_type or "allen_bradley", [44818])
         hosts = _expand_scan_range(payload.scan_range)
@@ -1027,11 +1049,17 @@ def discover_network(payload: NetworkScanRequest) -> NetworkScanResult:
                     hosts = _expand_scan_range(cidr)
             except Exception:
                 hosts = []
-        # Probe in parallel — 32 worker threads keep a /24 sweep under ~2s.
+        # Probe in parallel. We bump workers up to 128 for the broad
+        # ANY-TCP sweep so 254 hosts × 15 ports finishes in a few
+        # seconds instead of minutes. Per-port timeout drops to 0.5 s
+        # in any-TCP mode because we're probing 15 ports per host —
+        # an unreachable port at 4 s × 15 = 60 s of dead waiting.
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        worker_count = 128 if payload.scan_any_tcp else 32
+        probe_timeout_s = 0.5 if payload.scan_any_tcp else timeout_s
         if hosts:
-            with ThreadPoolExecutor(max_workers=32) as pool:
-                futures = {pool.submit(_tcp_probe_ports, h, ports, timeout_s): h for h in hosts}
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                futures = {pool.submit(_tcp_probe_ports, h, ports, probe_timeout_s): h for h in hosts}
                 for fut in as_completed(futures):
                     h = futures[fut]
                     try:
@@ -1048,15 +1076,20 @@ def discover_network(payload: NetworkScanRequest) -> NetworkScanResult:
                             102: "S7 (Siemens)",
                             4840: "OPC-UA",
                             502: "Modbus TCP",
+                            47808: "BACnet/IP",
+                            9600: "Omron FINS",
                             80: "HTTP",
                             443: "HTTPS",
-                            22: "SSH",
                             8080: "HTTP-alt",
+                            8443: "HTTPS-alt",
+                            22: "SSH",
+                            3389: "RDP (Windows)",
+                            445: "SMB (Windows)",
+                            135: "RPC (Windows)",
                             5900: "VNC",
-                            7000: "AFS3 / generic",
-                            21: "FTP",
-                            23: "Telnet",
                             161: "SNMP",
+                            23: "Telnet",
+                            21: "FTP",
                         }
                         hint = port_hints.get(int(port), f"port {port}")
                         found[h] = NetworkScanDevice(

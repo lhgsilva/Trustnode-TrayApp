@@ -21809,26 +21809,28 @@ const getGatewayHealth = (gateway) => {
                   disabled={!canEditPage("gateway_configuration")}
                 />
               </label>
-              <label className="gateway-span-2">
-                Tags (; separated)
-                <input
-                  placeholder="Tag_01;Tag_02;Tag_03"
-                  value={gatewayForm.tags_text}
-                  onChange={(e) => setGatewayForm({ ...gatewayForm, tags_text: e.target.value })}
-                  disabled={!canEditPage("gateway_configuration")}
-                />
-              </label>
-              {/* Operator request 2026-06-12: present the saved tags as
-                  a column checkbox view too so the operator can quickly
-                  toggle individual tags off without editing the ; list
-                  by hand. The text input above stays as the source of
-                  truth; toggling a checkbox here rewrites it. */}
+              {/* Operator request 2026-06-12 (re-rev): "we don't need
+                  the field where the tags are separated by ';', we
+                  have already the selected tags field now, the
+                  formatting can happen in the background". Removed
+                  the raw text input — the Selected Tags grid below
+                  is now the visible source of truth. gatewayForm
+                  .tags_text stays as the storage format so the OK
+                  save path still serializes the same ; list. When
+                  no tags are selected yet we show a helper banner
+                  pointing at Search Available Tags. */}
               {(() => {
                 const tagList = String(gatewayForm.tags_text || "")
                   .split(";")
                   .map((t) => t.trim())
                   .filter(Boolean);
-                if (tagList.length === 0) return null;
+                if (tagList.length === 0) {
+                  return (
+                    <div className="gateway-span-2 info-note" style={{ marginTop: 4 }}>
+                      No tags selected yet. Click <strong>Search Available Tags</strong> below to browse what the PLC exposes, or load a TXT configuration.
+                    </div>
+                  );
+                }
                 return (
                   <div className="gateway-span-2 discovered-tags-card">
                     <div className="discovered-tags-toolbar">
