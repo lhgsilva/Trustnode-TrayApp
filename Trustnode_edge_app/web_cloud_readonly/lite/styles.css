@@ -1620,7 +1620,7 @@ main {
    "<value> | <tag> | <type>" layout so the operator can read every
    current value without opening the chart legend. */
 .widget-head-text {
-  display: flex;
+  display: inline-flex;
   flex-wrap: wrap;
   align-items: baseline;
   gap: 0 6px;
@@ -1630,10 +1630,25 @@ main {
   line-height: 1.3;
   min-width: 0;
 }
+/* Each header span gets a small horizontal margin so the
+   "value | tag · value | tag | type" strip never crams together
+   regardless of container width. Operator 2026-06-12: client view
+   showed everything mashed against each other because some
+   parent style was overriding the flex gap. The per-span margin
+   wins because it's directly on the leaf elements. */
+.widget-head-text > span {
+  margin: 0 4px;
+}
+.widget-head-text > span:first-child {
+  margin-left: 0;
+}
+.widget-head-text > span:last-child {
+  margin-right: 0;
+}
 .widget-head-value { font-weight: 700; }
 .widget-head-tag { color: var(--muted, #8a98ab); font-weight: 500; }
 .widget-head-type { color: var(--muted, #8a98ab); font-weight: 500; }
-.widget-head-sep { color: var(--muted, #8a98ab); opacity: 0.55; padding: 0 1px; }
+.widget-head-sep { color: var(--muted, #8a98ab); opacity: 0.55; padding: 0 2px; }
 
 /* ============================================================ */
 /* Meter / gauge widget — Recharts pie + pointer needle          */
