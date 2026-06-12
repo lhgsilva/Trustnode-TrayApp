@@ -3055,6 +3055,19 @@ input[type="checkbox"] {
   color: #ffffff;
 }
 
+/* Yellow trial state — license expired but a trial grant is keeping
+   the edge alive. Distinct from green "active" so the operator knows
+   the clock is ticking and from red "expired" so they don't panic. */
+.license-banner-trial {
+  border-bottom-color: rgba(245, 158, 11, 0.55);
+  background: color-mix(in srgb, var(--card) 86%, #b45309 14%);
+}
+
+.license-banner-trial .license-banner-pill {
+  background: #f59e0b;
+  color: #1f1300;
+}
+
 .license-guard-backdrop {
   z-index: 110;
   background: rgba(0, 0, 0, 0.62);

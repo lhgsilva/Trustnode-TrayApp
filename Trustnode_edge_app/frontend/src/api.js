@@ -2123,6 +2123,31 @@ export async function checkControlPlaneEdgeLicense(edgeId = "", tenantId = "") {
   return data;
 }
 
+export async function startControlPlaneEdgeTrial(payload, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-link/trial/start${suffix}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  await ensureOk(res, "Start trial failed");
+  return res.json();
+}
+
+export async function listControlPlaneEdgeTrialHistory({ edgeId = "", licenseId = "", tenantId = "", limit = 200 } = {}) {
+  const params = new URLSearchParams();
+  if (edgeId) params.set("edge_id", String(edgeId));
+  if (licenseId) params.set("license_id", String(licenseId));
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  if (limit) params.set("limit", String(limit));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edge-link/trial/history${suffix}`);
+  await ensureOk(res, "Trial history fetch failed");
+  return res.json();
+}
+
 export async function issueControlPlanePasswordReset(payload, tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));

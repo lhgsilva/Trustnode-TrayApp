@@ -322,12 +322,36 @@ class ControlPlaneStore:
                       metadata_json TEXT NOT NULL DEFAULT '{}'
                     );
 
+                    -- Emergency-trial grants. Issued by the edge app when an
+                    -- operator clicks "Start 2-Hour Trial" after their
+                    -- license expires so the plant doesn't lock out mid-
+                    -- production. Each edge is allowed ONE grant of each
+                    -- trial_kind per license; once both ('trial_2h' and
+                    -- 'trial_renew_1h') are consumed the operator must
+                    -- contact TrustNode admin to issue a new license.
+                    CREATE TABLE IF NOT EXISTS cp_trial_grants (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      tenant_id TEXT NOT NULL,
+                      customer_id TEXT,
+                      license_id TEXT NOT NULL,
+                      edge_id TEXT NOT NULL,
+                      trial_kind TEXT NOT NULL,
+                      granted_utc TEXT NOT NULL,
+                      expires_utc TEXT NOT NULL,
+                      granted_by TEXT,
+                      source TEXT,
+                      metadata_json TEXT NOT NULL DEFAULT '{}',
+                      UNIQUE(license_id, edge_id, trial_kind)
+                    );
+
                     CREATE INDEX IF NOT EXISTS ix_cp_customers_tenant ON cp_customers(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_edges_tenant ON cp_edges(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_users_tenant ON cp_users(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_licenses_tenant ON cp_licenses(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_audit_tenant_ts ON cp_security_audit_log(tenant_id, ts_utc DESC);
                     CREATE INDEX IF NOT EXISTS ix_cp_view_links_edge ON cp_edge_view_links(tenant_id, edge_id);
+                    CREATE INDEX IF NOT EXISTS ix_cp_trial_grants_edge ON cp_trial_grants(license_id, edge_id);
+                    CREATE INDEX IF NOT EXISTS ix_cp_trial_grants_tenant ON cp_trial_grants(tenant_id, granted_utc DESC);
                     """
                 )
                 cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(cp_edge_activation_codes)").fetchall()}
@@ -1668,6 +1692,255 @@ class ControlPlaneStore:
             },
         }
 
+    # ------------------------------------------------------------------
+    # Trial grants — emergency 2-hour and 1-hour trial windows the edge
+    # operator can grant themselves once each after a license expires,
+    # so machinery doesn't lock out mid-shift while procurement renews
+    # the license. Trial state is authoritative on the control plane;
+    # the edge caches it locally so an offline edge still trusts what
+    # the cloud said the last time it was reachable.
+    # ------------------------------------------------------------------
+    TRIAL_KIND_INITIAL = "trial_2h"
+    TRIAL_KIND_RENEW = "trial_renew_1h"
+    TRIAL_KIND_DURATIONS_S = {
+        "trial_2h": 2 * 60 * 60,
+        "trial_renew_1h": 1 * 60 * 60,
+    }
+    TRIAL_KIND_LABELS = {
+        "trial_2h": "2-Hour Emergency Trial",
+        "trial_renew_1h": "1-Hour Trial Renewal",
+    }
+
+    def list_trial_grants(
+        self,
+        *,
+        license_id: str,
+        edge_id: str,
+        tenant_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """All trial grants ever issued for this license+edge pair, newest first."""
+        lid = str(license_id or "").strip()
+        eid = str(edge_id or "").strip()
+        if not lid or not eid:
+            return []
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, tenant_id, customer_id, license_id, edge_id,
+                           trial_kind, granted_utc, expires_utc, granted_by,
+                           source, metadata_json
+                    FROM cp_trial_grants
+                    WHERE license_id=? AND edge_id=?
+                    ORDER BY granted_utc DESC, id DESC
+                    """,
+                    (lid, eid),
+                ).fetchall()
+                out = [dict(r) for r in rows]
+                for o in out:
+                    try:
+                        o["metadata"] = json.loads(str(o.get("metadata_json") or "{}"))
+                    except Exception:
+                        o["metadata"] = {}
+                    o.pop("metadata_json", None)
+                return out
+
+    def list_trial_grants_for_tenant(
+        self,
+        *,
+        tenant_id: str,
+        edge_id: str | None = None,
+        license_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Portal-facing list of trial grants — admins inspect activity per
+        tenant/edge. Optional filters by edge_id or license_id."""
+        tid = normalize_tenant_id(tenant_id)
+        clauses = ["tenant_id = ?"]
+        args: list[Any] = [tid]
+        if edge_id:
+            clauses.append("edge_id = ?")
+            args.append(str(edge_id).strip())
+        if license_id:
+            clauses.append("license_id = ?")
+            args.append(str(license_id).strip())
+        sql = (
+            "SELECT id, tenant_id, customer_id, license_id, edge_id, "
+            "trial_kind, granted_utc, expires_utc, granted_by, source, "
+            "metadata_json FROM cp_trial_grants WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY granted_utc DESC, id DESC LIMIT ?"
+        )
+        args.append(int(max(1, min(2000, limit))))
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(sql, tuple(args)).fetchall()
+        out = [dict(r) for r in rows]
+        for o in out:
+            try:
+                o["metadata"] = json.loads(str(o.get("metadata_json") or "{}"))
+            except Exception:
+                o["metadata"] = {}
+            o.pop("metadata_json", None)
+        return out
+
+    def active_trial_for_edge(
+        self,
+        *,
+        license_id: str,
+        edge_id: str,
+        now: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the most recent grant whose expires_utc is still in the
+        future, or None when no trial is currently active."""
+        ref_now = str(now or self._utc_now())
+        grants = self.list_trial_grants(license_id=license_id, edge_id=edge_id)
+        for g in grants:
+            exp = str(g.get("expires_utc") or "")
+            if exp and not self._is_expired_utc(exp, ref_now):
+                return g
+        return None
+
+    def trial_eligibility(
+        self,
+        *,
+        license_id: str,
+        edge_id: str,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """Decide which trial the operator can claim next.
+
+        Returns a stable shape the edge UI consumes directly:
+          - {"state": "active", "active": grant, "next": None}
+              → a trial is running right now; no button to offer.
+          - {"state": "trial_available", "active": None, "next": "trial_2h"}
+              → operator may click "Start 2-Hour Trial".
+          - {"state": "renew_available", "active": None, "next": "trial_renew_1h"}
+              → 2h burned; operator may click "Renew (1 Hour)".
+          - {"state": "exhausted", "active": None, "next": None}
+              → both kinds burned; show "Contact TrustNode" copy.
+        """
+        ref_now = str(now or self._utc_now())
+        grants = self.list_trial_grants(license_id=license_id, edge_id=edge_id)
+        # Active wins regardless of how many grants exist.
+        for g in grants:
+            exp = str(g.get("expires_utc") or "")
+            if exp and not self._is_expired_utc(exp, ref_now):
+                return {"state": "active", "active": g, "next": None, "history": grants}
+        kinds_used = {str(g.get("trial_kind") or "").strip() for g in grants}
+        if self.TRIAL_KIND_INITIAL not in kinds_used:
+            return {"state": "trial_available", "active": None, "next": self.TRIAL_KIND_INITIAL, "history": grants}
+        if self.TRIAL_KIND_RENEW not in kinds_used:
+            return {"state": "renew_available", "active": None, "next": self.TRIAL_KIND_RENEW, "history": grants}
+        return {"state": "exhausted", "active": None, "next": None, "history": grants}
+
+    def start_trial(
+        self,
+        *,
+        tenant_id: str,
+        license_id: str,
+        edge_id: str,
+        trial_kind: str,
+        granted_by: str = "",
+        source: str = "edge",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Issue a trial grant. Enforces:
+          - trial_kind must be one of TRIAL_KIND_DURATIONS_S keys
+          - no active trial currently running
+          - this kind not already used for the license+edge
+          - the requested kind matches what trial_eligibility says is next
+        Returns the persisted grant row plus a "license" stub the caller
+        can splice into a license-check response."""
+        tid = normalize_tenant_id(tenant_id)
+        lid = str(license_id or "").strip()
+        eid = str(edge_id or "").strip()
+        kind = str(trial_kind or "").strip()
+        if not lid:
+            return {"ok": False, "reason": "license_id_required"}
+        if not eid:
+            return {"ok": False, "reason": "edge_id_required"}
+        if kind not in self.TRIAL_KIND_DURATIONS_S:
+            return {"ok": False, "reason": "invalid_trial_kind"}
+        now = self._utc_now()
+        elig = self.trial_eligibility(license_id=lid, edge_id=eid, now=now)
+        if elig.get("state") == "active":
+            return {"ok": False, "reason": "trial_already_active", "eligibility": elig}
+        if elig.get("state") == "exhausted":
+            return {"ok": False, "reason": "trial_exhausted", "eligibility": elig}
+        if elig.get("next") != kind:
+            return {
+                "ok": False,
+                "reason": "trial_kind_not_available_now",
+                "expected_kind": elig.get("next"),
+                "eligibility": elig,
+            }
+        dur = int(self.TRIAL_KIND_DURATIONS_S[kind])
+        from datetime import datetime, timedelta, timezone
+        try:
+            ref = datetime.fromisoformat(now.replace("Z", "+00:00")) if now else datetime.now(timezone.utc)
+        except Exception:
+            ref = datetime.now(timezone.utc)
+        expires = (ref + timedelta(seconds=dur)).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        # Resolve customer_id from the license row when possible — helps
+        # the portal's per-customer audit view.
+        customer_id = ""
+        try:
+            with self._lock:
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT customer_id FROM cp_licenses WHERE license_id=? LIMIT 1",
+                        (lid,),
+                    ).fetchone()
+                    if row:
+                        customer_id = str(dict(row).get("customer_id") or "").strip()
+        except Exception:
+            customer_id = ""
+        meta_json = json.dumps(metadata or {}, sort_keys=True)
+        try:
+            with self._lock:
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO cp_trial_grants (
+                          tenant_id, customer_id, license_id, edge_id,
+                          trial_kind, granted_utc, expires_utc,
+                          granted_by, source, metadata_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            tid,
+                            customer_id or None,
+                            lid,
+                            eid,
+                            kind,
+                            now,
+                            expires,
+                            str(granted_by or "")[:128],
+                            str(source or "edge")[:64],
+                            meta_json,
+                        ),
+                    )
+                    conn.commit()
+        except Exception as exc:  # pragma: no cover - integrity collision
+            return {"ok": False, "reason": "trial_insert_failed", "detail": str(exc)}
+        grant = {
+            "license_id": lid,
+            "edge_id": eid,
+            "trial_kind": kind,
+            "granted_utc": now,
+            "expires_utc": expires,
+            "granted_by": str(granted_by or ""),
+            "source": str(source or "edge"),
+            "metadata": metadata or {},
+            "label": self.TRIAL_KIND_LABELS.get(kind, kind),
+        }
+        return {
+            "ok": True,
+            "grant": grant,
+            "eligibility": self.trial_eligibility(license_id=lid, edge_id=eid, now=now),
+        }
+
     def check_edge_license(self, *, tenant_id: str, edge_id: str) -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
         eid = str(edge_id or "").strip()
@@ -1733,9 +2006,50 @@ class ControlPlaneStore:
                 if status != "active":
                     return {"ok": False, "reason": "license_inactive", "edge": edge_row, "license": lic, "resolved_tenant_id": tid}
                 end_utc = str(lic.get("end_utc") or "").strip()
-                if end_utc and self._is_expired_utc(end_utc, now):
-                    return {"ok": False, "reason": "license_expired", "edge": edge_row, "license": lic, "resolved_tenant_id": tid}
-                return {"ok": True, "edge": edge_row, "license": lic, "resolved_tenant_id": tid}
+                expired = bool(end_utc and self._is_expired_utc(end_utc, now))
+                # Always attach trial eligibility so the edge UI can decide
+                # whether to show "Start Trial" / "Renew" / "Contact Admin"
+                # buttons without a second round-trip.
+                trial_info = (
+                    self.trial_eligibility(license_id=lid, edge_id=eid, now=now)
+                    if lid else {"state": "exhausted", "active": None, "next": None, "history": []}
+                )
+                if expired:
+                    # If an in-window trial grant exists, treat the edge as
+                    # OK so it doesn't lock out — but flag the response so
+                    # the operator sees the trial banner instead of the
+                    # green "License Active" pill.
+                    active = trial_info.get("active")
+                    if active:
+                        return {
+                            "ok": True,
+                            "edge": edge_row,
+                            "license": lic,
+                            "resolved_tenant_id": tid,
+                            "trial": {
+                                "active": True,
+                                "kind": active.get("trial_kind"),
+                                "granted_utc": active.get("granted_utc"),
+                                "expires_utc": active.get("expires_utc"),
+                                "label": self.TRIAL_KIND_LABELS.get(str(active.get("trial_kind") or ""), str(active.get("trial_kind") or "")),
+                            },
+                            "trial_eligibility": trial_info,
+                        }
+                    return {
+                        "ok": False,
+                        "reason": "license_expired",
+                        "edge": edge_row,
+                        "license": lic,
+                        "resolved_tenant_id": tid,
+                        "trial_eligibility": trial_info,
+                    }
+                return {
+                    "ok": True,
+                    "edge": edge_row,
+                    "license": lic,
+                    "resolved_tenant_id": tid,
+                    "trial_eligibility": trial_info,
+                }
 
 
 

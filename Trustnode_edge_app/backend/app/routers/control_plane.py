@@ -2621,6 +2621,135 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
 # The edge's local SQLite is also cleaned up so the next mirror reconcile
 # won't resurrect the deleted row.
 
+class _TrialStartPayload(BaseModel):
+    edge_id: str = ""
+    trial_kind: str = ""
+    actor: str = ""
+    metadata: dict[str, Any] = {}
+
+
+@router.post("/edge-link/trial/start")
+def edge_link_trial_start(request: Request, payload: _TrialStartPayload, tenant_id: str | None = None) -> dict[str, Any]:
+    """Issue an emergency-trial grant for a license that has expired.
+
+    The edge calls this when the operator clicks "Start 2-Hour Trial" or
+    "Renew (1 Hour)". The cloud is authoritative: a fresh edge probe AFTER
+    this call will see the trial as active and return ok=True so the UI
+    unlocks. Each edge may use each trial kind ONCE per license; the
+    control plane enforces that via the unique index on
+    cp_trial_grants(license_id, edge_id, trial_kind).
+    """
+    tid = _scoped_tenant(request, tenant_id)
+    eid = str(payload.edge_id or "").strip()
+    if not eid:
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        app_settings = dict(bootstrap.get("app_settings") or {})
+        eid = str(app_settings.get("edge_id") or "").strip()
+    if not eid:
+        return {"ok": False, "reason": "edge_id_required"}
+
+    # Resolve the license_id from the current edge_license_check so the
+    # operator can't accidentally start a trial against the wrong license.
+    check = control_plane_store.check_edge_license(tenant_id=tid, edge_id=eid)
+    lic = dict(check.get("license") or {}) if isinstance(check.get("license"), dict) else {}
+    license_id = str(lic.get("license_id") or "").strip()
+    if not license_id:
+        return {"ok": False, "reason": "license_not_found"}
+    actor = str(payload.actor or "").strip()
+    if not actor:
+        try:
+            actor = str(request.state.user.get("username") or "") if hasattr(request, "state") and getattr(request.state, "user", None) else ""
+        except Exception:
+            actor = ""
+    # Try the cloud first so the portal sees the trial event in
+    # near-real-time. If the cloud is unreachable, fall back to the
+    # local SQLite write so the edge still unlocks for the operator
+    # mid-shift (machinery uptime trumps audit completeness; the
+    # next successful mirror will sync the row up).
+    cloud_ok = False
+    try:
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        app_settings = dict(bootstrap.get("app_settings") or {})
+        cloud_url = str(app_settings.get("cloud_url") or app_settings.get("cloud_api_url") or "").strip().rstrip("/")
+        if cloud_url and not _is_same_origin_as_request(cloud_url, request):
+            fwd_headers = {"X-Tenant-Id": tid, "Content-Type": "application/json"}
+            auth = str(request.headers.get("authorization") or "").strip()
+            if auth:
+                fwd_headers["Authorization"] = auth
+            cloud_body = {
+                "edge_id": eid,
+                "trial_kind": str(payload.trial_kind or "").strip(),
+                "actor": actor or "edge_operator",
+                "metadata": dict(payload.metadata or {}),
+            }
+            resp = requests.post(
+                f"{cloud_url}/api/control-plane/edge-link/trial/start",
+                json=cloud_body,
+                headers=fwd_headers,
+                timeout=8,
+            )
+            if resp.status_code < 400:
+                cloud_ok = True
+                try:
+                    return resp.json()
+                except Exception:
+                    pass
+    except Exception:
+        cloud_ok = False
+    out = control_plane_store.start_trial(
+        tenant_id=tid,
+        license_id=license_id,
+        edge_id=eid,
+        trial_kind=str(payload.trial_kind or "").strip(),
+        granted_by=actor or "edge_operator",
+        source="edge_app" if not cloud_ok else "edge_app_cloud_fallback",
+        metadata=dict(payload.metadata or {}),
+    )
+    if not out.get("ok"):
+        return out
+    # Audit trail for the portal.
+    try:
+        control_plane_store.audit(
+            actor_type="edge_operator",
+            actor_id=actor or "edge_operator",
+            tenant_id=tid,
+            action="trial_started",
+            outcome="ok",
+            correlation_id=eid,
+            details={
+                "license_id": license_id,
+                "edge_id": eid,
+                "trial_kind": str(payload.trial_kind or ""),
+                "expires_utc": str((out.get("grant") or {}).get("expires_utc") or ""),
+            },
+        )
+    except Exception:
+        pass
+    # Re-run the license check so the response carries the same shape
+    # the edge already knows how to parse (`license`, `trial`,
+    # `trial_eligibility`). The edge can store this verbatim as its
+    # licenseSnapshot.
+    refreshed = control_plane_store.check_edge_license(tenant_id=tid, edge_id=eid)
+    refreshed["trial_grant"] = out.get("grant")
+    return refreshed
+
+
+@router.get("/edge-link/trial/history")
+def edge_link_trial_history(request: Request, edge_id: str = "", license_id: str = "", tenant_id: str | None = None, limit: int = 200) -> dict[str, Any]:
+    """List trial grants for the portal/edge UI. Operator sees their own
+    edge's history; admin sees their whole tenant or filters by edge."""
+    tid = _scoped_tenant(request, tenant_id)
+    eid = str(edge_id or "").strip()
+    lid = str(license_id or "").strip()
+    rows = control_plane_store.list_trial_grants_for_tenant(
+        tenant_id=tid,
+        edge_id=eid or None,
+        license_id=lid or None,
+        limit=int(limit or 200),
+    )
+    return {"ok": True, "tenant_id": tid, "rows": rows}
+
+
 def _supabase_rest_target() -> tuple[str, str, str] | None:
     """Return (url, service_key, schema) for Supabase PostgREST, or None
     when this backend isn't configured to talk to Supabase (e.g. an

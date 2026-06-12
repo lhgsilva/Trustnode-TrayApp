@@ -110,6 +110,8 @@ import {
   registerControlPlaneEdgeLink,
   unlinkControlPlaneEdgeLink,
   checkControlPlaneEdgeLicense,
+  startControlPlaneEdgeTrial,
+  listControlPlaneEdgeTrialHistory,
   issueControlPlanePasswordReset,
   applyControlPlanePasswordReset,
   issuePublicPasswordReset,
@@ -2513,6 +2515,16 @@ function AppShell() {
   const [edgeActivationCodeInput, setEdgeActivationCodeInput] = useState("");
   const [edgeActivationBusy, setEdgeActivationBusy] = useState(false);
   const [edgeActivationResult, setEdgeActivationResult] = useState("");
+  // Trial state derived from the license-check response. The cloud
+  // probe attaches `trial_eligibility` (state in
+  // {trial_available, renew_available, active, exhausted}) and, when
+  // a trial is in progress, an active grant with expires_utc. The UI
+  // uses these to pick banner colour + modal copy + which button to
+  // show. See LICENSE_TRIAL_STATES enum just below.
+  const [edgeTrialEligibility, setEdgeTrialEligibility] = useState(null);
+  const [edgeTrialActive, setEdgeTrialActive] = useState(null);
+  const [edgeTrialBusy, setEdgeTrialBusy] = useState(false);
+  const [edgeTrialResult, setEdgeTrialResult] = useState("");
   const [cloudSupabaseMode, setCloudSupabaseMode] = useState("auto");
   const [cloudSupabaseHasIpv4AddOn, setCloudSupabaseHasIpv4AddOn] = useState(true);
   const [cloudSupabaseApplyResult, setCloudSupabaseApplyResult] = useState("");
@@ -2935,7 +2947,14 @@ function AppShell() {
     edges: false,
     users: false,
     activation: false,
+    trials: false,
   });
+  // Emergency-trial history for the portal admin. Populated by
+  // refreshCpTrialHistory (called when the Edges workspace mounts and
+  // on demand via the Refresh button). cpTrialHistory rows mirror the
+  // cp_trial_grants table.
+  const [cpTrialHistory, setCpTrialHistory] = useState([]);
+  const [cpTrialHistoryBusy, setCpTrialHistoryBusy] = useState(false);
   const isPortalOnly = useMemo(() => {
     try {
       const path = String(window.location.pathname || "").toLowerCase();
@@ -7946,6 +7965,22 @@ function AppShell() {
       // snapshot when the new one is genuinely a positive answer.
       if (out && (out.ok || !edgeLicenseSnapshot?.ok)) {
         setEdgeLicenseSnapshot(out);
+      }
+      // Pick up trial-related fields whenever they appear on the
+      // response — eligibility comes back on EVERY check, the active
+      // grant only when one is in progress. We update these
+      // unconditionally so an expired trial transitions the UI back
+      // to "renew available" or "exhausted" without a manual reload.
+      if (out && typeof out === "object") {
+        if ("trial_eligibility" in out) {
+          setEdgeTrialEligibility(out.trial_eligibility || null);
+        }
+        if ("trial" in out) {
+          setEdgeTrialActive(out.trial && out.trial.active ? out.trial : null);
+        } else if (out.ok === false && String(out.reason || "") === "license_expired") {
+          // Expired with no active trial — clear any stale active.
+          setEdgeTrialActive(null);
+        }
       }
       const reason = String(out?.reason || "");
       // Self-heal once per session: if the cloud probe carries a customer_id
@@ -13811,6 +13846,35 @@ const getGatewayHealth = (gateway) => {
     setCpWorkspaceCollapsed((prev) => ({ ...(prev || {}), [key]: !Boolean(prev?.[key]) }));
   };
 
+  // Pull the cp_trial_grants rows for the active tenant (or all
+  // tenants when the master admin hasn't picked one). Called when the
+  // workspace mounts and via the Refresh button on the Emergency
+  // Trials card.
+  const refreshCpTrialHistory = useCallback(async () => {
+    if (!currentUser) return;
+    setCpTrialHistoryBusy(true);
+    try {
+      const out = await listControlPlaneEdgeTrialHistory({
+        tenantId: currentTenantId || "default",
+        limit: 200,
+      });
+      const rows = Array.isArray(out?.rows) ? out.rows : [];
+      setCpTrialHistory(rows);
+    } catch (_) {
+      // Soft-fail: leave the prior list in place so the panel doesn't
+      // flash empty on a transient cloud blip.
+    } finally {
+      setCpTrialHistoryBusy(false);
+    }
+  }, [currentUser, currentTenantId]);
+
+  useEffect(() => {
+    // Auto-load when the operator opens the portal workspace tab.
+    if (cpPortalPage === "workspace" || cpPortalPage === "edges") {
+      refreshCpTrialHistory();
+    }
+  }, [cpPortalPage, refreshCpTrialHistory]);
+
   const syncControlPlaneEdgeHeartbeat = async () => {
     if (isHostedWebClient) return false;
     const edgeId = String(edgeProfile?.edge_id || "").trim();
@@ -15089,6 +15153,62 @@ const getGatewayHealth = (gateway) => {
     }
   };
 
+  // Emergency trial flow. Operator clicks the button when their
+  // license has expired so the plant doesn't sit idle while
+  // procurement renews; cloud records the grant, sets license-check
+  // back to ok=true with trial metadata, and we re-run the compliance
+  // check to unlock the UI.
+  const startEdgeTrial = async (trialKind) => {
+    const kind = String(trialKind || "").trim();
+    if (!kind) return;
+    const edgeId = String(edgeProfile?.edge_id || "").trim();
+    if (!edgeId) {
+      setEdgeTrialResult("Edge ID missing — set the Edge ID first.");
+      return;
+    }
+    setEdgeTrialBusy(true);
+    setEdgeTrialResult("");
+    try {
+      const out = await startControlPlaneEdgeTrial(
+        {
+          edge_id: edgeId,
+          trial_kind: kind,
+          actor: currentUser?.username || "edge_operator",
+        },
+        currentTenantId || "default",
+      );
+      if (out && out.ok) {
+        const trialInfo = out.trial || (out.trial_grant
+          ? {
+              active: true,
+              kind: out.trial_grant.trial_kind,
+              expires_utc: out.trial_grant.expires_utc,
+              label: out.trial_grant.label,
+            }
+          : null);
+        if (trialInfo) setEdgeTrialActive(trialInfo);
+        if (out.trial_eligibility) setEdgeTrialEligibility(out.trial_eligibility);
+        setEdgeLicenseSnapshot(out);
+        setLicenseGuardBlocked(false);
+        setLicenseGuardDismissed(true);
+        setEdgeTrialResult(
+          trialInfo?.label
+            ? `${trialInfo.label} started — expires ${fmtTs(trialInfo.expires_utc)}`
+            : "Trial started.",
+        );
+      } else {
+        const reason = String(out?.reason || "trial_start_failed");
+        setEdgeTrialResult(`Trial start failed: ${reason.replace(/_/g, " ")}`);
+        if (out?.eligibility) setEdgeTrialEligibility(out.eligibility);
+      }
+    } catch (err) {
+      const msg = String(err?.message || err || "trial start failed");
+      setEdgeTrialResult(`Trial start failed: ${msg}`);
+    } finally {
+      setEdgeTrialBusy(false);
+    }
+  };
+
   const canManageUsers = Boolean(
     currentUser &&
     currentUser.role === "admin" &&
@@ -15414,26 +15534,62 @@ const getGatewayHealth = (gateway) => {
           </button>
         </div>
       </header>
-      {showTopLicenseBanner ? (
-        <div className={`license-banner ${licenseGuardBlocked ? "license-banner-warning" : "license-banner-ok"}`}>
-          <span className="license-banner-pill">{licenseGuardBlocked ? "LICENSE REQUIRED" : "LICENSE ACTIVE"}</span>
-          <span className="license-banner-text">
-            {licenseGuardBlocked
-              ? licenseGuardMessage || "This edge must be activated with a valid license."
-              : `License valid${licenseGuardLastCheckedUtc ? ` | Checked: ${fmtTs(licenseGuardLastCheckedUtc)}` : ""}`}
-          </span>
-          <div className="license-banner-actions">
-            {licenseGuardBlocked ? (
-              <button className="btn btn-primary btn-sm" onClick={() => setActivePage("edge")}>
-                Activate License
+      {showTopLicenseBanner ? (() => {
+        // Three banner states:
+        //   1. license valid — GREEN, no action.
+        //   2. trial active (license expired but trial in window) —
+        //      YELLOW, shows remaining time.
+        //   3. license expired (no trial) — RED, "Activate License"
+        //      action that jumps to the Edge page where the modal
+        //      lives.
+        const trialActive = edgeTrialActive && edgeTrialActive.active;
+        const expiredNow = licenseGuardBlocked && !trialActive;
+        const expiresAt = trialActive ? String(edgeTrialActive?.expires_utc || "") : "";
+        const remainingMs = expiresAt ? Math.max(0, new Date(expiresAt).getTime() - Date.now()) : 0;
+        const remainingTxt = (() => {
+          if (!trialActive || !remainingMs) return "";
+          const m = Math.floor(remainingMs / 60000);
+          const h = Math.floor(m / 60);
+          const mm = m % 60;
+          return h > 0 ? `${h}h ${mm.toString().padStart(2, "0")}m` : `${mm}m`;
+        })();
+        const pillClass = trialActive
+          ? "license-banner-trial"
+          : expiredNow
+            ? "license-banner-warning"
+            : "license-banner-ok";
+        const pillLabel = trialActive
+          ? "TRIAL ACTIVE"
+          : expiredNow
+            ? "LICENSE EXPIRED"
+            : "LICENSE ACTIVE";
+        const text = trialActive
+          ? `${edgeTrialActive?.label || "Trial active"} — ${remainingTxt} remaining`
+          : expiredNow
+            ? licenseGuardMessage || "This edge's license has expired. Activate a new license or start a trial to continue."
+            : `License valid${licenseGuardLastCheckedUtc ? ` | Checked: ${fmtTs(licenseGuardLastCheckedUtc)}` : ""}`;
+        return (
+          <div className={`license-banner ${pillClass}`}>
+            <span className="license-banner-pill">{pillLabel}</span>
+            <span className="license-banner-text">{text}</span>
+            <div className="license-banner-actions">
+              {expiredNow ? (
+                <button className="btn btn-primary btn-sm" onClick={() => setActivePage("edge")}>
+                  Activate or Start Trial
+                </button>
+              ) : null}
+              {trialActive ? (
+                <button className="btn btn-secondary btn-sm" onClick={() => setActivePage("edge")}>
+                  Manage License
+                </button>
+              ) : null}
+              <button className="btn btn-secondary btn-sm" onClick={() => setLicenseBannerHidden(true)}>
+                Hide
               </button>
-            ) : null}
-            <button className="btn btn-secondary btn-sm" onClick={() => setLicenseBannerHidden(true)}>
-              Hide
-            </button>
+            </div>
           </div>
-        </div>
-      ) : null}
+        );
+      })() : null}
 
       <div className={`body ${sidebarCollapsed ? "sidebar-hidden" : ""}`}>
         <aside className={`sidebar ${sidebarCollapsed ? "hidden" : ""}`}>
@@ -19298,6 +19454,37 @@ const getGatewayHealth = (gateway) => {
                         </div>
                         ) : null}
                       </section>
+                      <section className="card control-plane-workspace-card">
+                        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                          <h4 style={{ margin: 0 }}>Emergency Trials</h4>
+                          <div className="row">
+                            <button className="btn btn-secondary btn-sm" onClick={refreshCpTrialHistory} disabled={cpTrialHistoryBusy}>
+                              {cpTrialHistoryBusy ? "Loading..." : "Refresh"}
+                            </button>
+                            <button className="icon-btn portal-card-btn" onClick={() => toggleCpWorkspaceCard("trials")} aria-label={cpWorkspaceCollapsed.trials ? "Expand" : "Collapse"} title={cpWorkspaceCollapsed.trials ? "Expand" : "Collapse"}>{cpWorkspaceCollapsed.trials ? <ExpandIcon /> : <CollapseIcon />}</button>
+                          </div>
+                        </div>
+                        {!cpWorkspaceCollapsed.trials ? (
+                          <div className="table-scroll" style={{ marginTop: 10, maxHeight: 260 }}>
+                            <div className="table cp-workspace-table">
+                              <div className="thead"><span>Edge</span><span>Customer</span><span>Kind</span><span>Granted</span><span>Expires</span><span>By</span></div>
+                              {(cpTrialHistory || []).slice(0, 12).map((row, idx) => (
+                                <div className="trow" key={`ws-trial-${idx}`}>
+                                  <span>{String(row?.edge_id || "-")}</span>
+                                  <span>{String(row?.customer_id || "-")}</span>
+                                  <span>{String(row?.trial_kind || "-").replace(/_/g, " ")}</span>
+                                  <span>{row?.granted_utc ? fmtTs(row.granted_utc) : "-"}</span>
+                                  <span>{row?.expires_utc ? fmtTs(row.expires_utc) : "-"}</span>
+                                  <span>{String(row?.granted_by || "-")}</span>
+                                </div>
+                              ))}
+                              {(!cpTrialHistory || !cpTrialHistory.length) ? (
+                                <div className="trow"><span className="muted" style={{ gridColumn: "1 / -1" }}>No emergency trials issued yet.</span></div>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : null}
+                      </section>
                     </div>
                   ) : null}
 
@@ -20841,6 +21028,67 @@ const getGatewayHealth = (gateway) => {
                 ) : null}
               </div>
             ) : null}
+            {/* Trial flow controls. When the license is expired and the
+                operator hasn't burned both trial grants yet, offer the
+                appropriate button (2-hour first, then 1-hour renew). On
+                the third bounce we show contact-admin copy instead so
+                they know the road ends here. */}
+            {(() => {
+              const elig = edgeTrialEligibility || {};
+              const state = String(elig?.state || "");
+              const nextKind = String(elig?.next || "");
+              const reason = String(licenseGuardMessage || "").toLowerCase();
+              const looksExpired =
+                reason.includes("expired") ||
+                String(edgeLicenseSnapshot?.reason || "") === "license_expired";
+              if (!looksExpired) return null;
+              if (state === "exhausted") {
+                return (
+                  <div className="license-guard-trial" style={{ marginTop: 12, padding: 10, background: "rgba(220,38,38,0.08)", border: "1px solid rgba(220,38,38,0.4)", borderRadius: 8 }}>
+                    <strong style={{ display: "block", marginBottom: 4 }}>Trials exhausted</strong>
+                    <span className="muted" style={{ fontSize: 12 }}>
+                      Both the 2-hour and the 1-hour renewal trials have been used on this edge. Contact TrustNode admin to issue a new license.
+                    </span>
+                  </div>
+                );
+              }
+              if (state === "active") {
+                const lbl = edgeTrialActive?.label || "Trial active";
+                const exp = edgeTrialActive?.expires_utc ? fmtTs(edgeTrialActive.expires_utc) : "";
+                return (
+                  <div className="license-guard-trial" style={{ marginTop: 12, padding: 10, background: "rgba(245,158,11,0.10)", border: "1px solid rgba(245,158,11,0.45)", borderRadius: 8 }}>
+                    <strong style={{ display: "block", marginBottom: 4 }}>{lbl}</strong>
+                    <span className="muted" style={{ fontSize: 12 }}>
+                      Expires {exp}. Activate a valid license before this window closes — the next available action is{" "}
+                      {String(elig?.next || "trial_renew_1h") === "trial_renew_1h" ? "the 1-hour renewal" : "to contact admin"}.
+                    </span>
+                  </div>
+                );
+              }
+              if (nextKind !== "trial_2h" && nextKind !== "trial_renew_1h") return null;
+              const buttonLabel = nextKind === "trial_2h" ? "Start 2-Hour Trial" : "Renew (1 Hour)";
+              return (
+                <div className="license-guard-trial" style={{ marginTop: 12, padding: 10, background: "rgba(20,168,154,0.08)", border: "1px solid rgba(20,168,154,0.35)", borderRadius: 8 }}>
+                  <strong style={{ display: "block", marginBottom: 6 }}>Emergency trial available</strong>
+                  <span className="muted" style={{ fontSize: 12, display: "block", marginBottom: 8 }}>
+                    Keep the edge running while procurement renews the license. {nextKind === "trial_2h" ? "First emergency window: 2 hours." : "Final emergency window: 1 hour (renew)."}
+                  </span>
+                  <button
+                    className="btn btn-primary btn-sm"
+                    type="button"
+                    onClick={() => startEdgeTrial(nextKind)}
+                    disabled={edgeTrialBusy}
+                  >
+                    {edgeTrialBusy ? "Starting..." : buttonLabel}
+                  </button>
+                  {edgeTrialResult ? (
+                    <div className={edgeTrialResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 8 }}>
+                      {edgeTrialResult}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })()}
             <div className="modal-actions license-guard-actions">
               {licenseGuardShowActivation ? (
                 <button
