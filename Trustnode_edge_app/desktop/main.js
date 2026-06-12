@@ -592,10 +592,10 @@ function withBackendParam(url, backendUrl) {
 //     "Starting backend…" → "Waiting for service…" → "Loading UI…".
 //   * Auto-closes the moment the main window's ready-to-show fires.
 // ---------------------------------------------------------------------------
-// Inline TrustNode wordmark SVG so the splash has no external asset
-// dependency at all (the ICO read had silently failed on some packaged
-// installs and the splash never opened). Coloured to match the
-// in-app brand mark.
+// Inline TrustNode wordmark SVG kept as a hard fallback when the
+// bundled brand PNG can't be read for any reason (packaged install
+// missing the extraResource, dev run without assets present, etc.).
+// Coloured to match the in-app brand mark.
 const SPLASH_LOGO_SVG = `
   <svg viewBox="0 0 64 64" width="64" height="64" xmlns="http://www.w3.org/2000/svg">
     <defs>
@@ -613,8 +613,30 @@ const SPLASH_LOGO_SVG = `
   </svg>
 `;
 
+function readSplashBrandDataUri() {
+  // Use the official brand PNG that ships alongside the app icon.
+  // Bundled via electron-builder extraResources (see package.json).
+  try {
+    const brandPath = app.isPackaged
+      ? path.join(process.resourcesPath, "trustnode_brand.png")
+      : path.resolve(__dirname, "assets", "trustnode_brand.png");
+    if (!fs.existsSync(brandPath)) return "";
+    const buf = fs.readFileSync(brandPath);
+    return `data:image/png;base64,${buf.toString("base64")}`;
+  } catch (_) {
+    return "";
+  }
+}
+
 function buildSplashHtml() {
   const version = (() => { try { return app.getVersion(); } catch (_) { return "0.1.0"; } })();
+  const brandUri = readSplashBrandDataUri();
+  // Use the real brand mark when available; fall back to the inline
+  // SVG so the splash always shows something even if the resource
+  // path resolution fails.
+  const brandMark = brandUri
+    ? `<img src="${brandUri}" alt="TrustNode" />`
+    : SPLASH_LOGO_SVG;
   // SAFE escaping: no template substitution attacks possible here, but
   // keep braces literal in the CSS by not using ${...} for them.
   return `<!doctype html>
@@ -628,12 +650,12 @@ function buildSplashHtml() {
   .stage { display: flex; flex-direction: column; align-items: center;
     justify-content: center; height: 100%; padding: 24px 32px; gap: 14px;
     -webkit-app-region: drag; position: relative; }
-  .logo { width: 96px; height: 96px; border-radius: 22px;
-    background: rgba(255,255,255,0.04); display: flex; align-items: center;
-    justify-content: center; box-shadow: 0 8px 28px rgba(0,0,0,0.4),
-      inset 0 0 0 1px rgba(255,255,255,0.06); }
-  .brand { font-size: 24px; font-weight: 700; letter-spacing: 0.04em;
-    color: #ffffff; margin-top: 4px; }
+  .logo { width: 200px; height: 96px; display: flex;
+    align-items: center; justify-content: center; }
+  .logo img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .logo svg { width: 88px; height: 88px; }
+  .brand { font-size: 22px; font-weight: 700; letter-spacing: 0.04em;
+    color: #ffffff; margin-top: 6px; }
   .tagline { font-size: 11px; color: #8aa0bd; margin-top: -4px;
     letter-spacing: 0.12em; text-transform: uppercase; }
   .status { font-size: 13px; color: #cfd8e6; margin-top: 4px;
@@ -651,9 +673,9 @@ function buildSplashHtml() {
 </style>
 </head><body>
   <div class="stage">
-    <div class="logo">${SPLASH_LOGO_SVG}</div>
-    <div class="brand">TrustNode</div>
-    <div class="tagline">Industrial Edge</div>
+    <div class="logo">${brandMark}</div>
+    <div class="brand">TrustNode Edge</div>
+    <div class="tagline">Industrial Data Platform</div>
     <div class="bar"></div>
     <div class="status" id="status">Starting up…</div>
     <div class="footer">v${version}</div>
@@ -681,8 +703,10 @@ function createSplashWindow() {
   if (splashWindow && !splashWindow.isDestroyed()) return;
   try {
     splashWindow = new BrowserWindow({
-      width: 420,
-      height: 340,
+      // Slightly wider to fit the wordmark brand logo without
+      // squeezing the status text underneath.
+      width: 480,
+      height: 360,
       resizable: false,
       minimizable: false,
       maximizable: false,

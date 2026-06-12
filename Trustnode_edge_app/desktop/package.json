@@ -55,6 +55,10 @@
       {
         "from": "assets/trustnode_logo.ico",
         "to": "trustnode_logo.ico"
+      },
+      {
+        "from": "assets/trustnode_brand.png",
+        "to": "trustnode_brand.png"
       }
     ],
     "win": {

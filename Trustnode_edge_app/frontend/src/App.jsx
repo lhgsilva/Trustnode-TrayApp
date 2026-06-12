@@ -7481,6 +7481,12 @@ function AppShell() {
 
   const hasClientModuleAccess = useCallback(
     (page) => {
+      // Admins skip the license + module gate entirely (same rationale as
+      // canOpenPage above — never lock an admin out of the navigation
+      // because the license snapshot momentarily failed).
+      const role = String(currentUser?.role || "").toLowerCase();
+      const isAdmin = role === "admin" || role === "super";
+      if (isAdmin) return true;
       if (!isPageLicensed(page)) return false;
       if (!userHasModuleForPage(currentUser, page)) return false;
       const perms = currentUser?.permissions || {};
@@ -7534,7 +7540,16 @@ function AppShell() {
 
   const canOpenPage = (page) => {
     if (page === "control_plane") return Boolean(isPortalOnly);
-    if (!isPageLicensed(page) && ["dashboard", "power_overview", "historian", "alarms", "reporting", "interface"].includes(page)) {
+    // Admins are never gated by the license check. Operator regression
+    // 2026-06-12: a transient license snapshot miss (edge offline, slow
+    // backend boot, stale token) was hiding the entire Overview/Dashboard
+    // section even though the admin had every permission and the
+    // backend was responding. The license endpoint stays authoritative
+    // for the API itself; the nav just doesn't hide top-level pages
+    // from admins because of it.
+    const role = String(currentUser?.role || "").toLowerCase();
+    const isAdmin = role === "admin" || role === "super";
+    if (!isAdmin && !isPageLicensed(page) && ["dashboard", "power_overview", "historian", "alarms", "reporting", "interface"].includes(page)) {
       return false;
     }
     // Single-file customer portal build: block ONLY edge-runtime config
