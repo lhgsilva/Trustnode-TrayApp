@@ -1112,24 +1112,34 @@ function LiveTagChart({
     // Real-time window enforcement. Operator request 2026-06-12:
     // "if my chart X axis is every sec, my gateway stopped for 10
     // min and my chart is configured to show 120 point, I should
-    // not show any point before / after I restarted, make sure you
-    // understand". Translation: the chart represents a sliding
-    // wall-clock window of capacity × pollMs seconds. Samples
-    // outside that window must drop out — even if the buffer still
-    // has them. So after a 10-min stall on a 1 s × 120 chart, the
-    // 60 pre-stall samples that USED to be in view are now too old
-    // to be in the [now - 120 s, now] window and the chart shows
-    // only the freshly arrived samples (with empty space behind
-    // them filling out the rest of the X axis).
+    // not show any point before / after I restarted". Translation:
+    // when the buffer has FRESH data (latest sample within the
+    // last window), drop anything older than capacity * pollMs so
+    // a stale gap can't drag old pre-stall samples into view.
     //
-    // Bucketing exception: when grouping is on (groupBucketMs > 0)
-    // each "sample" already represents groupBucketMs of time, so
-    // the window is capacity × groupBucketMs.
+    // CRITICAL guard 2026-06-12 (re-rev): we ONLY enforce the
+    // window when the latest sample IS fresh. Otherwise the chart
+    // shows seed data from the historian — sample timestamps are
+    // by definition older than the window when the gateway just
+    // started, the seed runs at boot, etc. Filtering them out
+    // means the chart shows "No points yet" forever even though
+    // there ARE samples in the buffer. So:
+    //   - latest sample <= 2 × windowMs old → enforce window
+    //   - latest sample older → keep whatever the buffer has,
+    //     show as historical-style snapshot
+    // Bucketing case uses capacity × groupBucketMs as the window.
     const effectivePollMs = groupBucketMs > 0 ? groupBucketMs : pollMs;
     const windowMs = Math.max(1, capacity) * effectivePollMs;
     const nowMs = Date.now();
-    const windowStartMs = nowMs - windowMs;
-    sorted = sorted.filter((ts) => ts >= windowStartMs);
+    if (sorted.length > 0) {
+      const latestSampleMs = sorted[sorted.length - 1];
+      const freshnessHorizon = windowMs * 2;
+      const isFresh = (nowMs - latestSampleMs) <= freshnessHorizon;
+      if (isFresh) {
+        const windowStartMs = nowMs - windowMs;
+        sorted = sorted.filter((ts) => ts >= windowStartMs);
+      }
+    }
     if (sorted.length > capacity) sorted = sorted.slice(-capacity);
 
     // Per-series sorted entries so we can carry-forward by walking with

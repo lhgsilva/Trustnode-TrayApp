@@ -2265,6 +2265,15 @@ function AppShell() {
   const [selectedAlarmIds, setSelectedAlarmIds] = useState([]);
   const [dataLog, setDataLog] = useState([]);
   const [appLogs, setAppLogs] = useState([]);
+  // Server-fetched historian rows. When the operator clicks Load
+  // with a from/to range we fetch from disk via the
+  // /api/app-store/historian/range endpoint and stash the result
+  // here. The historianRows useMemo prefers this list over the
+  // in-memory dataLogView so a 6-hour-old query window doesn't
+  // come back empty just because the live buffer rolled.
+  const [historianServerRows, setHistorianServerRows] = useState(null);
+  const [historianLoadBusy, setHistorianLoadBusy] = useState(false);
+  const [historianLoadError, setHistorianLoadError] = useState("");
   // Dismiss state for the Historian sync-status banner. Persisted in
   // localStorage so a refresh / restart doesn't immediately re-pop
   // the message the operator just dismissed. Re-shows if backlog
@@ -10047,8 +10056,23 @@ const getGatewayHealth = (gateway) => {
   }, [tagMonitorSeries, tagMonitorSelection, tagMonitorLatest, renderNowMs]);
 
   const historianRows = useMemo(() => {
-    return dataLogView.filter((row) => {
-      if (!inRange(row.ts, historianFilters.from, historianFilters.to)) return false;
+    // Prefer the server-loaded set when the operator clicked Load
+    // with a from/to range — otherwise fall back to the in-memory
+    // dataLogView so the page still shows fresh data on first
+    // open. The server set is already pre-filtered by from/to on
+    // the SQL side but we keep applying the in-memory filters too
+    // (tag substring, gateway, device, quality) so the operator
+    // can narrow further without re-querying.
+    const source = Array.isArray(historianServerRows) && historianServerRows.length
+      ? historianServerRows
+      : dataLogView;
+    return source.filter((row) => {
+      // If we're reading the server set, from/to was already
+      // applied at SQL level — skip the in-range check (it works
+      // off the local "from / to" inputs which the operator can
+      // change after Load too).
+      const skipRange = Array.isArray(historianServerRows) && historianServerRows.length;
+      if (!skipRange && !inRange(row.ts, historianFilters.from, historianFilters.to)) return false;
       if (historianFilters.tag) {
         const needle = String(historianFilters.tag || "").toLowerCase();
         const rawTag = String(row.tag || "").toLowerCase();
@@ -10063,7 +10087,7 @@ const getGatewayHealth = (gateway) => {
       ...row,
       gateway_name: row.gateway_name || gatewayNameById[row.gateway_id] || row.gateway_id || "-"
     }));
-  }, [dataLogView, historianFilters, gatewayNameById]);
+  }, [dataLogView, historianServerRows, historianFilters, gatewayNameById]);
 
   // Render only the most recent N rows to keep DOM size bounded. Without
   // this cap React reconciles every row on every state change — opening
@@ -19439,38 +19463,83 @@ const getGatewayHealth = (gateway) => {
                       <option value="BAD">BAD</option>
                     </select>
                   </label>
-                  <div className="historian-filter-actions">
+                  {/* Wrap actions in a label-shaped column so its
+                      baseline aligns with the other filters' inputs.
+                      The hidden span occupies the same vertical
+                      space as the labels above the inputs. */}
+                  <div className="historian-filter-actions-wrap" style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 4,
+                  }}>
+                    <span aria-hidden="true" style={{ fontSize: 12, visibility: "hidden", lineHeight: 1.2 }}>actions</span>
+                    <div className="historian-filter-actions">
                     <button
                       type="button"
                       className="btn btn-secondary"
-                      onClick={() => {
-                        // Force a fresh server pull. We don't have an
-                        // explicit refetch in scope here, but we can
-                        // bump the historian-poll tick so the next
-                        // render re-fetches.
-                        if (typeof window !== "undefined") {
-                          try { window.dispatchEvent(new CustomEvent("tn-historian-reload")); } catch (_) {}
+                      disabled={historianLoadBusy}
+                      onClick={async () => {
+                        // Fetch from disk via the app-store historian
+                        // range endpoint. Without an explicit Load
+                        // pass the chart relied on the in-memory
+                        // dataLogView buffer (≈25 000 rows of the
+                        // most recent samples) so old time windows
+                        // came back empty. Load now hits SQLite
+                        // directly and stashes the result in
+                        // historianServerRows.
+                        setHistorianLoadBusy(true);
+                        setHistorianLoadError("");
+                        try {
+                          const toIso = (txt) => {
+                            const s = String(txt || "").trim();
+                            if (!s) return "";
+                            const ms = new Date(s).getTime();
+                            return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
+                          };
+                          const res = await getAppStoreHistorianRange({
+                            fromUtc: toIso(historianFilters.from),
+                            toUtc: toIso(historianFilters.to),
+                            limit: 50000,
+                            offset: 0,
+                            gateway: String(historianFilters.gatewayId || ""),
+                            tag: "",
+                            timeoutMs: 60000,
+                            maxAttempts: 1,
+                          });
+                          const rows = Array.isArray(res?.rows) ? res.rows : [];
+                          setHistorianServerRows(rows);
+                          if (rows.length === 0) {
+                            setHistorianLoadError("No rows in the selected range.");
+                          }
+                        } catch (err) {
+                          setHistorianLoadError(`Load failed: ${String(err?.message || err || "")}`);
+                          setHistorianServerRows(null);
+                        } finally {
+                          setHistorianLoadBusy(false);
                         }
-                        // Defensive: trigger a re-evaluation of historianRows
-                        // by tickling the filters (identity change).
-                        setHistorianFilters((p) => ({ ...p }));
                       }}
                       title="Re-load historian data from disk"
                     >
-                      Load
+                      {historianLoadBusy ? "Loading..." : "Load"}
                     </button>
                     <button
                       type="button"
                       className="btn btn-secondary"
-                      onClick={() => setHistorianFilters({
-                        from: "",
-                        to: "",
-                        tag: "",
-                        gatewayId: "",
-                        deviceName: "",
-                        quality: "all",
-                      })}
-                      title="Reset every filter"
+                      onClick={() => {
+                        setHistorianFilters({
+                          from: "",
+                          to: "",
+                          tag: "",
+                          gatewayId: "",
+                          deviceName: "",
+                          quality: "all",
+                        });
+                        // Also drop the server-loaded set so the page
+                        // reverts to the live dataLogView buffer.
+                        setHistorianServerRows(null);
+                        setHistorianLoadError("");
+                      }}
+                      title="Reset every filter and clear the loaded set"
                     >
                       Clean
                     </button>
@@ -19482,8 +19551,19 @@ const getGatewayHealth = (gateway) => {
                     >
                       Export
                     </button>
+                    </div>
                   </div>
                 </div>
+                {historianLoadError ? (
+                  <div className="muted" style={{ fontSize: 12, marginTop: 6, color: "#d35454" }}>
+                    {historianLoadError}
+                  </div>
+                ) : null}
+                {Array.isArray(historianServerRows) && historianServerRows.length > 0 ? (
+                  <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
+                    Loaded {historianServerRows.length.toLocaleString()} row(s) from disk. Click <strong>Clean</strong> to return to the live buffer.
+                  </div>
+                ) : null}
               </section>
               <section className="card card-fill">
                 <div className="table-scroll fill-scroll">

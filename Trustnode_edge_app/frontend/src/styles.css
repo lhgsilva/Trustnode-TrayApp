@@ -2682,6 +2682,7 @@ body {
 .historian-filter-row-tight {
   grid-template-columns: repeat(6, minmax(0, 1fr)) auto;
   align-items: end;
+  gap: 10px;
 }
 .historian-filter-row > label {
   display: flex;
