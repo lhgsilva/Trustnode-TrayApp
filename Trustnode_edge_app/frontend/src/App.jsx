@@ -7937,7 +7937,16 @@ function AppShell() {
     }
     try {
       const out = await checkControlPlaneEdgeLicense(edgeId, currentTenantId || "default");
-      setEdgeLicenseSnapshot(out || null);
+      // Preserve the prior snapshot when the cloud probe came back
+      // negative (offline / unreachable / 5xx). Earlier we
+      // overwrote it with the failed payload, which clobbered the
+      // .ok=true we had cached from the last successful probe and
+      // tripped the "License Activation Required" modal repeatedly
+      // every time cloud connectivity blipped. Only replace the
+      // snapshot when the new one is genuinely a positive answer.
+      if (out && (out.ok || !edgeLicenseSnapshot?.ok)) {
+        setEdgeLicenseSnapshot(out);
+      }
       const reason = String(out?.reason || "");
       // Self-heal once per session: if the cloud probe carries a customer_id
       // that we don't have locally, mirror it back into app_settings so the
@@ -8043,7 +8052,13 @@ function AppShell() {
   useEffect(() => {
     if (licenseGuardBlocked) return;
     setLicenseGuardShowActivation(false);
-    setLicenseGuardDismissed(false);
+    // INTENTIONALLY do NOT reset licenseGuardDismissed here. When the
+    // cloud probe flutters between ok/fail (intermittent network), this
+    // useEffect used to flip dismissed back to false on every "ok"
+    // moment, so the very next failed probe popped the modal again
+    // immediately. Now the modal stays dismissed for the session once
+    // the operator clicks X — the only way to re-show it is a real
+    // user action (logout + login, or hit "Re-check License").
     // Guard cleared: restore the user's previously-selected page if we
     // overrode it. We only restore if we're still parked on "edge" — the
     // user may have deliberately navigated somewhere else in the meantime.

@@ -928,9 +928,30 @@ export function DashboardDesigner({
     // traces, skip limit-lines) so the title strip can show one
     // "value | tag" pair per series — including when the primary
     // gateway/tag is unset and the widget is series-only.
+    // Apply the saved unit / suffix when rendering the live value in
+    // the header. Operator config order:
+    //   - suffix wins (treated as a glyph that hugs the number, e.g. %),
+    //   - unit appended with a single space when no suffix,
+    //   - bare value when neither configured.
+    // Same convention the tooltip uses inside LiveTagChart so the
+    // header value and the chart tooltip stay consistent.
+    const decorateValue = (rawText, unitTxt, suffixTxt) => {
+      if (rawText === "-" || rawText === "—" || !rawText) return rawText;
+      const suf = String(suffixTxt || "").trim();
+      if (suf) return `${rawText}${suf}`;
+      const u = String(unitTxt || "").trim();
+      if (u) return `${rawText} ${u}`;
+      return rawText;
+    };
+    const primaryUnit = String(cfg.primary_unit || "");
+    const primarySuffix = String(cfg.primary_suffix || "");
     const seriesItems = [];
     if (gatewayId && tagName) {
-      seriesItems.push({ value: latestValue, tag: plcTag, color: String(widget?.color || "#14a89a") });
+      seriesItems.push({
+        value: decorateValue(latestValue, primaryUnit, primarySuffix),
+        tag: plcTag,
+        color: String(widget?.color || "#14a89a"),
+      });
     }
     const extras = Array.isArray(cfg.series_extra) ? cfg.series_extra : [];
     const fallbackPalette = ["#f97316", "#3b82f6", "#a855f7", "#dc2626", "#10b981", "#f59e0b"];
@@ -945,13 +966,16 @@ export function DashboardDesigner({
       const sValue = formatHeaderValue(sLatest?.last_value);
       const sLabel = String(s?.label || "").trim() || (formatTagForDisplay ? formatTagForDisplay(sTag) : sTag);
       seriesItems.push({
-        value: sValue,
+        value: decorateValue(sValue, s?.unit, s?.suffix),
         tag: sLabel,
         color: String(s?.color || "").trim() || fallbackPalette[paletteIdx % fallbackPalette.length],
       });
       paletteIdx += 1;
     }
-    return { latestValue, plcTag, typeLabel, liveLatencyMs, seriesItems };
+    // Decorate the single-series fallback display too so the
+    // single-series header path matches the multi-series rendering.
+    const decoratedLatest = decorateValue(latestValue, primaryUnit, primarySuffix);
+    return { latestValue: decoratedLatest, plcTag, typeLabel, liveLatencyMs, seriesItems };
   };
 
   const formatLatencyLabel = (msValue) => {
