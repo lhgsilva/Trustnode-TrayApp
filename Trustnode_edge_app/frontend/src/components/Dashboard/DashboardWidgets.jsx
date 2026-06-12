@@ -1171,31 +1171,44 @@ function LiveTagChart({
       lastTs: -Infinity,
     }));
 
-    // Append a synthetic "now" trailing tick so a stalled gateway shows
-    // as a real-time gap rather than an indefinite carry-forward line.
-    // Operator request 2026-06-12: "the gap when the gateway didn't
-    // collect data is only shown in historical, should also in live".
-    // We only add this tick when (a) we already have at least one
-    // sample and (b) the latest sample is older than the smallest
-    // per-series gap threshold — otherwise the chart's right edge
-    // would shimmer for normal-cadence streams. The synthetic row
-    // doesn't widen the array beyond capacity because it replaces
-    // the trailing position in `sorted`.
-    const nowMs = (typeof performance !== "undefined" && typeof performance.now === "function")
-      ? Date.now()
-      : Date.now();
+    // Append a synthetic "now" trailing tick ONLY when the gateway has
+    // truly stalled — defined as no fresh sample for at least 4 × the
+    // smallest per-series median gap AND a minimum of 30 s. Earlier
+    // this triggered on a single missed sample (5 s on a 1 s gateway)
+    // and the operator saw an empty strip at the right edge of an
+    // otherwise-healthy chart. Now the synthetic gap only appears
+    // when the data really did stop coming.
+    // Operator request 2026-06-12 (re-rev): "there is a gap showing
+    // in the end, in the labels and in the chart, it should never
+    // happens". We only insert the synthetic tick after a long stall;
+    // otherwise the chart ends at the most recent real sample.
+    const nowMs = Date.now();
     if (sorted.length > 0) {
       const latestKnown = sorted[sorted.length - 1];
       let minGap = Infinity;
       for (const v of gapByIdMs.values()) {
         if (Number.isFinite(v) && v < minGap) minGap = v;
       }
-      if (!Number.isFinite(minGap)) minGap = Math.max(5000, pollMs * 10);
-      if (nowMs - latestKnown > minGap && nowMs > latestKnown) {
+      if (!Number.isFinite(minGap)) minGap = Math.max(30_000, pollMs * 20);
+      const stallThreshold = Math.max(30_000, minGap * 4);
+      if (nowMs - latestKnown > stallThreshold && nowMs > latestKnown) {
         sorted.push(nowMs);
         if (sorted.length > capacity) sorted = sorted.slice(-capacity);
       }
     }
+
+    // Compute the smallest per-series gap threshold once so we can
+    // detect "big gap between consecutive union timestamps" and insert
+    // an explicit null marker between them. That keeps the line broken
+    // through gateway-stopped periods even when the carry-forward
+    // walker would otherwise straight-line t=2 → t=100 (operator
+    // request 2026-06-12: "if the gateway stops we should not have it
+    // printed in the period of time, similar to the historical one").
+    let smallestGapMs = Infinity;
+    for (const v of gapByIdMs.values()) {
+      if (Number.isFinite(v) && v < smallestGapMs) smallestGapMs = v;
+    }
+    if (!Number.isFinite(smallestGapMs)) smallestGapMs = Math.max(30_000, pollMs * 20);
 
     const rows = [];
     for (let i = 0; i < sorted.length; i += 1) {
@@ -1215,6 +1228,20 @@ function LiveTagChart({
         row[w.def.id] = (w.lastTs > -Infinity && ageMs <= cap) ? w.lastValue : null;
       }
       rows.push(row);
+
+      // Gateway-stopped marker: when the next union timestamp is more
+      // than smallestGapMs away, emit a synthetic null row halfway so
+      // Recharts breaks the line and the chart shows the dead period
+      // as empty space instead of straight-lining across it. The row
+      // carries null for EVERY series so the gap applies to all of
+      // them — the line resumes at the next real row.
+      const next = sorted[i + 1];
+      if (next !== undefined && next - tsMs > smallestGapMs) {
+        const midTs = tsMs + Math.floor((next - tsMs) / 2);
+        const nullRow = { idx: rows.length + 1, tsMs: midTs, ts: new Date(midTs).toISOString() };
+        for (const s of seriesDefs) nullRow[s.id] = null;
+        rows.push(nullRow);
+      }
     }
     const hasRightAxis = seriesDefs.some((s) => s.axis === "right");
     return { rows, hasRightAxis };
@@ -2409,7 +2436,22 @@ export function DashboardWidgetCard({
     const fetcher = fetchWidgetRowsRef.current;
     if (typeof fetcher !== "function") return;
     let cancelled = false;
-    const localRange = resolveTimeFilterRange(cfg);
+    // Honor dashboard historical range for extras too. Operator
+    // 2026-06-12: "the historical should show all information like
+    // the live one, but filtered by the time selected". Previously
+    // extras inherited only the per-widget time filter via
+    // resolveTimeFilterRange(cfg), which meant the global Historical
+    // mode date range filtered the primary but not the extra series
+    // — the chart rendered as a single-series chart instead of
+    // multi-series.
+    let localRange = resolveTimeFilterRange(cfg);
+    if (historicalMode) {
+      const histFromMs = historicalFromLocal ? new Date(historicalFromLocal).getTime() : NaN;
+      const histToMs = historicalToLocal ? new Date(historicalToLocal).getTime() : NaN;
+      const fromIso = Number.isFinite(histFromMs) ? new Date(histFromMs).toISOString() : "";
+      const toIso = Number.isFinite(histToMs) ? new Date(histToMs).toISOString() : "";
+      if (fromIso || toIso) localRange = { fromUtc: fromIso, toUtc: toIso };
+    }
     const fetchAll = async () => {
       const next = {};
       // Operator request: every series in the chart should pull the SAME
@@ -2477,6 +2519,9 @@ export function DashboardWidgetCard({
     cfgTimeFrom,
     cfgTimeTo,
     cfgReadingsCount,
+    historicalMode,
+    historicalFromLocal,
+    historicalToLocal,
   ]);
 
   // Combined source: prefer the server-fetched historian rows; fall back to
