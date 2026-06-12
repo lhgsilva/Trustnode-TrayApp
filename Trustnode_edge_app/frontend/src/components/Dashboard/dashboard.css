@@ -1745,3 +1745,76 @@
   flex: 1 1 0;
   min-width: 0;
 }
+
+/* Slide toggle — operator request 2026-06-12: the configure modal
+   checkboxes for Hide title bar and Manual Y axis should look like
+   slide buttons, with the toggle and the text on the SAME row, no
+   surrounding helper text. The wrapping label uses inline-flex with
+   high-specificity selectors that beat the global `label { display:
+   grid }`. The visual toggle is a 36x18 pill with a sliding 14px
+   knob; the underlying <input type="checkbox"> is visually hidden
+   but still receives clicks via the label's standard a11y wiring. */
+label.dashboard-slide-toggle {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  padding: 4px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+  user-select: none;
+}
+label.dashboard-slide-toggle > input[type="checkbox"] {
+  /* Visually hidden but keyboard-focusable. The track + knob below
+     are the visible affordance. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+label.dashboard-slide-toggle > .slide-track {
+  position: relative;
+  flex: 0 0 36px;
+  width: 36px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--stroke, rgba(255,255,255,0.18));
+  transition: background 140ms ease;
+  display: inline-block;
+}
+label.dashboard-slide-toggle > .slide-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition: transform 140ms ease;
+}
+label.dashboard-slide-toggle > input[type="checkbox"]:checked + .slide-track {
+  background: var(--teal, #14a89a);
+}
+label.dashboard-slide-toggle > input[type="checkbox"]:checked + .slide-track::after {
+  transform: translateX(18px);
+}
+label.dashboard-slide-toggle > input[type="checkbox"]:focus-visible + .slide-track {
+  outline: 2px solid var(--teal, #14a89a);
+  outline-offset: 2px;
+}
+label.dashboard-slide-toggle > .slide-label {
+  flex: 1 1 auto;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+}

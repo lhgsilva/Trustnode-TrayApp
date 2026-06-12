@@ -1293,10 +1293,11 @@ function ChartWidget({ widget, liveByKey }) {
           return out;
         })()
       : undefined;
-    // Manual mode starts at 0 unless the operator typed a negative min,
-    // matching the edge fix shipped earlier today.
-    const domainLo = a < 0 ? a : 0;
-    return { domain: [domainLo, b], ticks };
+    // Honor operator-typed min verbatim. Earlier the lite chart forced
+    // min to 0 unless the typed value was negative — that ignored
+    // ranges like min=100 max=200 and the axis painted 0..200. Edge
+    // had the same bug; both layers now use the typed value as-is.
+    return { domain: [a, b], ticks };
   };
   const manualLeft = buildManualY(cfg.y_axis_mode, cfg.y_min, cfg.y_max, cfg.y_tick_step);
   const manualRight = buildManualY(cfg.y_right_axis_mode, cfg.y_right_min, cfg.y_right_max, cfg.y_right_tick_step);
@@ -2056,6 +2057,20 @@ function TagMonitor({ open, payload, onClose }) {
   const hasRight = seriesDefs.some((s) => s.axis === "right");
   const widgetType = String(payload?.widget?.type || "line_chart");
   const labelFmt = (v) => (data && data.find((p) => p.idx === v)?.ts) || String(v);
+  // Honor the widget's manual Y axis settings inside the tag monitor
+  // too (operator: "all configurations should be maintained when we
+  // hit the tag monitor window and the lite view"). Falls through to
+  // the autoFit default when the widget is in auto mode or no widget
+  // is bound (raw tag click).
+  const monCfg = payload?.widget?.config || {};
+  const monManualLeft = buildManualY(monCfg.y_axis_mode, monCfg.y_min, monCfg.y_max, monCfg.y_tick_step);
+  const monManualRight = buildManualY(monCfg.y_right_axis_mode, monCfg.y_right_min, monCfg.y_right_max, monCfg.y_right_tick_step);
+  const monLeftYProps = monManualLeft
+    ? { ...monYProps, domain: monManualLeft.domain, ticks: monManualLeft.ticks, allowDataOverflow: true }
+    : monYProps;
+  const monRightYProps = monManualRight
+    ? { ...monYProps, domain: monManualRight.domain, ticks: monManualRight.ticks, allowDataOverflow: true }
+    : monYProps;
 
   return h("div", { className: "monitor-back", onClick: (e) => { if (e.target.classList.contains("monitor-back")) onClose(); } },
     h("div", { className: "monitor" },
@@ -2071,9 +2086,9 @@ function TagMonitor({ open, payload, onClose }) {
           : h(ResponsiveContainer, { width: "100%", height: "100%" },
               h(buildChartRoot(widgetType, seriesDefs.length), { data, margin: getChartMargin() },
                 h(CartesianGrid, { stroke: "var(--line, rgba(255,255,255,0.07))", strokeDasharray: "3 3" }),
-                h(XAxis, buildXAxisProps(data, payload?.widget?.config || {})),
-                h(YAxis, { ...monYProps, yAxisId: "left" }),
-                hasRight ? h(YAxis, { ...monYProps, yAxisId: "right", orientation: "right" }) : null,
+                h(XAxis, buildXAxisProps(data, monCfg)),
+                h(YAxis, { ...monLeftYProps, yAxisId: "left" }),
+                hasRight ? h(YAxis, { ...monRightYProps, yAxisId: "right", orientation: "right" }) : null,
                 h(Tooltip, { ...chartTooltipProps, labelFormatter: labelFmt, formatter: (v, n) => [fmtVal(v), n] }),
                 h(Legend, { wrapperStyle: { fontSize: 12, color: "var(--muted, #8a98ab)" } }),
                 ...seriesDefs.map((s) => renderSeriesElement(s, widgetType))

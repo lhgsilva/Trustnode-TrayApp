@@ -1199,15 +1199,24 @@ function LiveTagChart({
     if (String(cfg[modeKey] || "auto").toLowerCase() !== "manual") return null;
     const loRaw = cfg[minKey];
     const hiRaw = cfg[maxKey];
-    const loProvided = loRaw !== "" && loRaw !== null && loRaw !== undefined;
-    const hiProvided = hiRaw !== "" && hiRaw !== null && hiRaw !== undefined;
-    const lo = loProvided && Number.isFinite(Number(loRaw)) ? Number(loRaw) : 0;
-    const hi = hiProvided && Number.isFinite(Number(hiRaw)) ? Number(hiRaw) : null;
-    // hi is genuinely missing — let the auto-domain callback handle the
-    // top while still anchoring lo. We return an object so the chart
-    // can detect "anchor lo, auto hi" and use a mixed domain.
+    const loProvided = loRaw !== "" && loRaw !== null && loRaw !== undefined
+      && Number.isFinite(Number(loRaw));
+    const hiProvided = hiRaw !== "" && hiRaw !== null && hiRaw !== undefined
+      && Number.isFinite(Number(hiRaw));
+    // When lo is provided, honor it verbatim (positive 100, negative -50,
+    // anything goes). Earlier we forced "lo = max(lo, 0)" for non-negative
+    // values, which trashed the operator's explicit min when they typed
+    // e.g. min=100 max=200 — the axis painted 0..200 because lo got
+    // snapped to 0. The lo<0?lo:0 heuristic was meant only for the
+    // PARTIAL case where the operator left min blank (so we sensibly
+    // anchor at 0 instead of plotting somewhere weird).
+    const lo = loProvided ? Number(loRaw) : 0;
+    const hi = hiProvided ? Number(hiRaw) : null;
     if (hi === null) {
-      return { lo: lo < 0 ? lo : 0, hi: null, ticks: undefined, partial: true };
+      // Partial: operator typed only the max (or only the toggle).
+      // Anchor lo to 0 unless they typed a negative value; let the
+      // chart's auto-domain compute the top.
+      return { lo: loProvided ? lo : 0, hi: null, ticks: undefined, partial: true };
     }
     if (hi <= lo) return null;
     const step = Number(cfg[stepKey]);
@@ -1219,7 +1228,7 @@ function LiveTagChart({
         ticks.push(Number(v.toFixed(10)));
       }
     }
-    return { lo: lo < 0 ? lo : 0, hi, ticks, partial: false };
+    return { lo, hi, ticks, partial: false };
   };
   const manualY = buildManualDomain("y_axis_mode", "y_min", "y_max", "y_tick_step");
   const manualYRight = buildManualDomain("y_right_axis_mode", "y_right_min", "y_right_max", "y_right_tick_step");
@@ -2684,13 +2693,13 @@ export function DashboardWidgetCard({
   }, [manualY, cfg?.y_tick_step]);
   const yDomain = useMemo(() => {
     if (manualY) {
-      // Operator request: manual mode should start from 0 by default
-      // unless they explicitly typed a negative min. Industrial values
-      // are almost always non-negative so anchoring at 0 makes the
-      // chart trivially comparable across widgets. The operator's
-      // typed max becomes the top of the axis.
-      const lo = manualY.lo < 0 ? manualY.lo : 0;
-      return [lo, manualY.hi];
+      // Honor the operator's typed min exactly. Earlier we forced the
+      // axis to start at 0 unless the typed min was negative, which
+      // ignored ranges like min=100 max=200 (the chart painted 0..200
+      // instead of 100..200). The form widget already exposes the
+      // toggle + the three fields; if the operator typed it, that's
+      // what they want.
+      return [manualY.lo, manualY.hi];
     }
     return buildAutoYDomain(series);
   }, [manualY, series]);
@@ -2716,8 +2725,8 @@ export function DashboardWidgetCard({
   }, [manualYRight, cfg?.y_right_tick_step]);
   const yRightDomain = useMemo(() => {
     if (manualYRight) {
-      const lo = manualYRight.lo < 0 ? manualYRight.lo : 0;
-      return [lo, manualYRight.hi];
+      // Honor operator-typed min exactly (matches the left axis fix).
+      return [manualYRight.lo, manualYRight.hi];
     }
     return undefined; // recharts auto-domain on the right axis when undefined
   }, [manualYRight]);

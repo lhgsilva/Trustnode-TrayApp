@@ -1998,10 +1998,7 @@ export function DashboardDesigner({
                     Lets the operator strip the card chrome so the body
                     uses the full footprint, which is what an industrial
                     HMI usually wants. */}
-                <label
-                  className="dashboard-inline-toggle dashboard-full-row"
-                  style={{ display: "flex", alignItems: "center", gap: 8, padding: "2px 0", cursor: "pointer" }}
-                >
+                <label className="dashboard-slide-toggle dashboard-full-row">
                   <input
                     type="checkbox"
                     checked={Boolean(form.config?.hide_widget_header)}
@@ -2011,9 +2008,9 @@ export function DashboardDesigner({
                         config: { ...p.config, hide_widget_header: e.target.checked },
                       }))
                     }
-                    style={{ margin: 0, width: 16, height: 16 }}
                   />
-                  <span style={{ fontWeight: 600, fontSize: 13 }}>Hide widget title bar</span>
+                  <span className="slide-track" aria-hidden="true" />
+                  <span className="slide-label">Hide widget title bar</span>
                 </label>
                 {/* Body text scale used by dividers / fixed_text / table_list
                     captions / KPI labels. Range 0.6..2.5 covers the usual
@@ -2189,13 +2186,7 @@ export function DashboardDesigner({
                   );
                   return (
                     <div className="dashboard-full-row">
-                      <label className="dashboard-inline-toggle" style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                        padding: "2px 0",
-                        cursor: "pointer",
-                      }}>
+                      <label className="dashboard-slide-toggle">
                         <input
                           type="checkbox"
                           checked={manualOn}
@@ -2210,12 +2201,9 @@ export function DashboardDesigner({
                               },
                             }));
                           }}
-                          style={{ margin: 0 }}
                         />
-                        <span style={{ fontWeight: 600, fontSize: 13 }}>Manual Y axis scale</span>
-                        <span className="muted" style={{ fontSize: 11, marginLeft: 4 }}>
-                          {manualOn ? "Set min / max / step below." : "Auto-fit to live data."}
-                        </span>
+                        <span className="slide-track" aria-hidden="true" />
+                        <span className="slide-label">Manual Y axis scale</span>
                       </label>
                       {manualOn ? (
                         <>
