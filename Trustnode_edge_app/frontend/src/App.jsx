@@ -21098,23 +21098,49 @@ const getGatewayHealth = (gateway) => {
           onLogout={logout}
         />
       ) : null}
-      {!isPortalOnly && currentUser && !isHostedWebClient && licenseGuardBlocked && !licenseGuardDismissed ? (
+      {(() => {
+        // Hard-lock when the license is *expired* (or the cloud confirms
+        // a hard lock reason like license_inactive / edge_not_found).
+        // Operator request 2026-06-12: "if the license is expired we
+        // should be locked to that popup screen until we activate or
+        // start the trial". The X dismiss / close button is hidden in
+        // hard-lock mode so the operator has to take a positive action
+        // — Activate or start a trial. Other guard reasons (cloud not
+        // reachable, snapshot missing) remain dismissable so a transient
+        // problem doesn't trap the operator out of the dashboard.
+        const reason = String(
+          edgeLicenseSnapshot?.reason || licenseGuardMessage || ""
+        ).toLowerCase();
+        const isHardLockReason =
+          reason.includes("expired") ||
+          reason.includes("license_inactive") ||
+          reason.includes("edge_not_found") ||
+          reason.includes("license_not_found") ||
+          (licenseGuardMessage || "").toLowerCase().includes("expired");
+        const hardLocked = isHardLockReason && !(edgeTrialActive && edgeTrialActive.active);
+        const shouldShowModal =
+          !isPortalOnly && currentUser && !isHostedWebClient && licenseGuardBlocked &&
+          (hardLocked || !licenseGuardDismissed);
+        if (!shouldShowModal) return null;
+        return (
         <div className="modal-backdrop license-guard-backdrop">
           <div className="modal-card license-guard-modal">
             <div className="license-guard-head">
-              <h3>License Activation Required</h3>
+              <h3>{hardLocked ? "License Expired" : "License Activation Required"}</h3>
               <div className="license-guard-head-actions">
                 <span className="license-banner-pill">LOCKED</span>
-                <button
-                  className="license-guard-close"
-                  type="button"
-                  aria-label="Close"
-                  title="Close"
-                  onClick={() => setLicenseGuardDismissed(true)}
-                  disabled={edgeActivationBusy}
-                >
-                  X
-                </button>
+                {hardLocked ? null : (
+                  <button
+                    className="license-guard-close"
+                    type="button"
+                    aria-label="Close"
+                    title="Close"
+                    onClick={() => setLicenseGuardDismissed(true)}
+                    disabled={edgeActivationBusy}
+                  >
+                    X
+                  </button>
+                )}
               </div>
             </div>
             <p className="license-guard-message">
@@ -21236,7 +21262,8 @@ const getGatewayHealth = (gateway) => {
             </div>
           </div>
         </div>
-      ) : null}
+        );
+      })()}
       {reportPreviewDoc ? (
         <div className="modal-backdrop">
           <div className="modal-card reporting-preview-modal">
