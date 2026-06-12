@@ -457,6 +457,39 @@ export async function discoverPlcTags(payload) {
   return res.json();
 }
 
+export async function exportHistorianXlsx(payload) {
+  // Returns the Blob directly so the caller can trigger a download.
+  const res = await fetchWithTimeout(
+    `${getApiBase()}/api/historian/export-xlsx`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    },
+    180000,
+  );
+  if (!res.ok) {
+    let detail = "";
+    try { detail = await res.text(); } catch (_) { detail = ""; }
+    throw new Error(`Excel export failed (HTTP ${res.status})${detail ? `: ${detail}` : ""}`);
+  }
+  return res.blob();
+}
+
+export async function downloadHistorianXlsxReferenceTemplate() {
+  const res = await fetchWithTimeout(
+    `${getApiBase()}/api/historian/export-xlsx/reference-template`,
+    {},
+    30000,
+  );
+  if (!res.ok) {
+    let detail = "";
+    try { detail = await res.text(); } catch (_) { detail = ""; }
+    throw new Error(`Reference template download failed (HTTP ${res.status})${detail ? `: ${detail}` : ""}`);
+  }
+  return res.blob();
+}
+
 export async function discoverPlcNetwork(payload) {
   const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/discover-network`, {
     method: "POST",

@@ -12,6 +12,8 @@ import {
   getGatewayInstanceStatuses,
   discoverPlcTags,
   discoverPlcNetwork,
+  exportHistorianXlsx,
+  downloadHistorianXlsxReferenceTemplate,
   browseOpcUaNodes,
   getWsStreamUrl,
   getCloudWsStreamUrl,
@@ -10083,10 +10085,27 @@ const getGatewayHealth = (gateway) => {
       if (historianFilters.deviceName && !String(row.device_name || "").toLowerCase().includes(historianFilters.deviceName.toLowerCase())) return false;
       if (historianFilters.quality !== "all" && String(row.quality_label || "").toUpperCase() !== historianFilters.quality) return false;
       return true;
-    }).map((row) => ({
-      ...row,
-      gateway_name: row.gateway_name || gatewayNameById[row.gateway_id] || row.gateway_id || "-"
-    }));
+    }).map((row) => {
+      // Operator request 2026-06-12: "the gateway information to be
+      // shown should be the name and not the id, for the UI and
+      // exports". Historian rows can carry a stale gateway_name (if
+      // the gateway was renamed since the row was written) OR a raw
+      // "gw-1781..." string that LOOKS like an id. Prefer the live
+      // name lookup first; only fall back to the stored value if
+      // the live map doesn't know this gateway id (e.g. the gateway
+      // was deleted).
+      const liveName = gatewayNameById[row.gateway_id];
+      const storedLooksLikeId = /^gw-\d/.test(String(row.gateway_name || ""));
+      const friendlyName = liveName
+        || (storedLooksLikeId ? "" : row.gateway_name)
+        || row.gateway_name
+        || row.gateway_id
+        || "-";
+      return {
+        ...row,
+        gateway_name: friendlyName,
+      };
+    });
   }, [dataLogView, historianServerRows, historianFilters, gatewayNameById]);
 
   // Render only the most recent N rows to keep DOM size bounded. Without
@@ -11662,25 +11681,16 @@ const getGatewayHealth = (gateway) => {
       } else if (fmt === "json") {
         downloadText(`historian_${stamp}.json`, JSON.stringify(rows, null, 2), "application/json;charset=utf-8");
       } else if (fmt === "xlsx") {
-        // Excel via backend (openpyxl). When the operator uploaded a
-        // template .xlsx, pass it through as base64 so the backend
-        // can apply the placeholder substitutions.
-        const payload = {
+        // Excel via backend (openpyxl). exportHistorianXlsx goes
+        // through the proper api wrapper so the auth Bearer token
+        // is attached; the previous raw fetch was unauthenticated
+        // which caused the empty / broken file the operator saw.
+        const blob = await exportHistorianXlsx({
           rows,
           columns: (historianExportColumns || []).filter((c) => c.enabled !== false).map((c) => ({ key: c.key, label: c.label })),
           template_xlsx_b64: historianExportXlsxTemplate ? historianExportXlsxTemplate.b64 : null,
           template_name: historianExportXlsxTemplate ? historianExportXlsxTemplate.name : null,
-        };
-        const res = await fetch(`${getApiBase()}/api/historian/export-xlsx`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
         });
-        if (!res.ok) {
-          const err = await res.text().catch(() => "");
-          throw new Error(`Excel export failed: ${err || res.statusText}`);
-        }
-        const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
@@ -19463,16 +19473,12 @@ const getGatewayHealth = (gateway) => {
                       <option value="BAD">BAD</option>
                     </select>
                   </label>
-                  {/* Wrap actions in a label-shaped column so its
-                      baseline aligns with the other filters' inputs.
-                      The hidden span occupies the same vertical
-                      space as the labels above the inputs. */}
-                  <div className="historian-filter-actions-wrap" style={{
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: 4,
-                  }}>
-                    <span aria-hidden="true" style={{ fontSize: 12, visibility: "hidden", lineHeight: 1.2 }}>actions</span>
+                  {/* Actions wrap: CSS .historian-filter-row-tight >
+                      .historian-filter-actions-wrap sets
+                      align-self: center, so the buttons end up
+                      vertically centered in the same row as the
+                      filter (label + input) combos. */}
+                  <div className="historian-filter-actions-wrap">
                     <div className="historian-filter-actions">
                     <button
                       type="button"
@@ -22531,8 +22537,33 @@ const getGatewayHealth = (gateway) => {
                 <legend style={{ padding: "0 6px", fontSize: 12 }}>Excel template (optional)</legend>
                 <p className="muted" style={{ fontSize: 12 }}>
                   Upload a styled <code>.xlsx</code>. Cells containing{" "}
-                  <code>{"{{ts}}"}</code> / <code>{"{{tag}}"}</code> / <code>{"{{value}}"}</code> etc. are replaced with row values.
-                  Mark a row with <code>{"{{#each}}"}</code> in column A and <code>{"{{/each}}"}</code> on a later row to indicate the data loop.
+                  <code>{"{{Timestamp}}"}</code> / <code>{"{{Tag}}"}</code> / <code>{"{{Value}}"}</code> /{" "}
+                  <code>{"{{Quality}}"}</code> / <code>{"{{Device}}"}</code> / <code>{"{{Gateway}}"}</code> /{" "}
+                  <code>{"{{ts}}"}</code> are replaced. Wrap repeating rows between{" "}
+                  <code>{"{{#each}}"}</code> (column A) and <code>{"{{/each}}"}</code>.
+                  {" "}
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    style={{ marginLeft: 6, padding: "2px 8px" }}
+                    onClick={async () => {
+                      try {
+                        const blob = await downloadHistorianXlsxReferenceTemplate();
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.href = url;
+                        a.download = "trustnode-historian-template-reference.xlsx";
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        setTimeout(() => URL.revokeObjectURL(url), 2000);
+                      } catch (err) {
+                        setError(`Reference template download failed: ${String(err?.message || err)}`);
+                      }
+                    }}
+                  >
+                    Download reference template
+                  </button>
                 </p>
                 <div className="row" style={{ flexWrap: "wrap" }}>
                   <input

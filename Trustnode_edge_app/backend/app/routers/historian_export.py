@@ -149,8 +149,18 @@ def _build_templated_xlsx(
             break
 
     # Build the global row context — first data row's values, used to
-    # fill placeholders OUTSIDE the loop.
-    first_row = rows[0] if rows else {}
+    # fill placeholders OUTSIDE the loop. We also inject a few
+    # synthetic placeholders so the operator can reference the
+    # export wallclock and the number of rows in title rows etc.
+    from datetime import datetime as _dt
+    synthetic = {
+        "ts": _dt.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ts_iso": _dt.now().isoformat(timespec="seconds"),
+        "row_count": str(len(rows)),
+    }
+    first_row = dict(rows[0] if rows else {})
+    for k, v in synthetic.items():
+        first_row.setdefault(k, v)
 
     def _apply_to_cell(cell, ctx: dict[str, Any]) -> None:
         v = cell.value
@@ -201,11 +211,17 @@ def _build_templated_xlsx(
         write_row = loop_start
         from copy import copy as shallow_copy  # for cell styles
         for data_row in rows:
+            # Merge synthetic context (ts, row_count) so loop cells
+            # can also reference them — useful for footers like
+            # "Generated {{ts}}" inside the loop block.
+            merged_ctx = dict(data_row)
+            for k, v in synthetic.items():
+                merged_ctx.setdefault(k, v)
             for pattern_row in loop_template_rows:
                 for c_idx, val in enumerate(pattern_row, start=1):
                     cell = ws.cell(row=write_row, column=c_idx)
                     if isinstance(val, str):
-                        cell.value = _resolve_placeholder(val, data_row)
+                        cell.value = _resolve_placeholder(val, merged_ctx)
                     else:
                         cell.value = val
                 write_row += 1
@@ -214,6 +230,104 @@ def _build_templated_xlsx(
     wb.save(bio)
     bio.seek(0)
     return bio.read()
+
+
+@router.get("/export-xlsx/reference-template")
+def reference_template() -> StreamingResponse:
+    """Return a styled .xlsx reference template the operator can
+    download, edit, and re-upload. Demonstrates every supported
+    placeholder so the operator knows what they can drop in their
+    own workbook.
+
+    Layout:
+      Row 1 — Title with the export wallclock placeholder.
+      Row 3 — Header row with column labels (matches the default
+              export columns).
+      Row 5 — Loop start marker {{#each}} in column A.
+      Row 6 — One row of placeholders {{Timestamp}} {{Tag}} {{Value}}
+              {{Quality}} {{Device}} {{Gateway}}.
+      Row 7 — Loop end marker {{/each}}.
+      Row 9 — Helper text explaining how to use it.
+
+    Operator uploads back into Export modal → backend repeats
+    rows 5–7 for every data row, substituting placeholders.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+    except ImportError as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"openpyxl missing: {exc}")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Reference"
+
+    accent = PatternFill(start_color="14A89A", end_color="14A89A", fill_type="solid")
+    light = PatternFill(start_color="EAF6F4", end_color="EAF6F4", fill_type="solid")
+    head_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    title_font = Font(name="Calibri", size=14, bold=True, color="0E1A2B")
+    body_font = Font(name="Calibri", size=10, color="0E1A2B")
+    thin = Side(border_style="thin", color="BBBBBB")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Column widths
+    widths = [22, 22, 14, 14, 18, 18]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(ord("A") + i - 1)].width = w
+
+    # Row 1 — title
+    ws.cell(row=1, column=1, value="TrustNode Historian Export — generated {{ts}}").font = title_font
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
+
+    # Row 3 — column headers (the operator can rename them)
+    headers = ["Timestamp", "Tag", "Value", "Quality", "Device", "Gateway"]
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=3, column=i, value=h)
+        c.font = head_font
+        c.fill = accent
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = box
+
+    # Row 5 — loop start marker (column A)
+    ws.cell(row=5, column=1, value="{{#each}}").font = Font(italic=True, color="888888")
+
+    # Row 6 — placeholder row inside the loop
+    placeholders = ["{{Timestamp}}", "{{Tag}}", "{{Value}}", "{{Quality}}", "{{Device}}", "{{Gateway}}"]
+    for i, p in enumerate(placeholders, start=1):
+        c = ws.cell(row=6, column=i, value=p)
+        c.font = body_font
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        c.fill = light
+        c.border = box
+
+    # Row 7 — loop end marker
+    ws.cell(row=7, column=1, value="{{/each}}").font = Font(italic=True, color="888888")
+
+    # Row 9+ — operator-facing instructions
+    instructions = [
+        "How to use this template:",
+        "  1. Open it in Excel and style it however you like (colors, fonts, logos, merged cells, etc.).",
+        "  2. The placeholders {{Timestamp}} / {{Tag}} / {{Value}} / {{Quality}} / {{Device}} / {{Gateway}}",
+        "     are case-insensitive and match the column labels in the export modal. Add or remove",
+        "     placeholders to suit your report.",
+        "  3. The row between {{#each}} and {{/each}} is repeated once per data row.",
+        "  4. Cells OUTSIDE the loop (titles, footers, summary rows) are substituted with the FIRST row's values.",
+        "  5. {{ts}} is replaced with the export's wallclock time (the moment you click Export).",
+        "  6. Save as .xlsx and upload via the Export modal's 'Excel template' field.",
+    ]
+    for i, text in enumerate(instructions):
+        c = ws.cell(row=9 + i, column=1, value=text)
+        c.font = body_font
+        ws.merge_cells(start_row=9 + i, start_column=1, end_row=9 + i, end_column=6)
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    headers_resp = {
+        "Content-Disposition": 'attachment; filename="trustnode-historian-template-reference.xlsx"',
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }
+    return StreamingResponse(iter([bio.read()]), media_type=headers_resp["Content-Type"], headers=headers_resp)
 
 
 @router.post("/export-xlsx")

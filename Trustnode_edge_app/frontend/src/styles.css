@@ -2684,6 +2684,18 @@ body {
   align-items: end;
   gap: 10px;
 }
+/* Action buttons sit in their own grid track on the right. The grid
+   align-items: end above keeps the inputs aligned to the bottom of
+   the row so their labels line up neatly. The actions column gets
+   center alignment (operator request 2026-06-12: "the buttons of
+   controls should be vertically centralized in the same row of the
+   filter fields") via align-self: center; we pull it up half a label
+   height to look optically centered against the (label+input) combo
+   to its left. */
+.historian-filter-row-tight > .historian-filter-actions-wrap {
+  align-self: center;
+  margin-top: 8px;
+}
 .historian-filter-row > label {
   display: flex;
   flex-direction: column;
