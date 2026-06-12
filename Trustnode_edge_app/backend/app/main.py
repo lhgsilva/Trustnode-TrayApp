@@ -93,6 +93,7 @@ from app.routers.power import router as power_router
 from app.routers.control_plane import router as control_plane_router, resolve_edge_view_link_public
 from app.routers.reports import router as reports_router
 from app.routers.cloud_live import router as cloud_live_router
+from app.routers.historian_export import router as historian_export_router
 from app.state import (
     plc_manager,
     app_store,
@@ -224,6 +225,7 @@ app.include_router(control_plane_router)
 def _lite_view_resolve(token: str):
     return resolve_edge_view_link_public(token)
 app.include_router(reports_router)
+app.include_router(historian_export_router)
 
 # The cloud-live SSE endpoint lives in a SEPARATE FastAPI app so it does
 # NOT inherit the main app's BaseHTTPMiddleware (which buffers responses

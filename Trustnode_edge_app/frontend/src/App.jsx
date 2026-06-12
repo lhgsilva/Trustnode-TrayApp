@@ -2265,6 +2265,36 @@ function AppShell() {
   const [selectedAlarmIds, setSelectedAlarmIds] = useState([]);
   const [dataLog, setDataLog] = useState([]);
   const [appLogs, setAppLogs] = useState([]);
+  // Dismiss state for the Historian sync-status banner. Persisted in
+  // localStorage so a refresh / restart doesn't immediately re-pop
+  // the message the operator just dismissed. Re-shows if backlog
+  // jumps OR a new lastDataError appears.
+  const [historianSyncBannerDismissedUntil, setHistorianSyncBannerDismissedUntil] = useState(0);
+  const [historianSyncBannerDismissedBacklog, setHistorianSyncBannerDismissedBacklog] = useState(0);
+  const [historianSyncBannerDismissedError, setHistorianSyncBannerDismissedError] = useState("");
+  // Export modal + template state. The export modal lets the operator
+  // pick a format (CSV/Excel/TXT/JSON), reorder columns, save / load
+  // / download / upload templates. Templates live in localStorage as
+  // historianExportTemplates (array of {name, format, columns, ...}).
+  const [historianExportOpen, setHistorianExportOpen] = useState(false);
+  const [historianExportFormat, setHistorianExportFormat] = useState("csv");
+  const [historianExportColumns, setHistorianExportColumns] = useState([
+    { key: "timestamp_local", label: "Timestamp", enabled: true },
+    { key: "tag", label: "Tag", enabled: true },
+    { key: "value", label: "Value", enabled: true },
+    { key: "quality_label", label: "Quality", enabled: true },
+    { key: "device", label: "Device", enabled: true },
+    { key: "gateway", label: "Gateway", enabled: true },
+    { key: "database", label: "Database", enabled: false },
+    { key: "plc_ip", label: "PLC IP", enabled: false },
+    { key: "source", label: "Source", enabled: false },
+  ]);
+  const [historianExportTemplates, setHistorianExportTemplates] = useState([]);
+  const [historianExportTemplateName, setHistorianExportTemplateName] = useState("");
+  const [historianExportBusy, setHistorianExportBusy] = useState(false);
+  const [historianExportXlsxTemplate, setHistorianExportXlsxTemplate] = useState(null);
+  const historianXlsxFileRef = useRef(null);
+  const historianTemplateFileRef = useRef(null);
   const [historianFilters, setHistorianFilters] = useState({
     from: "",
     to: "",
@@ -3593,6 +3623,25 @@ function AppShell() {
     if (savedTrend === "line" || savedTrend === "bar") setTrendChartType(savedTrend);
     const savedTagMonitor = loadStringSetting(TAG_MONITOR_CHART_TYPE_STORAGE_KEY, "");
     if (savedTagMonitor === "line" || savedTagMonitor === "bar" || savedTagMonitor === "area") setTagMonitorChartType(savedTagMonitor);
+    // Historian banner dismiss + export templates.
+    try {
+      const raw = localStorage.getItem("trustnode.historianBannerDismiss");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Number(parsed.until) > Date.now()) {
+          setHistorianSyncBannerDismissedUntil(Number(parsed.until));
+          setHistorianSyncBannerDismissedBacklog(Number(parsed.backlog || 0));
+          setHistorianSyncBannerDismissedError(String(parsed.err || ""));
+        }
+      }
+    } catch (_) {}
+    try {
+      const raw = localStorage.getItem("trustnode.historianExportTemplates");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) setHistorianExportTemplates(parsed);
+      }
+    } catch (_) {}
     try {
       const rawSidebar = localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY);
       if (rawSidebar === "true" || rawSidebar === "false") {
@@ -11536,6 +11585,187 @@ const getGatewayHealth = (gateway) => {
     );
   };
 
+  // Historian export — builds the dataset from the visible
+  // historianRows according to historianExportColumns then writes
+  // it out in the chosen format. For CSV / TXT / JSON we render
+  // client-side. For Excel we POST to the backend which can also
+  // honor an uploaded .xlsx template with {{tag}} / {{value}} /
+  // {{ts}} / {{#each}} / {{/each}} placeholders for fancy layouts.
+  const buildHistorianExportRows = useCallback(() => {
+    const enabledCols = (historianExportColumns || []).filter((c) => c.enabled !== false);
+    return historianRows.map((r) => {
+      const out = {};
+      for (const col of enabledCols) {
+        switch (col.key) {
+          case "timestamp_local": out[col.label] = fmtTs(r.ts); break;
+          case "timestamp_utc": out[col.label] = String(r.ts || ""); break;
+          case "tag": out[col.label] = String(r.tag || ""); break;
+          case "value": out[col.label] = formatStandardValue(r.value, 3); break;
+          case "value_raw": out[col.label] = Number.isFinite(Number(r.value)) ? Number(r.value) : r.value; break;
+          case "quality": out[col.label] = String(r.quality ?? ""); break;
+          case "quality_label": out[col.label] = String(r.quality_label || ""); break;
+          case "device": out[col.label] = String(r.device_name || ""); break;
+          case "gateway": out[col.label] = String(r.gateway_name || r.gateway_id || ""); break;
+          case "database": out[col.label] = String(r.database_name || ""); break;
+          case "plc_ip": out[col.label] = String(r.plc_ip || ""); break;
+          case "source": out[col.label] = String(r.source || ""); break;
+          default: out[col.label] = String(r[col.key] ?? "");
+        }
+      }
+      return out;
+    });
+  }, [historianRows, historianExportColumns]);
+
+  const runHistorianExport = useCallback(async () => {
+    setHistorianExportBusy(true);
+    try {
+      const rows = buildHistorianExportRows();
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      const fmt = String(historianExportFormat || "csv").toLowerCase();
+      if (fmt === "csv") {
+        downloadText(`historian_${stamp}.csv`, toCsv(rows), "text/csv;charset=utf-8");
+      } else if (fmt === "txt") {
+        // Tab-separated for spreadsheets that won't auto-detect CSV.
+        if (rows.length === 0) {
+          downloadText(`historian_${stamp}.txt`, "", "text/plain;charset=utf-8");
+        } else {
+          const headers = Object.keys(rows[0]);
+          const body = [headers.join("\t")]
+            .concat(rows.map((r) => headers.map((h) => String(r[h] ?? "").replace(/[\r\n\t]+/g, " ")).join("\t")))
+            .join("\n");
+          downloadText(`historian_${stamp}.txt`, body, "text/plain;charset=utf-8");
+        }
+      } else if (fmt === "json") {
+        downloadText(`historian_${stamp}.json`, JSON.stringify(rows, null, 2), "application/json;charset=utf-8");
+      } else if (fmt === "xlsx") {
+        // Excel via backend (openpyxl). When the operator uploaded a
+        // template .xlsx, pass it through as base64 so the backend
+        // can apply the placeholder substitutions.
+        const payload = {
+          rows,
+          columns: (historianExportColumns || []).filter((c) => c.enabled !== false).map((c) => ({ key: c.key, label: c.label })),
+          template_xlsx_b64: historianExportXlsxTemplate ? historianExportXlsxTemplate.b64 : null,
+          template_name: historianExportXlsxTemplate ? historianExportXlsxTemplate.name : null,
+        };
+        const res = await fetch(`${getApiBase()}/api/historian/export-xlsx`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const err = await res.text().catch(() => "");
+          throw new Error(`Excel export failed: ${err || res.statusText}`);
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `historian_${stamp}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+      }
+      setHistorianExportOpen(false);
+    } catch (err) {
+      setError(`Export failed: ${String(err?.message || err || "")}`);
+    } finally {
+      setHistorianExportBusy(false);
+    }
+  }, [
+    buildHistorianExportRows,
+    historianExportFormat,
+    historianExportColumns,
+    historianExportXlsxTemplate,
+  ]);
+
+  const saveHistorianTemplate = useCallback(() => {
+    const name = String(historianExportTemplateName || "").trim();
+    if (!name) return;
+    const tpl = {
+      name,
+      format: historianExportFormat,
+      columns: historianExportColumns,
+      xlsx_template_b64: historianExportXlsxTemplate ? historianExportXlsxTemplate.b64 : null,
+      xlsx_template_name: historianExportXlsxTemplate ? historianExportXlsxTemplate.name : null,
+      created_utc: new Date().toISOString(),
+    };
+    setHistorianExportTemplates((prev) => {
+      const next = (prev || []).filter((t) => String(t.name) !== name).concat([tpl]);
+      try { localStorage.setItem("trustnode.historianExportTemplates", JSON.stringify(next)); } catch (_) {}
+      return next;
+    });
+    setHistorianExportTemplateName("");
+  }, [
+    historianExportTemplateName,
+    historianExportFormat,
+    historianExportColumns,
+    historianExportXlsxTemplate,
+  ]);
+
+  const loadHistorianTemplate = useCallback((tpl) => {
+    if (!tpl) return;
+    if (tpl.format) setHistorianExportFormat(tpl.format);
+    if (Array.isArray(tpl.columns)) setHistorianExportColumns(tpl.columns);
+    if (tpl.xlsx_template_b64) {
+      setHistorianExportXlsxTemplate({ b64: tpl.xlsx_template_b64, name: tpl.xlsx_template_name || "template.xlsx" });
+    } else {
+      setHistorianExportXlsxTemplate(null);
+    }
+    setHistorianExportTemplateName(tpl.name || "");
+  }, []);
+
+  const deleteHistorianTemplate = useCallback((name) => {
+    setHistorianExportTemplates((prev) => {
+      const next = (prev || []).filter((t) => String(t.name) !== String(name));
+      try { localStorage.setItem("trustnode.historianExportTemplates", JSON.stringify(next)); } catch (_) {}
+      return next;
+    });
+  }, []);
+
+  const downloadHistorianTemplate = useCallback((tpl) => {
+    if (!tpl) return;
+    const safe = String(tpl.name || "template").toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+    downloadText(`${safe}.tn-historian-template.json`, JSON.stringify(tpl, null, 2), "application/json;charset=utf-8");
+  }, []);
+
+  const onUploadHistorianTemplate = useCallback(async (e) => {
+    const file = e?.target?.files?.[0];
+    if (!file) return;
+    try {
+      const txt = await file.text();
+      const tpl = JSON.parse(txt);
+      if (!tpl || typeof tpl !== "object" || !tpl.name) throw new Error("Invalid template file");
+      setHistorianExportTemplates((prev) => {
+        const next = (prev || []).filter((t) => String(t.name) !== String(tpl.name)).concat([tpl]);
+        try { localStorage.setItem("trustnode.historianExportTemplates", JSON.stringify(next)); } catch (_) {}
+        return next;
+      });
+      loadHistorianTemplate(tpl);
+    } catch (err) {
+      setError(`Template load failed: ${String(err?.message || err || "")}`);
+    } finally {
+      if (historianTemplateFileRef.current) historianTemplateFileRef.current.value = "";
+    }
+  }, [loadHistorianTemplate]);
+
+  const onUploadHistorianXlsxTemplate = useCallback(async (e) => {
+    const file = e?.target?.files?.[0];
+    if (!file) return;
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+      const b64 = btoa(binary);
+      setHistorianExportXlsxTemplate({ b64, name: file.name });
+    } catch (err) {
+      setError(`Excel template load failed: ${String(err?.message || err || "")}`);
+    } finally {
+      if (historianXlsxFileRef.current) historianXlsxFileRef.current.value = "";
+    }
+  }, []);
+
   // Network discovery for the Add PLC Device modal. The operator can
   // leave Range empty (broadcast EtherNet/IP discovery via pylogix)
   // OR type a CIDR / comma list (e.g. "192.168.10.0/24" or
@@ -19036,6 +19266,20 @@ const getGatewayHealth = (gateway) => {
                 if (!cloudEnabled && !lastDataError && backlog === 0 && !lastUtc) {
                   return null;
                 }
+                // Dismiss for 1 hour. Operator request 2026-06-12: "the
+                // message about the buffering should be possible to be
+                // dismissed and the information is not correct". We
+                // also re-show on demand if the backlog grows OR a new
+                // error appears, so a real problem can't hide behind
+                // the dismiss.
+                const dismissUntil = Number(historianSyncBannerDismissedUntil || 0);
+                const dismissCookieValid = dismissUntil > 0 && Date.now() < dismissUntil;
+                const dismissedBacklog = Number(historianSyncBannerDismissedBacklog || 0);
+                const backlogGrew = backlog > dismissedBacklog + 100;
+                const forceShow = backlogGrew || (lastDataError && lastDataError !== historianSyncBannerDismissedError);
+                if (dismissCookieValid && !forceShow) {
+                  return null;
+                }
                 const ageSeconds = (() => {
                   if (!lastUtc) return null;
                   try {
@@ -19046,11 +19290,21 @@ const getGatewayHealth = (gateway) => {
                     return Math.max(0, Math.floor((Date.now() - ms) / 1000));
                   } catch (_) { return null; }
                 })();
+                // Verdict: rely on the WORST of (error / age / backlog).
+                // Earlier "Buffering" fired purely on age > 5 min even
+                // when backlog was 0 — confusing because there was
+                // nothing actually buffered. Now we treat the buffer
+                // as healthy when backlog is 0 AND there is no error,
+                // regardless of last-push age.
                 const verdict = lastDataError
                   ? "error"
                   : !cloudEnabled
                     ? "muted"
-                    : (backlog > 1000 || (ageSeconds != null && ageSeconds > 300) ? "warn" : "ok");
+                    : backlog === 0
+                      ? "ok"
+                      : backlog > 1000 || (ageSeconds != null && ageSeconds > 300)
+                        ? "warn"
+                        : "ok";
                 const verdictColor = {
                   ok: "var(--accent, #14a89a)",
                   warn: "#d39d3a",
@@ -19058,7 +19312,7 @@ const getGatewayHealth = (gateway) => {
                   muted: "var(--muted, #5a5a5a)"
                 }[verdict];
                 const verdictLabel = {
-                  ok: "Forwarding to cloud",
+                  ok: backlog === 0 ? "Cloud sync up to date" : "Forwarding to cloud",
                   warn: "Buffering — slow / delayed push",
                   error: "Forwarding paused",
                   muted: "Cloud sync disabled"
@@ -19080,6 +19334,25 @@ const getGatewayHealth = (gateway) => {
                         Error: {lastDataError.slice(0, 100)}
                       </span>
                     ) : null}
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => {
+                        const until = Date.now() + 60 * 60 * 1000;
+                        setHistorianSyncBannerDismissedUntil(until);
+                        setHistorianSyncBannerDismissedBacklog(backlog);
+                        setHistorianSyncBannerDismissedError(lastDataError);
+                        try {
+                          localStorage.setItem("trustnode.historianBannerDismiss", JSON.stringify({
+                            until, backlog, err: lastDataError,
+                          }));
+                        } catch (_) {}
+                      }}
+                      style={{ marginLeft: "auto" }}
+                      title="Hide this banner for 1 hour"
+                    >
+                      Dismiss
+                    </button>
                   </section>
                 );
               })()}
@@ -19100,7 +19373,16 @@ const getGatewayHealth = (gateway) => {
                 </section>
               ) : null}
               <section className="card">
-                <div className="historian-filter-row">
+                {/* One-row filter strip: all fields share the same
+                    height. Action buttons (Load / Clean / Export) sit
+                    at the right end so the operator can run them
+                    after composing the filter. Operator request
+                    2026-06-12: "should be in one row with all same
+                    height size then in the end the actions buttons,
+                    load, clean and export". The historian-filter-row
+                    class already laid out 6 fields with grid; we add
+                    inline-end actions next to it. */}
+                <div className="historian-filter-row historian-filter-row-tight">
                   <label>
                     From
                     <input
@@ -19157,45 +19439,50 @@ const getGatewayHealth = (gateway) => {
                       <option value="BAD">BAD</option>
                     </select>
                   </label>
-                </div>
-                <div className="row">
-                  <button
-                    className="btn btn-success"
-                    onClick={() =>
-                      downloadText(
-                        `historian_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`,
-                        toCsv(
-                          historianRows.map((r) => ({
-                            timestamp_local: fmtTs(r.ts),
-                            gateway: r.gateway_name || "",
-                            device: r.device_name || "",
-                            plc_ip: r.plc_ip || "",
-                            database: r.database_name || "",
-                            tag: r.tag,
-                            value: formatStandardValue(r.value, 3),
-                            quality: r.quality,
-                            quality_label: r.quality_label,
-                            source: r.source
-                          }))
-                        ),
-                        "text/csv;charset=utf-8"
-                      )
-                    }
-                  >
-                    Export CSV
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    onClick={() =>
-                      downloadText(
-                        `historian_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`,
-                        JSON.stringify(historianRows, null, 2),
-                        "application/json;charset=utf-8"
-                      )
-                    }
-                  >
-                    Export JSON
-                  </button>
+                  <div className="historian-filter-actions">
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={() => {
+                        // Force a fresh server pull. We don't have an
+                        // explicit refetch in scope here, but we can
+                        // bump the historian-poll tick so the next
+                        // render re-fetches.
+                        if (typeof window !== "undefined") {
+                          try { window.dispatchEvent(new CustomEvent("tn-historian-reload")); } catch (_) {}
+                        }
+                        // Defensive: trigger a re-evaluation of historianRows
+                        // by tickling the filters (identity change).
+                        setHistorianFilters((p) => ({ ...p }));
+                      }}
+                      title="Re-load historian data from disk"
+                    >
+                      Load
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={() => setHistorianFilters({
+                        from: "",
+                        to: "",
+                        tag: "",
+                        gatewayId: "",
+                        deviceName: "",
+                        quality: "all",
+                      })}
+                      title="Reset every filter"
+                    >
+                      Clean
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-success"
+                      onClick={() => setHistorianExportOpen(true)}
+                      title="Open the export window"
+                    >
+                      Export
+                    </button>
+                  </div>
                 </div>
               </section>
               <section className="card card-fill">
@@ -22070,6 +22357,188 @@ const getGatewayHealth = (gateway) => {
                 <span>OK</span>
               </button>
               <button className="btn btn-danger" onClick={() => setShowGatewayModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {historianExportOpen ? (
+        <div className="modal-backdrop">
+          <div className="modal-card modal-card-wide">
+            <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+              <h3 style={{ margin: 0 }}>Historian Export</h3>
+              <button className="btn btn-secondary btn-sm" onClick={() => setHistorianExportOpen(false)}>Close</button>
+            </div>
+            <p className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+              Configure the export — pick a format, choose / reorder columns, optionally use an Excel template with{" "}
+              <code>{"{{tag}}"}</code> / <code>{"{{value}}"}</code> / <code>{"{{ts}}"}</code> placeholders. Save templates for reuse.
+            </p>
+            <div className="form-grid" style={{ marginTop: 8 }}>
+              <label>
+                Format
+                <select
+                  value={historianExportFormat}
+                  onChange={(e) => setHistorianExportFormat(e.target.value)}
+                >
+                  <option value="csv">CSV (comma separated)</option>
+                  <option value="xlsx">Excel (.xlsx)</option>
+                  <option value="txt">Text (tab separated)</option>
+                  <option value="json">JSON</option>
+                </select>
+              </label>
+              <label>
+                Rows in current filter
+                <input value={historianRows.length.toLocaleString()} disabled />
+              </label>
+            </div>
+            <fieldset className="card" style={{ marginTop: 12, padding: 12 }}>
+              <legend style={{ padding: "0 6px", fontSize: 12 }}>Columns (drag to reorder, untick to hide)</legend>
+              <div style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+                gap: 8,
+              }}>
+                {historianExportColumns.map((col, idx) => (
+                  <div key={col.key} style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "6px 8px",
+                    border: "1px solid var(--stroke)",
+                    borderRadius: 6,
+                  }}>
+                    <input
+                      type="checkbox"
+                      checked={col.enabled !== false}
+                      onChange={() => setHistorianExportColumns((prev) => prev.map((c, i) => i === idx ? { ...c, enabled: !(c.enabled !== false) } : c))}
+                    />
+                    <input
+                      value={col.label}
+                      onChange={(e) => setHistorianExportColumns((prev) => prev.map((c, i) => i === idx ? { ...c, label: e.target.value } : c))}
+                      style={{ flex: 1, minWidth: 0, height: 30 }}
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      title="Move up"
+                      disabled={idx === 0}
+                      onClick={() => setHistorianExportColumns((prev) => {
+                        if (idx === 0) return prev;
+                        const next = [...prev];
+                        [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+                        return next;
+                      })}
+                      style={{ padding: "2px 8px" }}
+                    >↑</button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      title="Move down"
+                      disabled={idx === historianExportColumns.length - 1}
+                      onClick={() => setHistorianExportColumns((prev) => {
+                        if (idx === prev.length - 1) return prev;
+                        const next = [...prev];
+                        [next[idx + 1], next[idx]] = [next[idx], next[idx + 1]];
+                        return next;
+                      })}
+                      style={{ padding: "2px 8px" }}
+                    >↓</button>
+                  </div>
+                ))}
+              </div>
+            </fieldset>
+            {historianExportFormat === "xlsx" ? (
+              <fieldset className="card" style={{ marginTop: 12, padding: 12 }}>
+                <legend style={{ padding: "0 6px", fontSize: 12 }}>Excel template (optional)</legend>
+                <p className="muted" style={{ fontSize: 12 }}>
+                  Upload a styled <code>.xlsx</code>. Cells containing{" "}
+                  <code>{"{{ts}}"}</code> / <code>{"{{tag}}"}</code> / <code>{"{{value}}"}</code> etc. are replaced with row values.
+                  Mark a row with <code>{"{{#each}}"}</code> in column A and <code>{"{{/each}}"}</code> on a later row to indicate the data loop.
+                </p>
+                <div className="row" style={{ flexWrap: "wrap" }}>
+                  <input
+                    ref={historianXlsxFileRef}
+                    type="file"
+                    accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    onChange={onUploadHistorianXlsxTemplate}
+                  />
+                  {historianExportXlsxTemplate ? (
+                    <>
+                      <span className="ok-note" style={{ fontSize: 12 }}>
+                        Template loaded: {historianExportXlsxTemplate.name}
+                      </span>
+                      <button
+                        type="button"
+                        className="btn btn-danger btn-sm"
+                        onClick={() => setHistorianExportXlsxTemplate(null)}
+                      >
+                        Remove
+                      </button>
+                    </>
+                  ) : (
+                    <span className="muted" style={{ fontSize: 12 }}>No template uploaded — plain header + rows layout will be used.</span>
+                  )}
+                </div>
+              </fieldset>
+            ) : null}
+            <fieldset className="card" style={{ marginTop: 12, padding: 12 }}>
+              <legend style={{ padding: "0 6px", fontSize: 12 }}>Templates</legend>
+              <div className="row" style={{ flexWrap: "wrap" }}>
+                <input
+                  placeholder="Template name"
+                  value={historianExportTemplateName}
+                  onChange={(e) => setHistorianExportTemplateName(e.target.value)}
+                  style={{ flex: "1 1 220px", minWidth: 0 }}
+                />
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={saveHistorianTemplate}
+                  disabled={!historianExportTemplateName.trim()}
+                >
+                  Save template
+                </button>
+                <input
+                  ref={historianTemplateFileRef}
+                  type="file"
+                  accept="application/json,.json"
+                  style={{ display: "none" }}
+                  onChange={onUploadHistorianTemplate}
+                />
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={() => historianTemplateFileRef.current && historianTemplateFileRef.current.click()}
+                >
+                  Upload template (JSON)
+                </button>
+              </div>
+              <div style={{ marginTop: 8 }}>
+                {(historianExportTemplates || []).length === 0 ? (
+                  <span className="muted" style={{ fontSize: 12 }}>No saved templates yet.</span>
+                ) : (
+                  <div className="table">
+                    <div className="thead"><span>Name</span><span>Format</span><span>Columns</span><span>Action</span></div>
+                    {(historianExportTemplates || []).map((t, i) => (
+                      <div key={`tpl-${i}`} className="trow">
+                        <span><strong>{t.name}</strong></span>
+                        <span>{String(t.format || "csv").toUpperCase()}</span>
+                        <span className="muted">{Array.isArray(t.columns) ? `${t.columns.filter((c) => c.enabled !== false).length} cols` : "—"}</span>
+                        <span className="row-actions">
+                          <button type="button" className="btn btn-primary btn-sm" onClick={() => loadHistorianTemplate(t)}>Load</button>
+                          <button type="button" className="btn btn-secondary btn-sm" onClick={() => downloadHistorianTemplate(t)}>Download</button>
+                          <button type="button" className="btn btn-danger btn-sm" onClick={() => deleteHistorianTemplate(t.name)}>Delete</button>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </fieldset>
+            <div className="row modal-actions" style={{ marginTop: 12, justifyContent: "flex-end" }}>
+              <button className="btn btn-secondary" onClick={() => setHistorianExportOpen(false)} disabled={historianExportBusy}>Cancel</button>
+              <button className="btn btn-success" onClick={runHistorianExport} disabled={historianExportBusy}>
+                {historianExportBusy ? "Exporting..." : "Export"}
+              </button>
             </div>
           </div>
         </div>

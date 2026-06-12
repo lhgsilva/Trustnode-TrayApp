@@ -2676,6 +2676,13 @@ body {
   margin-bottom: 12px;
   align-items: end;
 }
+/* Tight variant — 6 filter fields + the inline actions column on
+   the right. Operator 2026-06-12: "should be in one row with all
+   same height size then in the end the actions buttons". */
+.historian-filter-row-tight {
+  grid-template-columns: repeat(6, minmax(0, 1fr)) auto;
+  align-items: end;
+}
 .historian-filter-row > label {
   display: flex;
   flex-direction: column;
@@ -2687,12 +2694,40 @@ body {
 .historian-filter-row select {
   width: 100%;
   min-width: 0;
+  height: 38px;
+  box-sizing: border-box;
+}
+.historian-filter-actions {
+  display: inline-flex;
+  align-items: end;
+  gap: 6px;
+  height: 38px;
+  align-self: end;
+}
+.historian-filter-actions .btn {
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+}
+@media (max-width: 1300px) {
+  .historian-filter-row-tight {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+  .historian-filter-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+    margin-top: 8px;
+  }
 }
 @media (max-width: 1100px) {
   .historian-filter-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .historian-filter-row-tight { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 640px) {
   .historian-filter-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .historian-filter-row-tight { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 .form-note {
