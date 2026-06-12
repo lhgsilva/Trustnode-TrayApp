@@ -2684,16 +2684,113 @@ const HISTORY_RANGES = [
   { label: "7d",  ms: 7 * 24 * 60 * 60_000 },
   { label: "All", ms: 0 },
 ];
+// Shared row decorator — mirrors the desktop's resolver: when the
+// stored gateway_name looks like a synthetic id (gw-12345...) the
+// gateway_id is used as a label fallback instead so the UI never
+// renders raw ids.
+function _liteDecorateHistRow(r) {
+  const storedLooksLikeId = /^gw-\d/.test(String(r?.gateway_name || ""));
+  const friendly = storedLooksLikeId
+    ? String(r?.gateway_id || "")
+    : (r?.gateway_name || r?.gateway_id || "");
+  return { ...r, gateway_name: friendly };
+}
+
+// CSV / TXT / JSON download helper for Lite.
+function _liteDownload(name, text, mime) {
+  const blob = new Blob([text], { type: mime || "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function _liteToCsv(rows) {
+  if (!rows.length) return "";
+  const headers = Object.keys(rows[0]);
+  const esc = (v) => {
+    if (v == null) return "";
+    const s = String(v);
+    if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  return [
+    headers.join(","),
+    ...rows.map((r) => headers.map((h) => esc(r[h])).join(",")),
+  ].join("\n");
+}
+
+// Same long/pivot reshaping the desktop uses, ported to JS.
+function _liteBuildExportRows(rows, pivot) {
+  if (!rows || !rows.length) return [];
+  if (pivot) {
+    const byTs = new Map();
+    const tagSet = new Set();
+    for (const r of rows) {
+      const ts = String(r.ts_utc || "");
+      const tag = String(r.tag_name || "");
+      if (!ts || !tag) continue;
+      tagSet.add(tag);
+      if (!byTs.has(ts)) byTs.set(ts, { _raw: r, _byTag: {} });
+      byTs.get(ts)._byTag[tag] = r;
+    }
+    const tags = [...tagSet].sort();
+    const sortedTs = [...byTs.keys()].sort();
+    return sortedTs.map((ts) => {
+      const bucket = byTs.get(ts);
+      const out = {
+        Timestamp: fmtTs(ts),
+        Gateway: bucket._raw.gateway_name || bucket._raw.gateway_id || "",
+        Device: bucket._raw.device_name || "",
+      };
+      for (const tag of tags) {
+        const s = bucket._byTag[tag];
+        out[tag] = s
+          ? (Number.isFinite(Number(s.value)) ? Number(s.value) : s.value)
+          : "";
+      }
+      return out;
+    });
+  }
+  return rows.map((r) => ({
+    Timestamp: fmtTs(r.ts_utc),
+    Tag: r.tag_name || "",
+    Value: Number.isFinite(Number(r.value)) ? Number(r.value) : r.value,
+    Quality: r.quality_label || (r.quality != null ? String(r.quality) : ""),
+    Device: r.device_name || "",
+    Gateway: r.gateway_name || r.gateway_id || "",
+  }));
+}
+
 function HistorianView() {
+  const [tab, setTab] = useState("live");
+  // ── LIVE STATE ────────────────────────────────────────────────
   const [rows, setRows] = useState(null);
   const [error, setError] = useState("");
   const [gwFilter, setGwFilter] = useState("");
   const [tagFilter, setTagFilter] = useState("");
   const [rangeMs, setRangeMs] = useState(60 * 60_000);
   const [limit, setLimit] = useState(300);
+
+  // ── EXPORT STATE ──────────────────────────────────────────────
+  const [exFrom, setExFrom] = useState("");
+  const [exTo, setExTo] = useState("");
+  const [exGw, setExGw] = useState("");
+  const [exTag, setExTag] = useState("");
+  const [exDevice, setExDevice] = useState("");
+  const [exServerRows, setExServerRows] = useState([]);
+  const [exLoadBusy, setExLoadBusy] = useState(false);
+  const [exLoadError, setExLoadError] = useState("");
+  const [exPivot, setExPivot] = useState(false);
+  const [exFormat, setExFormat] = useState("csv");
+
   const { pickedTenantId } = useContext(TenantScopeCtx);
 
+  // ── LIVE POLLER ───────────────────────────────────────────────
   useEffect(() => {
+    if (tab !== "live") return; // pause polling on Export tab
     let stop = false;
     const f = async () => {
       let q = applyTenantScope(
@@ -2708,26 +2805,18 @@ function HistorianView() {
         const from = new Date(Date.now() - rangeMs).toISOString();
         q = q.gte("ts_utc", from);
       }
-      if (gwFilter.trim())  q = q.ilike("gateway_id", `%${gwFilter.trim()}%`);
+      if (gwFilter.trim()) q = q.ilike("gateway_id", `%${gwFilter.trim()}%`);
       if (tagFilter.trim()) q = q.ilike("tag_name", `%${tagFilter.trim()}%`);
       const { data, error: e } = await q;
       if (stop) return;
       if (e) setError(e.message);
       else {
-        // Defense in depth — never display rows from another tenant.
-        setRows((data || []).filter(scopedTo(pickedTenantId)));
+        setRows((data || []).filter(scopedTo(pickedTenantId)).map(_liteDecorateHistRow));
         setError("");
       }
     };
     f();
-    // Faster cadence than before (was 5 s) so the table feels live even
-    // when the realtime channel is interrupted by Supabase free-tier
-    // backpressure. Cheap query — server-side index seek on (tenant_id,
-    // ts_utc DESC) with the row limit.
     const t = setInterval(f, 2000);
-    // Live append: every historian_readings INSERT for the scoped tenant
-    // is prepended into the table immediately. The 2 s poller above stays
-    // as a safety net to catch up if the realtime socket drops a window.
     const gwNeedle = gwFilter.trim().toLowerCase();
     const tagNeedle = tagFilter.trim().toLowerCase();
     const liveHandler = (r) => {
@@ -2742,9 +2831,6 @@ function HistorianView() {
         const tag = String(r.tag_name || "").toLowerCase();
         if (!tag.includes(tagNeedle)) return;
       }
-      // Respect the active time window — only prepend rows newer than the
-      // configured `from` bound so an "Last 1h" view doesn't suddenly start
-      // showing rows from outside the range.
       if (rangeMs > 0) {
         const fromMs = Date.now() - rangeMs;
         const tsMs = Date.parse(String(r.ts_utc || ""));
@@ -2752,7 +2838,8 @@ function HistorianView() {
       }
       setRows((prev) => {
         const cap = Math.max(20, Math.min(5000, Number(limit) || 300));
-        const next = [r, ...(Array.isArray(prev) ? prev : [])];
+        const decorated = _liteDecorateHistRow(r);
+        const next = [decorated, ...(Array.isArray(prev) ? prev : [])];
         return next.length > cap ? next.slice(0, cap) : next;
       });
     };
@@ -2763,69 +2850,212 @@ function HistorianView() {
       clearInterval(t);
       historianSubscribers.delete(liveHandler);
     };
-  }, [gwFilter, tagFilter, rangeMs, limit, pickedTenantId]);
+  }, [tab, gwFilter, tagFilter, rangeMs, limit, pickedTenantId]);
+
+  // ── EXPORT LOAD ───────────────────────────────────────────────
+  const runExportLoad = async () => {
+    setExLoadBusy(true); setExLoadError("");
+    try {
+      let q = applyTenantScope(
+        supabase
+          .from("historian_readings")
+          .select("gateway_id, gateway_name, device_name, tag_name, value, quality, quality_label, ts_utc, tenant_id"),
+        pickedTenantId,
+      )
+        .order("ts_utc", { ascending: false })
+        .limit(100000);
+      if (exFrom) q = q.gte("ts_utc", new Date(exFrom).toISOString());
+      if (exTo) q = q.lte("ts_utc", new Date(exTo).toISOString());
+      if (exGw.trim()) q = q.ilike("gateway_id", `%${exGw.trim()}%`);
+      if (exTag.trim()) q = q.ilike("tag_name", `%${exTag.trim()}%`);
+      if (exDevice.trim()) q = q.ilike("device_name", `%${exDevice.trim()}%`);
+      const { data, error: e } = await q;
+      if (e) throw e;
+      const decorated = (data || []).filter(scopedTo(pickedTenantId)).map(_liteDecorateHistRow);
+      setExServerRows(decorated);
+      if (!decorated.length) setExLoadError("No rows in the selected range.");
+    } catch (err) {
+      setExLoadError(`Load failed: ${err?.message || err || ""}`);
+      setExServerRows([]);
+    } finally { setExLoadBusy(false); }
+  };
+
+  const runExportClean = () => {
+    setExFrom(""); setExTo(""); setExGw(""); setExTag(""); setExDevice("");
+    setExServerRows([]); setExLoadError("");
+  };
+
+  const runExportDownload = () => {
+    const built = _liteBuildExportRows(exServerRows, exPivot);
+    if (!built.length) return;
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    if (exFormat === "json") {
+      _liteDownload(`historian_${stamp}.json`, JSON.stringify(built, null, 2), "application/json;charset=utf-8");
+    } else if (exFormat === "txt") {
+      const headers = Object.keys(built[0]);
+      const body = [headers.join("\t")]
+        .concat(built.map((r) => headers.map((h) => String(r[h] ?? "").replace(/[\r\n\t]+/g, " ")).join("\t")))
+        .join("\n");
+      _liteDownload(`historian_${stamp}.txt`, body, "text/plain;charset=utf-8");
+    } else {
+      _liteDownload(`historian_${stamp}.csv`, _liteToCsv(built), "text/csv;charset=utf-8");
+    }
+  };
+
+  const exportPreview = _liteBuildExportRows(exServerRows, exPivot).slice(0, 200);
+  const previewHeaders = exportPreview.length ? Object.keys(exportPreview[0]) : [];
 
   return h("div", null,
     h("div", { className: "section" },
       h("h2", null, "Historian"),
-      h("span", { className: "meta" }, rows ? `${rows.length} rows` : "")
     ),
-    // One-row filter bar
-    h("div", { className: "hist-filters" },
-      h("input", {
-        className: "hist-filter-input",
-        type: "text",
-        placeholder: "Gateway contains…",
-        value: gwFilter,
-        onChange: (e) => setGwFilter(e.target.value),
-      }),
-      h("input", {
-        className: "hist-filter-input",
-        type: "text",
-        placeholder: "Tag contains…",
-        value: tagFilter,
-        onChange: (e) => setTagFilter(e.target.value),
-      }),
-      h("div", { className: "seg" },
-        ...HISTORY_RANGES.map((opt) => h("button", {
-          key: opt.label,
-          className: `seg-btn ${rangeMs === opt.ms ? "active" : ""}`,
-          onClick: () => setRangeMs(opt.ms),
-        }, opt.label))
+    h("div", { className: "seg", style: { marginBottom: 12 } },
+      h("button", {
+        className: `seg-btn ${tab === "live" ? "active" : ""}`,
+        onClick: () => setTab("live"),
+      }, "Live Table"),
+      h("button", {
+        className: `seg-btn ${tab === "export" ? "active" : ""}`,
+        onClick: () => setTab("export"),
+      }, "Export"),
+    ),
+    tab === "live" ? h("div", null,
+      h("div", { className: "hist-filters" },
+        h("input", {
+          className: "hist-filter-input", type: "text",
+          placeholder: "Gateway contains…",
+          value: gwFilter,
+          onChange: (e) => setGwFilter(e.target.value),
+        }),
+        h("input", {
+          className: "hist-filter-input", type: "text",
+          placeholder: "Tag contains…",
+          value: tagFilter,
+          onChange: (e) => setTagFilter(e.target.value),
+        }),
+        h("div", { className: "seg" },
+          ...HISTORY_RANGES.map((opt) => h("button", {
+            key: opt.label,
+            className: `seg-btn ${rangeMs === opt.ms ? "active" : ""}`,
+            onClick: () => setRangeMs(opt.ms),
+          }, opt.label))
+        ),
+        h("select", {
+          className: "hist-filter-input",
+          value: String(limit),
+          onChange: (e) => setLimit(Number(e.target.value)),
+          title: "Max rows to fetch",
+        },
+          ...[100, 300, 500, 1000, 2000].map((n) =>
+            h("option", { key: n, value: String(n) }, `${n} rows`))
+        ),
+        (gwFilter || tagFilter) ? h("button", {
+          className: "btn-ghost hist-filter-clear",
+          onClick: () => { setGwFilter(""); setTagFilter(""); },
+        }, "Clear") : null,
       ),
-      h("select", {
-        className: "hist-filter-input",
-        value: String(limit),
-        onChange: (e) => setLimit(Number(e.target.value)),
-        title: "Max rows to fetch",
+      error ? h("div", { className: "banner" }, error) : null,
+      rows == null
+        ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…")
+        : !rows.length
+          ? h("div", { className: "empty" }, "no rows match the filters")
+          : h("div", { className: "hist-table-wrap" },
+              h("table", { className: "hist-table" },
+                h("thead", null, h("tr", null,
+                  h("th", null, "Time"), h("th", null, "Gateway"),
+                  h("th", null, "Tag"), h("th", null, "Value"), h("th", null, "Q"))),
+                h("tbody", null, ...rows.map((r, i) =>
+                  h("tr", { key: i },
+                    h("td", { "data-label": "Time" }, fmtTs(r.ts_utc)),
+                    h("td", { "data-label": "Gateway" }, r.gateway_name || r.gateway_id || "—"),
+                    h("td", { "data-label": "Tag" }, r.tag_name || "—"),
+                    h("td", { "data-label": "Value", className: "num" }, fmtVal(r.value)),
+                    h("td", { "data-label": "Quality" }, r.quality_label || (r.quality != null ? String(r.quality) : ""))
+                  )))
+              )
+            )
+    ) : h("div", null,
+      // EXPORT TAB
+      h("div", { className: "hist-filters", style: { flexWrap: "wrap" } },
+        h("input", {
+          className: "hist-filter-input", type: "datetime-local",
+          value: exFrom, onChange: (e) => setExFrom(e.target.value),
+          title: "From",
+        }),
+        h("input", {
+          className: "hist-filter-input", type: "datetime-local",
+          value: exTo, onChange: (e) => setExTo(e.target.value),
+          title: "To",
+        }),
+        h("input", {
+          className: "hist-filter-input", type: "text",
+          placeholder: "Gateway contains…", value: exGw,
+          onChange: (e) => setExGw(e.target.value),
+        }),
+        h("input", {
+          className: "hist-filter-input", type: "text",
+          placeholder: "Tag contains…", value: exTag,
+          onChange: (e) => setExTag(e.target.value),
+        }),
+        h("input", {
+          className: "hist-filter-input", type: "text",
+          placeholder: "Device contains…", value: exDevice,
+          onChange: (e) => setExDevice(e.target.value),
+        }),
+        h("select", {
+          className: "hist-filter-input",
+          value: exFormat, onChange: (e) => setExFormat(e.target.value),
+        },
+          h("option", { value: "csv" }, "CSV"),
+          h("option", { value: "txt" }, "TXT"),
+          h("option", { value: "json" }, "JSON"),
+        ),
+        h("button", {
+          className: "seg-btn",
+          disabled: exLoadBusy,
+          onClick: runExportLoad,
+        }, exLoadBusy ? "Loading…" : "Load"),
+        h("button", { className: "btn-ghost", onClick: runExportClean }, "Clean"),
+        h("button", {
+          className: "seg-btn active",
+          disabled: !exServerRows.length,
+          onClick: runExportDownload,
+        }, "Export"),
+      ),
+      h("label", {
+        className: "seg-btn",
+        style: { display: "inline-flex", alignItems: "center", gap: 6, marginTop: 8 },
       },
-        ...[100, 300, 500, 1000, 2000].map((n) => h("option", { key: n, value: String(n) }, `${n} rows`))
+        h("input", {
+          type: "checkbox",
+          checked: exPivot,
+          onChange: (e) => setExPivot(e.target.checked),
+          style: { margin: 0 },
+        }),
+        h("span", null, "Pivot mode — one column per tag, one row per timestamp"),
       ),
-      (gwFilter || tagFilter) ? h("button", {
-        className: "btn-ghost hist-filter-clear",
-        onClick: () => { setGwFilter(""); setTagFilter(""); },
-      }, "Clear") : null
-    ),
-    error ? h("div", { className: "banner" }, error) : null,
-    rows == null
-      ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…")
-      : !rows.length
-        ? h("div", { className: "empty" }, "no rows match the filters")
-        : h("div", { className: "hist-table-wrap" },
+      exLoadError ? h("div", { className: "banner" }, exLoadError) : null,
+      exServerRows.length
+        ? h("div", { className: "meta", style: { padding: "6px 0" } },
+            `Loaded ${exServerRows.length.toLocaleString()} row(s) · `,
+            `${exPivot ? "Pivot" : "Long"} mode preview below · `,
+            `Showing up to 200 of ${exportPreview.length} preview rows.`)
+        : h("div", { className: "meta", style: { padding: "6px 0" } },
+            "Set filters and click Load to populate the preview."),
+      exportPreview.length
+        ? h("div", { className: "hist-table-wrap" },
             h("table", { className: "hist-table" },
               h("thead", null, h("tr", null,
-                h("th", null, "Time"), h("th", null, "Gateway"),
-                h("th", null, "Tag"), h("th", null, "Value"), h("th", null, "Q"))),
-              h("tbody", null, ...rows.map((r, i) =>
-                h("tr", { key: i },
-                  h("td", { "data-label": "Time" }, fmtTs(r.ts_utc)),
-                  h("td", { "data-label": "Gateway" }, r.gateway_name || r.gateway_id || "—"),
-                  h("td", { "data-label": "Tag" }, r.tag_name || "—"),
-                  h("td", { "data-label": "Value", className: "num" }, fmtVal(r.value)),
-                  h("td", { "data-label": "Quality" }, r.quality_label || (r.quality != null ? String(r.quality) : ""))
-                )))
+                ...previewHeaders.map((c) => h("th", { key: `h-${c}` }, c)))),
+              h("tbody", null, ...exportPreview.map((row, ri) =>
+                h("tr", { key: `pr-${ri}` },
+                  ...previewHeaders.map((c) =>
+                    h("td", { key: `c-${ri}-${c}`, "data-label": c },
+                      row[c] == null ? "" : String(row[c]))))))
             )
           )
+        : null
+    )
   );
 }
 
