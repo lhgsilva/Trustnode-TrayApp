@@ -2289,6 +2289,13 @@ function AppShell() {
   // historianExportTemplates (array of {name, format, columns, ...}).
   const [historianExportOpen, setHistorianExportOpen] = useState(false);
   const [historianExportFormat, setHistorianExportFormat] = useState("csv");
+  // Pivot / wide mode. Operator request 2026-06-12: "a mode to
+  // export it when each tag is a different column and each line
+  // the timestamps". When ON, the dataset is reshaped from the
+  // default LONG layout (one row per sample, tag column) to a
+  // WIDE layout (one row per timestamp, one column per tag) —
+  // ideal for time-series analysis in Excel pivots / plotting.
+  const [historianExportPivot, setHistorianExportPivot] = useState(false);
   const [historianExportColumns, setHistorianExportColumns] = useState([
     { key: "timestamp_local", label: "Timestamp", enabled: true },
     { key: "tag", label: "Tag", enabled: true },
@@ -4447,7 +4454,12 @@ function AppShell() {
         // Surface so the operator can see that the very first
         // post-hydration fetch failed (often a startup race where the
         // backend hadn't bound port yet, or a stuck SQLite write lock).
-        if (!cancelled) {
+        // Same abort-suppression as the live poll below — operator
+        // 2026-06-12: aborts were terrifying ops without being real
+        // errors.
+        const msg = String(err?.name || "") + " " + String(err?.message || err || "");
+        const isAbort = /abort|signal\s*is\s*aborted|the operation was aborted/i.test(msg);
+        if (!cancelled && !isAbort) {
           setHistorianPollError(String(err?.message || err));
         }
       }
@@ -4484,7 +4496,17 @@ function AppShell() {
         // staring at an empty Historian table for hours with no clue
         // why. Now the error appears inline above the filter row and
         // the next tick still retries on its own.
-        if (!cancelled) {
+        // BUT — suppress AbortError / "signal is aborted". Operator
+        // 2026-06-12: "signal is aborted without reason" was a
+        // benign control-flow event triggered when the operator
+        // navigated, filtered, or the previous tick was still in
+        // flight at timeout. It scared users into thinking the
+        // historian was broken when in fact it kept ticking. We
+        // only show the error banner now for non-abort failures,
+        // and we ALWAYS clear it on the next successful poll.
+        const msg = String(err?.name || "") + " " + String(err?.message || err || "");
+        const isAbort = /abort|signal\s*is\s*aborted|the operation was aborted/i.test(msg);
+        if (!cancelled && !isAbort) {
           setHistorianPollError(String(err?.message || err));
         }
       } finally {
@@ -4492,7 +4514,10 @@ function AppShell() {
       }
     };
     tick();
-    const timer = setInterval(tick, 2000);
+    // 3 s polling instead of 2 s — gives the backend more headroom
+    // between ticks and reduces "previous still in flight" abort
+    // races when SQLite is under write pressure from the gateway.
+    const timer = setInterval(tick, 3000);
     return () => {
       cancelled = true;
       clearInterval(timer);
@@ -11636,6 +11661,71 @@ const getGatewayHealth = (gateway) => {
   // {{ts}} / {{#each}} / {{/each}} placeholders for fancy layouts.
   const buildHistorianExportRows = useCallback(() => {
     const enabledCols = (historianExportColumns || []).filter((c) => c.enabled !== false);
+
+    // ─── PIVOT (wide) mode ────────────────────────────────────────
+    // Reshape from one-row-per-sample to one-row-per-timestamp,
+    // with one column per distinct tag. The operator's enabled
+    // columns drive the leading metadata columns (timestamp,
+    // optionally device / gateway / database). Tag column header =
+    // operator-facing tag name (formatTagForDisplay) so the file
+    // looks like "DINT[2] | DINT[3] | REAL[2] | ...".
+    if (historianExportPivot) {
+      // Group rows by timestamp (millisecond resolution) so two
+      // samples written within the same ms — rare but possible —
+      // collapse into the same output row.
+      const byTs = new Map();
+      const tagSet = new Set();
+      for (const r of historianRows) {
+        const ts = String(r.ts || "");
+        const tag = String(r.tag || "");
+        if (!ts || !tag) continue;
+        tagSet.add(tag);
+        if (!byTs.has(ts)) byTs.set(ts, { _raw: r, _byTag: {} });
+        byTs.get(ts)._byTag[tag] = r;
+      }
+      // Sort tags alphabetically so the column order is stable.
+      const tags = [...tagSet].sort();
+      // Build the leading metadata columns from operator's enabled
+      // set. We keep the timestamp column AND any non-tag metadata
+      // they enabled (device / gateway / database / plc_ip / source
+      // / quality_label). Tag / value / value_raw / quality / quality
+      // columns are MEANINGLESS in pivot mode (they refer to a
+      // specific tag) so we drop them silently.
+      const leadingCols = enabledCols.filter((c) => ![
+        "tag", "value", "value_raw", "quality", "quality_label",
+      ].includes(c.key));
+      const sortedTimestamps = [...byTs.keys()].sort();
+      return sortedTimestamps.map((ts) => {
+        const bucket = byTs.get(ts);
+        const out = {};
+        for (const col of leadingCols) {
+          // Use any sample from the bucket — they share device /
+          // gateway / etc. unless the operator combined multiple
+          // gateways which they explicitly asked for.
+          const sample = bucket._raw;
+          switch (col.key) {
+            case "timestamp_local": out[col.label] = fmtTs(ts); break;
+            case "timestamp_utc": out[col.label] = ts; break;
+            case "device": out[col.label] = String(sample.device_name || ""); break;
+            case "gateway": out[col.label] = String(sample.gateway_name || sample.gateway_id || ""); break;
+            case "database": out[col.label] = String(sample.database_name || ""); break;
+            case "plc_ip": out[col.label] = String(sample.plc_ip || ""); break;
+            case "source": out[col.label] = String(sample.source || ""); break;
+            default: out[col.label] = String(sample[col.key] ?? "");
+          }
+        }
+        for (const tag of tags) {
+          const tagHeader = formatTagForDisplay(tag);
+          const sample = bucket._byTag[tag];
+          out[tagHeader] = sample
+            ? (Number.isFinite(Number(sample.value)) ? Number(sample.value) : sample.value)
+            : "";
+        }
+        return out;
+      });
+    }
+
+    // ─── LONG (default) mode ──────────────────────────────────────
     return historianRows.map((r) => {
       const out = {};
       for (const col of enabledCols) {
@@ -11657,7 +11747,7 @@ const getGatewayHealth = (gateway) => {
       }
       return out;
     });
-  }, [historianRows, historianExportColumns]);
+  }, [historianRows, historianExportColumns, historianExportPivot]);
 
   const runHistorianExport = useCallback(async () => {
     setHistorianExportBusy(true);
@@ -22474,6 +22564,30 @@ const getGatewayHealth = (gateway) => {
               <label>
                 Rows in current filter
                 <input value={historianRows.length.toLocaleString()} disabled />
+              </label>
+              <label className="dashboard-full-row" style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "6px 10px",
+                background: historianExportPivot ? "rgba(20,168,154,0.08)" : "transparent",
+                border: historianExportPivot ? "1px solid rgba(20,168,154,0.35)" : "1px solid var(--stroke)",
+                borderRadius: 8,
+                cursor: "pointer",
+                gridColumn: "1 / -1",
+              }}>
+                <input
+                  type="checkbox"
+                  checked={historianExportPivot}
+                  onChange={(e) => setHistorianExportPivot(e.target.checked)}
+                  style={{ margin: 0, width: 16, height: 16 }}
+                />
+                <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                  <strong style={{ fontSize: 13 }}>Pivot mode — one column per tag, one row per timestamp</strong>
+                  <span className="muted" style={{ fontSize: 11 }}>
+                    Reshape the dataset for time-series analysis. Tag / Value / Quality columns are hidden in this mode (the tag becomes the column header, the value becomes the cell).
+                  </span>
+                </span>
               </label>
             </div>
             <fieldset className="card" style={{ marginTop: 12, padding: 12 }}>
