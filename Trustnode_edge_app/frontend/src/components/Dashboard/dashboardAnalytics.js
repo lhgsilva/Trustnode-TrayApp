@@ -18,8 +18,14 @@ export function toTsMs(value) {
     const n = Number(raw);
     if (Number.isFinite(n)) return n < 1e12 ? n * 1000 : n;
   }
-  const direct = new Date(raw).getTime();
-  if (Number.isFinite(direct)) return direct;
+  // CRITICAL: do NOT use `new Date(raw).getTime()` as a fast path
+  // for ISO-like strings. Chrome interprets "2026-06-12 13:42:10"
+  // (the format the backend emits for ts_utc) as LOCAL wall-clock
+  // time, so the chart was systematically 1 hour off in BST/CET.
+  // Fall through to the explicit isoLike branch below which
+  // treats no-TZ strings as UTC (matches the ts_utc field name).
+  // Only fall back to `new Date(raw).getTime()` for FORMATS the
+  // regex doesn't recognize (e.g. RFC2822 / GMT-style strings).
 
   // Fallback 1: deterministic parse for
   // YYYY-MM-DD[ T]HH:mm:ss(.fraction)?(Z|±HH:MM)?
@@ -71,7 +77,14 @@ export function toTsMs(value) {
     const localMs = new Date(yyyy, mm, dd, hh, mi, ss).getTime();
     return Number.isFinite(localMs) ? localMs : Number.NaN;
   }
-  return Number.NaN;
+
+  // Last-resort: hand off to the platform Date parser. Covers
+  // RFC2822 / GMT-style strings the regex above doesn't model.
+  // Safe because we ONLY reach this branch when the explicit
+  // ISO and DD/MM/YYYY patterns didn't match — there's no
+  // ISO-like format here to be misread as local.
+  const fallback = new Date(raw).getTime();
+  return Number.isFinite(fallback) ? fallback : Number.NaN;
 }
 
 export function filterRowsByRange(rows, fromUtc, toUtc) {
