@@ -3055,6 +3055,14 @@ function AppShell() {
   // bypassed so the UI doesn't keep showing RUNNING for ~20 s because the
   // last DB write is still fresh.
   const userStoppedAtRef = useRef({});
+  // Per-gateway "we first saw it running at this wall-clock time"
+  // map. Used by the top-level Zombie banner to grace each
+  // freshly-started gateway for 30 s before complaining about no
+  // fresh check timestamp. Stored as a Map so we can .delete() the
+  // entry when a gateway transitions back to stopped, which prevents
+  // a stale stamp from suppressing the banner on a SECOND zombie
+  // event for the same gateway.
+  const gatewayRunningSinceRef = useRef(new Map());
   const cloudLastAcceptedTsByKeyRef = useRef(new Map());
   const cloudPollLogThrottleRef = useRef({ live: 0, aux: 0 });
   const powerHistoryLastFetchMsRef = useRef(0);
@@ -7924,12 +7932,35 @@ function AppShell() {
     const localLicense = edgeLicenseSnapshot?.license && typeof edgeLicenseSnapshot.license === "object"
       ? edgeLicenseSnapshot.license
       : {};
+    // Local "looks active" must actually check end_utc against now.
+    // Otherwise a cached snapshot from a license that has SINCE
+    // expired still tests as active and the modal lets the operator
+    // out. Bug seen 2026-06-12: operator's license expired but the
+    // local snapshot still said status=active + had end_utc in the
+    // past — the !out.ok / localLicenseLooksActive fallback flipped
+    // blocked=false and the modal vanished.
+    const _localEndStr = String(localLicense?.end_utc || "").trim();
+    const _localEndMs = _localEndStr ? Date.parse(_localEndStr) : NaN;
+    const _localNotPastEnd = Number.isFinite(_localEndMs)
+      ? _localEndMs > Date.now()
+      : false;
+    const _snapshotActiveAndFresh = Boolean(
+      edgeLicenseSnapshot?.ok &&
+      (() => {
+        const snapEnd = String(
+          edgeLicenseSnapshot?.license?.end_utc || ""
+        ).trim();
+        if (!snapEnd) return true; // perpetual / unbounded
+        const ms = Date.parse(snapEnd);
+        return !Number.isFinite(ms) || ms > Date.now();
+      })()
+    );
     const localLicenseLooksActive = Boolean(
-      edgeLicenseSnapshot?.ok ||
+      _snapshotActiveAndFresh ||
       (
         String(localLicense?.status || "").trim().toLowerCase() === "active" &&
         String(localLicense?.start_utc || "").trim() &&
-        String(localLicense?.end_utc || "").trim()
+        _localNotPastEnd
       )
     );
     if (!edgeId) {
@@ -8035,7 +8066,23 @@ function AppShell() {
         // best-effort; next poll will retry
       }
       if (!out?.ok) {
-        if (localLicenseLooksActive) {
+        // Hard-lock reasons override the local-license fallback. If
+        // the cloud explicitly says "expired / inactive / not found",
+        // we trust the cloud no matter what our cached snapshot says
+        // — the operator gets blocked until they renew or burn a
+        // trial. Soft reasons (cloud unreachable, transient error)
+        // still fall back to the local snapshot so a network blip
+        // doesn't trap the operator.
+        const hardReasons = new Set([
+          "license_expired",
+          "license_inactive",
+          "license_not_found",
+          "edge_not_found",
+        ]);
+        if (hardReasons.has(reason)) {
+          setLicenseGuardBlocked(true);
+          setLicenseGuardMessage(formatLicenseGuardReason(reason));
+        } else if (localLicenseLooksActive) {
           // Keep app usable from persisted local state; cloud check will run again on schedule.
           setLicenseGuardBlocked(false);
           setLicenseGuardMessage("License active");
@@ -15240,6 +15287,45 @@ const getGatewayHealth = (gateway) => {
     }
   };
 
+  // Enforce edge lockdown when the license hard-locks. Operator:
+  // "the edge is keeping working fine and should not". When the
+  // cloud says the license is truly gone (and no trial covers it),
+  // stop every running gateway so the plant doesn't keep collecting
+  // / writing on an invalid license. The actual stop call is
+  // best-effort; the modal stays up regardless until the operator
+  // takes action.
+  const _licenseHardLockedRef = useRef(false);
+  useEffect(() => {
+    const snapshotReason = String(edgeLicenseSnapshot?.reason || "").toLowerCase();
+    const messageText = String(licenseGuardMessage || "").toLowerCase();
+    const isHardLockReason =
+      snapshotReason === "license_expired" ||
+      snapshotReason === "license_inactive" ||
+      snapshotReason === "edge_not_found" ||
+      snapshotReason === "license_not_found" ||
+      messageText.includes("expired") ||
+      messageText.includes("inactive") ||
+      messageText.includes("not found");
+    const trialIsActive = Boolean(edgeTrialActive && edgeTrialActive.active);
+    const hardLocked = isHardLockReason && !trialIsActive;
+    // Fire once on the false → true edge so we don't keep hammering
+    // stop on every poll while the operator is reading the modal.
+    if (hardLocked && !_licenseHardLockedRef.current) {
+      _licenseHardLockedRef.current = true;
+      try {
+        const running = (gatewayConfigs || []).filter((g) => isGatewayRunning(g));
+        for (const g of running) {
+          // Fire-and-forget so an outage on one gateway doesn't block
+          // the others. errors here are non-fatal — the modal already
+          // tells the operator what to do.
+          stopGatewayInstance(String(g?.id || "")).catch(() => {});
+        }
+      } catch (_) { /* swallow */ }
+    } else if (!hardLocked && _licenseHardLockedRef.current) {
+      _licenseHardLockedRef.current = false;
+    }
+  }, [edgeLicenseSnapshot?.reason, licenseGuardMessage, edgeTrialActive, gatewayConfigs, isGatewayRunning]);
+
   // Emergency trial flow. Operator clicks the button when their
   // license has expired so the plant doesn't sit idle while
   // procurement renews; cloud records the grant, sets license-check
@@ -15830,20 +15916,34 @@ const getGatewayHealth = (gateway) => {
         <main className="content">
           <div className="content-scroll" style={{ paddingBottom: `${contentBottomPad}px` }}>
           {!isPortalOnly && error ? <div className="error">{error}</div> : null}
-          {/* Zombie-gateway banner. Operator request 2026-06-12: "the
-              gateway stops, but still says it is running, we need to
-              fix that". isGatewayRunning() already downgrades a stale
-              "running=true" runtime to false after 90 s without a
-              fresh check/write. Surface that as a banner so the
-              operator notices BEFORE they assume data is flowing. */}
+          {/* Zombie-gateway banner. Operator request 2026-06-12:
+              "the gateway stops, but still says it is running". We
+              ONLY surface this for gateways that have been "running"
+              for at least 30 s — otherwise the banner flashed for
+              one frame the moment the operator clicked Start
+              (running=true the instant the click fired, but the
+              first runtime poll hadn't landed yet so last_check_utc
+              was still empty). gatewayRunningSinceRef stamps when a
+              gateway first goes running so we can do that grace. */}
           {!isPortalOnly && Array.isArray(gatewayConfigsView) && gatewayConfigsView.length > 0 ? (() => {
+            const nowMs = Date.now();
+            const GRACE_AFTER_START_MS = 30000;
+            const STALE = 90000;
+            const stamps = gatewayRunningSinceRef.current;
             const zombies = gatewayConfigsView.filter((g) => {
               const rt = resolveGatewayRuntimeStatus(g);
-              if (!rt || rt.running !== true) return false;
-              const nowMs = Date.now();
+              if (!rt || rt.running !== true) {
+                // Not running anymore — clear the start stamp so
+                // a subsequent restart doesn't reuse a stale value.
+                stamps.delete(String(g?.id || ""));
+                return false;
+              }
+              const gid = String(g?.id || "");
+              if (!stamps.has(gid)) stamps.set(gid, nowMs);
+              const runningFor = nowMs - (stamps.get(gid) || nowMs);
+              if (runningFor < GRACE_AFTER_START_MS) return false;
               const lc = parseTimestampMs(String(rt.last_check_utc || ""));
               const lw = parseTimestampMs(String(rt.db_last_write_utc || ""));
-              const STALE = 90000;
               const recentCheck = Number.isFinite(lc) && (nowMs - lc) <= STALE;
               const recentWrite = Number.isFinite(lw) && (nowMs - lw) <= STALE;
               return !(recentCheck || recentWrite || hasFreshGatewayLiveSignal(g));
@@ -21100,27 +21200,35 @@ const getGatewayHealth = (gateway) => {
       ) : null}
       {(() => {
         // Hard-lock when the license is *expired* (or the cloud confirms
-        // a hard lock reason like license_inactive / edge_not_found).
+        // license_inactive / edge_not_found / license_not_found).
         // Operator request 2026-06-12: "if the license is expired we
         // should be locked to that popup screen until we activate or
-        // start the trial". The X dismiss / close button is hidden in
-        // hard-lock mode so the operator has to take a positive action
-        // — Activate or start a trial. Other guard reasons (cloud not
-        // reachable, snapshot missing) remain dismissable so a transient
-        // problem doesn't trap the operator out of the dashboard.
-        const reason = String(
-          edgeLicenseSnapshot?.reason || licenseGuardMessage || ""
-        ).toLowerCase();
+        // start the trial". The X close button is hidden in hard-lock
+        // mode so the operator has to take a positive action — Activate
+        // or start a trial. Other guard reasons (cloud not reachable,
+        // snapshot missing) remain dismissable so a transient problem
+        // doesn't trap the operator out of the dashboard.
+        const snapshotReason = String(edgeLicenseSnapshot?.reason || "").toLowerCase();
+        const messageText = String(licenseGuardMessage || "").toLowerCase();
         const isHardLockReason =
-          reason.includes("expired") ||
-          reason.includes("license_inactive") ||
-          reason.includes("edge_not_found") ||
-          reason.includes("license_not_found") ||
-          (licenseGuardMessage || "").toLowerCase().includes("expired");
-        const hardLocked = isHardLockReason && !(edgeTrialActive && edgeTrialActive.active);
+          snapshotReason === "license_expired" ||
+          snapshotReason === "license_inactive" ||
+          snapshotReason === "edge_not_found" ||
+          snapshotReason === "license_not_found" ||
+          messageText.includes("expired") ||
+          messageText.includes("inactive") ||
+          messageText.includes("not found");
+        const trialIsActive = Boolean(edgeTrialActive && edgeTrialActive.active);
+        const hardLocked = isHardLockReason && !trialIsActive;
+        // shouldShowModal: hard-lock OVERRIDES blocked=false. The
+        // license-check effect briefly flips blocked back to false
+        // before re-flipping to true during cloud probe retries; if
+        // we keyed the modal off blocked alone, the X click escaped
+        // the lock during that 50 ms window. Hard-lock forces the
+        // modal regardless and ignores licenseGuardDismissed too.
         const shouldShowModal =
-          !isPortalOnly && currentUser && !isHostedWebClient && licenseGuardBlocked &&
-          (hardLocked || !licenseGuardDismissed);
+          !isPortalOnly && currentUser && !isHostedWebClient &&
+          (hardLocked || (licenseGuardBlocked && !licenseGuardDismissed));
         if (!shouldShowModal) return null;
         return (
         <div className="modal-backdrop license-guard-backdrop">
