@@ -1746,28 +1746,32 @@
   min-width: 0;
 }
 
-/* Slide toggle — operator request 2026-06-12: the configure modal
-   checkboxes for Hide title bar and Manual Y axis should look like
-   slide buttons, with the toggle and the text on the SAME row, no
-   surrounding helper text. The wrapping label uses inline-flex with
-   high-specificity selectors that beat the global `label { display:
-   grid }`. The visual toggle is a 36x18 pill with a sliding 14px
-   knob; the underlying <input type="checkbox"> is visually hidden
-   but still receives clicks via the label's standard a11y wiring. */
-label.dashboard-slide-toggle {
-  display: inline-flex !important;
+/* Slide toggle — operator request 2026-06-12 (re-rev): the configure
+   modal checkboxes for Hide title bar and Manual Y axis must render
+   as a pill slider on the LEFT and the label text on the RIGHT, on
+   the SAME row, both centered horizontally inside the modal. The
+   previous attempt wrapped in <label> which inherited the global
+   `label { display: grid }` rule; the !important didn't always win
+   when the modal's local form-grid added its own display rule. This
+   revision wraps in a <div>, so there's no global rule to fight.
+   Centered horizontally via margin: 0 auto on the wrapper. */
+.dashboard-slide-toggle {
+  display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: center;
+  gap: 12px;
   cursor: pointer;
-  padding: 4px 0;
+  padding: 6px 0;
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
   text-transform: none;
   letter-spacing: 0;
   user-select: none;
+  margin: 4px auto;
+  width: 100%;
 }
-label.dashboard-slide-toggle > input[type="checkbox"] {
+.dashboard-slide-toggle > input[type="checkbox"] {
   /* Visually hidden but keyboard-focusable. The track + knob below
      are the visible affordance. */
   position: absolute;
@@ -1780,17 +1784,19 @@ label.dashboard-slide-toggle > input[type="checkbox"] {
   clip: rect(0 0 0 0);
   white-space: nowrap;
 }
-label.dashboard-slide-toggle > .slide-track {
+.dashboard-slide-toggle > .slide-track {
   position: relative;
-  flex: 0 0 36px;
-  width: 36px;
-  height: 18px;
+  flex: 0 0 38px;
+  width: 38px;
+  height: 20px;
   border-radius: 999px;
-  background: var(--stroke, rgba(255,255,255,0.18));
+  background: var(--stroke, rgba(138, 152, 171, 0.35));
   transition: background 140ms ease;
   display: inline-block;
+  border: 1px solid rgba(138, 152, 171, 0.45);
+  box-sizing: border-box;
 }
-label.dashboard-slide-toggle > .slide-track::after {
+.dashboard-slide-toggle > .slide-track::after {
   content: "";
   position: absolute;
   top: 2px;
@@ -1802,19 +1808,21 @@ label.dashboard-slide-toggle > .slide-track::after {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
   transition: transform 140ms ease;
 }
-label.dashboard-slide-toggle > input[type="checkbox"]:checked + .slide-track {
+.dashboard-slide-toggle > input[type="checkbox"]:checked + .slide-track {
   background: var(--teal, #14a89a);
+  border-color: var(--teal, #14a89a);
 }
-label.dashboard-slide-toggle > input[type="checkbox"]:checked + .slide-track::after {
+.dashboard-slide-toggle > input[type="checkbox"]:checked + .slide-track::after {
   transform: translateX(18px);
 }
-label.dashboard-slide-toggle > input[type="checkbox"]:focus-visible + .slide-track {
+.dashboard-slide-toggle > input[type="checkbox"]:focus-visible + .slide-track {
   outline: 2px solid var(--teal, #14a89a);
   outline-offset: 2px;
 }
-label.dashboard-slide-toggle > .slide-label {
-  flex: 1 1 auto;
+.dashboard-slide-toggle > .slide-label {
+  flex: 0 1 auto;
   text-transform: none;
   letter-spacing: 0;
   color: var(--text);
+  text-align: left;
 }

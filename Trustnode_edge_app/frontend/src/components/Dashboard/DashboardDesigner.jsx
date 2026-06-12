@@ -1244,6 +1244,51 @@ export function DashboardDesigner({
     }
   };
 
+  // Import a widget configuration from a previously-downloaded JSON
+  // file (the per-widget export button writes one). Merges the file's
+  // payload into the currently-open form, preserving id/position so
+  // the widget doesn't jump or replace another. Used from the modal
+  // tab strip via the small upload icon next to Configure.
+  const widgetImportFileRef = useRef(null);
+  const [widgetImportNotice, setWidgetImportNotice] = useState("");
+  const onImportWidgetFile = async (e) => {
+    const file = e?.target?.files?.[0];
+    if (!file) return;
+    setWidgetImportNotice("");
+    try {
+      const txt = await file.text();
+      const parsed = JSON.parse(txt);
+      const incoming = parsed && typeof parsed === "object" && parsed.widget && typeof parsed.widget === "object"
+        ? parsed.widget
+        : parsed && typeof parsed === "object" && parsed.config && typeof parsed.config === "object"
+          ? parsed
+          : null;
+      if (!incoming) throw new Error("File does not contain a widget object");
+      const incomingCfg = (incoming.config && typeof incoming.config === "object") ? incoming.config : {};
+      setForm((p) => ({
+        ...p,
+        // Adopt the imported type / title / color / size but never the
+        // imported id (would clash if the operator imports back into the
+        // same dashboard) and never the imported position (let the grid
+        // keep where the widget already lives, OR fill the first slot for
+        // a brand-new widget — both work because form.x/y stay as-is).
+        type: typeof incoming.type === "string" && incoming.type ? incoming.type : p.type,
+        title: typeof incoming.title === "string" && incoming.title ? incoming.title : p.title,
+        color: typeof incoming.color === "string" && incoming.color ? incoming.color : p.color,
+        w: Number.isFinite(Number(incoming.w)) ? Number(incoming.w) : p.w,
+        h: Number.isFinite(Number(incoming.h)) ? Number(incoming.h) : p.h,
+        config: { ...(p.config || {}), ...incomingCfg },
+      }));
+      setTab("config");
+      setWidgetImportNotice(`Imported from ${file.name}`);
+    } catch (err) {
+      setWidgetImportNotice(`Failed: ${String(err?.message || err || "import error").slice(0, 120)}`);
+    } finally {
+      // Reset value so re-picking the SAME file fires onChange again.
+      if (widgetImportFileRef.current) widgetImportFileRef.current.value = "";
+    }
+  };
+
   /**
    * Clone an existing widget with all its config (tag, axes, series_extra,
    * colors, query options). Asks the operator for an optional replacement
@@ -2061,6 +2106,39 @@ export function DashboardDesigner({
               <button className={`dashboard-pill ${tab === "config" ? "active" : ""}`} onClick={() => setTab("config")} type="button">
                 Configure
               </button>
+              {/* Operator request 2026-06-12: a small import icon next
+                  to Configure that loads a JSON file produced by the
+                  per-widget download button. Reads + parses on the
+                  client, then merges fields into form (preserving the
+                  widget's own id/position so importing doesn't move
+                  it). Hidden <input type="file"> keeps the trigger
+                  visually a clean icon button. */}
+              <input
+                ref={widgetImportFileRef}
+                type="file"
+                accept="application/json,.json"
+                style={{ display: "none" }}
+                onChange={onImportWidgetFile}
+              />
+              <button
+                type="button"
+                className="dashboard-pill"
+                onClick={() => widgetImportFileRef.current && widgetImportFileRef.current.click()}
+                title="Import widget configuration (JSON file)"
+                aria-label="Import widget configuration"
+                style={{ padding: "6px 10px" }}
+              >
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M12 3v12" />
+                  <path d="m17 8-5-5-5 5" />
+                  <path d="M5 21h14" />
+                </svg>
+              </button>
+              {widgetImportNotice ? (
+                <span className={`muted ${widgetImportNotice.startsWith("Failed") ? "error" : ""}`} style={{ fontSize: 12, alignSelf: "center", marginLeft: 6 }}>
+                  {widgetImportNotice}
+                </span>
+              ) : null}
             </div>
 
             {tab === "type" ? (
@@ -2103,20 +2181,39 @@ export function DashboardDesigner({
                     Lets the operator strip the card chrome so the body
                     uses the full footprint, which is what an industrial
                     HMI usually wants. */}
-                <label className="dashboard-slide-toggle dashboard-full-row">
+                {/* Slide toggle: <div> wrapper instead of <label> so the
+                    global `label { display: grid }` rule doesn't fight
+                    our flex layout. Click flips the underlying hidden
+                    checkbox. */}
+                <div
+                  className="dashboard-slide-toggle dashboard-full-row"
+                  onClick={() => setForm((p) => ({
+                    ...p,
+                    config: { ...p.config, hide_widget_header: !Boolean(p.config?.hide_widget_header) },
+                  }))}
+                  role="switch"
+                  aria-checked={Boolean(form.config?.hide_widget_header)}
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === " " || e.key === "Enter") {
+                      e.preventDefault();
+                      setForm((p) => ({
+                        ...p,
+                        config: { ...p.config, hide_widget_header: !Boolean(p.config?.hide_widget_header) },
+                      }));
+                    }
+                  }}
+                >
                   <input
                     type="checkbox"
                     checked={Boolean(form.config?.hide_widget_header)}
-                    onChange={(e) =>
-                      setForm((p) => ({
-                        ...p,
-                        config: { ...p.config, hide_widget_header: e.target.checked },
-                      }))
-                    }
+                    onChange={() => {}}
+                    tabIndex={-1}
+                    aria-hidden="true"
                   />
                   <span className="slide-track" aria-hidden="true" />
                   <span className="slide-label">Hide widget title bar</span>
-                </label>
+                </div>
                 {/* Body text scale used by dividers / fixed_text / table_list
                     captions / KPI labels. Range 0.6..2.5 covers the usual
                     "shrink to fit a card" and "make this label readable
@@ -2289,27 +2386,45 @@ export function DashboardDesigner({
                       {numField(kStep, "tick step")}
                     </div>
                   );
+                  const toggleManualY = () => {
+                    setForm((p) => {
+                      const now = String(p.config?.y_axis_mode || "auto").toLowerCase() === "manual";
+                      const next = !now;
+                      return {
+                        ...p,
+                        config: {
+                          ...p.config,
+                          y_axis_mode: next ? "manual" : "auto",
+                          y_right_axis_mode: next ? "manual" : "auto",
+                        },
+                      };
+                    });
+                  };
                   return (
                     <div className="dashboard-full-row">
-                      <label className="dashboard-slide-toggle">
+                      <div
+                        className="dashboard-slide-toggle"
+                        onClick={toggleManualY}
+                        role="switch"
+                        aria-checked={manualOn}
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (e.key === " " || e.key === "Enter") {
+                            e.preventDefault();
+                            toggleManualY();
+                          }
+                        }}
+                      >
                         <input
                           type="checkbox"
                           checked={manualOn}
-                          onChange={(e) => {
-                            const manual = e.target.checked;
-                            setForm((p) => ({
-                              ...p,
-                              config: {
-                                ...p.config,
-                                y_axis_mode: manual ? "manual" : "auto",
-                                y_right_axis_mode: manual ? "manual" : "auto",
-                              },
-                            }));
-                          }}
+                          onChange={() => {}}
+                          tabIndex={-1}
+                          aria-hidden="true"
                         />
                         <span className="slide-track" aria-hidden="true" />
                         <span className="slide-label">Manual Y axis scale</span>
-                      </label>
+                      </div>
                       {manualOn ? (
                         <>
                           {axisRow("Left axis", "y_min", "y_max", "y_tick_step")}

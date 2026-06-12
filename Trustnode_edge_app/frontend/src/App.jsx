@@ -8559,6 +8559,38 @@ function AppShell() {
     return pickBest(nameMatches);
   }
 
+// Hysteresis cache for gateway health labels. Keyed by gateway id;
+// stores the timestamp the gateway FIRST entered a failing state. We
+// only surface "Fails" labels once the failure has persisted for
+// ≥ 3 s — that way transient single-cycle hiccups (one missed Modbus
+// read, one DB write blip) don't flash a red Device + DB Fails badge
+// at the operator. The "ok" → "fails" cooldown also runs the reverse:
+// once we go back to ok=true we clear the cached failure ts. Refs
+// avoid extra re-renders.
+const _gatewayHealthHystRef = (typeof window !== "undefined")
+  ? (window.__tnGatewayHealthHyst = window.__tnGatewayHealthHyst || { failedSince: new Map() })
+  : { failedSince: new Map() };
+const _hysteresisFailDelayMs = 3000;
+const _applyHealthHysteresis = (gid, fresh) => {
+  if (!gid) return fresh;
+  const map = _gatewayHealthHystRef.failedSince;
+  if (fresh.ok) {
+    if (map.has(gid)) map.delete(gid);
+    return fresh;
+  }
+  const since = map.get(gid);
+  const nowMs = Date.now();
+  if (!since) {
+    map.set(gid, nowMs);
+    // Mask the failure on first observation — present "Checking..." so
+    // the operator doesn't see the badge slam to red on every poll.
+    return { ok: true, label: "Checking...", reason: fresh.reason };
+  }
+  if (nowMs - since < _hysteresisFailDelayMs) {
+    return { ok: true, label: "Checking...", reason: fresh.reason };
+  }
+  return fresh;
+};
 const getGatewayHealth = (gateway) => {
     if (!gateway) return { ok: false, label: "Not Ready" };
     const runtimeStatus = resolveGatewayRuntimeStatus(gateway);
@@ -8600,10 +8632,11 @@ const getGatewayHealth = (gateway) => {
     if (!db) reasons.push("No database connection assigned to this gateway.");
     else if (!db.connection_ok) reasons.push(`DB "${db.name || db.id}" (${db.engine || ""}) test: ${(db.last_test || "no detail").slice(0, 200)}`);
     const reasonText = reasons.join("\n") || "All checks passed.";
-    if (!plcOk && !dbOk) return { ok: false, label: "Device + DB Fails", reason: reasonText };
-    if (!plcOk) return { ok: false, label: "Device Fails", reason: reasonText };
-    if (!dbOk) return { ok: false, label: "DB Fails", reason: reasonText };
-    return { ok: true, label: "Ready", reason: reasonText };
+    const gid = String(gateway?.id || "");
+    if (!plcOk && !dbOk) return _applyHealthHysteresis(gid, { ok: false, label: "Device + DB Fails", reason: reasonText });
+    if (!plcOk) return _applyHealthHysteresis(gid, { ok: false, label: "Device Fails", reason: reasonText });
+    if (!dbOk) return _applyHealthHysteresis(gid, { ok: false, label: "DB Fails", reason: reasonText });
+    return _applyHealthHysteresis(gid, { ok: true, label: "Ready", reason: reasonText });
   };
 
   const getDbWritingLabel = (dbId) => {
@@ -8864,12 +8897,15 @@ const getGatewayHealth = (gateway) => {
     return Math.max(0, Date.now() - tsMs) <= maxAgeMs;
   };
 
+  // Ring of previous-tick samples so we can derive a per-second rate
+  // for each gateway's writes counter. Operator request 2026-06-12:
+  // the footer should show writes-per-interval, not the running
+  // accumulated total — at 1 sample/s the accumulated number becomes
+  // useless after a few minutes and the operator can't tell whether
+  // the gateway is actually pumping. We track the previous (count,
+  // ts) per gateway and compute rate at render time.
+  const gatewayWriteSamplesRef = useRef(new Map());
   const getGatewayFooterDbWriting = (gateway) => {
-    // Power-meter "gateways" don't use a PLC DB sink — power_manager writes
-    // straight to the local app-store historian (and optionally mirrors to
-    // an additional sink chosen on the meter form). Surface that explicitly
-    // so the footer doesn't claim "No DB selected" while data IS flowing
-    // into the historian behind the scenes.
     if (gateway?.power_meter === true || String(gateway?.gateway_type || "") === "modbus_tcp_meter") {
       const did = String(gateway?.id || "");
       const st = powerDeviceStatuses?.[did] || {};
@@ -8884,13 +8920,39 @@ const getGatewayHealth = (gateway) => {
     const dbName = db?.name || "Unknown DB";
     const runtimeStatus = resolveGatewayRuntimeStatus(gateway);
     const writes = Number(runtimeStatus?.db_write_count || 0);
-    const pending = Number(runtimeStatus?.db_pending_count || 0);
     const lastCheckUtc = String(runtimeStatus?.last_check_utc || "");
+    // Compute writes/s from the delta vs the last observation. First
+    // observation seeds the cache and shows "—" until a second sample
+    // arrives so we don't print a misleading "writes/s" off a single
+    // datapoint.
+    const gid = String(gateway?.id || "");
+    const sampleMap = gatewayWriteSamplesRef.current;
+    const prev = sampleMap.get(gid);
+    const nowMs = Date.now();
+    let rateLabel = "—";
+    if (prev && Number.isFinite(prev.writes) && Number.isFinite(prev.tsMs)) {
+      const dCount = writes - prev.writes;
+      const dMs = nowMs - prev.tsMs;
+      if (dMs > 250) {
+        // Show in writes/s rounded to one decimal when sub-10, integer above.
+        const rate = (dCount / dMs) * 1000;
+        if (Number.isFinite(rate) && rate >= 0) {
+          rateLabel = rate < 10 ? `${rate.toFixed(1)} w/s` : `${Math.round(rate)} w/s`;
+        }
+      } else {
+        rateLabel = prev.lastRate || "—";
+      }
+    }
+    sampleMap.set(gid, {
+      writes,
+      tsMs: nowMs,
+      lastRate: rateLabel,
+    });
     if (isHostedWebClient && endpointMode === "cloud") {
       const cloudState = isFreshCloudTs(lastCheckUtc, 15000) ? "LIVE" : "STALE";
-      return `${dbName} | Rows ${writes} | Pending ${pending} | ${cloudState}`;
+      return `${dbName} | ${rateLabel} | ${cloudState}`;
     }
-    return `${dbName} | Writes ${writes} | Pending ${pending}`;
+    return `${dbName} | ${rateLabel}`;
   };
   const dbOverviewStats = useMemo(() => {
     const total = dbConnections.length;
@@ -9237,7 +9299,19 @@ const getGatewayHealth = (gateway) => {
     const recentlyStoppedByUser = stoppedAtMs > 0 && (nowMs - stoppedAtMs) <= 10000;
     if (runtimeStatus && typeof runtimeStatus.running === "boolean") {
       if (recentlyStoppedByUser && runtimeStatus.running === false) return false;
-      if (runtimeStatus.running === true) return true;
+      if (runtimeStatus.running === true) {
+        // Zombie detection: the backend says running, but if neither a
+        // fresh write NOR a fresh check timestamp has arrived in
+        // 90 s the worker thread has almost certainly died. Operator
+        // request 2026-06-12: "the gateway stops, but still says it is
+        // running". Treat that as STOPPED so the UI matches reality;
+        // the backend status will catch up on its next poll.
+        const STALE_RUNNING_MS = 90000;
+        const recentCheck = Number.isFinite(lastCheckMs) && (nowMs - lastCheckMs) <= STALE_RUNNING_MS;
+        const recentWrite = Number.isFinite(lastWriteMs) && (nowMs - lastWriteMs) <= STALE_RUNNING_MS;
+        if (recentCheck || recentWrite || hasFreshGatewayLiveSignal(gateway)) return true;
+        return false;
+      }
       if (hasFreshRuntimeWrite) return true;
       // If live points are still arriving for this gateway, keep UI state RUNNING.
       if (hasFreshGatewayLiveSignal(gateway)) return true;
@@ -10368,13 +10442,22 @@ const getGatewayHealth = (gateway) => {
         });
         return;
       }
-      setError(`Start gateway failed: ${errText}`);
+      // Translate the bare "Failed to fetch" wall-of-text into a
+      // line operators can act on: the backend either didn't respond
+      // (process dead, port blocked, antivirus quarantining the EXE)
+      // or returned a real reason in errText. We keep errText when
+      // it's substantive and replace the boilerplate browser error.
+      const rawErr = String(errText || "").trim();
+      const friendlyErr = /failed to fetch|networkerror|load failed/i.test(rawErr)
+        ? "Backend service is not responding. Restart TrustNode or check that trustnode-service.exe is allowed by your antivirus / firewall."
+        : rawErr || "unknown error";
+      setError(`Start gateway failed: ${friendlyErr}`);
       addAppLog({
         level: "error",
         category: "gateway",
         gateway_id: gateway.id,
         gateway_name: gateway.name || gateway.id,
-        message: `Start failed: ${errText}`
+        message: `Start failed: ${friendlyErr}`,
       });
     }
   };
@@ -10435,12 +10518,16 @@ const getGatewayHealth = (gateway) => {
       // Stop RPC failed — revert the optimistic flip so the UI reflects reality.
       markGatewayRunningState(stopIds, true);
       refreshGatewayRuntimes().catch(() => {});
-      setError(`Stop gateway failed: ${String(err)}`);
+      const rawErr = String(err?.message || err || "");
+      const friendlyErr = /failed to fetch|networkerror|load failed/i.test(rawErr)
+        ? "Backend service is not responding. The gateway may still be running on the backend; restart TrustNode and try again."
+        : rawErr || "unknown error";
+      setError(`Stop gateway failed: ${friendlyErr}`);
       addAppLog({
         level: "error",
         category: "gateway",
         gateway_id: gatewayId,
-        message: `Stop failed: ${String(err)}`
+        message: `Stop failed: ${friendlyErr}`
       });
     }
   };
@@ -15743,6 +15830,35 @@ const getGatewayHealth = (gateway) => {
         <main className="content">
           <div className="content-scroll" style={{ paddingBottom: `${contentBottomPad}px` }}>
           {!isPortalOnly && error ? <div className="error">{error}</div> : null}
+          {/* Zombie-gateway banner. Operator request 2026-06-12: "the
+              gateway stops, but still says it is running, we need to
+              fix that". isGatewayRunning() already downgrades a stale
+              "running=true" runtime to false after 90 s without a
+              fresh check/write. Surface that as a banner so the
+              operator notices BEFORE they assume data is flowing. */}
+          {!isPortalOnly && Array.isArray(gatewayConfigsView) && gatewayConfigsView.length > 0 ? (() => {
+            const zombies = gatewayConfigsView.filter((g) => {
+              const rt = resolveGatewayRuntimeStatus(g);
+              if (!rt || rt.running !== true) return false;
+              const nowMs = Date.now();
+              const lc = parseTimestampMs(String(rt.last_check_utc || ""));
+              const lw = parseTimestampMs(String(rt.db_last_write_utc || ""));
+              const STALE = 90000;
+              const recentCheck = Number.isFinite(lc) && (nowMs - lc) <= STALE;
+              const recentWrite = Number.isFinite(lw) && (nowMs - lw) <= STALE;
+              return !(recentCheck || recentWrite || hasFreshGatewayLiveSignal(g));
+            });
+            if (zombies.length === 0) return null;
+            const names = zombies.map((g) => g?.name || g?.id || "?").join(", ");
+            return (
+              <div className="error" style={{ marginBottom: 10 }}>
+                <strong>Gateway not collecting:</strong> {names}.
+                The backend reported it as RUNNING, but no fresh sample or check
+                arrived in 90 s. The worker may have died — open
+                Gateway and Edge Control to stop and restart it.
+              </div>
+            );
+          })() : null}
           {!isPortalOnly && status?.db_last_error ? (
             isTransientCloudDbError(status.db_last_error) ? (
               <div className="lock-note">

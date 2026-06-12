@@ -1171,6 +1171,32 @@ function LiveTagChart({
       lastTs: -Infinity,
     }));
 
+    // Append a synthetic "now" trailing tick so a stalled gateway shows
+    // as a real-time gap rather than an indefinite carry-forward line.
+    // Operator request 2026-06-12: "the gap when the gateway didn't
+    // collect data is only shown in historical, should also in live".
+    // We only add this tick when (a) we already have at least one
+    // sample and (b) the latest sample is older than the smallest
+    // per-series gap threshold — otherwise the chart's right edge
+    // would shimmer for normal-cadence streams. The synthetic row
+    // doesn't widen the array beyond capacity because it replaces
+    // the trailing position in `sorted`.
+    const nowMs = (typeof performance !== "undefined" && typeof performance.now === "function")
+      ? Date.now()
+      : Date.now();
+    if (sorted.length > 0) {
+      const latestKnown = sorted[sorted.length - 1];
+      let minGap = Infinity;
+      for (const v of gapByIdMs.values()) {
+        if (Number.isFinite(v) && v < minGap) minGap = v;
+      }
+      if (!Number.isFinite(minGap)) minGap = Math.max(5000, pollMs * 10);
+      if (nowMs - latestKnown > minGap && nowMs > latestKnown) {
+        sorted.push(nowMs);
+        if (sorted.length > capacity) sorted = sorted.slice(-capacity);
+      }
+    }
+
     const rows = [];
     for (let i = 0; i < sorted.length; i += 1) {
       const tsMs = sorted[i];
