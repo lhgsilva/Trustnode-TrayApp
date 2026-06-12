@@ -688,11 +688,19 @@ function buildXAxisProps(series, cfg) {
   const angle = Number.isFinite(angleRaw) ? angleRaw : 0;
   const rotated = angle === 0
     ? { height: mobile ? 18 : undefined }
-    : {
-        angle,
-        textAnchor: angle < 0 ? "end" : "start",
-        height: Math.abs(angle) >= 75 ? 60 : 44,
-      };
+    : (() => {
+        // Match edge LiveTagChart heights so cloud share-links and
+        // desktop dashboards reserve the same vertical strip for
+        // rotated tick labels — keeps the plot area as tall as
+        // possible while still letting 90° YYYY-MM-DD HH:MM fit.
+        const a = Math.abs(angle);
+        const h = a < 35 ? 30 : a < 60 ? 40 : a < 80 ? 48 : 56;
+        return {
+          angle,
+          textAnchor: angle < 0 ? "end" : "start",
+          height: h,
+        };
+      })();
   return {
     dataKey: "idx",
     tickFormatter: (v) => {

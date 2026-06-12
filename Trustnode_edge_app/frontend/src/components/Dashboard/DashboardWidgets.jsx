@@ -380,11 +380,19 @@ function buildXAxisProps(series, cfg = {}) {
   const angle = Number.isFinite(angleRaw) ? angleRaw : 0;
   const rotatedProps = angle === 0
     ? { height: 22 }
-    : {
-        angle,
-        textAnchor: angle < 0 ? "end" : "start",
-        height: Math.abs(angle) >= 75 ? 60 : 44,
-      };
+    : (() => {
+        // Same heights as LiveTagChart so the heavy + light renderers
+        // present the same chart footprint at any rotation. Tighter
+        // than the earlier 44/60 px steps so the plot area keeps as
+        // much vertical room as possible.
+        const a = Math.abs(angle);
+        const h = a < 35 ? 30 : a < 60 ? 40 : a < 80 ? 48 : 56;
+        return {
+          angle,
+          textAnchor: angle < 0 ? "end" : "start",
+          height: h,
+        };
+      })();
   if (!sample) return { dataKey: "idx", ...rotatedProps };
   const tsMsLookup = new Map();
   let hasReal = false;
@@ -1350,19 +1358,18 @@ function LiveTagChart({
     if (s?.unit) return [`${base} ${s.unit}`, s.label];
     return [base, s?.label || name];
   };
-  // Bottom margin reserves room for x-axis tick labels. Extra when the
-  // operator chose rotated ticks so 90° labels don't get clipped by the
-  // card edge. Left bump when there's an axis label.
-  const xBottom = (() => {
-    if (xTickAngle === 0) return 18;
-    if (Math.abs(xTickAngle) >= 75) return 60;
-    return 44;
-  })();
+  // The XAxis `height` prop (set on the <XAxis /> below) already
+  // reserves enough space INSIDE the plot area for rotated labels.
+  // Earlier we ALSO added a matching margin.bottom here, which made
+  // recharts double-reserve the bottom strip — the chart shrunk and
+  // a wide black gap appeared underneath the tick labels. Now the
+  // margin only reserves the small legend gap; the axis handles its
+  // own label space.
   const margin = {
     top: 4,
     right: rightAxisLabel ? 32 : 8,
     left: primaryAxisLabel ? 12 : 0,
-    bottom: xBottom,
+    bottom: showLegend ? 4 : 0,
   };
 
   if (seedError && renderedData.rows.length === 0) {
@@ -1404,7 +1411,20 @@ function LiveTagChart({
               interval="preserveStartEnd"
               angle={xTickAngle}
               textAnchor={xTickAngle === 0 ? "middle" : (xTickAngle < 0 ? "end" : "start")}
-              height={xTickAngle === 0 ? 22 : (Math.abs(xTickAngle) >= 75 ? 60 : 44)}
+              /* Heights tuned so even the longest format (YYYY-MM-DD HH:MM,
+                 ~16 chars at fontSize 10 ≈ 80 px rendered, projected
+                 vertically at 90° ≈ 80 px) fits without the card's plot
+                 area collapsing. 0° flat → tiny strip. 30/45° → mid. 60°+
+                 → full vertical span. Stays under what we previously
+                 reserved with margin.bottom + height combined. */
+              height={(() => {
+                const a = Math.abs(xTickAngle);
+                if (a === 0) return 22;
+                if (a < 35) return 30;
+                if (a < 60) return 40;
+                if (a < 80) return 48;
+                return 56;
+              })()}
             />
             <YAxis
               yAxisId="left"

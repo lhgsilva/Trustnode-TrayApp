@@ -1189,7 +1189,59 @@ export function DashboardDesigner({
 
   const removeWidget = (id) => {
     if (!canEdit) return;
+    const target = normalizeWidgets(widgets).find((w) => String(w.id) === String(id));
+    if (!target) return;
+    const labelBits = [
+      String(target?.title || "").trim(),
+      String(target?.config?.tag_name || "").trim(),
+      String(target?.config?.gateway_id || "").trim(),
+    ].filter(Boolean);
+    const labelTxt = labelBits.length ? `\n\n${labelBits.join("  ·  ")}` : "";
+    // Browser confirm() is the right tool: blocking + native + carries
+    // the operator's full attention. Anything inline would let an
+    // accidental enter-press resolve the dialog. Operator request
+    // 2026-06-12: "we need to confirm to avoid accidentally delete a
+    // configured widget".
+    const ok = window.confirm(
+      `Delete this widget?${labelTxt}\n\nThis action cannot be undone.`,
+    );
+    if (!ok) return;
     setWidgets((prev) => normalizeWidgets(prev).filter((w) => w.id !== id));
+  };
+
+  // Download the full widget configuration as a JSON file. Operator
+  // request 2026-06-12: "we need an option to download the widget
+  // configuration completed". The file format mirrors the import
+  // payload the dashboard already understands ({widgets:[...]}) so an
+  // exported widget can be imported on another edge or pasted into a
+  // git-tracked dashboard profile.
+  const exportWidget = (id) => {
+    const target = normalizeWidgets(widgets).find((w) => String(w.id) === String(id));
+    if (!target) return;
+    const payload = {
+      schema: "trustnode.dashboard.widget/1",
+      exported_utc: new Date().toISOString(),
+      widget: target,
+    };
+    try {
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const safeName = String(target?.title || target?.type || "widget")
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .slice(0, 60) || "widget";
+      a.href = url;
+      a.download = `${safeName}-${target.id}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      // Revoke after the click cycle so the browser has finished the download.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      console.warn("exportWidget failed", err);
+    }
   };
 
   /**
@@ -1875,6 +1927,35 @@ export function DashboardDesigner({
                           aria-label="Duplicate widget"
                         >
                           <DuplicateIcon />
+                        </button>
+                        <button
+                          type="button"
+                          className="dashboard-widget-action-icon"
+                          onClick={() => {
+                            exportWidget(widget.id);
+                            setMenuWidgetId("");
+                          }}
+                          title="Download widget configuration (JSON)"
+                          aria-label="Download widget configuration"
+                        >
+                          {/* Inline download icon — small enough to live in
+                              the action strip without dragging in another
+                              icon import. Matches the stroke weight of the
+                              TrashIcon / DuplicateIcon next to it. */}
+                          <svg
+                            viewBox="0 0 24 24"
+                            width="14"
+                            height="14"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          >
+                            <path d="M12 3v12" />
+                            <path d="m7 10 5 5 5-5" />
+                            <path d="M5 21h14" />
+                          </svg>
                         </button>
                         <button
                           type="button"
