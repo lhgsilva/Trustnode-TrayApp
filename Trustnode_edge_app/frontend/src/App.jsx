@@ -9353,8 +9353,17 @@ const getGatewayHealth = (gateway) => {
     const gid = String(gateway?.id || "");
     const stoppedAtMs = Number(userStoppedAtRef.current?.[gid] || 0);
     const recentlyStoppedByUser = stoppedAtMs > 0 && (nowMs - stoppedAtMs) <= 10000;
+    // User intent wins over a runtime poll that hasn't caught up yet.
+    // Operator 2026-06-12: "when I stopped the gateway it didn't stop
+    // immediately and UI kept showing it running". Earlier this branch
+    // only honored the user stop when the runtime ALREADY reported
+    // running=false — but the runtime poll takes a few seconds, so
+    // during that window the optimistic flip was being overridden by
+    // a stale "running=true" runtime row. Now any user stop within
+    // the last 10 s forces STOPPED unconditionally; the runtime poll
+    // catches up shortly after.
+    if (recentlyStoppedByUser) return false;
     if (runtimeStatus && typeof runtimeStatus.running === "boolean") {
-      if (recentlyStoppedByUser && runtimeStatus.running === false) return false;
       if (runtimeStatus.running === true) {
         // Zombie detection: the backend says running, but if neither a
         // fresh write NOR a fresh check timestamp has arrived in

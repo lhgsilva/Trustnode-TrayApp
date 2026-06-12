@@ -1171,31 +1171,16 @@ function LiveTagChart({
       lastTs: -Infinity,
     }));
 
-    // Append a synthetic "now" trailing tick ONLY when the gateway has
-    // truly stalled — defined as no fresh sample for at least 4 × the
-    // smallest per-series median gap AND a minimum of 30 s. Earlier
-    // this triggered on a single missed sample (5 s on a 1 s gateway)
-    // and the operator saw an empty strip at the right edge of an
-    // otherwise-healthy chart. Now the synthetic gap only appears
-    // when the data really did stop coming.
-    // Operator request 2026-06-12 (re-rev): "there is a gap showing
-    // in the end, in the labels and in the chart, it should never
-    // happens". We only insert the synthetic tick after a long stall;
-    // otherwise the chart ends at the most recent real sample.
-    const nowMs = Date.now();
-    if (sorted.length > 0) {
-      const latestKnown = sorted[sorted.length - 1];
-      let minGap = Infinity;
-      for (const v of gapByIdMs.values()) {
-        if (Number.isFinite(v) && v < minGap) minGap = v;
-      }
-      if (!Number.isFinite(minGap)) minGap = Math.max(30_000, pollMs * 20);
-      const stallThreshold = Math.max(30_000, minGap * 4);
-      if (nowMs - latestKnown > stallThreshold && nowMs > latestKnown) {
-        sorted.push(nowMs);
-        if (sorted.length > capacity) sorted = sorted.slice(-capacity);
-      }
-    }
+    // The synthetic "now" trailing tick was removed by operator
+    // request 2026-06-12: even after the long-stall guard, the
+    // operator saw an empty strip at the right edge of healthy
+    // charts and explicitly asked for the chart to ALWAYS end at
+    // the last real sample. Gateway-stopped periods are still
+    // visible because the middle-gap detector below inserts a null
+    // row between consecutive union timestamps separated by more
+    // than smallestGapMs — so a paused gateway in the MIDDLE of
+    // the buffer still shows as a break; only the right edge stops
+    // at the latest sample now.
 
     // Compute the smallest per-series gap threshold once so we can
     // detect "big gap between consecutive union timestamps" and insert
