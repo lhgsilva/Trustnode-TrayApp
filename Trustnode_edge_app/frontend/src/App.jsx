@@ -8577,6 +8577,20 @@ function AppShell() {
     () => Object.fromEntries((allGatewayOptions || []).map((g) => [String(g.id || ""), String(g.name || g.id || "")])),
     [allGatewayOptions]
   );
+  // Secondary lookup so historian rows from a previous gateway-id
+  // (gateway renamed / recreated / deleted) can still resolve to a
+  // friendly name. Operator 2026-06-12: rows showed "gw-1781..." in
+  // exports because the historian's saved gateway_id no longer
+  // matched any live gateway. Now we also index by plc_ip — if a
+  // gateway with the same PLC IP exists today, use ITS name.
+  const gatewayNameByPlcIp = useMemo(
+    () => Object.fromEntries(
+      (allGatewayOptions || [])
+        .filter((g) => g.plc_ip)
+        .map((g) => [String(g.plc_ip || ""), String(g.name || g.id || "")])
+    ),
+    [allGatewayOptions]
+  );
   const triggerTagsByGateway = useMemo(() => {
     const byGateway = {};
     for (const g of gatewayConfigs) {
@@ -10115,15 +10129,21 @@ const getGatewayHealth = (gateway) => {
       // shown should be the name and not the id, for the UI and
       // exports". Historian rows can carry a stale gateway_name (if
       // the gateway was renamed since the row was written) OR a raw
-      // "gw-1781..." string that LOOKS like an id. Prefer the live
-      // name lookup first; only fall back to the stored value if
-      // the live map doesn't know this gateway id (e.g. the gateway
-      // was deleted).
-      const liveName = gatewayNameById[row.gateway_id];
+      // "gw-1781..." string that LOOKS like an id.
+      // Resolution order:
+      //   1. Live name by gateway_id (most authoritative)
+      //   2. Live name by plc_ip (same physical PLC even if the
+      //      logical gateway was recreated with a fresh id)
+      //   3. Stored gateway_name, but ONLY if it doesn't look like
+      //      a synthetic id (matches /^gw-\d/)
+      //   4. Empty stored name = fall through to gateway_id
+      const liveNameById = gatewayNameById[row.gateway_id];
+      const liveNameByIp = row.plc_ip ? gatewayNameByPlcIp[String(row.plc_ip)] : undefined;
       const storedLooksLikeId = /^gw-\d/.test(String(row.gateway_name || ""));
-      const friendlyName = liveName
-        || (storedLooksLikeId ? "" : row.gateway_name)
-        || row.gateway_name
+      const storedClean = storedLooksLikeId ? "" : String(row.gateway_name || "");
+      const friendlyName = liveNameById
+        || liveNameByIp
+        || storedClean
         || row.gateway_id
         || "-";
       return {
@@ -10131,7 +10151,7 @@ const getGatewayHealth = (gateway) => {
         gateway_name: friendlyName,
       };
     });
-  }, [dataLogView, historianServerRows, historianFilters, gatewayNameById]);
+  }, [dataLogView, historianServerRows, historianFilters, gatewayNameById, gatewayNameByPlcIp]);
 
   // Render only the most recent N rows to keep DOM size bounded. Without
   // this cap React reconciles every row on every state change — opening
@@ -11775,9 +11795,20 @@ const getGatewayHealth = (gateway) => {
         // through the proper api wrapper so the auth Bearer token
         // is attached; the previous raw fetch was unauthenticated
         // which caused the empty / broken file the operator saw.
+        // CRITICAL: when pivot mode is ON, the rows have been
+        // reshaped client-side and their KEYS are the column
+        // labels (one column per tag). Sending the operator's
+        // long-format column spec would tell the backend to look
+        // for "Tag" / "Value" labels that don't exist in the
+        // pivoted rows, producing an empty workbook. Instead,
+        // derive the column list from the first pivoted row so
+        // the backend writes exactly what we built.
+        const pivotedColumns = historianExportPivot && rows.length > 0
+          ? Object.keys(rows[0]).map((label) => ({ key: label, label }))
+          : (historianExportColumns || []).filter((c) => c.enabled !== false).map((c) => ({ key: c.key, label: c.label }));
         const blob = await exportHistorianXlsx({
           rows,
-          columns: (historianExportColumns || []).filter((c) => c.enabled !== false).map((c) => ({ key: c.key, label: c.label })),
+          columns: pivotedColumns,
           template_xlsx_b64: historianExportXlsxTemplate ? historianExportXlsxTemplate.b64 : null,
           template_name: historianExportXlsxTemplate ? historianExportXlsxTemplate.name : null,
         });
@@ -22565,30 +22596,35 @@ const getGatewayHealth = (gateway) => {
                 Rows in current filter
                 <input value={historianRows.length.toLocaleString()} disabled />
               </label>
-              <label className="dashboard-full-row" style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 10,
-                padding: "6px 10px",
-                background: historianExportPivot ? "rgba(20,168,154,0.08)" : "transparent",
-                border: historianExportPivot ? "1px solid rgba(20,168,154,0.35)" : "1px solid var(--stroke)",
-                borderRadius: 8,
-                cursor: "pointer",
-                gridColumn: "1 / -1",
-              }}>
+              {/* Slide pill toggle matching the chart-configuration
+                  style. Operator request 2026-06-12: "the check box
+                  and the text layout should be a pill slide toggle
+                  button on the left and text (no description) on
+                  the right". */}
+              <div
+                className="dashboard-slide-toggle dashboard-full-row"
+                onClick={() => setHistorianExportPivot((v) => !v)}
+                role="switch"
+                aria-checked={historianExportPivot}
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === " " || e.key === "Enter") {
+                    e.preventDefault();
+                    setHistorianExportPivot((v) => !v);
+                  }
+                }}
+                style={{ gridColumn: "1 / -1" }}
+              >
                 <input
                   type="checkbox"
                   checked={historianExportPivot}
-                  onChange={(e) => setHistorianExportPivot(e.target.checked)}
-                  style={{ margin: 0, width: 16, height: 16 }}
+                  onChange={() => {}}
+                  tabIndex={-1}
+                  aria-hidden="true"
                 />
-                <span style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                  <strong style={{ fontSize: 13 }}>Pivot mode — one column per tag, one row per timestamp</strong>
-                  <span className="muted" style={{ fontSize: 11 }}>
-                    Reshape the dataset for time-series analysis. Tag / Value / Quality columns are hidden in this mode (the tag becomes the column header, the value becomes the cell).
-                  </span>
-                </span>
-              </label>
+                <span className="slide-track" aria-hidden="true" />
+                <span className="slide-label">Pivot mode — one column per tag, one row per timestamp</span>
+              </div>
             </div>
             <fieldset className="card" style={{ marginTop: 12, padding: 12 }}>
               <legend style={{ padding: "0 6px", fontSize: 12 }}>Columns (drag to reorder, untick to hide)</legend>
