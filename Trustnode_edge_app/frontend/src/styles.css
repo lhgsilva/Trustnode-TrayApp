@@ -3164,6 +3164,17 @@ input[type="checkbox"] {
   -webkit-backdrop-filter: blur(16px);
 }
 
+/* Wider modal variant for forms that pack a lot of horizontal
+   content. Operator 2026-06-12: the Add PLC Device and Edit Gateway
+   Configuration modals were too narrow — discovered-device tables
+   and multi-column tag grids were getting clipped or required
+   horizontal scroll. modal-card-wide gives them 980 px (with the
+   same 96vw cap on narrow screens). */
+.modal-card.modal-card-wide,
+.modal-card-wide {
+  width: min(980px, 96vw);
+}
+
 /* The Edit User modal carries many permission groups + module checkboxes;
    needs more horizontal room than the 430-px default. */
 .edit-user-modal {

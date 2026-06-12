@@ -420,11 +420,21 @@ export async function testPlcConnection(payload) {
 }
 
 export async function discoverPlcTags(payload) {
-  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/discover-tags`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
+  // Tag discovery on a controller with thousands of tags can take
+  // 30–60 s — pylogix walks every program scope and we fan-out
+  // array indices. Operator 2026-06-12: "could not fetch and
+  // should". The previous 12 s default timed out the request mid-
+  // walk. Allow up to 120 s here; the operator can cancel by
+  // closing the modal.
+  const res = await fetchWithTimeout(
+    `${getControlApiBase()}/api/plc/discover-tags`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+    120000,
+  );
   if (!res.ok) {
     let detail = "";
     try {

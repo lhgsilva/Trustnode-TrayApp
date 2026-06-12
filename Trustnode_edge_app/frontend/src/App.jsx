@@ -3012,6 +3012,10 @@ function AppShell() {
   const [deviceScanResults, setDeviceScanResults] = useState([]);
   const [deviceScanMessage, setDeviceScanMessage] = useState("");
   const [deviceScanRange, setDeviceScanRange] = useState("");
+  // Operator: scan for ANYTHING on the network (PCs, printers, PLCs)
+  // — not just the protocol port matching the gateway type. Wider
+  // port list on the backend; the responding port gets reported.
+  const [deviceScanAnyTcp, setDeviceScanAnyTcp] = useState(true);
   const [appStoreHydrated, setAppStoreHydrated] = useState(false);
   const reconnectTimerRef = useRef(null);
   const fileSinkPickerRef = useRef(null);
@@ -11549,6 +11553,7 @@ const getGatewayHealth = (gateway) => {
         gateway_type: deviceForm.gateway_type,
         timeout_ms: 4000,
         include_tcp_probe: true,
+        scan_any_tcp: deviceScanAnyTcp,
       });
       setDeviceScanResults(Array.isArray(out?.devices) ? out.devices : []);
       setDeviceScanMessage(String(out?.message || ""));
@@ -21677,7 +21682,7 @@ const getGatewayHealth = (gateway) => {
       ) : null}
       {showGatewayModal ? (
         <div className="modal-backdrop">
-          <div className="modal-card gateway-modal-card">
+          <div className="modal-card gateway-modal-card modal-card-wide">
             <h3>{editingGatewayId ? "Edit Gateway Configuration" : "Add Gateway Configuration"}</h3>
             <div className="gateway-form-grid">
               <label>
@@ -21813,6 +21818,57 @@ const getGatewayHealth = (gateway) => {
                   disabled={!canEditPage("gateway_configuration")}
                 />
               </label>
+              {/* Operator request 2026-06-12: present the saved tags as
+                  a column checkbox view too so the operator can quickly
+                  toggle individual tags off without editing the ; list
+                  by hand. The text input above stays as the source of
+                  truth; toggling a checkbox here rewrites it. */}
+              {(() => {
+                const tagList = String(gatewayForm.tags_text || "")
+                  .split(";")
+                  .map((t) => t.trim())
+                  .filter(Boolean);
+                if (tagList.length === 0) return null;
+                return (
+                  <div className="gateway-span-2 discovered-tags-card">
+                    <div className="discovered-tags-toolbar">
+                      <strong>Selected Tags ({tagList.length})</strong>
+                      <button
+                        type="button"
+                        className="btn btn-danger btn-sm"
+                        onClick={() => setGatewayForm({ ...gatewayForm, tags_text: "" })}
+                        disabled={!canEditPage("gateway_configuration")}
+                      >
+                        Remove All
+                      </button>
+                    </div>
+                    <div className="discovered-tags-list" style={{ maxHeight: 220 }}>
+                      <div style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                        gap: "4px 12px",
+                        padding: "4px 8px",
+                        width: "100%",
+                      }}>
+                        {tagList.map((tag) => (
+                          <label key={`saved-${tag}`} className="discovered-tag-item" style={{ minWidth: 0 }}>
+                            <input
+                              type="checkbox"
+                              checked
+                              onChange={() => {
+                                const next = tagList.filter((t) => t !== tag).join(";");
+                                setGatewayForm({ ...gatewayForm, tags_text: next });
+                              }}
+                              disabled={!canEditPage("gateway_configuration")}
+                            />
+                            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{tag}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
               <div className="gateway-span-2 row">
                 <button
                   type="button"
@@ -22018,7 +22074,7 @@ const getGatewayHealth = (gateway) => {
       ) : null}
       {showDeviceModal ? (
         <div className="modal-backdrop">
-          <div className="modal-card">
+          <div className="modal-card modal-card-wide">
             <h3>{editingDeviceId ? "Edit PLC Device" : "Add PLC Device"}</h3>
             <div className="device-form-grid">
               <label>
@@ -22104,6 +22160,15 @@ const getGatewayHealth = (gateway) => {
                         onChange={(e) => setDeviceScanRange(e.target.value)}
                         style={{ flex: "1 1 220px", minWidth: 0 }}
                       />
+                      <label style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--muted)" }}>
+                        <input
+                          type="checkbox"
+                          checked={deviceScanAnyTcp}
+                          onChange={(e) => setDeviceScanAnyTcp(e.target.checked)}
+                          style={{ margin: 0 }}
+                        />
+                        <span>Any TCP</span>
+                      </label>
                       <button
                         type="button"
                         className="btn btn-secondary btn-sm"
@@ -22171,6 +22236,11 @@ const getGatewayHealth = (gateway) => {
                                   // clobber the operator's hand-typed name.
                                   name: prev.name || d.product_name || "",
                                 }));
+                                // Operator request: hide the scan panel
+                                // after selection so the modal collapses
+                                // back to the simple device form.
+                                setDeviceScanResults([]);
+                                setDeviceScanMessage("");
                               }}
                               style={{ padding: "2px 8px", fontSize: 11 }}
                             >

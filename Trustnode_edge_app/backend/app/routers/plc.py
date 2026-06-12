@@ -667,43 +667,73 @@ def _discover_ab_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
                 # when init_program_tags=True (which we did) — those are
                 # already vetted. We probe in chunks because pycomm3
                 # accepts a large batch but a single huge call can stall.
-                CHUNK = 64
+                # Operator 2026-06-12: "we should have a recovery logic
+                # when the PLC has too many tags". Two safety nets:
+                #   1. Soft time budget — bail out of the probe loop
+                #      after PROBE_BUDGET_S and return what we have
+                #      plus the unprobed remainder as candidate tags
+                #      (better to offer 1000 unverified than to time
+                #      out and offer none).
+                #   2. Chunk-size de-escalation — pycomm3 chokes on
+                #      huge multi-reads against some firmware; start
+                #      at 64, drop to 16, then 4, then 1.
+                import time as _time
+                PROBE_BUDGET_S = 45.0
+                CHUNK_LADDER = (64, 16, 4, 1)
+                start_ts = _time.monotonic()
                 good: list[str] = []
                 bad_count = 0
-                for i in range(0, len(candidates), CHUNK):
+                partial = False
+                i = 0
+                chunk_idx = 0
+                while i < len(candidates):
+                    if _time.monotonic() - start_ts > PROBE_BUDGET_S:
+                        # Out of time: keep going with the unprobed
+                        # remainder as raw candidates so the operator
+                        # at least sees them in the picker.
+                        partial = True
+                        for nm in candidates[i:]:
+                            good.append(nm)
+                        break
+                    CHUNK = CHUNK_LADDER[chunk_idx]
                     chunk = candidates[i:i + CHUNK]
                     try:
                         results = plc.read(*chunk)
+                        if not isinstance(results, list):
+                            results = [results]
                     except Exception:
-                        # If a chunk fails wholesale, fall back to single-
-                        # tag reads so one poison tag doesn't blacklist
-                        # everything else in the chunk.
+                        # A whole-chunk failure → step the chunk size
+                        # down. Eventually we'll be reading singles,
+                        # which always works (or never works, in which
+                        # case the bad_count grows and we move on).
+                        if chunk_idx < len(CHUNK_LADDER) - 1:
+                            chunk_idx += 1
+                            continue
                         results = []
                         for nm in chunk:
                             try:
                                 r = plc.read(nm)
                                 results.append(r)
                             except Exception as inner:
-                                # synthesize a result-like object with an
-                                # error so it gets filtered below.
                                 class _Bad:
                                     error = str(inner) or "read failed"
                                     value = None
                                 results.append(_Bad())
-                    if not isinstance(results, list):
-                        results = [results]
                     for nm, res in zip(chunk, results):
                         err = getattr(res, "error", None)
                         if err:
                             bad_count += 1
                             continue
                         good.append(nm)
+                    i += CHUNK
 
                 if good:
                     array_count = sum(1 for n in good if "[" in n and "]" in n)
                     msg = f"Discovered {len(good)} valid AB tags from {path} (arrays expanded: {array_count})"
                     if bad_count:
                         msg += f"; filtered {bad_count} unreadable tag(s)"
+                    if partial:
+                        msg += f"; probe-read budget exceeded — last {len(candidates) - i} tag(s) returned unverified"
                     return TagDiscoveryResult(ok=True, tags=good, message=msg)
                 return TagDiscoveryResult(
                     ok=False,
@@ -831,6 +861,15 @@ class NetworkScanRequest(BaseModel):
     gateway_type: Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston"] = "allen_bradley"
     timeout_ms: int = 4000
     include_tcp_probe: bool = True
+    # Operator 2026-06-12: "we should scan for any TCP/IP devices,
+    # any computer, PLC, Siemens or Allen-Bradley, anything at all
+    # in the network". When True, the TCP probe widens beyond the
+    # protocol-specific port and tries a broad set of well-known
+    # TCP ports (44818, 102, 4840, 502, 80, 443, 22, 8080, 5900,
+    # 7000). First responding port wins and is reported on the
+    # device row so the operator can tell what KIND of host
+    # answered.
+    scan_any_tcp: bool = False
 
 
 class NetworkScanDevice(BaseModel):
@@ -961,7 +1000,15 @@ def discover_network(payload: NetworkScanRequest) -> NetworkScanResult:
             "siemens_opcua": [4840],
             "boston": [502],
         }
-        ports = port_by_type.get(payload.gateway_type or "allen_bradley", [44818])
+        if payload.scan_any_tcp:
+            # Broad TCP sweep — first responding port wins. The order
+            # is roughly: industrial protocol ports first (so a real
+            # PLC gets labelled correctly when both 44818 AND 80 are
+            # open), then general-purpose ports for printers / PCs /
+            # cameras / SSH boxes / VNC.
+            ports = [44818, 102, 4840, 502, 80, 443, 22, 8080, 5900, 7000, 21, 23, 161]
+        else:
+            ports = port_by_type.get(payload.gateway_type or "allen_bradley", [44818])
         hosts = _expand_scan_range(payload.scan_range)
         if not hosts:
             # Auto-derive the host's own /24 from the default route.
@@ -994,9 +1041,28 @@ def discover_network(payload: NetworkScanRequest) -> NetworkScanResult:
                     if not port:
                         continue
                     if h not in found:
+                        # Map a friendly hint to the responding port
+                        # so the operator can tell what answered.
+                        port_hints = {
+                            44818: "EtherNet/IP (Allen-Bradley)",
+                            102: "S7 (Siemens)",
+                            4840: "OPC-UA",
+                            502: "Modbus TCP",
+                            80: "HTTP",
+                            443: "HTTPS",
+                            22: "SSH",
+                            8080: "HTTP-alt",
+                            5900: "VNC",
+                            7000: "AFS3 / generic",
+                            21: "FTP",
+                            23: "Telnet",
+                            161: "SNMP",
+                        }
+                        hint = port_hints.get(int(port), f"port {port}")
                         found[h] = NetworkScanDevice(
                             ip=h,
-                            product_name=f"Open port {port}",
+                            product_name=hint,
+                            device_type=f"tcp/{port}",
                             source="tcp_probe",
                         )
 
