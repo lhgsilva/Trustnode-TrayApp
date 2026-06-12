@@ -48,8 +48,15 @@ export function toTsMs(value) {
       // Local clock in provided offset -> normalize to UTC epoch.
       return utcBase - offsetMs;
     }
-    // No timezone provided: treat as local wall-clock time.
-    return new Date(yyyy, mm, dd, hh, mi, ss, msPart).getTime();
+    // No timezone provided: treat as UTC. The backend's
+    // historian timestamps are stored as UTC (field name is
+    // literally ts_utc) but the on-the-wire format
+    // "YYYY-MM-DD HH:mm:ss" omits the Z marker, so a naive parse
+    // used to be 1 hour off in BST / CET. Operator 2026-06-12:
+    // "my computer time is one hour after what is printed on the
+    // X time labels, why?" — this fix shifts the wall-clock
+    // labels back to the operator's local zone.
+    return utcBase;
   }
 
   // Fallback 2: "DD/MM/YYYY HH:mm:ss" (local clock)

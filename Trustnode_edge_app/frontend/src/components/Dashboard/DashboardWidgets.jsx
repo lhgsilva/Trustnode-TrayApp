@@ -399,7 +399,11 @@ function buildXAxisProps(series, cfg = {}) {
   for (const p of series) {
     const raw = String(p?.ts || "");
     if (!raw) continue;
-    const ms = Date.parse(raw.includes("T") ? raw : raw.replace(" ", "T"));
+    // toTsMs treats no-TZ timestamps as UTC (backend stores ts_utc
+    // without the Z marker). Earlier we used Date.parse which read
+    // those as local wall-clock and the chart was 1 h off in
+    // BST/CET.
+    const ms = toTsMs(raw);
     if (Number.isFinite(ms)) {
       tsMsLookup.set(p.idx, ms);
       hasReal = true;
@@ -426,7 +430,7 @@ function buildXAxisProps(series, cfg = {}) {
       const hit = series.find((p) => p?.idx === idx);
       const ts = String(hit?.ts || "");
       if (!ts) return String(idx);
-      const ms = Date.parse(ts.includes("T") ? ts : ts.replace(" ", "T"));
+      const ms = toTsMs(ts);
       if (Number.isFinite(ms)) return _formatChartTickTime(ms, fmt);
       const t = ts.includes("T") ? ts.split("T")[1] : ts.split(" ")[1];
       return String(t || ts).slice(0, 8);
@@ -917,7 +921,7 @@ function LiveTagChart({
         if (!buf) return;
         let newest = -Infinity;
         for (const r of Array.isArray(rows) ? rows : []) {
-          const tsMs = Date.parse(String(r?.ts || r?.ts_utc || ""));
+          const tsMs = toTsMs(r?.ts || r?.ts_utc);
           const raw = Number(r?.value);
           if (!Number.isFinite(tsMs) || !Number.isFinite(raw)) continue;
           buf.set(tsMs, raw * s.multiplier + s.offset);
@@ -971,7 +975,7 @@ function LiveTagChart({
         // Match by gateway_id OR fall through if not strict (tag-only widgets).
         const gid = String(r?.gateway_id || "");
         if (s.gatewayId && gid && gid !== s.gatewayId) continue;
-        const tsMs = Date.parse(String(r?.ts || r?.ts_utc || ""));
+        const tsMs = toTsMs(r?.ts || r?.ts_utc);
         if (!Number.isFinite(tsMs) || tsMs <= last) continue;
         const raw = Number(r?.value);
         if (!Number.isFinite(raw)) continue;
@@ -1033,7 +1037,7 @@ function LiveTagChart({
           if (!buf) return;
           let newest = lastSeen.get(s.id) || -Infinity;
           for (const r of Array.isArray(rows) ? rows : []) {
-            const tsMs = Date.parse(String(r?.ts || r?.ts_utc || ""));
+            const tsMs = toTsMs(r?.ts || r?.ts_utc);
             const raw = Number(r?.value);
             if (!Number.isFinite(tsMs) || !Number.isFinite(raw)) continue;
             if (tsMs <= newest) continue;
@@ -2289,13 +2293,13 @@ export function DashboardWidgetCard({
     // Find baseRows' newest ts so we only append strictly fresher rows.
     let newestTs = -Infinity;
     for (let i = 0; i < baseRows.length; i += 1) {
-      const ts = Date.parse(String(baseRows[i]?.ts || baseRows[i]?.ts_utc || ""));
+      const ts = toTsMs(baseRows[i]?.ts || baseRows[i]?.ts_utc);
       if (Number.isFinite(ts) && ts > newestTs) newestTs = ts;
     }
     const append = [];
     for (let i = 0; i < live.length; i += 1) {
       const r = live[i];
-      const ts = Date.parse(String(r?.ts || r?.ts_utc || ""));
+      const ts = toTsMs(r?.ts || r?.ts_utc);
       if (Number.isFinite(ts) && ts > newestTs) append.push(r);
     }
     return append.length ? baseRows.concat(append) : baseRows;
@@ -2382,8 +2386,8 @@ export function DashboardWidgetCard({
       out.push(cur);
       const next = scaled[i + 1];
       if (!next) continue;
-      const a = Date.parse(String(cur.ts || ""));
-      const b = Date.parse(String(next.ts || ""));
+      const a = toTsMs(cur.ts);
+      const b = toTsMs(next.ts);
       if (Number.isFinite(a) && Number.isFinite(b) && (b - a) > gapThresholdMs) {
         out.push({ idx: cur.idx + 0.5, ts: new Date(a + Math.floor((b - a) / 2)).toISOString(), value: null });
       }
@@ -2598,7 +2602,7 @@ export function DashboardWidgetCard({
         for (const r of liveRows) {
           if (String(r?.tag || r?.tag_name || "").trim() !== targetTag) continue;
           if (targetGw && String(r?.gateway_id || "").trim() !== targetGw) continue;
-          const ms = Date.parse(String(r?.ts || r?.ts_utc || "").replace(" ", "T"));
+          const ms = toTsMs(r?.ts || r?.ts_utc);
           if (Number.isFinite(ms) && ms > latestTs) {
             latestTs = ms;
             latestVal = r?.value;
@@ -2641,14 +2645,11 @@ export function DashboardWidgetCard({
     // renderers so each series draws as a continuous line through its
     // own real points — no carry-forward, no fake fills, no gaps inside
     // a series that's still publishing.
+    // Use the shared toTsMs helper which treats no-TZ timestamps
+    // as UTC (matches the backend's ts_utc field convention).
     const tsToMs = (raw) => {
-      const t = String(raw || "");
-      if (!t) return NaN;
-      const ms = Date.parse(t);
-      if (Number.isFinite(ms)) return ms;
-      const iso = t.includes("T") ? t : t.replace(" ", "T");
-      const ms2 = Date.parse(iso);
-      return Number.isFinite(ms2) ? ms2 : NaN;
+      const ms = toTsMs(raw);
+      return Number.isFinite(ms) ? ms : NaN;
     };
 
     const primaryPts = series
