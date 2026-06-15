@@ -31,6 +31,14 @@ from typing import Any
 
 import requests
 
+# Force UTF-8 stdout/stderr on Windows so em-dashes and arrows
+# in the report don't crash on cp1252 consoles.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
@@ -61,7 +69,57 @@ def resolve_db_path() -> Path:
     env_path = os.environ.get("TRUSTNODE_APP_STORE_PATH", "").strip()
     if env_path:
         return Path(env_path).expanduser().resolve()
-    return Path.home() / ".trustnode_edge" / "data" / "trustnode_app_store.db"
+    # Try both the dev path (~/.trustnode_edge) and the packaged
+    # path (%LOCALAPPDATA%\TrustNode\data). Prefer whichever has
+    # the most recent historian write — the launcher can leave
+    # both around when a user has run dev and packaged builds
+    # on the same machine.
+    candidates = [
+        Path.home() / ".trustnode_edge" / "data" / "trustnode_app_store.db",
+        Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "TrustNode" / "data" / "trustnode_app_store.db",
+    ]
+    best, best_ts = None, ""
+    for c in candidates:
+        if not c.exists():
+            continue
+        try:
+            con = sqlite3.connect(str(c), timeout=2)
+            ts = con.execute("SELECT MAX(ts_utc) FROM historian_readings").fetchone()[0] or ""
+            con.close()
+        except Exception:
+            ts = ""
+        if ts > best_ts:
+            best, best_ts = c, ts
+    return best or candidates[0]
+
+
+def authenticate(api_base: str) -> dict[str, str]:
+    """POST /api/auth/login with the configured smoke credentials and
+    return Authorization headers. Returns an empty dict on failure
+    so the caller falls through to the unauthenticated path (some
+    deployments allow read-only access without login)."""
+    user = os.environ.get("TRUSTNODE_SMOKE_USER", "admin")
+    pwd = os.environ.get("TRUSTNODE_SMOKE_PASS", "admin")
+    try:
+        r = requests.post(
+            f"{api_base}/api/auth/login",
+            json={"username": user, "password": pwd},
+            timeout=4,
+        )
+        if r.ok:
+            token = (r.json() or {}).get("token")
+            if token:
+                return {"Authorization": f"Bearer {token}"}
+    except Exception:
+        pass
+    return {}
+
+
+def _row_tag(row: dict) -> str:
+    """Historian rows expose the tag name under different keys
+    depending on the endpoint (/api/power/history uses `tag`; the
+    app-store historian uses `tag_name`). Read both."""
+    return str(row.get("tag") or row.get("tag_name") or "")
 
 
 # ---------- trapezoidal kWh reference ------------------------------------
@@ -135,11 +193,15 @@ def main() -> int:
         print(f"\nBackend unreachable. Start the edge and retry.\n{r.summary()}")
         return 2
 
+    headers = authenticate(api_base)
+    r.add("authentication", "PASS" if headers else "WARN",
+          "logged in" if headers else "no token — falling back to anonymous (some endpoints will 401)")
+
     # ---------- 1. Power config ------------------------------------------
     section("1. Power configuration")
     cfg = {}
     try:
-        cfg_resp = requests.get(f"{api_base}/api/power/config", timeout=4)
+        cfg_resp = requests.get(f"{api_base}/api/power/config", timeout=4, headers=headers)
         cfg = (cfg_resp.json() or {}).get("config", {}) if cfg_resp.ok else {}
     except Exception as exc:
         r.add("GET /api/power/config", "FAIL", str(exc))
@@ -157,6 +219,14 @@ def main() -> int:
           f"{len(tariffs)} tariff(s) defined")
     flat_rate = float(cfg.get("energy_price_eur_kwh") or 0.0)
     r.add("flat fallback rate", "INFO", f"€{flat_rate:.4f}/kWh")
+    # If a tariff is defined, at least one should have a non-zero
+    # rate or every cost calc collapses to 0.
+    if tariffs:
+        non_zero = [t for t in tariffs if float(t.get("rate_eur_kwh") or 0.0) > 0]
+        r.add("at least one tariff has rate_eur_kwh > 0",
+              "PASS" if non_zero else "WARN",
+              f"{len(non_zero)}/{len(tariffs)} priced tariff(s)"
+              + ("" if non_zero else " — Energy Costs KPI + donut will report €0 until set"))
     downtime_rules = cfg.get("downtime_rules") or []
     r.add("downtime_rules", "PASS" if downtime_rules else "INFO",
           f"{len(downtime_rules)} rule(s)")
@@ -165,7 +235,7 @@ def main() -> int:
     section("2. Live meter status")
     statuses: list[dict] = []
     try:
-        s_resp = requests.get(f"{api_base}/api/power/status", timeout=4)
+        s_resp = requests.get(f"{api_base}/api/power/status", timeout=4, headers=headers)
         statuses = ((s_resp.json() or {}).get("status") or {}).get("devices") or []
     except Exception as exc:
         r.add("GET /api/power/status", "FAIL", str(exc))
@@ -177,7 +247,7 @@ def main() -> int:
     section("3. Historian rows (power_modbus + power_insight)")
     hist_rows: list[dict] = []
     try:
-        h_resp = requests.get(f"{api_base}/api/power/history?limit=2000", timeout=6)
+        h_resp = requests.get(f"{api_base}/api/power/history?limit=2000", timeout=6, headers=headers)
         hist_rows = (h_resp.json() or {}).get("rows") or []
         r.add("GET /api/power/history?limit=2000", "PASS",
               f"{len(hist_rows)} row(s)")
@@ -187,18 +257,24 @@ def main() -> int:
     sources = {str(row.get("source") or "") for row in hist_rows}
     r.add("source = power_modbus present", "PASS" if "power_modbus" in sources else "FAIL",
           f"sources seen: {sorted(sources)}")
-    insight_via_endpoint = "power_insight" in sources
-    if insight_via_endpoint:
-        r.add("source = power_insight via /history", "PASS", "")
-    else:
-        # We KNOW the writer emits power_insight rows; the /history endpoint
-        # filters by source == 'power_modbus'. Surface this as a real bug.
-        r.add("source = power_insight via /history", "FAIL",
-              "endpoint filters out insight rows — Tags page / dashboard widgets "
-              "will not see KPI tags through getPowerHistory")
+    r.add("source = power_insight via /history",
+          "PASS" if "power_insight" in sources else "FAIL",
+          "" if "power_insight" in sources else "endpoint filters out insight rows")
 
-    # Distinct tags seen
-    tags_seen = {str(row.get("tag_name") or "") for row in hist_rows}
+    # The /api/power/history payload uses `tag` (not `tag_name`).
+    tags_seen = {_row_tag(row) for row in hist_rows}
+    # If we only have 2000 rows, insight rows may not appear in the sample
+    # because the modbus rows dominate. Re-fetch a wider window if needed.
+    if "active_power_w" not in tags_seen or not any(t.startswith("insight.") for t in tags_seen):
+        try:
+            h_resp2 = requests.get(f"{api_base}/api/power/history?limit=5000", timeout=10, headers=headers)
+            hist_rows2 = (h_resp2.json() or {}).get("rows") or []
+            if len(hist_rows2) > len(hist_rows):
+                hist_rows = hist_rows2
+                tags_seen = {_row_tag(row) for row in hist_rows}
+        except Exception:
+            pass
+
     expected_register_tags = {"voltage_v", "current_a", "active_power_w", "energy_wh"}
     missing = expected_register_tags - tags_seen
     r.add("core register tags present", "PASS" if not missing else "FAIL",
@@ -207,7 +283,8 @@ def main() -> int:
     insight_tags = {t for t in tags_seen if t.startswith("insight.")}
     r.add("insight.* tags present (any source)",
           "PASS" if insight_tags else "WARN",
-          f"{sorted(insight_tags) if insight_tags else 'none — operator should wait for poll cycle or check writer'}")
+          f"{len(insight_tags)} tag(s): {sorted(insight_tags)[:6]}{'...' if len(insight_tags) > 6 else ''}"
+          if insight_tags else "none — operator should wait for poll cycle or check writer")
 
     # ---------- 4. Direct DB check (insight rows persisted) --------------
     section("4. Direct historian DB check")
@@ -257,11 +334,15 @@ def main() -> int:
     cutoff = utc_now() - timedelta(minutes=5)
     by_meter: dict[str, list[tuple[float, float]]] = {}
     for row in hist_rows:
-        if str(row.get("tag_name") or "") not in ("active_power_total_w", "active_power_w"):
+        if _row_tag(row) not in ("active_power_total_w", "active_power_w"):
             continue
         ts_raw = str(row.get("ts") or row.get("ts_utc") or "")
+        # Accept both "YYYY-MM-DD HH:MM:SS..." and ISO formats.
         try:
-            ts = datetime.strptime(ts_raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            txt = ts_raw.replace("Z", "+00:00")
+            ts = datetime.fromisoformat(txt) if "T" in txt else datetime.strptime(txt[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
         except Exception:
             continue
         if ts < cutoff:
@@ -318,7 +399,7 @@ def main() -> int:
                 gid = str(row.get("gateway_id") or "")
                 if meter_id and gid != meter_id:
                     continue
-                tag = str(row.get("tag_name") or "")
+                tag = _row_tag(row)
                 if tag not in ("voltage_v", "active_power_w", "active_power_total_w"):
                     continue
                 ts = str(row.get("ts") or row.get("ts_utc") or "")
