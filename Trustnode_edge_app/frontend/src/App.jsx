@@ -749,6 +749,61 @@ function formatTimeDisplay(rawValue, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
   return `${p.hour}:${p.minute}:${p.second}`;
 }
 
+// Build the X-axis bucket skeleton anchored to "now" (operator
+// 2026-06-15: charts should always END at the current grain and
+// walk backwards). Returns ordered bucket keys identical in shape
+// to bucketKeyForInterval(). Used by both the main and side
+// charts on the Power Overview.
+function buildAnchoredSkeleton(interval) {
+  const now = new Date();
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const yyyy = now.getFullYear();
+  const mm = pad2(now.getMonth() + 1);
+  const dd = pad2(now.getDate());
+  const hh = pad2(now.getHours());
+  const out = [];
+  if (interval === "year") {
+    // Last 12 years ending this year (covers Decade-ish range; in
+    // practice Year view buckets by month, but this branch is here
+    // so the function is total).
+    for (let y = 11; y >= 0; y--) out.push(String(yyyy - y));
+  } else if (interval === "month") {
+    // Last 12 months ending current month.
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(yyyy, now.getMonth() - i, 1);
+      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}`);
+    }
+  } else if (interval === "day") {
+    // Last 31 days ending today. Bucket key is YYYY-MM-DD.
+    for (let i = 30; i >= 0; i--) {
+      const d = new Date(yyyy, now.getMonth(), now.getDate() - i);
+      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`);
+    }
+  } else if (interval === "hour") {
+    // Last 24 hours ending at the current hour. Bucket key is
+    // YYYY-MM-DD HH:00 — note the date may roll back across
+    // midnight so we walk back hour by hour through Date.
+    for (let i = 23; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 3600_000);
+      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:00`);
+    }
+  } else if (interval === "minute") {
+    // Last 60 minutes ending at the current minute. Bucket key is
+    // YYYY-MM-DD HH:MM.
+    for (let i = 59; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 60_000);
+      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`);
+    }
+  } else if (interval === "second") {
+    // Last 60 seconds. Only used for the explicit Second interval.
+    for (let i = 59; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 1000);
+      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`);
+    }
+  }
+  return out;
+}
+
 function bucketKeyForInterval(tsMs, interval, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
   const p = getDatePartsInTimeZone(tsMs, timeZone);
   if (!p) return "";
@@ -7307,45 +7362,24 @@ function AppShell() {
     // 60 minutes). Each skeleton entry seeds a 0 bucket; merge with
     // the data buckets so cells without samples become 0 instead
     // of being absent from the X axis.
-    const skeletonKeys = (() => {
-      const now = new Date();
-      const out = [];
-      const pad2 = (n) => String(n).padStart(2, "0");
-      if (effectiveInterval === "month") {
-        for (let m = 0; m < 12; m++) out.push(`${now.getFullYear()}-${pad2(m + 1)}`);
-      } else if (effectiveInterval === "day") {
-        const year = now.getFullYear();
-        const month = now.getMonth();
-        const daysInMonth = new Date(year, month + 1, 0).getDate();
-        for (let d = 1; d <= daysInMonth; d++) out.push(`${year}-${pad2(month + 1)}-${pad2(d)}`);
-      } else if (effectiveInterval === "hour") {
-        const yyyy = now.getFullYear();
-        const mm = pad2(now.getMonth() + 1);
-        const dd = pad2(now.getDate());
-        for (let h = 0; h < 24; h++) out.push(`${yyyy}-${mm}-${dd} ${pad2(h)}:00`);
-      } else if (effectiveInterval === "minute") {
-        const yyyy = now.getFullYear();
-        const mm = pad2(now.getMonth() + 1);
-        const dd = pad2(now.getDate());
-        const hh = pad2(now.getHours());
-        for (let m = 0; m < 60; m++) out.push(`${yyyy}-${mm}-${dd} ${hh}:${pad2(m)}`);
-      }
-      return out;
-    })();
-    // Operator 2026-06-15: skeleton only fills slots BETWEEN the
-    // first and last real bucket so the chart starts at the first
-    // actual sample (not midnight) and ends at "now".
-    const dataKeys = Array.from(buckets.keys()).filter((k) => !skeletonKeys.includes(k) || (buckets.get(k)?.meterBuckets && Object.keys(buckets.get(k).meterBuckets).length > 0));
-    const realDataKeys = Array.from(buckets.entries())
-      .filter(([, b]) => Object.keys(b.meterBuckets || {}).length > 0)
-      .map(([k]) => k)
-      .sort();
-    if (realDataKeys.length) {
-      const firstKey = realDataKeys[0];
-      for (const k of skeletonKeys) {
-        if (String(k) >= String(firstKey) && !buckets.has(k)) {
-          buckets.set(k, { ts: k, meterBuckets: {} });
-        }
+    // Operator 2026-06-15: the X-axis must always end at "now" and
+    // walk back N buckets per the View scale. Year → last 12
+    // months ending at this month; Month → last 30/31 days ending
+    // today; Day → last 24 hours ending at the current hour; Hour
+    // → last 60 minutes ending at the current minute. We compute
+    // the skeleton by stepping back from now in the matching
+    // grain so the rightmost bucket is the active one.
+    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval);
+    for (const k of skeletonKeys) {
+      if (!buckets.has(k)) buckets.set(k, { ts: k, meterBuckets: {} });
+    }
+    // Drop buckets that fall OUTSIDE the anchored window (older
+    // than the leftmost skeleton key). This stops a stale Year
+    // sample from leaking into a Day view, for example.
+    if (skeletonKeys.length) {
+      const minKey = skeletonKeys[0];
+      for (const k of Array.from(buckets.keys())) {
+        if (String(k) < String(minKey)) buckets.delete(k);
       }
     }
     const rows = Array.from(buckets.values()).map((b) => {
@@ -7433,38 +7467,18 @@ function AppShell() {
       b.total_kwh += kwh;
       buckets.set(key, b);
     }
-    // Grain skeleton — same as main chart.
-    const now = new Date();
-    const pad2 = (n) => String(n).padStart(2, "0");
-    const skeletonKeys = [];
-    if (effectiveInterval === "month") {
-      for (let m = 0; m < 12; m++) skeletonKeys.push(`${now.getFullYear()}-${pad2(m + 1)}`);
-    } else if (effectiveInterval === "day") {
-      const year = now.getFullYear();
-      const month = now.getMonth();
-      const daysInMonth = new Date(year, month + 1, 0).getDate();
-      for (let d = 1; d <= daysInMonth; d++) skeletonKeys.push(`${year}-${pad2(month + 1)}-${pad2(d)}`);
-    } else if (effectiveInterval === "hour") {
-      const yyyy = now.getFullYear();
-      const mm = pad2(now.getMonth() + 1);
-      const dd = pad2(now.getDate());
-      for (let h = 0; h < 24; h++) skeletonKeys.push(`${yyyy}-${mm}-${dd} ${pad2(h)}:00`);
-    } else if (effectiveInterval === "minute") {
-      const yyyy = now.getFullYear();
-      const mm = pad2(now.getMonth() + 1);
-      const dd = pad2(now.getDate());
-      const hh = pad2(now.getHours());
-      for (let m = 0; m < 60; m++) skeletonKeys.push(`${yyyy}-${mm}-${dd} ${hh}:${pad2(m)}`);
+    // X-axis anchored to "now" (operator 2026-06-15) — see
+    // buildAnchoredSkeleton above. Same logic as the main chart so
+    // the two charts always share the same X domain.
+    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval);
+    for (const k of skeletonKeys) {
+      if (!buckets.has(k)) buckets.set(k, { ts: k, total_kwh: 0 });
     }
-    // Skeleton fills slots BETWEEN first real bucket and "now"
-    // only (operator 2026-06-15: chart should start at first sample).
-    const realKeys = Array.from(buckets.keys()).sort();
-    if (realKeys.length) {
-      const firstKey = realKeys[0];
-      for (const k of skeletonKeys) {
-        if (String(k) >= String(firstKey) && !buckets.has(k)) {
-          buckets.set(k, { ts: k, total_kwh: 0 });
-        }
+    // Drop buckets older than the anchored window.
+    if (skeletonKeys.length) {
+      const minKey = skeletonKeys[0];
+      for (const k of Array.from(buckets.keys())) {
+        if (String(k) < String(minKey)) buckets.delete(k);
       }
     }
     const sorted = Array.from(buckets.values())
