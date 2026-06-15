@@ -3940,9 +3940,9 @@ input[type="checkbox"] {
   overflow: visible;
   display: flex;
   flex-direction: column;
-  /* Taller default so charts have room to breathe; the chart-wrap
-     stretches with flex:1 to fill anything beyond this. */
-  min-height: 560px;
+  /* Operator 2026-06-15: "the chart still with too much space
+     below". Card height now grows from content; chart-wrap min
+     drives the floor instead. */
 }
 
 /* Chart edit button — hover-only and uniform size with other table
@@ -3966,10 +3966,10 @@ input[type="checkbox"] {
 .power-side-chart-card .chart-wrap {
   width: 100%;
   flex: 1 1 auto;
-  height: auto;
+  height: 380px;
   overflow: hidden;
-  padding: 6px 8px 14px;
-  min-height: 440px;
+  padding: 4px 4px 4px;
+  min-height: 320px;
 }
 
 .power-main-chart-card .recharts-wrapper,
@@ -4170,6 +4170,24 @@ input[type="checkbox"] {
    rule (operator 2026-06-15: same size everywhere). The earlier 20x20
    override that lived here is removed so the register table matches
    the rest of the app. */
+
+/* Expand/collapse button on Power Configuration cards. Operator
+   2026-06-15: button background should match the card surface in
+   both light and dark themes — the default .card-collapse-btn was
+   semi-transparent and looked off against the card. */
+.pwr-card-collapse-btn {
+  background: var(--card) !important;
+  border: 1px solid var(--stroke) !important;
+  color: var(--text) !important;
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  padding: 0;
+  line-height: 1;
+}
+.pwr-card-collapse-btn:hover {
+  background: color-mix(in srgb, var(--card) 92%, var(--bg) 8%) !important;
+}
 
 /* .pwr-square-btn no longer needs custom sizing — the global
    .table-action-btn rule above is now squared by default. The

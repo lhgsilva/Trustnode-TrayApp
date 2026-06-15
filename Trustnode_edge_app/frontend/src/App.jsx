@@ -17249,30 +17249,9 @@ const getGatewayHealth = (gateway) => {
           {activePage === "power_overview" ? (
             <>
               <section className="card pwr-overview-toolbar">
-                {/* One-row toolbar (operator 2026-06-15): Live /
-                    Historical tabs sit on the left, filters in the
-                    middle, the From/To/Apply pair appears only in
-                    Historical mode. The whole row shrinks gracefully
-                    on narrow screens (.pwr-overview-toolbar handles
-                    wrap). */}
-                <div className="pwr-overview-tabs" role="tablist" aria-label="Power view mode">
-                  <button
-                    type="button"
-                    className={`power-top-tab ${powerViewMode === "realtime" ? "active" : ""}`}
-                    onClick={() => setPowerViewMode("realtime")}
-                    aria-selected={powerViewMode === "realtime"}
-                  >
-                    Live
-                  </button>
-                  <button
-                    type="button"
-                    className={`power-top-tab ${powerViewMode === "historical" ? "active" : ""}`}
-                    onClick={() => setPowerViewMode("historical")}
-                    aria-selected={powerViewMode === "historical"}
-                  >
-                    Historical
-                  </button>
-                </div>
+                {/* One-row toolbar (operator 2026-06-15): filters
+                    on the left, Live / Historical tabs on the right
+                    immediately before the Apply button. */}
                 <label className="field pwr-overview-field">
                   <span>Meter</span>
                   <select value={powerFilterMeterId} onChange={(e) => setPowerFilterMeterId(e.target.value)}>
@@ -17335,6 +17314,24 @@ const getGatewayHealth = (gateway) => {
                   </select>
                 </label>
                 <div className="pwr-overview-actions">
+                  <div className="pwr-overview-tabs" role="tablist" aria-label="Power view mode">
+                    <button
+                      type="button"
+                      className={`power-top-tab ${powerViewMode === "realtime" ? "active" : ""}`}
+                      onClick={() => setPowerViewMode("realtime")}
+                      aria-selected={powerViewMode === "realtime"}
+                    >
+                      Live
+                    </button>
+                    <button
+                      type="button"
+                      className={`power-top-tab ${powerViewMode === "historical" ? "active" : ""}`}
+                      onClick={() => setPowerViewMode("historical")}
+                      aria-selected={powerViewMode === "historical"}
+                    >
+                      Historical
+                    </button>
+                  </div>
                   <button
                     type="button"
                     className="btn btn-primary"
@@ -17669,122 +17666,6 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "power_configuration" ? (
             <>
-              {/* Electricity Tariff card. Operator 2026-06-15: separate
-                  card, collapsed by default, lets operators add multiple
-                  tariffs by time window (Flat / Peak / Off-Peak /
-                  Valley / Shoulder). Empty list falls back to a single
-                  flat rate stored as energy_price_eur_kwh for
-                  back-compat with existing reports. */}
-              <section className="card">
-                <div className="db-simple-head">
-                  <div className="db-head-title-wrap">
-                    <h3 style={{ margin: 0 }}>Electricity Tariff</h3>
-                  </div>
-                  <div className="db-card-top-actions">
-                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddTariff} disabled={!canEditPage("power_configuration")}>
-                      <AddIcon /><span>Add Tariff</span>
-                    </button>
-                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save</button>
-                    <button
-                      className="btn btn-sm card-collapse-btn"
-                      onClick={() => setTariffsCardCollapsed((v) => !v)}
-                      title={tariffsCardCollapsed ? "Expand card" : "Collapse card"}
-                    >
-                      {tariffsCardCollapsed ? "+" : "-"}
-                    </button>
-                  </div>
-                </div>
-                {!tariffsCardCollapsed ? (
-                  <>
-                    {(!Array.isArray(powerConfig.electricity_tariffs) || powerConfig.electricity_tariffs.length === 0) ? (
-                      <div className="muted" style={{ padding: 14, textAlign: "center" }}>
-                        No tariffs defined yet. Click <strong>Add Tariff</strong> to define Flat / Peak / Off-Peak / Valley windows. Overview cost calculations use the active tariff for each timestamp.
-                      </div>
-                    ) : (
-                      <div className="table db-table power-tariff-table">
-                        <div className="thead">
-                          <span>Name</span><span>Type</span><span>Window</span><span>Rate (€/kWh)</span><span>Description</span><span style={{ textAlign: "right" }}>Actions</span>
-                        </div>
-                        {powerConfig.electricity_tariffs.map((t) => (
-                          <div key={`tariff-${t.id}`} className="trow">
-                            <span>{t.name}</span>
-                            <span>{String(t.type || "flat").replace("_", " ")}</span>
-                            <span>{t.start_time} – {t.end_time}</span>
-                            <span>{Number(t.rate_eur_kwh || 0).toFixed(4)}</span>
-                            <span title={t.description}>{t.description || "—"}</span>
-                            <span className="row-actions">
-                              <button className="icon-btn table-action-btn pwr-square-btn" title="Edit tariff" onClick={() => openEditTariff(t)}><EditIcon /></button>
-                              <button className="icon-btn table-action-btn danger pwr-square-btn" title="Remove tariff" onClick={() => removeTariff(t.id)}><DeleteIcon /></button>
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </>
-                ) : null}
-              </section>
-
-              {/* Downtime detection rules. Operator 2026-06-15: "the
-                  user can select which meter reading and the range
-                  with conditions that will mean that the machine is
-                  on but not operating". Each rule = voltage_min AND
-                  power_max — both must hold for the sample to count
-                  as downtime. Rules apply per-meter (meter_id="" =
-                  any meter). */}
-              <section className="card">
-                <div className="db-simple-head">
-                  <div className="db-head-title-wrap">
-                    <h3 style={{ margin: 0 }}>Downtime Rules</h3>
-                  </div>
-                  <div className="db-card-top-actions">
-                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddDowntimeRule} disabled={!canEditPage("power_configuration")}>
-                      <AddIcon /><span>Add Rule</span>
-                    </button>
-                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save</button>
-                    <button
-                      className="btn btn-sm card-collapse-btn"
-                      onClick={() => setDowntimeCardCollapsed((v) => !v)}
-                      title={downtimeCardCollapsed ? "Expand card" : "Collapse card"}
-                    >
-                      {downtimeCardCollapsed ? "+" : "-"}
-                    </button>
-                  </div>
-                </div>
-                {!downtimeCardCollapsed ? (
-                  <>
-                    {(!Array.isArray(powerConfig.downtime_rules) || powerConfig.downtime_rules.length === 0) ? (
-                      <div className="muted" style={{ padding: 14, textAlign: "center" }}>
-                        No downtime rules defined. Click <strong>Add Rule</strong> to flag periods where voltage is present but active power stays under a threshold — Overview's "Downtime Energy Cost" sums the cost of those idle hours.
-                      </div>
-                    ) : (
-                      <div className="table db-table power-tariff-table">
-                        <div className="thead">
-                          <span>Name</span><span>Meter</span><span>Voltage ≥</span><span>Active Power ≤</span><span>Description</span><span style={{ textAlign: "right" }}>Actions</span>
-                        </div>
-                        {powerConfig.downtime_rules.map((r) => {
-                          const meterName = r.meter_id
-                            ? (powerConfig.devices || []).find((d) => String(d.id) === String(r.meter_id))?.name || r.meter_id
-                            : "Any meter";
-                          return (
-                            <div key={`dt-${r.id}`} className="trow">
-                              <span>{r.name}</span>
-                              <span>{meterName}</span>
-                              <span>{Number(r.voltage_min_v || 0).toFixed(1)} V</span>
-                              <span>{Number(r.power_max_kw || 0).toFixed(3)} kW</span>
-                              <span title={r.description}>{r.description || "—"}</span>
-                              <span className="row-actions">
-                                <button className="icon-btn table-action-btn pwr-square-btn" title="Edit rule" onClick={() => openEditDowntimeRule(r)}><EditIcon /></button>
-                                <button className="icon-btn table-action-btn danger pwr-square-btn" title="Remove rule" onClick={() => removeDowntimeRule(r.id)}><DeleteIcon /></button>
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </>
-                ) : null}
-              </section>
-
               <section className="card">
                 <div className="db-simple-head">
                   <div className="db-head-title-wrap">
@@ -17795,13 +17676,12 @@ const getGatewayHealth = (gateway) => {
                       <AddIcon />
                       <span>Add</span>
                     </button>
-                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save</button>
-                    {/* Expand/collapse moved to top-right per operator
-                        request 2026-06-12 — sits next to Save with the
-                        other actions for symmetry across the page's
-                        cards. */}
+                    {/* Per-card Save removed (operator 2026-06-15) —
+                        Add/Edit/Remove each persist immediately via
+                        savePowerConfigPayload, so the page-level Save
+                        is redundant noise. */}
                     <button
-                      className="btn btn-sm card-collapse-btn"
+                      className="btn btn-sm card-collapse-btn pwr-card-collapse-btn"
                       onClick={() =>
                         setPowerCardsCollapsed((prev) => ({ ...prev, meters: !prev.meters }))
                       }
@@ -17900,9 +17780,8 @@ const getGatewayHealth = (gateway) => {
                     <h3 style={{ margin: 0 }}>Registers — {selectedPowerDevice.name || selectedPowerDevice.id}</h3>
                   </div>
                   <div className="db-card-top-actions">
-                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save</button>
                     <button
-                      className="btn btn-sm card-collapse-btn"
+                      className="btn btn-sm card-collapse-btn pwr-card-collapse-btn"
                       onClick={() =>
                         setPowerCardsCollapsed((prev) => ({ ...prev, registers: !prev.registers }))
                       }
@@ -18000,6 +17879,114 @@ const getGatewayHealth = (gateway) => {
                 ) : null}
               </section>
               ) : null}
+
+              {/* Tariff + Downtime cards moved AFTER the Registers
+                  card per operator 2026-06-15. Save buttons removed
+                  from each card head (each Add/Edit/Remove already
+                  persists immediately through savePowerConfigPayload).
+                  Expand/collapse uses pwr-card-collapse-btn so the
+                  button background tracks the card surface in both
+                  themes. */}
+              <section className="card">
+                <div className="db-simple-head">
+                  <div className="db-head-title-wrap">
+                    <h3 style={{ margin: 0 }}>Electricity Tariff</h3>
+                  </div>
+                  <div className="db-card-top-actions">
+                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddTariff} disabled={!canEditPage("power_configuration")}>
+                      <AddIcon /><span>Add Tariff</span>
+                    </button>
+                    <button
+                      className="btn btn-sm card-collapse-btn pwr-card-collapse-btn"
+                      onClick={() => setTariffsCardCollapsed((v) => !v)}
+                      title={tariffsCardCollapsed ? "Expand card" : "Collapse card"}
+                    >
+                      {tariffsCardCollapsed ? "+" : "-"}
+                    </button>
+                  </div>
+                </div>
+                {!tariffsCardCollapsed ? (
+                  <>
+                    {(!Array.isArray(powerConfig.electricity_tariffs) || powerConfig.electricity_tariffs.length === 0) ? (
+                      <div className="muted" style={{ padding: 14, textAlign: "center" }}>
+                        No tariffs defined yet. Click <strong>Add Tariff</strong> to define Flat / Peak / Off-Peak / Valley windows. Overview cost calculations use the active tariff for each timestamp.
+                      </div>
+                    ) : (
+                      <div className="table db-table power-tariff-table">
+                        <div className="thead">
+                          <span>Name</span><span>Type</span><span>Window</span><span>Rate (€/kWh)</span><span>Description</span><span style={{ textAlign: "right" }}>Actions</span>
+                        </div>
+                        {powerConfig.electricity_tariffs.map((t) => (
+                          <div key={`tariff-${t.id}`} className="trow">
+                            <span>{t.name}</span>
+                            <span>{String(t.type || "flat").replace("_", " ")}</span>
+                            <span>{t.start_time} – {t.end_time}</span>
+                            <span>{Number(t.rate_eur_kwh || 0).toFixed(4)}</span>
+                            <span title={t.description}>{t.description || "—"}</span>
+                            <span className="row-actions">
+                              <button className="icon-btn table-action-btn pwr-square-btn" title="Edit tariff" onClick={() => openEditTariff(t)}><EditIcon /></button>
+                              <button className="icon-btn table-action-btn danger pwr-square-btn" title="Remove tariff" onClick={() => removeTariff(t.id)}><DeleteIcon /></button>
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                ) : null}
+              </section>
+
+              <section className="card">
+                <div className="db-simple-head">
+                  <div className="db-head-title-wrap">
+                    <h3 style={{ margin: 0 }}>Downtime Rules</h3>
+                  </div>
+                  <div className="db-card-top-actions">
+                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddDowntimeRule} disabled={!canEditPage("power_configuration")}>
+                      <AddIcon /><span>Add Rule</span>
+                    </button>
+                    <button
+                      className="btn btn-sm card-collapse-btn pwr-card-collapse-btn"
+                      onClick={() => setDowntimeCardCollapsed((v) => !v)}
+                      title={downtimeCardCollapsed ? "Expand card" : "Collapse card"}
+                    >
+                      {downtimeCardCollapsed ? "+" : "-"}
+                    </button>
+                  </div>
+                </div>
+                {!downtimeCardCollapsed ? (
+                  <>
+                    {(!Array.isArray(powerConfig.downtime_rules) || powerConfig.downtime_rules.length === 0) ? (
+                      <div className="muted" style={{ padding: 14, textAlign: "center" }}>
+                        No downtime rules defined. Click <strong>Add Rule</strong> to flag periods where voltage is present but active power stays under a threshold — Overview's "Downtime Energy Cost" sums the cost of those idle hours.
+                      </div>
+                    ) : (
+                      <div className="table db-table power-tariff-table">
+                        <div className="thead">
+                          <span>Name</span><span>Meter</span><span>Voltage ≥</span><span>Active Power ≤</span><span>Description</span><span style={{ textAlign: "right" }}>Actions</span>
+                        </div>
+                        {powerConfig.downtime_rules.map((r) => {
+                          const meterName = r.meter_id
+                            ? (powerConfig.devices || []).find((d) => String(d.id) === String(r.meter_id))?.name || r.meter_id
+                            : "Any meter";
+                          return (
+                            <div key={`dt-${r.id}`} className="trow">
+                              <span>{r.name}</span>
+                              <span>{meterName}</span>
+                              <span>{Number(r.voltage_min_v || 0).toFixed(1)} V</span>
+                              <span>{Number(r.power_max_kw || 0).toFixed(3)} kW</span>
+                              <span title={r.description}>{r.description || "—"}</span>
+                              <span className="row-actions">
+                                <button className="icon-btn table-action-btn pwr-square-btn" title="Edit rule" onClick={() => openEditDowntimeRule(r)}><EditIcon /></button>
+                                <button className="icon-btn table-action-btn danger pwr-square-btn" title="Remove rule" onClick={() => removeDowntimeRule(r.id)}><DeleteIcon /></button>
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </>
+                ) : null}
+              </section>
             </>
           ) : null}
 
