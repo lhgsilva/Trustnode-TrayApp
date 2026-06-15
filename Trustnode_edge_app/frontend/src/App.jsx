@@ -2738,7 +2738,7 @@ function AppShell() {
       y2_label: "",
       y2_unit: "",
       // Persisted drag-resize height (operator 2026-06-15).
-      height: 420,
+      height: 360,
       // Parity with the dashboard widget editor.
       interpolation: "stepAfter",
       readings_count: 200,
@@ -2758,7 +2758,7 @@ function AppShell() {
       y2_min: "", y2_max: "",
       y2_label: "",
       y2_unit: "",
-      height: 420,
+      height: 280,
       interpolation: "stepAfter",
       readings_count: 200,
       color_mode: "default",
@@ -2771,7 +2771,7 @@ function AppShell() {
       hide_title: false,
       mode: "cost", // "cost" or "kwh"
       show_legend: true,
-      height: 420,
+      height: 260,
     },
   });
   const [chartSettingsOpenKey, setChartSettingsOpenKey] = useState("");
@@ -7376,35 +7376,45 @@ function AppShell() {
     return out;
   }, [powerMainChartData, effectiveInterval]);
   const powerSideChartData = useMemo(() => {
-    const nowMs = Date.now();
     // Operator 2026-06-15: the side chart must follow the View
-    // scale just like the main chart. Bucket by effectiveInterval
-    // and pre-fill the full grain so the X axis shows every slot.
-    const fromMs = nowMs - periodMs;
+    // scale just like the main chart and use the SAME integration
+    // method as the KPI Total tiles — kW * dt across consecutive
+    // samples (capped at 1h to discard offline gaps).
+    const nowMs = Date.now();
+    const fromMs = (powerViewMode === "historical" && powerHistoricalRange)
+      ? powerHistoricalRange.fromMs
+      : nowMs - periodMs;
+    const toMs = (powerViewMode === "historical" && powerHistoricalRange)
+      ? powerHistoricalRange.toMs
+      : nowMs + 60_000;
     const meterSet = new Set((selectedPowerChartMeters || []).map(String));
     const scopedMeterId = String(powerFilterMeterId || "all");
-    const intervalByGateway = Object.fromEntries(
-      (powerConfig?.devices || []).map((d) => [String(d?.id || ""), Number(d?.poll_interval_ms || 1000)])
-    );
     const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, effectiveInterval, displayTimeZone);
-    const buckets = new Map();
+    const samples = [];
     for (const row of powerHistoryRows || []) {
       const gid = String(row?.gateway_id || "");
       if (scopedMeterId && scopedMeterId !== "all" && gid !== scopedMeterId) continue;
       if (meterSet.size && !meterSet.has(gid)) continue;
-      const tsMs = parseTimestampMs(row?.ts || row?.ts_utc || "");
-      if (!Number.isFinite(tsMs) || tsMs < fromMs || tsMs > nowMs + 60000) continue;
       const tag = String(row?.tag || row?.tag_name || "");
       if (!(tag === "active_power_total_w" || tag === "active_power_w")) continue;
-      const raw = Number(row?.value || 0);
-      if (!Number.isFinite(raw)) continue;
-      const kw = raw / 1000.0;
-      const intervalMs = Math.max(100, Number(intervalByGateway[gid] || 1000));
-      const kwh = kw * (intervalMs / 3600000.0);
-      const key = bucketKey(tsMs);
-      const prev = buckets.get(key) || { ts: key, total_kwh: 0 };
-      prev.total_kwh += kwh;
-      buckets.set(key, prev);
+      const tsMs = parseTimestampMs(row?.ts || row?.ts_utc || "");
+      if (!Number.isFinite(tsMs) || tsMs < fromMs || tsMs > toMs) continue;
+      samples.push({ ts: tsMs, kw: Math.max(0, Number(row?.value || 0) / 1000.0), meter: gid });
+    }
+    samples.sort((a, b) => a.ts - b.ts);
+    const buckets = new Map();
+    const prev = new Map();
+    for (const s of samples) {
+      const p = prev.get(s.meter);
+      prev.set(s.meter, s);
+      if (!p) continue;
+      const dtH = (s.ts - p.ts) / 3_600_000;
+      if (dtH <= 0 || dtH > 1) continue;
+      const kwh = s.kw * dtH;
+      const key = bucketKey(s.ts);
+      const b = buckets.get(key) || { ts: key, total_kwh: 0 };
+      b.total_kwh += kwh;
+      buckets.set(key, b);
     }
     // Grain skeleton — same as main chart.
     const now = new Date();
@@ -7447,7 +7457,7 @@ function AppShell() {
       };
     });
     return { rows, keys: ["total_kwh", "total_cost"], showPhases: false };
-  }, [powerHistoryRows, powerConfig, powerFilterMeterId, selectedPowerChartMeters, powerCostPerKwh, displayTimeZone, periodMs, effectiveInterval]);
+  }, [powerHistoryRows, powerConfig, powerFilterMeterId, selectedPowerChartMeters, powerCostPerKwh, displayTimeZone, periodMs, effectiveInterval, powerViewMode, powerHistoricalRange]);
 
   const powerSideYDomain = useMemo(() => {
     const auto = computeMultiSeriesDomain(powerSideChartData.rows, ["total_kwh"], true);
@@ -7475,24 +7485,46 @@ function AppShell() {
 
   const powerKpis = useMemo(() => {
     const latest = powerTrendData[powerTrendData.length - 1] || null;
-    // Operator 2026-06-15: KPI Total tiles must reflect the full
-    // ACCUMULATED total across the filtered window, not the
-    // last-bucket value. We sum the per-bucket kWh contributions
-    // (kW * hours-per-bucket) over every bucket in scope.
-    const intervalHours =
-      effectiveInterval === "year"
-        ? 8760
-        : effectiveInterval === "month"
-          ? 720
-          : effectiveInterval === "day"
-            ? 24
-            : effectiveInterval === "hour"
-              ? 1
-              : effectiveInterval === "minute"
-                ? 1 / 60
-                : 1 / 3600;
-    const totalEnergyKwh = powerTrendData.reduce((acc, r) => acc + Number(r.total_kw || 0), 0) * intervalHours;
-    const totalCost = totalEnergyKwh * powerCostPerKwh;
+    // Operator 2026-06-15: Total Power Usage and Total Energy
+    // Costs must come from an actual time-integration across the
+    // filtered window — not bucket-count × hours-per-bucket which
+    // under-counts when buckets are sparse and over-counts when
+    // a meter is offline. Walk the raw power samples in order per
+    // meter, integrate kW * dt for every pair of consecutive
+    // samples (capped at 1h to discard offline gaps), and resolve
+    // the tariff per slice.
+    const nowMs = Date.now();
+    const fromMs = (powerViewMode === "historical" && powerHistoricalRange)
+      ? powerHistoricalRange.fromMs
+      : (nowMs - periodMs);
+    const toMs = (powerViewMode === "historical" && powerHistoricalRange)
+      ? powerHistoricalRange.toMs
+      : (nowMs + 60_000);
+    const meterScope = String(powerFilterMeterId || "all");
+    const samples = [];
+    for (const r of powerHistoryRows || []) {
+      const tag = String(r?.tag || r?.tag_name || "");
+      if (tag !== "active_power_total_w" && tag !== "active_power_w") continue;
+      const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
+      if (!Number.isFinite(ts) || ts < fromMs || ts > toMs) continue;
+      const gid = String(r?.gateway_id || "");
+      if (meterScope !== "all" && gid !== meterScope) continue;
+      samples.push({ ts, kw: Math.max(0, Number(r?.value || 0) / 1000.0), meter: gid });
+    }
+    samples.sort((a, b) => a.ts - b.ts);
+    let totalEnergyKwh = 0;
+    let totalCost = 0;
+    const prev = new Map();
+    for (const s of samples) {
+      const p = prev.get(s.meter);
+      prev.set(s.meter, s);
+      if (!p) continue;
+      const dtH = (s.ts - p.ts) / 3_600_000;
+      if (dtH <= 0 || dtH > 1) continue; // discard gaps > 1h
+      const kwh = s.kw * dtH;
+      totalEnergyKwh += kwh;
+      totalCost += kwh * resolveTariffRate(s.ts);
+    }
     const liveKw = Number(latest?.total_kw || 0);
     const peakKw = powerTrendData.reduce((m, r) => Math.max(m, Number(r.total_kw || 0)), 0);
     const peakLabel = peakKw >= 100 ? "High" : peakKw >= 50 ? "Medium" : "Normal";
@@ -7558,7 +7590,7 @@ function AppShell() {
       peakLabel,
       downtimeCost,
     };
-  }, [powerTrendData, powerInterval, effectiveInterval, powerCostPerKwh, powerConfig, powerHistoryRows, resolveTariffRate]);
+  }, [powerTrendData, powerInterval, effectiveInterval, powerCostPerKwh, powerConfig, powerHistoryRows, resolveTariffRate, periodMs, powerFilterMeterId, powerViewMode, powerHistoricalRange]);
 
   // Previous-period KPI snapshot for delta arrows (operator
   // 2026-06-15). Re-runs the trend integration against
@@ -17884,7 +17916,7 @@ const getGatewayHealth = (gateway) => {
                   </div>
                   <div className="chart-wrap">
                     <ResponsiveContainer width="100%" height="100%" minHeight={260}>
-                      <ComposedChart data={powerMainChartData.rows} margin={{ top: 10, right: 20, left: 10, bottom: 44 }}>
+                      <ComposedChart data={powerMainChartData.rows} margin={{ top: 6, right: 10, left: 6, bottom: 8 }}>
                         {/* Same grid/legend styling as the dashboard chart widget
                             so Power Overview charts visually match the rest of
                             the app. */}
@@ -17895,7 +17927,7 @@ const getGatewayHealth = (gateway) => {
                           minTickGap={22}
                           interval="preserveStartEnd"
                           allowDuplicatedCategory={false}
-                          height={56}
+                          height={24}
                           tickMargin={14}
                           tickFormatter={formatPowerMainXAxisTick}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
@@ -17930,7 +17962,7 @@ const getGatewayHealth = (gateway) => {
                           />
                         ) : null}
                         <Tooltip formatter={(v) => formatChartValue(v, 3)} />
-                        {powerChartSettings.main.show_legend !== false ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
+                        {powerChartSettings.main.show_legend !== false ? <Legend wrapperStyle={{ fontSize: 11, paddingTop: 4, paddingBottom: 0, lineHeight: "16px" }} verticalAlign="bottom" height={20} /> : null}
                         {powerMainChartType === "bar" ? (
                           <>
                             {powerChartSettings.main.show_total !== false ? (
@@ -18047,7 +18079,7 @@ const getGatewayHealth = (gateway) => {
                     <ResponsiveContainer width="100%" height="100%" minHeight={260}>
                       <ComposedChart
                         data={powerSideChartData.rows}
-                        margin={{ top: 10, right: 14, left: 8, bottom: 44 }}
+                        margin={{ top: 6, right: 8, left: 4, bottom: 8 }}
                       >
                         <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
                         <XAxis
@@ -18056,7 +18088,7 @@ const getGatewayHealth = (gateway) => {
                           minTickGap={22}
                           interval="preserveStartEnd"
                           allowDuplicatedCategory={false}
-                          height={56}
+                          height={24}
                           tickMargin={14}
                           tickFormatter={formatPowerSideXAxisTick}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
@@ -18073,7 +18105,7 @@ const getGatewayHealth = (gateway) => {
                           tickLine={{ stroke: powerChartAxisColor }}
                         />
                         <Tooltip formatter={(v) => formatChartValue(v, 3)} />
-                        <Legend wrapperStyle={{ fontSize: 11 }} />
+                        <Legend wrapperStyle={{ fontSize: 11, paddingTop: 4, paddingBottom: 0, lineHeight: "16px" }} verticalAlign="bottom" height={20} />
                         {powerSideChartType === "bar" ? (
                           <Bar
                             key="pwr-side-bar-total-kwh"
@@ -18175,10 +18207,6 @@ const getGatewayHealth = (gateway) => {
                         No consumption data in the selected window.
                       </div>
                     )}
-                  </div>
-                  <div className="meta" style={{ padding: "4px 12px 10px" }}>
-                    <span>Total: € {powerTariffBreakdown.total_cost.toFixed(2)}</span>
-                    <span>{powerTariffBreakdown.total_kwh.toFixed(2)} kWh</span>
                   </div>
                 </article>
 

@@ -3918,12 +3918,17 @@ input[type="checkbox"] {
 }
 
 .power-kpi-grid {
-  /* Operator 2026-06-15: 8 cards in a flat row, no dividers. */
+  /* Operator 2026-06-15: 8 cards in a flat row, no dividers. The
+     `overflow-x:auto` was making the strip collapse vertically
+     on some browsers and the cards spilled into the chart row;
+     pinning a min-height + flex-shrink:0 keeps it self-contained. */
   display: grid;
   grid-template-columns: repeat(8, minmax(140px, 1fr));
   gap: 10px;
   align-items: stretch;
   overflow-x: auto;
+  min-height: 120px;
+  flex-shrink: 0;
 }
 .pwr-insight-group-label {
   display: flex;
@@ -4087,13 +4092,15 @@ input[type="checkbox"] {
 }
 .power-main-chart-card,
 .power-side-chart-card {
-  min-height: 360px;
-  padding-bottom: 6px;
+  /* Operator 2026-06-15: floor was 360 even for cards the operator
+     intentionally shrunk; drop to 220 so the operator can use the
+     resize handle to make them as small as they want. */
+  min-height: 220px;
+  padding-bottom: 0;
 }
-/* Operator 2026-06-15: kill the gap between the Recharts legend
-   and the bottom of the card. The legend wrapper natively absorbs
-   a row of height for its rendered text; pulling overflow margin
-   off the surface stops the whitespace from compounding. */
+/* Recharts wrappers — kill internal padding so the chart fills
+   right to the card edge. The Legend gets a height={20} prop on
+   the JSX side which keeps the bottom band tiny. */
 .power-main-chart-card .recharts-wrapper,
 .power-side-chart-card .recharts-wrapper {
   height: 100% !important;
@@ -4102,6 +4109,7 @@ input[type="checkbox"] {
 .power-side-chart-card .recharts-legend-wrapper {
   bottom: 0 !important;
   padding-bottom: 0 !important;
+  margin-bottom: 0 !important;
 }
 
 .power-main-chart-card .recharts-wrapper,
