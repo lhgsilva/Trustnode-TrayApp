@@ -881,8 +881,18 @@ class PowerManager:
                 "source": "power_insight",
             }
 
+        # Convenience aliases for the redesigned KPI strip
+        # (operator 2026-06-15). Backend was already publishing
+        # live_kw / peak_kw / total_kwh / cost / efficiency /
+        # downtime; the strip also asks for Current (A), Active
+        # Power (kW) and a "Power Usage (kWh)" alias for the
+        # rolling-window kWh integral.
+        current_a = float(values.get("current_a") or values.get("current_l1_a") or 0.0)
         return [
             _row("insight.live_kw", live_kw),
+            _row("insight.active_power_kw", live_kw),       # alias for KPI strip
+            _row("insight.current_a", current_a),
+            _row("insight.power_usage_kwh", total_kwh),     # window kWh
             _row("insight.peak_kw", peak_kw),
             _row("insight.energy_efficiency_pct", efficiency_pct),
             _row("insight.total_kwh", total_kwh),

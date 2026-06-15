@@ -2766,13 +2766,20 @@ function AppShell() {
       show_point_labels: false,
       show_total: true,
     },
+    donut: {
+      title: "",
+      hide_title: false,
+      mode: "cost", // "cost" or "kwh"
+      show_legend: true,
+      height: 420,
+    },
   });
   const [chartSettingsOpenKey, setChartSettingsOpenKey] = useState("");
   const [powerMainMetric, setPowerMainMetric] = useState("power_kw");
-  const [powerMainChartType, setPowerMainChartType] = useState("line");
+  const [powerMainChartType, setPowerMainChartType] = useState("area");
   const [powerCostChartRange, setPowerCostChartRange] = useState("12h");
   const [powerSideMetric, setPowerSideMetric] = useState("power_kw");
-  const [powerSideChartType, setPowerSideChartType] = useState("line");
+  const [powerSideChartType, setPowerSideChartType] = useState("bar");
   const [selectedPowerChartMeters, setSelectedPowerChartMeters] = useState([]);
   const [showPowerDeviceModal, setShowPowerDeviceModal] = useState(false);
   const [editingPowerDeviceId, setEditingPowerDeviceId] = useState(null);
@@ -9307,6 +9314,9 @@ function AppShell() {
           tags: [
             ...Object.keys(mergedMap || {}),
             "insight.live_kw",
+            "insight.active_power_kw",
+            "insight.current_a",
+            "insight.power_usage_kwh",
             "insight.peak_kw",
             "insight.energy_efficiency_pct",
             "insight.total_kwh",
@@ -17658,14 +17668,11 @@ const getGatewayHealth = (gateway) => {
               </section>
               <section className="power-kpi-grid">
                 {(() => {
-                  // Operator 2026-06-15: each card gets a small
-                  // arrow + % vs the previous window. Positive cost
-                  // changes are bad (arrow up red); positive
-                  // efficiency changes are good (arrow up green).
-                  // We pass an `isPositiveGood` flag per card to
-                  // colour the arrow correctly.
+                  // Operator 2026-06-15: 8 cards in two logical
+                  // groups (Live / Total) on one row, bigger value
+                  // font. Delta arrows compare to the prior window
+                  // and colour by "what's good for the metric".
                   const fmtPct = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
-                  const delta = (cur, prev) => powerKpiDelta(cur, prev);
                   const arrow = (v, positiveGood) => {
                     if (v == null || !Number.isFinite(v) || v === 0) return { icon: "→", cls: "pwr-delta-flat" };
                     const up = v > 0;
@@ -17673,7 +17680,7 @@ const getGatewayHealth = (gateway) => {
                     return { icon: up ? "↑" : "↓", cls: good ? "pwr-delta-good" : "pwr-delta-bad" };
                   };
                   const renderDelta = (cur, prev, positiveGood) => {
-                    const d = delta(cur, prev);
+                    const d = powerKpiDelta(cur, prev);
                     if (d == null) return <div className="pwr-delta pwr-delta-flat">— vs previous</div>;
                     const a = arrow(d, positiveGood);
                     return (
@@ -17682,37 +17689,68 @@ const getGatewayHealth = (gateway) => {
                       </div>
                     );
                   };
+                  // Latest sample per meter for the Live group.
+                  const liveByMeter = {};
+                  for (const r of powerHistoryRows || []) {
+                    const gid = String(r?.gateway_id || "");
+                    if (!gid) continue;
+                    const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
+                    if (!Number.isFinite(ts)) continue;
+                    const b = liveByMeter[gid] || { ts: 0, tags: {} };
+                    if (ts < b.ts) continue;
+                    if (ts > b.ts) { b.ts = ts; b.tags = {}; }
+                    b.tags[String(r?.tag || r?.tag_name || "")] = Number(r?.value);
+                    liveByMeter[gid] = b;
+                  }
+                  const meterScope = String(powerFilterMeterId || "all");
+                  const meterEntries = Object.entries(liveByMeter)
+                    .filter(([gid]) => meterScope === "all" || gid === meterScope);
+                  const liveCurrentA = meterEntries.reduce((acc, [, b]) => acc + (Number(b.tags.current_a) || 0), 0);
+                  const liveKw = meterEntries.reduce((acc, [, b]) => {
+                    const v = Number(b.tags.active_power_total_w) || Number(b.tags.active_power_w) || 0;
+                    return acc + v / 1000;
+                  }, 0);
+                  const livePowerUsageKwh = powerKpis.totalEnergyKwh; // window kWh — same as Total for now; back ends will diverge if we add a rolling-hour aggregate.
                   return (
                     <>
+                      <div className="pwr-insight-group-label">Live</div>
+                      <div className="stat-card power-insight-card power-insight-live">
+                        <div className="stat-title">Current (A)</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(liveCurrentA, 2)}</span><span className="power-insight-unit">A</span></div>
+                      </div>
+                      <div className="stat-card power-insight-card power-insight-live">
+                        <div className="stat-title">Active Power (kW)</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(liveKw, 2)}</span><span className="power-insight-unit">kW</span></div>
+                      </div>
+                      <div className="stat-card power-insight-card power-insight-energy">
+                        <div className="stat-title">Power Usage (kWh)</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(livePowerUsageKwh, 2)}</span><span className="power-insight-unit">kWh</span></div>
+                      </div>
                       <div className="stat-card power-insight-card power-insight-eff">
-                        <div className="stat-title">Energy Efficiency</div>
+                        <div className="stat-title">Energy Efficiency (%)</div>
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.efficiency, 1)}</span><span className="power-insight-unit">%</span></div>
                         {renderDelta(powerKpis.efficiency, powerKpisPrevious.efficiency, true)}
                       </div>
-                      <div className="stat-card power-insight-card power-insight-cost">
-                        <div className="stat-title">Energy Costs</div>
-                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.totalCost, 2)}</span><span className="power-insight-unit">EUR</span></div>
-                        {renderDelta(powerKpis.totalCost, powerKpisPrevious.totalCost, false)}
-                      </div>
-                      <div className="stat-card power-insight-card power-insight-energy">
-                        <div className="stat-title">Total kWh Consumption</div>
-                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.totalEnergyKwh, 2)}</span><span className="power-insight-unit">kWh</span></div>
-                        {renderDelta(powerKpis.totalEnergyKwh, powerKpisPrevious.totalEnergyKwh, false)}
-                      </div>
-                      <div className="stat-card power-insight-card power-insight-live">
-                        <div className="stat-title">Live kW Consumption</div>
-                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.liveKw, 2)}</span><span className="power-insight-unit">kW</span></div>
-                        {renderDelta(powerKpis.liveKw, powerKpisPrevious.liveKw, false)}
-                      </div>
+                      <div className="pwr-insight-group-label">Total</div>
                       <div className="stat-card power-insight-card power-insight-peak">
-                        <div className="stat-title">Peak Demand Indicator</div>
+                        <div className="stat-title">Peak Demand (kW)</div>
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.peakKw, 2)}</span><span className="power-insight-unit">kW</span></div>
                         {renderDelta(powerKpis.peakKw, powerKpisPrevious.peakKw, false)}
                       </div>
                       <div className="stat-card power-insight-card power-insight-down">
-                        <div className="stat-title">Downtime Energy Cost</div>
-                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.downtimeCost, 2)}</span><span className="power-insight-unit">EUR</span></div>
+                        <div className="stat-title">Downtime Cost (€)</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.downtimeCost, 2)}</span><span className="power-insight-unit">€</span></div>
                         {renderDelta(powerKpis.downtimeCost, powerKpisPrevious.downtimeCost, false)}
+                      </div>
+                      <div className="stat-card power-insight-card power-insight-energy">
+                        <div className="stat-title">Total Power Usage (kWh)</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.totalEnergyKwh, 2)}</span><span className="power-insight-unit">kWh</span></div>
+                        {renderDelta(powerKpis.totalEnergyKwh, powerKpisPrevious.totalEnergyKwh, false)}
+                      </div>
+                      <div className="stat-card power-insight-card power-insight-cost">
+                        <div className="stat-title">Total Energy Costs (€)</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.totalCost, 2)}</span><span className="power-insight-unit">€</span></div>
+                        {renderDelta(powerKpis.totalCost, powerKpisPrevious.totalCost, false)}
                       </div>
                     </>
                   );
@@ -17735,23 +17773,10 @@ const getGatewayHealth = (gateway) => {
                   <div className="row trend-header-row">
                     {powerChartSettings.main.hide_title ? <span /> : (
                       <h3 style={{ marginTop: 0, marginBottom: 0 }}>
-                        {powerChartSettings.main.title || (
-                          powerMainMetric === "voltage_v" ? "Voltage (V)" : powerMainMetric === "current_a" ? "Current (A)" : powerMainMetric === "energy_kwh" ? "Consumption (kWh)" : "Energy Consumption (kW)"
-                        )} by {powerInterval}
+                        {powerChartSettings.main.title || "Live Usage"}
                       </h3>
                     )}
                     <div className="row power-side-controls">
-                      <select value={powerMainMetric} onChange={(e) => setPowerMainMetric(e.target.value)}>
-                        <option value="power_kw">Power (kW)</option>
-                        <option value="voltage_v">Voltage (V)</option>
-                        <option value="current_a">Current (A)</option>
-                        <option value="energy_kwh">Consumption (kWh)</option>
-                      </select>
-                      <div className="power-chart-type-toggle" role="group" aria-label="Main chart type">
-                        <button type="button" className={powerMainChartType === "line" ? "active" : ""} onClick={() => setPowerMainChartType("line")}>Line</button>
-                        <button type="button" className={powerMainChartType === "area" ? "active" : ""} onClick={() => setPowerMainChartType("area")}>Area</button>
-                        <button type="button" className={powerMainChartType === "bar" ? "active" : ""} onClick={() => setPowerMainChartType("bar")}>Bar</button>
-                      </div>
                       <button
                         type="button"
                         className="icon-btn table-action-btn pwr-chart-edit-btn"
@@ -17907,19 +17932,10 @@ const getGatewayHealth = (gateway) => {
                   <div className="row trend-header-row">
                     {powerChartSettings.side.hide_title ? <span /> : (
                       <h3 style={{ marginTop: 0, marginBottom: 0 }}>
-                        {powerChartSettings.side.title || `Total Consumption (kWh) ${powerCostChartRange === "12h" ? "by Hour (Last 12h)" : "by Day (Last 30d)"}`}
+                        {powerChartSettings.side.title || "Total Consumption"}
                       </h3>
                     )}
                     <div className="row power-side-controls">
-                      <select value={powerCostChartRange} onChange={(e) => setPowerCostChartRange(e.target.value)}>
-                        <option value="12h">Last 12 hours</option>
-                        <option value="30d">Last 30 days</option>
-                      </select>
-                      <div className="power-chart-type-toggle" role="group" aria-label="Side chart type">
-                        <button type="button" className={powerSideChartType === "line" ? "active" : ""} onClick={() => setPowerSideChartType("line")}>Line</button>
-                        <button type="button" className={powerSideChartType === "area" ? "active" : ""} onClick={() => setPowerSideChartType("area")}>Area</button>
-                        <button type="button" className={powerSideChartType === "bar" ? "active" : ""} onClick={() => setPowerSideChartType("bar")}>Bar</button>
-                      </div>
                       <button
                         type="button"
                         className="icon-btn table-action-btn pwr-chart-edit-btn"
@@ -18013,15 +18029,27 @@ const getGatewayHealth = (gateway) => {
                     scale / meter selector as the main chart. */}
                 <article
                   className="card power-side-chart-card pwr-chart-hover pwr-chart-resizable"
-                  style={{ height: Number(powerChartSettings.side.height || 420) }}
+                  style={{ height: Number(powerChartSettings.donut?.height || 420) }}
+                  onMouseUp={(e) => {
+                    const h = e.currentTarget?.offsetHeight;
+                    if (Number.isFinite(h) && h > 0 && h !== powerChartSettings.donut?.height) {
+                      setPowerChartSettings((p) => ({ ...p, donut: { ...(p.donut || {}), height: h } }));
+                    }
+                  }}
                 >
                   <div className="row trend-header-row">
-                    <h3 style={{ marginTop: 0, marginBottom: 0 }}>Consumption by Tariff</h3>
+                    <h3 style={{ marginTop: 0, marginBottom: 0 }}>
+                      {(powerChartSettings.donut?.title) || "Total Usage / Cost by Tariff Rates"}
+                    </h3>
                     <div className="row power-side-controls">
-                      <div className="power-chart-type-toggle" role="group" aria-label="Donut mode">
-                        <button type="button" className={powerDonutMode === "cost" ? "active" : ""} onClick={() => setPowerDonutMode("cost")}>€ Cost</button>
-                        <button type="button" className={powerDonutMode === "kwh" ? "active" : ""} onClick={() => setPowerDonutMode("kwh")}>kWh</button>
-                      </div>
+                      <button
+                        type="button"
+                        className="icon-btn table-action-btn pwr-chart-edit-btn"
+                        title="Edit chart"
+                        onClick={() => setChartSettingsOpenKey("donut")}
+                      >
+                        <EditIcon />
+                      </button>
                     </div>
                   </div>
                   <div className="chart-wrap">
@@ -18030,7 +18058,7 @@ const getGatewayHealth = (gateway) => {
                         <PieChart>
                           <Pie
                             data={powerTariffBreakdown.items}
-                            dataKey={powerDonutMode === "cost" ? "cost" : "kwh"}
+                            dataKey={(powerChartSettings.donut?.mode || "cost") === "cost" ? "cost" : "kwh"}
                             nameKey="name"
                             innerRadius="55%"
                             outerRadius="85%"
@@ -18043,11 +18071,11 @@ const getGatewayHealth = (gateway) => {
                           </Pie>
                           <Tooltip formatter={(v, n, p) => {
                             const item = p?.payload || {};
-                            return powerDonutMode === "cost"
+                            return (powerChartSettings.donut?.mode || "cost") === "cost"
                               ? [`€ ${Number(item.cost || 0).toFixed(2)} (${Number(item.kwh || 0).toFixed(2)} kWh)`, item.name]
                               : [`${Number(item.kwh || 0).toFixed(2)} kWh (€ ${Number(item.cost || 0).toFixed(2)})`, item.name];
                           }} />
-                          <Legend wrapperStyle={{ fontSize: 11 }} />
+                          {powerChartSettings.donut?.show_legend !== false ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
                         </PieChart>
                       </ResponsiveContainer>
                     ) : (
@@ -25534,6 +25562,43 @@ const getGatewayHealth = (gateway) => {
             [key]: { ...prev[key], [field]: value },
           }));
         };
+        // Donut chart only exposes title, hide-title, mode (€/kWh) and legend.
+        if (key === "donut") {
+          return (
+            <div className="modal-backdrop">
+              <div className="modal-card pwr-modal" style={{ width: "min(420px, 96vw)" }}>
+                <h3>Chart Settings — Donut</h3>
+                <div className="pwr-modal-body">
+                  <div className="pwr-section">
+                    <div className="pwr-section-title">Layout</div>
+                    <label className="pwr-full">
+                      <span>Title (leave blank for auto)</span>
+                      <input value={current.title || ""} onChange={(e) => setField("title", e.target.value)} placeholder="Auto" />
+                    </label>
+                    <label className="pwr-check" style={{ marginTop: 6 }}>
+                      <input type="checkbox" checked={Boolean(current.hide_title)} onChange={(e) => setField("hide_title", e.target.checked)} />
+                      <span>Hide title bar</span>
+                    </label>
+                    <label className="pwr-full" style={{ marginTop: 6 }}>
+                      <span>Show value</span>
+                      <select value={current.mode || "cost"} onChange={(e) => setField("mode", e.target.value)}>
+                        <option value="cost">€ Cost</option>
+                        <option value="kwh">kWh</option>
+                      </select>
+                    </label>
+                    <label className="pwr-check" style={{ marginTop: 6 }}>
+                      <input type="checkbox" checked={current.show_legend !== false} onChange={(e) => setField("show_legend", e.target.checked)} />
+                      <span>Show legend</span>
+                    </label>
+                  </div>
+                </div>
+                <div className="row modal-actions">
+                  <button className="btn btn-primary" onClick={() => setChartSettingsOpenKey("")}>Done</button>
+                </div>
+              </div>
+            </div>
+          );
+        }
         const toggleMeter = (mid) => {
           setPowerChartSettings((prev) => {
             const cur = new Set(prev[key].hidden_meters || []);

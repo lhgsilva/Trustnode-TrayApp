@@ -3918,10 +3918,31 @@ input[type="checkbox"] {
 }
 
 .power-kpi-grid {
+  /* Operator 2026-06-15: 8 cards in two groups (Live / Total) on a
+     single row. Group label sits on its own micro-column. The
+     entire strip scrolls horizontally rather than wrapping so the
+     comparison row stays intact at narrow widths. */
   display: grid;
-  grid-template-columns: repeat(6, minmax(170px, 1fr));
-  gap: 12px;
+  grid-template-columns:
+    auto repeat(4, minmax(150px, 1fr))
+    auto repeat(4, minmax(150px, 1fr));
+  gap: 10px;
   align-items: stretch;
+  overflow-x: auto;
+}
+.pwr-insight-group-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 4px 2px;
+  border-left: 2px solid var(--teal);
 }
 
 .power-kpi-grid .stat-card {
@@ -3929,6 +3950,19 @@ input[type="checkbox"] {
   border: 1px solid var(--stroke);
   border-radius: 12px;
   min-height: 116px;
+  padding: 10px 12px;
+}
+/* Bigger value font (operator 2026-06-15: "the insights value font
+   can be bigger to fit better"). */
+.power-kpi-grid .stat-card .stat-value {
+  font-size: 28px;
+  line-height: 1.05;
+}
+.power-kpi-grid .stat-card .power-insight-unit {
+  font-size: 12px;
+}
+.power-kpi-grid .stat-card .stat-title {
+  font-size: 11px;
 }
 
 /* Insight card delta indicator (operator 2026-06-15). */
