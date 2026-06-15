@@ -599,10 +599,19 @@ function buildRegisterScaleMap(registers, existing = {}) {
   }
   return out;
 }
+// Operator 2026-06-15: extended set incl. calendar-bounded windows
+// (Day = midnight of today, Week = start of current ISO week,
+// Month = first of current month). Live mode keeps only the rolling
+// windows; calendar windows surface in Live too because operators
+// asked for them on the same dropdown.
 const POWER_PERIOD_OPTIONS = [
   { value: "1h", label: "Last 1 hour", ms: 60 * 60 * 1000 },
-  { value: "6h", label: "Last 6 hours", ms: 6 * 60 * 60 * 1000 },
+  { value: "8h", label: "Last 8 hours", ms: 8 * 60 * 60 * 1000 },
+  { value: "12h", label: "Last 12 hours", ms: 12 * 60 * 60 * 1000 },
   { value: "24h", label: "Last 24 hours", ms: 24 * 60 * 60 * 1000 },
+  { value: "day", label: "Day (current day)", ms: 24 * 60 * 60 * 1000 },
+  { value: "week", label: "Week (current week)", ms: 7 * 24 * 60 * 60 * 1000 },
+  { value: "month", label: "Month (current month)", ms: 31 * 24 * 60 * 60 * 1000 },
   { value: "7d", label: "Last 7 days", ms: 7 * 24 * 60 * 60 * 1000 },
   { value: "30d", label: "Last 30 days", ms: 30 * 24 * 60 * 60 * 1000 },
 ];
@@ -2706,8 +2715,29 @@ function AppShell() {
   // Overview chart settings (operator 2026-06-15: edit chart info on
   // hover — title, type, axis, limits, series). Keys: "main" / "side".
   const [powerChartSettings, setPowerChartSettings] = useState({
-    main: { title: "", y_min: "", y_max: "", hidden_meters: [] },
-    side: { title: "", y_min: "", y_max: "", hidden_meters: [] },
+    main: {
+      title: "",
+      y_min: "", y_max: "",
+      y_label: "",
+      y_unit: "",
+      hidden_meters: [],
+      // Per-meter override to put a meter on the secondary (right) axis.
+      secondary_meters: [],
+      y2_min: "", y2_max: "",
+      y2_label: "",
+      y2_unit: "",
+    },
+    side: {
+      title: "",
+      y_min: "", y_max: "",
+      y_label: "",
+      y_unit: "",
+      hidden_meters: [],
+      secondary_meters: [],
+      y2_min: "", y2_max: "",
+      y2_label: "",
+      y2_unit: "",
+    },
   });
   const [chartSettingsOpenKey, setChartSettingsOpenKey] = useState("");
   const [powerMainMetric, setPowerMainMetric] = useState("power_kw");
@@ -6980,11 +7010,28 @@ function AppShell() {
   }, [powerConfig]);
 
   const periodMs = useMemo(() => {
-    const realtimePeriods = new Set(["1h", "6h", "24h"]);
-    const available = powerViewMode === "realtime"
-      ? POWER_PERIOD_OPTIONS.filter((p) => realtimePeriods.has(p.value))
-      : POWER_PERIOD_OPTIONS;
-    const match = available.find((p) => p.value === powerPeriod) || available[0];
+    // Calendar windows (day/week/month) measure from the start of
+    // the corresponding boundary to now, not a rolling 24/168/720
+    // hour span. Operator 2026-06-15.
+    const now = new Date();
+    if (powerPeriod === "day") {
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
+    }
+    if (powerPeriod === "week") {
+      const d = new Date(now);
+      // ISO week starts Monday — but match the OS locale heuristic of
+      // "current week" instead (Sun-based on en-US). Keep it Monday-
+      // based since that matches the European factory shift planner.
+      const dow = (d.getDay() + 6) % 7; // 0 = Monday
+      const start = new Date(d.getFullYear(), d.getMonth(), d.getDate() - dow);
+      return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
+    }
+    if (powerPeriod === "month") {
+      const start = new Date(now.getFullYear(), now.getMonth(), 1);
+      return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
+    }
+    const match = POWER_PERIOD_OPTIONS.find((p) => p.value === powerPeriod) || POWER_PERIOD_OPTIONS[3];
     return match?.ms || 24 * 60 * 60 * 1000;
   }, [powerPeriod, powerViewMode]);
 
@@ -17246,9 +17293,11 @@ const getGatewayHealth = (gateway) => {
                     onChange={(e) => setPowerPeriod(e.target.value)}
                     disabled={powerViewMode === "historical"}
                   >
-                    {POWER_PERIOD_OPTIONS.filter((p) => ["1h", "6h", "24h"].includes(p.value)).map((p) => (
-                      <option key={p.value} value={p.value}>{p.label}</option>
-                    ))}
+                    {POWER_PERIOD_OPTIONS
+                      .filter((p) => ["1h", "8h", "12h", "24h", "day", "week", "month"].includes(p.value))
+                      .map((p) => (
+                        <option key={p.value} value={p.value}>{p.label}</option>
+                      ))}
                   </select>
                 </label>
                 <label className="field pwr-overview-field">
@@ -17361,24 +17410,43 @@ const getGatewayHealth = (gateway) => {
                           tickLine={{ stroke: powerChartAxisColor }}
                         />
                         <YAxis
+                          yAxisId="left"
                           width={62}
                           domain={powerMainYDomain}
                           ticks={buildYAxisTicks(powerMainYDomain, 0.5, 12)}
-                          tickFormatter={(v) => formatChartValue(v, 3)}
+                          tickFormatter={(v) => `${formatChartValue(v, 3)}${powerChartSettings.main.y_unit ? " " + powerChartSettings.main.y_unit : ""}`}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
                           axisLine={{ stroke: powerChartAxisColor }}
                           tickLine={{ stroke: powerChartAxisColor }}
+                          label={powerChartSettings.main.y_label ? { value: powerChartSettings.main.y_label, angle: -90, position: "insideLeft", style: { fontSize: 11, fill: powerChartAxisColor } } : undefined}
                         />
+                        {powerChartSettings.main.secondary_meters.length ? (
+                          <YAxis
+                            yAxisId="right"
+                            orientation="right"
+                            width={56}
+                            domain={[
+                              Number.isFinite(Number(powerChartSettings.main.y2_min)) ? Number(powerChartSettings.main.y2_min) : "auto",
+                              Number.isFinite(Number(powerChartSettings.main.y2_max)) ? Number(powerChartSettings.main.y2_max) : "auto",
+                            ]}
+                            tickFormatter={(v) => `${formatChartValue(v, 3)}${powerChartSettings.main.y2_unit ? " " + powerChartSettings.main.y2_unit : ""}`}
+                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                            axisLine={{ stroke: powerChartAxisColor }}
+                            tickLine={{ stroke: powerChartAxisColor }}
+                            label={powerChartSettings.main.y2_label ? { value: powerChartSettings.main.y2_label, angle: 90, position: "insideRight", style: { fontSize: 11, fill: powerChartAxisColor } } : undefined}
+                          />
+                        ) : null}
                         <Tooltip formatter={(v) => formatChartValue(v, 3)} />
                         <Legend wrapperStyle={{ fontSize: 11 }} />
                         {powerMainChartType === "bar" ? (
                           <>
-                            <Bar dataKey="total" name="Total" fill="#16a34a" isAnimationActive={false} />
+                            <Bar yAxisId="left" dataKey="total" name="Total" fill="#16a34a" isAnimationActive={false} />
                             {(powerConfig?.devices || [])
                               .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
                               .map((d, idx) => (
                                 <Bar
                                   key={`pwr-bar-${d.id}`}
+                                  yAxisId={powerChartSettings.main.secondary_meters.includes(String(d.id)) ? "right" : "left"}
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
                                   fill={getSeriesColor(idx)}
@@ -17389,6 +17457,7 @@ const getGatewayHealth = (gateway) => {
                         ) : powerMainChartType === "area" ? (
                           <>
                             <Area
+                              yAxisId="left"
                               type="stepAfter"
                               dataKey="total"
                               name="Total"
@@ -17404,6 +17473,7 @@ const getGatewayHealth = (gateway) => {
                               .map((d, idx) => (
                                 <Area
                                   key={`pwr-area-${d.id}`}
+                                  yAxisId={powerChartSettings.main.secondary_meters.includes(String(d.id)) ? "right" : "left"}
                                   type="stepAfter"
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
@@ -17418,12 +17488,13 @@ const getGatewayHealth = (gateway) => {
                           </>
                         ) : (
                           <>
-                            <Line type="stepAfter" dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={false} isAnimationActive={false} />
+                            <Line yAxisId="left" type="stepAfter" dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={false} isAnimationActive={false} />
                             {(powerConfig?.devices || [])
                               .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
                               .map((d, idx) => (
                                 <Line
                                   key={`pwr-line-${d.id}`}
+                                  yAxisId={powerChartSettings.main.secondary_meters.includes(String(d.id)) ? "right" : "left"}
                                   type="stepAfter"
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
@@ -25016,7 +25087,7 @@ const getGatewayHealth = (gateway) => {
       ) : null}
       {chartSettingsOpenKey ? (() => {
         const key = chartSettingsOpenKey;
-        const current = powerChartSettings[key] || { title: "", y_min: "", y_max: "", hidden_meters: [] };
+        const current = powerChartSettings[key] || { title: "", y_min: "", y_max: "", y_label: "", y_unit: "", hidden_meters: [], secondary_meters: [], y2_min: "", y2_max: "", y2_label: "", y2_unit: "" };
         const setField = (field, value) => {
           setPowerChartSettings((prev) => ({
             ...prev,
@@ -25030,21 +25101,25 @@ const getGatewayHealth = (gateway) => {
             return { ...prev, [key]: { ...prev[key], hidden_meters: Array.from(cur) } };
           });
         };
+        const toggleAxis = (mid) => {
+          setPowerChartSettings((prev) => {
+            const cur = new Set(prev[key].secondary_meters || []);
+            if (cur.has(mid)) cur.delete(mid); else cur.add(mid);
+            return { ...prev, [key]: { ...prev[key], secondary_meters: Array.from(cur) } };
+          });
+        };
         return (
           <div className="modal-backdrop">
-            <div className="modal-card pwr-modal" style={{ width: "min(520px, 96vw)" }}>
+            <div className="modal-card pwr-modal" style={{ width: "min(640px, 96vw)" }}>
               <h3>Chart Settings — {key === "main" ? "Main" : "Side"}</h3>
               <div className="pwr-modal-body">
                 <div className="pwr-section">
+                  <div className="pwr-section-title">Layout</div>
                   <label className="pwr-full">
                     <span>Title (leave blank for auto)</span>
                     <input value={current.title} onChange={(e) => setField("title", e.target.value)} placeholder="Auto" />
                   </label>
-                  <div className="pwr-grid">
-                    <label><span>Y min (blank=auto)</span><input type="number" step="0.01" value={current.y_min} onChange={(e) => setField("y_min", e.target.value)} /></label>
-                    <label><span>Y max (blank=auto)</span><input type="number" step="0.01" value={current.y_max} onChange={(e) => setField("y_max", e.target.value)} /></label>
-                  </div>
-                  <label className="pwr-full">
+                  <label className="pwr-full" style={{ marginTop: 6 }}>
                     <span>Type</span>
                     <select value={key === "main" ? powerMainChartType : powerSideChartType} onChange={(e) => key === "main" ? setPowerMainChartType(e.target.value) : setPowerSideChartType(e.target.value)}>
                       <option value="line">Line</option>
@@ -25052,20 +25127,51 @@ const getGatewayHealth = (gateway) => {
                       <option value="bar">Bar</option>
                     </select>
                   </label>
-                  <div className="pwr-full">
-                    <span style={{ fontSize: 10.5, letterSpacing: "0.04em", textTransform: "uppercase", color: "var(--muted)" }}>Series (toggle to hide)</span>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
-                      {(powerConfig?.devices || []).map((d) => {
-                        const mid = String(d.id || "");
-                        const hidden = current.hidden_meters.includes(mid);
-                        return (
-                          <label key={`series-${mid}`} className="pwr-check">
-                            <input type="checkbox" checked={!hidden} onChange={() => toggleMeter(mid)} />
-                            <span>{d.name || mid}</span>
-                          </label>
-                        );
-                      })}
-                    </div>
+                </div>
+
+                <div className="pwr-section">
+                  <div className="pwr-section-title">Primary Y axis (left)</div>
+                  <div className="pwr-grid">
+                    <label><span>Label</span><input value={current.y_label} onChange={(e) => setField("y_label", e.target.value)} placeholder="e.g. Power" /></label>
+                    <label><span>Unit</span><input value={current.y_unit} onChange={(e) => setField("y_unit", e.target.value)} placeholder="kW" /></label>
+                    <label><span>Min (blank=auto)</span><input type="number" step="0.01" value={current.y_min} onChange={(e) => setField("y_min", e.target.value)} /></label>
+                    <label><span>Max (blank=auto)</span><input type="number" step="0.01" value={current.y_max} onChange={(e) => setField("y_max", e.target.value)} /></label>
+                  </div>
+                </div>
+
+                <div className="pwr-section">
+                  <div className="pwr-section-title">
+                    Secondary Y axis (right) <span className="pwr-section-hint">— shown only when meters are assigned</span>
+                  </div>
+                  <div className="pwr-grid">
+                    <label><span>Label</span><input value={current.y2_label} onChange={(e) => setField("y2_label", e.target.value)} placeholder="e.g. Voltage" /></label>
+                    <label><span>Unit</span><input value={current.y2_unit} onChange={(e) => setField("y2_unit", e.target.value)} placeholder="V" /></label>
+                    <label><span>Min (blank=auto)</span><input type="number" step="0.01" value={current.y2_min} onChange={(e) => setField("y2_min", e.target.value)} /></label>
+                    <label><span>Max (blank=auto)</span><input type="number" step="0.01" value={current.y2_max} onChange={(e) => setField("y2_max", e.target.value)} /></label>
+                  </div>
+                </div>
+
+                <div className="pwr-section">
+                  <div className="pwr-section-title">Series — show, hide, axis</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 6, alignItems: "center", fontSize: 12 }}>
+                    <span style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase" }}>Meter</span>
+                    <span style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase" }}>Visible</span>
+                    <span style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase" }}>Axis</span>
+                    {(powerConfig?.devices || []).map((d) => {
+                      const mid = String(d.id || "");
+                      const hidden = current.hidden_meters.includes(mid);
+                      const onRight = current.secondary_meters.includes(mid);
+                      return (
+                        <div key={`m-${mid}`} style={{ display: "contents" }}>
+                          <span>{d.name || mid}</span>
+                          <input type="checkbox" checked={!hidden} onChange={() => toggleMeter(mid)} title="Show this series" />
+                          <select value={onRight ? "right" : "left"} onChange={() => toggleAxis(mid)} style={{ height: 28, padding: "0 6px" }}>
+                            <option value="left">Left</option>
+                            <option value="right">Right</option>
+                          </select>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </div>

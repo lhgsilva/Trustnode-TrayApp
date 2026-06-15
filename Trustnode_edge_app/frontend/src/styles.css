@@ -2903,6 +2903,33 @@ textarea {
   background: var(--bg);
   color: var(--text);
   width: 100%;
+  /* accent-color hooks into the native control palette (checkbox
+     check, focus ring, dropdown highlight) so it doesn't fall back
+     to the OS default which can be black in some Windows themes —
+     operator 2026-06-15 reported selects rendering with a dark
+     fill in light mode. */
+  accent-color: var(--teal);
+}
+/* Force the closed control to stay on the light surface even when
+   focused / opened, in case a Windows accent-color theme or a
+   browser default would paint it dark. */
+:root:not([data-theme="dark"]) input,
+:root:not([data-theme="dark"]) select,
+:root:not([data-theme="dark"]) textarea {
+  background-color: #ffffff;
+  color: #111111;
+}
+:root:not([data-theme="dark"]) input:focus,
+:root:not([data-theme="dark"]) select:focus,
+:root:not([data-theme="dark"]) textarea:focus {
+  background-color: #ffffff;
+  color: #111111;
+  outline: 2px solid var(--teal);
+  outline-offset: -1px;
+}
+:root:not([data-theme="dark"]) select option {
+  background-color: #ffffff;
+  color: #111111;
 }
 
 select option {
