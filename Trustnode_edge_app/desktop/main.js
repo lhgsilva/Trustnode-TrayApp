@@ -748,6 +748,12 @@ function buildSplashHtml() {
 
 function createSplashWindow() {
   if (splashWindow && !splashWindow.isDestroyed()) return;
+  // Use the same .ico the main window uses so the Windows taskbar
+  // shows the TrustNode brand during startup, not the default
+  // Electron logo (operator 2026-06-15).
+  const splashIconPath = app.isPackaged
+    ? path.join(process.resourcesPath, "trustnode_logo.ico")
+    : path.resolve(__dirname, "assets", "trustnode_logo.ico");
   try {
     splashWindow = new BrowserWindow({
       // Slightly wider to fit the wordmark brand logo without
@@ -773,6 +779,7 @@ function createSplashWindow() {
       skipTaskbar: false,
       backgroundColor: "#f6f8fb",
       title: "TrustNode",
+      icon: splashIconPath,
       webPreferences: {
         contextIsolation: true,
         nodeIntegration: false,
