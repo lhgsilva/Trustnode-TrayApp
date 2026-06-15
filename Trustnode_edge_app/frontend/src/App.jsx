@@ -7332,8 +7332,21 @@ function AppShell() {
       }
       return out;
     })();
-    for (const k of skeletonKeys) {
-      if (!buckets.has(k)) buckets.set(k, { ts: k, meterBuckets: {} });
+    // Operator 2026-06-15: skeleton only fills slots BETWEEN the
+    // first and last real bucket so the chart starts at the first
+    // actual sample (not midnight) and ends at "now".
+    const dataKeys = Array.from(buckets.keys()).filter((k) => !skeletonKeys.includes(k) || (buckets.get(k)?.meterBuckets && Object.keys(buckets.get(k).meterBuckets).length > 0));
+    const realDataKeys = Array.from(buckets.entries())
+      .filter(([, b]) => Object.keys(b.meterBuckets || {}).length > 0)
+      .map(([k]) => k)
+      .sort();
+    if (realDataKeys.length) {
+      const firstKey = realDataKeys[0];
+      for (const k of skeletonKeys) {
+        if (String(k) >= String(firstKey) && !buckets.has(k)) {
+          buckets.set(k, { ts: k, meterBuckets: {} });
+        }
+      }
     }
     const rows = Array.from(buckets.values()).map((b) => {
       const row = { ts: b.ts, total: 0 };
@@ -7402,6 +7415,9 @@ function AppShell() {
       samples.push({ ts: tsMs, kw: Math.max(0, Number(row?.value || 0) / 1000.0), meter: gid });
     }
     samples.sort((a, b) => a.ts - b.ts);
+    // Trapezoidal integration (industry std): kWh between two
+    // samples = avg(kw[i], kw[i+1]) * dt_h. Each kWh slice is
+    // attributed to the bucket of the LATER sample.
     const buckets = new Map();
     const prev = new Map();
     for (const s of samples) {
@@ -7410,7 +7426,8 @@ function AppShell() {
       if (!p) continue;
       const dtH = (s.ts - p.ts) / 3_600_000;
       if (dtH <= 0 || dtH > 1) continue;
-      const kwh = s.kw * dtH;
+      const avgKw = (p.kw + s.kw) / 2;
+      const kwh = avgKw * dtH;
       const key = bucketKey(s.ts);
       const b = buckets.get(key) || { ts: key, total_kwh: 0 };
       b.total_kwh += kwh;
@@ -7439,8 +7456,16 @@ function AppShell() {
       const hh = pad2(now.getHours());
       for (let m = 0; m < 60; m++) skeletonKeys.push(`${yyyy}-${mm}-${dd} ${hh}:${pad2(m)}`);
     }
-    for (const k of skeletonKeys) {
-      if (!buckets.has(k)) buckets.set(k, { ts: k, total_kwh: 0 });
+    // Skeleton fills slots BETWEEN first real bucket and "now"
+    // only (operator 2026-06-15: chart should start at first sample).
+    const realKeys = Array.from(buckets.keys()).sort();
+    if (realKeys.length) {
+      const firstKey = realKeys[0];
+      for (const k of skeletonKeys) {
+        if (String(k) >= String(firstKey) && !buckets.has(k)) {
+          buckets.set(k, { ts: k, total_kwh: 0 });
+        }
+      }
     }
     const sorted = Array.from(buckets.values())
       .sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
@@ -7512,6 +7537,10 @@ function AppShell() {
       samples.push({ ts, kw: Math.max(0, Number(r?.value || 0) / 1000.0), meter: gid });
     }
     samples.sort((a, b) => a.ts - b.ts);
+    // Trapezoidal integration — industry standard for power-to-
+    // energy across irregular sampling (PI, Ignition, EcoStruxure,
+    // utility billing all use this). dt > 1h is discarded as an
+    // offline gap.
     let totalEnergyKwh = 0;
     let totalCost = 0;
     const prev = new Map();
@@ -7520,8 +7549,9 @@ function AppShell() {
       prev.set(s.meter, s);
       if (!p) continue;
       const dtH = (s.ts - p.ts) / 3_600_000;
-      if (dtH <= 0 || dtH > 1) continue; // discard gaps > 1h
-      const kwh = s.kw * dtH;
+      if (dtH <= 0 || dtH > 1) continue;
+      const avgKw = (p.kw + s.kw) / 2;
+      const kwh = avgKw * dtH;
       totalEnergyKwh += kwh;
       totalCost += kwh * resolveTariffRate(s.ts);
     }
@@ -7598,19 +7628,23 @@ function AppShell() {
   // each insight card can show a "vs previous window" %.
   const powerKpisPrevious = useMemo(() => {
     const rows = powerHistoryRows || [];
-    if (!rows.length) return { totalCost: 0, totalEnergyKwh: 0, liveKw: 0, peakKw: 0, downtimeCost: 0, efficiency: 0 };
+    if (!rows.length) return { totalCost: 0, totalEnergyKwh: 0, liveKw: 0, liveCurrentA: 0, peakKw: 0, downtimeCost: 0, efficiency: 0 };
     const nowMs = Date.now();
     const prevFrom = nowMs - 2 * periodMs;
     const prevTo = nowMs - periodMs;
     const samples = [];
+    const currentSamples = [];
     const meterFilter = String(powerFilterMeterId || "all");
     for (const r of rows) {
       const tag = String(r?.tag || r?.tag_name || "");
-      if (tag !== "active_power_total_w" && tag !== "active_power_w") continue;
       const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
       if (!Number.isFinite(ts) || ts < prevFrom || ts > prevTo) continue;
       if (meterFilter !== "all" && String(r?.gateway_id || "") !== meterFilter) continue;
-      samples.push({ ts, kw: Number(r?.value || 0) / 1000.0, meter: String(r?.gateway_id || "") });
+      if (tag === "active_power_total_w" || tag === "active_power_w") {
+        samples.push({ ts, kw: Number(r?.value || 0) / 1000.0, meter: String(r?.gateway_id || "") });
+      } else if (tag === "current_a" || tag === "current_l1_a") {
+        currentSamples.push(Number(r?.value || 0));
+      }
     }
     samples.sort((a, b) => a.ts - b.ts);
     let totalEnergyKwh = 0;
@@ -7627,18 +7661,20 @@ function AppShell() {
       if (!p) continue;
       const dtH = (s.ts - p.ts) / 3_600_000;
       if (dtH <= 0 || dtH > 1) continue;
-      const kwh = Math.max(0, s.kw) * dtH;
+      const kwh = Math.max(0, (p.kw + s.kw) / 2) * dtH;
       totalEnergyKwh += kwh;
       totalCost += kwh * resolveTariffRate(s.ts);
     }
     const avgKw = count ? sumKw / count : 0;
     const efficiency = peakKw > 0 ? Math.max(0, Math.min(100, (avgKw / peakKw) * 100)) : 0;
+    const liveCurrentA = currentSamples.length ? currentSamples.reduce((a, b) => a + b, 0) / currentSamples.length : 0;
     return {
       totalCost,
       totalEnergyKwh,
       liveKw: avgKw,
+      liveCurrentA,
       peakKw,
-      downtimeCost: 0, // not computed for prior window; arrow stays neutral
+      downtimeCost: 0,
       efficiency,
     };
   }, [powerHistoryRows, periodMs, powerFilterMeterId, resolveTariffRate]);
@@ -7696,7 +7732,7 @@ function AppShell() {
       if (!prev) continue;
       const dtH = (s.ts - prev.ts) / 3_600_000;
       if (dtH <= 0 || dtH > 1) continue;
-      const kwh = Math.max(0, s.kw) * dtH;
+      const kwh = Math.max(0, (p.kw + s.kw) / 2) * dtH;
       const idx = tariffIndex(s.ts);
       const key = idx >= 0 ? String(idx) : "default";
       const acc = buckets.get(key) || { kwh: 0, cost: 0 };
@@ -7747,7 +7783,7 @@ function AppShell() {
       if (!p) continue;
       const dtH = (s.ts - p.ts) / 3_600_000;
       if (dtH <= 0 || dtH > 1) continue;
-      const kwh = Math.max(0, s.kw) * dtH;
+      const kwh = Math.max(0, (p.kw + s.kw) / 2) * dtH;
       const cost = kwh * resolveTariffRate(s.ts);
       const acc = out[s.meter] || { kwh: 0, cost: 0 };
       acc.kwh += kwh;
@@ -17845,14 +17881,17 @@ const getGatewayHealth = (gateway) => {
                       <div className="stat-card power-insight-card power-insight-live">
                         <div className="stat-title">Current (A)</div>
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(liveCurrentA, 2)}</span><span className="power-insight-unit">A</span></div>
+                        {renderDelta(liveCurrentA, powerKpisPrevious.liveCurrentA, false)}
                       </div>
                       <div className="stat-card power-insight-card power-insight-live">
                         <div className="stat-title">Active Power (kW)</div>
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(liveKw, 2)}</span><span className="power-insight-unit">kW</span></div>
+                        {renderDelta(liveKw, powerKpisPrevious.liveKw, false)}
                       </div>
                       <div className="stat-card power-insight-card power-insight-energy">
                         <div className="stat-title">Power Usage (kWh)</div>
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(livePowerUsageKwh, 2)}</span><span className="power-insight-unit">kWh</span></div>
+                        {renderDelta(livePowerUsageKwh, powerKpisPrevious.totalEnergyKwh, false)}
                       </div>
                       <div className="stat-card power-insight-card power-insight-eff">
                         <div className="stat-title">Energy Efficiency (%)</div>
@@ -17904,6 +17943,16 @@ const getGatewayHealth = (gateway) => {
                       </h3>
                     )}
                     <div className="row power-side-controls">
+                      {/* Metric pill (operator 2026-06-15: bring
+                          the metric selector back to the top right
+                          of chart 1). Edit modal also exposes the
+                          same control. */}
+                      <div className="power-chart-type-toggle" role="group" aria-label="Live chart metric">
+                        <button type="button" className={powerMainMetric === "current_a" ? "active" : ""} onClick={() => setPowerMainMetric("current_a")}>A</button>
+                        <button type="button" className={powerMainMetric === "power_kw" ? "active" : ""} onClick={() => setPowerMainMetric("power_kw")}>kW</button>
+                        <button type="button" className={powerMainMetric === "energy_kwh" ? "active" : ""} onClick={() => setPowerMainMetric("energy_kwh")}>kWh</button>
+                        <button type="button" className={powerMainMetric === "voltage_v" ? "active" : ""} onClick={() => setPowerMainMetric("voltage_v")}>V</button>
+                      </div>
                       <button
                         type="button"
                         className="icon-btn table-action-btn pwr-chart-edit-btn"
@@ -17938,7 +17987,7 @@ const getGatewayHealth = (gateway) => {
                           yAxisId="left"
                           width={62}
                           domain={powerMainYDomain}
-                          ticks={buildYAxisTicks(powerMainYDomain, 0.5, 12)}
+                          ticks={buildYAxisTicks(powerMainYDomain, 0.5, Math.max(4, Math.floor(Number(powerChartSettings.main.height || 360) / 55)))}
                           tickFormatter={(v) => `${formatChartValue(v, 3)}${powerChartSettings.main.y_unit ? " " + powerChartSettings.main.y_unit : ""}`}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
                           axisLine={{ stroke: powerChartAxisColor }}
@@ -18098,7 +18147,7 @@ const getGatewayHealth = (gateway) => {
                         <YAxis
                           width={64}
                           domain={powerSideYDomain}
-                          ticks={buildYAxisTicks(powerSideYDomain, 0.5, 12)}
+                          ticks={buildYAxisTicks(powerSideYDomain, 0.5, Math.max(4, Math.floor(Number(powerChartSettings.side.height || 280) / 55)))}
                           tickFormatter={(v) => formatChartValue(v, 3)}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
                           axisLine={{ stroke: powerChartAxisColor }}
