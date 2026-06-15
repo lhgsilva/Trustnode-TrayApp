@@ -3931,6 +3931,37 @@ input[type="checkbox"] {
   min-height: 116px;
 }
 
+/* Insight card delta indicator (operator 2026-06-15). */
+.pwr-delta {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-top: 4px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--card) 85%, var(--bg) 15%);
+}
+.pwr-delta-arrow {
+  font-weight: 800;
+  font-size: 12px;
+}
+.pwr-delta-good {
+  color: #16a34a;
+}
+.pwr-delta-bad {
+  color: #dc2626;
+}
+.pwr-delta-flat {
+  color: var(--muted);
+}
+.pwr-delta-hint {
+  color: var(--muted);
+  font-weight: 400;
+  margin-left: 2px;
+}
+
 .power-main-grid {
   display: grid;
   /* 50 / 25 / 25 — operator 2026-06-15. Main trend, side bar/total,
@@ -3984,11 +4015,20 @@ input[type="checkbox"] {
 .power-main-chart-card .chart-wrap,
 .power-side-chart-card .chart-wrap {
   width: 100%;
-  flex: 1 1 auto;
+  flex: 1 1 0;
   height: auto;
   overflow: hidden;
   padding: 4px 4px 4px;
-  min-height: 220px;
+  /* Operator 2026-06-15: chart should fill the card bottom and
+     follow when the operator drags the card taller. min-height:0
+     lets the flex container actually shrink/grow the chart-wrap. */
+  min-height: 0;
+}
+.power-main-chart-card,
+.power-side-chart-card {
+  /* The article needs to behave as a flex column so the chart-wrap
+     can consume the remaining height under the title row. */
+  min-height: 360px;
 }
 
 .power-main-chart-card .recharts-wrapper,

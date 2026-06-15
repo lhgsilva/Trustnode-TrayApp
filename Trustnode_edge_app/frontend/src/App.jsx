@@ -2745,6 +2745,7 @@ function AppShell() {
       color_mode: "default",
       show_legend: true,
       show_point_labels: false,
+      show_total: true,
     },
     side: {
       title: "",
@@ -2763,6 +2764,7 @@ function AppShell() {
       color_mode: "default",
       show_legend: true,
       show_point_labels: false,
+      show_total: true,
     },
   });
   const [chartSettingsOpenKey, setChartSettingsOpenKey] = useState("");
@@ -7237,6 +7239,40 @@ function AppShell() {
       if (powerAggregation === "sum") return arr.reduce((a, n) => a + n, 0);
       return arr.reduce((a, n) => a + n, 0) / arr.length;
     };
+    // Build the grain skeleton so the X-axis renders the full set
+    // even when a slot has no data (operator 2026-06-15: Year shows
+    // all 12 months, Month all ~30 days, Day all 24 hours, Hour all
+    // 60 minutes). Each skeleton entry seeds a 0 bucket; merge with
+    // the data buckets so cells without samples become 0 instead
+    // of being absent from the X axis.
+    const skeletonKeys = (() => {
+      const now = new Date();
+      const out = [];
+      const pad2 = (n) => String(n).padStart(2, "0");
+      if (effectiveInterval === "month") {
+        for (let m = 0; m < 12; m++) out.push(`${now.getFullYear()}-${pad2(m + 1)}`);
+      } else if (effectiveInterval === "day") {
+        const year = now.getFullYear();
+        const month = now.getMonth();
+        const daysInMonth = new Date(year, month + 1, 0).getDate();
+        for (let d = 1; d <= daysInMonth; d++) out.push(`${year}-${pad2(month + 1)}-${pad2(d)}`);
+      } else if (effectiveInterval === "hour") {
+        const yyyy = now.getFullYear();
+        const mm = pad2(now.getMonth() + 1);
+        const dd = pad2(now.getDate());
+        for (let h = 0; h < 24; h++) out.push(`${yyyy}-${mm}-${dd} ${pad2(h)}:00`);
+      } else if (effectiveInterval === "minute") {
+        const yyyy = now.getFullYear();
+        const mm = pad2(now.getMonth() + 1);
+        const dd = pad2(now.getDate());
+        const hh = pad2(now.getHours());
+        for (let m = 0; m < 60; m++) out.push(`${yyyy}-${mm}-${dd} ${hh}:${pad2(m)}`);
+      }
+      return out;
+    })();
+    for (const k of skeletonKeys) {
+      if (!buckets.has(k)) buckets.set(k, { ts: k, meterBuckets: {} });
+    }
     const rows = Array.from(buckets.values()).map((b) => {
       const row = { ts: b.ts, total: 0 };
       for (const gid of meterIds) {
@@ -7265,14 +7301,18 @@ function AppShell() {
       new Set((powerMainChartData?.rows || []).map((r) => String(r?.ts || "").trim()).filter(Boolean))
     );
     if (!labels.length) return [];
-    const maxTicks = powerInterval === "second" ? 8 : powerInterval === "minute" ? 10 : powerInterval === "hour" ? 12 : 14;
+    // Operator 2026-06-15: when the view scale dictates a fixed
+    // grain (Year / Month / Day / Hour), show every label.
+    if (effectiveInterval === "year" || effectiveInterval === "month") return labels;
+    if (effectiveInterval === "day" || effectiveInterval === "hour") return labels;
+    const maxTicks = effectiveInterval === "second" ? 8 : effectiveInterval === "minute" ? 12 : 14;
     if (labels.length <= maxTicks) return labels;
     const step = Math.max(1, Math.ceil((labels.length - 1) / (maxTicks - 1)));
     const out = [];
     for (let i = 0; i < labels.length; i += step) out.push(labels[i]);
     if (out[out.length - 1] !== labels[labels.length - 1]) out.push(labels[labels.length - 1]);
     return out;
-  }, [powerMainChartData, powerInterval]);
+  }, [powerMainChartData, effectiveInterval]);
   const powerSideChartData = useMemo(() => {
     const nowMs = Date.now();
     const isLast12h = String(powerCostChartRange || "12h") === "12h";
@@ -7413,6 +7453,64 @@ function AppShell() {
     };
   }, [powerTrendData, powerInterval, powerCostPerKwh, powerConfig, powerHistoryRows, resolveTariffRate]);
 
+  // Previous-period KPI snapshot for delta arrows (operator
+  // 2026-06-15). Re-runs the trend integration against
+  // [now - 2*period, now - period] using the same period length so
+  // each insight card can show a "vs previous window" %.
+  const powerKpisPrevious = useMemo(() => {
+    const rows = powerHistoryRows || [];
+    if (!rows.length) return { totalCost: 0, totalEnergyKwh: 0, liveKw: 0, peakKw: 0, downtimeCost: 0, efficiency: 0 };
+    const nowMs = Date.now();
+    const prevFrom = nowMs - 2 * periodMs;
+    const prevTo = nowMs - periodMs;
+    const samples = [];
+    const meterFilter = String(powerFilterMeterId || "all");
+    for (const r of rows) {
+      const tag = String(r?.tag || r?.tag_name || "");
+      if (tag !== "active_power_total_w" && tag !== "active_power_w") continue;
+      const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
+      if (!Number.isFinite(ts) || ts < prevFrom || ts > prevTo) continue;
+      if (meterFilter !== "all" && String(r?.gateway_id || "") !== meterFilter) continue;
+      samples.push({ ts, kw: Number(r?.value || 0) / 1000.0, meter: String(r?.gateway_id || "") });
+    }
+    samples.sort((a, b) => a.ts - b.ts);
+    let totalEnergyKwh = 0;
+    let totalCost = 0;
+    let peakKw = 0;
+    let count = 0, sumKw = 0;
+    const prev = new Map();
+    for (const s of samples) {
+      const p = prev.get(s.meter);
+      prev.set(s.meter, s);
+      sumKw += Math.max(0, s.kw);
+      count++;
+      if (s.kw > peakKw) peakKw = s.kw;
+      if (!p) continue;
+      const dtH = (s.ts - p.ts) / 3_600_000;
+      if (dtH <= 0 || dtH > 1) continue;
+      const kwh = Math.max(0, s.kw) * dtH;
+      totalEnergyKwh += kwh;
+      totalCost += kwh * resolveTariffRate(s.ts);
+    }
+    const avgKw = count ? sumKw / count : 0;
+    const efficiency = peakKw > 0 ? Math.max(0, Math.min(100, (avgKw / peakKw) * 100)) : 0;
+    return {
+      totalCost,
+      totalEnergyKwh,
+      liveKw: avgKw,
+      peakKw,
+      downtimeCost: 0, // not computed for prior window; arrow stays neutral
+      efficiency,
+    };
+  }, [powerHistoryRows, periodMs, powerFilterMeterId, resolveTariffRate]);
+
+  const powerKpiDelta = useCallback((cur, prev) => {
+    const a = Number(cur);
+    const b = Number(prev);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) return null;
+    return ((a - b) / Math.abs(b)) * 100;
+  }, []);
+
   // Per-tariff breakdown for the donut. Walks the filtered rows
   // (already scoped by view scale via powerRowsFiltered), picks the
   // matching tariff per timestamp, and accumulates kWh + cost. The
@@ -7524,18 +7622,35 @@ function AppShell() {
     (value) => {
       const text = String(value || "");
       if (!text) return "";
-      if (powerInterval === "day") {
-        return text.length >= 10 ? text.slice(5, 10) : text;
+      const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+      if (effectiveInterval === "year") return text;
+      if (effectiveInterval === "month") {
+        // YYYY-MM → "Mon"
+        const m = text.match(/^(\d{4})-(\d{2})$/);
+        if (m) return MONTHS[Number(m[2]) - 1] || text;
+      }
+      if (effectiveInterval === "day") {
+        // YYYY-MM-DD → "DD"
+        return text.length >= 10 ? text.slice(8, 10) : text;
+      }
+      if (effectiveInterval === "hour") {
+        // "YYYY-MM-DD HH:00" → "HHh"
+        const parts = text.split(" ");
+        if (parts.length >= 2) return `${parts[1].slice(0, 2)}h`;
+      }
+      if (effectiveInterval === "minute") {
+        const parts = text.split(" ");
+        if (parts.length >= 2) return parts[1].slice(0, 5); // HH:MM
+      }
+      if (effectiveInterval === "second") {
+        const parts = text.split(" ");
+        if (parts.length >= 2) return parts[1].slice(0, 8);
       }
       const parts = text.split(" ");
-      if (parts.length >= 2) {
-        if (powerInterval === "second") return parts[1].slice(0, 8);
-        return parts[1].slice(0, 5);
-      }
-      if (powerInterval === "second") return text.length >= 8 ? text.slice(-8) : text;
+      if (parts.length >= 2) return parts[1].slice(0, 5);
       return text.length >= 5 ? text.slice(-5) : text;
     },
-    [powerInterval]
+    [effectiveInterval]
   );
   const formatPowerSideXAxisTick = useCallback(
     (value) => {
@@ -17542,12 +17657,66 @@ const getGatewayHealth = (gateway) => {
                 </div>
               </section>
               <section className="power-kpi-grid">
-                <div className="stat-card power-insight-card power-insight-eff"><div className="stat-title">Energy Efficiency</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.efficiency, 1)}</span><span className="power-insight-unit">%</span></div></div>
-                <div className="stat-card power-insight-card power-insight-cost"><div className="stat-title">Energy Costs</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.totalCost, 2)}</span><span className="power-insight-unit">EUR</span></div></div>
-                <div className="stat-card power-insight-card power-insight-energy"><div className="stat-title">Total kWh Consumption</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.totalEnergyKwh, 2)}</span><span className="power-insight-unit">kWh</span></div></div>
-                <div className="stat-card power-insight-card power-insight-live"><div className="stat-title">Live kW Consumption</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.liveKw, 2)}</span><span className="power-insight-unit">kW</span></div></div>
-                <div className="stat-card power-insight-card power-insight-peak"><div className="stat-title">Peak Demand Indicator</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.peakKw, 2)}</span><span className="power-insight-unit">kW</span></div><div className="meta"><span>{powerKpis.peakLabel}</span></div></div>
-                <div className="stat-card power-insight-card power-insight-down"><div className="stat-title">Downtime Energy Cost</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.downtimeCost, 2)}</span><span className="power-insight-unit">EUR</span></div></div>
+                {(() => {
+                  // Operator 2026-06-15: each card gets a small
+                  // arrow + % vs the previous window. Positive cost
+                  // changes are bad (arrow up red); positive
+                  // efficiency changes are good (arrow up green).
+                  // We pass an `isPositiveGood` flag per card to
+                  // colour the arrow correctly.
+                  const fmtPct = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
+                  const delta = (cur, prev) => powerKpiDelta(cur, prev);
+                  const arrow = (v, positiveGood) => {
+                    if (v == null || !Number.isFinite(v) || v === 0) return { icon: "→", cls: "pwr-delta-flat" };
+                    const up = v > 0;
+                    const good = positiveGood ? up : !up;
+                    return { icon: up ? "↑" : "↓", cls: good ? "pwr-delta-good" : "pwr-delta-bad" };
+                  };
+                  const renderDelta = (cur, prev, positiveGood) => {
+                    const d = delta(cur, prev);
+                    if (d == null) return <div className="pwr-delta pwr-delta-flat">— vs previous</div>;
+                    const a = arrow(d, positiveGood);
+                    return (
+                      <div className={`pwr-delta ${a.cls}`}>
+                        <span className="pwr-delta-arrow">{a.icon}</span> {fmtPct(d)} <span className="pwr-delta-hint">vs previous</span>
+                      </div>
+                    );
+                  };
+                  return (
+                    <>
+                      <div className="stat-card power-insight-card power-insight-eff">
+                        <div className="stat-title">Energy Efficiency</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.efficiency, 1)}</span><span className="power-insight-unit">%</span></div>
+                        {renderDelta(powerKpis.efficiency, powerKpisPrevious.efficiency, true)}
+                      </div>
+                      <div className="stat-card power-insight-card power-insight-cost">
+                        <div className="stat-title">Energy Costs</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.totalCost, 2)}</span><span className="power-insight-unit">EUR</span></div>
+                        {renderDelta(powerKpis.totalCost, powerKpisPrevious.totalCost, false)}
+                      </div>
+                      <div className="stat-card power-insight-card power-insight-energy">
+                        <div className="stat-title">Total kWh Consumption</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.totalEnergyKwh, 2)}</span><span className="power-insight-unit">kWh</span></div>
+                        {renderDelta(powerKpis.totalEnergyKwh, powerKpisPrevious.totalEnergyKwh, false)}
+                      </div>
+                      <div className="stat-card power-insight-card power-insight-live">
+                        <div className="stat-title">Live kW Consumption</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.liveKw, 2)}</span><span className="power-insight-unit">kW</span></div>
+                        {renderDelta(powerKpis.liveKw, powerKpisPrevious.liveKw, false)}
+                      </div>
+                      <div className="stat-card power-insight-card power-insight-peak">
+                        <div className="stat-title">Peak Demand Indicator</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.peakKw, 2)}</span><span className="power-insight-unit">kW</span></div>
+                        {renderDelta(powerKpis.peakKw, powerKpisPrevious.peakKw, false)}
+                      </div>
+                      <div className="stat-card power-insight-card power-insight-down">
+                        <div className="stat-title">Downtime Energy Cost</div>
+                        <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.downtimeCost, 2)}</span><span className="power-insight-unit">EUR</span></div>
+                        {renderDelta(powerKpis.downtimeCost, powerKpisPrevious.downtimeCost, false)}
+                      </div>
+                    </>
+                  );
+                })()}
               </section>
               <section className="power-main-grid">
                 <article
@@ -17649,7 +17818,9 @@ const getGatewayHealth = (gateway) => {
                         {powerChartSettings.main.show_legend !== false ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
                         {powerMainChartType === "bar" ? (
                           <>
-                            <Bar yAxisId="left" dataKey="total" name="Total" fill="#16a34a" isAnimationActive={false} />
+                            {powerChartSettings.main.show_total !== false ? (
+                              <Bar yAxisId="left" dataKey="total" name="Total" fill="#16a34a" isAnimationActive={false} />
+                            ) : null}
                             {(powerConfig?.devices || [])
                               .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
                               .map((d, idx) => (
@@ -17665,18 +17836,20 @@ const getGatewayHealth = (gateway) => {
                           </>
                         ) : powerMainChartType === "area" ? (
                           <>
-                            <Area
-                              yAxisId="left"
-                              type={powerChartSettings.main.interpolation || "stepAfter"}
-                              dataKey="total"
-                              name="Total"
-                              stroke="#16a34a"
-                              fill="#16a34a"
-                              fillOpacity={0.16}
-                              strokeWidth={2}
-                              dot={false}
-                              isAnimationActive={false}
-                            />
+                            {powerChartSettings.main.show_total !== false ? (
+                              <Area
+                                yAxisId="left"
+                                type={powerChartSettings.main.interpolation || "stepAfter"}
+                                dataKey="total"
+                                name="Total"
+                                stroke="#16a34a"
+                                fill="#16a34a"
+                                fillOpacity={0.16}
+                                strokeWidth={2}
+                                dot={false}
+                                isAnimationActive={false}
+                              />
+                            ) : null}
                             {(powerConfig?.devices || [])
                               .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
                               .map((d, idx) => (
@@ -17697,7 +17870,9 @@ const getGatewayHealth = (gateway) => {
                           </>
                         ) : (
                           <>
-                            <Line yAxisId="left" type={powerChartSettings.main.interpolation || "stepAfter"} dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={powerChartSettings.main.show_point_labels} isAnimationActive={false} />
+                            {powerChartSettings.main.show_total !== false ? (
+                              <Line yAxisId="left" type={powerChartSettings.main.interpolation || "stepAfter"} dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={powerChartSettings.main.show_point_labels} isAnimationActive={false} />
+                            ) : null}
                             {(powerConfig?.devices || [])
                               .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
                               .map((d, idx) => (
@@ -17803,7 +17978,7 @@ const getGatewayHealth = (gateway) => {
                         ) : powerSideChartType === "area" ? (
                           <Area
                             key="pwr-side-area-total-kwh"
-                            type="stepAfter"
+                            type={powerChartSettings.side.interpolation || "stepAfter"}
                             dataKey="total_kwh"
                             name="Total kWh"
                             stroke={getSeriesColor(0)}
@@ -17816,7 +17991,7 @@ const getGatewayHealth = (gateway) => {
                         ) : (
                           <Line
                             key="pwr-side-line-total-kwh"
-                            type="stepAfter"
+                            type={powerChartSettings.side.interpolation || "stepAfter"}
                             dataKey="total_kwh"
                             name="Total kWh"
                             stroke={getSeriesColor(0)}
@@ -17890,10 +18065,6 @@ const getGatewayHealth = (gateway) => {
               <section className="card">
                 <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
                   <h3 style={{ marginTop: 0 }}>Meters and Main Lines</h3>
-                  <div className="meta">
-                    <span>Total meters: {(powerConfig?.devices || []).length}</span>
-                    <span>Connected: {powerMeterRows.filter((m) => m.connected).length}</span>
-                  </div>
                 </div>
                 <div className="table db-table power-meter-table">
                   <div className="thead">
@@ -25426,6 +25597,10 @@ const getGatewayHealth = (gateway) => {
                   <label className="pwr-check">
                     <input type="checkbox" checked={Boolean(current.show_point_labels)} onChange={(e) => setField("show_point_labels", e.target.checked)} />
                     <span>Show point markers</span>
+                  </label>
+                  <label className="pwr-check">
+                    <input type="checkbox" checked={current.show_total !== false} onChange={(e) => setField("show_total", e.target.checked)} />
+                    <span>Show total series (aggregate of all meters)</span>
                   </label>
                 </div>
 
