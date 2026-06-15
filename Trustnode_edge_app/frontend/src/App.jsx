@@ -7432,12 +7432,20 @@ function AppShell() {
     for (const k of skeletonKeys) {
       if (!buckets.has(k)) buckets.set(k, { ts: k, total_kwh: 0 });
     }
-    const rows = Array.from(buckets.values())
-      .sort((a, b) => String(a.ts).localeCompare(String(b.ts)))
-      .map((r) => ({
-        ...r,
-        total_cost: Number(r.total_kwh || 0) * powerCostPerKwh,
-      }));
+    const sorted = Array.from(buckets.values())
+      .sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
+    // Operator 2026-06-15: chart 2 shows the ACCUMULATED total over
+    // the filtered window, not the per-bucket value. Each bar is
+    // the running sum up to and including that bucket.
+    let running = 0;
+    const rows = sorted.map((r) => {
+      running += Number(r.total_kwh || 0);
+      return {
+        ts: r.ts,
+        total_kwh: running,
+        total_cost: running * powerCostPerKwh,
+      };
+    });
     return { rows, keys: ["total_kwh", "total_cost"], showPhases: false };
   }, [powerHistoryRows, powerConfig, powerFilterMeterId, selectedPowerChartMeters, powerCostPerKwh, displayTimeZone, periodMs, effectiveInterval]);
 
@@ -7467,14 +7475,22 @@ function AppShell() {
 
   const powerKpis = useMemo(() => {
     const latest = powerTrendData[powerTrendData.length - 1] || null;
+    // Operator 2026-06-15: KPI Total tiles must reflect the full
+    // ACCUMULATED total across the filtered window, not the
+    // last-bucket value. We sum the per-bucket kWh contributions
+    // (kW * hours-per-bucket) over every bucket in scope.
     const intervalHours =
-      powerInterval === "day"
-        ? 24
-        : powerInterval === "hour"
-          ? 1
-          : powerInterval === "minute"
-            ? 1 / 60
-            : 1 / 3600;
+      effectiveInterval === "year"
+        ? 8760
+        : effectiveInterval === "month"
+          ? 720
+          : effectiveInterval === "day"
+            ? 24
+            : effectiveInterval === "hour"
+              ? 1
+              : effectiveInterval === "minute"
+                ? 1 / 60
+                : 1 / 3600;
     const totalEnergyKwh = powerTrendData.reduce((acc, r) => acc + Number(r.total_kw || 0), 0) * intervalHours;
     const totalCost = totalEnergyKwh * powerCostPerKwh;
     const liveKw = Number(latest?.total_kw || 0);
@@ -7542,7 +7558,7 @@ function AppShell() {
       peakLabel,
       downtimeCost,
     };
-  }, [powerTrendData, powerInterval, powerCostPerKwh, powerConfig, powerHistoryRows, resolveTariffRate]);
+  }, [powerTrendData, powerInterval, effectiveInterval, powerCostPerKwh, powerConfig, powerHistoryRows, resolveTariffRate]);
 
   // Previous-period KPI snapshot for delta arrows (operator
   // 2026-06-15). Re-runs the trend integration against
@@ -17993,10 +18009,10 @@ const getGatewayHealth = (gateway) => {
                     </ResponsiveContainer>
                   </div>
                 </article>
-                <div className="pwr-right-column">
+                <div className="pwr-row-two">
                 <article
                   className="card power-side-chart-card pwr-chart-hover pwr-chart-resizable"
-                  style={{ height: "100%" }}
+                  style={{ height: Number(powerChartSettings.side.height || 420) }}
                   onMouseUp={(e) => {
                     const h = e.currentTarget?.offsetHeight;
                     if (Number.isFinite(h) && h > 0 && h !== powerChartSettings.side.height) {
@@ -18096,14 +18112,13 @@ const getGatewayHealth = (gateway) => {
                   </div>
                 </article>
 
-                {/* Bottom-right: donut + tariff list (operator
-                    2026-06-15). Donut loses its inline legend; the
-                    list-view card next to it shows tariff names,
-                    kWh and €. */}
-                <div className="pwr-right-bottom">
+                {/* Donut + tariff list cards on the same row 2
+                    as Total Consumption (operator 2026-06-15:
+                    "second row: 50% consumption, 25% donut, 25%
+                    tariff list"). */}
                 <article
                   className="card power-side-chart-card pwr-chart-hover pwr-chart-resizable"
-                  style={{ height: "100%" }}
+                  style={{ height: Number(powerChartSettings.donut?.height || 420) }}
                   onMouseUp={(e) => {
                     const h = e.currentTarget?.offsetHeight;
                     if (Number.isFinite(h) && h > 0 && h !== powerChartSettings.donut?.height) {
@@ -18198,8 +18213,7 @@ const getGatewayHealth = (gateway) => {
                     <span className="pwr-tariff-list-value">€ {powerTariffBreakdown.total_cost.toFixed(2)}</span>
                   </div>
                 </article>
-                </div>{/* /pwr-right-bottom */}
-                </div>{/* /pwr-right-column */}
+                </div>{/* /pwr-row-two */}
               </section>
               <section className="card">
                 <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>

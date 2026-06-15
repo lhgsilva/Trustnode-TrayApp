@@ -3992,23 +3992,19 @@ input[type="checkbox"] {
 }
 
 .power-main-grid {
+  /* Operator 2026-06-15: two-row layout. Row 1 is the full-width
+     Live Usage chart; row 2 is a 50 / 25 / 25 split (Total
+     Consumption / Donut / Tariff Rates list). The old 60/40 nested
+     grid was overflowing the KPI strip above it. */
   display: grid;
-  /* 60 / 40 — operator 2026-06-15. Left column = main trend; right
-     column is split vertically: chart 2 on top, donut + tariff list
-     on the bottom. */
-  grid-template-columns: 6fr 4fr;
+  grid-template-columns: 1fr;
+  grid-template-rows: auto auto;
   gap: 12px;
   align-items: stretch;
 }
-.pwr-right-column {
+.pwr-row-two {
   display: grid;
-  grid-template-rows: 1fr 1fr;
-  gap: 12px;
-  min-width: 0;
-}
-.pwr-right-bottom {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 2fr 1fr 1fr;
   gap: 12px;
   min-width: 0;
 }
