@@ -6872,14 +6872,20 @@ function AppShell() {
         if (!stopped && (activePage === "power_overview" || activePage === "power_configuration")) {
           // Operator 2026-06-15: the Registers table on the Power
           // Configuration page also needs the live history feed so
-          // Last Raw / Last Scaled columns populate. Without this the
-          // table only ever showed '-' because the poll was gated to
-          // the Overview page.
-          const nowMs = Date.now();
-          if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= 2000) {
-            powerHistoryLastFetchMsRef.current = nowMs;
-            const histRes = await getPowerHistory(1500, "");
-            if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
+          // Last Raw / Last Scaled columns populate. The Live poll
+          // also drives the Power Overview KPIs. Skip it when the
+          // Overview is in Historical mode so our snapshot from
+          // getAppStoreHistorianRange isn't overwritten by the
+          // last-1500-row tail.
+          if (activePage === "power_overview" && powerViewMode === "historical") {
+            // no-op
+          } else {
+            const nowMs = Date.now();
+            if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= 2000) {
+              powerHistoryLastFetchMsRef.current = nowMs;
+              const histRes = await getPowerHistory(1500, "");
+              if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
+            }
           }
         }
       } catch (err) {
@@ -6905,7 +6911,7 @@ function AppShell() {
       stopped = true;
       clearInterval(timer);
     };
-  }, [currentUser, activePage, endpointVersion]);
+  }, [currentUser, activePage, endpointVersion, powerViewMode]);
 
   useEffect(() => {
     if (!currentUser) return undefined;
@@ -7132,6 +7138,55 @@ function AppShell() {
     [powerConfig]
   );
   const powerCostPerKwh = useMemo(() => resolveTariffRate(Date.now()), [resolveTariffRate]);
+
+  // Historical-mode fetch (operator 2026-06-15: "the historian
+  // grouping and filter are not working updating the chart"). The
+  // live poll only pulls the last 1500 power rows which can sit
+  // entirely outside the historical window. When the operator
+  // presses Apply with a valid From/To range, fetch from the
+  // historian range endpoint and replace powerHistoryRows.
+  const powerHistoricalLastTokenRef = useRef(0);
+  useEffect(() => {
+    if (powerViewMode !== "historical") return;
+    if (!powerHistoricalFrom || !powerHistoricalTo) return;
+    if (powerHistoricalApplyToken === powerHistoricalLastTokenRef.current) return;
+    powerHistoricalLastTokenRef.current = powerHistoricalApplyToken;
+    let cancelled = false;
+    (async () => {
+      try {
+        const fromUtc = new Date(powerHistoricalFrom).toISOString();
+        const toUtc = new Date(powerHistoricalTo).toISOString();
+        const res = await getAppStoreHistorianRange({
+          fromUtc,
+          toUtc,
+          limit: 50000,
+          offset: 0,
+          gateway: "",
+          tag: "",
+        });
+        if (cancelled) return;
+        const rows = Array.isArray(res?.rows) ? res.rows : [];
+        // Keep only power-related rows so the in-memory blob stays small.
+        const powerTags = new Set([
+          "voltage_v", "voltage_l1_v",
+          "current_a", "current_l1_a",
+          "active_power_w", "active_power_total_w",
+          "energy_wh", "energy_total_wh",
+          "power_factor", "frequency_hz",
+        ]);
+        const filtered = rows.filter((r) => {
+          const tag = String(r?.tag || r?.tag_name || "");
+          return powerTags.has(tag) || tag.startsWith("insight.");
+        });
+        setPowerHistoryRows(filtered);
+      } catch (err) {
+        if (!cancelled) {
+          setPowerStatus((prev) => ({ ...(prev || {}), last_error: String(err?.message || err || "Historical fetch failed") }));
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [powerViewMode, powerHistoricalFrom, powerHistoricalTo, powerHistoricalApplyToken]);
 
   // Historical range — only takes effect when the Apply button is
   // pressed (powerHistoricalApplyToken bumps), so the operator can
@@ -17644,7 +17699,14 @@ const getGatewayHealth = (gateway) => {
                     <button
                       type="button"
                       className={`power-top-tab ${powerViewMode === "historical" ? "active" : ""}`}
-                      onClick={() => setPowerViewMode("historical")}
+                      onClick={() => {
+                        setPowerViewMode("historical");
+                        // Auto-fire the range fetch on first
+                        // switch so the operator sees data
+                        // immediately without having to press
+                        // Apply (operator 2026-06-15).
+                        setPowerHistoricalApplyToken((v) => v + 1);
+                      }}
                       aria-selected={powerViewMode === "historical"}
                     >
                       Historical
@@ -17732,7 +17794,6 @@ const getGatewayHealth = (gateway) => {
                   const livePowerUsageKwh = powerKpis.totalEnergyKwh; // window kWh — same as Total for now; back ends will diverge if we add a rolling-hour aggregate.
                   return (
                     <>
-                      <div className="pwr-insight-group-label">Live</div>
                       <div className="stat-card power-insight-card power-insight-live">
                         <div className="stat-title">Current (A)</div>
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(liveCurrentA, 2)}</span><span className="power-insight-unit">A</span></div>
@@ -17750,7 +17811,6 @@ const getGatewayHealth = (gateway) => {
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.efficiency, 1)}</span><span className="power-insight-unit">%</span></div>
                         {renderDelta(powerKpis.efficiency, powerKpisPrevious.efficiency, true)}
                       </div>
-                      <div className="pwr-insight-group-label">Total</div>
                       <div className="stat-card power-insight-card power-insight-peak">
                         <div className="stat-title">Peak Demand (kW)</div>
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.peakKw, 2)}</span><span className="power-insight-unit">kW</span></div>
@@ -17933,9 +17993,10 @@ const getGatewayHealth = (gateway) => {
                     </ResponsiveContainer>
                   </div>
                 </article>
+                <div className="pwr-right-column">
                 <article
                   className="card power-side-chart-card pwr-chart-hover pwr-chart-resizable"
-                  style={{ height: Number(powerChartSettings.side.height || 420) }}
+                  style={{ height: "100%" }}
                   onMouseUp={(e) => {
                     const h = e.currentTarget?.offsetHeight;
                     if (Number.isFinite(h) && h > 0 && h !== powerChartSettings.side.height) {
@@ -18035,15 +18096,14 @@ const getGatewayHealth = (gateway) => {
                   </div>
                 </article>
 
-                {/* Tariff donut (operator 2026-06-15). Splits the
-                    consumption window into per-tariff slices and
-                    toggles between € spent and kWh consumed. The
-                    underlying data comes from powerTariffBreakdown
-                    which is already filtered by the same view
-                    scale / meter selector as the main chart. */}
+                {/* Bottom-right: donut + tariff list (operator
+                    2026-06-15). Donut loses its inline legend; the
+                    list-view card next to it shows tariff names,
+                    kWh and €. */}
+                <div className="pwr-right-bottom">
                 <article
                   className="card power-side-chart-card pwr-chart-hover pwr-chart-resizable"
-                  style={{ height: Number(powerChartSettings.donut?.height || 420) }}
+                  style={{ height: "100%" }}
                   onMouseUp={(e) => {
                     const h = e.currentTarget?.offsetHeight;
                     if (Number.isFinite(h) && h > 0 && h !== powerChartSettings.donut?.height) {
@@ -18089,7 +18149,10 @@ const getGatewayHealth = (gateway) => {
                               ? [`€ ${Number(item.cost || 0).toFixed(2)} (${Number(item.kwh || 0).toFixed(2)} kWh)`, item.name]
                               : [`${Number(item.kwh || 0).toFixed(2)} kWh (€ ${Number(item.cost || 0).toFixed(2)})`, item.name];
                           }} />
-                          {powerChartSettings.donut?.show_legend !== false ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
+                          {/* Donut legend is intentionally off
+                              (operator 2026-06-15) — the tariff
+                              list-view card next to it shows the
+                              names, kWh and € per slice. */}
                         </PieChart>
                       </ResponsiveContainer>
                     ) : (
@@ -18103,6 +18166,40 @@ const getGatewayHealth = (gateway) => {
                     <span>{powerTariffBreakdown.total_kwh.toFixed(2)} kWh</span>
                   </div>
                 </article>
+
+                {/* Tariff rates + costs list view (operator
+                    2026-06-15). Replaces the inline donut legend
+                    with a scrollable name/kWh/€ table. */}
+                <article className="card pwr-tariff-list-card">
+                  <div className="row trend-header-row">
+                    <h3 style={{ marginTop: 0, marginBottom: 0 }}>Tariff Rates &amp; Costs</h3>
+                  </div>
+                  <div className="pwr-tariff-list">
+                    <span className="pwr-tariff-list-head">Tariff</span>
+                    <span className="pwr-tariff-list-head pwr-tariff-list-value">kWh</span>
+                    <span className="pwr-tariff-list-head pwr-tariff-list-value">€</span>
+                    {powerTariffBreakdown.items.length ? (
+                      powerTariffBreakdown.items.map((t, idx) => (
+                        <div key={`tariff-list-${t.key}`} style={{ display: "contents" }}>
+                          <span><span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 2, background: getSeriesColor(idx), marginRight: 6 }} />{t.name}</span>
+                          <span className="pwr-tariff-list-value">{Number(t.kwh || 0).toFixed(2)}</span>
+                          <span className="pwr-tariff-list-value">{Number(t.cost || 0).toFixed(2)}</span>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="muted" style={{ gridColumn: "1 / -1", padding: 14, textAlign: "center" }}>
+                        No tariff usage in the selected window.
+                      </div>
+                    )}
+                  </div>
+                  <div className="meta" style={{ padding: "4px 4px 0", marginTop: 6, borderTop: "1px solid var(--stroke)" }}>
+                    <span><strong>Total</strong></span>
+                    <span className="pwr-tariff-list-value">{powerTariffBreakdown.total_kwh.toFixed(2)} kWh</span>
+                    <span className="pwr-tariff-list-value">€ {powerTariffBreakdown.total_cost.toFixed(2)}</span>
+                  </div>
+                </article>
+                </div>{/* /pwr-right-bottom */}
+                </div>{/* /pwr-right-column */}
               </section>
               <section className="card">
                 <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
@@ -25599,10 +25696,6 @@ const getGatewayHealth = (gateway) => {
                         <option value="cost">€ Cost</option>
                         <option value="kwh">kWh</option>
                       </select>
-                    </label>
-                    <label className="pwr-check" style={{ marginTop: 6 }}>
-                      <input type="checkbox" checked={current.show_legend !== false} onChange={(e) => setField("show_legend", e.target.checked)} />
-                      <span>Show legend</span>
                     </label>
                   </div>
                 </div>

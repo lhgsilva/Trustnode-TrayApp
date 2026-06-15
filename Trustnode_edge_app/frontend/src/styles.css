@@ -3918,14 +3918,9 @@ input[type="checkbox"] {
 }
 
 .power-kpi-grid {
-  /* Operator 2026-06-15: 8 cards in two groups (Live / Total) on a
-     single row. Group label sits on its own micro-column. The
-     entire strip scrolls horizontally rather than wrapping so the
-     comparison row stays intact at narrow widths. */
+  /* Operator 2026-06-15: 8 cards in a flat row, no dividers. */
   display: grid;
-  grid-template-columns:
-    auto repeat(4, minmax(150px, 1fr))
-    auto repeat(4, minmax(150px, 1fr));
+  grid-template-columns: repeat(8, minmax(140px, 1fr));
   gap: 10px;
   align-items: stretch;
   overflow-x: auto;
@@ -3998,11 +3993,50 @@ input[type="checkbox"] {
 
 .power-main-grid {
   display: grid;
-  /* 50 / 25 / 25 — operator 2026-06-15. Main trend, side bar/total,
-     tariff donut. */
-  grid-template-columns: 2fr 1fr 1fr;
+  /* 60 / 40 — operator 2026-06-15. Left column = main trend; right
+     column is split vertically: chart 2 on top, donut + tariff list
+     on the bottom. */
+  grid-template-columns: 6fr 4fr;
   gap: 12px;
   align-items: stretch;
+}
+.pwr-right-column {
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  gap: 12px;
+  min-width: 0;
+}
+.pwr-right-bottom {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  min-width: 0;
+}
+.pwr-tariff-list-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 240px;
+}
+.pwr-tariff-list-card .pwr-tariff-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 4px 12px;
+  font-size: 12px;
+  padding: 6px 4px 0;
+}
+.pwr-tariff-list-card .pwr-tariff-list-head {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.pwr-tariff-list-card .pwr-tariff-list-value {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
 }
 
 .power-main-chart-card,
