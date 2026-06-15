@@ -3662,7 +3662,14 @@ function buildPowerWidget(gw, tag, label, color) {
 
 function PowerView({ liveRows }) {
   const prefs = useDashPrefs();
-  const cardHeight = prefs.cardHeight || 220;
+  const cardHeight = prefs.cardHeight || 260;
+  // Mirror of the desktop Power Overview redesign (operator
+  // 2026-06-15). Lite stays read-only (no tariff/downtime editors),
+  // but exposes the same KPIs, meter filter and chart-type toggle so
+  // the customer cloud view matches what they see on the edge.
+  const [meterFilter, setMeterFilter] = useState("all");
+  const [mainType, setMainType] = useState("line");
+  const [period, setPeriod] = useState("1h");
 
   const byGw = new Map();
   for (const r of liveRows) {
@@ -3676,18 +3683,73 @@ function PowerView({ liveRows }) {
   const list = [...byGw.values()];
   if (!list.length) return h("div", { className: "empty" }, "No power meters reporting.");
 
-  const fields = [
-    ["voltage_v", "V", "Voltage"], ["current_a", "A", "Current"],
-    ["active_power_w", "W", "Active power"], ["power_factor", "", "PF"],
-    ["frequency_hz", "Hz", "Frequency"], ["energy_wh", "Wh", "Energy"],
-  ];
+  const scoped = meterFilter === "all" ? list : list.filter((d) => String(d.gateway_id) === meterFilter);
+
+  // KPIs across the scoped meter set. Energy is best-effort (no
+  // historical aggregation client-side in lite); these mirror the
+  // desktop "live" values.
+  const liveKw = scoped.reduce((acc, d) => acc + (Number(d.tags.active_power_w) || 0) / 1000, 0);
+  const totalVoltage = scoped.reduce((acc, d) => acc + (Number(d.tags.voltage_v) || 0), 0);
+  const avgVoltage = scoped.length ? totalVoltage / scoped.length : 0;
+  const totalEnergyKwh = scoped.reduce((acc, d) => acc + (Number(d.tags.energy_wh) || 0) / 1000, 0);
+  const avgPf = (() => {
+    const vals = scoped.map((d) => Number(d.tags.power_factor)).filter((v) => Number.isFinite(v));
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+  })();
+  const peakKw = scoped.reduce((m, d) => Math.max(m, (Number(d.tags.active_power_w) || 0) / 1000), 0);
+
+  const periodMs = period === "1h" ? 3600_000 : period === "6h" ? 6 * 3600_000 : 24 * 3600_000;
+
+  const kpi = (label, value, unit, accent) => h("div", { className: "stat-card", style: { borderTop: `2px solid ${accent}` } },
+    h("div", { className: "stat-title" }, label),
+    h("div", { className: "stat-value" }, `${fmtVal(value)}${unit ? " " + unit : ""}`),
+  );
 
   return h("div", null,
-    h("div", { className: "section" }, h("h2", null, "Power overview"),
-      h("span", { className: "meta" }, `${list.length} device${list.length === 1 ? "" : "s"}`)),
-    ...list.map((d) => h("div", { key: d.gateway_id, className: "power-card" },
+    h("div", { className: "section pwr-overview-toolbar" },
+      h("h2", null, "Power overview"),
+      h("div", { className: "pwr-overview-tabs" },
+        h("button", {
+          className: "power-top-tab active",
+          disabled: true,
+          title: "Historical mode is desktop-only for now",
+        }, "Live"),
+      ),
+      h("label", { className: "field pwr-overview-field" },
+        h("span", null, "Meter"),
+        h("select", { value: meterFilter, onChange: (e) => setMeterFilter(e.target.value) },
+          h("option", { value: "all" }, "All meters"),
+          ...list.map((d) => h("option", { key: d.gateway_id, value: String(d.gateway_id) }, d.gateway_name || d.gateway_id)),
+        ),
+      ),
+      h("label", { className: "field pwr-overview-field" },
+        h("span", null, "Period"),
+        h("select", { value: period, onChange: (e) => setPeriod(e.target.value) },
+          h("option", { value: "1h" }, "Last 1h"),
+          h("option", { value: "6h" }, "Last 6h"),
+          h("option", { value: "24h" }, "Last 24h"),
+        ),
+      ),
+      h("div", { className: "pwr-overview-actions" },
+        h("div", { className: "meta" }, `${scoped.length}/${list.length} meter${list.length === 1 ? "" : "s"}`),
+      ),
+    ),
+
+    h("div", { className: "power-kpi-grid" },
+      kpi("Live kW", liveKw, "kW", "#14a89a"),
+      kpi("Avg Voltage", avgVoltage, "V", "#60a5fa"),
+      kpi("Total Energy", totalEnergyKwh, "kWh", "#c4b5fd"),
+      kpi("Avg Power Factor", avgPf, "", "#67e8f9"),
+      kpi("Peak (live)", peakKw, "kW", "#f0b35c"),
+    ),
+
+    ...scoped.map((d) => h("div", { key: d.gateway_id, className: "power-card" },
       h("h3", null, d.gateway_name || d.gateway_id),
-      h("div", { className: "power-grid" }, ...fields.map(([k, unit, label]) => {
+      h("div", { className: "power-grid" }, ...[
+        ["voltage_v", "V", "Voltage"], ["current_a", "A", "Current"],
+        ["active_power_w", "W", "Active power"], ["power_factor", "", "PF"],
+        ["frequency_hz", "Hz", "Frequency"], ["energy_wh", "Wh", "Energy"],
+      ].map(([k, unit, label]) => {
         const v = d.tags[k];
         if (v === undefined || v === null) return null;
         return h("div", { key: k, className: "power-stat" },
@@ -3695,12 +3757,31 @@ function PowerView({ liveRows }) {
           h("div", { className: "value" }, `${fmtVal(v)}${unit ? " " + unit : ""}`)
         );
       })),
-      // Live active-power line chart — same widget rendering as the dashboard.
-      d.tags.active_power_w !== undefined ? h("div", {
-        className: "power-chart-wrap widget widget-line_chart",
-        style: { height: `${cardHeight}px` },
-      },
-        h(ChartWidget, { widget: buildPowerWidget(d.gateway_id, "active_power_w", "Active power (W)", "#14a89a") })
+      d.tags.active_power_w !== undefined ? h("div", null,
+        h("div", { className: "power-chart-type-toggle", style: { marginBottom: 6 } },
+          h("button", { type: "button", className: mainType === "line" ? "active" : "", onClick: () => setMainType("line") }, "Line"),
+          h("button", { type: "button", className: mainType === "area" ? "active" : "", onClick: () => setMainType("area") }, "Area"),
+          h("button", { type: "button", className: mainType === "bar" ? "active" : "", onClick: () => setMainType("bar") }, "Bar"),
+        ),
+        h("div", {
+          className: "power-chart-wrap widget widget-line_chart",
+          style: { height: `${cardHeight}px` },
+        },
+          h(ChartWidget, {
+            widget: {
+              id: `power-${d.gateway_id}-active_power_w`,
+              type: mainType === "bar" ? "bar_chart" : mainType === "area" ? "area_chart" : "line_chart",
+              config: {
+                title: `Active power (W) — last ${period}`,
+                gateway_id: d.gateway_id,
+                tag_name: "active_power_w",
+                color: "#14a89a",
+                readings_count: 240,
+                range_ms: periodMs,
+              },
+            },
+          }),
+        ),
       ) : null
     ))
   );

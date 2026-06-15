@@ -948,6 +948,116 @@ main {
   padding: 14px 16px;
   margin-bottom: 12px;
 }
+
+/* Lite Power Overview — toolbar + KPI grid + chart type toggle.
+   Mirror of the desktop redesign (operator 2026-06-15). */
+.pwr-overview-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+.pwr-overview-toolbar h2 {
+  margin: 0 8px 0 0;
+  flex: 0 0 auto;
+}
+.pwr-overview-tabs {
+  display: flex;
+  gap: 6px;
+  align-self: flex-end;
+}
+.pwr-overview-tabs .power-top-tab {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+}
+.pwr-overview-tabs .power-top-tab.active {
+  background: var(--teal);
+  color: #fff;
+  border-color: var(--teal);
+}
+.pwr-overview-tabs .power-top-tab:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.pwr-overview-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 140px;
+  flex: 1 1 140px;
+  max-width: 220px;
+  margin: 0;
+}
+.pwr-overview-field > span {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.pwr-overview-field input,
+.pwr-overview-field select {
+  height: 34px;
+  padding: 4px 10px;
+}
+.pwr-overview-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: flex-end;
+}
+
+.power-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  margin: 12px 0 16px;
+}
+.power-kpi-grid .stat-card {
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-lg);
+  padding: 12px 14px;
+}
+.power-kpi-grid .stat-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+.power-kpi-grid .stat-value {
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.power-chart-type-toggle {
+  display: inline-flex;
+  gap: 4px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 2px;
+  background: var(--card);
+}
+.power-chart-type-toggle button {
+  background: transparent;
+  border: 0;
+  padding: 4px 12px;
+  font-size: 11.5px;
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+}
+.power-chart-type-toggle button.active {
+  background: var(--teal);
+  color: #fff;
+}
 .power-card h3 {
   margin: 0 0 10px;
   font-size: 13px;
