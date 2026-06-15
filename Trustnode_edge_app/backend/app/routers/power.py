@@ -101,7 +101,7 @@ def get_power_status(request: Request) -> dict:
     devices = list(cfg.get("devices") or [])
     selected_id = str(cfg.get("selected_device_id") or (devices[0].get("id") if devices else "") or "")
     rows = app_store.get_live_rows(limit=8000, prefer_cloud_reads=True)
-    power_rows = [r for r in rows if str(r.get("source") or "") == "power_modbus"]
+    power_rows = [r for r in rows if str(r.get("source") or "") in ("power_modbus", "power_insight")]
     now = datetime.now(timezone.utc)
     latest_by_device: dict[str, dict[str, Any]] = {}
     for r in power_rows:
@@ -170,7 +170,7 @@ def get_power_latest(request: Request, device_id: str = "") -> dict:
         return {"ok": True, "sample": power_manager.get_latest(device_id=device_id or None)}
 
     rows = app_store.get_live_rows(limit=8000, prefer_cloud_reads=True)
-    power_rows = [r for r in rows if str(r.get("source") or "") == "power_modbus"]
+    power_rows = [r for r in rows if str(r.get("source") or "") in ("power_modbus", "power_insight")]
     if str(device_id or "").strip():
         power_rows = [r for r in power_rows if str(r.get("gateway_id") or "") == str(device_id).strip()]
     if not power_rows:
@@ -209,7 +209,7 @@ def get_power_history(request: Request, limit: int = 300, device_id: str = "") -
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
     prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
     rows = app_store.get_historian_rows(limit=max(lim * 8, 800), prefer_cloud_reads=prefer_cloud_reads)
-    filtered = [r for r in rows if str(r.get("source") or "") == "power_modbus"]
+    filtered = [r for r in rows if str(r.get("source") or "") in ("power_modbus", "power_insight")]
     if str(device_id or "").strip():
         filtered = [r for r in filtered if str(r.get("gateway_id") or "") == str(device_id).strip()]
     return {"ok": True, "rows": filtered[:lim]}
