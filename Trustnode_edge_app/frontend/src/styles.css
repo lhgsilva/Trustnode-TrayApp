@@ -4022,6 +4022,135 @@ input[type="checkbox"] {
   height: 12px;
 }
 
+/* Power-meter edit modal — compact sectioned layout. Operator
+   2026-06-15: vertically minimum, checkbox+label same row, sections
+   for Identity / Connection / Wiring / Profile / Metadata. */
+.pwr-modal {
+  width: min(720px, 96vw);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+.pwr-modal h3 {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+.pwr-modal-body {
+  overflow-y: auto;
+  padding-right: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.pwr-section {
+  border: 1px solid var(--border, rgba(127,127,127,0.18));
+  border-radius: 8px;
+  padding: 8px 10px 10px;
+  background: color-mix(in srgb, var(--card) 92%, var(--bg) 8%);
+}
+.pwr-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted, #8a93a3);
+  margin-bottom: 8px;
+}
+.pwr-section-hint {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.7;
+  margin-left: 4px;
+}
+.pwr-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+.pwr-grid > label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  margin: 0;
+}
+.pwr-grid > label > span {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted, #8a93a3);
+  margin-bottom: 1px;
+}
+.pwr-grid input,
+.pwr-grid select {
+  height: 30px;
+  min-height: 30px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+.pwr-full {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+.pwr-full > span {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted, #8a93a3);
+}
+.pwr-full select {
+  height: 30px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+/* Inline checkbox row — checkbox + text on same line. */
+.pwr-check {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  margin: 0;
+  padding: 4px 0;
+}
+.pwr-check input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex: 0 0 auto;
+}
+.pwr-check > span {
+  text-transform: none !important;
+  letter-spacing: normal !important;
+  font-size: 13px !important;
+  color: inherit !important;
+  margin: 0 !important;
+}
+.pwr-check-pair {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  justify-content: center;
+}
+.pwr-inline-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.pwr-inline-actions .btn {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+@media (max-width: 560px) {
+  .pwr-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 1400px) {
   .power-kpi-grid {
     grid-template-columns: repeat(3, minmax(150px, 1fr));

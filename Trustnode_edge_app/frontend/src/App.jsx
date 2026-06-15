@@ -24048,18 +24048,35 @@ const getGatewayHealth = (gateway) => {
       ) : null}
       {showPowerDeviceModal ? (
         <div className="modal-backdrop">
-          <div className="modal-card trigger-modal-card">
+          <div className="modal-card trigger-modal-card pwr-modal">
             <h3>{editingPowerDeviceId ? "Edit Power Meter" : "Add Power Meter"}</h3>
-            <div className="trigger-form-grid">
-              <label><span>Device ID</span><input value={powerDeviceForm.id} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, id: e.target.value })} /></label>
-              <label><span>Name</span><input value={powerDeviceForm.name} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, name: e.target.value })} /></label>
-              <label><span>Description</span><input value={powerDeviceForm.description} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, description: e.target.value })} /></label>
-              <label><span>Type</span><select value={powerDeviceForm.type || "modbus_tcp"} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, type: e.target.value })}><option value="modbus_tcp">Modbus TCP</option></select></label>
-              <label><span>IP Address</span><input value={powerDeviceForm.ip} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ip: e.target.value })} /></label>
-              <label><span>Port</span><input type="number" value={powerDeviceForm.port} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, port: Number(e.target.value || 502) })} /></label>
-              <label><span>Unit ID</span><input type="number" value={powerDeviceForm.unit_id} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, unit_id: Number(e.target.value || 1) })} /></label>
-              <label><span>Polling Interval (ms)</span><input type="number" value={powerDeviceForm.poll_interval_ms} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, poll_interval_ms: Number(e.target.value || 1000) })} /></label>
-              <label>
+            {/* Compact sectioned layout — operator 2026-06-15:
+                "make it compact … checkbox and text together in the
+                same row … remove everything that is useless". Each
+                fieldset is a single visual band; checkboxes use
+                .pwr-check (inline row), .pwr-grid (2-col). */}
+            <div className="pwr-modal-body">
+
+            <div className="pwr-section">
+              <div className="pwr-section-title">Identity</div>
+              <div className="pwr-grid">
+                <label><span>Device ID</span><input value={powerDeviceForm.id} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, id: e.target.value })} /></label>
+                <label><span>Name</span><input value={powerDeviceForm.name} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, name: e.target.value })} /></label>
+                <label className="pwr-check"><input type="checkbox" checked={Boolean(powerDeviceForm.enabled)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, enabled: e.target.checked })} /><span>Enabled (start polling)</span></label>
+                <label><span>Description</span><input value={powerDeviceForm.description} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, description: e.target.value })} placeholder="optional note" /></label>
+              </div>
+            </div>
+
+            <div className="pwr-section">
+              <div className="pwr-section-title">Connection</div>
+              <div className="pwr-grid">
+                <label><span>Type</span><select value={powerDeviceForm.type || "modbus_tcp"} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, type: e.target.value })}><option value="modbus_tcp">Modbus TCP</option></select></label>
+                <label><span>IP Address</span><input value={powerDeviceForm.ip} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ip: e.target.value })} /></label>
+                <label><span>Port</span><input type="number" value={powerDeviceForm.port} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, port: Number(e.target.value || 502) })} /></label>
+                <label><span>Unit ID</span><input type="number" value={powerDeviceForm.unit_id} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, unit_id: Number(e.target.value || 1) })} /></label>
+                <label><span>Poll Interval (ms)</span><input type="number" value={powerDeviceForm.poll_interval_ms} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, poll_interval_ms: Number(e.target.value || 1000) })} /></label>
+              </div>
+              <label className="pwr-full">
                 <span>Database Connection (optional)</span>
                 <select
                   value={powerDeviceForm.database_id || ""}
@@ -24104,41 +24121,65 @@ const getGatewayHealth = (gateway) => {
                   })()}
                 </select>
               </label>
-              <label><span>Meter Mode</span><select value={powerDeviceForm.electrical_mode || "single_phase"} onChange={(e) => {
-                const nextMode = e.target.value;
-                const nextProfile = powerProfiles?.mode_defaults?.[nextMode] || POWER_PROFILE_DEFAULTS[nextMode] || POWER_PROFILE_DEFAULTS.single_phase;
-                const nextRegisters = powerProfiles?.profiles?.[nextProfile] || powerDeviceForm.registers || {};
-                const effectiveRegisters = powerDeviceForm.use_custom_registers ? (powerDeviceForm.registers || {}) : nextRegisters;
-                setPowerDeviceForm({
-                  ...powerDeviceForm,
-                  electrical_mode: nextMode,
-                  wiring_type: nextMode,
-                  register_profile: nextProfile,
-                  registers: effectiveRegisters,
-                  register_scales: buildRegisterScaleMap(effectiveRegisters, powerDeviceForm.register_scales || {}),
-                });
-              }}><option value="single_phase">Single Phase</option><option value="three_phase">Three Phase</option></select></label>
-              <label><span>Register Profile</span><select value={powerDeviceForm.register_profile || ""} onChange={(e) => {
-                const nextProfile = e.target.value;
-                const nextRegisters = powerProfiles?.profiles?.[nextProfile] || powerDeviceForm.registers || {};
-                const effectiveRegisters = powerDeviceForm.use_custom_registers ? (powerDeviceForm.registers || {}) : nextRegisters;
-                setPowerDeviceForm({
-                  ...powerDeviceForm,
-                  register_profile: nextProfile,
-                  registers: effectiveRegisters,
-                  register_scales: buildRegisterScaleMap(effectiveRegisters, powerDeviceForm.register_scales || {}),
-                });
-              }}>
-                {Object.keys(powerProfiles?.profiles || {}).map((k) => <option key={k} value={k}>{k}</option>)}
-              </select></label>
-              {/* Profile Import/Export (operator 2026-06-12). JSON
-                  shape: {schema:"trustnode.power.profile/v1",
-                  manufacturer, model, mode, registers,
-                  register_scales, notes}. Reads with FileReader;
-                  writes via a one-shot Blob download. The imported
-                  registers become the active meter's custom map so
-                  the operator can tweak before saving. */}
-              <div className="row" style={{ gap: 6, gridColumn: "1 / -1" }}>
+            </div>
+
+            <div className="pwr-section">
+              <div className="pwr-section-title">Wiring</div>
+              <div className="pwr-grid">
+                <label><span>Meter Mode</span><select value={powerDeviceForm.electrical_mode || "single_phase"} onChange={(e) => {
+                  const nextMode = e.target.value;
+                  const nextProfile = powerProfiles?.mode_defaults?.[nextMode] || POWER_PROFILE_DEFAULTS[nextMode] || POWER_PROFILE_DEFAULTS.single_phase;
+                  const nextRegisters = powerProfiles?.profiles?.[nextProfile] || powerDeviceForm.registers || {};
+                  const effectiveRegisters = powerDeviceForm.use_custom_registers ? (powerDeviceForm.registers || {}) : nextRegisters;
+                  setPowerDeviceForm({
+                    ...powerDeviceForm,
+                    electrical_mode: nextMode,
+                    wiring_type: nextMode,
+                    register_profile: nextProfile,
+                    registers: effectiveRegisters,
+                    register_scales: buildRegisterScaleMap(effectiveRegisters, powerDeviceForm.register_scales || {}),
+                  });
+                }}><option value="single_phase">Single Phase</option><option value="three_phase">Three Phase</option></select></label>
+                <div className="pwr-check-pair">
+                  <label className="pwr-check"><input type="checkbox" checked={Boolean(powerDeviceForm.voltage_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, voltage_connected: e.target.checked })} /><span>Voltage connected</span></label>
+                  <label className="pwr-check"><input type="checkbox" checked={Boolean(powerDeviceForm.ct_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_connected: e.target.checked })} /><span>CT connected</span></label>
+                </div>
+                <label><span>CT Primary (A)</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_primary ?? 80)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_primary: Number(e.target.value || 80) })} /></label>
+                <label><span>CT Secondary (A)</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_secondary ?? 5)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_secondary: Number(e.target.value || 5) })} /></label>
+                <label><span>VT Primary (V)</span><input type="number" step="0.1" value={Number(powerDeviceForm.vt_primary ?? 230)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_primary: Number(e.target.value || 230) })} /></label>
+                <label><span>VT Secondary (V)</span><input type="number" step="0.1" value={Number(powerDeviceForm.vt_secondary ?? 230)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_secondary: Number(e.target.value || 230) })} /></label>
+              </div>
+            </div>
+
+            <div className="pwr-section">
+              <div className="pwr-section-title">Register Profile</div>
+              <div className="pwr-grid">
+                <label><span>Profile</span><select value={powerDeviceForm.register_profile || ""} onChange={(e) => {
+                  const nextProfile = e.target.value;
+                  const nextRegisters = powerProfiles?.profiles?.[nextProfile] || powerDeviceForm.registers || {};
+                  const effectiveRegisters = powerDeviceForm.use_custom_registers ? (powerDeviceForm.registers || {}) : nextRegisters;
+                  setPowerDeviceForm({
+                    ...powerDeviceForm,
+                    register_profile: nextProfile,
+                    registers: effectiveRegisters,
+                    register_scales: buildRegisterScaleMap(effectiveRegisters, powerDeviceForm.register_scales || {}),
+                  });
+                }}>
+                  {Object.keys(powerProfiles?.profiles || {}).map((k) => <option key={k} value={k}>{k}</option>)}
+                </select></label>
+                <label className="pwr-check"><input type="checkbox" checked={Boolean(powerDeviceForm.use_custom_registers)} onChange={(e) => {
+                  const checked = e.target.checked;
+                  const profileRegs = powerProfiles?.profiles?.[powerDeviceForm.register_profile || ""] || {};
+                  const effectiveRegisters = checked ? (powerDeviceForm.registers || profileRegs) : profileRegs;
+                  setPowerDeviceForm({
+                    ...powerDeviceForm,
+                    use_custom_registers: checked,
+                    registers: effectiveRegisters,
+                    register_scales: buildRegisterScaleMap(effectiveRegisters, powerDeviceForm.register_scales || {}),
+                  });
+                }} /><span>Use custom register mapping</span></label>
+              </div>
+              <div className="pwr-inline-actions">
                 <button
                   className="btn btn-sm"
                   onClick={() => {
@@ -24204,45 +24245,22 @@ const getGatewayHealth = (gateway) => {
                   />
                 </label>
               </div>
-              <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.use_custom_registers)} onChange={(e) => {
-                const checked = e.target.checked;
-                const profileRegs = powerProfiles?.profiles?.[powerDeviceForm.register_profile || ""] || {};
-                const effectiveRegisters = checked ? (powerDeviceForm.registers || profileRegs) : profileRegs;
-                setPowerDeviceForm({
-                  ...powerDeviceForm,
-                  use_custom_registers: checked,
-                  registers: effectiveRegisters,
-                  register_scales: buildRegisterScaleMap(effectiveRegisters, powerDeviceForm.register_scales || {}),
-                });
-              }} /><span className="remember-label">Use custom register mapping</span></label>
-              <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.voltage_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, voltage_connected: e.target.checked })} /><span className="remember-label">Voltage connected</span></label>
-              <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.ct_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_connected: e.target.checked })} /><span className="remember-label">CT connected</span></label>
-                    {/* CT/VT moved into modal per operator 2026-06-12:
-                        "the configuration field of the meters should
-                        be parts of the each meters configuration
-                        popup window". Defaults match the pre-refactor
-                        inline form so existing saved configs render
-                        unchanged. */}
-                    <label><span>CT Primary</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_primary ?? 80)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_primary: Number(e.target.value || 80) })} /></label>
-                    <label><span>CT Secondary</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_secondary ?? 5)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_secondary: Number(e.target.value || 5) })} /></label>
-                    <label><span>VT Primary</span><input type="number" step="0.1" value={Number(powerDeviceForm.vt_primary ?? 230)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_primary: Number(e.target.value || 230) })} /></label>
-                    <label><span>VT Secondary</span><input type="number" step="0.1" value={Number(powerDeviceForm.vt_secondary ?? 230)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_secondary: Number(e.target.value || 230) })} /></label>
-                    <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.enabled)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, enabled: e.target.checked })} /><span className="remember-label">Enabled</span></label>
-                    <label><span>Machine Description</span><input value={powerDeviceForm.machine_description || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, machine_description: e.target.value })} /></label>
-                    <label><span>Site</span><input value={powerDeviceForm.site || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, site: e.target.value })} /></label>
-                    <label><span>Area</span><input value={powerDeviceForm.area || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, area: e.target.value })} /></label>
-                    <label><span>Equipment</span><input value={powerDeviceForm.equipment || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, equipment: e.target.value })} /></label>
-                    <label><span>Min Active Power (kW)</span><input type="number" step="0.01" value={powerDeviceForm.min_active_power_kw ?? ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, min_active_power_kw: e.target.value })} /></label>
-                    <label><span>Max Active Power (kW)</span><input type="number" step="0.01" value={powerDeviceForm.max_active_power_kw ?? ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, max_active_power_kw: e.target.value })} /></label>
-                  </div>
+            </div>
+
+            <div className="pwr-section">
+              <div className="pwr-section-title">Asset Metadata <span className="pwr-section-hint">(optional)</span></div>
+              <div className="pwr-grid">
+                <label><span>Site</span><input value={powerDeviceForm.site || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, site: e.target.value })} /></label>
+                <label><span>Area</span><input value={powerDeviceForm.area || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, area: e.target.value })} /></label>
+                <label><span>Equipment</span><input value={powerDeviceForm.equipment || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, equipment: e.target.value })} /></label>
+                <label><span>Min Power (kW)</span><input type="number" step="0.01" value={powerDeviceForm.min_active_power_kw ?? ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, min_active_power_kw: e.target.value })} /></label>
+                <label><span>Max Power (kW)</span><input type="number" step="0.01" value={powerDeviceForm.max_active_power_kw ?? ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, max_active_power_kw: e.target.value })} /></label>
+              </div>
+            </div>
+
+            </div>{/* pwr-modal-body */}
             <div className="row modal-actions">
               <button className="btn btn-primary" onClick={savePowerDevice}>OK</button>
-              {/* Test Connection moved into the modal per operator
-                  2026-06-12 — the per-meter test runs against the
-                  ip/port the operator just typed, which is more
-                  intuitive than the page-level run-all-meters
-                  button. Falls back to runPowerConnectionTest when
-                  a per-meter handler isn't present (existing flow). */}
               <button
                 className="btn"
                 onClick={() => runPowerConnectionTest()}
