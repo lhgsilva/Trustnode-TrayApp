@@ -7732,7 +7732,7 @@ function AppShell() {
       if (!prev) continue;
       const dtH = (s.ts - prev.ts) / 3_600_000;
       if (dtH <= 0 || dtH > 1) continue;
-      const kwh = Math.max(0, (p.kw + s.kw) / 2) * dtH;
+      const kwh = Math.max(0, (prev.kw + s.kw) / 2) * dtH;
       const idx = tariffIndex(s.ts);
       const key = idx >= 0 ? String(idx) : "default";
       const acc = buckets.get(key) || { kwh: 0, cost: 0 };
