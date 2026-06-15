@@ -4022,6 +4022,46 @@ input[type="checkbox"] {
   height: 12px;
 }
 
+/* Power Meters list (Gateway-style row). Six columns; Actions
+   right-aligned, fixed width so buttons sit on the right edge.
+   Operator 2026-06-15. */
+.power-meters-table .thead,
+.power-meters-table .trow {
+  grid-template-columns: 1.2fr 0.8fr 0.9fr 1.4fr 1fr 160px;
+}
+.power-meters-table .row-actions {
+  justify-content: flex-end;
+  display: flex;
+  gap: 6px;
+}
+
+/* Ultra-compact register rows. Operator 2026-06-15: rows + action
+   buttons should be vertically minimum. */
+.power-register-table.power-register-compact .trow {
+  padding: 2px 6px;
+  min-height: 24px;
+}
+.power-register-table.power-register-compact .trow > span {
+  min-height: 22px;
+}
+.power-register-table.power-register-compact input,
+.power-register-table.power-register-compact select {
+  height: 22px;
+  min-height: 22px;
+  padding: 0 6px;
+  font-size: 12px;
+}
+.power-register-table.power-register-compact .row-actions .icon-btn {
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  padding: 0;
+}
+.power-register-table.power-register-compact .row-actions .icon-btn svg {
+  width: 11px;
+  height: 11px;
+}
+
 /* Power-meter edit modal — compact sectioned layout. Operator
    2026-06-15: vertically minimum, checkbox+label same row, sections
    for Identity / Connection / Wiring / Profile / Metadata. */

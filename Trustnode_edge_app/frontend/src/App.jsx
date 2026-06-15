@@ -7587,14 +7587,23 @@ function AppShell() {
     }
   };
 
-  const runPowerConnectionTest = async () => {
+  const runPowerConnectionTest = async (deviceOverride = null) => {
+    // deviceOverride lets the meter-edit modal test against the
+    // pending form (operator 2026-06-15: "test connection button is
+    // not working" — previously the call relied on
+    // powerConfig.selected_device_id which is empty for a brand-new
+    // meter being added).
     setPowerBusy(true);
     try {
-      const did = String(powerConfig?.selected_device_id || "");
-      const res = await testPowerConnection({
-        device_id: did,
-        timeout_ms: 3000,
-      });
+      const payload = { timeout_ms: 3000 };
+      if (deviceOverride && typeof deviceOverride === "object") {
+        payload.device = deviceOverride;
+        if (deviceOverride.id) payload.device_id = String(deviceOverride.id);
+      } else {
+        payload.device_id = String(powerConfig?.selected_device_id || "");
+      }
+      const res = await testPowerConnection(payload);
+      const did = String(payload.device_id || "");
       if (did) {
         setPowerRegisterTests((prev) => ({
           ...(prev || {}),
@@ -9103,7 +9112,16 @@ const getGatewayHealth = (gateway) => {
       const baseSink = "Local SQLite (default)";
       const extraSinkId = String((powerConfig?.devices || []).find((d) => String(d?.id || "") === did)?.database_id || "");
       const extraDb = extraSinkId ? (dbConnections.find((c) => String(c.id || "") === extraSinkId)?.name || "") : "";
-      const writing = st?.connected ? "LIVE" : (st?.last_error ? "ERROR" : "IDLE");
+      // Operator 2026-06-15: the footer used to label every error as
+      // "ERROR" (DB write status), even when the failure was the
+      // device's Modbus connection (no data to write). Discriminate:
+      // device fault → "WAITING" (DB sink is fine, just no rows in
+      // flight); explicit DB sink failure → "DB ERROR".
+      const errStr = String(st?.last_error || "").toLowerCase();
+      const dbFault = /(sink|writer|historian).*(fail|error)|database.*(write|insert).*fail/.test(errStr);
+      const writing = st?.connected
+        ? (dbFault ? "DB ERROR" : "LIVE")
+        : (dbFault ? "DB ERROR" : (st?.last_error ? "WAITING" : "IDLE"));
       return extraDb ? `${baseSink} + ${extraDb} | ${writing}` : `${baseSink} | ${writing}`;
     }
     if (!gateway?.database_id) return "No DB selected";
@@ -17126,28 +17144,31 @@ const getGatewayHealth = (gateway) => {
                         No power meters configured. Click <strong>Add</strong> to register one.
                       </div>
                     ) : (
-                    <div className="table db-table">
+                    <div className="table db-table power-meters-table">
                       {/* Power-meter row format mirrors the Gateway
-                          Configuration table: Name / ID / Endpoint /
-                          Status / Actions. Wiring / Interval moved
-                          into the per-meter edit modal so the table
-                          stays scannable. Operator 2026-06-12. */}
-                      <div className="thead"><span>Name</span><span>ID</span><span>Type</span><span>Endpoint</span><span>Status</span><span>Actions</span></div>
+                          Configuration table: Name / ID / Type /
+                          Endpoint / Status / Actions. Actions sit on
+                          the right edge of the row (operator
+                          2026-06-15) to match every other list view
+                          in the app. */}
+                      <div className="thead"><span>Name</span><span>ID</span><span>Type</span><span>Endpoint</span><span>Status</span><span style={{ textAlign: "right" }}>Actions</span></div>
                       {powerConfig.devices.map((d) => {
                         const st = (powerStatus?.devices || []).find((x) => String(x.device_id || "") === String(d.id || "")) || {};
                         const selected = String(powerConfig?.selected_device_id || "") === String(d.id || "");
-                        // Status copy converges with the Gateway page:
-                        // "Running" when polling and connected, "Stopped"
-                        // when disabled, "Device Fails" when enabled but
-                        // not reaching the Modbus endpoint, "DB Fails"
-                        // when last_error mentions write/sink/db.
+                        // Status copy converges with the Gateway page.
+                        // Operator 2026-06-15: previously the heuristic
+                        // matched any "db" substring in the error
+                        // string — which spuriously labelled a plain
+                        // socket failure as "Device + DB Fails". We now
+                        // only call out DB failure when the explicit
+                        // sink-write phrase is present.
                         const lastErr = String(st.last_error || "").toLowerCase();
-                        const dbFault = /db|database|write|sink|queue/.test(lastErr);
+                        const dbFault = /(sink|writer|historian).*(fail|error)|database.*(write|insert).*fail/.test(lastErr);
                         const enabledByOp = d.enabled !== false;
                         const label = !enabledByOp
                           ? "Stopped"
                           : st.connected
-                            ? "Running"
+                            ? (dbFault ? "DB Fails" : "Running")
                             : dbFault
                               ? "Device + DB Fails"
                               : "Device Fails";
@@ -24263,7 +24284,7 @@ const getGatewayHealth = (gateway) => {
               <button className="btn btn-primary" onClick={savePowerDevice}>OK</button>
               <button
                 className="btn"
-                onClick={() => runPowerConnectionTest()}
+                onClick={() => runPowerConnectionTest(powerDeviceForm)}
                 disabled={powerBusy}
               >
                 Test Connection
