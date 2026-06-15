@@ -3976,7 +3976,7 @@ input[type="checkbox"] {
     minmax(110px, 0.9fr)
     minmax(110px, 0.9fr)
     minmax(220px, 1.5fr)
-    72px;
+    96px;
 }
 
 .power-register-table.power-register-compact .thead {
@@ -4060,6 +4060,30 @@ input[type="checkbox"] {
 .power-register-table.power-register-compact .row-actions .icon-btn svg {
   width: 11px;
   height: 11px;
+}
+
+/* Squared action buttons used in the register and tariff tables.
+   Operator 2026-06-15: "the action button should be squared and
+   all action button to be aligned on the right". */
+.row-actions .pwr-square-btn {
+  border-radius: 6px;
+  aspect-ratio: 1 / 1;
+}
+.power-register-table.power-register-compact .row-actions {
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+/* Electricity Tariff table. Same row style as db-table, with a
+   right-aligned Actions column. */
+.power-tariff-table .thead,
+.power-tariff-table .trow {
+  grid-template-columns: 1.2fr 0.9fr 1.1fr 0.9fr 1.5fr 110px;
+}
+.power-tariff-table .row-actions {
+  justify-content: flex-end;
+  display: flex;
+  gap: 6px;
 }
 
 /* Power-meter edit modal — compact sectioned layout. Operator

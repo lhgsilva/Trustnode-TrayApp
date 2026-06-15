@@ -2751,6 +2751,30 @@ function AppShell() {
   });
   const [newPowerRegisterKey, setNewPowerRegisterKey] = useState("");
   const [newPowerRegisterAddress, setNewPowerRegisterAddress] = useState("");
+  // Per-register edit modal (operator 2026-06-15: each register row
+  // needs an Edit button so tag name, description, scale and address
+  // can be tuned without inline cell editing).
+  const [showRegisterEditModal, setShowRegisterEditModal] = useState(false);
+  const [registerEditForm, setRegisterEditForm] = useState({
+    original_key: "",
+    key: "",
+    address: 0,
+    scale: 1,
+    description: "",
+  });
+  // Electricity tariff editor (operator 2026-06-15: Electricity
+  // Tariff card with collapsible table of time-windowed rates).
+  const [tariffsCardCollapsed, setTariffsCardCollapsed] = useState(true);
+  const [showTariffModal, setShowTariffModal] = useState(false);
+  const [tariffForm, setTariffForm] = useState({
+    id: "",
+    name: "",
+    type: "flat",
+    rate_eur_kwh: 0,
+    start_time: "00:00",
+    end_time: "23:59",
+    description: "",
+  });
   const [retentionResult, setRetentionResult] = useState("");
   const [backupRows, setBackupRows] = useState([]);
   const [backupBusy, setBackupBusy] = useState(false);
@@ -7520,6 +7544,112 @@ function AppShell() {
     setNewPowerRegisterAddress("");
   };
 
+  const openEditRegisterModal = (regKey) => {
+    const dev = selectedPowerDevice || {};
+    const desc = (dev.register_descriptions || {})[regKey] || POWER_REGISTER_HINTS[regKey] || "";
+    setRegisterEditForm({
+      original_key: regKey,
+      key: regKey,
+      address: Number((dev.registers || {})[regKey] || 0),
+      scale: Number((dev.register_scales || {})[regKey] || 1) || 1,
+      description: desc,
+    });
+    setShowRegisterEditModal(true);
+  };
+  const saveEditedRegister = () => {
+    const selectedId = String(powerConfig?.selected_device_id || "");
+    const orig = String(registerEditForm.original_key || "");
+    const nextKey = String(registerEditForm.key || "").trim();
+    if (!selectedId || !orig || !nextKey) {
+      setShowRegisterEditModal(false);
+      return;
+    }
+    const addr = Math.max(0, Math.floor(Number(registerEditForm.address || 0)));
+    const scale = Number(registerEditForm.scale);
+    const safeScale = Number.isFinite(scale) && scale !== 0 ? scale : 1;
+    setPowerConfig((prev) => {
+      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
+      const devices = prevDevices.map((d) => {
+        if (String(d?.id || "") !== selectedId) return d;
+        const regs = { ...(d.registers || {}) };
+        const scales = { ...(d.register_scales || {}) };
+        const descs = { ...(d.register_descriptions || {}) };
+        if (orig !== nextKey) {
+          delete regs[orig];
+          delete scales[orig];
+          delete descs[orig];
+        }
+        regs[nextKey] = addr;
+        scales[nextKey] = safeScale;
+        descs[nextKey] = String(registerEditForm.description || "");
+        return {
+          ...d,
+          use_custom_registers: true,
+          registers: regs,
+          register_scales: scales,
+          register_descriptions: descs,
+        };
+      });
+      return { ...(prev || {}), devices };
+    });
+    setShowRegisterEditModal(false);
+  };
+
+  const openAddTariff = () => {
+    setTariffForm({
+      id: "",
+      name: "",
+      type: "flat",
+      rate_eur_kwh: Number(powerConfig?.energy_price_eur_kwh ?? DEFAULT_ENERGY_COST_PER_KWH),
+      start_time: "00:00",
+      end_time: "23:59",
+      description: "",
+    });
+    setShowTariffModal(true);
+  };
+  const openEditTariff = (t) => {
+    setTariffForm({
+      id: String(t.id || ""),
+      name: String(t.name || ""),
+      type: String(t.type || "flat"),
+      rate_eur_kwh: Number(t.rate_eur_kwh || 0),
+      start_time: String(t.start_time || "00:00"),
+      end_time: String(t.end_time || "23:59"),
+      description: String(t.description || ""),
+    });
+    setShowTariffModal(true);
+  };
+  const saveTariff = () => {
+    const name = String(tariffForm.name || "").trim();
+    if (!name) {
+      setPowerResult("Tariff name is required.");
+      return;
+    }
+    setPowerConfig((prev) => {
+      const list = Array.isArray(prev?.electricity_tariffs) ? [...prev.electricity_tariffs] : [];
+      const tariffId = tariffForm.id || `tariff_${Date.now().toString(36)}`;
+      const row = {
+        id: tariffId,
+        name,
+        type: String(tariffForm.type || "flat"),
+        rate_eur_kwh: Number(tariffForm.rate_eur_kwh) || 0,
+        start_time: String(tariffForm.start_time || "00:00"),
+        end_time: String(tariffForm.end_time || "23:59"),
+        description: String(tariffForm.description || ""),
+      };
+      const idx = list.findIndex((x) => String(x.id || "") === tariffId);
+      if (idx >= 0) list[idx] = row; else list.push(row);
+      return { ...(prev || {}), electricity_tariffs: list };
+    });
+    setShowTariffModal(false);
+  };
+  const removeTariff = (id) => {
+    setPowerConfig((prev) => {
+      const list = (Array.isArray(prev?.electricity_tariffs) ? prev.electricity_tariffs : []).filter((x) => String(x.id || "") !== String(id));
+      return { ...(prev || {}), electricity_tariffs: list };
+    });
+  };
+
   const removePowerRegisterRow = (key) => {
     const selectedId = String(powerConfig?.selected_device_id || "");
     const regKey = String(key || "").trim();
@@ -7530,9 +7660,11 @@ function AppShell() {
         if (String(d?.id || "") !== selectedId) return d;
         const nextRegs = { ...(d.registers || {}) };
         const nextScales = { ...(d.register_scales || {}) };
+        const nextDescs = { ...(d.register_descriptions || {}) };
         delete nextRegs[regKey];
         delete nextScales[regKey];
-        return { ...d, use_custom_registers: true, registers: nextRegs, register_scales: nextScales };
+        delete nextDescs[regKey];
+        return { ...d, use_custom_registers: true, registers: nextRegs, register_scales: nextScales, register_descriptions: nextDescs };
       });
       return { ...(prev || {}), devices };
     });
@@ -17096,6 +17228,79 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "power_configuration" ? (
             <>
+              {/* Electricity Tariff card. Operator 2026-06-15: separate
+                  card, collapsed by default, lets operators add multiple
+                  tariffs by time window (Flat / Peak / Off-Peak /
+                  Valley / Shoulder). Empty list falls back to a single
+                  flat rate stored as energy_price_eur_kwh for
+                  back-compat with existing reports. */}
+              <section className="card">
+                <div className="db-simple-head">
+                  <div className="db-head-title-wrap">
+                    <h3 style={{ margin: 0 }}>Electricity Tariff</h3>
+                  </div>
+                  <div className="db-card-top-actions">
+                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddTariff} disabled={!canEditPage("power_configuration")}>
+                      <AddIcon /><span>Add Tariff</span>
+                    </button>
+                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save</button>
+                    <button
+                      className="btn btn-sm card-collapse-btn"
+                      onClick={() => setTariffsCardCollapsed((v) => !v)}
+                      title={tariffsCardCollapsed ? "Expand card" : "Collapse card"}
+                    >
+                      {tariffsCardCollapsed ? "+" : "-"}
+                    </button>
+                  </div>
+                </div>
+                {!tariffsCardCollapsed ? (
+                  <>
+                    <div className="form-grid three" style={{ marginTop: 10 }}>
+                      <label className="field">
+                        <span>Default Flat Rate (EUR/kWh)</span>
+                        <input
+                          type="number"
+                          step="0.001"
+                          min="0"
+                          value={Number(powerConfig?.energy_price_eur_kwh ?? DEFAULT_ENERGY_COST_PER_KWH)}
+                          onChange={(e) =>
+                            setPowerConfig((prev) => ({
+                              ...(prev || {}),
+                              energy_price_eur_kwh: Number(e.target.value || DEFAULT_ENERGY_COST_PER_KWH),
+                            }))
+                          }
+                          title="Fallback rate when no tariff window matches the current time."
+                        />
+                      </label>
+                    </div>
+                    {(!Array.isArray(powerConfig.electricity_tariffs) || powerConfig.electricity_tariffs.length === 0) ? (
+                      <div className="muted" style={{ padding: 14, textAlign: "center" }}>
+                        No time-of-use tariffs defined. The flat rate above is used for every hour. Click <strong>Add Tariff</strong> to define Peak / Off-Peak / Valley windows.
+                      </div>
+                    ) : (
+                      <div className="table db-table power-tariff-table">
+                        <div className="thead">
+                          <span>Name</span><span>Type</span><span>Window</span><span>Rate (€/kWh)</span><span>Description</span><span style={{ textAlign: "right" }}>Actions</span>
+                        </div>
+                        {powerConfig.electricity_tariffs.map((t) => (
+                          <div key={`tariff-${t.id}`} className="trow">
+                            <span>{t.name}</span>
+                            <span>{String(t.type || "flat").replace("_", " ")}</span>
+                            <span>{t.start_time} – {t.end_time}</span>
+                            <span>{Number(t.rate_eur_kwh || 0).toFixed(4)}</span>
+                            <span title={t.description}>{t.description || "—"}</span>
+                            <span className="row-actions">
+                              <button className="icon-btn table-action-btn pwr-square-btn" title="Edit tariff" onClick={() => openEditTariff(t)}><EditIcon /></button>
+                              <button className="icon-btn table-action-btn danger pwr-square-btn" title="Remove tariff" onClick={() => removeTariff(t.id)}><DeleteIcon /></button>
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                ) : null}
+              </section>
+
               <section className="card">
                 <div className="db-simple-head">
                   <div className="db-head-title-wrap">
@@ -17124,23 +17329,6 @@ const getGatewayHealth = (gateway) => {
                 </div>
                 {!powerCardsCollapsed.meters ? (
                   <>
-                    <div className="form-grid three" style={{ marginTop: 10 }}>
-                      <label className="field">
-                        <span>Energy Price (EUR/kWh)</span>
-                        <input
-                          type="number"
-                          step="0.001"
-                          min="0"
-                          value={Number(powerConfig?.energy_price_eur_kwh ?? DEFAULT_ENERGY_COST_PER_KWH)}
-                          onChange={(e) =>
-                            setPowerConfig((prev) => ({
-                              ...(prev || {}),
-                              energy_price_eur_kwh: Number(e.target.value || DEFAULT_ENERGY_COST_PER_KWH),
-                            }))
-                          }
-                        />
-                      </label>
-                    </div>
                     {(!Array.isArray(powerConfig.devices) || powerConfig.devices.length === 0) ? (
                       <div className="muted" style={{ padding: 14, textAlign: "center" }}>
                         No power meters configured. Click <strong>Add</strong> to register one.
@@ -17243,20 +17431,18 @@ const getGatewayHealth = (gateway) => {
                 {!powerCardsCollapsed.registers ? (
                   <>
                     <div className="table db-table power-register-table power-register-compact" style={{ marginTop: 12 }}>
-                      <div className="thead"><span>Tag Key</span><span>Register Address</span><span>Scale</span><span>Description</span><span>Last Raw</span><span>Last Scaled</span><span>Tested</span><span>Actions</span></div>
-                      {Object.entries(selectedPowerRegisterMap || {}).map(([regKey, regVal]) => (
+                      <div className="thead"><span>Tag Key</span><span>Register Address</span><span>Scale</span><span>Description</span><span>Last Raw</span><span>Last Scaled</span><span>Tested</span><span style={{ textAlign: "right" }}>Actions</span></div>
+                      {Object.entries(selectedPowerRegisterMap || {}).map(([regKey, regVal]) => {
+                        const desc =
+                          (selectedPowerDevice?.register_descriptions || {})[regKey] ||
+                          POWER_REGISTER_HINTS[regKey] ||
+                          regKey.replaceAll("_", " ");
+                        return (
                         <div key={`pwr-reg-${regKey}`} className="trow">
                           <span>{regKey}</span>
-                          <span><input type="number" value={Number(regVal || 0)} onChange={(e) => setPowerDeviceRegisterField(regKey, Number(e.target.value || 0))} /></span>
-                          <span>
-                            <input
-                              type="number"
-                              step="0.0001"
-                              value={Number(selectedPowerDevice?.register_scales?.[regKey] || 1)}
-                              onChange={(e) => setPowerDeviceRegisterScaleField(regKey, Number(e.target.value || 1))}
-                            />
-                          </span>
-                          <span>{POWER_REGISTER_HINTS[regKey] || regKey.replaceAll("_", " ")}</span>
+                          <span>{Number(regVal || 0)}</span>
+                          <span>{Number(selectedPowerDevice?.register_scales?.[regKey] || 1)}</span>
+                          <span title={desc}>{desc}</span>
                           <span>
                             {Number.isFinite(Number(selectedPowerLatestByTag?.values_raw?.[regKey]))
                               ? formatMetricValue(Number(selectedPowerLatestByTag?.values_raw?.[regKey]), 3)
@@ -17287,12 +17473,16 @@ const getGatewayHealth = (gateway) => {
                             })()}
                           </span>
                           <span className="row-actions">
-                            <button className="icon-btn table-action-btn danger" title="Remove register" onClick={() => removePowerRegisterRow(regKey)}>
+                            <button className="icon-btn table-action-btn pwr-square-btn" title="Edit register" onClick={() => openEditRegisterModal(regKey)}>
+                              <EditIcon />
+                            </button>
+                            <button className="icon-btn table-action-btn danger pwr-square-btn" title="Remove register" onClick={() => removePowerRegisterRow(regKey)}>
                               <DeleteIcon />
                             </button>
                           </span>
                         </div>
-                      ))}
+                        );
+                      })}
                       <div className="trow">
                         <span>
                           <input
@@ -24300,6 +24490,64 @@ const getGatewayHealth = (gateway) => {
                 {powerBusy ? "Testing…" : "Test Connection"}
               </button>
               <button className="btn btn-danger" onClick={() => setShowPowerDeviceModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showRegisterEditModal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card pwr-modal" style={{ width: "min(480px, 96vw)" }}>
+            <h3>Edit Register</h3>
+            <div className="pwr-modal-body">
+              <div className="pwr-section">
+                <div className="pwr-grid">
+                  <label><span>Tag Key</span><input value={registerEditForm.key} onChange={(e) => setRegisterEditForm({ ...registerEditForm, key: e.target.value })} /></label>
+                  <label><span>Register Address</span><input type="number" value={registerEditForm.address} onChange={(e) => setRegisterEditForm({ ...registerEditForm, address: Number(e.target.value || 0) })} /></label>
+                  <label><span>Scale</span><input type="number" step="0.0001" value={registerEditForm.scale} onChange={(e) => setRegisterEditForm({ ...registerEditForm, scale: Number(e.target.value || 1) })} /></label>
+                </div>
+                <label className="pwr-full">
+                  <span>Description</span>
+                  <input value={registerEditForm.description} onChange={(e) => setRegisterEditForm({ ...registerEditForm, description: e.target.value })} placeholder="e.g. Voltage L1-N" />
+                </label>
+              </div>
+            </div>
+            <div className="row modal-actions">
+              <button className="btn btn-primary" onClick={saveEditedRegister}>OK</button>
+              <button className="btn btn-danger" onClick={() => setShowRegisterEditModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showTariffModal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card pwr-modal" style={{ width: "min(520px, 96vw)" }}>
+            <h3>{tariffForm.id ? "Edit Tariff" : "Add Tariff"}</h3>
+            <div className="pwr-modal-body">
+              <div className="pwr-section">
+                <div className="pwr-grid">
+                  <label><span>Name</span><input value={tariffForm.name} onChange={(e) => setTariffForm({ ...tariffForm, name: e.target.value })} placeholder="e.g. Peak Morning" /></label>
+                  <label><span>Type</span>
+                    <select value={tariffForm.type} onChange={(e) => setTariffForm({ ...tariffForm, type: e.target.value })}>
+                      <option value="flat">Flat</option>
+                      <option value="peak">Peak</option>
+                      <option value="off_peak">Off-Peak</option>
+                      <option value="shoulder">Shoulder</option>
+                      <option value="valley">Valley</option>
+                    </select>
+                  </label>
+                  <label><span>Start Time</span><input type="time" value={tariffForm.start_time} onChange={(e) => setTariffForm({ ...tariffForm, start_time: e.target.value })} /></label>
+                  <label><span>End Time</span><input type="time" value={tariffForm.end_time} onChange={(e) => setTariffForm({ ...tariffForm, end_time: e.target.value })} /></label>
+                  <label><span>Rate (€/kWh)</span><input type="number" step="0.0001" min="0" value={tariffForm.rate_eur_kwh} onChange={(e) => setTariffForm({ ...tariffForm, rate_eur_kwh: Number(e.target.value || 0) })} /></label>
+                </div>
+                <label className="pwr-full">
+                  <span>Description</span>
+                  <input value={tariffForm.description} onChange={(e) => setTariffForm({ ...tariffForm, description: e.target.value })} placeholder="optional note" />
+                </label>
+              </div>
+            </div>
+            <div className="row modal-actions">
+              <button className="btn btn-primary" onClick={saveTariff}>OK</button>
+              <button className="btn btn-danger" onClick={() => setShowTariffModal(false)}>Cancel</button>
             </div>
           </div>
         </div>

@@ -102,6 +102,14 @@ DEFAULT_POWER_CONFIG: dict[str, Any] = {
     # already persisted devices stay untouched — _normalize_config
     # passes through whatever the app store holds.
     "devices": [],
+    # Electricity Tariff settings. Operator 2026-06-15: "we so we can
+    # add new tarifs based on the time period, setting the time range
+    # and type and description like, Flat, Peak, Flat, valley etc".
+    # `energy_price_eur_kwh` is the legacy flat rate (kept for back-
+    # compat); `electricity_tariffs` is the new list of per-window
+    # rates evaluated by start_time/end_time (HH:MM in local time).
+    "energy_price_eur_kwh": 0.25,
+    "electricity_tariffs": [],
 }
 
 
@@ -261,6 +269,18 @@ class PowerManager:
                 scale_map[k] = parsed if parsed != 0 else 1.0
         base["register_scales"] = scale_map
         base["include_raw_tags"] = bool(raw.get("include_raw_tags", base.get("include_raw_tags", False)))
+        # Operator-supplied register descriptions (added 2026-06-15).
+        # Plain {register_key: text} map, persisted alongside the
+        # address + scale maps so the UI can render meaningful labels.
+        desc_map: dict[str, str] = {}
+        desc_raw = raw.get("register_descriptions")
+        if isinstance(desc_raw, dict):
+            for k, v in desc_raw.items():
+                key = str(k or "").strip()
+                if not key:
+                    continue
+                desc_map[key] = str(v or "")
+        base["register_descriptions"] = desc_map
         # Carry through the chosen database connection id. Empty string means
         # "local app-store only" (the default).
         base["database_id"] = str(raw.get("database_id") or "").strip()
@@ -315,6 +335,37 @@ class PowerManager:
             base["selected_device_id"] = str(devices[0]["id"])
         else:
             base["selected_device_id"] = ""
+
+        # Electricity tariff settings (added 2026-06-15). Legacy flat
+        # rate stays as the safety default; the array is sanitized so
+        # exotic operator input doesn't poison consumers.
+        try:
+            base["energy_price_eur_kwh"] = float(raw.get("energy_price_eur_kwh") or 0.0)
+        except Exception:
+            base["energy_price_eur_kwh"] = 0.0
+        tariffs_raw = raw.get("electricity_tariffs")
+        tariffs: list[dict[str, Any]] = []
+        if isinstance(tariffs_raw, list):
+            for t in tariffs_raw:
+                if not isinstance(t, dict):
+                    continue
+                try:
+                    rate = float(t.get("rate_eur_kwh") or 0.0)
+                except Exception:
+                    rate = 0.0
+                row = {
+                    "id": str(t.get("id") or "").strip() or f"tariff_{len(tariffs) + 1}",
+                    "name": str(t.get("name") or "").strip() or "Untitled",
+                    "type": str(t.get("type") or "flat").strip().lower(),
+                    "rate_eur_kwh": rate,
+                    "start_time": str(t.get("start_time") or "00:00").strip(),
+                    "end_time": str(t.get("end_time") or "23:59").strip(),
+                    "description": str(t.get("description") or ""),
+                }
+                if row["type"] not in {"flat", "peak", "off_peak", "valley", "shoulder"}:
+                    row["type"] = "flat"
+                tariffs.append(row)
+        base["electricity_tariffs"] = tariffs
         return base
 
     def _force_stopped_config(self, cfg: dict[str, Any]) -> dict[str, Any]:
