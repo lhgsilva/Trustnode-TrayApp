@@ -17080,6 +17080,17 @@ const getGatewayHealth = (gateway) => {
                 <div className="db-simple-head">
                   <div className="db-head-title-wrap">
                     <h3 style={{ margin: 0 }}>Power Meters</h3>
+                  </div>
+                  <div className="db-card-top-actions">
+                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddPowerDevice} disabled={!canEditPage("power_configuration")}>
+                      <AddIcon />
+                      <span>Add</span>
+                    </button>
+                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save</button>
+                    {/* Expand/collapse moved to top-right per operator
+                        request 2026-06-12 — sits next to Save with the
+                        other actions for symmetry across the page's
+                        cards. */}
                     <button
                       className="btn btn-sm card-collapse-btn"
                       onClick={() =>
@@ -17089,22 +17100,6 @@ const getGatewayHealth = (gateway) => {
                     >
                       {powerCardsCollapsed.meters ? "+" : "-"}
                     </button>
-                    <label className="remember-row db-inline-toggle">
-                      <input
-                        type="checkbox"
-                        checked={Boolean(powerConfig.enabled)}
-                        onChange={(e) => setPowerConfig((prev) => ({ ...(prev || {}), enabled: e.target.checked }))}
-                      />
-                      <span className="remember-label">Enabled</span>
-                    </label>
-                  </div>
-                  <div className="db-card-top-actions">
-                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddPowerDevice} disabled={!canEditPage("power_configuration")}>
-                      <AddIcon />
-                      <span>Add</span>
-                    </button>
-                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save</button>
-                    <button className="btn btn-primary btn-sm" onClick={runPowerConnectionTest} disabled={powerBusy}>Test Connection</button>
                   </div>
                 </div>
                 {!powerCardsCollapsed.meters ? (
@@ -17126,11 +17121,41 @@ const getGatewayHealth = (gateway) => {
                         />
                       </label>
                     </div>
+                    {(!Array.isArray(powerConfig.devices) || powerConfig.devices.length === 0) ? (
+                      <div className="muted" style={{ padding: 14, textAlign: "center" }}>
+                        No power meters configured. Click <strong>Add</strong> to register one.
+                      </div>
+                    ) : (
                     <div className="table db-table">
-                      <div className="thead"><span>Name</span><span>ID</span><span>Type</span><span>Endpoint</span><span>Wiring</span><span>Interval</span><span>Status</span><span>Actions</span></div>
-                      {(Array.isArray(powerConfig.devices) ? powerConfig.devices : []).map((d) => {
+                      {/* Power-meter row format mirrors the Gateway
+                          Configuration table: Name / ID / Endpoint /
+                          Status / Actions. Wiring / Interval moved
+                          into the per-meter edit modal so the table
+                          stays scannable. Operator 2026-06-12. */}
+                      <div className="thead"><span>Name</span><span>ID</span><span>Type</span><span>Endpoint</span><span>Status</span><span>Actions</span></div>
+                      {powerConfig.devices.map((d) => {
                         const st = (powerStatus?.devices || []).find((x) => String(x.device_id || "") === String(d.id || "")) || {};
                         const selected = String(powerConfig?.selected_device_id || "") === String(d.id || "");
+                        // Status copy converges with the Gateway page:
+                        // "Running" when polling and connected, "Stopped"
+                        // when disabled, "Device Fails" when enabled but
+                        // not reaching the Modbus endpoint, "DB Fails"
+                        // when last_error mentions write/sink/db.
+                        const lastErr = String(st.last_error || "").toLowerCase();
+                        const dbFault = /db|database|write|sink|queue/.test(lastErr);
+                        const enabledByOp = d.enabled !== false;
+                        const label = !enabledByOp
+                          ? "Stopped"
+                          : st.connected
+                            ? "Running"
+                            : dbFault
+                              ? "Device + DB Fails"
+                              : "Device Fails";
+                        const pillClass = label === "Running"
+                          ? "status-online"
+                          : label === "Stopped"
+                            ? "status-warning"
+                            : "status-offline";
                         return (
                           <div
                             key={`pwr-dev-${d.id}`}
@@ -17141,11 +17166,9 @@ const getGatewayHealth = (gateway) => {
                             <span>{d.id}</span>
                             <span>{String(d.type || "modbus_tcp").toUpperCase()}</span>
                             <span>{`${d.ip || "-"}:${d.port || 502}`}</span>
-                            <span>{String(d.electrical_mode || d.wiring_type || "single_phase")}</span>
-                            <span>{`${Number(d.poll_interval_ms || 1000)} ms`}</span>
                             <span>
-                              <span className={`status-pill ${st.connected ? "status-online" : "status-offline"}`}>
-                                {st.connected ? "Connected" : "Disconnected"}
+                              <span className={`status-pill ${pillClass}`} title={st.last_error || ""}>
+                                {label}
                               </span>
                             </span>
                             <span className="row-actions">
@@ -17166,13 +17189,23 @@ const getGatewayHealth = (gateway) => {
                         );
                       })}
                     </div>
+                    )}
                   </>
                 ) : null}
               </section>
+              {/* Registers card only shows when a meter is selected.
+                  Operator 2026-06-12: "the second card should only to
+                  be shown if a power meter is selected"; also the
+                  wiring inputs moved into the meter edit modal so this
+                  card is now registers-only. */}
+              {selectedPowerDevice ? (
               <section className="card">
                 <div className="db-simple-head">
                   <div className="db-head-title-wrap">
-                    <h3 style={{ margin: 0 }}>Selected Meter Wiring & Registers</h3>
+                    <h3 style={{ margin: 0 }}>Registers — {selectedPowerDevice.name || selectedPowerDevice.id}</h3>
+                  </div>
+                  <div className="db-card-top-actions">
+                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save</button>
                     <button
                       className="btn btn-sm card-collapse-btn"
                       onClick={() =>
@@ -17184,39 +17217,8 @@ const getGatewayHealth = (gateway) => {
                     </button>
                   </div>
                 </div>
-                {powerCardsCollapsed.registers ? null : !selectedPowerDevice ? (
-                  <div className="info-note">Select a power meter to configure wiring and registers.</div>
-                ) : (
+                {!powerCardsCollapsed.registers ? (
                   <>
-                    <div className="form-grid three">
-                      <label className="field"><span>Meter Mode</span>
-                        <select value={selectedPowerDevice.electrical_mode || selectedPowerDevice.wiring_type || "single_phase"} onChange={(e) => setPowerDeviceMode(e.target.value)}>
-                          <option value="single_phase">Single Phase</option>
-                          <option value="three_phase">Three Phase</option>
-                        </select>
-                      </label>
-                      <label className="field"><span>Register Profile</span>
-                        <select value={selectedPowerDevice.register_profile || ""} onChange={(e) => setPowerDeviceRegisterProfile(e.target.value)}>
-                          {Object.keys(powerProfiles?.profiles || {}).map((k) => (
-                            <option key={k} value={k}>{k}</option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className="remember-row">
-                        <input
-                          type="checkbox"
-                          checked={Boolean(selectedPowerDevice.use_custom_registers)}
-                          onChange={(e) => setPowerDeviceField("use_custom_registers", e.target.checked)}
-                        />
-                        <span className="remember-label">Use custom register mapping</span>
-                      </label>
-                      <label className="remember-row"><input type="checkbox" checked={Boolean(selectedPowerDevice.voltage_connected)} onChange={(e) => setPowerDeviceField("voltage_connected", e.target.checked)} /><span className="remember-label">Voltage connected</span></label>
-                      <label className="remember-row"><input type="checkbox" checked={Boolean(selectedPowerDevice.ct_connected)} onChange={(e) => setPowerDeviceField("ct_connected", e.target.checked)} /><span className="remember-label">CT connected</span></label>
-                      <label className="field"><span>CT Primary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.ct_primary || 80)} onChange={(e) => setPowerDeviceField("ct_primary", Number(e.target.value || 80))} /></label>
-                      <label className="field"><span>CT Secondary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.ct_secondary || 5)} onChange={(e) => setPowerDeviceField("ct_secondary", Number(e.target.value || 5))} /></label>
-                      <label className="field"><span>VT Primary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.vt_primary || 230)} onChange={(e) => setPowerDeviceField("vt_primary", Number(e.target.value || 230))} /></label>
-                      <label className="field"><span>VT Secondary</span><input type="number" step="0.1" value={Number(selectedPowerDevice.vt_secondary || 230)} onChange={(e) => setPowerDeviceField("vt_secondary", Number(e.target.value || 230))} /></label>
-                    </div>
                     <div className="table db-table power-register-table power-register-compact" style={{ marginTop: 12 }}>
                       <div className="thead"><span>Tag Key</span><span>Register Address</span><span>Scale</span><span>Description</span><span>Last Raw</span><span>Last Scaled</span><span>Tested</span><span>Actions</span></div>
                       {Object.entries(selectedPowerRegisterMap || {}).map(([regKey, regVal]) => (
@@ -17296,14 +17298,11 @@ const getGatewayHealth = (gateway) => {
                         </span>
                       </div>
                     </div>
+                    {powerResult ? <div className="info-note" style={{ marginTop: 10 }}>{powerResult}</div> : null}
                   </>
-                )}
-                <div className="row" style={{ marginTop: 16, gap: 8 }}>
-                  <button className="btn btn-success" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save Configuration</button>
-                  <button className="btn btn-primary" onClick={runPowerConnectionTest} disabled={powerBusy}>Test Selected Meter</button>
-                </div>
-                {powerResult ? <div className="info-note" style={{ marginTop: 10 }}>{powerResult}</div> : null}
+                ) : null}
               </section>
+              ) : null}
             </>
           ) : null}
 
@@ -24132,6 +24131,79 @@ const getGatewayHealth = (gateway) => {
               }}>
                 {Object.keys(powerProfiles?.profiles || {}).map((k) => <option key={k} value={k}>{k}</option>)}
               </select></label>
+              {/* Profile Import/Export (operator 2026-06-12). JSON
+                  shape: {schema:"trustnode.power.profile/v1",
+                  manufacturer, model, mode, registers,
+                  register_scales, notes}. Reads with FileReader;
+                  writes via a one-shot Blob download. The imported
+                  registers become the active meter's custom map so
+                  the operator can tweak before saving. */}
+              <div className="row" style={{ gap: 6, gridColumn: "1 / -1" }}>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => {
+                    const payload = {
+                      schema: "trustnode.power.profile/v1",
+                      manufacturer: powerDeviceForm.manufacturer || "",
+                      model: powerDeviceForm.model || "",
+                      mode: powerDeviceForm.electrical_mode || "single_phase",
+                      registers: powerDeviceForm.registers || {},
+                      register_scales: powerDeviceForm.register_scales || {},
+                      notes: powerDeviceForm.description || "",
+                    };
+                    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `power-profile-${(powerDeviceForm.register_profile || "profile").replace(/[^a-z0-9_-]+/gi, "_")}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    setTimeout(() => URL.revokeObjectURL(url), 1000);
+                  }}
+                >
+                  Export Profile
+                </button>
+                <label className="btn btn-sm" style={{ cursor: "pointer", margin: 0 }}>
+                  Import Profile
+                  <input
+                    type="file"
+                    accept="application/json,.json"
+                    style={{ display: "none" }}
+                    onChange={(e) => {
+                      const file = e.target.files && e.target.files[0];
+                      if (!file) return;
+                      const reader = new FileReader();
+                      reader.onload = (ev) => {
+                        try {
+                          const data = JSON.parse(String(ev.target.result || "{}"));
+                          if (!data || typeof data !== "object" || !data.registers || typeof data.registers !== "object") {
+                            setPowerResult("Invalid profile JSON (missing registers map).");
+                            return;
+                          }
+                          const regs = data.registers || {};
+                          const scales = (data.register_scales && typeof data.register_scales === "object") ? data.register_scales : {};
+                          setPowerDeviceForm((prev) => ({
+                            ...prev,
+                            electrical_mode: data.mode === "three_phase" ? "three_phase" : (prev.electrical_mode || "single_phase"),
+                            wiring_type: data.mode === "three_phase" ? "three_phase" : (prev.electrical_mode || "single_phase"),
+                            manufacturer: data.manufacturer || prev.manufacturer || "",
+                            model: data.model || prev.model || "",
+                            use_custom_registers: true,
+                            registers: regs,
+                            register_scales: buildRegisterScaleMap(regs, scales),
+                          }));
+                          setPowerResult(`Imported profile: ${data.manufacturer || ""} ${data.model || ""}`.trim() || "Profile imported.");
+                        } catch (err) {
+                          setPowerResult(`Profile import failed: ${err && err.message ? err.message : err}`);
+                        }
+                      };
+                      reader.readAsText(file);
+                      e.target.value = "";
+                    }}
+                  />
+                </label>
+              </div>
               <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.use_custom_registers)} onChange={(e) => {
                 const checked = e.target.checked;
                 const profileRegs = powerProfiles?.profiles?.[powerDeviceForm.register_profile || ""] || {};
@@ -24145,6 +24217,16 @@ const getGatewayHealth = (gateway) => {
               }} /><span className="remember-label">Use custom register mapping</span></label>
               <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.voltage_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, voltage_connected: e.target.checked })} /><span className="remember-label">Voltage connected</span></label>
               <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.ct_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_connected: e.target.checked })} /><span className="remember-label">CT connected</span></label>
+                    {/* CT/VT moved into modal per operator 2026-06-12:
+                        "the configuration field of the meters should
+                        be parts of the each meters configuration
+                        popup window". Defaults match the pre-refactor
+                        inline form so existing saved configs render
+                        unchanged. */}
+                    <label><span>CT Primary</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_primary ?? 80)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_primary: Number(e.target.value || 80) })} /></label>
+                    <label><span>CT Secondary</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_secondary ?? 5)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_secondary: Number(e.target.value || 5) })} /></label>
+                    <label><span>VT Primary</span><input type="number" step="0.1" value={Number(powerDeviceForm.vt_primary ?? 230)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_primary: Number(e.target.value || 230) })} /></label>
+                    <label><span>VT Secondary</span><input type="number" step="0.1" value={Number(powerDeviceForm.vt_secondary ?? 230)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_secondary: Number(e.target.value || 230) })} /></label>
                     <label className="remember-row"><input type="checkbox" checked={Boolean(powerDeviceForm.enabled)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, enabled: e.target.checked })} /><span className="remember-label">Enabled</span></label>
                     <label><span>Machine Description</span><input value={powerDeviceForm.machine_description || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, machine_description: e.target.value })} /></label>
                     <label><span>Site</span><input value={powerDeviceForm.site || ""} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, site: e.target.value })} /></label>
@@ -24155,6 +24237,19 @@ const getGatewayHealth = (gateway) => {
                   </div>
             <div className="row modal-actions">
               <button className="btn btn-primary" onClick={savePowerDevice}>OK</button>
+              {/* Test Connection moved into the modal per operator
+                  2026-06-12 — the per-meter test runs against the
+                  ip/port the operator just typed, which is more
+                  intuitive than the page-level run-all-meters
+                  button. Falls back to runPowerConnectionTest when
+                  a per-meter handler isn't present (existing flow). */}
+              <button
+                className="btn"
+                onClick={() => runPowerConnectionTest()}
+                disabled={powerBusy}
+              >
+                Test Connection
+              </button>
               <button className="btn btn-danger" onClick={() => setShowPowerDeviceModal(false)}>Cancel</button>
             </div>
           </div>

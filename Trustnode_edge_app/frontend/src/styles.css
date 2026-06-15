@@ -4005,6 +4005,23 @@ input[type="checkbox"] {
   font-size: 12px;
 }
 
+/* Compact action icons — operator 2026-06-12: "the icon in the action
+   end to be smaller". Shrink the table-action-btn footprint inside the
+   register table only; other tables keep their default size. */
+.power-register-table.power-register-compact .row-actions {
+  gap: 4px;
+}
+.power-register-table.power-register-compact .row-actions .icon-btn {
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  padding: 2px;
+}
+.power-register-table.power-register-compact .row-actions .icon-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
 @media (max-width: 1400px) {
   .power-kpi-grid {
     grid-template-columns: repeat(3, minmax(150px, 1fr));

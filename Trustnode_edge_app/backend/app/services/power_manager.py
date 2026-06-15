@@ -95,8 +95,13 @@ DEFAULT_DEVICE: dict[str, Any] = {
 
 DEFAULT_POWER_CONFIG: dict[str, Any] = {
     "enabled": False,
-    "selected_device_id": "power_meter_01",
-    "devices": [DEFAULT_DEVICE],
+    "selected_device_id": "",
+    # Fresh installs start with NO power meters. Operator 2026-06-12:
+    # "for every new installation the power meters is already loaded
+    # automatically it should not be it." Existing deployments that
+    # already persisted devices stay untouched — _normalize_config
+    # passes through whatever the app store holds.
+    "devices": [],
 }
 
 
@@ -211,21 +216,41 @@ class PowerManager:
         base["vt_primary"] = _to_float(raw.get("vt_primary"), base["vt_primary"])
         base["vt_secondary"] = max(0.0001, _to_float(raw.get("vt_secondary"), base["vt_secondary"]))
         base["use_custom_registers"] = bool(raw.get("use_custom_registers", False))
-        resolved_registers = dict(REGISTER_PROFILES.get(base["register_profile"], DEFAULT_REGISTERS))
         regs = raw.get("registers")
-        if isinstance(regs, dict):
-            merged = dict(resolved_registers)
+        # Operator 2026-06-12: "to add new registers and custom are not
+        # working properly when I add still do not loaded ( make sure
+        # the database doesnt have fixed values in the database in way
+        # we cannot change, delete or add new ones)". The previous
+        # behavior MERGED the user's registers on top of the profile
+        # defaults, so removing a register would silently come back on
+        # the next save. When use_custom_registers is True the user's
+        # map is now authoritative — adds, edits, AND deletes survive.
+        if base["use_custom_registers"] and isinstance(regs, dict):
+            user_map: dict[str, int] = {}
             for k, v in regs.items():
-                if v is None or v == "":
-                    continue
                 key = str(k or "").strip()
                 if not key:
                     continue
-                merged[key] = _to_int(v, merged.get(key, 0))
-            resolved_registers = merged
-            if raw.get("use_custom_registers") is None:
+                if v is None or v == "":
+                    continue
+                user_map[key] = _to_int(v, 0)
+            resolved_registers = user_map
+        elif isinstance(regs, dict) and raw.get("use_custom_registers") is None:
+            # Legacy configs that pre-date the use_custom_registers flag:
+            # if the user already stored a registers map, honor it as
+            # custom (preserve behavior for existing installs).
+            user_map = {}
+            for k, v in regs.items():
+                key = str(k or "").strip()
+                if not key or v is None or v == "":
+                    continue
+                user_map[key] = _to_int(v, 0)
+            if user_map:
+                resolved_registers = user_map
                 base["use_custom_registers"] = True
-        if base["use_custom_registers"] is False:
+            else:
+                resolved_registers = dict(REGISTER_PROFILES.get(base["register_profile"], DEFAULT_REGISTERS))
+        else:
             resolved_registers = dict(REGISTER_PROFILES.get(base["register_profile"], DEFAULT_REGISTERS))
         base["registers"] = resolved_registers
         scale_map = {k: 1.0 for k in resolved_registers.keys()}
