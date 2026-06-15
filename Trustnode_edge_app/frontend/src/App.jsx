@@ -7269,6 +7269,7 @@ function AppShell() {
         energy_delivered_total_wh: 1,
       },
     });
+    setPowerResult("");
     setShowPowerDeviceModal(true);
   };
 
@@ -7292,6 +7293,7 @@ function AppShell() {
         device.register_scales || {}
       ),
     });
+    setPowerResult("");
     setShowPowerDeviceModal(true);
   };
 
@@ -24280,6 +24282,14 @@ const getGatewayHealth = (gateway) => {
             </div>
 
             </div>{/* pwr-modal-body */}
+            {powerResult ? (
+              <div
+                className={`pwr-modal-result ${/fail|unable|error|refused|timeout/i.test(String(powerResult)) ? "is-error" : "is-ok"}`}
+                title={powerResult}
+              >
+                {powerResult}
+              </div>
+            ) : null}
             <div className="row modal-actions">
               <button className="btn btn-primary" onClick={savePowerDevice}>OK</button>
               <button
@@ -24287,7 +24297,7 @@ const getGatewayHealth = (gateway) => {
                 onClick={() => runPowerConnectionTest(powerDeviceForm)}
                 disabled={powerBusy}
               >
-                Test Connection
+                {powerBusy ? "Testing…" : "Test Connection"}
               </button>
               <button className="btn btn-danger" onClick={() => setShowPowerDeviceModal(false)}>Cancel</button>
             </div>

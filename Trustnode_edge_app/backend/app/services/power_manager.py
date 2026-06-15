@@ -1072,14 +1072,33 @@ class PowerManager:
 
     def test_connection(self, payload: dict[str, Any] | None = None, timeout_s: float = 3.0) -> dict[str, Any]:
         target = self._normalize_device(payload or self._deep_copy(DEFAULT_DEVICE))
+        host = str(target.get("ip") or "")
+        port = int(target.get("port") or 502)
+        endpoint = f"{host}:{port}"
         client = ModbusTcpClient(
-            host=str(target.get("ip") or ""),
-            port=int(target.get("port") or 502),
+            host=host,
+            port=port,
             timeout=max(0.5, float(timeout_s)),
         )
         try:
+            # Pre-flight the TCP port directly so we can distinguish
+            # "no route / wrong subnet" from "host up, port closed".
+            # ModbusTcpClient.connect() returns False for both and the
+            # operator had no way to tell which one applied.
+            try:
+                import socket as _sock
+                with _sock.create_connection((host, port), timeout=max(0.5, float(timeout_s))):
+                    pass
+            except _sock.timeout:
+                return {"ok": False, "message": f"Timeout connecting to {endpoint} (host unreachable or firewall blocking)"}
+            except OSError as exc:
+                # ConnectionRefused → host up, port closed.
+                # Network unreachable → wrong subnet / IP typo.
+                detail = str(exc) or exc.__class__.__name__
+                return {"ok": False, "message": f"Cannot reach {endpoint}: {detail}"}
+
             if not client.connect():
-                return {"ok": False, "message": "Unable to connect to Modbus TCP endpoint"}
+                return {"ok": False, "message": f"Modbus TCP handshake failed at {endpoint}"}
             regs = dict(target.get("registers") or {})
             reg_scales = dict(target.get("register_scales") or {})
             if not regs:
