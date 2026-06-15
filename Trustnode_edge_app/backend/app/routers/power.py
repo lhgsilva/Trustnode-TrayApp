@@ -5,7 +5,7 @@ import logging
 import traceback
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -15,9 +15,18 @@ router = APIRouter(prefix="/api/power", tags=["power"])
 
 
 class PowerConfigPayload(BaseModel):
+    # Operator 2026-06-15: tariff entries were silently dropped because
+    # this model didn't declare electricity_tariffs / energy_price.
+    # Pydantic strips unknown keys on .model_dump() — even though the
+    # power_manager normaliser would accept them. Allow extras as
+    # belt-and-braces against future config additions.
+    model_config = ConfigDict(extra="allow")
+
     enabled: bool = True
     selected_device_id: str = "power_meter_01"
     devices: list[dict[str, Any]] = Field(default_factory=list)
+    energy_price_eur_kwh: float = 0.0
+    electricity_tariffs: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PowerConnectionTestPayload(BaseModel):
