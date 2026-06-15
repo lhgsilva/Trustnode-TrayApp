@@ -2766,6 +2766,7 @@ function AppShell() {
   // Tariff card with collapsible table of time-windowed rates).
   const [tariffsCardCollapsed, setTariffsCardCollapsed] = useState(true);
   const [showTariffModal, setShowTariffModal] = useState(false);
+  const [tariffModalError, setTariffModalError] = useState("");
   const [tariffForm, setTariffForm] = useState({
     id: "",
     name: "",
@@ -6777,7 +6778,12 @@ function AppShell() {
             }
           }
         }
-        if (!stopped && activePage === "power_overview") {
+        if (!stopped && (activePage === "power_overview" || activePage === "power_configuration")) {
+          // Operator 2026-06-15: the Registers table on the Power
+          // Configuration page also needs the live history feed so
+          // Last Raw / Last Scaled columns populate. Without this the
+          // table only ever showed '-' because the poll was gated to
+          // the Overview page.
           const nowMs = Date.now();
           if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= 2000) {
             powerHistoryLastFetchMsRef.current = nowMs;
@@ -6799,7 +6805,7 @@ function AppShell() {
     };
 
     const pollMs =
-      activePage === "power_overview" || activePage === "dashboard" || activePage === "tags"
+      activePage === "power_overview" || activePage === "power_configuration" || activePage === "dashboard" || activePage === "tags"
         ? 1000
         : 2500;
     pollPower();
@@ -6835,6 +6841,26 @@ function AppShell() {
       stopped = true;
     };
   }, [currentUser]);
+
+  const savePowerConfigPayload = async (payload) => {
+    const res = await updatePowerConfig(payload);
+    if (res?.ok && res?.config) {
+      const cfg = res.config || {};
+      const cfgDevices = Array.isArray(cfg.devices) ? cfg.devices : [];
+      setPowerConfig({
+        ...cfg,
+        devices: cfgDevices.map((d) => {
+          const registers = d?.registers && typeof d.registers === "object" ? d.registers : {};
+          return {
+            ...(d || {}),
+            registers,
+            register_scales: buildRegisterScaleMap(registers, d?.register_scales || {}),
+          };
+        }),
+      });
+    }
+    return res;
+  };
 
   const savePowerConfig = async () => {
     setPowerBusy(true);
@@ -6942,10 +6968,37 @@ function AppShell() {
     setPowerPeriod("24h");
   }, [powerViewMode, powerPeriod]);
 
-  const powerCostPerKwh = useMemo(() => {
-    const v = Number(powerConfig?.energy_price_eur_kwh);
-    return Number.isFinite(v) && v > 0 ? v : DEFAULT_ENERGY_COST_PER_KWH;
-  }, [powerConfig]);
+  // Time-of-use tariff resolver. Operator 2026-06-15: Overview cost
+  // calculations should consume the configured tariffs, not a single
+  // flat rate. Returns the matching tariff rate for an epoch ms, or
+  // falls back to energy_price_eur_kwh / DEFAULT_ENERGY_COST_PER_KWH.
+  const resolveTariffRate = useCallback(
+    (epochMs) => {
+      const tariffs = Array.isArray(powerConfig?.electricity_tariffs) ? powerConfig.electricity_tariffs : [];
+      if (tariffs.length && Number.isFinite(Number(epochMs))) {
+        const d = new Date(Number(epochMs));
+        const hh = d.getHours();
+        const mm = d.getMinutes();
+        const minutes = hh * 60 + mm;
+        const toMin = (s) => {
+          const [h, m] = String(s || "00:00").split(":").map((x) => Number(x) || 0);
+          return h * 60 + m;
+        };
+        for (const t of tariffs) {
+          const start = toMin(t.start_time);
+          const end = toMin(t.end_time);
+          const inWindow = start <= end
+            ? minutes >= start && minutes <= end
+            : minutes >= start || minutes <= end; // overnight window
+          if (inWindow) return Number(t.rate_eur_kwh) || 0;
+        }
+      }
+      const flat = Number(powerConfig?.energy_price_eur_kwh);
+      return Number.isFinite(flat) && flat > 0 ? flat : DEFAULT_ENERGY_COST_PER_KWH;
+    },
+    [powerConfig]
+  );
+  const powerCostPerKwh = useMemo(() => resolveTariffRate(Date.now()), [resolveTariffRate]);
 
   const powerRowsFiltered = useMemo(() => {
     const nowMs = Date.now();
@@ -7596,11 +7649,12 @@ function AppShell() {
   };
 
   const openAddTariff = () => {
+    setTariffModalError("");
     setTariffForm({
       id: "",
       name: "",
       type: "flat",
-      rate_eur_kwh: Number(powerConfig?.energy_price_eur_kwh ?? DEFAULT_ENERGY_COST_PER_KWH),
+      rate_eur_kwh: 0,
       start_time: "00:00",
       end_time: "23:59",
       description: "",
@@ -7608,6 +7662,7 @@ function AppShell() {
     setShowTariffModal(true);
   };
   const openEditTariff = (t) => {
+    setTariffModalError("");
     setTariffForm({
       id: String(t.id || ""),
       name: String(t.name || ""),
@@ -7619,35 +7674,56 @@ function AppShell() {
     });
     setShowTariffModal(true);
   };
-  const saveTariff = () => {
+  const saveTariff = async () => {
     const name = String(tariffForm.name || "").trim();
     if (!name) {
-      setPowerResult("Tariff name is required.");
+      setTariffModalError("Tariff name is required.");
       return;
     }
-    setPowerConfig((prev) => {
-      const list = Array.isArray(prev?.electricity_tariffs) ? [...prev.electricity_tariffs] : [];
-      const tariffId = tariffForm.id || `tariff_${Date.now().toString(36)}`;
-      const row = {
-        id: tariffId,
-        name,
-        type: String(tariffForm.type || "flat"),
-        rate_eur_kwh: Number(tariffForm.rate_eur_kwh) || 0,
-        start_time: String(tariffForm.start_time || "00:00"),
-        end_time: String(tariffForm.end_time || "23:59"),
-        description: String(tariffForm.description || ""),
-      };
-      const idx = list.findIndex((x) => String(x.id || "") === tariffId);
-      if (idx >= 0) list[idx] = row; else list.push(row);
-      return { ...(prev || {}), electricity_tariffs: list };
-    });
+    // Persist immediately so the row sticks even if the operator
+    // doesn't press the Save Configuration button afterwards.
+    // Operator 2026-06-15: "should be wired back to the database
+    // and ready for calculations of the overview".
+    const tariffId = tariffForm.id || `tariff_${Date.now().toString(36)}`;
+    const row = {
+      id: tariffId,
+      name,
+      type: String(tariffForm.type || "flat"),
+      rate_eur_kwh: Number(tariffForm.rate_eur_kwh) || 0,
+      start_time: String(tariffForm.start_time || "00:00"),
+      end_time: String(tariffForm.end_time || "23:59"),
+      description: String(tariffForm.description || ""),
+    };
+    const currentList = Array.isArray(powerConfig?.electricity_tariffs) ? [...powerConfig.electricity_tariffs] : [];
+    const idx = currentList.findIndex((x) => String(x.id || "") === tariffId);
+    if (idx >= 0) currentList[idx] = row; else currentList.push(row);
+    const nextConfig = { ...(powerConfig || {}), electricity_tariffs: currentList };
+    setPowerConfig(nextConfig);
     setShowTariffModal(false);
+    setTariffModalError("");
+    try {
+      setPowerBusy(true);
+      await savePowerConfigPayload(nextConfig);
+      setPowerResult(`Tariff "${row.name}" saved.`);
+    } catch (err) {
+      setPowerResult(`Failed to persist tariff: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
   };
-  const removeTariff = (id) => {
-    setPowerConfig((prev) => {
-      const list = (Array.isArray(prev?.electricity_tariffs) ? prev.electricity_tariffs : []).filter((x) => String(x.id || "") !== String(id));
-      return { ...(prev || {}), electricity_tariffs: list };
-    });
+  const removeTariff = async (id) => {
+    const list = (Array.isArray(powerConfig?.electricity_tariffs) ? powerConfig.electricity_tariffs : [])
+      .filter((x) => String(x.id || "") !== String(id));
+    const nextConfig = { ...(powerConfig || {}), electricity_tariffs: list };
+    setPowerConfig(nextConfig);
+    try {
+      setPowerBusy(true);
+      await savePowerConfigPayload(nextConfig);
+    } catch (err) {
+      setPowerResult(`Failed to remove tariff: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
   };
 
   const removePowerRegisterRow = (key) => {
@@ -17255,27 +17331,9 @@ const getGatewayHealth = (gateway) => {
                 </div>
                 {!tariffsCardCollapsed ? (
                   <>
-                    <div className="form-grid three" style={{ marginTop: 10 }}>
-                      <label className="field">
-                        <span>Default Flat Rate (EUR/kWh)</span>
-                        <input
-                          type="number"
-                          step="0.001"
-                          min="0"
-                          value={Number(powerConfig?.energy_price_eur_kwh ?? DEFAULT_ENERGY_COST_PER_KWH)}
-                          onChange={(e) =>
-                            setPowerConfig((prev) => ({
-                              ...(prev || {}),
-                              energy_price_eur_kwh: Number(e.target.value || DEFAULT_ENERGY_COST_PER_KWH),
-                            }))
-                          }
-                          title="Fallback rate when no tariff window matches the current time."
-                        />
-                      </label>
-                    </div>
                     {(!Array.isArray(powerConfig.electricity_tariffs) || powerConfig.electricity_tariffs.length === 0) ? (
                       <div className="muted" style={{ padding: 14, textAlign: "center" }}>
-                        No time-of-use tariffs defined. The flat rate above is used for every hour. Click <strong>Add Tariff</strong> to define Peak / Off-Peak / Valley windows.
+                        No tariffs defined yet. Click <strong>Add Tariff</strong> to define Flat / Peak / Off-Peak / Valley windows. Overview cost calculations use the active tariff for each timestamp.
                       </div>
                     ) : (
                       <div className="table db-table power-tariff-table">
@@ -24556,9 +24614,12 @@ const getGatewayHealth = (gateway) => {
                 </label>
               </div>
             </div>
+            {tariffModalError ? (
+              <div className="pwr-modal-result is-error">{tariffModalError}</div>
+            ) : null}
             <div className="row modal-actions">
-              <button className="btn btn-primary" onClick={saveTariff}>OK</button>
-              <button className="btn btn-danger" onClick={() => setShowTariffModal(false)}>Cancel</button>
+              <button className="btn btn-primary" onClick={saveTariff} disabled={powerBusy}>OK</button>
+              <button className="btn btn-danger" onClick={() => { setShowTariffModal(false); setTariffModalError(""); }}>Cancel</button>
             </div>
           </div>
         </div>

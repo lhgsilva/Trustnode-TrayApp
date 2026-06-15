@@ -2158,14 +2158,27 @@ body {
 }
 
 .table-action-btn {
-  min-width: 30px;
-  width: 30px;
-  height: 30px;
+  /* Operator 2026-06-15: action buttons should be a small square
+     default across the app — same size everywhere. 26×26 with a
+     compact 6px radius reads as a square at glance while still
+     looking like a button (a pure radius:0 would look brittle).
+     Per-table overrides should NOT change dimensions; only
+     colour/icon tint. */
+  min-width: 26px;
+  width: 26px;
+  height: 26px;
   padding: 0;
-  border-radius: 8px;
+  border-radius: 6px;
   border: 1px solid var(--stroke);
   background: transparent;
   color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.table-action-btn svg {
+  width: 14px;
+  height: 14px;
 }
 
 .table-action-btn:hover {
@@ -4051,24 +4064,14 @@ input[type="checkbox"] {
   padding: 0 6px;
   font-size: 12px;
 }
-.power-register-table.power-register-compact .row-actions .icon-btn {
-  width: 20px;
-  height: 20px;
-  min-width: 20px;
-  padding: 0;
-}
-.power-register-table.power-register-compact .row-actions .icon-btn svg {
-  width: 11px;
-  height: 11px;
-}
+/* Per-row icon sizing is now governed by the global .table-action-btn
+   rule (operator 2026-06-15: same size everywhere). The earlier 20x20
+   override that lived here is removed so the register table matches
+   the rest of the app. */
 
-/* Squared action buttons used in the register and tariff tables.
-   Operator 2026-06-15: "the action button should be squared and
-   all action button to be aligned on the right". */
-.row-actions .pwr-square-btn {
-  border-radius: 6px;
-  aspect-ratio: 1 / 1;
-}
+/* .pwr-square-btn no longer needs custom sizing — the global
+   .table-action-btn rule above is now squared by default. The
+   class stays as a no-op marker on existing markup. */
 .power-register-table.power-register-compact .row-actions {
   justify-content: flex-end;
   gap: 4px;
