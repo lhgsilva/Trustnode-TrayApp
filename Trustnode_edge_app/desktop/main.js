@@ -1,10 +1,38 @@
 const { app, BrowserWindow, Menu, Tray, nativeImage, dialog, ipcMain } = require("electron");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
 const net = require("net");
+const os = require("os");
 const { URL } = require("url");
+
+// ── Early boot-error logger (operator 2026-06-15: "the exe never
+// even shows the splash on the other PC"). Anything that throws
+// before the splash window opens lands in
+// %LOCALAPPDATA%\TrustNode\boot-error.log so we have something to
+// inspect on customer machines where the EXE silently exits.
+const BOOT_LOG_DIR = (() => {
+  try {
+    const base = process.env.LOCALAPPDATA || os.homedir();
+    const dir = path.join(base, "TrustNode");
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  } catch (_) { return os.tmpdir(); }
+})();
+const BOOT_LOG_PATH = path.join(BOOT_LOG_DIR, "boot-error.log");
+function bootLog(line) {
+  try {
+    fs.appendFileSync(BOOT_LOG_PATH, `[${new Date().toISOString()}] ${line}\n`);
+  } catch (_) { /* writing the log must never crash boot */ }
+}
+process.on("uncaughtException", (err) => {
+  bootLog(`uncaughtException: ${err && err.stack || err}`);
+});
+process.on("unhandledRejection", (reason) => {
+  bootLog(`unhandledRejection: ${reason && reason.stack || reason}`);
+});
+bootLog(`boot start v${(() => { try { return app.getVersion(); } catch { return "?"; } })()} pid=${process.pid}`);
 
 let mainWindow = null;
 let splashWindow = null;
@@ -32,7 +60,32 @@ if (process.platform === "win32") {
   try { app.setAppUserModelId("com.trustnode.edge"); } catch (_) {}
 }
 
+// Sweep stale backend processes left over from a previous version's
+// crash / unclean exit. Operator 2026-06-15: upgrading on top of an
+// existing install left a zombie trustnode-service.exe holding the
+// file lock, so the installer couldn't overwrite it and the new
+// Electron shell couldn't bind to its port. Kill silently — if the
+// process truly belongs to a running instance, the singleton lock
+// below will pick that up. ONLY runs on Windows.
+function sweepStaleBackend() {
+  if (process.platform !== "win32") return;
+  // We can't reliably tell ours apart from someone else's, so this is
+  // safe-by-omission: only act when the exe name matches AND it's not
+  // already our own child (it can't be — we haven't spawned anything
+  // yet). Use taskkill /F /T to take the tree down even if children
+  // are misbehaving.
+  try {
+    execFileSync("taskkill.exe", ["/F", "/T", "/IM", BACKEND_EXE_NAME], {
+      stdio: ["ignore", "ignore", "ignore"],
+      timeout: 4000,
+    });
+    bootLog("stale backend swept");
+  } catch (_) { /* nothing to kill is the happy path */ }
+}
+try { sweepStaleBackend(); } catch (err) { bootLog(`sweep failed: ${err && err.message || err}`); }
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
+bootLog(`singleton lock acquired=${gotSingleInstanceLock}`);
 
 if (!gotSingleInstanceLock) {
   try {
