@@ -7110,6 +7110,7 @@ function AppShell() {
     // start of today, Month → start of current month, Year → start
     // of current year. Trumps the explicit Period dropdown when set.
     const now = new Date();
+    if (powerViewScale === "second") return 60 * 1000;
     if (powerViewScale === "hour") return 60 * 60 * 1000;
     if (powerViewScale === "day") {
       const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -7149,6 +7150,7 @@ function AppShell() {
   // Year → month buckets. Falls back to the explicit Interval
   // dropdown when no scale is selected.
   const effectiveInterval = useMemo(() => {
+    if (powerViewScale === "second") return "second";
     if (powerViewScale === "hour") return "minute";
     if (powerViewScale === "day") return "hour";
     if (powerViewScale === "month") return "day";
@@ -17742,6 +17744,11 @@ const getGatewayHealth = (gateway) => {
                   <span>View</span>
                   <select value={powerViewScale} onChange={(e) => setPowerViewScale(e.target.value)}>
                     <option value="">Custom (use Period + Interval)</option>
+                    {/* Live (Second) is the high-frequency mode: last
+                        60 seconds ending now, no bucket averaging
+                        (operator 2026-06-15). Restricted to Live
+                        view mode — Historical use Custom + From/To. */}
+                    {powerViewMode === "realtime" ? <option value="second">Live (Second — last 60s)</option> : null}
                     <option value="hour">Hour — minutes</option>
                     <option value="day">Day — hours</option>
                     <option value="month">Month — days</option>
