@@ -125,7 +125,7 @@ import {
   setCompanyLogo,
   deleteCompanyLogo,
 } from "./api";
-import { Area, AreaChart, Bar, BarChart, CartesianGrid, ComposedChart, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, ComposedChart, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 function getUiStorageScope() {
   try {
@@ -752,6 +752,8 @@ function formatTimeDisplay(rawValue, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
 function bucketKeyForInterval(tsMs, interval, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
   const p = getDatePartsInTimeZone(tsMs, timeZone);
   if (!p) return "";
+  if (interval === "year") return String(p.year);
+  if (interval === "month") return `${p.year}-${p.month}`;
   if (interval === "day") return `${p.year}-${p.month}-${p.day}`;
   if (interval === "hour") return `${p.year}-${p.month}-${p.day} ${p.hour}:00`;
   if (interval === "minute") return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
@@ -2712,6 +2714,14 @@ function AppShell() {
   });
   const [powerHistoricalTo, setPowerHistoricalTo] = useState(() => new Date().toISOString().slice(0, 16));
   const [powerHistoricalApplyToken, setPowerHistoricalApplyToken] = useState(0);
+  // Aggregation scale (operator 2026-06-15): one dropdown that
+  // bundles a period + bucket pair. Year shows 12 monthly bars,
+  // Month shows ~30 daily bars, Day shows 24 hourly bars, Hour
+  // shows 60 minute bars. Set to "" to use the explicit Period +
+  // Interval pair on the toolbar.
+  const [powerViewScale, setPowerViewScale] = useState("");
+  // Donut: € (cost) vs kWh (consumption) toggle. Operator 2026-06-15.
+  const [powerDonutMode, setPowerDonutMode] = useState("cost");
   // Overview chart settings (operator 2026-06-15: edit chart info on
   // hover — title, type, axis, limits, series). Keys: "main" / "side".
   const [powerChartSettings, setPowerChartSettings] = useState({
@@ -7026,19 +7036,32 @@ function AppShell() {
   }, [powerConfig]);
 
   const periodMs = useMemo(() => {
+    // View scale (operator 2026-06-15): Hour → last 60min, Day →
+    // start of today, Month → start of current month, Year → start
+    // of current year. Trumps the explicit Period dropdown when set.
+    const now = new Date();
+    if (powerViewScale === "hour") return 60 * 60 * 1000;
+    if (powerViewScale === "day") {
+      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
+    }
+    if (powerViewScale === "month") {
+      const start = new Date(now.getFullYear(), now.getMonth(), 1);
+      return Math.max(24 * 60 * 60 * 1000, now.getTime() - start.getTime());
+    }
+    if (powerViewScale === "year") {
+      const start = new Date(now.getFullYear(), 0, 1);
+      return Math.max(31 * 24 * 60 * 60 * 1000, now.getTime() - start.getTime());
+    }
     // Calendar windows (day/week/month) measure from the start of
     // the corresponding boundary to now, not a rolling 24/168/720
     // hour span. Operator 2026-06-15.
-    const now = new Date();
     if (powerPeriod === "day") {
       const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
       return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
     }
     if (powerPeriod === "week") {
       const d = new Date(now);
-      // ISO week starts Monday — but match the OS locale heuristic of
-      // "current week" instead (Sun-based on en-US). Keep it Monday-
-      // based since that matches the European factory shift planner.
       const dow = (d.getDay() + 6) % 7; // 0 = Monday
       const start = new Date(d.getFullYear(), d.getMonth(), d.getDate() - dow);
       return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
@@ -7049,7 +7072,19 @@ function AppShell() {
     }
     const match = POWER_PERIOD_OPTIONS.find((p) => p.value === powerPeriod) || POWER_PERIOD_OPTIONS[3];
     return match?.ms || 24 * 60 * 60 * 1000;
-  }, [powerPeriod, powerViewMode]);
+  }, [powerPeriod, powerViewMode, powerViewScale]);
+
+  // Effective bucketing interval driven by the view scale.
+  // Hour → minute buckets, Day → hour buckets, Month → day buckets,
+  // Year → month buckets. Falls back to the explicit Interval
+  // dropdown when no scale is selected.
+  const effectiveInterval = useMemo(() => {
+    if (powerViewScale === "hour") return "minute";
+    if (powerViewScale === "day") return "hour";
+    if (powerViewScale === "month") return "day";
+    if (powerViewScale === "year") return "month";
+    return powerInterval;
+  }, [powerViewScale, powerInterval]);
 
   useEffect(() => {
     if (powerViewMode !== "realtime") return;
@@ -7128,7 +7163,7 @@ function AppShell() {
 
   const powerTrendData = useMemo(() => {
     const meterIds = (powerConfig?.devices || []).map((d) => String(d?.id || "")).filter(Boolean);
-    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, powerInterval, displayTimeZone);
+    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, effectiveInterval, displayTimeZone);
     const powerTags = new Set(["active_power_total_w", "active_power_w"]);
     const buckets = new Map();
     for (const row of powerRowsFiltered) {
@@ -7163,13 +7198,13 @@ function AppShell() {
     });
     out.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
     return out;
-  }, [powerRowsFiltered, powerInterval, powerAggregation, powerConfig, powerCostPerKwh, displayTimeZone]);
+  }, [powerRowsFiltered, powerInterval, effectiveInterval, powerAggregation, powerConfig, powerCostPerKwh, displayTimeZone]);
 
   const powerMainChartData = useMemo(() => {
     const meterIds = (powerConfig?.devices || [])
       .map((d) => String(d?.id || ""))
       .filter((id) => !selectedPowerChartMeters.length || selectedPowerChartMeters.includes(id));
-    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, powerInterval, displayTimeZone);
+    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, effectiveInterval, displayTimeZone);
     const metricTagPriority =
       powerMainMetric === "voltage_v"
         ? ["voltage_v", "voltage_l1_v"]
@@ -7213,7 +7248,7 @@ function AppShell() {
     });
     rows.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
     return { rows, meterIds };
-  }, [powerConfig, powerRowsFiltered, powerInterval, powerMainMetric, powerAggregation, selectedPowerChartMeters, displayTimeZone]);
+  }, [powerConfig, powerRowsFiltered, powerInterval, effectiveInterval, powerMainMetric, powerAggregation, selectedPowerChartMeters, displayTimeZone]);
 
   const powerMainYDomain = useMemo(() => {
     const keys = ["total", ...powerMainChartData.meterIds];
@@ -7377,6 +7412,113 @@ function AppShell() {
       downtimeCost,
     };
   }, [powerTrendData, powerInterval, powerCostPerKwh, powerConfig, powerHistoryRows, resolveTariffRate]);
+
+  // Per-tariff breakdown for the donut. Walks the filtered rows
+  // (already scoped by view scale via powerRowsFiltered), picks the
+  // matching tariff per timestamp, and accumulates kWh + cost. The
+  // donut toggles between cost (€) and consumption (kWh).
+  const powerTariffBreakdown = useMemo(() => {
+    const tariffs = Array.isArray(powerConfig?.electricity_tariffs) ? powerConfig.electricity_tariffs : [];
+    const rows = powerHistoryRows || [];
+    if (!rows.length) return { items: [], total_kwh: 0, total_cost: 0 };
+    const tariffIndex = (epochMs) => {
+      if (!tariffs.length) return -1;
+      const d = new Date(epochMs);
+      const minutes = d.getHours() * 60 + d.getMinutes();
+      const toMin = (s) => {
+        const [h, m] = String(s || "00:00").split(":").map((x) => Number(x) || 0);
+        return h * 60 + m;
+      };
+      for (let i = 0; i < tariffs.length; i++) {
+        const t = tariffs[i];
+        const start = toMin(t.start_time);
+        const end = toMin(t.end_time);
+        const inWin = start <= end ? minutes >= start && minutes <= end : minutes >= start || minutes <= end;
+        if (inWin) return i;
+      }
+      return -1;
+    };
+    // Sort by ts so dt integration is monotonic.
+    const samples = [];
+    const fromMs = Date.now() - periodMs;
+    const meterFilter = String(powerFilterMeterId || "all");
+    for (const r of rows) {
+      const tag = String(r?.tag || r?.tag_name || "");
+      if (tag !== "active_power_total_w" && tag !== "active_power_w") continue;
+      const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
+      if (!Number.isFinite(ts) || ts < fromMs) continue;
+      if (meterFilter !== "all" && String(r?.gateway_id || "") !== meterFilter) continue;
+      samples.push({ ts, kw: Number(r?.value || 0) / 1000.0, meter: String(r?.gateway_id || "") });
+    }
+    samples.sort((a, b) => a.ts - b.ts);
+    const buckets = new Map(); // tariff index → { kwh, cost }
+    const lastByMeter = new Map();
+    for (const s of samples) {
+      const prev = lastByMeter.get(s.meter);
+      lastByMeter.set(s.meter, s);
+      if (!prev) continue;
+      const dtH = (s.ts - prev.ts) / 3_600_000;
+      if (dtH <= 0 || dtH > 1) continue;
+      const kwh = Math.max(0, s.kw) * dtH;
+      const idx = tariffIndex(s.ts);
+      const key = idx >= 0 ? String(idx) : "default";
+      const acc = buckets.get(key) || { kwh: 0, cost: 0 };
+      acc.kwh += kwh;
+      acc.cost += kwh * resolveTariffRate(s.ts);
+      buckets.set(key, acc);
+    }
+    const items = [];
+    let total_kwh = 0, total_cost = 0;
+    for (const [k, v] of buckets) {
+      const tariff = k === "default" ? null : tariffs[Number(k)];
+      items.push({
+        key: k,
+        name: tariff?.name || (k === "default" ? "Flat (default)" : `Tariff ${k}`),
+        type: tariff?.type || "flat",
+        kwh: v.kwh,
+        cost: v.cost,
+      });
+      total_kwh += v.kwh;
+      total_cost += v.cost;
+    }
+    items.sort((a, b) => (b.cost || b.kwh) - (a.cost || a.kwh));
+    return { items, total_kwh, total_cost };
+  }, [powerConfig, powerHistoryRows, periodMs, powerFilterMeterId, resolveTariffRate]);
+
+  // Per-meter kWh + cost for the Meters and Main Lines footer
+  // table (operator 2026-06-15: "in the meters list, we need a
+  // column to show the cost related to the power usage"). Honors
+  // the same view-scale window as the donut.
+  const powerCostByMeter = useMemo(() => {
+    const out = {};
+    const rows = powerHistoryRows || [];
+    if (!rows.length) return out;
+    const fromMs = Date.now() - periodMs;
+    const samples = [];
+    for (const r of rows) {
+      const tag = String(r?.tag || r?.tag_name || "");
+      if (tag !== "active_power_total_w" && tag !== "active_power_w") continue;
+      const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
+      if (!Number.isFinite(ts) || ts < fromMs) continue;
+      samples.push({ ts, kw: Number(r?.value || 0) / 1000.0, meter: String(r?.gateway_id || "") });
+    }
+    samples.sort((a, b) => a.ts - b.ts);
+    const prev = new Map();
+    for (const s of samples) {
+      const p = prev.get(s.meter);
+      prev.set(s.meter, s);
+      if (!p) continue;
+      const dtH = (s.ts - p.ts) / 3_600_000;
+      if (dtH <= 0 || dtH > 1) continue;
+      const kwh = Math.max(0, s.kw) * dtH;
+      const cost = kwh * resolveTariffRate(s.ts);
+      const acc = out[s.meter] || { kwh: 0, cost: 0 };
+      acc.kwh += kwh;
+      acc.cost += cost;
+      out[s.meter] = acc;
+    }
+    return out;
+  }, [powerHistoryRows, periodMs, resolveTariffRate]);
   const powerChartAxisColor = useMemo(() => (theme === "dark" ? "#9da0a6" : "#6b7280"), [theme]);
   const formatPowerMainXAxisTick = useCallback(
     (value) => {
@@ -17299,6 +17441,16 @@ const getGatewayHealth = (gateway) => {
                     ))}
                   </select>
                 </label>
+                <label className="field pwr-overview-field">
+                  <span>View</span>
+                  <select value={powerViewScale} onChange={(e) => setPowerViewScale(e.target.value)}>
+                    <option value="">Custom (use Period + Interval)</option>
+                    <option value="hour">Hour — minutes</option>
+                    <option value="day">Day — hours</option>
+                    <option value="month">Month — days</option>
+                    <option value="year">Year — months</option>
+                  </select>
+                </label>
                 {/* Period stays visible in both modes — operator
                     2026-06-15 wants the date inputs always present;
                     only disabled in Live so the operator sees what
@@ -17308,7 +17460,7 @@ const getGatewayHealth = (gateway) => {
                   <select
                     value={powerPeriod}
                     onChange={(e) => setPowerPeriod(e.target.value)}
-                    disabled={powerViewMode === "historical"}
+                    disabled={powerViewMode === "historical" || Boolean(powerViewScale)}
                   >
                     {POWER_PERIOD_OPTIONS
                       .filter((p) => ["1h", "8h", "12h", "24h", "day", "week", "month"].includes(p.value))
@@ -17319,10 +17471,12 @@ const getGatewayHealth = (gateway) => {
                 </label>
                 <label className="field pwr-overview-field">
                   <span>Interval</span>
-                  <select value={powerInterval} onChange={(e) => setPowerInterval(e.target.value)}>
+                  <select value={effectiveInterval} onChange={(e) => setPowerInterval(e.target.value)} disabled={Boolean(powerViewScale)}>
                     {POWER_INTERVAL_OPTIONS.map((o) => (
                       <option key={o.value} value={o.value}>{o.label}</option>
                     ))}
+                    {powerViewScale === "month" ? <option value="month">Month</option> : null}
+                    {powerViewScale === "year" ? <option value="year">Year</option> : null}
                   </select>
                 </label>
                 <label className="field pwr-overview-field">
@@ -17675,6 +17829,63 @@ const getGatewayHealth = (gateway) => {
                     </ResponsiveContainer>
                   </div>
                 </article>
+
+                {/* Tariff donut (operator 2026-06-15). Splits the
+                    consumption window into per-tariff slices and
+                    toggles between € spent and kWh consumed. The
+                    underlying data comes from powerTariffBreakdown
+                    which is already filtered by the same view
+                    scale / meter selector as the main chart. */}
+                <article
+                  className="card power-side-chart-card pwr-chart-hover pwr-chart-resizable"
+                  style={{ height: Number(powerChartSettings.side.height || 420) }}
+                >
+                  <div className="row trend-header-row">
+                    <h3 style={{ marginTop: 0, marginBottom: 0 }}>Consumption by Tariff</h3>
+                    <div className="row power-side-controls">
+                      <div className="power-chart-type-toggle" role="group" aria-label="Donut mode">
+                        <button type="button" className={powerDonutMode === "cost" ? "active" : ""} onClick={() => setPowerDonutMode("cost")}>€ Cost</button>
+                        <button type="button" className={powerDonutMode === "kwh" ? "active" : ""} onClick={() => setPowerDonutMode("kwh")}>kWh</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="chart-wrap">
+                    {powerTariffBreakdown.items.length ? (
+                      <ResponsiveContainer width="100%" height="100%" minHeight={260}>
+                        <PieChart>
+                          <Pie
+                            data={powerTariffBreakdown.items}
+                            dataKey={powerDonutMode === "cost" ? "cost" : "kwh"}
+                            nameKey="name"
+                            innerRadius="55%"
+                            outerRadius="85%"
+                            paddingAngle={2}
+                            isAnimationActive={false}
+                          >
+                            {powerTariffBreakdown.items.map((entry, idx) => (
+                              <Cell key={`tariff-slice-${entry.key}`} fill={getSeriesColor(idx)} />
+                            ))}
+                          </Pie>
+                          <Tooltip formatter={(v, n, p) => {
+                            const item = p?.payload || {};
+                            return powerDonutMode === "cost"
+                              ? [`€ ${Number(item.cost || 0).toFixed(2)} (${Number(item.kwh || 0).toFixed(2)} kWh)`, item.name]
+                              : [`${Number(item.kwh || 0).toFixed(2)} kWh (€ ${Number(item.cost || 0).toFixed(2)})`, item.name];
+                          }} />
+                          <Legend wrapperStyle={{ fontSize: 11 }} />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <div className="muted" style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", textAlign: "center", padding: 12 }}>
+                        No consumption data in the selected window.
+                      </div>
+                    )}
+                  </div>
+                  <div className="meta" style={{ padding: "4px 12px 10px" }}>
+                    <span>Total: € {powerTariffBreakdown.total_cost.toFixed(2)}</span>
+                    <span>{powerTariffBreakdown.total_kwh.toFixed(2)} kWh</span>
+                  </div>
+                </article>
               </section>
               <section className="card">
                 <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
@@ -17694,6 +17905,7 @@ const getGatewayHealth = (gateway) => {
                     <span>Current (A)</span>
                     <span>Active Power (kW)</span>
                     <span>Energy (kWh)</span>
+                    <span>Cost (€)</span>
                     <span>Include in Charts</span>
                     <span>Status</span>
                   </div>
@@ -17707,6 +17919,7 @@ const getGatewayHealth = (gateway) => {
                       <span>{formatMetricValue(m.currentA, 3)}</span>
                       <span>{formatMetricValue(m.powerKw, 3)}</span>
                       <span>{formatMetricValue(m.energyKwh, 3)}</span>
+                      <span>€ {Number(powerCostByMeter[m.id]?.cost || 0).toFixed(2)}</span>
                       <span>
                         <input
                           type="checkbox"

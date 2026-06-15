@@ -3933,7 +3933,9 @@ input[type="checkbox"] {
 
 .power-main-grid {
   display: grid;
-  grid-template-columns: 3fr 2fr;
+  /* 50 / 25 / 25 — operator 2026-06-15. Main trend, side bar/total,
+     tariff donut. */
+  grid-template-columns: 2fr 1fr 1fr;
   gap: 12px;
   align-items: stretch;
 }
@@ -4084,8 +4086,9 @@ input[type="checkbox"] {
 
 .power-meter-table .thead,
 .power-meter-table .trow {
-  min-width: 1120px;
-  grid-template-columns: minmax(120px, 1.1fr) minmax(180px, 1.4fr) minmax(170px, 1.3fr) minmax(100px, 0.8fr) minmax(100px, 0.8fr) minmax(100px, 0.8fr) minmax(130px, 1fr) minmax(130px, 1fr) minmax(130px, 0.9fr) minmax(120px, 0.9fr);
+  min-width: 1240px;
+  /* Added Cost column (operator 2026-06-15). */
+  grid-template-columns: minmax(120px, 1.1fr) minmax(180px, 1.4fr) minmax(170px, 1.3fr) minmax(100px, 0.8fr) minmax(100px, 0.8fr) minmax(100px, 0.8fr) minmax(130px, 1fr) minmax(130px, 1fr) minmax(110px, 0.9fr) minmax(130px, 0.9fr) minmax(120px, 0.9fr);
 }
 
 .card-collapse-btn {
