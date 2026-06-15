@@ -2717,6 +2717,7 @@ function AppShell() {
   const [powerChartSettings, setPowerChartSettings] = useState({
     main: {
       title: "",
+      hide_title: false,
       y_min: "", y_max: "",
       y_label: "",
       y_unit: "",
@@ -2728,9 +2729,16 @@ function AppShell() {
       y2_unit: "",
       // Persisted drag-resize height (operator 2026-06-15).
       height: 420,
+      // Parity with the dashboard widget editor.
+      interpolation: "stepAfter",
+      readings_count: 200,
+      color_mode: "default",
+      show_legend: true,
+      show_point_labels: false,
     },
     side: {
       title: "",
+      hide_title: false,
       y_min: "", y_max: "",
       y_label: "",
       y_unit: "",
@@ -2740,6 +2748,11 @@ function AppShell() {
       y2_label: "",
       y2_unit: "",
       height: 420,
+      interpolation: "stepAfter",
+      readings_count: 200,
+      color_mode: "default",
+      show_legend: true,
+      show_point_labels: false,
     },
   });
   const [chartSettingsOpenKey, setChartSettingsOpenKey] = useState("");
@@ -17305,24 +17318,6 @@ const getGatewayHealth = (gateway) => {
                   </select>
                 </label>
                 <label className="field pwr-overview-field">
-                  <span>From</span>
-                  <input
-                    type="datetime-local"
-                    value={powerHistoricalFrom}
-                    onChange={(e) => setPowerHistoricalFrom(e.target.value)}
-                    disabled={powerViewMode === "realtime"}
-                  />
-                </label>
-                <label className="field pwr-overview-field">
-                  <span>To</span>
-                  <input
-                    type="datetime-local"
-                    value={powerHistoricalTo}
-                    onChange={(e) => setPowerHistoricalTo(e.target.value)}
-                    disabled={powerViewMode === "realtime"}
-                  />
-                </label>
-                <label className="field pwr-overview-field">
                   <span>Interval</span>
                   <select value={powerInterval} onChange={(e) => setPowerInterval(e.target.value)}>
                     {POWER_INTERVAL_OPTIONS.map((o) => (
@@ -17357,6 +17352,30 @@ const getGatewayHealth = (gateway) => {
                       Historical
                     </button>
                   </div>
+                  {/* From/To pickers only appear in Historical mode
+                      and sit directly after the Historical tab so
+                      the date inputs read as belonging to that mode
+                      (operator 2026-06-15). */}
+                  {powerViewMode === "historical" ? (
+                    <>
+                      <label className="field pwr-overview-field pwr-overview-date">
+                        <span>From</span>
+                        <input
+                          type="datetime-local"
+                          value={powerHistoricalFrom}
+                          onChange={(e) => setPowerHistoricalFrom(e.target.value)}
+                        />
+                      </label>
+                      <label className="field pwr-overview-field pwr-overview-date">
+                        <span>To</span>
+                        <input
+                          type="datetime-local"
+                          value={powerHistoricalTo}
+                          onChange={(e) => setPowerHistoricalTo(e.target.value)}
+                        />
+                      </label>
+                    </>
+                  ) : null}
                   <button
                     type="button"
                     className="btn btn-primary"
@@ -17391,11 +17410,13 @@ const getGatewayHealth = (gateway) => {
                   }}
                 >
                   <div className="row trend-header-row">
-                    <h3 style={{ marginTop: 0, marginBottom: 0 }}>
-                      {powerChartSettings.main.title || (
-                        powerMainMetric === "voltage_v" ? "Voltage (V)" : powerMainMetric === "current_a" ? "Current (A)" : powerMainMetric === "energy_kwh" ? "Consumption (kWh)" : "Energy Consumption (kW)"
-                      )} by {powerInterval}
-                    </h3>
+                    {powerChartSettings.main.hide_title ? <span /> : (
+                      <h3 style={{ marginTop: 0, marginBottom: 0 }}>
+                        {powerChartSettings.main.title || (
+                          powerMainMetric === "voltage_v" ? "Voltage (V)" : powerMainMetric === "current_a" ? "Current (A)" : powerMainMetric === "energy_kwh" ? "Consumption (kWh)" : "Energy Consumption (kW)"
+                        )} by {powerInterval}
+                      </h3>
+                    )}
                     <div className="row power-side-controls">
                       <select value={powerMainMetric} onChange={(e) => setPowerMainMetric(e.target.value)}>
                         <option value="power_kw">Power (kW)</option>
@@ -17471,7 +17492,7 @@ const getGatewayHealth = (gateway) => {
                           />
                         ) : null}
                         <Tooltip formatter={(v) => formatChartValue(v, 3)} />
-                        <Legend wrapperStyle={{ fontSize: 11 }} />
+                        {powerChartSettings.main.show_legend !== false ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
                         {powerMainChartType === "bar" ? (
                           <>
                             <Bar yAxisId="left" dataKey="total" name="Total" fill="#16a34a" isAnimationActive={false} />
@@ -17492,7 +17513,7 @@ const getGatewayHealth = (gateway) => {
                           <>
                             <Area
                               yAxisId="left"
-                              type="stepAfter"
+                              type={powerChartSettings.main.interpolation || "stepAfter"}
                               dataKey="total"
                               name="Total"
                               stroke="#16a34a"
@@ -17508,7 +17529,7 @@ const getGatewayHealth = (gateway) => {
                                 <Area
                                   key={`pwr-area-${d.id}`}
                                   yAxisId={powerChartSettings.main.secondary_meters.includes(String(d.id)) ? "right" : "left"}
-                                  type="stepAfter"
+                                  type={powerChartSettings.main.interpolation || "stepAfter"}
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
                                   stroke={getSeriesColor(idx)}
@@ -17522,19 +17543,19 @@ const getGatewayHealth = (gateway) => {
                           </>
                         ) : (
                           <>
-                            <Line yAxisId="left" type="stepAfter" dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={false} isAnimationActive={false} />
+                            <Line yAxisId="left" type={powerChartSettings.main.interpolation || "stepAfter"} dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={powerChartSettings.main.show_point_labels} isAnimationActive={false} />
                             {(powerConfig?.devices || [])
                               .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
                               .map((d, idx) => (
                                 <Line
                                   key={`pwr-line-${d.id}`}
                                   yAxisId={powerChartSettings.main.secondary_meters.includes(String(d.id)) ? "right" : "left"}
-                                  type="stepAfter"
+                                  type={powerChartSettings.main.interpolation || "stepAfter"}
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
                                   stroke={getSeriesColor(idx)}
                                   strokeWidth={1.6}
-                                  dot={false}
+                                  dot={powerChartSettings.main.show_point_labels}
                                   isAnimationActive={false}
                                 />
                               ))}
@@ -17555,9 +17576,11 @@ const getGatewayHealth = (gateway) => {
                   }}
                 >
                   <div className="row trend-header-row">
-                    <h3 style={{ marginTop: 0, marginBottom: 0 }}>
-                      {powerChartSettings.side.title || `Total Consumption (kWh) ${powerCostChartRange === "12h" ? "by Hour (Last 12h)" : "by Day (Last 30d)"}`}
-                    </h3>
+                    {powerChartSettings.side.hide_title ? <span /> : (
+                      <h3 style={{ marginTop: 0, marginBottom: 0 }}>
+                        {powerChartSettings.side.title || `Total Consumption (kWh) ${powerCostChartRange === "12h" ? "by Hour (Last 12h)" : "by Day (Last 30d)"}`}
+                      </h3>
+                    )}
                     <div className="row power-side-controls">
                       <select value={powerCostChartRange} onChange={(e) => setPowerCostChartRange(e.target.value)}>
                         <option value="12h">Last 12 hours</option>
@@ -25152,13 +25175,44 @@ const getGatewayHealth = (gateway) => {
                     <span>Title (leave blank for auto)</span>
                     <input value={current.title} onChange={(e) => setField("title", e.target.value)} placeholder="Auto" />
                   </label>
-                  <label className="pwr-full" style={{ marginTop: 6 }}>
-                    <span>Type</span>
-                    <select value={key === "main" ? powerMainChartType : powerSideChartType} onChange={(e) => key === "main" ? setPowerMainChartType(e.target.value) : setPowerSideChartType(e.target.value)}>
-                      <option value="line">Line</option>
-                      <option value="area">Area</option>
-                      <option value="bar">Bar</option>
-                    </select>
+                  <label className="pwr-check" style={{ marginTop: 6 }}>
+                    <input type="checkbox" checked={Boolean(current.hide_title)} onChange={(e) => setField("hide_title", e.target.checked)} />
+                    <span>Hide title bar</span>
+                  </label>
+                  <div className="pwr-grid" style={{ marginTop: 6 }}>
+                    <label><span>Type</span>
+                      <select value={key === "main" ? powerMainChartType : powerSideChartType} onChange={(e) => key === "main" ? setPowerMainChartType(e.target.value) : setPowerSideChartType(e.target.value)}>
+                        <option value="line">Line</option>
+                        <option value="area">Area</option>
+                        <option value="bar">Bar</option>
+                      </select>
+                    </label>
+                    <label><span>Interpolation</span>
+                      <select value={current.interpolation || "stepAfter"} onChange={(e) => setField("interpolation", e.target.value)}>
+                        <option value="stepAfter">Step after</option>
+                        <option value="monotone">Monotone</option>
+                        <option value="linear">Linear</option>
+                        <option value="basis">Basis</option>
+                        <option value="natural">Natural</option>
+                      </select>
+                    </label>
+                    <label><span>Reading points</span>
+                      <input type="number" min="10" max="2000" value={Number(current.readings_count || 200)} onChange={(e) => setField("readings_count", Math.max(10, Math.min(2000, Number(e.target.value || 200))))} />
+                    </label>
+                    <label><span>Chart colors</span>
+                      <select value={current.color_mode || "default"} onChange={(e) => setField("color_mode", e.target.value)}>
+                        <option value="default">Default brand colors</option>
+                        <option value="custom">Custom per series</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label className="pwr-check" style={{ marginTop: 6 }}>
+                    <input type="checkbox" checked={current.show_legend !== false} onChange={(e) => setField("show_legend", e.target.checked)} />
+                    <span>Show legend</span>
+                  </label>
+                  <label className="pwr-check">
+                    <input type="checkbox" checked={Boolean(current.show_point_labels)} onChange={(e) => setField("show_point_labels", e.target.checked)} />
+                    <span>Show point markers</span>
                   </label>
                 </div>
 
