@@ -2695,6 +2695,14 @@ function AppShell() {
   const [powerInterval, setPowerInterval] = useState("hour");
   const [powerAggregation, setPowerAggregation] = useState("avg");
   const [powerFilterMeterId, setPowerFilterMeterId] = useState("all");
+  // Historical range pickers — local "YYYY-MM-DDTHH:mm" strings as
+  // datetime-local inputs natively emit. Default = last 24 h.
+  const [powerHistoricalFrom, setPowerHistoricalFrom] = useState(() => {
+    const d = new Date(Date.now() - 24 * 3600_000);
+    return d.toISOString().slice(0, 16);
+  });
+  const [powerHistoricalTo, setPowerHistoricalTo] = useState(() => new Date().toISOString().slice(0, 16));
+  const [powerHistoricalApplyToken, setPowerHistoricalApplyToken] = useState(0);
   const [powerMainMetric, setPowerMainMetric] = useState("power_kw");
   const [powerMainChartType, setPowerMainChartType] = useState("line");
   const [powerCostChartRange, setPowerCostChartRange] = useState("12h");
@@ -7000,21 +7008,42 @@ function AppShell() {
   );
   const powerCostPerKwh = useMemo(() => resolveTariffRate(Date.now()), [resolveTariffRate]);
 
+  // Historical range — only takes effect when the Apply button is
+  // pressed (powerHistoricalApplyToken bumps), so the operator can
+  // edit From/To freely without expensive recomputes on every
+  // keystroke.
+  const powerHistoricalRange = useMemo(() => {
+    if (powerViewMode !== "historical") return null;
+    const fromMs = powerHistoricalFrom ? new Date(powerHistoricalFrom).getTime() : NaN;
+    const toMs = powerHistoricalTo ? new Date(powerHistoricalTo).getTime() : NaN;
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs >= toMs) return null;
+    return { fromMs, toMs };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [powerHistoricalApplyToken, powerViewMode]);
+
   const powerRowsFiltered = useMemo(() => {
-    const nowMs = Date.now();
-    const fromMs = nowMs - periodMs;
     const meterSet = new Set((selectedPowerChartMeters || []).map(String));
     const scopedMeterId = String(powerFilterMeterId || "all");
+    let fromMs;
+    let toMs;
+    if (powerViewMode === "historical" && powerHistoricalRange) {
+      fromMs = powerHistoricalRange.fromMs;
+      toMs = powerHistoricalRange.toMs;
+    } else {
+      const nowMs = Date.now();
+      fromMs = nowMs - periodMs;
+      toMs = nowMs + 60000;
+    }
     const rows = (powerHistoryRows || []).filter((r) => {
       const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
-      if (!Number.isFinite(ts) || ts < fromMs || ts > nowMs + 60000) return false;
+      if (!Number.isFinite(ts) || ts < fromMs || ts > toMs) return false;
       const gid = String(r?.gateway_id || "");
       if (scopedMeterId && scopedMeterId !== "all" && gid !== scopedMeterId) return false;
       if (meterSet.size && !meterSet.has(gid)) return false;
       return true;
     });
     return rows;
-  }, [powerHistoryRows, periodMs, selectedPowerChartMeters, powerFilterMeterId]);
+  }, [powerHistoryRows, periodMs, selectedPowerChartMeters, powerFilterMeterId, powerViewMode, powerHistoricalRange]);
 
   const powerTrendData = useMemo(() => {
     const meterIds = (powerConfig?.devices || []).map((d) => String(d?.id || "")).filter(Boolean);
@@ -16963,15 +16992,21 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "power_overview" ? (
             <>
-              <section className="card">
-                <div className="power-top-tabs" role="tablist" aria-label="Power view mode">
+              <section className="card pwr-overview-toolbar">
+                {/* One-row toolbar (operator 2026-06-15): Live /
+                    Historical tabs sit on the left, filters in the
+                    middle, the From/To/Apply pair appears only in
+                    Historical mode. The whole row shrinks gracefully
+                    on narrow screens (.pwr-overview-toolbar handles
+                    wrap). */}
+                <div className="pwr-overview-tabs" role="tablist" aria-label="Power view mode">
                   <button
                     type="button"
                     className={`power-top-tab ${powerViewMode === "realtime" ? "active" : ""}`}
                     onClick={() => setPowerViewMode("realtime")}
                     aria-selected={powerViewMode === "realtime"}
                   >
-                    Realtime
+                    Live
                   </button>
                   <button
                     type="button"
@@ -16982,43 +17017,71 @@ const getGatewayHealth = (gateway) => {
                     Historical
                   </button>
                 </div>
-                <div className="power-toolbar-grid">
-                  <label className="field">
-                    <span>Meter</span>
-                    <select value={powerFilterMeterId} onChange={(e) => setPowerFilterMeterId(e.target.value)}>
-                      <option value="all">All meters</option>
-                      {(powerConfig?.devices || []).map((d) => (
-                        <option key={`p-meter-${d.id}`} value={String(d.id || "")}>{String(d.name || d.id)}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="field">
+                <label className="field pwr-overview-field">
+                  <span>Meter</span>
+                  <select value={powerFilterMeterId} onChange={(e) => setPowerFilterMeterId(e.target.value)}>
+                    <option value="all">All meters</option>
+                    {(powerConfig?.devices || []).map((d) => (
+                      <option key={`p-meter-${d.id}`} value={String(d.id || "")}>{String(d.name || d.id)}</option>
+                    ))}
+                  </select>
+                </label>
+                {powerViewMode === "realtime" ? (
+                  <label className="field pwr-overview-field">
                     <span>Period</span>
                     <select value={powerPeriod} onChange={(e) => setPowerPeriod(e.target.value)}>
-                      {(powerViewMode === "realtime"
-                        ? POWER_PERIOD_OPTIONS.filter((p) => ["1h", "6h", "24h"].includes(p.value))
-                        : POWER_PERIOD_OPTIONS
-                      ).map((p) => (
+                      {POWER_PERIOD_OPTIONS.filter((p) => ["1h", "6h", "24h"].includes(p.value)).map((p) => (
                         <option key={p.value} value={p.value}>{p.label}</option>
                       ))}
                     </select>
                   </label>
-                  <label className="field">
-                    <span>Interval</span>
-                    <select value={powerInterval} onChange={(e) => setPowerInterval(e.target.value)}>
-                      {POWER_INTERVAL_OPTIONS.map((o) => (
-                        <option key={o.value} value={o.value}>{o.label}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="field">
-                    <span>Aggregation</span>
-                    <select value={powerAggregation} onChange={(e) => setPowerAggregation(e.target.value)}>
-                      {POWER_AGG_OPTIONS.map((o) => (
-                        <option key={o} value={o}>{o.toUpperCase()}</option>
-                      ))}
-                    </select>
-                  </label>
+                ) : (
+                  <>
+                    <label className="field pwr-overview-field">
+                      <span>From</span>
+                      <input
+                        type="datetime-local"
+                        value={powerHistoricalFrom}
+                        onChange={(e) => setPowerHistoricalFrom(e.target.value)}
+                      />
+                    </label>
+                    <label className="field pwr-overview-field">
+                      <span>To</span>
+                      <input
+                        type="datetime-local"
+                        value={powerHistoricalTo}
+                        onChange={(e) => setPowerHistoricalTo(e.target.value)}
+                      />
+                    </label>
+                  </>
+                )}
+                <label className="field pwr-overview-field">
+                  <span>Interval</span>
+                  <select value={powerInterval} onChange={(e) => setPowerInterval(e.target.value)}>
+                    {POWER_INTERVAL_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>{o.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field pwr-overview-field">
+                  <span>Aggregation</span>
+                  <select value={powerAggregation} onChange={(e) => setPowerAggregation(e.target.value)}>
+                    {POWER_AGG_OPTIONS.map((o) => (
+                      <option key={o} value={o}>{o.toUpperCase()}</option>
+                    ))}
+                  </select>
+                </label>
+                <div className="pwr-overview-actions">
+                  {powerViewMode === "historical" ? (
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      onClick={() => setPowerHistoricalApplyToken((v) => v + 1)}
+                      title="Reload data for the selected range"
+                    >
+                      Apply
+                    </button>
+                  ) : null}
                 </div>
               </section>
               <section className="power-kpi-grid">
@@ -17055,7 +17118,7 @@ const getGatewayHealth = (gateway) => {
                     <span>Selected meters: {selectedPowerChartMeters.length || (powerConfig?.devices || []).length}</span>
                   </div>
                   <div className="chart-wrap">
-                    <ResponsiveContainer width="100%" height={320}>
+                    <ResponsiveContainer width="100%" height="100%" minHeight={260}>
                       <ComposedChart data={powerMainChartData.rows} margin={{ top: 10, right: 20, left: 10, bottom: 44 }}>
                         {/* Same grid/legend styling as the dashboard chart widget
                             so Power Overview charts visually match the rest of
@@ -17177,7 +17240,7 @@ const getGatewayHealth = (gateway) => {
                         Previously this was three separate <BarChart> /
                         <AreaChart> / <LineChart> blocks duplicating the same
                         XAxis / YAxis / Tooltip props. */}
-                    <ResponsiveContainer width="100%" height={320}>
+                    <ResponsiveContainer width="100%" height="100%" minHeight={260}>
                       <ComposedChart
                         data={powerSideChartData.rows}
                         margin={{ top: 10, right: 14, left: 8, bottom: 44 }}

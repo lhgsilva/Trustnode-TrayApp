@@ -1,4 +1,10 @@
 :root {
+  /* Without this, Chrome paints native <select> dropdowns and date
+     pickers with the OS dark theme even when the app is in light
+     mode — operator 2026-06-15 reported the Day/AVG/Period selects
+     rendering with a dark background. Lock the form-control palette
+     to the active app theme. */
+  color-scheme: light;
   --bg: #fcfcfc;
   --header: #ffffff;
   --header-text: #111111;
@@ -28,6 +34,7 @@
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --bg: #111111;
   --header: #111111;
   --header-text: #fcfcfc;
@@ -3814,6 +3821,47 @@ input[type="checkbox"] {
   align-items: center;
 }
 
+/* Single-row Power Overview toolbar. Operator 2026-06-15: tabs +
+   filters + Apply on one row, the button right-aligned. Wraps
+   gracefully on narrow viewports. */
+.pwr-overview-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+.pwr-overview-tabs {
+  display: flex;
+  gap: 6px;
+  align-self: flex-end;
+}
+.pwr-overview-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 140px;
+  flex: 1 1 140px;
+  max-width: 220px;
+  margin: 0;
+}
+.pwr-overview-field > span {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.pwr-overview-field input,
+.pwr-overview-field select {
+  height: 36px;
+  padding: 4px 10px;
+}
+.pwr-overview-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
 .power-top-tabs {
   display: flex;
   gap: 6px;
@@ -3862,14 +3910,23 @@ input[type="checkbox"] {
 .power-side-chart-card {
   min-width: 0;
   overflow: visible;
+  display: flex;
+  flex-direction: column;
+  min-height: 460px;
 }
 
+/* Operator 2026-06-15: charts should fill the available card space.
+   The card becomes a flex column; the chart-wrap is the only growing
+   child, so it expands to whatever room is left after the title row
+   and meta line. */
 .power-main-chart-card .chart-wrap,
 .power-side-chart-card .chart-wrap {
   width: 100%;
+  flex: 1 1 auto;
+  height: auto;
   overflow: hidden;
   padding: 6px 8px 28px;
-  min-height: 360px;
+  min-height: 320px;
 }
 
 .power-main-chart-card .recharts-wrapper,
