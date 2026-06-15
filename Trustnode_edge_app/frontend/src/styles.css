@@ -3839,9 +3839,10 @@ input[type="checkbox"] {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  min-width: 140px;
-  flex: 1 1 140px;
-  max-width: 220px;
+  min-width: 110px;
+  /* Operator 2026-06-15: filters should fill the available row
+     width; no max-width clamp so they expand evenly. */
+  flex: 1 1 0;
   margin: 0;
 }
 .pwr-overview-field > span {
@@ -3912,7 +3913,22 @@ input[type="checkbox"] {
   overflow: visible;
   display: flex;
   flex-direction: column;
-  min-height: 460px;
+  /* Taller default so charts have room to breathe; the chart-wrap
+     stretches with flex:1 to fill anything beyond this. */
+  min-height: 560px;
+}
+
+/* Chart edit button — hover-only and uniform size with other table
+   icons. Operator 2026-06-15: "the edit chart button should only to
+   be shown when we hover on it and should be same size". */
+.pwr-chart-edit-btn {
+  opacity: 0;
+  transition: opacity 120ms ease-in-out;
+  margin-left: 4px;
+}
+.pwr-chart-hover:hover .pwr-chart-edit-btn,
+.pwr-chart-edit-btn:focus-visible {
+  opacity: 1;
 }
 
 /* Operator 2026-06-15: charts should fill the available card space.
@@ -3925,8 +3941,8 @@ input[type="checkbox"] {
   flex: 1 1 auto;
   height: auto;
   overflow: hidden;
-  padding: 6px 8px 28px;
-  min-height: 320px;
+  padding: 6px 8px 14px;
+  min-height: 440px;
 }
 
 .power-main-chart-card .recharts-wrapper,

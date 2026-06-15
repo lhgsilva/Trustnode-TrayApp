@@ -17235,35 +17235,40 @@ const getGatewayHealth = (gateway) => {
                     ))}
                   </select>
                 </label>
-                {powerViewMode === "realtime" ? (
-                  <label className="field pwr-overview-field">
-                    <span>Period</span>
-                    <select value={powerPeriod} onChange={(e) => setPowerPeriod(e.target.value)}>
-                      {POWER_PERIOD_OPTIONS.filter((p) => ["1h", "6h", "24h"].includes(p.value)).map((p) => (
-                        <option key={p.value} value={p.value}>{p.label}</option>
-                      ))}
-                    </select>
-                  </label>
-                ) : (
-                  <>
-                    <label className="field pwr-overview-field">
-                      <span>From</span>
-                      <input
-                        type="datetime-local"
-                        value={powerHistoricalFrom}
-                        onChange={(e) => setPowerHistoricalFrom(e.target.value)}
-                      />
-                    </label>
-                    <label className="field pwr-overview-field">
-                      <span>To</span>
-                      <input
-                        type="datetime-local"
-                        value={powerHistoricalTo}
-                        onChange={(e) => setPowerHistoricalTo(e.target.value)}
-                      />
-                    </label>
-                  </>
-                )}
+                {/* Period stays visible in both modes — operator
+                    2026-06-15 wants the date inputs always present;
+                    only disabled in Live so the operator sees what
+                    they'd be editing in Historical. */}
+                <label className="field pwr-overview-field">
+                  <span>Period</span>
+                  <select
+                    value={powerPeriod}
+                    onChange={(e) => setPowerPeriod(e.target.value)}
+                    disabled={powerViewMode === "historical"}
+                  >
+                    {POWER_PERIOD_OPTIONS.filter((p) => ["1h", "6h", "24h"].includes(p.value)).map((p) => (
+                      <option key={p.value} value={p.value}>{p.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="field pwr-overview-field">
+                  <span>From</span>
+                  <input
+                    type="datetime-local"
+                    value={powerHistoricalFrom}
+                    onChange={(e) => setPowerHistoricalFrom(e.target.value)}
+                    disabled={powerViewMode === "realtime"}
+                  />
+                </label>
+                <label className="field pwr-overview-field">
+                  <span>To</span>
+                  <input
+                    type="datetime-local"
+                    value={powerHistoricalTo}
+                    onChange={(e) => setPowerHistoricalTo(e.target.value)}
+                    disabled={powerViewMode === "realtime"}
+                  />
+                </label>
                 <label className="field pwr-overview-field">
                   <span>Interval</span>
                   <select value={powerInterval} onChange={(e) => setPowerInterval(e.target.value)}>
@@ -17281,16 +17286,15 @@ const getGatewayHealth = (gateway) => {
                   </select>
                 </label>
                 <div className="pwr-overview-actions">
-                  {powerViewMode === "historical" ? (
-                    <button
-                      type="button"
-                      className="btn btn-primary"
-                      onClick={() => setPowerHistoricalApplyToken((v) => v + 1)}
-                      title="Reload data for the selected range"
-                    >
-                      Apply
-                    </button>
-                  ) : null}
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={() => setPowerHistoricalApplyToken((v) => v + 1)}
+                    disabled={powerViewMode === "realtime"}
+                    title={powerViewMode === "realtime" ? "Switch to Historical to apply a custom range" : "Reload data for the selected range"}
+                  >
+                    Apply
+                  </button>
                 </div>
               </section>
               <section className="power-kpi-grid">

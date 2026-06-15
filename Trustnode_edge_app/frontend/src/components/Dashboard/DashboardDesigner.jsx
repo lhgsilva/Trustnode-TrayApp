@@ -730,20 +730,24 @@ export function DashboardDesigner({
   // dashboard profile (default) available in the dashboard, create
   // one that replicates the power overview pages without the
   // filters"). Builds 6 stat tiles + 2 chart cards for the first
-  // power meter in the catalog. Does NOT overwrite existing
-  // profiles — it just replaces the live widget set so the
-  // operator can save it under a name if they want.
+  // power meter in the catalog. Bound to REAL historian tags so the
+  // widgets actually fetch data — earlier version pointed at
+  // insight.* virtual tags which the historian doesn't carry, so
+  // every widget rendered "Historian fetch failed".
   const buildPowerDefaultPayload = useCallback(() => {
     const meters = (Array.isArray(gatewayCatalog) ? gatewayCatalog : []).filter((g) => g?.power_meter);
     const meter = meters[0] || null;
     if (!meter) return null;
     const gwId = String(meter.id || "");
+    // Wider stat tiles (w=4) + taller charts (h=8) so the layout
+    // actually uses the page like the Power Overview does, instead
+    // of squeezing into 2x2 cells.
     const makeStat = (key, title, tag, unit, x, y) => ({
       id: `pd-stat-${key}-${gwId}`,
       type: "stat",
       title,
       color: "#14a89a",
-      x, y, w: 2, h: 2,
+      x, y, w: 4, h: 3,
       config: {
         gateway_id: gwId,
         tag_name: tag,
@@ -769,14 +773,14 @@ export function DashboardDesigner({
       },
     });
     const widgets = [
-      makeStat("eff", "Energy Efficiency", "insight.energy_efficiency_pct", "%", 0, 0),
-      makeStat("cost", "Energy Cost", "insight.energy_cost_eur", "EUR", 2, 0),
-      makeStat("kwh", "Total kWh", "insight.total_kwh", "kWh", 4, 0),
-      makeStat("live", "Live kW", "insight.live_kw", "kW", 6, 0),
-      makeStat("peak", "Peak kW", "insight.peak_kw", "kW", 8, 0),
-      makeStat("down", "Downtime Cost", "insight.downtime_cost_eur", "EUR", 10, 0),
-      makeChart("power", "Active Power (kW) — Last 1h", "active_power_kw", "line_chart", 0, 2, 8, 4),
-      makeChart("voltage", "Voltage (V) — Last 1h", "voltage_v", "area_chart", 8, 2, 4, 4),
+      makeStat("voltage", "Voltage", "voltage_v", "V", 0, 0),
+      makeStat("current", "Current", "current_a", "A", 4, 0),
+      makeStat("power", "Active Power", "active_power_w", "W", 8, 0),
+      makeStat("pf", "Power Factor", "power_factor", "", 0, 3),
+      makeStat("freq", "Frequency", "frequency_hz", "Hz", 4, 3),
+      makeStat("energy", "Total Energy", "energy_wh", "Wh", 8, 3),
+      makeChart("power-trend", "Active Power (W) — Last 1h", "active_power_w", "line_chart", 0, 6, 8, 8),
+      makeChart("voltage-trend", "Voltage (V) — Last 1h", "voltage_v", "area_chart", 8, 6, 4, 8),
     ];
     return { name: "Power Default", widgets, mode: "grid", per_row: 12, tag_colors: {} };
   }, [gatewayCatalog]);
