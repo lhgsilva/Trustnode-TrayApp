@@ -644,38 +644,32 @@ function buildSplashHtml() {
 <style>
   * { box-sizing: border-box; -webkit-user-select: none; user-select: none; }
   html, body { margin: 0; padding: 0; height: 100%; width: 100%;
-    font-family: 'Segoe UI', Roboto, sans-serif; color: #e9edf2;
-    background: linear-gradient(160deg, #0e1a2b 0%, #14283f 65%, #0d1726 100%);
+    font-family: 'Segoe UI', Roboto, sans-serif; color: #0f172a;
+    background: linear-gradient(160deg, #f6f8fb 0%, #ffffff 60%, #e9f1f0 100%);
     overflow: hidden; }
   .stage { display: flex; flex-direction: column; align-items: center;
-    justify-content: center; height: 100%; padding: 24px 32px; gap: 14px;
+    justify-content: center; height: 100%; padding: 24px 32px; gap: 18px;
     -webkit-app-region: drag; position: relative; }
-  .logo { width: 200px; height: 96px; display: flex;
+  .logo { width: 240px; height: 140px; display: flex;
     align-items: center; justify-content: center; }
   .logo img { max-width: 100%; max-height: 100%; object-fit: contain; }
-  .logo svg { width: 88px; height: 88px; }
-  .brand { font-size: 22px; font-weight: 700; letter-spacing: 0.04em;
-    color: #ffffff; margin-top: 6px; }
-  .tagline { font-size: 11px; color: #8aa0bd; margin-top: -4px;
-    letter-spacing: 0.12em; text-transform: uppercase; }
-  .status { font-size: 13px; color: #cfd8e6; margin-top: 4px;
-    min-height: 18px; text-align: center; max-width: 360px; }
-  .bar { width: 220px; height: 4px; border-radius: 999px;
-    background: rgba(255,255,255,0.08); overflow: hidden; position: relative; }
+  .logo svg { width: 120px; height: 120px; }
+  .status { font-size: 12px; color: #475569; margin-top: 2px;
+    min-height: 16px; text-align: center; max-width: 360px; }
+  .bar { width: 220px; height: 3px; border-radius: 999px;
+    background: rgba(15,23,42,0.08); overflow: hidden; position: relative; }
   .bar::after { content: ""; position: absolute; left: -40%; top: 0;
     width: 40%; height: 100%; border-radius: 999px;
     background: linear-gradient(90deg, transparent, #14a89a, transparent);
     animation: slide 1.4s ease-in-out infinite; }
   @keyframes slide { 0% { left: -40%; } 100% { left: 100%; } }
-  .footer { position: absolute; bottom: 14px; left: 0; right: 0;
-    text-align: center; font-size: 10px; color: #5b6d86;
+  .footer { position: absolute; bottom: 12px; left: 0; right: 0;
+    text-align: center; font-size: 10px; color: #94a3b8;
     letter-spacing: 0.08em; }
 </style>
 </head><body>
   <div class="stage">
     <div class="logo">${brandMark}</div>
-    <div class="brand">TrustNode Edge</div>
-    <div class="tagline">Industrial Data Platform</div>
     <div class="bar"></div>
     <div class="status" id="status">Starting up…</div>
     <div class="footer">v${version}</div>
@@ -724,7 +718,7 @@ function createSplashWindow() {
       show: true,
       alwaysOnTop: true,
       skipTaskbar: false,
-      backgroundColor: "#0e1a2b",
+      backgroundColor: "#f6f8fb",
       title: "TrustNode",
       webPreferences: {
         contextIsolation: true,
