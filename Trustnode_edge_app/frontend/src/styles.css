@@ -2157,16 +2157,17 @@ body {
   align-items: center;
 }
 
+.icon-btn.table-action-btn,
 .table-action-btn {
   /* Operator 2026-06-15: action buttons should be a small square
-     default across the app — same size everywhere. 26×26 with a
-     compact 6px radius reads as a square at glance while still
-     looking like a button (a pure radius:0 would look brittle).
-     Per-table overrides should NOT change dimensions; only
-     colour/icon tint. */
-  min-width: 26px;
-  width: 26px;
-  height: 26px;
+     default across the app — same size everywhere. The double
+     selector (.icon-btn.table-action-btn) wins over the
+     min-width:38px / height:38px set on the bare .icon-btn header
+     button so the per-row icon size stays uniform in the meter
+     rows too. */
+  min-width: 26px !important;
+  width: 26px !important;
+  height: 26px !important;
   padding: 0;
   border-radius: 6px;
   border: 1px solid var(--stroke);
@@ -2176,6 +2177,7 @@ body {
   align-items: center;
   justify-content: center;
 }
+.icon-btn.table-action-btn svg,
 .table-action-btn svg {
   width: 14px;
   height: 14px;

@@ -654,7 +654,14 @@ class PowerManager:
                 }
             )
             raw_val = raw_values.get(key)
-            if bool(device.get("include_raw_tags", False)) and raw_val is not None:
+            # Operator 2026-06-15: Last Raw column was always blank
+            # because include_raw_tags defaulted to False. The Power
+            # Configuration register table needs both raw and scaled
+            # values to populate, so emit raw rows unconditionally
+            # when present. Storage cost is one extra row per
+            # register per poll — acceptable for power meters which
+            # ship 6-12 registers.
+            if raw_val is not None:
                 rows.append(
                     {
                         "ts_utc": now,
