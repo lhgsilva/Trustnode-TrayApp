@@ -4052,17 +4052,26 @@ input[type="checkbox"] {
   flex: 1 1 0;
   height: auto;
   overflow: hidden;
-  padding: 4px 4px 4px;
-  /* Operator 2026-06-15: chart should fill the card bottom and
-     follow when the operator drags the card taller. min-height:0
-     lets the flex container actually shrink/grow the chart-wrap. */
+  padding: 0;
   min-height: 0;
 }
 .power-main-chart-card,
 .power-side-chart-card {
-  /* The article needs to behave as a flex column so the chart-wrap
-     can consume the remaining height under the title row. */
   min-height: 360px;
+  padding-bottom: 6px;
+}
+/* Operator 2026-06-15: kill the gap between the Recharts legend
+   and the bottom of the card. The legend wrapper natively absorbs
+   a row of height for its rendered text; pulling overflow margin
+   off the surface stops the whitespace from compounding. */
+.power-main-chart-card .recharts-wrapper,
+.power-side-chart-card .recharts-wrapper {
+  height: 100% !important;
+}
+.power-main-chart-card .recharts-legend-wrapper,
+.power-side-chart-card .recharts-legend-wrapper {
+  bottom: 0 !important;
+  padding-bottom: 0 !important;
 }
 
 .power-main-chart-card .recharts-wrapper,

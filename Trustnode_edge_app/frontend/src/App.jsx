@@ -7322,14 +7322,16 @@ function AppShell() {
   }, [powerMainChartData, effectiveInterval]);
   const powerSideChartData = useMemo(() => {
     const nowMs = Date.now();
-    const isLast12h = String(powerCostChartRange || "12h") === "12h";
-    const fromMs = nowMs - (isLast12h ? 12 * 60 * 60 * 1000 : 30 * 24 * 60 * 60 * 1000);
+    // Operator 2026-06-15: the side chart must follow the View
+    // scale just like the main chart. Bucket by effectiveInterval
+    // and pre-fill the full grain so the X axis shows every slot.
+    const fromMs = nowMs - periodMs;
     const meterSet = new Set((selectedPowerChartMeters || []).map(String));
     const scopedMeterId = String(powerFilterMeterId || "all");
     const intervalByGateway = Object.fromEntries(
       (powerConfig?.devices || []).map((d) => [String(d?.id || ""), Number(d?.poll_interval_ms || 1000)])
     );
-    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, isLast12h ? "hour" : "day", displayTimeZone);
+    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, effectiveInterval, displayTimeZone);
     const buckets = new Map();
     for (const row of powerHistoryRows || []) {
       const gid = String(row?.gateway_id || "");
@@ -7349,6 +7351,32 @@ function AppShell() {
       prev.total_kwh += kwh;
       buckets.set(key, prev);
     }
+    // Grain skeleton — same as main chart.
+    const now = new Date();
+    const pad2 = (n) => String(n).padStart(2, "0");
+    const skeletonKeys = [];
+    if (effectiveInterval === "month") {
+      for (let m = 0; m < 12; m++) skeletonKeys.push(`${now.getFullYear()}-${pad2(m + 1)}`);
+    } else if (effectiveInterval === "day") {
+      const year = now.getFullYear();
+      const month = now.getMonth();
+      const daysInMonth = new Date(year, month + 1, 0).getDate();
+      for (let d = 1; d <= daysInMonth; d++) skeletonKeys.push(`${year}-${pad2(month + 1)}-${pad2(d)}`);
+    } else if (effectiveInterval === "hour") {
+      const yyyy = now.getFullYear();
+      const mm = pad2(now.getMonth() + 1);
+      const dd = pad2(now.getDate());
+      for (let h = 0; h < 24; h++) skeletonKeys.push(`${yyyy}-${mm}-${dd} ${pad2(h)}:00`);
+    } else if (effectiveInterval === "minute") {
+      const yyyy = now.getFullYear();
+      const mm = pad2(now.getMonth() + 1);
+      const dd = pad2(now.getDate());
+      const hh = pad2(now.getHours());
+      for (let m = 0; m < 60; m++) skeletonKeys.push(`${yyyy}-${mm}-${dd} ${hh}:${pad2(m)}`);
+    }
+    for (const k of skeletonKeys) {
+      if (!buckets.has(k)) buckets.set(k, { ts: k, total_kwh: 0 });
+    }
     const rows = Array.from(buckets.values())
       .sort((a, b) => String(a.ts).localeCompare(String(b.ts)))
       .map((r) => ({
@@ -7356,7 +7384,7 @@ function AppShell() {
         total_cost: Number(r.total_kwh || 0) * powerCostPerKwh,
       }));
     return { rows, keys: ["total_kwh", "total_cost"], showPhases: false };
-  }, [powerHistoryRows, powerConfig, powerFilterMeterId, selectedPowerChartMeters, powerCostChartRange, powerCostPerKwh, displayTimeZone]);
+  }, [powerHistoryRows, powerConfig, powerFilterMeterId, selectedPowerChartMeters, powerCostPerKwh, displayTimeZone, periodMs, effectiveInterval]);
 
   const powerSideYDomain = useMemo(() => {
     const auto = computeMultiSeriesDomain(powerSideChartData.rows, ["total_kwh"], true);
@@ -7372,14 +7400,15 @@ function AppShell() {
       new Set((powerSideChartData?.rows || []).map((r) => String(r?.ts || "").trim()).filter(Boolean))
     );
     if (!labels.length) return [];
-    const maxTicks = String(powerCostChartRange || "12h") === "30d" ? 10 : 12;
+    if (effectiveInterval === "year" || effectiveInterval === "month" || effectiveInterval === "day" || effectiveInterval === "hour") return labels;
+    const maxTicks = effectiveInterval === "second" ? 8 : effectiveInterval === "minute" ? 12 : 14;
     if (labels.length <= maxTicks) return labels;
     const step = Math.max(1, Math.ceil((labels.length - 1) / (maxTicks - 1)));
     const out = [];
     for (let i = 0; i < labels.length; i += step) out.push(labels[i]);
     if (out[out.length - 1] !== labels[labels.length - 1]) out.push(labels[labels.length - 1]);
     return out;
-  }, [powerSideChartData, powerCostChartRange]);
+  }, [powerSideChartData, effectiveInterval]);
 
   const powerKpis = useMemo(() => {
     const latest = powerTrendData[powerTrendData.length - 1] || null;
@@ -7659,19 +7688,9 @@ function AppShell() {
     },
     [effectiveInterval]
   );
-  const formatPowerSideXAxisTick = useCallback(
-    (value) => {
-      const text = String(value || "");
-      if (!text) return "";
-      if (String(powerCostChartRange || "12h") === "30d") {
-        return text.length >= 10 ? text.slice(5, 10) : text;
-      }
-      const parts = text.split(" ");
-      if (parts.length >= 2) return parts[1].slice(0, 5);
-      return text.length >= 5 ? text.slice(-5) : text;
-    },
-    [powerCostChartRange]
-  );
+  // Side chart now uses the same grain formatter as the main chart
+  // so labels match (operator 2026-06-15).
+  const formatPowerSideXAxisTick = formatPowerMainXAxisTick;
 
   const powerMeterRows = useMemo(() => {
     const meterIds = (powerConfig?.devices || []).map((d) => String(d?.id || ""));
@@ -17681,11 +17700,11 @@ const getGatewayHealth = (gateway) => {
                   };
                   const renderDelta = (cur, prev, positiveGood) => {
                     const d = powerKpiDelta(cur, prev);
-                    if (d == null) return <div className="pwr-delta pwr-delta-flat">— vs previous</div>;
+                    if (d == null) return null;
                     const a = arrow(d, positiveGood);
                     return (
                       <div className={`pwr-delta ${a.cls}`}>
-                        <span className="pwr-delta-arrow">{a.icon}</span> {fmtPct(d)} <span className="pwr-delta-hint">vs previous</span>
+                        <span className="pwr-delta-arrow">{a.icon}</span>{fmtPct(d)}
                       </div>
                     );
                   };
@@ -17787,11 +17806,6 @@ const getGatewayHealth = (gateway) => {
                       </button>
                     </div>
                   </div>
-                  <div className="meta">
-                    <span>Mode: {powerViewMode}</span>
-                    <span>Aggregation: {powerAggregation.toUpperCase()}</span>
-                    <span>Selected meters: {selectedPowerChartMeters.length || (powerConfig?.devices || []).length}</span>
-                  </div>
                   <div className="chart-wrap">
                     <ResponsiveContainer width="100%" height="100%" minHeight={260}>
                       <ComposedChart data={powerMainChartData.rows} margin={{ top: 10, right: 20, left: 10, bottom: 44 }}>
@@ -17854,7 +17868,7 @@ const getGatewayHealth = (gateway) => {
                                   yAxisId={powerChartSettings.main.secondary_meters.includes(String(d.id)) ? "right" : "left"}
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
-                                  fill={getSeriesColor(idx)}
+                                  fill={(powerChartSettings.main.series_colors || {})[String(d.id)] || getSeriesColor(idx)}
                                   isAnimationActive={false}
                                 />
                               ))}
@@ -17884,8 +17898,8 @@ const getGatewayHealth = (gateway) => {
                                   type={powerChartSettings.main.interpolation || "stepAfter"}
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
-                                  stroke={getSeriesColor(idx)}
-                                  fill={getSeriesColor(idx)}
+                                  stroke={(powerChartSettings.main.series_colors || {})[String(d.id)] || getSeriesColor(idx)}
+                                  fill={(powerChartSettings.main.series_colors || {})[String(d.id)] || getSeriesColor(idx)}
                                   fillOpacity={0.1}
                                   strokeWidth={1.6}
                                   dot={false}
@@ -17907,7 +17921,7 @@ const getGatewayHealth = (gateway) => {
                                   type={powerChartSettings.main.interpolation || "stepAfter"}
                                   dataKey={String(d.id)}
                                   name={String(d.name || d.id)}
-                                  stroke={getSeriesColor(idx)}
+                                  stroke={(powerChartSettings.main.series_colors || {})[String(d.id)] || getSeriesColor(idx)}
                                   strokeWidth={1.6}
                                   dot={powerChartSettings.main.show_point_labels}
                                   isAnimationActive={false}
@@ -17932,7 +17946,7 @@ const getGatewayHealth = (gateway) => {
                   <div className="row trend-header-row">
                     {powerChartSettings.side.hide_title ? <span /> : (
                       <h3 style={{ marginTop: 0, marginBottom: 0 }}>
-                        {powerChartSettings.side.title || "Total Consumption"}
+                        {powerChartSettings.side.title || "Total Consumption (kWh)"}
                       </h3>
                     )}
                     <div className="row power-side-controls">
@@ -25629,6 +25643,17 @@ const getGatewayHealth = (gateway) => {
                     <span>Hide title bar</span>
                   </label>
                   <div className="pwr-grid" style={{ marginTop: 6 }}>
+                    {key === "main" ? (
+                      <label><span>Metric</span>
+                        <select value={powerMainMetric} onChange={(e) => setPowerMainMetric(e.target.value)}>
+                          <option value="current_a">Current (A)</option>
+                          <option value="power_w">Active Power (W)</option>
+                          <option value="power_kw">Active Power (kW)</option>
+                          <option value="energy_kwh">Consumption (kWh)</option>
+                          <option value="voltage_v">Voltage (V)</option>
+                        </select>
+                      </label>
+                    ) : null}
                     <label><span>Type</span>
                       <select value={key === "main" ? powerMainChartType : powerSideChartType} onChange={(e) => key === "main" ? setPowerMainChartType(e.target.value) : setPowerSideChartType(e.target.value)}>
                         <option value="line">Line</option>
@@ -25692,15 +25717,18 @@ const getGatewayHealth = (gateway) => {
                 </div>
 
                 <div className="pwr-section">
-                  <div className="pwr-section-title">Series — show, hide, axis</div>
-                  <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: 6, alignItems: "center", fontSize: 12 }}>
+                  <div className="pwr-section-title">Series — visible, axis, color</div>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto auto", gap: 6, alignItems: "center", fontSize: 12 }}>
                     <span style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase" }}>Meter</span>
                     <span style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase" }}>Visible</span>
                     <span style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase" }}>Axis</span>
-                    {(powerConfig?.devices || []).map((d) => {
+                    <span style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase" }}>Color</span>
+                    {(powerConfig?.devices || []).map((d, idx) => {
                       const mid = String(d.id || "");
                       const hidden = current.hidden_meters.includes(mid);
                       const onRight = current.secondary_meters.includes(mid);
+                      const seriesColors = current.series_colors || {};
+                      const color = seriesColors[mid] || getSeriesColor(idx);
                       return (
                         <div key={`m-${mid}`} style={{ display: "contents" }}>
                           <span>{d.name || mid}</span>
@@ -25709,9 +25737,18 @@ const getGatewayHealth = (gateway) => {
                             <option value="left">Left</option>
                             <option value="right">Right</option>
                           </select>
+                          <input
+                            type="color"
+                            value={color}
+                            onChange={(e) => setField("series_colors", { ...seriesColors, [mid]: e.target.value })}
+                            style={{ width: 30, height: 26, padding: 0, border: "1px solid var(--stroke)", borderRadius: 4 }}
+                          />
                         </div>
                       );
                     })}
+                  </div>
+                  <div className="muted" style={{ fontSize: 10.5, marginTop: 6 }}>
+                    Axis min/max apply globally for the primary and secondary axes above. Per-series limits live in the Dashboard widget editor.
                   </div>
                 </div>
               </div>
