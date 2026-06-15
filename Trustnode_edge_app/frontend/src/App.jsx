@@ -17602,10 +17602,21 @@ const getGatewayHealth = (gateway) => {
                     const dbName = (dbConnections.find((db) => String(db.id || "") === String(d?.database_id || ""))?.name)
                       || "Local SQLite (default)";
                     const st = powerDeviceStatuses?.[did] || {};
-                    const running = Boolean(st?.connected) || d?.enabled !== false;
+                    // Operator 2026-06-15: this row used to flip to
+                    // RUNNING whenever d.enabled was true, regardless
+                    // of the backend status — so the row stayed
+                    // RUNNING after a Stop until the next poll. Use
+                    // the operator intent (enabled flag) as the
+                    // primary signal so the row updates immediately
+                    // when Stop/Start is pressed, and overlay the
+                    // backend status when there's evidence of a
+                    // failure or success after the start.
+                    const enabledByOp = d?.enabled !== false;
+                    const running = enabledByOp;
                     const configuredIntervalMs = Number(d?.poll_interval_ms || 1000);
-                    const statusKey = st?.last_error ? "offline" : running ? "online" : "warning";
-                    const statusText = st?.last_error ? "ERROR" : running ? "RUNNING" : "STOPPED";
+                    const hasError = enabledByOp && st?.last_error && !st?.connected;
+                    const statusKey = !enabledByOp ? "warning" : hasError ? "offline" : "online";
+                    const statusText = !enabledByOp ? "STOPPED" : hasError ? "ERROR" : "RUNNING";
                     const tags = Object.keys(d?.registers || {}).filter((k) => !String(k).endsWith("_raw"));
                     return (
                       <div key={`gw-power-row-${did}`} className="trow">
