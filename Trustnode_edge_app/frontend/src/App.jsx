@@ -2703,6 +2703,13 @@ function AppShell() {
   });
   const [powerHistoricalTo, setPowerHistoricalTo] = useState(() => new Date().toISOString().slice(0, 16));
   const [powerHistoricalApplyToken, setPowerHistoricalApplyToken] = useState(0);
+  // Overview chart settings (operator 2026-06-15: edit chart info on
+  // hover — title, type, axis, limits, series). Keys: "main" / "side".
+  const [powerChartSettings, setPowerChartSettings] = useState({
+    main: { title: "", y_min: "", y_max: "", hidden_meters: [] },
+    side: { title: "", y_min: "", y_max: "", hidden_meters: [] },
+  });
+  const [chartSettingsOpenKey, setChartSettingsOpenKey] = useState("");
   const [powerMainMetric, setPowerMainMetric] = useState("power_kw");
   const [powerMainChartType, setPowerMainChartType] = useState("line");
   const [powerCostChartRange, setPowerCostChartRange] = useState("12h");
@@ -2773,6 +2780,17 @@ function AppShell() {
   // Electricity tariff editor (operator 2026-06-15: Electricity
   // Tariff card with collapsible table of time-windowed rates).
   const [tariffsCardCollapsed, setTariffsCardCollapsed] = useState(true);
+  const [downtimeCardCollapsed, setDowntimeCardCollapsed] = useState(true);
+  const [showDowntimeRuleModal, setShowDowntimeRuleModal] = useState(false);
+  const [downtimeRuleModalError, setDowntimeRuleModalError] = useState("");
+  const [downtimeRuleForm, setDowntimeRuleForm] = useState({
+    id: "",
+    name: "",
+    meter_id: "",
+    voltage_min_v: 200,
+    power_max_kw: 0.5,
+    description: "",
+  });
   const [showTariffModal, setShowTariffModal] = useState(false);
   const [tariffModalError, setTariffModalError] = useState("");
   const [tariffForm, setTariffForm] = useState({
@@ -7136,8 +7154,14 @@ function AppShell() {
 
   const powerMainYDomain = useMemo(() => {
     const keys = ["total", ...powerMainChartData.meterIds];
-    return computeMultiSeriesDomain(powerMainChartData.rows, keys, true);
-  }, [powerMainChartData]);
+    const auto = computeMultiSeriesDomain(powerMainChartData.rows, keys, true);
+    const yMin = Number(powerChartSettings.main.y_min);
+    const yMax = Number(powerChartSettings.main.y_max);
+    return [
+      Number.isFinite(yMin) ? yMin : auto[0],
+      Number.isFinite(yMax) ? yMax : auto[1],
+    ];
+  }, [powerMainChartData, powerChartSettings]);
   const powerMainXAxisTicks = useMemo(() => {
     const labels = Array.from(
       new Set((powerMainChartData?.rows || []).map((r) => String(r?.ts || "").trim()).filter(Boolean))
@@ -7190,8 +7214,14 @@ function AppShell() {
   }, [powerHistoryRows, powerConfig, powerFilterMeterId, selectedPowerChartMeters, powerCostChartRange, powerCostPerKwh, displayTimeZone]);
 
   const powerSideYDomain = useMemo(() => {
-    return computeMultiSeriesDomain(powerSideChartData.rows, ["total_kwh"], true);
-  }, [powerSideChartData]);
+    const auto = computeMultiSeriesDomain(powerSideChartData.rows, ["total_kwh"], true);
+    const yMin = Number(powerChartSettings.side.y_min);
+    const yMax = Number(powerChartSettings.side.y_max);
+    return [
+      Number.isFinite(yMin) ? yMin : auto[0],
+      Number.isFinite(yMax) ? yMax : auto[1],
+    ];
+  }, [powerSideChartData, powerChartSettings]);
   const powerSideXAxisTicks = useMemo(() => {
     const labels = Array.from(
       new Set((powerSideChartData?.rows || []).map((r) => String(r?.ts || "").trim()).filter(Boolean))
@@ -7223,9 +7253,57 @@ function AppShell() {
     const peakLabel = peakKw >= 100 ? "High" : peakKw >= 50 ? "Medium" : "Normal";
     const avgKw = powerTrendData.length ? powerTrendData.reduce((a, r) => a + Number(r.total_kw || 0), 0) / powerTrendData.length : 0;
     const efficiency = peakKw > 0 ? Math.max(0, Math.min(100, (avgKw / peakKw) * 100)) : 0;
-    const downtimeCost = powerTrendData
-      .filter((r) => Number(r.total_kw || 0) < Math.max(1, peakKw * 0.1))
-      .reduce((a, r) => a + Number(r.energy_cost || 0), 0);
+    // Operator 2026-06-15: downtime cost is now driven by the
+    // configured downtime_rules — "machine on but not operating" is
+    // detected by per-meter voltage_min + power_max thresholds. For
+    // each rule match we accumulate idle kWh and multiply by the
+    // tariff active at that timestamp.
+    const downtimeRules = Array.isArray(powerConfig?.downtime_rules) ? powerConfig.downtime_rules : [];
+    let downtimeCost = 0;
+    if (downtimeRules.length) {
+      const sampleByTs = new Map();
+      for (const row of powerHistoryRows || []) {
+        const ts = parseTimestampMs(row?.ts || row?.ts_utc || "");
+        if (!Number.isFinite(ts)) continue;
+        const meter = String(row?.gateway_id || "");
+        const key = `${meter}|${Math.floor(ts / 1000)}`;
+        let bucket = sampleByTs.get(key);
+        if (!bucket) {
+          bucket = { ts, meter };
+          sampleByTs.set(key, bucket);
+        }
+        const tag = String(row?.tag || row?.tag_name || "");
+        const v = Number(row?.value);
+        if (!Number.isFinite(v)) continue;
+        if (tag === "voltage_v") bucket.voltage_v = v;
+        else if (tag === "active_power_w") bucket.active_power_w = v;
+        else if (tag === "active_power_kw") bucket.active_power_kw = v;
+      }
+      const samples = Array.from(sampleByTs.values()).sort((a, b) => a.ts - b.ts);
+      // Idle minutes per meter — accumulate dt between consecutive
+      // samples while the rule predicate holds.
+      const prevByMeter = new Map();
+      for (const s of samples) {
+        const rule = downtimeRules.find((r) => !r.meter_id || String(r.meter_id) === s.meter);
+        if (!rule) {
+          prevByMeter.set(s.meter, s);
+          continue;
+        }
+        const kw = Number.isFinite(s.active_power_kw)
+          ? s.active_power_kw
+          : Number.isFinite(s.active_power_w) ? s.active_power_w / 1000 : null;
+        const voltOk = Number.isFinite(s.voltage_v) && s.voltage_v >= Number(rule.voltage_min_v || 0);
+        const powerIdle = Number.isFinite(kw) && kw <= Number(rule.power_max_kw || 0);
+        const prev = prevByMeter.get(s.meter);
+        prevByMeter.set(s.meter, s);
+        if (!prev) continue;
+        if (!(voltOk && powerIdle)) continue;
+        const dtHours = Math.max(0, (s.ts - prev.ts) / 3_600_000);
+        if (dtHours <= 0 || dtHours > 1) continue; // discard gaps > 1h
+        const idleKw = Math.max(0, Number.isFinite(kw) ? kw : 0);
+        downtimeCost += idleKw * dtHours * resolveTariffRate(s.ts);
+      }
+    }
     return {
       efficiency,
       totalCost,
@@ -7235,7 +7313,7 @@ function AppShell() {
       peakLabel,
       downtimeCost,
     };
-  }, [powerTrendData, powerInterval, powerCostPerKwh]);
+  }, [powerTrendData, powerInterval, powerCostPerKwh, powerConfig, powerHistoryRows, resolveTariffRate]);
   const powerChartAxisColor = useMemo(() => (theme === "dark" ? "#9da0a6" : "#6b7280"), [theme]);
   const formatPowerMainXAxisTick = useCallback(
     (value) => {
@@ -7740,6 +7818,77 @@ function AppShell() {
       setPowerBusy(false);
     }
   };
+  const openAddDowntimeRule = () => {
+    setDowntimeRuleModalError("");
+    setDowntimeRuleForm({
+      id: "",
+      name: "",
+      meter_id: String((powerConfig?.devices || [])[0]?.id || ""),
+      voltage_min_v: 200,
+      power_max_kw: 0.5,
+      description: "",
+    });
+    setShowDowntimeRuleModal(true);
+  };
+  const openEditDowntimeRule = (r) => {
+    setDowntimeRuleModalError("");
+    setDowntimeRuleForm({
+      id: String(r.id || ""),
+      name: String(r.name || ""),
+      meter_id: String(r.meter_id || ""),
+      voltage_min_v: Number(r.voltage_min_v || 0),
+      power_max_kw: Number(r.power_max_kw || 0),
+      description: String(r.description || ""),
+    });
+    setShowDowntimeRuleModal(true);
+  };
+  const saveDowntimeRule = async () => {
+    const name = String(downtimeRuleForm.name || "").trim();
+    if (!name) {
+      setDowntimeRuleModalError("Rule name is required.");
+      return;
+    }
+    const ruleId = downtimeRuleForm.id || `dt_${Date.now().toString(36)}`;
+    const row = {
+      id: ruleId,
+      name,
+      meter_id: String(downtimeRuleForm.meter_id || ""),
+      voltage_min_v: Number(downtimeRuleForm.voltage_min_v) || 0,
+      power_max_kw: Number(downtimeRuleForm.power_max_kw) || 0,
+      description: String(downtimeRuleForm.description || ""),
+    };
+    const list = Array.isArray(powerConfig?.downtime_rules) ? [...powerConfig.downtime_rules] : [];
+    const idx = list.findIndex((x) => String(x.id || "") === ruleId);
+    if (idx >= 0) list[idx] = row; else list.push(row);
+    const nextConfig = { ...(powerConfig || {}), downtime_rules: list };
+    setPowerConfig(nextConfig);
+    setShowDowntimeRuleModal(false);
+    setDowntimeRuleModalError("");
+    try {
+      setPowerBusy(true);
+      await savePowerConfigPayload(nextConfig);
+      setPowerResult(`Downtime rule "${row.name}" saved.`);
+    } catch (err) {
+      setPowerResult(`Failed to persist downtime rule: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
+  };
+  const removeDowntimeRule = async (id) => {
+    const list = (Array.isArray(powerConfig?.downtime_rules) ? powerConfig.downtime_rules : [])
+      .filter((x) => String(x.id || "") !== String(id));
+    const nextConfig = { ...(powerConfig || {}), downtime_rules: list };
+    setPowerConfig(nextConfig);
+    try {
+      setPowerBusy(true);
+      await savePowerConfigPayload(nextConfig);
+    } catch (err) {
+      setPowerResult(`Failed to remove downtime rule: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
+  };
+
   const removeTariff = async (id) => {
     const list = (Array.isArray(powerConfig?.electricity_tariffs) ? powerConfig.electricity_tariffs : [])
       .filter((x) => String(x.id || "") !== String(id));
@@ -9930,11 +10079,71 @@ const getGatewayHealth = (gateway) => {
     return rows;
   }, [gatewayConfigsView, powerGatewayDescriptors, devicesView, dataLogView, liveTagValuesView]);
 
+  // Virtual insight tags (operator 2026-06-15: "all the insights
+  // information on the overview cards should be available to be
+  // used as a tag of the meters in the tags pages"). One row per
+  // meter per KPI; values computed live from powerKpis when "all
+  // meters" is the scope, or derived per-meter from history rows.
+  const powerInsightTagRows = useMemo(() => {
+    const meters = Array.isArray(powerConfig?.devices) ? powerConfig.devices : [];
+    if (!meters.length) return [];
+    const out = [];
+    const now = new Date().toISOString();
+    const fmt = (n) => Number.isFinite(n) ? Number(n).toFixed(3) : "0.000";
+    for (const m of meters) {
+      const did = String(m.id || "");
+      // Latest sample from history for this meter
+      const samples = (powerHistoryRows || []).filter((r) => String(r?.gateway_id || "") === did);
+      const latestBy = {};
+      let latestTs = 0;
+      for (const r of samples) {
+        const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
+        if (!Number.isFinite(ts)) continue;
+        if (ts < latestTs) continue;
+        const tag = String(r?.tag || r?.tag_name || "");
+        if (!tag) continue;
+        if (ts > latestTs) {
+          latestTs = ts;
+          for (const k of Object.keys(latestBy)) delete latestBy[k];
+        }
+        latestBy[tag] = Number(r.value);
+      }
+      const liveKw = Number.isFinite(latestBy.active_power_kw)
+        ? latestBy.active_power_kw
+        : Number.isFinite(latestBy.active_power_w) ? latestBy.active_power_w / 1000 : 0;
+      // Use the page-level powerKpis if this meter matches the scope, else fall back to live-only.
+      const scopeMatches = String(powerFilterMeterId || "all") === "all" || String(powerFilterMeterId) === did;
+      const kpis = scopeMatches ? powerKpis : null;
+      const tsLabel = latestTs ? new Date(latestTs).toISOString() : now;
+      const push = (tagName, value, unit) => {
+        out.push({
+          key: `insight::${did}::${tagName}`,
+          tag_name: tagName,
+          device_name: String(m.name || did),
+          gateway_id: did,
+          gateway_name: String(m.name || did),
+          last_value: `${value}${unit ? " " + unit : ""}`,
+          last_ts: tsLabel,
+        });
+      };
+      push("insight.live_kw", fmt(liveKw), "kW");
+      if (kpis) {
+        push("insight.energy_efficiency_pct", fmt(kpis.efficiency), "%");
+        push("insight.energy_cost_eur", fmt(kpis.totalCost), "EUR");
+        push("insight.total_kwh", fmt(kpis.totalEnergyKwh), "kWh");
+        push("insight.peak_kw", fmt(kpis.peakKw), "kW");
+        push("insight.downtime_cost_eur", fmt(kpis.downtimeCost), "EUR");
+      }
+    }
+    return out;
+  }, [powerConfig, powerHistoryRows, powerFilterMeterId, powerKpis]);
+
   const filteredTagRows = useMemo(() => {
     const deviceNeedle = String(tagFilters.device || "").trim().toLowerCase();
     const tagNeedle = String(tagFilters.tag || "").trim().toLowerCase();
     const valueNeedle = String(tagFilters.value || "").trim().toLowerCase();
-    return tagRows.filter((row) => {
+    const combined = [...(tagRows || []), ...powerInsightTagRows];
+    return combined.filter((row) => {
       if (tagFilters.gatewayId && String(row.gateway_id) !== String(tagFilters.gatewayId)) return false;
       if (deviceNeedle && !String(row.device_name || "").toLowerCase().includes(deviceNeedle)) return false;
       if (
@@ -9947,7 +10156,7 @@ const getGatewayHealth = (gateway) => {
       if (valueNeedle && !String(row.last_value ?? "").toLowerCase().includes(valueNeedle)) return false;
       return true;
     });
-  }, [tagRows, tagFilters]);
+  }, [tagRows, tagFilters, powerInsightTagRows]);
 
   const dashboardColorKeyFor = useCallback((gatewayId, tagName) => {
     return `${String(gatewayId || "").trim()}::${normalizeTagName(tagName)}`;
@@ -17093,10 +17302,12 @@ const getGatewayHealth = (gateway) => {
                 <div className="stat-card power-insight-card power-insight-down"><div className="stat-title">Downtime Energy Cost</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.downtimeCost, 2)}</span><span className="power-insight-unit">EUR</span></div></div>
               </section>
               <section className="power-main-grid">
-                <article className="card power-main-chart-card">
+                <article className="card power-main-chart-card pwr-chart-hover">
                   <div className="row trend-header-row">
                     <h3 style={{ marginTop: 0, marginBottom: 0 }}>
-                      {powerMainMetric === "voltage_v" ? "Voltage (V)" : powerMainMetric === "current_a" ? "Current (A)" : powerMainMetric === "energy_kwh" ? "Consumption (kWh)" : "Energy Consumption (kW)"} by {powerInterval}
+                      {powerChartSettings.main.title || (
+                        powerMainMetric === "voltage_v" ? "Voltage (V)" : powerMainMetric === "current_a" ? "Current (A)" : powerMainMetric === "energy_kwh" ? "Consumption (kWh)" : "Energy Consumption (kW)"
+                      )} by {powerInterval}
                     </h3>
                     <div className="row power-side-controls">
                       <select value={powerMainMetric} onChange={(e) => setPowerMainMetric(e.target.value)}>
@@ -17110,6 +17321,14 @@ const getGatewayHealth = (gateway) => {
                         <button type="button" className={powerMainChartType === "area" ? "active" : ""} onClick={() => setPowerMainChartType("area")}>Area</button>
                         <button type="button" className={powerMainChartType === "bar" ? "active" : ""} onClick={() => setPowerMainChartType("bar")}>Bar</button>
                       </div>
+                      <button
+                        type="button"
+                        className="icon-btn table-action-btn pwr-chart-edit-btn"
+                        title="Edit chart"
+                        onClick={() => setChartSettingsOpenKey("main")}
+                      >
+                        <EditIcon />
+                      </button>
                     </div>
                   </div>
                   <div className="meta">
@@ -17152,7 +17371,7 @@ const getGatewayHealth = (gateway) => {
                           <>
                             <Bar dataKey="total" name="Total" fill="#16a34a" isAnimationActive={false} />
                             {(powerConfig?.devices || [])
-                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")))
+                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
                               .map((d, idx) => (
                                 <Bar
                                   key={`pwr-bar-${d.id}`}
@@ -17177,7 +17396,7 @@ const getGatewayHealth = (gateway) => {
                               isAnimationActive={false}
                             />
                             {(powerConfig?.devices || [])
-                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")))
+                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
                               .map((d, idx) => (
                                 <Area
                                   key={`pwr-area-${d.id}`}
@@ -17197,7 +17416,7 @@ const getGatewayHealth = (gateway) => {
                           <>
                             <Line type="stepAfter" dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={false} isAnimationActive={false} />
                             {(powerConfig?.devices || [])
-                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")))
+                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
                               .map((d, idx) => (
                                 <Line
                                   key={`pwr-line-${d.id}`}
@@ -17216,10 +17435,10 @@ const getGatewayHealth = (gateway) => {
                     </ResponsiveContainer>
                   </div>
                 </article>
-                <article className="card power-side-chart-card">
+                <article className="card power-side-chart-card pwr-chart-hover">
                   <div className="row trend-header-row">
                     <h3 style={{ marginTop: 0, marginBottom: 0 }}>
-                      Total Consumption (kWh) {powerCostChartRange === "12h" ? "by Hour (Last 12h)" : "by Day (Last 30d)"}
+                      {powerChartSettings.side.title || `Total Consumption (kWh) ${powerCostChartRange === "12h" ? "by Hour (Last 12h)" : "by Day (Last 30d)"}`}
                     </h3>
                     <div className="row power-side-controls">
                       <select value={powerCostChartRange} onChange={(e) => setPowerCostChartRange(e.target.value)}>
@@ -17231,6 +17450,14 @@ const getGatewayHealth = (gateway) => {
                         <button type="button" className={powerSideChartType === "area" ? "active" : ""} onClick={() => setPowerSideChartType("area")}>Area</button>
                         <button type="button" className={powerSideChartType === "bar" ? "active" : ""} onClick={() => setPowerSideChartType("bar")}>Bar</button>
                       </div>
+                      <button
+                        type="button"
+                        className="icon-btn table-action-btn pwr-chart-edit-btn"
+                        title="Edit chart"
+                        onClick={() => setChartSettingsOpenKey("side")}
+                      >
+                        <EditIcon />
+                      </button>
                     </div>
                   </div>
                   <div className="chart-wrap">
@@ -17416,6 +17643,67 @@ const getGatewayHealth = (gateway) => {
                             </span>
                           </div>
                         ))}
+                      </div>
+                    )}
+                  </>
+                ) : null}
+              </section>
+
+              {/* Downtime detection rules. Operator 2026-06-15: "the
+                  user can select which meter reading and the range
+                  with conditions that will mean that the machine is
+                  on but not operating". Each rule = voltage_min AND
+                  power_max — both must hold for the sample to count
+                  as downtime. Rules apply per-meter (meter_id="" =
+                  any meter). */}
+              <section className="card">
+                <div className="db-simple-head">
+                  <div className="db-head-title-wrap">
+                    <h3 style={{ margin: 0 }}>Downtime Rules</h3>
+                  </div>
+                  <div className="db-card-top-actions">
+                    <button className="btn btn-primary btn-sm icon-text-btn" onClick={openAddDowntimeRule} disabled={!canEditPage("power_configuration")}>
+                      <AddIcon /><span>Add Rule</span>
+                    </button>
+                    <button className="btn btn-success btn-sm" onClick={savePowerConfig} disabled={powerBusy || !canEditPage("power_configuration")}>Save</button>
+                    <button
+                      className="btn btn-sm card-collapse-btn"
+                      onClick={() => setDowntimeCardCollapsed((v) => !v)}
+                      title={downtimeCardCollapsed ? "Expand card" : "Collapse card"}
+                    >
+                      {downtimeCardCollapsed ? "+" : "-"}
+                    </button>
+                  </div>
+                </div>
+                {!downtimeCardCollapsed ? (
+                  <>
+                    {(!Array.isArray(powerConfig.downtime_rules) || powerConfig.downtime_rules.length === 0) ? (
+                      <div className="muted" style={{ padding: 14, textAlign: "center" }}>
+                        No downtime rules defined. Click <strong>Add Rule</strong> to flag periods where voltage is present but active power stays under a threshold — Overview's "Downtime Energy Cost" sums the cost of those idle hours.
+                      </div>
+                    ) : (
+                      <div className="table db-table power-tariff-table">
+                        <div className="thead">
+                          <span>Name</span><span>Meter</span><span>Voltage ≥</span><span>Active Power ≤</span><span>Description</span><span style={{ textAlign: "right" }}>Actions</span>
+                        </div>
+                        {powerConfig.downtime_rules.map((r) => {
+                          const meterName = r.meter_id
+                            ? (powerConfig.devices || []).find((d) => String(d.id) === String(r.meter_id))?.name || r.meter_id
+                            : "Any meter";
+                          return (
+                            <div key={`dt-${r.id}`} className="trow">
+                              <span>{r.name}</span>
+                              <span>{meterName}</span>
+                              <span>{Number(r.voltage_min_v || 0).toFixed(1)} V</span>
+                              <span>{Number(r.power_max_kw || 0).toFixed(3)} kW</span>
+                              <span title={r.description}>{r.description || "—"}</span>
+                              <span className="row-actions">
+                                <button className="icon-btn table-action-btn pwr-square-btn" title="Edit rule" onClick={() => openEditDowntimeRule(r)}><EditIcon /></button>
+                                <button className="icon-btn table-action-btn danger pwr-square-btn" title="Remove rule" onClick={() => removeDowntimeRule(r.id)}><DeleteIcon /></button>
+                              </span>
+                            </div>
+                          );
+                        })}
                       </div>
                     )}
                   </>
@@ -24687,6 +24975,103 @@ const getGatewayHealth = (gateway) => {
           </div>
         </div>
       ) : null}
+      {showDowntimeRuleModal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card pwr-modal" style={{ width: "min(520px, 96vw)" }}>
+            <h3>{downtimeRuleForm.id ? "Edit Downtime Rule" : "Add Downtime Rule"}</h3>
+            <div className="pwr-modal-body">
+              <div className="pwr-section">
+                <div className="pwr-grid">
+                  <label><span>Name</span><input value={downtimeRuleForm.name} onChange={(e) => setDowntimeRuleForm({ ...downtimeRuleForm, name: e.target.value })} placeholder="e.g. Idle Machine" /></label>
+                  <label><span>Meter</span>
+                    <select value={downtimeRuleForm.meter_id} onChange={(e) => setDowntimeRuleForm({ ...downtimeRuleForm, meter_id: e.target.value })}>
+                      <option value="">Any meter</option>
+                      {(powerConfig?.devices || []).map((d) => (
+                        <option key={`dt-meter-${d.id}`} value={String(d.id)}>{String(d.name || d.id)}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label><span>Voltage min (V)</span><input type="number" step="0.1" value={downtimeRuleForm.voltage_min_v} onChange={(e) => setDowntimeRuleForm({ ...downtimeRuleForm, voltage_min_v: Number(e.target.value || 0) })} /></label>
+                  <label><span>Power max (kW)</span><input type="number" step="0.001" value={downtimeRuleForm.power_max_kw} onChange={(e) => setDowntimeRuleForm({ ...downtimeRuleForm, power_max_kw: Number(e.target.value || 0) })} /></label>
+                </div>
+                <label className="pwr-full">
+                  <span>Description</span>
+                  <input value={downtimeRuleForm.description} onChange={(e) => setDowntimeRuleForm({ ...downtimeRuleForm, description: e.target.value })} placeholder="optional note" />
+                </label>
+              </div>
+            </div>
+            {downtimeRuleModalError ? (
+              <div className="pwr-modal-result is-error">{downtimeRuleModalError}</div>
+            ) : null}
+            <div className="row modal-actions">
+              <button className="btn btn-primary" onClick={saveDowntimeRule} disabled={powerBusy}>OK</button>
+              <button className="btn btn-danger" onClick={() => { setShowDowntimeRuleModal(false); setDowntimeRuleModalError(""); }}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {chartSettingsOpenKey ? (() => {
+        const key = chartSettingsOpenKey;
+        const current = powerChartSettings[key] || { title: "", y_min: "", y_max: "", hidden_meters: [] };
+        const setField = (field, value) => {
+          setPowerChartSettings((prev) => ({
+            ...prev,
+            [key]: { ...prev[key], [field]: value },
+          }));
+        };
+        const toggleMeter = (mid) => {
+          setPowerChartSettings((prev) => {
+            const cur = new Set(prev[key].hidden_meters || []);
+            if (cur.has(mid)) cur.delete(mid); else cur.add(mid);
+            return { ...prev, [key]: { ...prev[key], hidden_meters: Array.from(cur) } };
+          });
+        };
+        return (
+          <div className="modal-backdrop">
+            <div className="modal-card pwr-modal" style={{ width: "min(520px, 96vw)" }}>
+              <h3>Chart Settings — {key === "main" ? "Main" : "Side"}</h3>
+              <div className="pwr-modal-body">
+                <div className="pwr-section">
+                  <label className="pwr-full">
+                    <span>Title (leave blank for auto)</span>
+                    <input value={current.title} onChange={(e) => setField("title", e.target.value)} placeholder="Auto" />
+                  </label>
+                  <div className="pwr-grid">
+                    <label><span>Y min (blank=auto)</span><input type="number" step="0.01" value={current.y_min} onChange={(e) => setField("y_min", e.target.value)} /></label>
+                    <label><span>Y max (blank=auto)</span><input type="number" step="0.01" value={current.y_max} onChange={(e) => setField("y_max", e.target.value)} /></label>
+                  </div>
+                  <label className="pwr-full">
+                    <span>Type</span>
+                    <select value={key === "main" ? powerMainChartType : powerSideChartType} onChange={(e) => key === "main" ? setPowerMainChartType(e.target.value) : setPowerSideChartType(e.target.value)}>
+                      <option value="line">Line</option>
+                      <option value="area">Area</option>
+                      <option value="bar">Bar</option>
+                    </select>
+                  </label>
+                  <div className="pwr-full">
+                    <span style={{ fontSize: 10.5, letterSpacing: "0.04em", textTransform: "uppercase", color: "var(--muted)" }}>Series (toggle to hide)</span>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 4 }}>
+                      {(powerConfig?.devices || []).map((d) => {
+                        const mid = String(d.id || "");
+                        const hidden = current.hidden_meters.includes(mid);
+                        return (
+                          <label key={`series-${mid}`} className="pwr-check">
+                            <input type="checkbox" checked={!hidden} onChange={() => toggleMeter(mid)} />
+                            <span>{d.name || mid}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="row modal-actions">
+                <button className="btn btn-primary" onClick={() => setChartSettingsOpenKey("")}>Done</button>
+              </div>
+            </div>
+          </div>
+        );
+      })() : null}
       {showDashboardWidgetModal ? (
         <div className="modal-backdrop">
           <div className="modal-card">

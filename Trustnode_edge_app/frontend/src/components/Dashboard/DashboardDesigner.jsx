@@ -725,6 +725,69 @@ export function DashboardDesigner({
     persistProfiles(next);
   }, [activeProfileName, profiles, captureCurrentProfilePayload, persistProfiles, handleSaveAsProfile]);
 
+  // Power-default dashboard preset (operator 2026-06-15: "if the
+  // power management module is enabled we should have a new
+  // dashboard profile (default) available in the dashboard, create
+  // one that replicates the power overview pages without the
+  // filters"). Builds 6 stat tiles + 2 chart cards for the first
+  // power meter in the catalog. Does NOT overwrite existing
+  // profiles — it just replaces the live widget set so the
+  // operator can save it under a name if they want.
+  const buildPowerDefaultPayload = useCallback(() => {
+    const meters = (Array.isArray(gatewayCatalog) ? gatewayCatalog : []).filter((g) => g?.power_meter);
+    const meter = meters[0] || null;
+    if (!meter) return null;
+    const gwId = String(meter.id || "");
+    const makeStat = (key, title, tag, unit, x, y) => ({
+      id: `pd-stat-${key}-${gwId}`,
+      type: "stat",
+      title,
+      color: "#14a89a",
+      x, y, w: 2, h: 2,
+      config: {
+        gateway_id: gwId,
+        tag_name: tag,
+        data_source_type: "tag_direct",
+        chart_value_format: "auto",
+        text: unit ? `{value} ${unit}` : "{value}",
+      },
+    });
+    const makeChart = (key, title, tag, type, x, y, w, h) => ({
+      id: `pd-chart-${key}-${gwId}`,
+      type,
+      title,
+      color: "#16a34a",
+      x, y, w, h,
+      config: {
+        gateway_id: gwId,
+        tag_name: tag,
+        readings_count: 200,
+        interpolation: "stepAfter",
+        data_source_type: "tag_direct",
+        chart_show_legend: true,
+        chart_value_format: "auto",
+      },
+    });
+    const widgets = [
+      makeStat("eff", "Energy Efficiency", "insight.energy_efficiency_pct", "%", 0, 0),
+      makeStat("cost", "Energy Cost", "insight.energy_cost_eur", "EUR", 2, 0),
+      makeStat("kwh", "Total kWh", "insight.total_kwh", "kWh", 4, 0),
+      makeStat("live", "Live kW", "insight.live_kw", "kW", 6, 0),
+      makeStat("peak", "Peak kW", "insight.peak_kw", "kW", 8, 0),
+      makeStat("down", "Downtime Cost", "insight.downtime_cost_eur", "EUR", 10, 0),
+      makeChart("power", "Active Power (kW) — Last 1h", "active_power_kw", "line_chart", 0, 2, 8, 4),
+      makeChart("voltage", "Voltage (V) — Last 1h", "voltage_v", "area_chart", 8, 2, 4, 4),
+    ];
+    return { name: "Power Default", widgets, mode: "grid", per_row: 12, tag_colors: {} };
+  }, [gatewayCatalog]);
+
+  const applyPowerDefaultProfile = useCallback(() => {
+    const payload = buildPowerDefaultPayload();
+    if (!payload) return;
+    applyProfilePayload(payload);
+    setActiveProfileName("Power Default");
+  }, [applyProfilePayload, buildPowerDefaultPayload]);
+
   /**
    * Pan the dashboard's historical window left (older) or right (newer) by a
    * number of *windows*. Used by chart drag-to-scroll: a drag on any chart
@@ -2748,6 +2811,19 @@ export function DashboardDesigner({
                   title={activeProfileName ? `Delete profile "${activeProfileName}"` : "No profile loaded"}
                 >
                   Delete
+                </button>
+                {/* Power-default preset (operator 2026-06-15). Loads a
+                    6-stat + 2-chart layout aimed at one power meter.
+                    Doesn't write to localStorage until the user
+                    presses Save / Save as. */}
+                <button
+                  type="button"
+                  className="dashboard-profile-btn"
+                  onClick={applyPowerDefaultProfile}
+                  disabled={!canEdit || !(Array.isArray(gatewayCatalog) && gatewayCatalog.some((g) => g?.power_meter))}
+                  title="Replace the current layout with the Power Overview preset"
+                >
+                  Apply Power Default
                 </button>
               </div>
               <div className="dashboard-config-meta">

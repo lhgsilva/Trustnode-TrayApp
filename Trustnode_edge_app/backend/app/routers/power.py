@@ -27,6 +27,7 @@ class PowerConfigPayload(BaseModel):
     devices: list[dict[str, Any]] = Field(default_factory=list)
     energy_price_eur_kwh: float = 0.0
     electricity_tariffs: list[dict[str, Any]] = Field(default_factory=list)
+    downtime_rules: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PowerConnectionTestPayload(BaseModel):

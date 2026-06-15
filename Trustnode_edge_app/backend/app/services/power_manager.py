@@ -110,6 +110,13 @@ DEFAULT_POWER_CONFIG: dict[str, Any] = {
     # rates evaluated by start_time/end_time (HH:MM in local time).
     "energy_price_eur_kwh": 0.25,
     "electricity_tariffs": [],
+    # Downtime detection rules (added 2026-06-15). Each rule says
+    # "machine is on but idling when these conditions all hold".
+    # Shape: {id, name, meter_id, voltage_min_v, power_max_kw,
+    # description}. The frontend evaluates rules against the live
+    # historian rows and multiplies idle kWh by the tariff to
+    # compute downtime energy cost.
+    "downtime_rules": [],
 }
 
 
@@ -366,6 +373,31 @@ class PowerManager:
                     row["type"] = "flat"
                 tariffs.append(row)
         base["electricity_tariffs"] = tariffs
+
+        # Downtime detection rules (added 2026-06-15).
+        rules_raw = raw.get("downtime_rules")
+        rules: list[dict[str, Any]] = []
+        if isinstance(rules_raw, list):
+            for r in rules_raw:
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    v_min = float(r.get("voltage_min_v") or 0.0)
+                except Exception:
+                    v_min = 0.0
+                try:
+                    p_max = float(r.get("power_max_kw") or 0.0)
+                except Exception:
+                    p_max = 0.0
+                rules.append({
+                    "id": str(r.get("id") or "").strip() or f"dt_{len(rules) + 1}",
+                    "name": str(r.get("name") or "").strip() or "Downtime",
+                    "meter_id": str(r.get("meter_id") or "").strip(),
+                    "voltage_min_v": v_min,
+                    "power_max_kw": p_max,
+                    "description": str(r.get("description") or ""),
+                })
+        base["downtime_rules"] = rules
         return base
 
     def _force_stopped_config(self, cfg: dict[str, Any]) -> dict[str, Any]:

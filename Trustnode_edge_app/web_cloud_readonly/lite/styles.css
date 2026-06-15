@@ -19,6 +19,11 @@
   --danger: #e2585d;
   --info: #6e8dd2;
 
+  /* Lock native control palette to light mode — otherwise Chrome
+     paints <select> dropdowns + date pickers with the OS dark theme.
+     Operator 2026-06-15. */
+  color-scheme: light;
+
   --bg: #eceff3;
   --card: #ffffff;
   --card-2: #f6f8fa;
@@ -69,6 +74,7 @@
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --brand: #1f3a5f;
   --brand-strong: #0e8479;
   --teal: #14a89a;
