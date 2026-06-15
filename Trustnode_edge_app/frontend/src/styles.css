@@ -3945,6 +3945,19 @@ input[type="checkbox"] {
      drives the floor instead. */
 }
 
+/* Drag-resize handle (operator 2026-06-15: "charts should be
+   possible resize by dragging the bottom-right corner like the
+   cards from the dashboard"). resize:vertical gives a native
+   bottom-right corner handle; the React onMouseUp on the card
+   snapshots offsetHeight back into powerChartSettings.{key}.height
+   so the size persists across renders. */
+.pwr-chart-resizable {
+  resize: vertical;
+  overflow: hidden !important;
+  min-height: 280px;
+  max-height: 1200px;
+}
+
 /* Chart edit button — hover-only and uniform size with other table
    icons. Operator 2026-06-15: "the edit chart button should only to
    be shown when we hover on it and should be same size". */
@@ -3966,10 +3979,10 @@ input[type="checkbox"] {
 .power-side-chart-card .chart-wrap {
   width: 100%;
   flex: 1 1 auto;
-  height: 380px;
+  height: auto;
   overflow: hidden;
   padding: 4px 4px 4px;
-  min-height: 320px;
+  min-height: 220px;
 }
 
 .power-main-chart-card .recharts-wrapper,

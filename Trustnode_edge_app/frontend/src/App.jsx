@@ -2726,6 +2726,8 @@ function AppShell() {
       y2_min: "", y2_max: "",
       y2_label: "",
       y2_unit: "",
+      // Persisted drag-resize height (operator 2026-06-15).
+      height: 420,
     },
     side: {
       title: "",
@@ -2737,6 +2739,7 @@ function AppShell() {
       y2_min: "", y2_max: "",
       y2_label: "",
       y2_unit: "",
+      height: 420,
     },
   });
   const [chartSettingsOpenKey, setChartSettingsOpenKey] = useState("");
@@ -9027,7 +9030,19 @@ function AppShell() {
           endpoint: String(d?.endpoint || d?.ip || ""),
           interval_ms: Number(d?.poll_interval_ms || 1000),
           gateway_type: "modbus_tcp_meter",
-          tags: Object.keys(mergedMap || {}),
+          // Operator 2026-06-15: surface insight.* tags alongside the
+          // register-derived tags so the dashboard widget editor and
+          // gateway DB sinks see them. Backend's power_manager now
+          // emits real historian rows for these.
+          tags: [
+            ...Object.keys(mergedMap || {}),
+            "insight.live_kw",
+            "insight.peak_kw",
+            "insight.energy_efficiency_pct",
+            "insight.total_kwh",
+            "insight.energy_cost_eur",
+            "insight.downtime_cost_eur",
+          ],
           power_meter: true,
           enabled: d?.enabled !== false,
         };
@@ -10189,7 +10204,17 @@ const getGatewayHealth = (gateway) => {
     const deviceNeedle = String(tagFilters.device || "").trim().toLowerCase();
     const tagNeedle = String(tagFilters.tag || "").trim().toLowerCase();
     const valueNeedle = String(tagFilters.value || "").trim().toLowerCase();
-    const combined = [...(tagRows || []), ...powerInsightTagRows];
+    // Backend now publishes insight.* historian rows directly, so
+    // tagRows already contains them. The overlay only fills in if
+    // the historian hasn't seen an insight row yet for that meter
+    // (cold start / first 1-2 polls).
+    const haveBackendInsights = new Set(
+      (tagRows || [])
+        .filter((r) => String(r?.tag_name || "").startsWith("insight."))
+        .map((r) => `${String(r.gateway_id || "")}::${String(r.tag_name || "")}`)
+    );
+    const fallback = powerInsightTagRows.filter((r) => !haveBackendInsights.has(`${r.gateway_id}::${r.tag_name}`));
+    const combined = [...(tagRows || []), ...fallback];
     return combined.filter((row) => {
       if (tagFilters.gatewayId && String(row.gateway_id) !== String(tagFilters.gatewayId)) return false;
       if (deviceNeedle && !String(row.device_name || "").toLowerCase().includes(deviceNeedle)) return false;
@@ -17352,7 +17377,19 @@ const getGatewayHealth = (gateway) => {
                 <div className="stat-card power-insight-card power-insight-down"><div className="stat-title">Downtime Energy Cost</div><div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(powerKpis.downtimeCost, 2)}</span><span className="power-insight-unit">EUR</span></div></div>
               </section>
               <section className="power-main-grid">
-                <article className="card power-main-chart-card pwr-chart-hover">
+                <article
+                  className="card power-main-chart-card pwr-chart-hover pwr-chart-resizable"
+                  style={{ height: Number(powerChartSettings.main.height || 420) }}
+                  onMouseUp={(e) => {
+                    // CSS `resize: vertical` mutates the element's
+                    // inline height. Snapshot it back into state on
+                    // mouseup so the size sticks across renders.
+                    const h = e.currentTarget?.offsetHeight;
+                    if (Number.isFinite(h) && h > 0 && h !== powerChartSettings.main.height) {
+                      setPowerChartSettings((p) => ({ ...p, main: { ...p.main, height: h } }));
+                    }
+                  }}
+                >
                   <div className="row trend-header-row">
                     <h3 style={{ marginTop: 0, marginBottom: 0 }}>
                       {powerChartSettings.main.title || (
@@ -17507,7 +17544,16 @@ const getGatewayHealth = (gateway) => {
                     </ResponsiveContainer>
                   </div>
                 </article>
-                <article className="card power-side-chart-card pwr-chart-hover">
+                <article
+                  className="card power-side-chart-card pwr-chart-hover pwr-chart-resizable"
+                  style={{ height: Number(powerChartSettings.side.height || 420) }}
+                  onMouseUp={(e) => {
+                    const h = e.currentTarget?.offsetHeight;
+                    if (Number.isFinite(h) && h > 0 && h !== powerChartSettings.side.height) {
+                      setPowerChartSettings((p) => ({ ...p, side: { ...p.side, height: h } }));
+                    }
+                  }}
+                >
                   <div className="row trend-header-row">
                     <h3 style={{ marginTop: 0, marginBottom: 0 }}>
                       {powerChartSettings.side.title || `Total Consumption (kWh) ${powerCostChartRange === "12h" ? "by Hour (Last 12h)" : "by Day (Last 30d)"}`}

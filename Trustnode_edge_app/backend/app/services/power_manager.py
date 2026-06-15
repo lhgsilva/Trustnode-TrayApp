@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import struct
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 from datetime import datetime, timezone
 from typing import Any
 
@@ -709,6 +712,18 @@ class PowerManager:
                         "source": "power_modbus",
                     }
                 )
+
+        # Insight tags (operator 2026-06-15): emit synthesized KPI
+        # rows so the values land in the historian AND in any
+        # configured gateway DB sinks. The dashboard widget editor
+        # picks them up just like real tags.
+        try:
+            insight_rows = self._compute_insight_rows(device, values_scaled, now)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("insight tags failed for %s: %s", device_id, exc)
+            insight_rows = []
+        rows.extend(insight_rows)
+
         status = {
             "device_id": device_id,
             "name": str(device.get("name") or device_id),
@@ -742,6 +757,138 @@ class PowerManager:
                 "unit_id": int(device.get("unit_id") or 1),
                 "poll_interval_ms": int(device.get("poll_interval_ms") or 1000),
             }
+
+    # Per-device rolling state for insight tags. Operator 2026-06-15:
+    # KPIs were a frontend overlay only — now they're emitted as real
+    # historian rows so dashboards, gateway DB sinks and reports all
+    # see them. We keep a small rolling window per device for peak +
+    # efficiency math, plus a monotonic energy accumulator.
+    def _insight_state(self, device_id: str) -> dict[str, Any]:
+        st = getattr(self, "_insight_state_by_device", None)
+        if st is None:
+            st = {}
+            self._insight_state_by_device = st
+        bucket = st.get(device_id)
+        if bucket is None:
+            bucket = {
+                "samples": [],  # list[(ts_mono, kw)]
+                "energy_wh": 0.0,
+                "downtime_wh": 0.0,
+                "last_mono": None,
+            }
+            st[device_id] = bucket
+        return bucket
+
+    def _resolve_tariff_rate(self, ts: datetime) -> float:
+        tariffs = list(self._config.get("electricity_tariffs") or [])
+        if tariffs:
+            minutes = ts.hour * 60 + ts.minute
+            for t in tariffs:
+                try:
+                    sh, sm = str(t.get("start_time") or "00:00").split(":")
+                    eh, em = str(t.get("end_time") or "23:59").split(":")
+                    start = int(sh) * 60 + int(sm)
+                    end = int(eh) * 60 + int(em)
+                except Exception:
+                    continue
+                in_window = (start <= end and start <= minutes <= end) or (start > end and (minutes >= start or minutes <= end))
+                if in_window:
+                    try:
+                        return float(t.get("rate_eur_kwh") or 0.0)
+                    except Exception:
+                        return 0.0
+        try:
+            return float(self._config.get("energy_price_eur_kwh") or 0.0)
+        except Exception:
+            return 0.0
+
+    def _compute_insight_rows(self, device: dict[str, Any], values: dict[str, float], now: str) -> list[dict[str, Any]]:
+        device_id = str(device.get("id") or "")
+        gw_name = str(device.get("name") or device_id)
+        ip = str(device.get("ip") or "")
+        # Live kW prefers active_power_total_w/active_power_w; fall
+        # back to 0 so the tag still emits (otherwise dashboards lose
+        # the series during a brief read fault).
+        watts = None
+        for key in ("active_power_total_w", "active_power_w"):
+            v = values.get(key)
+            if v is not None:
+                try:
+                    watts = float(v)
+                    break
+                except Exception:
+                    continue
+        live_kw = (watts or 0.0) / 1000.0
+
+        st = self._insight_state(device_id)
+        now_mono = time.monotonic()
+        st["samples"].append((now_mono, live_kw))
+        # Keep the last hour at most so peak/avg reflect a useful
+        # window without unbounded growth.
+        cutoff = now_mono - 3600.0
+        st["samples"] = [(t, kw) for (t, kw) in st["samples"] if t >= cutoff]
+
+        # Energy accumulator — integrate kW * dt(h).
+        last_mono = st.get("last_mono")
+        dt_h = 0.0
+        if last_mono is not None:
+            dt_s = max(0.0, now_mono - float(last_mono))
+            # Discard gaps > 5 min so a meter offline window doesn't
+            # tank or inflate the integral.
+            if dt_s <= 300.0:
+                dt_h = dt_s / 3600.0
+                st["energy_wh"] += live_kw * 1000.0 * dt_h
+        st["last_mono"] = now_mono
+
+        peak_kw = max((kw for (_, kw) in st["samples"]), default=0.0)
+        avg_kw = (sum(kw for (_, kw) in st["samples"]) / len(st["samples"])) if st["samples"] else 0.0
+        efficiency_pct = max(0.0, min(100.0, (avg_kw / peak_kw) * 100.0)) if peak_kw > 0 else 0.0
+
+        # Tariff-aware cost for the window's accumulated kWh.
+        ts_now = datetime.now(timezone.utc)
+        rate = self._resolve_tariff_rate(ts_now)
+        total_kwh = st["energy_wh"] / 1000.0
+        total_cost = total_kwh * rate
+
+        # Downtime cost: when voltage >= min and active power <= max
+        # for the matching rule, accumulate live_kw * dt(h) * rate.
+        rules = list(self._config.get("downtime_rules") or [])
+        if rules and dt_h > 0:
+            voltage_v = float(values.get("voltage_v") or 0.0)
+            for rule in rules:
+                if rule.get("meter_id") and str(rule.get("meter_id")) != device_id:
+                    continue
+                vmin = float(rule.get("voltage_min_v") or 0.0)
+                pmax = float(rule.get("power_max_kw") or 0.0)
+                if voltage_v >= vmin and live_kw <= pmax:
+                    st["downtime_wh"] += live_kw * 1000.0 * dt_h
+                    break
+        downtime_kwh = st["downtime_wh"] / 1000.0
+        downtime_cost = downtime_kwh * rate
+
+        def _row(tag: str, value: float) -> dict[str, Any]:
+            return {
+                "ts_utc": now,
+                "gateway_id": device_id,
+                "gateway_name": gw_name,
+                "device_name": gw_name,
+                "plc_ip": ip,
+                "database_name": "Power Management",
+                "tag_name": tag,
+                "value": float(value),
+                "quality": 192,
+                "quality_label": "GOOD",
+                "source": "power_insight",
+            }
+
+        return [
+            _row("insight.live_kw", live_kw),
+            _row("insight.peak_kw", peak_kw),
+            _row("insight.energy_efficiency_pct", efficiency_pct),
+            _row("insight.total_kwh", total_kwh),
+            _row("insight.energy_cost_eur", total_cost),
+            _row("insight.downtime_cost_eur", downtime_cost),
+        ]
 
     def _enqueue_rows(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
