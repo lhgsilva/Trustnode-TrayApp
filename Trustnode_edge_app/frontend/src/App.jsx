@@ -2779,11 +2779,14 @@ function AppShell() {
   const [powerDonutMode, setPowerDonutMode] = useState("cost");
   // Overview chart settings (operator 2026-06-15: edit chart info on
   // hover — title, type, axis, limits, series). Keys: "main" / "side".
-  // Heights persist to localStorage so resizing the cards isn't lost
-  // every time the operator switches pages (operator 2026-06-16).
+  // Heights AND every other chart-edit field persist to localStorage
+  // so the operator's choices survive page switches and EXE restart
+  // (operator 2026-06-16).
   const POWER_CHART_HEIGHT_LSKEY = "tn_power_chart_heights_v1";
+  const POWER_CHART_SETTINGS_LSKEY = "tn_power_chart_settings_v1";
   const [powerChartSettings, setPowerChartSettings] = useState(() => {
     let storedHeights = {};
+    let storedSettings = {};
     try {
       const raw = typeof window !== "undefined" ? window.localStorage.getItem(POWER_CHART_HEIGHT_LSKEY) : null;
       if (raw) {
@@ -2791,56 +2794,57 @@ function AppShell() {
         if (parsed && typeof parsed === "object") storedHeights = parsed;
       }
     } catch (_) {}
-    return {
-    main: {
-      title: "",
-      hide_title: false,
-      y_min: "", y_max: "",
-      y_label: "",
-      y_unit: "",
-      hidden_meters: [],
-      // Per-meter override to put a meter on the secondary (right) axis.
-      secondary_meters: [],
-      y2_min: "", y2_max: "",
-      y2_label: "",
-      y2_unit: "",
-      // Persisted drag-resize height (operator 2026-06-15).
-      height: Number(storedHeights.main) || 360,
-      // Parity with the dashboard widget editor.
-      interpolation: "stepAfter",
-      readings_count: 200,
-      color_mode: "default",
-      show_legend: true,
-      show_point_labels: false,
-      show_total: true,
-    },
-    side: {
-      title: "",
-      hide_title: false,
-      y_min: "", y_max: "",
-      y_label: "",
-      y_unit: "",
-      hidden_meters: [],
-      secondary_meters: [],
-      y2_min: "", y2_max: "",
-      y2_label: "",
-      y2_unit: "",
-      height: Number(storedHeights.side) || 280,
-      interpolation: "stepAfter",
-      readings_count: 200,
-      color_mode: "default",
-      show_legend: true,
-      show_point_labels: false,
-      show_total: true,
-    },
-    donut: {
-      title: "",
-      hide_title: false,
-      mode: "cost", // "cost" or "kwh"
-      show_legend: true,
-      height: Number(storedHeights.donut) || 260,
-    },
+    try {
+      const raw = typeof window !== "undefined" ? window.localStorage.getItem(POWER_CHART_SETTINGS_LSKEY) : null;
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") storedSettings = parsed;
+      }
+    } catch (_) {}
+    const mergeKey = (key, defaults) => ({
+      ...defaults,
+      ...(storedSettings[key] || {}),
+      // Heights live under their own key for legacy reasons.
+      height: Number((storedSettings[key] || {}).height || storedHeights[key] || defaults.height) || defaults.height,
+    });
+    const _result = {
+      main: mergeKey("main", {
+        title: "", hide_title: false,
+        y_min: "", y_max: "", y_label: "", y_unit: "",
+        hidden_meters: [], secondary_meters: [],
+        y2_min: "", y2_max: "", y2_label: "", y2_unit: "",
+        height: 360,
+        interpolation: "stepAfter",
+        readings_count: 200,
+        color_mode: "default",
+        show_legend: true,
+        show_point_labels: false,
+        show_total: true,
+        series_colors: {},
+      }),
+      side: mergeKey("side", {
+        title: "", hide_title: false,
+        y_min: "", y_max: "", y_label: "", y_unit: "",
+        hidden_meters: [], secondary_meters: [],
+        y2_min: "", y2_max: "", y2_label: "", y2_unit: "",
+        height: 280,
+        interpolation: "stepAfter",
+        readings_count: 200,
+        color_mode: "default",
+        show_legend: true,
+        show_point_labels: false,
+        show_total: true,
+        series_colors: {},
+      }),
+      donut: mergeKey("donut", {
+        title: "", hide_title: false,
+        mode: "cost",
+        show_legend: true,
+        height: 260,
+        series_colors: {},
+      }),
     };
+    return _result;
   });
   const [chartSettingsOpenKey, setChartSettingsOpenKey] = useState("");
   const [powerMainMetric, setPowerMainMetric] = useState("power_kw");
@@ -6955,18 +6959,42 @@ function AppShell() {
             const nowMs = Date.now();
             if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= 2000) {
               powerHistoryLastFetchMsRef.current = nowMs;
-              // Operator 2026-06-16: short windows (Last 1m, Last 5m)
-              // were rendering empty because the fetch was hard-coded
-              // to 1500 rows — only ~70 s of history at the 21 tags
-              // / 1 Hz the meter emits. Scale the fetch to the
-              // active periodMs so Last 5m gets ~300s * 21 = 6300
-              // rows worth of history. Capped at 50000 server-side.
-              const tagsPerSec = 25;
               const periodMsLocal = Number(powerHistoryPeriodMsRef.current || 60000);
-              const desired = Math.max(1500, Math.ceil(periodMsLocal / 1000) * tagsPerSec);
-              const lim = Math.min(50000, desired);
-              const histRes = await getPowerHistory(lim, "");
-              if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
+              // Operator 2026-06-16: wide periods (1h+) were
+              // showing only the most recent ~40 min on the Live
+              // chart because /api/power/history is row-bounded.
+              // Switch to the historian range endpoint when the
+              // requested period exceeds 15 min — it fetches by
+              // time window not row count, so a full hour or day
+              // arrives intact.
+              if (periodMsLocal > 15 * 60 * 1000) {
+                try {
+                  const fromUtc = new Date(nowMs - periodMsLocal).toISOString();
+                  const toUtc = new Date(nowMs + 60_000).toISOString();
+                  const res = await getAppStoreHistorianRange({
+                    fromUtc, toUtc, limit: 200000, offset: 0, gateway: "", tag: "",
+                  });
+                  const rows = Array.isArray(res?.rows) ? res.rows : [];
+                  const powerTags = new Set([
+                    "voltage_v","voltage_l1_v","current_a","current_l1_a",
+                    "active_power_w","active_power_total_w","energy_wh","energy_total_wh",
+                    "power_factor","frequency_hz",
+                  ]);
+                  const filtered = rows.filter((r) => {
+                    const tag = String(r?.tag || r?.tag_name || "");
+                    return powerTags.has(tag) || tag.startsWith("insight.") || tag.endsWith("_raw");
+                  });
+                  setPowerHistoryRows(filtered);
+                } catch (_) { /* fall through */ }
+              } else {
+                // Short windows still use the lighter row-count
+                // endpoint so the poll stays cheap.
+                const tagsPerSec = 25;
+                const desired = Math.max(1500, Math.ceil(periodMsLocal / 1000) * tagsPerSec);
+                const lim = Math.min(50000, desired);
+                const histRes = await getPowerHistory(lim, "");
+                if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
+              }
             }
           }
         }
@@ -7162,8 +7190,10 @@ function AppShell() {
     powerHistoryPeriodMsRef.current = periodMs;
   }, [periodMs]);
 
-  // Persist Overview chart heights to localStorage so resizing
-  // survives page-switches (operator 2026-06-16).
+  // Persist Overview chart heights AND every other edit field to
+  // localStorage so resizing + axis settings + legend toggles +
+  // series colors survive page switches and EXE restart
+  // (operator 2026-06-16).
   useEffect(() => {
     try {
       window.localStorage.setItem(
@@ -7174,8 +7204,9 @@ function AppShell() {
           donut: Number(powerChartSettings.donut?.height) || 260,
         })
       );
+      window.localStorage.setItem(POWER_CHART_SETTINGS_LSKEY, JSON.stringify(powerChartSettings || {}));
     } catch (_) {}
-  }, [powerChartSettings.main?.height, powerChartSettings.side?.height, powerChartSettings.donut?.height]);
+  }, [powerChartSettings]);
 
   // Time-of-use tariff resolver. Operator 2026-06-15: Overview cost
   // calculations should consume the configured tariffs, not a single
@@ -7462,7 +7493,12 @@ function AppShell() {
       : nowMs + 60_000;
     const meterSet = new Set((selectedPowerChartMeters || []).map(String));
     const scopedMeterId = String(powerFilterMeterId || "all");
-    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, effectiveInterval, displayTimeZone);
+    // Operator 2026-06-16: the Total Consumption chart's smallest
+    // meaningful bucket is a minute — a second-level kWh bar is
+    // visually noisy and aggregates micro-energy slices that are
+    // below the meter's resolution. Clamp to minute minimum.
+    const sideInterval = effectiveInterval === "second" ? "minute" : effectiveInterval;
+    const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, sideInterval, displayTimeZone);
     const samples = [];
     for (const row of powerHistoryRows || []) {
       const gid = String(row?.gateway_id || "");
@@ -7496,7 +7532,7 @@ function AppShell() {
     // X-axis anchored to "now" (operator 2026-06-15) — see
     // buildAnchoredSkeleton above. Same logic as the main chart so
     // the two charts always share the same X domain.
-    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval, periodMs, displayTimeZone);
+    const skeletonKeys = buildAnchoredSkeleton(sideInterval, periodMs, displayTimeZone);
     for (const k of skeletonKeys) {
       if (!buckets.has(k)) buckets.set(k, { ts: k, total_kwh: 0 });
     }
@@ -7794,6 +7830,23 @@ function AppShell() {
       });
       total_kwh += v.kwh;
       total_cost += v.cost;
+    }
+    // Operator 2026-06-16: the tariff list should show EVERY
+    // configured tariff (so operators can see which ones aren't
+    // hitting in the current window). Pad with zero-usage entries
+    // for any configured tariff that didn't appear in the
+    // breakdown.
+    const seenIndexes = new Set(items.map((x) => x.key));
+    for (let i = 0; i < tariffs.length; i++) {
+      if (!seenIndexes.has(String(i))) {
+        items.push({
+          key: String(i),
+          name: tariffs[i]?.name || `Tariff ${i + 1}`,
+          type: tariffs[i]?.type || "flat",
+          kwh: 0,
+          cost: 0,
+        });
+      }
     }
     items.sort((a, b) => (b.cost || b.kwh) - (a.cost || a.kwh));
     return { items, total_kwh, total_cost };
@@ -18316,9 +18369,18 @@ const getGatewayHealth = (gateway) => {
                             }}
                             labelLine={false}
                           >
-                            {powerTariffBreakdown.items.map((entry, idx) => (
-                              <Cell key={`tariff-slice-${entry.key}`} fill={getSeriesColor(idx)} />
-                            ))}
+                            {powerTariffBreakdown.items.map((entry, idx) => {
+                              // Map by tariff id when possible so the
+                              // operator's chosen colour in the donut
+                              // editor sticks to the right slice. The
+                              // breakdown's `key` is the array index in
+                              // electricity_tariffs which may not match
+                              // the tariff's persisted id — resolve it.
+                              const tariffObj = (powerConfig?.electricity_tariffs || [])[Number(entry.key)] || {};
+                              const tariffId = String(tariffObj.id || entry.key);
+                              const colorOverride = (powerChartSettings.donut?.series_colors || {})[tariffId];
+                              return <Cell key={`tariff-slice-${entry.key}`} fill={colorOverride || getSeriesColor(idx)} />;
+                            })}
                           </Pie>
                           <Tooltip formatter={(v, n, p) => {
                             const item = p?.payload || {};
@@ -18368,11 +18430,15 @@ const getGatewayHealth = (gateway) => {
                   <div className="pwr-tariff-rows">
                     {powerTariffBreakdown.items.length ? (
                       powerTariffBreakdown.items.map((t, idx) => {
-                        const tariffObj = (powerConfig?.electricity_tariffs || []).find((x) => String(x.id) === String(t.key)) || {};
+                        // Resolve tariff via index (the breakdown's
+                        // key is the position inside electricity_tariffs).
+                        const tariffObj = (powerConfig?.electricity_tariffs || [])[Number(t.key)] || (powerConfig?.electricity_tariffs || []).find((x) => String(x.id) === String(t.key)) || {};
+                        const tariffId = String(tariffObj.id || t.key);
                         const sharePct = powerTariffBreakdown.total_kwh > 0
                           ? (Number(t.kwh || 0) / powerTariffBreakdown.total_kwh) * 100
                           : 0;
-                        const color = getSeriesColor(idx);
+                        const colorOverride = (powerChartSettings.donut?.series_colors || {})[tariffId];
+                        const color = colorOverride || getSeriesColor(idx);
                         const typeText = String(t.type || "flat").replace("_", " ");
                         return (
                           <div key={`tariff-row-${t.key}`} className="pwr-tariff-row" style={{ borderLeft: `3px solid ${color}` }}>
@@ -25894,9 +25960,10 @@ const getGatewayHealth = (gateway) => {
         };
         // Donut chart only exposes title, hide-title, mode (€/kWh) and legend.
         if (key === "donut") {
+          const donutColors = current.series_colors || {};
           return (
             <div className="modal-backdrop">
-              <div className="modal-card pwr-modal" style={{ width: "min(420px, 96vw)" }}>
+              <div className="modal-card pwr-modal" style={{ width: "min(520px, 96vw)" }}>
                 <h3>Chart Settings — Donut</h3>
                 <div className="pwr-modal-body">
                   <div className="pwr-section">
@@ -25909,13 +25976,50 @@ const getGatewayHealth = (gateway) => {
                       <input type="checkbox" checked={Boolean(current.hide_title)} onChange={(e) => setField("hide_title", e.target.checked)} />
                       <span>Hide title bar</span>
                     </label>
-                    <label className="pwr-full" style={{ marginTop: 6 }}>
-                      <span>Show value</span>
-                      <select value={current.mode || "cost"} onChange={(e) => setField("mode", e.target.value)}>
-                        <option value="cost">€ Cost</option>
-                        <option value="kwh">kWh</option>
-                      </select>
-                    </label>
+                    <div className="pwr-grid" style={{ marginTop: 6 }}>
+                      <label><span>Show value</span>
+                        <select value={current.mode || "cost"} onChange={(e) => setField("mode", e.target.value)}>
+                          <option value="cost">€ Cost</option>
+                          <option value="kwh">kWh</option>
+                        </select>
+                      </label>
+                      <label><span>Donut size</span>
+                        <select value={String(current.height || 260)} onChange={(e) => setField("height", Number(e.target.value))}>
+                          <option value="220">Small (220px)</option>
+                          <option value="260">Medium (260px)</option>
+                          <option value="320">Large (320px)</option>
+                          <option value="400">XL (400px)</option>
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+                  <div className="pwr-section">
+                    <div className="pwr-section-title">Tariff Colors</div>
+                    {(powerConfig?.electricity_tariffs || []).length === 0 ? (
+                      <div className="muted" style={{ fontSize: 12 }}>
+                        No tariffs configured yet.
+                      </div>
+                    ) : (
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6, alignItems: "center", fontSize: 12 }}>
+                        <span style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase" }}>Tariff</span>
+                        <span style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase" }}>Color</span>
+                        {(powerConfig?.electricity_tariffs || []).map((t, idx) => {
+                          const tariffId = String(t.id || idx);
+                          const color = donutColors[tariffId] || getSeriesColor(idx);
+                          return (
+                            <div key={`donut-color-${tariffId}`} style={{ display: "contents" }}>
+                              <span>{t.name || `Tariff ${idx + 1}`} <span className="muted" style={{ fontSize: 10 }}>({t.type || "flat"})</span></span>
+                              <input
+                                type="color"
+                                value={color}
+                                onChange={(e) => setField("series_colors", { ...donutColors, [tariffId]: e.target.value })}
+                                style={{ width: 30, height: 26, padding: 0, border: "1px solid var(--stroke)", borderRadius: 4 }}
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div className="row modal-actions">
