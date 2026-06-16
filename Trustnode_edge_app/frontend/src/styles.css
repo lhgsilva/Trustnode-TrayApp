@@ -4063,6 +4063,104 @@ input[type="checkbox"] {
   font-size: 12px;
   padding: 6px 4px 0;
 }
+
+/* New tariff row design (operator 2026-06-16). Each tariff is its
+   own card-let with a colored left border, a top row of meta
+   (name + type chip + time window + rate) and a bottom row of
+   metrics (Usage / Cost / Share). A thin share progress bar runs
+   under the row. */
+.pwr-tariff-rows {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 2px;
+}
+.pwr-tariff-row {
+  background: color-mix(in srgb, var(--card) 92%, var(--bg) 8%);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 6px 8px 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.pwr-tariff-row-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  font-size: 12px;
+}
+.pwr-tariff-row-name {
+  font-weight: 700;
+}
+.pwr-tariff-row-chip {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--muted);
+  border: 1px solid var(--stroke);
+}
+.pwr-tariff-row-window {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.pwr-tariff-row-rate {
+  margin-left: auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.pwr-tariff-row-bottom {
+  display: flex;
+  gap: 18px;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.pwr-tariff-row-metric {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.1;
+}
+.pwr-tariff-row-mlabel {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.pwr-tariff-row-mvalue {
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.pwr-tariff-row-share .pwr-tariff-row-mvalue {
+  font-variant-numeric: tabular-nums;
+}
+.pwr-tariff-row-bar {
+  height: 3px;
+  background: color-mix(in srgb, var(--stroke) 60%, transparent);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 2px;
+}
+.pwr-tariff-row-bar-fill {
+  height: 100%;
+  transition: width 200ms ease-out;
+}
+.pwr-tariff-total {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-top: 1px solid var(--stroke);
+  padding: 8px 6px 4px;
+  font-size: 12.5px;
+}
 .pwr-tariff-list-card .pwr-tariff-list-head {
   font-size: 10.5px;
   letter-spacing: 0.04em;

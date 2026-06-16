@@ -2779,7 +2779,19 @@ function AppShell() {
   const [powerDonutMode, setPowerDonutMode] = useState("cost");
   // Overview chart settings (operator 2026-06-15: edit chart info on
   // hover — title, type, axis, limits, series). Keys: "main" / "side".
-  const [powerChartSettings, setPowerChartSettings] = useState({
+  // Heights persist to localStorage so resizing the cards isn't lost
+  // every time the operator switches pages (operator 2026-06-16).
+  const POWER_CHART_HEIGHT_LSKEY = "tn_power_chart_heights_v1";
+  const [powerChartSettings, setPowerChartSettings] = useState(() => {
+    let storedHeights = {};
+    try {
+      const raw = typeof window !== "undefined" ? window.localStorage.getItem(POWER_CHART_HEIGHT_LSKEY) : null;
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") storedHeights = parsed;
+      }
+    } catch (_) {}
+    return {
     main: {
       title: "",
       hide_title: false,
@@ -2793,7 +2805,7 @@ function AppShell() {
       y2_label: "",
       y2_unit: "",
       // Persisted drag-resize height (operator 2026-06-15).
-      height: 360,
+      height: Number(storedHeights.main) || 360,
       // Parity with the dashboard widget editor.
       interpolation: "stepAfter",
       readings_count: 200,
@@ -2813,7 +2825,7 @@ function AppShell() {
       y2_min: "", y2_max: "",
       y2_label: "",
       y2_unit: "",
-      height: 280,
+      height: Number(storedHeights.side) || 280,
       interpolation: "stepAfter",
       readings_count: 200,
       color_mode: "default",
@@ -2826,8 +2838,9 @@ function AppShell() {
       hide_title: false,
       mode: "cost", // "cost" or "kwh"
       show_legend: true,
-      height: 260,
+      height: Number(storedHeights.donut) || 260,
     },
+    };
   });
   const [chartSettingsOpenKey, setChartSettingsOpenKey] = useState("");
   const [powerMainMetric, setPowerMainMetric] = useState("power_kw");
@@ -7148,6 +7161,21 @@ function AppShell() {
   useEffect(() => {
     powerHistoryPeriodMsRef.current = periodMs;
   }, [periodMs]);
+
+  // Persist Overview chart heights to localStorage so resizing
+  // survives page-switches (operator 2026-06-16).
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        POWER_CHART_HEIGHT_LSKEY,
+        JSON.stringify({
+          main: Number(powerChartSettings.main?.height) || 360,
+          side: Number(powerChartSettings.side?.height) || 280,
+          donut: Number(powerChartSettings.donut?.height) || 260,
+        })
+      );
+    } catch (_) {}
+  }, [powerChartSettings.main?.height, powerChartSettings.side?.height, powerChartSettings.donut?.height]);
 
   // Time-of-use tariff resolver. Operator 2026-06-15: Overview cost
   // calculations should consume the configured tariffs, not a single
@@ -18264,11 +18292,11 @@ const getGatewayHealth = (gateway) => {
                             data={powerTariffBreakdown.items}
                             dataKey={(powerChartSettings.donut?.mode || "cost") === "cost" ? "cost" : "kwh"}
                             nameKey="name"
-                            innerRadius="50%"
-                            outerRadius="78%"
+                            innerRadius={Number(powerChartSettings.donut?.height || 260) < 240 ? "55%" : "50%"}
+                            outerRadius={Number(powerChartSettings.donut?.height || 260) < 240 ? "82%" : "75%"}
                             paddingAngle={2}
                             isAnimationActive={false}
-                            label={(props) => {
+                            label={Number(powerChartSettings.donut?.height || 260) < 220 ? false : (props) => {
                               const total = (powerChartSettings.donut?.mode || "cost") === "cost"
                                 ? powerTariffBreakdown.total_cost
                                 : powerTariffBreakdown.total_kwh;
@@ -18276,10 +18304,13 @@ const getGatewayHealth = (gateway) => {
                                 ? props.payload.cost
                                 : props.payload.kwh;
                               const pct = total > 0 ? (value / total) * 100 : 0;
-                              if (pct < 4) return null; // skip tiny slices
+                              if (pct < 5) return null; // skip tiny slices
+                              const label = Number(powerChartSettings.donut?.height || 260) < 280
+                                ? `${pct.toFixed(0)}%`
+                                : `${props.payload.name} ${pct.toFixed(1)}%`;
                               return (
                                 <text x={props.x} y={props.y} fill="var(--text)" textAnchor={props.x > props.cx ? "start" : "end"} dominantBaseline="central" fontSize={11}>
-                                  {`${props.payload.name} ${pct.toFixed(1)}%`}
+                                  {label}
                                 </text>
                               );
                             }}
@@ -18334,47 +18365,57 @@ const getGatewayHealth = (gateway) => {
                   <div className="row trend-header-row">
                     <h3 style={{ marginTop: 0, marginBottom: 0 }}>Tariff Rates &amp; Costs</h3>
                   </div>
-                  <div className="pwr-tariff-list">
-                    <span className="pwr-tariff-list-head">Tariff</span>
-                    <span className="pwr-tariff-list-head pwr-tariff-list-value">Rate</span>
-                    <span className="pwr-tariff-list-head pwr-tariff-list-value">Window</span>
-                    <span className="pwr-tariff-list-head pwr-tariff-list-value">kWh</span>
-                    <span className="pwr-tariff-list-head pwr-tariff-list-value">€</span>
-                    <span className="pwr-tariff-list-head pwr-tariff-list-value">%</span>
+                  <div className="pwr-tariff-rows">
                     {powerTariffBreakdown.items.length ? (
                       powerTariffBreakdown.items.map((t, idx) => {
                         const tariffObj = (powerConfig?.electricity_tariffs || []).find((x) => String(x.id) === String(t.key)) || {};
                         const sharePct = powerTariffBreakdown.total_kwh > 0
                           ? (Number(t.kwh || 0) / powerTariffBreakdown.total_kwh) * 100
                           : 0;
+                        const color = getSeriesColor(idx);
+                        const typeText = String(t.type || "flat").replace("_", " ");
                         return (
-                          <div key={`tariff-list-${t.key}`} style={{ display: "contents" }}>
-                            <span title={`${t.name} • ${t.type}`}>
-                              <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 2, background: getSeriesColor(idx), marginRight: 6 }} />
-                              {t.name}
-                              <span className="muted" style={{ fontSize: 10, marginLeft: 4 }}>({String(t.type).replace("_", " ")})</span>
-                            </span>
-                            <span className="pwr-tariff-list-value">€{Number(tariffObj.rate_eur_kwh || 0).toFixed(3)}</span>
-                            <span className="pwr-tariff-list-value muted" style={{ fontSize: 11 }}>{tariffObj.start_time || "—"}–{tariffObj.end_time || "—"}</span>
-                            <span className="pwr-tariff-list-value">{Number(t.kwh || 0).toFixed(3)}</span>
-                            <span className="pwr-tariff-list-value">{Number(t.cost || 0).toFixed(2)}</span>
-                            <span className="pwr-tariff-list-value muted">{sharePct.toFixed(1)}%</span>
+                          <div key={`tariff-row-${t.key}`} className="pwr-tariff-row" style={{ borderLeft: `3px solid ${color}` }}>
+                            <div className="pwr-tariff-row-top">
+                              <span className="pwr-tariff-row-name">{t.name}</span>
+                              <span className="pwr-tariff-row-chip">{typeText}</span>
+                              <span className="pwr-tariff-row-window">
+                                {tariffObj.start_time || "—"} – {tariffObj.end_time || "—"}
+                              </span>
+                              <span className="pwr-tariff-row-rate">€{Number(tariffObj.rate_eur_kwh || 0).toFixed(3)}/kWh</span>
+                            </div>
+                            <div className="pwr-tariff-row-bottom">
+                              <span className="pwr-tariff-row-metric">
+                                <span className="pwr-tariff-row-mlabel">Usage</span>
+                                <span className="pwr-tariff-row-mvalue">{Number(t.kwh || 0).toFixed(3)} kWh</span>
+                              </span>
+                              <span className="pwr-tariff-row-metric">
+                                <span className="pwr-tariff-row-mlabel">Cost</span>
+                                <span className="pwr-tariff-row-mvalue">€{Number(t.cost || 0).toFixed(2)}</span>
+                              </span>
+                              <span className="pwr-tariff-row-metric pwr-tariff-row-share">
+                                <span className="pwr-tariff-row-mlabel">Share</span>
+                                <span className="pwr-tariff-row-mvalue">{sharePct.toFixed(1)}%</span>
+                              </span>
+                            </div>
+                            <div className="pwr-tariff-row-bar">
+                              <div className="pwr-tariff-row-bar-fill" style={{ width: `${Math.min(100, sharePct)}%`, background: color }} />
+                            </div>
                           </div>
                         );
                       })
                     ) : (
-                      <div className="muted" style={{ gridColumn: "1 / -1", padding: 14, textAlign: "center" }}>
+                      <div className="muted" style={{ padding: 14, textAlign: "center" }}>
                         No tariff usage in the selected window.
                       </div>
                     )}
                   </div>
-                  <div className="meta" style={{ padding: "4px 4px 0", marginTop: 6, borderTop: "1px solid var(--stroke)", display: "grid", gridTemplateColumns: "1fr auto auto auto auto auto", gap: "4px 12px" }}>
-                    <span><strong>Total</strong></span>
-                    <span></span>
-                    <span></span>
-                    <span className="pwr-tariff-list-value"><strong>{powerTariffBreakdown.total_kwh.toFixed(3)} kWh</strong></span>
-                    <span className="pwr-tariff-list-value"><strong>€{powerTariffBreakdown.total_cost.toFixed(2)}</strong></span>
-                    <span></span>
+                  <div className="pwr-tariff-total">
+                    <span className="pwr-tariff-row-mlabel">Total</span>
+                    <span>
+                      <strong>{powerTariffBreakdown.total_kwh.toFixed(3)} kWh</strong>
+                      <span className="muted" style={{ marginLeft: 10 }}>€{powerTariffBreakdown.total_cost.toFixed(2)}</span>
+                    </span>
                   </div>
                 </article>
                 </div>{/* /pwr-row-two */}
