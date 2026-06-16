@@ -639,24 +639,19 @@ class PowerManager:
         if not raw_values:
             raise RuntimeError("Read failed for all configured registers")
 
-        ct_ratio = 1.0
-        vt_ratio = 1.0
-        if bool(device.get("ct_connected", True)):
-            ct_ratio = float(device.get("ct_primary") or 1.0) / max(float(device.get("ct_secondary") or 1.0), 0.0001)
-        if bool(device.get("voltage_connected", True)):
-            vt_ratio = float(device.get("vt_primary") or 1.0) / max(float(device.get("vt_secondary") or 1.0), 0.0001)
-        ratio = ct_ratio * vt_ratio
-
+        # Operator 2026-06-16: modern power meters (Weidmüller EM525,
+        # Carlo Gavazzi EM340/530, Schneider iEM/PM, Janitza UMG…)
+        # report PRIMARY-side values directly when the CTs are
+        # configured on the meter. Multiplying by ct_primary /
+        # ct_secondary in the gateway double-counts. Read whatever
+        # the meter publishes and only apply the per-register
+        # divider (`register_scales[key]`) when the operator needs
+        # to compensate for an unusual register encoding (e.g.
+        # "energy in 0.1 kWh units" → scale 10). Default is 1.0
+        # i.e. pass-through.
         values_scaled: dict[str, float] = {}
         for key in list(raw_values.keys()):
-            low = key.lower()
             value = raw_values[key]
-            if "current" in low:
-                value = value * ct_ratio
-            elif "voltage" in low:
-                value = value * vt_ratio
-            elif "power" in low or "energy" in low:
-                value = value * ratio
             reg_scale = float(register_scales.get(key) or 1.0)
             if reg_scale == 0:
                 reg_scale = 1.0
@@ -1380,24 +1375,12 @@ class PowerManager:
                         "error": str(exc),
                     }
 
-            ct_ratio = 1.0
-            vt_ratio = 1.0
-            if bool(target.get("ct_connected", True)):
-                ct_ratio = float(target.get("ct_primary") or 1.0) / max(float(target.get("ct_secondary") or 1.0), 0.0001)
-            if bool(target.get("voltage_connected", True)):
-                vt_ratio = float(target.get("vt_primary") or 1.0) / max(float(target.get("vt_secondary") or 1.0), 0.0001)
-            ratio = ct_ratio * vt_ratio
-
+            # CT/VT auto-scaling dropped 2026-06-16 — see comment in
+            # _read_device. Pass meter values through; apply only the
+            # per-register divider.
             values_scaled: dict[str, float] = {}
             for key in list(values_raw.keys()):
-                low = key.lower()
                 value = values_raw[key]
-                if "current" in low:
-                    value = value * ct_ratio
-                elif "voltage" in low:
-                    value = value * vt_ratio
-                elif "power" in low or "energy" in low:
-                    value = value * ratio
                 reg_scale = float(reg_scales.get(key) or 1.0)
                 if reg_scale == 0:
                     reg_scale = 1.0
