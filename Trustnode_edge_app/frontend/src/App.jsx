@@ -3340,6 +3340,15 @@ function AppShell() {
   const cloudLastAcceptedTsByKeyRef = useRef(new Map());
   const cloudPollLogThrottleRef = useRef({ live: 0, aux: 0 });
   const powerHistoryLastFetchMsRef = useRef(0);
+  // Single-flight guard for the wide-window range fetch. Without
+  // this, a slow query (~1s for 24 h) can be re-issued by the next
+  // 1 Hz poll tick, piling up duplicate work and choking the UI.
+  const powerHistoryFetchInflightRef = useRef(false);
+  // Skip the historian fetch entirely when no meter is configured
+  // (operator 2026-06-16). Without this guard the Overview poll
+  // still hits the historian endpoint every 2 s even on a brand-
+  // new install with no devices — wastes CPU and disk IO.
+  const powerHistoryHasDevicesRef = useRef(false);
   // Mirror of periodMs for the poll effect — periodMs is declared
   // later than this effect's closure can capture, so we keep it
   // in a ref updated via a separate useEffect below.
@@ -6959,18 +6968,24 @@ function AppShell() {
           // last-1500-row tail.
           if (activePage === "power_overview" && powerViewMode === "historical") {
             // no-op
+          } else if (powerHistoryFetchInflightRef.current) {
+            // A previous poll is still running — let it finish.
+          } else if (!powerHistoryHasDevicesRef.current) {
+            // No meter configured — historian fetch is pointless.
           } else {
             const nowMs = Date.now();
             const periodMsLocal = Number(powerHistoryPeriodMsRef.current || 60000);
             // Operator 2026-06-16: wide windows are expensive, so
             // throttle the refetch in proportion to the period.
-            // Short windows refresh every 2s; long ones every 5-10s
-            // so the UI stays smooth.
+            // Short windows refresh every 2s; long ones every
+            // 5-15s so the UI stays smooth.
             const throttleMs = periodMsLocal <= 5 * 60 * 1000 ? 2000
                               : periodMsLocal <= 60 * 60 * 1000 ? 5000
-                              : 10000;
+                              : periodMsLocal <= 6 * 60 * 60 * 1000 ? 10000
+                              : 15000;
             if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= throttleMs) {
               powerHistoryLastFetchMsRef.current = nowMs;
+              powerHistoryFetchInflightRef.current = true;
               if (periodMsLocal > 15 * 60 * 1000) {
                 // For wide periods, hit the historian range
                 // endpoint scoped to power-related tags via the
@@ -7007,13 +7022,17 @@ function AppShell() {
                 const tagsPerSec = 25;
                 const desired = Math.max(1500, Math.ceil(periodMsLocal / 1000) * tagsPerSec);
                 const lim = Math.min(50000, desired);
-                const histRes = await getPowerHistory(lim, "");
-                if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
+                try {
+                  const histRes = await getPowerHistory(lim, "");
+                  if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
+                } catch (_) {}
               }
+              powerHistoryFetchInflightRef.current = false;
             }
           }
         }
       } catch (err) {
+        powerHistoryFetchInflightRef.current = false;
         if (!stopped) {
           setPowerStatus((prev) => ({
             ...(prev || {}),
@@ -7204,6 +7223,12 @@ function AppShell() {
   useEffect(() => {
     powerHistoryPeriodMsRef.current = periodMs;
   }, [periodMs]);
+
+  // Mirror "any meter configured?" into a ref so the poll effect
+  // can skip the historian fetch on installs with no devices.
+  useEffect(() => {
+    powerHistoryHasDevicesRef.current = Array.isArray(powerConfig?.devices) && powerConfig.devices.length > 0;
+  }, [powerConfig?.devices]);
 
   // Persist Overview chart heights AND every other edit field to
   // localStorage so resizing + axis settings + legend toggles +
