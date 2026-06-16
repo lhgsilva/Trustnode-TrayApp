@@ -3319,6 +3319,10 @@ function AppShell() {
   const cloudLastAcceptedTsByKeyRef = useRef(new Map());
   const cloudPollLogThrottleRef = useRef({ live: 0, aux: 0 });
   const powerHistoryLastFetchMsRef = useRef(0);
+  // Mirror of periodMs for the poll effect — periodMs is declared
+  // later than this effect's closure can capture, so we keep it
+  // in a ref updated via a separate useEffect below.
+  const powerHistoryPeriodMsRef = useRef(60 * 60 * 1000);
   const tagAlarmPrefsRef = useRef({});
   const emailSettingsRef = useRef({});
   const historianOutboxRef = useRef([]);
@@ -6938,7 +6942,17 @@ function AppShell() {
             const nowMs = Date.now();
             if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= 2000) {
               powerHistoryLastFetchMsRef.current = nowMs;
-              const histRes = await getPowerHistory(1500, "");
+              // Operator 2026-06-16: short windows (Last 1m, Last 5m)
+              // were rendering empty because the fetch was hard-coded
+              // to 1500 rows — only ~70 s of history at the 21 tags
+              // / 1 Hz the meter emits. Scale the fetch to the
+              // active periodMs so Last 5m gets ~300s * 21 = 6300
+              // rows worth of history. Capped at 50000 server-side.
+              const tagsPerSec = 25;
+              const periodMsLocal = Number(powerHistoryPeriodMsRef.current || 60000);
+              const desired = Math.max(1500, Math.ceil(periodMsLocal / 1000) * tagsPerSec);
+              const lim = Math.min(50000, desired);
+              const histRes = await getPowerHistory(lim, "");
               if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
             }
           }
@@ -7128,11 +7142,12 @@ function AppShell() {
 
   const effectiveInterval = useMemo(() => powerInterval, [powerInterval]);
 
+  // Keep the poll effect's periodMs in sync via a ref (the
+  // pollPower closure is declared earlier in the file so a direct
+  // capture of periodMs would be a TDZ violation).
   useEffect(() => {
-    if (powerViewMode !== "realtime") return;
-    if (["1h", "6h", "24h"].includes(String(powerPeriod || ""))) return;
-    setPowerPeriod("24h");
-  }, [powerViewMode, powerPeriod]);
+    powerHistoryPeriodMsRef.current = periodMs;
+  }, [periodMs]);
 
   // Time-of-use tariff resolver. Operator 2026-06-15: Overview cost
   // calculations should consume the configured tariffs, not a single
@@ -17722,7 +17737,22 @@ const getGatewayHealth = (gateway) => {
                   <span>Period</span>
                   <select
                     value={powerPeriod}
-                    onChange={(e) => setPowerPeriod(e.target.value)}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      setPowerPeriod(next);
+                      // Auto-pick a sensible Interval grain for the
+                      // new period (operator 2026-06-16). The
+                      // operator can still override after.
+                      const periodMsMap = Object.fromEntries(POWER_PERIOD_OPTIONS.map((p) => [p.value, p.ms]));
+                      const ms = periodMsMap[next] || 60 * 60 * 1000;
+                      const pick =
+                        ms <= 5 * 60 * 1000 ? "second"   // <= 5 minutes
+                        : ms <= 2 * 60 * 60 * 1000 ? "minute" // <= 2 hours
+                        : ms <= 2 * 24 * 60 * 60 * 1000 ? "hour" // <= 2 days
+                        : ms <= 90 * 24 * 60 * 60 * 1000 ? "day" // <= ~3 months
+                        : "month";
+                      setPowerInterval(pick);
+                    }}
                     disabled={powerViewMode === "historical"}
                   >
                     {POWER_PERIOD_OPTIONS.map((p) => (

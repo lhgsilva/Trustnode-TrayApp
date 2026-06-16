@@ -205,7 +205,7 @@ def get_power_latest(request: Request, device_id: str = "") -> dict:
 
 @router.get("/history")
 def get_power_history(request: Request, limit: int = 300, device_id: str = "") -> dict:
-    lim = max(1, min(int(limit or 300), 5000))
+    lim = max(1, min(int(limit or 300), 50000))
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
     prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
     rows = app_store.get_historian_rows(limit=max(lim * 8, 800), prefer_cloud_reads=prefer_cloud_reads)
