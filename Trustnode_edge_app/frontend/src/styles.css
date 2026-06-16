@@ -4064,18 +4064,107 @@ input[type="checkbox"] {
   padding: 6px 4px 0;
 }
 
-/* New tariff row design (operator 2026-06-16). Each tariff is its
-   own card-let with a colored left border, a top row of meta
-   (name + type chip + time window + rate) and a bottom row of
-   metrics (Usage / Cost / Share). A thin share progress bar runs
-   under the row. */
+/* Compact single-row tariff design (operator 2026-06-16: "save
+   vertical space, more horizontal columns"). One CSS grid row per
+   tariff; everything fits in one line. */
 .pwr-tariff-rows {
   flex: 1 1 auto;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
   padding: 4px 2px;
+}
+.pwr-tariff-row-compact {
+  display: grid;
+  grid-template-columns: 8px minmax(110px, 1.4fr) auto auto auto auto 46px;
+  align-items: center;
+  gap: 0 10px;
+  padding: 3px 4px;
+  font-size: 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--stroke) 50%, transparent);
+}
+.pwr-tariff-row-c-header {
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--stroke);
+  padding-bottom: 4px;
+}
+.pwr-tariff-row-c-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 18px;
+  border-radius: 2px;
+}
+.pwr-tariff-row-c-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pwr-tariff-row-c-window,
+.pwr-tariff-row-c-rate,
+.pwr-tariff-row-c-kwh,
+.pwr-tariff-row-c-cost,
+.pwr-tariff-row-c-share {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+.pwr-tariff-row-c-window {
+  font-size: 11px;
+  color: var(--muted);
+}
+.pwr-tariff-row-c-rate {
+  font-size: 11px;
+  color: var(--muted);
+}
+.pwr-tariff-row-c-share {
+  font-weight: 600;
+}
+
+/* Horizontal-bar variant of the tariff donut card (operator
+   2026-06-16: "show vertical chart where the bar goes horizontal
+   from left to right and on the right the labels of values"). */
+.pwr-tariff-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  padding: 8px 10px;
+  overflow-y: auto;
+}
+.pwr-tariff-bar-row {
+  display: grid;
+  grid-template-columns: minmax(70px, 0.9fr) 1.6fr minmax(80px, 0.9fr);
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.pwr-tariff-bar-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+}
+.pwr-tariff-bar-track {
+  height: 16px;
+  background: color-mix(in srgb, var(--stroke) 50%, transparent);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.pwr-tariff-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 200ms ease-out;
+}
+.pwr-tariff-bar-value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .pwr-tariff-row {
   background: color-mix(in srgb, var(--card) 92%, var(--bg) 8%);
