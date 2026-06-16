@@ -6961,38 +6961,49 @@ function AppShell() {
             // no-op
           } else {
             const nowMs = Date.now();
-            if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= 2000) {
+            const periodMsLocal = Number(powerHistoryPeriodMsRef.current || 60000);
+            // Operator 2026-06-16: wide windows are expensive, so
+            // throttle the refetch in proportion to the period.
+            // Short windows refresh every 2s; long ones every 5-10s
+            // so the UI stays smooth.
+            const throttleMs = periodMsLocal <= 5 * 60 * 1000 ? 2000
+                              : periodMsLocal <= 60 * 60 * 1000 ? 5000
+                              : 10000;
+            if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= throttleMs) {
               powerHistoryLastFetchMsRef.current = nowMs;
-              const periodMsLocal = Number(powerHistoryPeriodMsRef.current || 60000);
-              // Operator 2026-06-16: wide periods (1h+) were
-              // showing only the most recent ~40 min on the Live
-              // chart because /api/power/history is row-bounded.
-              // Switch to the historian range endpoint when the
-              // requested period exceeds 15 min — it fetches by
-              // time window not row count, so a full hour or day
-              // arrives intact.
               if (periodMsLocal > 15 * 60 * 1000) {
+                // For wide periods, hit the historian range
+                // endpoint scoped to power-related tags via the
+                // tag-LIKE filter so the SQL prefilter trims most
+                // of the rows server-side. Then trim further on
+                // the client (insight.* + _raw tags). The endpoint
+                // accepts at most 50000 rows per call (server cap),
+                // so multiple narrow tag queries are cheaper than
+                // one mega query.
                 try {
                   const fromUtc = new Date(nowMs - periodMsLocal).toISOString();
                   const toUtc = new Date(nowMs + 60_000).toISOString();
-                  const res = await getAppStoreHistorianRange({
-                    fromUtc, toUtc, limit: 200000, offset: 0, gateway: "", tag: "",
-                  });
-                  const rows = Array.isArray(res?.rows) ? res.rows : [];
-                  const powerTags = new Set([
-                    "voltage_v","voltage_l1_v","current_a","current_l1_a",
-                    "active_power_w","active_power_total_w","energy_wh","energy_total_wh",
-                    "power_factor","frequency_hz",
+                  // Single tag-LIKE pull. The historian column is
+                  // case-insensitive LIKE; we only need active power
+                  // + voltage + current for the Live chart.
+                  const fetchTag = async (pattern) => {
+                    try {
+                      const res = await getAppStoreHistorianRange({
+                        fromUtc, toUtc, limit: 50000, offset: 0, tag: pattern,
+                      });
+                      return Array.isArray(res?.rows) ? res.rows : [];
+                    } catch { return []; }
+                  };
+                  const [powerRows, voltRows, currRows, insightRows] = await Promise.all([
+                    fetchTag("active_power"),
+                    fetchTag("voltage"),
+                    fetchTag("current"),
+                    fetchTag("insight."),
                   ]);
-                  const filtered = rows.filter((r) => {
-                    const tag = String(r?.tag || r?.tag_name || "");
-                    return powerTags.has(tag) || tag.startsWith("insight.") || tag.endsWith("_raw");
-                  });
-                  setPowerHistoryRows(filtered);
+                  setPowerHistoryRows([...powerRows, ...voltRows, ...currRows, ...insightRows]);
                 } catch (_) { /* fall through */ }
               } else {
-                // Short windows still use the lighter row-count
-                // endpoint so the poll stays cheap.
+                // Short windows: lighter row-count endpoint.
                 const tagsPerSec = 25;
                 const desired = Math.max(1500, Math.ceil(periodMsLocal / 1000) * tagsPerSec);
                 const lim = Math.min(50000, desired);

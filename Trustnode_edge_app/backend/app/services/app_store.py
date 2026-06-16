@@ -729,7 +729,14 @@ class AppStore:
                 dt = dt.replace(tzinfo=timezone.utc)
             else:
                 dt = dt.astimezone(timezone.utc)
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
+            # Operator 2026-06-16: ts_utc column stores ISO format
+            # with `T` separator + microseconds + +00:00, e.g.
+            # "2026-06-16T09:06:35.270897+00:00". Returning the
+            # legacy "YYYY-MM-DD HH:MM:SS" format made lexicographic
+            # comparisons against ISO rows wrong (every row's `T`
+            # > the filter's space, so `ts_utc <= :to_utc` excluded
+            # everything). Emit ISO matching the column shape.
+            return dt.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
         except Exception:
             return ""
 
