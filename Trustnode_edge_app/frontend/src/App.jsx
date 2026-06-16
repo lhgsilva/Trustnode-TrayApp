@@ -3350,6 +3350,13 @@ function AppShell() {
   // data. This is the biggest UI speedup on idle (operator
   // 2026-06-16: "UI is extreme slow").
   const powerHistoryIdentityRef = useRef({ len: 0, lastId: 0 });
+  // Last-serialised snapshot of powerConfig / powerStatus from
+  // the poll so we can skip setState when bytes are identical
+  // (operator 2026-06-16: each unchanged poll was re-triggering
+  // every chart memo over 1500+ rows because React saw a new
+  // object reference even when the JSON was identical).
+  const powerConfigJsonRef = useRef("");
+  const powerStatusJsonRef = useRef("");
   // Skip the historian fetch entirely when no meter is configured
   // (operator 2026-06-16). Without this guard the Overview poll
   // still hits the historian endpoint every 2 s even on a brand-
@@ -6809,7 +6816,7 @@ function AppShell() {
           if (cfgRes?.ok && cfgRes?.config) {
             const cfg = cfgRes.config || {};
             const cfgDevices = Array.isArray(cfg.devices) ? cfg.devices : [];
-            setPowerConfig({
+            const nextCfg = {
               ...cfg,
               devices: cfgDevices.map((d) => {
                 const registers = d?.registers && typeof d.registers === "object" ? d.registers : {};
@@ -6819,9 +6826,37 @@ function AppShell() {
                   register_scales: buildRegisterScaleMap(registers, d?.register_scales || {}),
                 };
               }),
-            });
+            };
+            // Operator 2026-06-16: setPowerConfig fired on every
+            // poll with a fresh object reference even when the
+            // config bytes hadn't changed. Every memo that
+            // depended on powerConfig (chart data, KPIs, donut,
+            // …) re-ran over 1500+ rows — that's the multi-second
+            // UI lag. Skip the setState when the serialised
+            // payload matches the previous one.
+            try {
+              const next = JSON.stringify(nextCfg);
+              if (powerConfigJsonRef.current !== next) {
+                powerConfigJsonRef.current = next;
+                setPowerConfig(nextCfg);
+              }
+            } catch (_) {
+              setPowerConfig(nextCfg);
+            }
           }
-          if (statusRes?.ok && statusRes?.status) setPowerStatus(statusRes.status);
+          if (statusRes?.ok && statusRes?.status) {
+            // Same trick for powerStatus — it's polled at 1 Hz and
+            // many memos depend on it. Skip when bytes unchanged.
+            try {
+              const nextStatus = JSON.stringify(statusRes.status);
+              if (powerStatusJsonRef.current !== nextStatus) {
+                powerStatusJsonRef.current = nextStatus;
+                setPowerStatus(statusRes.status);
+              }
+            } catch (_) {
+              setPowerStatus(statusRes.status);
+            }
+          }
           const selectedDeviceId = String(cfgRes?.config?.selected_device_id || "");
           const selectedSample =
             latestByDevice.find((s) => String(s.deviceId) === selectedDeviceId)?.sample ||
@@ -7193,10 +7228,22 @@ function AppShell() {
   useEffect(() => {
     const deviceIds = (powerConfig?.devices || []).map((d) => String(d?.id || "")).filter(Boolean);
     setSelectedPowerChartMeters((prev) => {
-      const prevSet = new Set((prev || []).map(String));
+      const prevArr = prev || [];
+      const prevSet = new Set(prevArr.map(String));
       const kept = deviceIds.filter((id) => prevSet.has(id));
-      if (kept.length) return kept;
-      return deviceIds;
+      const next = kept.length ? kept : deviceIds;
+      // Operator 2026-06-16: return the SAME array reference when
+      // the contents are unchanged so chart memos don't refire on
+      // every config poll. The previous code always returned a
+      // new array, invalidating every consumer.
+      if (prevArr.length === next.length) {
+        let same = true;
+        for (let i = 0; i < next.length; i++) {
+          if (String(prevArr[i]) !== String(next[i])) { same = false; break; }
+        }
+        if (same) return prevArr;
+      }
+      return next;
     });
   }, [powerConfig]);
 
