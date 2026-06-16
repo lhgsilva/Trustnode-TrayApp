@@ -7336,8 +7336,13 @@ function AppShell() {
       if (!b.meterBuckets[gid]) b.meterBuckets[gid] = [];
       b.meterBuckets[gid].push(raw * scale);
     }
+    // Operator 2026-06-16: return null (NOT 0) for empty buckets
+    // so Recharts treats the trailing edge as "no data yet" instead
+    // of "dropped to zero". The Live chart was diving to 0 at the
+    // right edge because the rightmost ~2 s bucket usually hadn't
+    // received its sample yet (poll throttle).
     const aggFn = (arr) => {
-      if (!arr?.length) return 0;
+      if (!arr?.length) return null;
       if (powerAggregation === "max") return Math.max(...arr);
       if (powerAggregation === "min") return Math.min(...arr);
       if (powerAggregation === "sum") return arr.reduce((a, n) => a + n, 0);
@@ -7370,12 +7375,18 @@ function AppShell() {
       }
     }
     const rows = Array.from(buckets.values()).map((b) => {
-      const row = { ts: b.ts, total: 0 };
+      const row = { ts: b.ts };
+      let totalAny = false;
+      let totalSum = 0;
       for (const gid of meterIds) {
         const v = aggFn(b.meterBuckets[gid] || []);
         row[gid] = v;
-        row.total += v;
+        if (v != null && Number.isFinite(v)) {
+          totalAny = true;
+          totalSum += v;
+        }
       }
+      row.total = totalAny ? totalSum : null;
       return row;
     });
     rows.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
@@ -7470,16 +7481,17 @@ function AppShell() {
     }
     const sorted = Array.from(buckets.values())
       .sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
-    // Operator 2026-06-15: chart 2 shows the ACCUMULATED total over
-    // the filtered window, not the per-bucket value. Each bar is
-    // the running sum up to and including that bucket.
-    let running = 0;
+    // Operator 2026-06-16: chart 2 shows the PER-BUCKET energy
+    // total — what was consumed inside each minute / hour / day
+    // bucket. Matches industry "interval consumption" charts.
+    // The cumulative line lives on the KPI strip (Total Power
+    // Usage).
     const rows = sorted.map((r) => {
-      running += Number(r.total_kwh || 0);
+      const kwh = Number(r.total_kwh || 0);
       return {
         ts: r.ts,
-        total_kwh: running,
-        total_cost: running * powerCostPerKwh,
+        total_kwh: kwh,
+        total_cost: kwh * powerCostPerKwh,
       };
     });
     return { rows, keys: ["total_kwh", "total_cost"], showPhases: false };
@@ -17844,9 +17856,15 @@ const getGatewayHealth = (gateway) => {
                   // font. Delta arrows compare to the prior window
                   // and colour by "what's good for the metric".
                   const fmtPct = (v) => `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
+                  // positiveGood: true  = up is good (efficiency)
+                  //               false = up is bad (cost, usage, peak, downtime)
+                  //               null  = no value judgement (live readings)
                   const arrow = (v, positiveGood) => {
                     if (v == null || !Number.isFinite(v) || v === 0) return { icon: "→", cls: "pwr-delta-flat" };
                     const up = v > 0;
+                    if (positiveGood === null) {
+                      return { icon: up ? "↑" : "↓", cls: "pwr-delta-flat" };
+                    }
                     const good = positiveGood ? up : !up;
                     return { icon: up ? "↑" : "↓", cls: good ? "pwr-delta-good" : "pwr-delta-bad" };
                   };
@@ -17887,17 +17905,17 @@ const getGatewayHealth = (gateway) => {
                       <div className="stat-card power-insight-card power-insight-live">
                         <div className="stat-title">Current (A)</div>
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(liveCurrentA, 2)}</span><span className="power-insight-unit">A</span></div>
-                        {renderDelta(liveCurrentA, powerKpisPrevious.liveCurrentA, false)}
+                        {renderDelta(liveCurrentA, powerKpisPrevious.liveCurrentA, null)}
                       </div>
                       <div className="stat-card power-insight-card power-insight-live">
                         <div className="stat-title">Active Power (kW)</div>
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(liveKw, 2)}</span><span className="power-insight-unit">kW</span></div>
-                        {renderDelta(liveKw, powerKpisPrevious.liveKw, false)}
+                        {renderDelta(liveKw, powerKpisPrevious.liveKw, null)}
                       </div>
                       <div className="stat-card power-insight-card power-insight-energy">
                         <div className="stat-title">Power Usage (kWh)</div>
                         <div className="power-insight-value-row"><span className="stat-value">{formatMetricValue(livePowerUsageKwh, 2)}</span><span className="power-insight-unit">kWh</span></div>
-                        {renderDelta(livePowerUsageKwh, powerKpisPrevious.totalEnergyKwh, false)}
+                        {renderDelta(livePowerUsageKwh, powerKpisPrevious.totalEnergyKwh, null)}
                       </div>
                       <div className="stat-card power-insight-card power-insight-eff">
                         <div className="stat-title">Energy Efficiency (%)</div>
@@ -18237,18 +18255,35 @@ const getGatewayHealth = (gateway) => {
                       </button>
                     </div>
                   </div>
-                  <div className="chart-wrap">
+                  <div className="chart-wrap" style={{ position: "relative" }}>
                     {powerTariffBreakdown.items.length ? (
+                      <>
                       <ResponsiveContainer width="100%" height="100%" minHeight={260}>
                         <PieChart>
                           <Pie
                             data={powerTariffBreakdown.items}
                             dataKey={(powerChartSettings.donut?.mode || "cost") === "cost" ? "cost" : "kwh"}
                             nameKey="name"
-                            innerRadius="42%"
-                            outerRadius="68%"
+                            innerRadius="50%"
+                            outerRadius="78%"
                             paddingAngle={2}
                             isAnimationActive={false}
+                            label={(props) => {
+                              const total = (powerChartSettings.donut?.mode || "cost") === "cost"
+                                ? powerTariffBreakdown.total_cost
+                                : powerTariffBreakdown.total_kwh;
+                              const value = (powerChartSettings.donut?.mode || "cost") === "cost"
+                                ? props.payload.cost
+                                : props.payload.kwh;
+                              const pct = total > 0 ? (value / total) * 100 : 0;
+                              if (pct < 4) return null; // skip tiny slices
+                              return (
+                                <text x={props.x} y={props.y} fill="var(--text)" textAnchor={props.x > props.cx ? "start" : "end"} dominantBaseline="central" fontSize={11}>
+                                  {`${props.payload.name} ${pct.toFixed(1)}%`}
+                                </text>
+                              );
+                            }}
+                            labelLine={false}
                           >
                             {powerTariffBreakdown.items.map((entry, idx) => (
                               <Cell key={`tariff-slice-${entry.key}`} fill={getSeriesColor(idx)} />
@@ -18256,16 +18291,34 @@ const getGatewayHealth = (gateway) => {
                           </Pie>
                           <Tooltip formatter={(v, n, p) => {
                             const item = p?.payload || {};
+                            const total = (powerChartSettings.donut?.mode || "cost") === "cost"
+                              ? powerTariffBreakdown.total_cost
+                              : powerTariffBreakdown.total_kwh;
+                            const value = (powerChartSettings.donut?.mode || "cost") === "cost" ? item.cost : item.kwh;
+                            const pct = total > 0 ? (Number(value || 0) / total) * 100 : 0;
                             return (powerChartSettings.donut?.mode || "cost") === "cost"
-                              ? [`€ ${Number(item.cost || 0).toFixed(2)} (${Number(item.kwh || 0).toFixed(2)} kWh)`, item.name]
-                              : [`${Number(item.kwh || 0).toFixed(2)} kWh (€ ${Number(item.cost || 0).toFixed(2)})`, item.name];
+                              ? [`€${Number(item.cost || 0).toFixed(2)} • ${Number(item.kwh || 0).toFixed(2)} kWh • ${pct.toFixed(1)}%`, item.name]
+                              : [`${Number(item.kwh || 0).toFixed(2)} kWh • €${Number(item.cost || 0).toFixed(2)} • ${pct.toFixed(1)}%`, item.name];
                           }} />
-                          {/* Donut legend is intentionally off
-                              (operator 2026-06-15) — the tariff
-                              list-view card next to it shows the
-                              names, kWh and € per slice. */}
                         </PieChart>
                       </ResponsiveContainer>
+                      <div style={{
+                        position: "absolute", inset: 0, display: "flex", flexDirection: "column",
+                        alignItems: "center", justifyContent: "center", pointerEvents: "none",
+                      }}>
+                        <div style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                          {(powerChartSettings.donut?.mode || "cost") === "cost" ? "Total cost" : "Total energy"}
+                        </div>
+                        <div style={{ fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums", marginTop: 2 }}>
+                          {(powerChartSettings.donut?.mode || "cost") === "cost"
+                            ? `€${powerTariffBreakdown.total_cost.toFixed(2)}`
+                            : `${powerTariffBreakdown.total_kwh.toFixed(3)} kWh`}
+                        </div>
+                        <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+                          {powerTariffBreakdown.items.length} tariff{powerTariffBreakdown.items.length === 1 ? "" : "s"}
+                        </div>
+                      </div>
+                      </>
                     ) : (
                       <div className="muted" style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", textAlign: "center", padding: 12 }}>
                         No consumption data in the selected window.
@@ -18283,26 +18336,45 @@ const getGatewayHealth = (gateway) => {
                   </div>
                   <div className="pwr-tariff-list">
                     <span className="pwr-tariff-list-head">Tariff</span>
+                    <span className="pwr-tariff-list-head pwr-tariff-list-value">Rate</span>
+                    <span className="pwr-tariff-list-head pwr-tariff-list-value">Window</span>
                     <span className="pwr-tariff-list-head pwr-tariff-list-value">kWh</span>
                     <span className="pwr-tariff-list-head pwr-tariff-list-value">€</span>
+                    <span className="pwr-tariff-list-head pwr-tariff-list-value">%</span>
                     {powerTariffBreakdown.items.length ? (
-                      powerTariffBreakdown.items.map((t, idx) => (
-                        <div key={`tariff-list-${t.key}`} style={{ display: "contents" }}>
-                          <span><span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 2, background: getSeriesColor(idx), marginRight: 6 }} />{t.name}</span>
-                          <span className="pwr-tariff-list-value">{Number(t.kwh || 0).toFixed(2)}</span>
-                          <span className="pwr-tariff-list-value">{Number(t.cost || 0).toFixed(2)}</span>
-                        </div>
-                      ))
+                      powerTariffBreakdown.items.map((t, idx) => {
+                        const tariffObj = (powerConfig?.electricity_tariffs || []).find((x) => String(x.id) === String(t.key)) || {};
+                        const sharePct = powerTariffBreakdown.total_kwh > 0
+                          ? (Number(t.kwh || 0) / powerTariffBreakdown.total_kwh) * 100
+                          : 0;
+                        return (
+                          <div key={`tariff-list-${t.key}`} style={{ display: "contents" }}>
+                            <span title={`${t.name} • ${t.type}`}>
+                              <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 2, background: getSeriesColor(idx), marginRight: 6 }} />
+                              {t.name}
+                              <span className="muted" style={{ fontSize: 10, marginLeft: 4 }}>({String(t.type).replace("_", " ")})</span>
+                            </span>
+                            <span className="pwr-tariff-list-value">€{Number(tariffObj.rate_eur_kwh || 0).toFixed(3)}</span>
+                            <span className="pwr-tariff-list-value muted" style={{ fontSize: 11 }}>{tariffObj.start_time || "—"}–{tariffObj.end_time || "—"}</span>
+                            <span className="pwr-tariff-list-value">{Number(t.kwh || 0).toFixed(3)}</span>
+                            <span className="pwr-tariff-list-value">{Number(t.cost || 0).toFixed(2)}</span>
+                            <span className="pwr-tariff-list-value muted">{sharePct.toFixed(1)}%</span>
+                          </div>
+                        );
+                      })
                     ) : (
                       <div className="muted" style={{ gridColumn: "1 / -1", padding: 14, textAlign: "center" }}>
                         No tariff usage in the selected window.
                       </div>
                     )}
                   </div>
-                  <div className="meta" style={{ padding: "4px 4px 0", marginTop: 6, borderTop: "1px solid var(--stroke)" }}>
+                  <div className="meta" style={{ padding: "4px 4px 0", marginTop: 6, borderTop: "1px solid var(--stroke)", display: "grid", gridTemplateColumns: "1fr auto auto auto auto auto", gap: "4px 12px" }}>
                     <span><strong>Total</strong></span>
-                    <span className="pwr-tariff-list-value">{powerTariffBreakdown.total_kwh.toFixed(2)} kWh</span>
-                    <span className="pwr-tariff-list-value">€ {powerTariffBreakdown.total_cost.toFixed(2)}</span>
+                    <span></span>
+                    <span></span>
+                    <span className="pwr-tariff-list-value"><strong>{powerTariffBreakdown.total_kwh.toFixed(3)} kWh</strong></span>
+                    <span className="pwr-tariff-list-value"><strong>€{powerTariffBreakdown.total_cost.toFixed(2)}</strong></span>
+                    <span></span>
                   </div>
                 </article>
                 </div>{/* /pwr-row-two */}

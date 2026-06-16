@@ -3945,37 +3945,57 @@ input[type="checkbox"] {
   border-left: 2px solid var(--teal);
 }
 
+/* Operator 2026-06-16: title top-left, value center, delta
+   bottom-right; minimum padding. Use grid so the three slots line
+   up across every card in the strip. */
 .power-kpi-grid .stat-card {
   background: var(--card);
   border: 1px solid var(--stroke);
   border-radius: 10px;
   min-height: 0;
-  padding: 8px 10px;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 2px;
-}
-/* Compact strip (operator 2026-06-15: cards should be vertically
-   smaller so the rest of the screen fits). */
-.power-kpi-grid .stat-card .stat-value {
-  font-size: 22px;
-  line-height: 1.05;
-}
-.power-kpi-grid .stat-card .power-insight-unit {
-  font-size: 11px;
+  padding: 6px 8px;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "title  title"
+    "value  value"
+    "blank  delta";
+  gap: 2px 4px;
+  row-gap: 0;
 }
 .power-kpi-grid .stat-card .stat-title {
+  grid-area: title;
   font-size: 10.5px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--muted);
   margin: 0;
+  text-align: left;
+}
+.power-kpi-grid .stat-card .power-insight-value-row {
+  grid-area: value;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+.power-kpi-grid .stat-card .stat-value {
+  font-size: 22px;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+}
+.power-kpi-grid .stat-card .power-insight-unit {
+  font-size: 11px;
+  color: var(--muted);
 }
 .power-kpi-grid .stat-card .pwr-delta {
-  margin-top: 1px;
+  grid-area: delta;
+  justify-self: end;
+  margin: 0;
   padding: 0 4px;
   font-size: 10px;
+  background: transparent;
 }
 
 /* Insight card delta indicator (operator 2026-06-15). */
@@ -4036,7 +4056,8 @@ input[type="checkbox"] {
   flex: 1 1 auto;
   overflow-y: auto;
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  /* Tariff name | rate | window | kWh | € | share */
+  grid-template-columns: 1.6fr auto auto auto auto auto;
   align-items: center;
   gap: 4px 12px;
   font-size: 12px;
