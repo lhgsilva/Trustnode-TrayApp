@@ -606,6 +606,7 @@ function buildRegisterScaleMap(registers, existing = {}) {
 // asked for them on the same dropdown.
 const POWER_PERIOD_OPTIONS = [
   { value: "1m", label: "Last 1 minute", ms: 60 * 1000 },
+  { value: "5m", label: "Last 5 minutes", ms: 5 * 60 * 1000 },
   { value: "15m", label: "Last 15 minutes", ms: 15 * 60 * 1000 },
   { value: "1h", label: "Last 1 hour", ms: 60 * 60 * 1000 },
   { value: "6h", label: "Last 6 hours", ms: 6 * 60 * 60 * 1000 },
@@ -766,18 +767,16 @@ const POWER_INTERVAL_MS = {
   month: 30 * 24 * 60 * 60 * 1000,
 };
 
-function buildAnchoredSkeleton(interval, periodMs = null) {
-  const now = new Date();
-  const pad2 = (n) => String(n).padStart(2, "0");
+function buildAnchoredSkeleton(interval, periodMs = null, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
+  // Reuse the SAME formatter as the historian-row bucketer so the
+  // skeleton keys and the row-derived bucket keys collide exactly.
+  // Without this, second-grain (and TZ-shifted) charts produced
+  // skeleton keys that never matched row keys → empty chart.
   const grainMs = POWER_INTERVAL_MS[interval] || POWER_INTERVAL_MS.minute;
-  // count = how many bucket slots fit in the period, bounded so
-  // we never try to render an absurd number of points without an
-  // explicit operator decision.
   let count;
   if (periodMs && Number.isFinite(periodMs)) {
     count = Math.max(1, Math.min(20000, Math.ceil(periodMs / grainMs)));
   } else {
-    // Legacy single-period defaults when no period passed.
     count = interval === "minute" ? 60
           : interval === "hour"   ? 24
           : interval === "day"    ? 31
@@ -785,34 +784,18 @@ function buildAnchoredSkeleton(interval, periodMs = null) {
           : interval === "month"  ? 12
           : 24;
   }
+  const nowMs = Date.now();
   const out = [];
-  if (interval === "second") {
-    for (let i = count - 1; i >= 0; i--) {
-      const d = new Date(now.getTime() - i * 1000);
-      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`);
-    }
-  } else if (interval === "minute") {
-    for (let i = count - 1; i >= 0; i--) {
-      const d = new Date(now.getTime() - i * 60_000);
-      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`);
-    }
-  } else if (interval === "hour") {
-    for (let i = count - 1; i >= 0; i--) {
-      const d = new Date(now.getTime() - i * 3600_000);
-      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:00`);
-    }
-  } else if (interval === "day") {
-    for (let i = count - 1; i >= 0; i--) {
-      const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
-      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`);
-    }
-  } else if (interval === "month") {
-    for (let i = count - 1; i >= 0; i--) {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}`);
-    }
+  for (let i = count - 1; i >= 0; i--) {
+    const ts = nowMs - i * grainMs;
+    const k = bucketKeyForInterval(ts, interval, timeZone);
+    if (k) out.push(k);
   }
-  return out;
+  // Deduplicate while preserving order (when grainMs doesn't
+  // perfectly align with the bucket boundary, two adjacent slots
+  // can collapse — e.g. day grain when DST flips).
+  const seen = new Set();
+  return out.filter((k) => (seen.has(k) ? false : seen.add(k)));
 }
 
 // Returns the projected bucket count for a (periodMs, interval)
@@ -7358,7 +7341,7 @@ function AppShell() {
     // → last 60 minutes ending at the current minute. We compute
     // the skeleton by stepping back from now in the matching
     // grain so the rightmost bucket is the active one.
-    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval, periodMs);
+    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval, periodMs, displayTimeZone);
     for (const k of skeletonKeys) {
       if (!buckets.has(k)) buckets.set(k, { ts: k, meterBuckets: {} });
     }
@@ -7459,7 +7442,7 @@ function AppShell() {
     // X-axis anchored to "now" (operator 2026-06-15) — see
     // buildAnchoredSkeleton above. Same logic as the main chart so
     // the two charts always share the same X domain.
-    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval, periodMs);
+    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval, periodMs, displayTimeZone);
     for (const k of skeletonKeys) {
       if (!buckets.has(k)) buckets.set(k, { ts: k, total_kwh: 0 });
     }
@@ -18232,8 +18215,8 @@ const getGatewayHealth = (gateway) => {
                             data={powerTariffBreakdown.items}
                             dataKey={(powerChartSettings.donut?.mode || "cost") === "cost" ? "cost" : "kwh"}
                             nameKey="name"
-                            innerRadius="55%"
-                            outerRadius="85%"
+                            innerRadius="42%"
+                            outerRadius="68%"
                             paddingAngle={2}
                             isAnimationActive={false}
                           >
