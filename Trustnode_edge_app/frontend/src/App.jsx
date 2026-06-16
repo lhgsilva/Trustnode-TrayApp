@@ -605,22 +605,25 @@ function buildRegisterScaleMap(registers, existing = {}) {
 // windows; calendar windows surface in Live too because operators
 // asked for them on the same dropdown.
 const POWER_PERIOD_OPTIONS = [
+  { value: "1m", label: "Last 1 minute", ms: 60 * 1000 },
+  { value: "15m", label: "Last 15 minutes", ms: 15 * 60 * 1000 },
   { value: "1h", label: "Last 1 hour", ms: 60 * 60 * 1000 },
-  { value: "8h", label: "Last 8 hours", ms: 8 * 60 * 60 * 1000 },
-  { value: "12h", label: "Last 12 hours", ms: 12 * 60 * 60 * 1000 },
+  { value: "6h", label: "Last 6 hours", ms: 6 * 60 * 60 * 1000 },
   { value: "24h", label: "Last 24 hours", ms: 24 * 60 * 60 * 1000 },
-  { value: "day", label: "Day (current day)", ms: 24 * 60 * 60 * 1000 },
-  { value: "week", label: "Week (current week)", ms: 7 * 24 * 60 * 60 * 1000 },
-  { value: "month", label: "Month (current month)", ms: 31 * 24 * 60 * 60 * 1000 },
   { value: "7d", label: "Last 7 days", ms: 7 * 24 * 60 * 60 * 1000 },
   { value: "30d", label: "Last 30 days", ms: 30 * 24 * 60 * 60 * 1000 },
+  // Calendar windows kept for "show me THIS hour/day/month" use.
+  { value: "day", label: "Today (since midnight)", ms: 24 * 60 * 60 * 1000 },
+  { value: "month", label: "This month (since 1st)", ms: 31 * 24 * 60 * 60 * 1000 },
+  { value: "year", label: "This year (since Jan 1)", ms: 365 * 24 * 60 * 60 * 1000 },
 ];
 const POWER_AGG_OPTIONS = ["avg", "max", "min", "sum"];
 const POWER_INTERVAL_OPTIONS = [
-  { value: "second", label: "Second" },
-  { value: "minute", label: "Minute" },
-  { value: "hour", label: "Hour" },
-  { value: "day", label: "Day" },
+  { value: "second", label: "Second", ms: 1000 },
+  { value: "minute", label: "Minute", ms: 60 * 1000 },
+  { value: "hour", label: "Hour", ms: 60 * 60 * 1000 },
+  { value: "day", label: "Day", ms: 24 * 60 * 60 * 1000 },
+  { value: "month", label: "Month", ms: 30 * 24 * 60 * 60 * 1000 },
 ];
 const DEFAULT_ENERGY_COST_PER_KWH = 0.25;
 
@@ -749,59 +752,75 @@ function formatTimeDisplay(rawValue, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
   return `${p.hour}:${p.minute}:${p.second}`;
 }
 
-// Build the X-axis bucket skeleton anchored to "now" (operator
-// 2026-06-15: charts should always END at the current grain and
-// walk backwards). Returns ordered bucket keys identical in shape
-// to bucketKeyForInterval(). Used by both the main and side
-// charts on the Power Overview.
-function buildAnchoredSkeleton(interval) {
+// Build the X-axis bucket skeleton anchored to "now" with
+// independent (periodMs, interval) controls (operator 2026-06-16).
+// Returns count = ceil(periodMs / interval_ms) ordered bucket
+// keys ending at the current grain. Bucket keys match the shape
+// bucketKeyForInterval produces so historian samples merge
+// directly.
+const POWER_INTERVAL_MS = {
+  second: 1000,
+  minute: 60 * 1000,
+  hour: 60 * 60 * 1000,
+  day: 24 * 60 * 60 * 1000,
+  month: 30 * 24 * 60 * 60 * 1000,
+};
+
+function buildAnchoredSkeleton(interval, periodMs = null) {
   const now = new Date();
   const pad2 = (n) => String(n).padStart(2, "0");
-  const yyyy = now.getFullYear();
-  const mm = pad2(now.getMonth() + 1);
-  const dd = pad2(now.getDate());
-  const hh = pad2(now.getHours());
+  const grainMs = POWER_INTERVAL_MS[interval] || POWER_INTERVAL_MS.minute;
+  // count = how many bucket slots fit in the period, bounded so
+  // we never try to render an absurd number of points without an
+  // explicit operator decision.
+  let count;
+  if (periodMs && Number.isFinite(periodMs)) {
+    count = Math.max(1, Math.min(20000, Math.ceil(periodMs / grainMs)));
+  } else {
+    // Legacy single-period defaults when no period passed.
+    count = interval === "minute" ? 60
+          : interval === "hour"   ? 24
+          : interval === "day"    ? 31
+          : interval === "second" ? 60
+          : interval === "month"  ? 12
+          : 24;
+  }
   const out = [];
-  if (interval === "year") {
-    // Last 12 years ending this year (covers Decade-ish range; in
-    // practice Year view buckets by month, but this branch is here
-    // so the function is total).
-    for (let y = 11; y >= 0; y--) out.push(String(yyyy - y));
-  } else if (interval === "month") {
-    // Last 12 months ending current month.
-    for (let i = 11; i >= 0; i--) {
-      const d = new Date(yyyy, now.getMonth() - i, 1);
-      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}`);
-    }
-  } else if (interval === "day") {
-    // Last 31 days ending today. Bucket key is YYYY-MM-DD.
-    for (let i = 30; i >= 0; i--) {
-      const d = new Date(yyyy, now.getMonth(), now.getDate() - i);
-      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`);
-    }
-  } else if (interval === "hour") {
-    // Last 24 hours ending at the current hour. Bucket key is
-    // YYYY-MM-DD HH:00 — note the date may roll back across
-    // midnight so we walk back hour by hour through Date.
-    for (let i = 23; i >= 0; i--) {
-      const d = new Date(now.getTime() - i * 3600_000);
-      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:00`);
-    }
-  } else if (interval === "minute") {
-    // Last 60 minutes ending at the current minute. Bucket key is
-    // YYYY-MM-DD HH:MM.
-    for (let i = 59; i >= 0; i--) {
-      const d = new Date(now.getTime() - i * 60_000);
-      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`);
-    }
-  } else if (interval === "second") {
-    // Last 60 seconds. Only used for the explicit Second interval.
-    for (let i = 59; i >= 0; i--) {
+  if (interval === "second") {
+    for (let i = count - 1; i >= 0; i--) {
       const d = new Date(now.getTime() - i * 1000);
       out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`);
     }
+  } else if (interval === "minute") {
+    for (let i = count - 1; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 60_000);
+      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`);
+    }
+  } else if (interval === "hour") {
+    for (let i = count - 1; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 3600_000);
+      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:00`);
+    }
+  } else if (interval === "day") {
+    for (let i = count - 1; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`);
+    }
+  } else if (interval === "month") {
+    for (let i = count - 1; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      out.push(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}`);
+    }
   }
   return out;
+}
+
+// Returns the projected bucket count for a (periodMs, interval)
+// pair without materialising the array. Used to gate the chart
+// render with a warning chip on heavy combos.
+function powerBucketCount(periodMs, interval) {
+  const grain = POWER_INTERVAL_MS[interval] || POWER_INTERVAL_MS.minute;
+  return Math.max(1, Math.ceil(Number(periodMs || 0) / grain));
 }
 
 function bucketKeyForInterval(tsMs, interval, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
@@ -2769,12 +2788,10 @@ function AppShell() {
   });
   const [powerHistoricalTo, setPowerHistoricalTo] = useState(() => new Date().toISOString().slice(0, 16));
   const [powerHistoricalApplyToken, setPowerHistoricalApplyToken] = useState(0);
-  // Aggregation scale (operator 2026-06-15): one dropdown that
-  // bundles a period + bucket pair. Year shows 12 monthly bars,
-  // Month shows ~30 daily bars, Day shows 24 hourly bars, Hour
-  // shows 60 minute bars. Set to "" to use the explicit Period +
-  // Interval pair on the toolbar.
-  const [powerViewScale, setPowerViewScale] = useState("");
+  // Aggregation scale removed 2026-06-16 — Period + Interval are
+  // independent controls now. Keep the state slot so any legacy
+  // callers that read `powerViewScale` don't break; it stays "".
+  const [powerViewScale] = useState("");
   // Donut: € (cost) vs kWh (consumption) toggle. Operator 2026-06-15.
   const [powerDonutMode, setPowerDonutMode] = useState("cost");
   // Overview chart settings (operator 2026-06-15: edit chart info on
@@ -7105,58 +7122,28 @@ function AppShell() {
     });
   }, [powerConfig]);
 
+  // Operator 2026-06-16: Period and Interval are independent.
+  // Period = time range ending at "now". Interval = X-axis bucket
+  // grain. The chart renders ceil(periodMs / intervalMs) buckets.
   const periodMs = useMemo(() => {
-    // View scale (operator 2026-06-15): Hour → last 60min, Day →
-    // start of today, Month → start of current month, Year → start
-    // of current year. Trumps the explicit Period dropdown when set.
     const now = new Date();
-    if (powerViewScale === "second") return 60 * 1000;
-    if (powerViewScale === "hour") return 60 * 60 * 1000;
-    if (powerViewScale === "day") {
-      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
-    }
-    if (powerViewScale === "month") {
-      const start = new Date(now.getFullYear(), now.getMonth(), 1);
-      return Math.max(24 * 60 * 60 * 1000, now.getTime() - start.getTime());
-    }
-    if (powerViewScale === "year") {
-      const start = new Date(now.getFullYear(), 0, 1);
-      return Math.max(31 * 24 * 60 * 60 * 1000, now.getTime() - start.getTime());
-    }
-    // Calendar windows (day/week/month) measure from the start of
-    // the corresponding boundary to now, not a rolling 24/168/720
-    // hour span. Operator 2026-06-15.
     if (powerPeriod === "day") {
       const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
       return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
     }
-    if (powerPeriod === "week") {
-      const d = new Date(now);
-      const dow = (d.getDay() + 6) % 7; // 0 = Monday
-      const start = new Date(d.getFullYear(), d.getMonth(), d.getDate() - dow);
-      return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
-    }
     if (powerPeriod === "month") {
       const start = new Date(now.getFullYear(), now.getMonth(), 1);
-      return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
+      return Math.max(24 * 60 * 60 * 1000, now.getTime() - start.getTime());
     }
-    const match = POWER_PERIOD_OPTIONS.find((p) => p.value === powerPeriod) || POWER_PERIOD_OPTIONS[3];
-    return match?.ms || 24 * 60 * 60 * 1000;
-  }, [powerPeriod, powerViewMode, powerViewScale]);
+    if (powerPeriod === "year") {
+      const start = new Date(now.getFullYear(), 0, 1);
+      return Math.max(31 * 24 * 60 * 60 * 1000, now.getTime() - start.getTime());
+    }
+    const match = POWER_PERIOD_OPTIONS.find((p) => p.value === powerPeriod);
+    return match?.ms || 60 * 60 * 1000;
+  }, [powerPeriod]);
 
-  // Effective bucketing interval driven by the view scale.
-  // Hour → minute buckets, Day → hour buckets, Month → day buckets,
-  // Year → month buckets. Falls back to the explicit Interval
-  // dropdown when no scale is selected.
-  const effectiveInterval = useMemo(() => {
-    if (powerViewScale === "second") return "second";
-    if (powerViewScale === "hour") return "minute";
-    if (powerViewScale === "day") return "hour";
-    if (powerViewScale === "month") return "day";
-    if (powerViewScale === "year") return "month";
-    return powerInterval;
-  }, [powerViewScale, powerInterval]);
+  const effectiveInterval = useMemo(() => powerInterval, [powerInterval]);
 
   useEffect(() => {
     if (powerViewMode !== "realtime") return;
@@ -7371,7 +7358,7 @@ function AppShell() {
     // → last 60 minutes ending at the current minute. We compute
     // the skeleton by stepping back from now in the matching
     // grain so the rightmost bucket is the active one.
-    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval);
+    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval, periodMs);
     for (const k of skeletonKeys) {
       if (!buckets.has(k)) buckets.set(k, { ts: k, meterBuckets: {} });
     }
@@ -7472,7 +7459,7 @@ function AppShell() {
     // X-axis anchored to "now" (operator 2026-06-15) — see
     // buildAnchoredSkeleton above. Same logic as the main chart so
     // the two charts always share the same X domain.
-    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval);
+    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval, periodMs);
     for (const k of skeletonKeys) {
       if (!buckets.has(k)) buckets.set(k, { ts: k, total_kwh: 0 });
     }
@@ -17740,21 +17727,10 @@ const getGatewayHealth = (gateway) => {
                     ))}
                   </select>
                 </label>
-                <label className="field pwr-overview-field">
-                  <span>View</span>
-                  <select value={powerViewScale} onChange={(e) => setPowerViewScale(e.target.value)}>
-                    <option value="">Custom (use Period + Interval)</option>
-                    {/* Live (Second) is the high-frequency mode: last
-                        60 seconds ending now, no bucket averaging
-                        (operator 2026-06-15). Restricted to Live
-                        view mode — Historical use Custom + From/To. */}
-                    {powerViewMode === "realtime" ? <option value="second">Live (Second — last 60s)</option> : null}
-                    <option value="hour">Hour — minutes</option>
-                    <option value="day">Day — hours</option>
-                    <option value="month">Month — days</option>
-                    <option value="year">Year — months</option>
-                  </select>
-                </label>
+                {/* Operator 2026-06-16: View preset removed. Period
+                    (range) and Interval (grain) are the two
+                    independent controls; the chart computes
+                    ceil(period / grain) buckets ending at "now". */}
                 {/* Period stays visible in both modes — operator
                     2026-06-15 wants the date inputs always present;
                     only disabled in Live so the operator sees what
@@ -17764,23 +17740,19 @@ const getGatewayHealth = (gateway) => {
                   <select
                     value={powerPeriod}
                     onChange={(e) => setPowerPeriod(e.target.value)}
-                    disabled={powerViewMode === "historical" || Boolean(powerViewScale)}
+                    disabled={powerViewMode === "historical"}
                   >
-                    {POWER_PERIOD_OPTIONS
-                      .filter((p) => ["1h", "8h", "12h", "24h", "day", "week", "month"].includes(p.value))
-                      .map((p) => (
-                        <option key={p.value} value={p.value}>{p.label}</option>
-                      ))}
+                    {POWER_PERIOD_OPTIONS.map((p) => (
+                      <option key={p.value} value={p.value}>{p.label}</option>
+                    ))}
                   </select>
                 </label>
                 <label className="field pwr-overview-field">
                   <span>Interval</span>
-                  <select value={effectiveInterval} onChange={(e) => setPowerInterval(e.target.value)} disabled={Boolean(powerViewScale)}>
+                  <select value={effectiveInterval} onChange={(e) => setPowerInterval(e.target.value)}>
                     {POWER_INTERVAL_OPTIONS.map((o) => (
                       <option key={o.value} value={o.value}>{o.label}</option>
                     ))}
-                    {powerViewScale === "month" ? <option value="month">Month</option> : null}
-                    {powerViewScale === "year" ? <option value="year">Year</option> : null}
                   </select>
                 </label>
                 <label className="field pwr-overview-field">
@@ -17985,6 +17957,14 @@ const getGatewayHealth = (gateway) => {
                     </div>
                   </div>
                   <div className="chart-wrap">
+                    {powerBucketCount(periodMs, effectiveInterval) > 3000 ? (
+                      <div className="muted" style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", textAlign: "center", padding: 20 }}>
+                        <div>
+                          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>Too many points ({powerBucketCount(periodMs, effectiveInterval).toLocaleString()})</div>
+                          <div style={{ fontSize: 12 }}>The Period × Interval combo would render more than 3,000 buckets.<br/>Pick a coarser <strong>Interval</strong> or a shorter <strong>Period</strong>.</div>
+                        </div>
+                      </div>
+                    ) : (
                     <ResponsiveContainer width="100%" height="100%" minHeight={260}>
                       <ComposedChart data={powerMainChartData.rows} margin={{ top: 6, right: 10, left: 6, bottom: 8 }}>
                         {/* Same grid/legend styling as the dashboard chart widget
@@ -18109,6 +18089,7 @@ const getGatewayHealth = (gateway) => {
                         )}
                       </ComposedChart>
                     </ResponsiveContainer>
+                    )}
                   </div>
                 </article>
                 <div className="pwr-row-two">
@@ -18140,12 +18121,11 @@ const getGatewayHealth = (gateway) => {
                     </div>
                   </div>
                   <div className="chart-wrap">
-                    {/* Single ComposedChart so the side chart shares its
-                        styling (grid, legend, axis tokens) with the main
-                        Power Overview chart and the dashboard chart widget.
-                        Previously this was three separate <BarChart> /
-                        <AreaChart> / <LineChart> blocks duplicating the same
-                        XAxis / YAxis / Tooltip props. */}
+                    {powerBucketCount(periodMs, effectiveInterval) > 3000 ? (
+                      <div className="muted" style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", textAlign: "center", padding: 16, fontSize: 12 }}>
+                        Too many points — pick a coarser Interval.
+                      </div>
+                    ) : (
                     <ResponsiveContainer width="100%" height="100%" minHeight={260}>
                       <ComposedChart
                         data={powerSideChartData.rows}
@@ -18211,6 +18191,7 @@ const getGatewayHealth = (gateway) => {
                         )}
                       </ComposedChart>
                     </ResponsiveContainer>
+                    )}
                   </div>
                 </article>
 
