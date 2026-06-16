@@ -3344,6 +3344,12 @@ function AppShell() {
   // this, a slow query (~1s for 24 h) can be re-issued by the next
   // 1 Hz poll tick, piling up duplicate work and choking the UI.
   const powerHistoryFetchInflightRef = useRef(false);
+  // Identity ref for the last applied row set — if a poll comes
+  // back with the same length AND newest row id, we skip the
+  // setState so React doesn't refire every memo over the chart
+  // data. This is the biggest UI speedup on idle (operator
+  // 2026-06-16: "UI is extreme slow").
+  const powerHistoryIdentityRef = useRef({ len: 0, lastId: 0 });
   // Skip the historian fetch entirely when no meter is configured
   // (operator 2026-06-16). Without this guard the Overview poll
   // still hits the historian endpoint every 2 s even on a brand-
@@ -7015,7 +7021,7 @@ function AppShell() {
                     fetchTag("current"),
                     fetchTag("insight."),
                   ]);
-                  setPowerHistoryRows([...powerRows, ...voltRows, ...currRows, ...insightRows]);
+                  applyPowerHistoryRows([...powerRows, ...voltRows, ...currRows, ...insightRows]);
                 } catch (_) { /* fall through */ }
               } else {
                 // Short windows: lighter row-count endpoint.
@@ -7024,7 +7030,7 @@ function AppShell() {
                 const lim = Math.min(50000, desired);
                 try {
                   const histRes = await getPowerHistory(lim, "");
-                  if (histRes?.ok && Array.isArray(histRes.rows)) setPowerHistoryRows(histRes.rows);
+                  if (histRes?.ok && Array.isArray(histRes.rows)) applyPowerHistoryRows(histRes.rows);
                 } catch (_) {}
               }
               powerHistoryFetchInflightRef.current = false;
@@ -7230,6 +7236,47 @@ function AppShell() {
     powerHistoryHasDevicesRef.current = Array.isArray(powerConfig?.devices) && powerConfig.devices.length > 0;
   }, [powerConfig?.devices]);
 
+  // Latest-sample-per-meter map for the Live tile group
+  // (Current / Active Power / Power Usage). Used to be computed
+  // INSIDE the JSX render block — which ran on every component
+  // render, not just on data change. Now a memo so re-renders
+  // triggered by unrelated state (modals, hover, etc) don't
+  // re-walk the historian rows (operator 2026-06-16: UI lag).
+  const powerLiveByMeter = useMemo(() => {
+    const out = {};
+    for (const r of powerHistoryRows || []) {
+      const gid = String(r?.gateway_id || "");
+      if (!gid) continue;
+      const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
+      if (!Number.isFinite(ts)) continue;
+      const b = out[gid] || { ts: 0, tags: {} };
+      if (ts < b.ts) continue;
+      if (ts > b.ts) { b.ts = ts; b.tags = {}; }
+      b.tags[String(r?.tag || r?.tag_name || "")] = Number(r?.value);
+      out[gid] = b;
+    }
+    return out;
+  }, [powerHistoryRows]);
+
+  // Setter wrapper that skips the React state update when the
+  // fetched row set is identical to the last applied one (same
+  // length AND same newest id). Cuts the per-poll memo refire
+  // cost dramatically when the meter is idling at the same poll
+  // rate as the UI throttle (operator 2026-06-16).
+  const applyPowerHistoryRows = useCallback((rows) => {
+    if (!Array.isArray(rows)) return;
+    const len = rows.length;
+    let lastId = 0;
+    for (let i = 0; i < len; i++) {
+      const id = Number(rows[i]?.id || 0);
+      if (id > lastId) lastId = id;
+    }
+    const prev = powerHistoryIdentityRef.current || { len: 0, lastId: 0 };
+    if (prev.len === len && prev.lastId === lastId && lastId > 0) return;
+    powerHistoryIdentityRef.current = { len, lastId };
+    setPowerHistoryRows(rows);
+  }, []);
+
   // Persist Overview chart heights AND every other edit field to
   // localStorage so resizing + axis settings + legend toggles +
   // series colors survive page switches and EXE restart
@@ -7319,7 +7366,7 @@ function AppShell() {
           const tag = String(r?.tag || r?.tag_name || "");
           return powerTags.has(tag) || tag.startsWith("insight.");
         });
-        setPowerHistoryRows(filtered);
+        applyPowerHistoryRows(filtered);
       } catch (err) {
         if (!cancelled) {
           setPowerStatus((prev) => ({ ...(prev || {}), last_error: String(err?.message || err || "Historical fetch failed") }));
@@ -17999,21 +18046,11 @@ const getGatewayHealth = (gateway) => {
                       </div>
                     );
                   };
-                  // Latest sample per meter for the Live group.
-                  const liveByMeter = {};
-                  for (const r of powerHistoryRows || []) {
-                    const gid = String(r?.gateway_id || "");
-                    if (!gid) continue;
-                    const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
-                    if (!Number.isFinite(ts)) continue;
-                    const b = liveByMeter[gid] || { ts: 0, tags: {} };
-                    if (ts < b.ts) continue;
-                    if (ts > b.ts) { b.ts = ts; b.tags = {}; }
-                    b.tags[String(r?.tag || r?.tag_name || "")] = Number(r?.value);
-                    liveByMeter[gid] = b;
-                  }
+                  // Latest sample per meter — memoized above as
+                  // powerLiveByMeter so unrelated re-renders don't
+                  // re-walk the historian rows.
                   const meterScope = String(powerFilterMeterId || "all");
-                  const meterEntries = Object.entries(liveByMeter)
+                  const meterEntries = Object.entries(powerLiveByMeter)
                     .filter(([gid]) => meterScope === "all" || gid === meterScope);
                   const liveCurrentA = meterEntries.reduce((acc, [, b]) => acc + (Number(b.tags.current_a) || 0), 0);
                   const liveKw = meterEntries.reduce((acc, [, b]) => {
