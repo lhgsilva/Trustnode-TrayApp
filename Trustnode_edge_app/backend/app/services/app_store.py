@@ -972,6 +972,108 @@ class AppStore:
                 last_error="No enabled PostgreSQL cloud target configured",
             )
 
+    def _mirror_config_doc_to_customer_db(
+        self,
+        *,
+        domain: str,
+        scope_key: str,
+        payload_json: str,
+        version: int,
+        updated_utc: str,
+        actor: str = "system",
+    ) -> None:
+        """Mirror a config document into the customer Postgres.
+
+        Operator 2026-06-17 (M5): every config domain (dashboards,
+        alarms, gateway configs, power_management_config, users_access,
+        triggers_limits, app_settings, etc.) lands in
+        customer DB ``config_documents`` / ``config_documents_scoped``
+        so the LAN Lite has a single read source for everything that
+        is NOT timeseries data.
+
+        Best-effort: failures never block the local save. If
+        ``database_mode`` is not ``customer_sql`` the call is a
+        no-op so this hook is cheap on default installs.
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM config_documents WHERE domain = ?",
+                    ("app_settings",),
+                ).fetchone()
+        except Exception:
+            return
+        if not row:
+            return
+        try:
+            settings = json.loads(str(row["payload_json"] or "{}")) or {}
+        except Exception:
+            return
+        if str(settings.get("database_mode") or "local_sqlite").lower() != "customer_sql":
+            return
+        target = settings.get("customer_sql_target")
+        if not isinstance(target, dict) or not target.get("host"):
+            return
+        try:
+            from app.services import customer_sql as _cs
+            from app.services import sinks_sql as _ss
+            from sqlalchemy import text as _text
+        except Exception:
+            return
+        engine, _err = _cs.get_engine(target)
+        if engine is None:
+            return
+        try:
+            _ss.bootstrap_customer_db(engine, schema=str(target.get("schema") or "public"), note="config-mirror")
+        except Exception:
+            return
+        s = str(target.get("schema") or "public") or "public"
+        tenant = self._current_tenant_id()
+        try:
+            if scope_key:
+                sql = _text(
+                    f'INSERT INTO "{s}"."config_documents_scoped" '
+                    f'(domain, scope_key, tenant_id, version, payload_json, updated_utc, updated_by) '
+                    f'VALUES (:domain, :scope_key, :tenant, :version, CAST(:payload AS JSONB), :updated_utc, :actor) '
+                    f'ON CONFLICT (tenant_id, scope_key, domain) DO UPDATE SET '
+                    f'  version = EXCLUDED.version, '
+                    f'  payload_json = EXCLUDED.payload_json, '
+                    f'  updated_utc = EXCLUDED.updated_utc, '
+                    f'  updated_by = EXCLUDED.updated_by'
+                )
+                params = {
+                    "domain": domain,
+                    "scope_key": scope_key,
+                    "tenant": tenant,
+                    "version": int(version or 1),
+                    "payload": payload_json or "null",
+                    "updated_utc": updated_utc,
+                    "actor": actor,
+                }
+            else:
+                sql = _text(
+                    f'INSERT INTO "{s}"."config_documents" '
+                    f'(domain, tenant_id, version, payload_json, updated_utc, updated_by) '
+                    f'VALUES (:domain, :tenant, :version, CAST(:payload AS JSONB), :updated_utc, :actor) '
+                    f'ON CONFLICT (tenant_id, domain) DO UPDATE SET '
+                    f'  version = EXCLUDED.version, '
+                    f'  payload_json = EXCLUDED.payload_json, '
+                    f'  updated_utc = EXCLUDED.updated_utc, '
+                    f'  updated_by = EXCLUDED.updated_by'
+                )
+                params = {
+                    "domain": domain,
+                    "tenant": tenant,
+                    "version": int(version or 1),
+                    "payload": payload_json or "null",
+                    "updated_utc": updated_utc,
+                    "actor": actor,
+                }
+            with engine.begin() as conn:
+                conn.execute(sql, params)
+        except Exception:
+            return
+
     def _mirror_config_doc_to_cloud(
         self,
         table_name: str,
@@ -1223,6 +1325,9 @@ class AppStore:
             "triggers_limits",
             "gateway_configurations",
             "devices",
+            # Operator 2026-06-16: cloud Lite needs tariff config,
+            # meter list and downtime rules to render Power widgets.
+            "power_management_config",
         )
         cloud = self._get_cloud_database_target()
         if not cloud:
@@ -3457,6 +3562,18 @@ class AppStore:
                     -- busy edge (8 indexes × 50 tags × 1 Hz → +2.5 GB/month).
                     CREATE INDEX IF NOT EXISTS idx_hist_tenant_tag_ts
                       ON historian_readings(tenant_id, tag_name, ts_utc DESC);
+                    -- Operator 2026-06-17: queries without a tag filter
+                    -- (e.g. dashboard "all-tag" historian fetches and
+                    -- the new /historian/agg endpoint's untagged path)
+                    -- otherwise fall back to a TEMP B-TREE sort over
+                    -- the entire tenant slice. (tenant_id, ts_utc DESC)
+                    -- lets the planner walk the index in order.
+                    CREATE INDEX IF NOT EXISTS idx_hist_tenant_ts
+                      ON historian_readings(tenant_id, ts_utc DESC);
+                    -- Same problem when filtering by gateway_id without a
+                    -- tag (Power Overview's per-meter charts hit this).
+                    CREATE INDEX IF NOT EXISTS idx_hist_tenant_gw_ts
+                      ON historian_readings(tenant_id, gateway_id, ts_utc DESC);
 
                     CREATE TABLE IF NOT EXISTS app_logs (
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5247,6 +5364,7 @@ class AppStore:
                         "triggers_limits",
                         "gateway_configurations",
                         "devices",
+                        "power_management_config",
                     ):
                         try:
                             settings_row = conn.execute(
@@ -5358,6 +5476,20 @@ class AppStore:
                 version=new_version,
                 updated_utc=now,
             )
+        # Operator 2026-06-17 (M5): mirror EVERY config domain into the
+        # customer DB when database_mode=customer_sql, so the LAN Lite
+        # and any fresh-edge re-install can re-hydrate from there.
+        try:
+            self._mirror_config_doc_to_customer_db(
+                domain=domain,
+                scope_key="",
+                payload_json=payload_json,
+                version=new_version,
+                updated_utc=now,
+                actor=actor,
+            )
+        except Exception:
+            pass
         return {"domain": domain, "tenant_id": self._current_tenant_id(), "version": new_version, "updated_utc": now}
 
     def upsert_domain_scoped(self, scope_key: str, domain: str, payload: Any, actor: str = "system") -> Dict[str, Any]:
@@ -5517,6 +5649,17 @@ class AppStore:
                 version=new_version,
                 updated_utc=now,
             )
+        try:
+            self._mirror_config_doc_to_customer_db(
+                domain=domain_name,
+                scope_key=skey,
+                payload_json=payload_json,
+                version=new_version,
+                updated_utc=now,
+                actor=actor,
+            )
+        except Exception:
+            pass
         return {
             "domain": domain_name,
             "scope_key": skey,
@@ -5678,6 +5821,7 @@ class AppStore:
         device: str = "",
         tag: str = "",
         edge_id: str = "",
+        source: str = "",
     ) -> list[dict[str, Any]]:
         lim = max(1, min(int(limit or 1000), 10000))
         edge_filter = self._normalize_edge_filter(edge_id)
@@ -5713,6 +5857,20 @@ class AppStore:
         if tag_txt:
             where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
             params["tag_like"] = f"%{tag_txt}%"
+        # Operator 2026-06-16: push the source filter into SQL so the
+        # Power Overview's /api/power/history call (which only ever
+        # wants power_modbus + power_insight rows) doesn't fetch 8x
+        # the data only to throw most of it away on the Python side.
+        source_txt = str(source or "").strip()
+        if source_txt:
+            source_values = [s.strip() for s in source_txt.split(",") if s.strip()]
+            if source_values:
+                placeholders = []
+                for idx, sv in enumerate(source_values):
+                    key = f"src{idx}"
+                    placeholders.append(f":{key}")
+                    params[key] = sv
+                where += f" AND source IN ({', '.join(placeholders)})"
         # Read-only path: parallel readers via WAL, no global lock.
         # IMPORTANT: ORDER BY ts_utc DESC (not id DESC) so SQLite can walk
         # the (tenant_id, ts_utc DESC) covering index in order — otherwise
@@ -5773,6 +5931,119 @@ class AppStore:
             )
         out = self._filter_rows_by_edge(out, edge_filter)
         return out[:lim]
+
+    def get_historian_agg_rows(
+        self,
+        bucket: str = "minute",
+        from_utc: str = "",
+        to_utc: str = "",
+        gateway: str = "",
+        tag: str = "",
+        limit: int = 50000,
+        source: str = "",
+    ) -> list[dict[str, Any]]:
+        """Read from the pre-aggregated `historian_agg_<bucket>` tables.
+
+        Operator 2026-06-17: the Power Overview and any wide-window
+        dashboard widget used to pull raw 1 Hz rows and bucket them in
+        the browser. For a 24 h × Minute view that was ~17 000 rows
+        every refresh. The retention worker has been writing the agg
+        tables since the schema was added (see
+        `_compute_retention_run` rolling buckets into
+        historian_agg_minute/hour/day). This endpoint exposes them.
+
+        Returns rows shaped like the raw historian:
+            { ts, gateway_id, gateway_name, device_name, plc_ip,
+              database_name, tag, value (= avg), value_min, value_max,
+              sample_count, quality, quality_label }
+        so the frontend can drop the response into the same memo
+        pipeline without rewriting bucket logic.
+        """
+        bkt = str(bucket or "minute").strip().lower()
+        if bkt not in {"minute", "hour", "day"}:
+            bkt = "minute"
+        table = f"historian_agg_{bkt}"
+        lim = max(1, min(int(limit or 50000), 100000))
+        tenant_id = self._current_tenant_id()
+        where = "WHERE 1=1"
+        params: dict[str, Any] = {"lim": lim}
+        # The agg tables have no tenant_id column (see schema at
+        # ~3512); they're written by the retention worker which only
+        # processes the local tenant slice. We still scope by gateway/
+        # tag/source/range so the same endpoint serves multi-tenant
+        # edges when the schema gains a tenant column later.
+        from_txt = str(from_utc or "").strip()
+        if from_txt:
+            where += " AND bucket_utc >= :from_utc"
+            params["from_utc"] = from_txt
+        to_txt = str(to_utc or "").strip()
+        if to_txt:
+            where += " AND bucket_utc <= :to_utc"
+            params["to_utc"] = to_txt
+        gw_txt = str(gateway or "").strip()
+        if gw_txt:
+            where += " AND gateway_id = :gateway"
+            params["gateway"] = gw_txt
+        tag_txt = str(tag or "").strip()
+        if tag_txt:
+            # LIKE so the frontend can pass patterns like 'active_power'
+            # or 'insight.' without listing every variant.
+            where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+            params["tag_like"] = f"%{tag_txt}%"
+        source_txt = str(source or "").strip()
+        if source_txt:
+            # The agg tables don't carry source today. Map known power
+            # sources to the database_name written at write-time
+            # ("Power Management") so the filter still works for the
+            # Power Overview path.
+            srcs = [s.strip() for s in source_txt.split(",") if s.strip()]
+            if any(s in {"power_modbus", "power_insight"} for s in srcs):
+                where += " AND database_name = :pm_db"
+                params["pm_db"] = "Power Management"
+
+        with self._connect() as conn:
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT bucket_utc, gateway_id, gateway_name, device_name,
+                           plc_ip, database_name, tag_name,
+                           avg_value, min_value, max_value, sample_count,
+                           quality_min, quality_max
+                    FROM {table}
+                    {where}
+                    ORDER BY bucket_utc DESC
+                    LIMIT :lim
+                    """,
+                    params,
+                ).fetchall()
+            except Exception as exc:
+                logger.warning("get_historian_agg_rows failed: %s", exc)
+                return []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "ts": r["bucket_utc"],
+                    "tenant_id": tenant_id,
+                    "source": "historian_agg",
+                    "gateway_id": r["gateway_id"] or "",
+                    "gateway_name": r["gateway_name"] or "",
+                    "device_name": r["device_name"] or "",
+                    "plc_ip": r["plc_ip"] or "",
+                    "database_name": r["database_name"] or "",
+                    "tag": r["tag_name"] or "",
+                    # `value` is the avg so the frontend bucket builder
+                    # can carry it forward; min/max travel alongside
+                    # for chart band rendering when needed.
+                    "value": r["avg_value"],
+                    "value_min": r["min_value"],
+                    "value_max": r["max_value"],
+                    "sample_count": int(r["sample_count"] or 0),
+                    "quality": r["quality_max"],
+                    "quality_label": "GOOD" if int(r["quality_max"] or 0) >= 192 else "",
+                }
+            )
+        return out
 
     def get_historian_rows_range(
         self,

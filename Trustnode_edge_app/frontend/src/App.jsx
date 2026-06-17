@@ -1,6 +1,7 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Login } from "./components/Login/Login";
 import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
+import { DASHBOARD_GRID_VERSION, migrateWidgetsToFinerGrid } from "./components/Dashboard/widgetRegistry";
 import { ReportTemplateDesigner } from "./components/Reports/ReportTemplateDesigner";
 import { ScheduledReportsManager } from "./components/Reports/ScheduledReportsManager";
 import {
@@ -31,6 +32,7 @@ import {
   getAppStoreLive,
   getAppStoreHistorian,
   getAppStoreHistorianRange,
+  getAppStoreHistorianAgg,
   getAppStoreHistorianStats,
   getAppStoreHistorianRuleStats,
   getAppStoreLogs,
@@ -94,6 +96,17 @@ import {
   rotateEdgeViewLink,
   revokeEdgeViewLink,
   buildEdgeViewLinkUrl,
+  getEdgeUserViewLink,
+  createEdgeUserViewLink,
+  rotateEdgeUserViewLink,
+  getLiteLocalShareTargets,
+  buildLiteLocalUrl,
+  getOpcuaStatus,
+  setOpcuaEnabled,
+  setOpcuaDisabled,
+  getMqttStatus,
+  setMqttEnabled,
+  setMqttDisabled,
   getControlPlaneLicenses,
   upsertControlPlaneLicense,
   deleteControlPlaneLicense,
@@ -124,6 +137,11 @@ import {
   getCompanyLogo,
   setCompanyLogo,
   deleteCompanyLogo,
+  // Operator 2026-06-17 (M2): customer-DB mode.
+  getCustomerDbStatus,
+  testCustomerDbConnection,
+  activateCustomerDb,
+  deactivateCustomerDb,
 } from "./api";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, ComposedChart, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
@@ -208,7 +226,14 @@ const NAV_SECTIONS = [
   {
     id: "settings",
     title: "Database and Backup",
-    items: ["Database Overview", "Backup and Retention"]
+    items: ["Database Overview", "Customer Database", "Backup and Retention"]
+  },
+  // Operator 2026-06-17 (Phase 3): outbound Connections menu —
+  // OPC UA + MQTT services the edge exposes to LAN clients.
+  {
+    id: "connections",
+    title: "Connections",
+    items: ["Connections Overview", "OPC UA", "MQTT"]
   },
   {
     id: "administration",
@@ -239,6 +264,7 @@ function pageTitle(page) {
   if (page === "database_overview") return "Database Overview";
   if (page === "database_inspector") return "Database Inspector";
   if (page === "backup_and_retention") return "Backup and Retention";
+  if (page === "customer_database") return "Customer Database";
   if (page === "website_and_env") return "Website and Environment";
   if (page === "email_and_notifications") return "Email and Notifications";
   if (page === "scheduled_reports") return "Scheduled Reports";
@@ -247,6 +273,9 @@ function pageTitle(page) {
   if (page === "power_configuration") return "Power Configuration";
   if (page === "edge") return "Edge";
   if (page === "interface") return "Interface";
+  if (page === "connections_overview") return "Connections Overview";
+  if (page === "opc_ua") return "OPC UA";
+  if (page === "mqtt") return "MQTT";
   return page.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
@@ -514,22 +543,34 @@ function quantizeDomain(domain, step = 0.5, floorZero = false) {
   return [Number(min.toFixed(6)), Number(max.toFixed(6))];
 }
 
-function buildYAxisTicks(domain, step = 0.5, maxTicks = 14) {
+function buildYAxisTicks(domain, _stepHint = 0.5, maxTicks = 14) {
+  // Operator 2026-06-16: hard-coded step=0.5 produced 2 ticks
+  // when the domain was small (e.g. current 0..0.4 A). Use a
+  // nice-number ladder so the step adapts to the range.
   if (!Array.isArray(domain) || domain.length !== 2) return undefined;
   const min = Number(domain[0]);
   const max = Number(domain[1]);
   if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return undefined;
-  const safeMaxTicks = Math.max(2, Number(maxTicks) || 14);
-  let tickStep = Math.max(0.000001, Number(step) || 0.5);
-  let count = Math.round((max - min) / tickStep) + 1;
-  if (count > safeMaxTicks) {
-    const mult = Math.ceil(count / safeMaxTicks);
-    tickStep *= mult;
-  }
+  const target = Math.max(3, Math.min(Number(maxTicks) || 8, 12));
+  const range = max - min;
+  // Compute a "nice" step ≈ range/target.
+  const rough = range / Math.max(1, target);
+  const exp = Math.floor(Math.log10(rough));
+  const base = Math.pow(10, exp);
+  const norm = rough / base;
+  let nice;
+  if (norm < 1.5) nice = 1;
+  else if (norm < 3) nice = 2;
+  else if (norm < 7) nice = 5;
+  else nice = 10;
+  const tickStep = nice * base;
   const start = Math.floor(min / tickStep) * tickStep;
   const end = Math.ceil(max / tickStep) * tickStep;
   const ticks = [];
-  for (let v = start; v <= end + tickStep * 0.5; v += tickStep) ticks.push(Number(v.toFixed(6)));
+  // Round to 8 sig figs to avoid float drift (e.g. 0.30000000000000004)
+  for (let v = start; v <= end + tickStep * 0.5; v += tickStep) {
+    ticks.push(Number(v.toPrecision(8)));
+  }
   return ticks;
 }
 
@@ -708,19 +749,31 @@ function safeTimeZone(value, fallback = DEFAULT_DISPLAY_TIMEZONE) {
   }
 }
 
+// Operator 2026-06-17: constructing Intl.DateTimeFormat per call is
+// ~1 ms in v8 — for a 1500-row chart that's ~1.5 s of pure formatter
+// allocation on every render. Cache one formatter per timezone.
+const _intlFmtCache = new Map();
+function _getIntlFormatter(tz) {
+  let f = _intlFmtCache.get(tz);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-GB", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+    _intlFmtCache.set(tz, f);
+  }
+  return f;
+}
 function getDatePartsInTimeZone(ms, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
   if (!Number.isFinite(ms)) return null;
   const tz = safeTimeZone(timeZone, DEFAULT_DISPLAY_TIMEZONE);
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).formatToParts(new Date(ms));
+  const parts = _getIntlFormatter(tz).formatToParts(new Date(ms));
   const map = {};
   for (const p of parts) map[p.type] = p.value;
   return {
@@ -767,7 +820,7 @@ const POWER_INTERVAL_MS = {
   month: 30 * 24 * 60 * 60 * 1000,
 };
 
-function buildAnchoredSkeleton(interval, periodMs = null, timeZone = DEFAULT_DISPLAY_TIMEZONE) {
+function buildAnchoredSkeleton(interval, periodMs = null, timeZone = DEFAULT_DISPLAY_TIMEZONE, anchorMs = null) {
   // Reuse the SAME formatter as the historian-row bucketer so the
   // skeleton keys and the row-derived bucket keys collide exactly.
   // Without this, second-grain (and TZ-shifted) charts produced
@@ -784,10 +837,13 @@ function buildAnchoredSkeleton(interval, periodMs = null, timeZone = DEFAULT_DIS
           : interval === "month"  ? 12
           : 24;
   }
-  const nowMs = Date.now();
+  // Historical mode passes anchorMs = toMs so the skeleton ends at
+  // the user-selected window, not "now" (operator 2026-06-16: chart
+  // was empty in Historical because skeleton was anchored to now).
+  const endMs = Number.isFinite(anchorMs) ? Number(anchorMs) : Date.now();
   const out = [];
   for (let i = count - 1; i >= 0; i--) {
-    const ts = nowMs - i * grainMs;
+    const ts = endMs - i * grainMs;
     const k = bucketKeyForInterval(ts, interval, timeZone);
     if (k) out.push(k);
   }
@@ -815,6 +871,34 @@ function bucketKeyForInterval(tsMs, interval, timeZone = DEFAULT_DISPLAY_TIMEZON
   if (interval === "hour") return `${p.year}-${p.month}-${p.day} ${p.hour}:00`;
   if (interval === "minute") return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
+}
+
+// Operator 2026-06-16: historical date inputs must read DD/MM/YYYY.
+// We keep the underlying state in ISO-local "YYYY-MM-DDTHH:mm" so
+// the rest of the pipeline (new Date(...)) is unchanged; only the
+// display flips. parseDmyToIsoLocal returns null while the operator
+// is still mid-typing so we don't overwrite their input.
+function formatIsoLocalAsDmy(isoLocal) {
+  const s = String(isoLocal || "").trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (!m) return "";
+  return `${m[3]}/${m[2]}/${m[1]} ${m[4]}:${m[5]}`;
+}
+function parseDmyToIsoLocal(dmy) {
+  const s = String(dmy || "").trim();
+  if (!s) return "";
+  // Accept "DD/MM/YYYY HH:mm" or "DD/MM/YYYY" (defaults to 00:00).
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[ T](\d{1,2}):(\d{2}))?$/);
+  if (!m) return null;
+  const dd = m[1].padStart(2, "0");
+  const mm = m[2].padStart(2, "0");
+  const yyyy = m[3];
+  const hh = (m[4] || "00").padStart(2, "0");
+  const mi = m[5] || "00";
+  if (Number(mm) < 1 || Number(mm) > 12) return null;
+  if (Number(dd) < 1 || Number(dd) > 31) return null;
+  if (Number(hh) > 23 || Number(mi) > 59) return null;
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}`;
 }
 
 function loadStringSetting(storageKey, fallback = "") {
@@ -1313,6 +1397,21 @@ function MenuIcon({ page }) {
       return <svg {...common}><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v12c0 1.7 3.6 3 8 3s8-1.3 8-3V5" /><path d="M4 11c0 1.7 3.6 3 8 3s8-1.3 8-3" /><circle cx="18" cy="18" r="3" /><path d="M20.2 20.2L22 22" /></svg>;
     case "backup_and_retention":
       return <svg {...common}><path d="M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8" /><path d="M1 8h22" /><path d="M8 8V4h8v4" /><path d="M12 12v6" /><path d="M9 15h6" /></svg>;
+    // Operator 2026-06-17: cylinder-with-network glyph for the customer
+    // DB submenu so it visually reads as "a database somewhere on the
+    // network" — distinct from the local DB icon.
+    case "customer_database":
+      return (
+        <svg {...common}>
+          <ellipse cx="12" cy="5" rx="7" ry="2.5" />
+          <path d="M5 5v8c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V5" />
+          <path d="M5 11c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5" />
+          <circle cx="6" cy="20" r="1.5" />
+          <circle cx="18" cy="20" r="1.5" />
+          <circle cx="12" cy="20" r="1.5" />
+          <path d="M12 16v3M6 20l6-2 6 2" />
+        </svg>
+      );
     case "website_and_env":
       return <svg {...common}><path d="M3 5h18v14H3z" /><path d="M3 9h18" /><path d="M8 4v2M16 4v2" /></svg>;
     case "email_and_notifications":
@@ -1325,6 +1424,31 @@ function MenuIcon({ page }) {
       return <svg {...common}><path d="M3 12h6l3-8 3 16 3-8h3" /></svg>;
     case "users_and_access_control":
       return <svg {...common}><circle cx="9" cy="8" r="3" /><path d="M3 20a6 6 0 0 1 12 0" /><circle cx="18" cy="8" r="2" /><path d="M15 20a4 4 0 0 1 6 0" /></svg>;
+    // Operator 2026-06-17: dedicated icons for the Power Management
+    // section so it's not a generic circle.
+    case "power_management":
+      // Lightning bolt: classic "energy" mark, shared by the group header.
+      return <svg {...common}><path d="M13 2L4 14h7l-1 8 9-12h-7z" /></svg>;
+    case "power_overview":
+      // Donut with energy bolt — mirrors the Overview's headline
+      // "tariff donut" so the icon reads as "live energy".
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="9" />
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 4l-2 6h3l-1 4" stroke="currentColor" />
+        </svg>
+      );
+    case "power_configuration":
+      // Meter face: dial with needle — reads as "set up meters".
+      return (
+        <svg {...common}>
+          <path d="M3 13a9 9 0 0 1 18 0" />
+          <path d="M12 13L8 8" />
+          <circle cx="12" cy="13" r="1.2" fill="currentColor" />
+          <path d="M3 17h18" />
+        </svg>
+      );
     // -- Portal section pages ---------------------------------------------
     case "portal_overview":
       return <svg {...common}><rect x="3" y="3" width="7" height="9" rx="1" /><rect x="14" y="3" width="7" height="5" rx="1" /><rect x="14" y="12" width="7" height="9" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /></svg>;
@@ -1689,6 +1813,7 @@ const PERMISSION_LABELS = {
   database_overview: "Database Overview (Legacy)",
   database_inspector: "Database Inspector",
   backup_and_retention: "Backup and Retention",
+  customer_database: "Customer Database",
   control_plane: "Control Plane",
   email_and_notifications: "Email and Notifications",
   scheduled_reports: "Scheduled Reports",
@@ -2231,6 +2356,330 @@ function EdgeClientViewCell({ row, tenantScope }) {
   );
 }
 
+// Per-user Lite share token. Renders Generate / Copy / Rotate on a Users
+// table row so an admin can mint one local-LAN Lite URL per user. The
+// Copy button puts a full http://<lan-ip>:<lan-port>/lite/?token=<...>
+// URL on the clipboard so the user can paste it into any LAN browser.
+// Falls back to copying just the token if LAN sharing is off.
+function UserClientViewCell({ row, tenantScope, edgeId, isAdminViewer }) {
+  const userId = String(row?.username || row?.user_id || "").trim();
+  const [link, setLink] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [justCopied, setJustCopied] = useState(false);
+  const [lanTargets, setLanTargets] = useState({ urls: [], running: false });
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!userId || !edgeId) return;
+      try {
+        const [res, targets] = await Promise.all([
+          getEdgeUserViewLink(edgeId, userId, tenantScope),
+          getLiteLocalShareTargets(),
+        ]);
+        if (cancelled) return;
+        setLink(res?.link || null);
+        setLanTargets(targets || { urls: [], running: false });
+      } catch (e) {
+        if (!cancelled) setError(String(e?.message || e));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [userId, edgeId, tenantScope]);
+
+  const ensureLink = async () => {
+    if (link?.token) return link;
+    setBusy(true);
+    setError("");
+    try {
+      const res = await createEdgeUserViewLink(edgeId, userId, tenantScope);
+      const next = res?.link || null;
+      setLink(next);
+      return next;
+    } catch (e) {
+      setError(String(e?.message || e));
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onCopy = async () => {
+    const lk = await ensureLink();
+    if (!lk?.token) return;
+    // Prefer a LAN URL — that's what the user is supposed to open in a
+    // browser. If LAN sharing isn't running we just copy the raw token so
+    // the user can paste it into the existing Lite landing prompt.
+    let textToCopy = lk.token;
+    if (lanTargets?.urls?.length) {
+      textToCopy = buildLiteLocalUrl(lanTargets.urls[0], lk.token);
+    }
+    try {
+      await navigator.clipboard.writeText(textToCopy);
+      setJustCopied(true);
+      setTimeout(() => setJustCopied(false), 1500);
+    } catch (_) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = textToCopy;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        setJustCopied(true);
+        setTimeout(() => setJustCopied(false), 1500);
+      } catch (_) {}
+    }
+  };
+
+  const onRotate = async () => {
+    if (!userId || !edgeId) return;
+    if (!window.confirm(`Rotate the Lite access link for '${userId}'?\n\nThe current URL stops working immediately and a new one is generated. The user must paste the new URL.`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      const res = await rotateEdgeUserViewLink(edgeId, userId, tenantScope);
+      setLink(res?.link || null);
+      setJustCopied(false);
+    } catch (e) {
+      setError(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!isAdminViewer) return <span style={{ color: "#666", fontSize: 11 }}>—</span>;
+  if (!userId || !edgeId) return <span>-</span>;
+  return (
+    <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+      <button
+        type="button"
+        className="btn btn-secondary btn-sm"
+        onClick={onCopy}
+        disabled={busy}
+        title={lanTargets?.running
+          ? `Copy LAN Lite URL (port ${lanTargets.port || ""}) for this user`
+          : "Copy the user's Lite token (LAN sharing not on — paste the token into the Lite page)"}
+      >{justCopied ? "Copied!" : (link?.token ? "Copy" : "Generate")}</button>
+      <button
+        type="button"
+        className="btn btn-danger btn-sm"
+        onClick={onRotate}
+        disabled={busy || !link}
+        title="Invalidate the current link and mint a new one"
+      >Rotate</button>
+      {error ? <span style={{ color: "#d35454", fontSize: 11, marginLeft: 4 }} title={error}>!</span> : null}
+    </span>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Connections pages (operator 2026-06-17, Phase 3). OPC UA / MQTT
+// servers that the edge runs on the LAN so external SCADA / HMI
+// clients can read TrustNode tags. Settings persist in
+// app_settings.connections via /api/connections/*.
+// ──────────────────────────────────────────────────────────────────────
+function ConnectionsOverviewPage() {
+  const [opc, setOpc] = useState({ running: false, port: 0 });
+  const [mqtt, setMqtt] = useState({ running: false, port: 0 });
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const [o, m] = await Promise.all([getOpcuaStatus(), getMqttStatus()]);
+        if (cancelled) return;
+        setOpc(o || {});
+        setMqtt(m || {});
+      } catch (_) {}
+    };
+    poll();
+    const t = setInterval(poll, 3000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+  return (
+    <section className="card">
+      <h3 style={{ marginTop: 0 }}>Outbound Connections</h3>
+      <p className="muted" style={{ marginTop: 0 }}>Expose TrustNode tags to LAN clients over OPC UA or MQTT. Configure each in the sub-pages.</p>
+      <div className="form-grid" style={{ gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 16, marginTop: 12 }}>
+        <div className="card" style={{ padding: 14 }}>
+          <h4 style={{ margin: 0 }}>OPC UA Server</h4>
+          <div className="row" style={{ marginTop: 8, alignItems: "center", gap: 8 }}>
+            <span className={`status-pill ${opc.running ? "status-online" : "status-offline"}`}>{opc.running ? "Running" : "Stopped"}</span>
+            {opc.running ? <span className="muted">opc.tcp://&lt;edge-ip&gt;:{opc.port}/trustnode/edge</span> : null}
+          </div>
+          {opc.last_error ? <div className="lock-note" style={{ marginTop: 8 }}>Last error: {opc.last_error}</div> : null}
+        </div>
+        <div className="card" style={{ padding: 14 }}>
+          <h4 style={{ margin: 0 }}>MQTT Broker</h4>
+          <div className="row" style={{ marginTop: 8, alignItems: "center", gap: 8 }}>
+            <span className={`status-pill ${mqtt.running ? "status-online" : "status-offline"}`}>{mqtt.running ? "Running" : "Stopped"}</span>
+            {mqtt.running ? <span className="muted">tcp://&lt;edge-ip&gt;:{mqtt.port}</span> : null}
+          </div>
+          {mqtt.last_error ? <div className="lock-note" style={{ marginTop: 8 }}>Last error: {mqtt.last_error}</div> : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function OpcuaSettingsPage({ canEdit }) {
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState({ running: false, port: 4840, config: {} });
+  const [form, setForm] = useState({
+    port: 4840,
+    server_name: "TrustNode Edge OPC UA",
+    anonymous: true,
+    username: "",
+    password: "",
+    runtime: "python",
+  });
+  const refresh = async () => {
+    try {
+      const s = await getOpcuaStatus();
+      setStatus(s || {});
+      if (s?.config) {
+        setForm((f) => ({
+          ...f,
+          port: Number(s.config.port || f.port || 4840),
+          server_name: String(s.config.server_name || f.server_name),
+          anonymous: s.config.anonymous !== false,
+          username: String(s.config.username || ""),
+          password: String(s.config.password || ""),
+          runtime: String(s.config.runtime || "python"),
+        }));
+      }
+    } catch (_) {}
+  };
+  useEffect(() => { refresh(); }, []);
+  const onEnable = async () => {
+    setBusy(true);
+    try {
+      await setOpcuaEnabled({ enabled: true, ...form });
+      await refresh();
+    } finally { setBusy(false); }
+  };
+  const onDisable = async () => {
+    setBusy(true);
+    try {
+      await setOpcuaDisabled();
+      await refresh();
+    } finally { setBusy(false); }
+  };
+  return (
+    <section className="card">
+      <h3 style={{ marginTop: 0 }}>OPC UA Server</h3>
+      <p className="muted">Exposes tags flagged "Publish to OPC UA" on the Tags page. Endpoint <code>opc.tcp://&lt;edge-ip&gt;:{form.port}/trustnode/edge</code>.</p>
+      <div className="row" style={{ alignItems: "center", gap: 10 }}>
+        <span className={`status-pill ${status.running ? "status-online" : "status-offline"}`}>{status.running ? `Running on port ${status.port}` : "Stopped"}</span>
+        {!status.running && canEdit ? <button className="btn btn-primary" disabled={busy} onClick={onEnable}>Turn ON</button> : null}
+        {status.running && canEdit ? <button className="btn btn-danger" disabled={busy} onClick={onDisable}>Turn OFF</button> : null}
+      </div>
+      {status.last_error ? <div className="lock-note" style={{ marginTop: 10 }}>Last error: {status.last_error}</div> : null}
+      <div className="form-grid" style={{ gridTemplateColumns: "repeat(2, minmax(0, 1fr))", marginTop: 14, gap: 12 }}>
+        <label>Runtime
+          <select value={form.runtime} onChange={(e) => setForm({ ...form, runtime: e.target.value })} disabled={!canEdit || status.running}>
+            <option value="python">Python (asyncua) — bundled</option>
+            <option value="native">OPC Foundation .NET — native sidecar</option>
+          </select>
+        </label>
+        <label>Port<input type="number" value={form.port} onChange={(e) => setForm({ ...form, port: Number(e.target.value || 4840) })} disabled={!canEdit || status.running} /></label>
+        <label>Server name<input value={form.server_name} onChange={(e) => setForm({ ...form, server_name: e.target.value })} disabled={!canEdit || status.running} /></label>
+        <label className="remember-row" style={{ marginTop: 8 }}>
+          <input type="checkbox" checked={form.anonymous} onChange={(e) => setForm({ ...form, anonymous: e.target.checked })} disabled={!canEdit || status.running} />
+          <span>Allow anonymous (no login)</span>
+        </label>
+        {!form.anonymous ? <>
+          <label>Username<input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} disabled={!canEdit || status.running} /></label>
+          <label>Password<input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} disabled={!canEdit || status.running} /></label>
+        </> : null}
+      </div>
+      {form.runtime === "native" ? (
+        <div className="lock-note" style={{ marginTop: 12 }}>
+          The OPC Foundation .NET sidecar is not bundled in this build. Selecting it will report "not installed" until the native runtime is dropped in <code>backend/sidecars/opcua/</code>.
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function MqttSettingsPage({ canEdit }) {
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState({ running: false, port: 1883, config: {} });
+  const [form, setForm] = useState({
+    port: 1883,
+    anonymous: true,
+    username: "",
+    password: "",
+    runtime: "python",
+  });
+  const refresh = async () => {
+    try {
+      const s = await getMqttStatus();
+      setStatus(s || {});
+      if (s?.config) {
+        setForm((f) => ({
+          ...f,
+          port: Number(s.config.port || f.port || 1883),
+          anonymous: s.config.anonymous !== false,
+          username: String(s.config.username || ""),
+          password: String(s.config.password || ""),
+          runtime: String(s.config.runtime || "python"),
+        }));
+      }
+    } catch (_) {}
+  };
+  useEffect(() => { refresh(); }, []);
+  const onEnable = async () => {
+    setBusy(true);
+    try {
+      await setMqttEnabled({ enabled: true, ...form });
+      await refresh();
+    } finally { setBusy(false); }
+  };
+  const onDisable = async () => {
+    setBusy(true);
+    try {
+      await setMqttDisabled();
+      await refresh();
+    } finally { setBusy(false); }
+  };
+  return (
+    <section className="card">
+      <h3 style={{ marginTop: 0 }}>MQTT Broker</h3>
+      <p className="muted">Exposes tags flagged "Publish to MQTT" on the Tags page. Topic <code>trustnode/&lt;tenant&gt;/&lt;edge&gt;/&lt;gateway&gt;/&lt;device&gt;/&lt;tag&gt;</code>.</p>
+      <div className="row" style={{ alignItems: "center", gap: 10 }}>
+        <span className={`status-pill ${status.running ? "status-online" : "status-offline"}`}>{status.running ? `Running on port ${status.port}` : "Stopped"}</span>
+        {!status.running && canEdit ? <button className="btn btn-primary" disabled={busy} onClick={onEnable}>Turn ON</button> : null}
+        {status.running && canEdit ? <button className="btn btn-danger" disabled={busy} onClick={onDisable}>Turn OFF</button> : null}
+      </div>
+      {status.last_error ? <div className="lock-note" style={{ marginTop: 10 }}>Last error: {status.last_error}</div> : null}
+      <div className="form-grid" style={{ gridTemplateColumns: "repeat(2, minmax(0, 1fr))", marginTop: 14, gap: 12 }}>
+        <label>Runtime
+          <select value={form.runtime} onChange={(e) => setForm({ ...form, runtime: e.target.value })} disabled={!canEdit || status.running}>
+            <option value="python">Python (amqtt) — bundled</option>
+            <option value="native">Eclipse Mosquitto — native sidecar</option>
+          </select>
+        </label>
+        <label>Port<input type="number" value={form.port} onChange={(e) => setForm({ ...form, port: Number(e.target.value || 1883) })} disabled={!canEdit || status.running} /></label>
+        <label className="remember-row" style={{ marginTop: 8 }}>
+          <input type="checkbox" checked={form.anonymous} onChange={(e) => setForm({ ...form, anonymous: e.target.checked })} disabled={!canEdit || status.running} />
+          <span>Allow anonymous (no login)</span>
+        </label>
+        {!form.anonymous ? <>
+          <label>Username<input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} disabled={!canEdit || status.running} /></label>
+          <label>Password<input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} disabled={!canEdit || status.running} /></label>
+        </> : null}
+      </div>
+      {form.runtime === "native" ? (
+        <div className="lock-note" style={{ marginTop: 12 }}>
+          Eclipse Mosquitto is not bundled in this build. Selecting it will report "not installed" until <code>mosquitto.exe</code> is dropped in <code>backend/sidecars/mosquitto/</code>.
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function AppShell() {
   const isReadonlyCloudMode = isForcedReadonlyCloudMode();
   const isClientView = isClientViewMode();
@@ -2642,7 +3091,26 @@ function AppShell() {
     machine_group: "",
   });
   const [edgeProfileSaveResult, setEdgeProfileSaveResult] = useState("");
-  const [edgeLicenseSnapshot, setEdgeLicenseSnapshot] = useState(null);
+  const [edgeLicenseSnapshot, setEdgeLicenseSnapshot] = useState(() => {
+    // Operator 2026-06-17: hydrate the last positive license check
+    // from localStorage so a boot offline does not lock the operator
+    // out for 30 days. Treat the cache as authoritative until the
+    // 30-day window plus a 7-day grace expires; after that, fall
+    // back to a fresh cloud call.
+    try {
+      const raw = localStorage.getItem("trustnode_edge_license_snapshot_v1");
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return null;
+      const cachedAt = Number(parsed.cached_at_ms || 0);
+      const ageMs = Date.now() - cachedAt;
+      const maxAgeMs = 30 * 24 * 60 * 60 * 1000 + 7 * 24 * 60 * 60 * 1000;
+      if (!Number.isFinite(cachedAt) || ageMs > maxAgeMs) return null;
+      return parsed.snapshot || null;
+    } catch {
+      return null;
+    }
+  });
   const [edgeLicenseBusy, setEdgeLicenseBusy] = useState(false);
   const [licenseGuardBlocked, setLicenseGuardBlocked] = useState(false);
   const [licenseGuardMessage, setLicenseGuardMessage] = useState("");
@@ -2650,6 +3118,23 @@ function AppShell() {
   const [licenseGuardShowActivation, setLicenseGuardShowActivation] = useState(false);
   const [licenseGuardDismissed, setLicenseGuardDismissed] = useState(false);
   const [licenseBannerHidden, setLicenseBannerHidden] = useState(false);
+  // Operator 2026-06-17 (M2): customer-DB mode panel state.
+  const [customerDbStatus, setCustomerDbStatus] = useState(null);
+  const [customerDbForm, setCustomerDbForm] = useState({
+    engine: "postgresql",
+    host: "",
+    port: 5432,
+    database: "",
+    schema: "public",
+    username: "",
+    password: "",
+    tls: false,
+    name: "",
+  });
+  const [customerDbTestResult, setCustomerDbTestResult] = useState(null);
+  const [customerDbBusy, setCustomerDbBusy] = useState(false);
+  const [customerDbActivateConfirm, setCustomerDbActivateConfirm] = useState(false);
+  const [customerDbMessage, setCustomerDbMessage] = useState("");
   const [edgeActivationCodeInput, setEdgeActivationCodeInput] = useState("");
   const [edgeActivationBusy, setEdgeActivationBusy] = useState(false);
   const [edgeActivationResult, setEdgeActivationResult] = useState("");
@@ -2758,18 +3243,34 @@ function AppShell() {
     meters: false,
     registers: false,
   });
-  const [powerViewMode, setPowerViewMode] = useState("realtime");
-  const [powerPeriod, setPowerPeriod] = useState("24h");
-  const [powerInterval, setPowerInterval] = useState("hour");
-  const [powerAggregation, setPowerAggregation] = useState("avg");
-  const [powerFilterMeterId, setPowerFilterMeterId] = useState("all");
+  // Persisted view filter (operator 2026-06-16: "save the last view
+  // filter used configured in the interface so when the user reopen
+  // the app still the same"). All controls in the top strip — view
+  // mode, period, interval, aggregation, meter scope, From/To —
+  // restore from localStorage at boot and re-write on change.
+  const POWER_FILTER_LSKEY = "tn_power_overview_filter_v1";
+  const _powerFilterStored = (() => {
+    try {
+      const raw = localStorage.getItem(POWER_FILTER_LSKEY);
+      return raw ? (JSON.parse(raw) || {}) : {};
+    } catch { return {}; }
+  })();
+  const [powerViewMode, setPowerViewMode] = useState(_powerFilterStored.viewMode || "realtime");
+  const [powerPeriod, setPowerPeriod] = useState(_powerFilterStored.period || "24h");
+  const [powerInterval, setPowerInterval] = useState(_powerFilterStored.interval || "hour");
+  const [powerAggregation, setPowerAggregation] = useState(_powerFilterStored.aggregation || "avg");
+  const [powerFilterMeterId, setPowerFilterMeterId] = useState(_powerFilterStored.meterId || "all");
   // Historical range pickers — local "YYYY-MM-DDTHH:mm" strings as
   // datetime-local inputs natively emit. Default = last 24 h.
   const [powerHistoricalFrom, setPowerHistoricalFrom] = useState(() => {
+    if (_powerFilterStored.from) return String(_powerFilterStored.from);
     const d = new Date(Date.now() - 24 * 3600_000);
     return d.toISOString().slice(0, 16);
   });
-  const [powerHistoricalTo, setPowerHistoricalTo] = useState(() => new Date().toISOString().slice(0, 16));
+  const [powerHistoricalTo, setPowerHistoricalTo] = useState(() => {
+    if (_powerFilterStored.to) return String(_powerFilterStored.to);
+    return new Date().toISOString().slice(0, 16);
+  });
   const [powerHistoricalApplyToken, setPowerHistoricalApplyToken] = useState(0);
   // Aggregation scale removed 2026-06-16 — Period + Interval are
   // independent controls now. Keep the state slot so any legacy
@@ -2840,6 +3341,10 @@ function AppShell() {
         title: "", hide_title: false,
         mode: "cost",
         show_legend: true,
+        // Operator 2026-06-16: slice labels off by default — they
+        // overflow the donut area on narrow cards. The legend at the
+        // bottom + the center total carry the same information.
+        show_slice_labels: false,
         height: 260,
         series_colors: {},
         // Visualisation choice (operator 2026-06-16): "donut" or
@@ -2852,6 +3357,11 @@ function AppShell() {
   });
   const [chartSettingsOpenKey, setChartSettingsOpenKey] = useState("");
   const [powerMainMetric, setPowerMainMetric] = useState("power_kw");
+  // Operator 2026-06-17: ref mirror of powerMainMetric so the
+  // pollPower closure can read the latest metric without re-binding
+  // the interval timer on every metric flip.
+  const powerMainMetricRef = useRef("power_kw");
+  useEffect(() => { powerMainMetricRef.current = powerMainMetric; }, [powerMainMetric]);
   const [powerMainChartType, setPowerMainChartType] = useState("area");
   const [powerCostChartRange, setPowerCostChartRange] = useState("12h");
   const [powerSideMetric, setPowerSideMetric] = useState("power_kw");
@@ -3362,6 +3872,12 @@ function AppShell() {
   // still hits the historian endpoint every 2 s even on a brand-
   // new install with no devices — wastes CPU and disk IO.
   const powerHistoryHasDevicesRef = useRef(false);
+  // Operator 2026-06-16: when every configured meter is disconnected
+  // (gateway stopped / power off), the Overview poll has nothing
+  // useful to read but was still hammering the historian + latest
+  // endpoints. Track "any meter connected" so the poll cadence can
+  // back off and the historian fetch can be skipped.
+  const powerAnyConnectedRef = useRef(false);
   // Mirror of periodMs for the poll effect — periodMs is declared
   // later than this effect's closure can capture, so we keep it
   // in a ref updated via a separate useEffect below.
@@ -4462,8 +4978,18 @@ function AppShell() {
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed)) {
-          setDashboardWidgets(parsed);
+          // Operator 2026-06-16: migrate v1 (20×20) layouts to v2
+          // (40×40) by doubling w/h/x/y so widgets keep their
+          // visual footprint on the finer grid. Idempotent.
+          const savedVersion = Number(localStorage.getItem("trustnode_dashboard_grid_version") || 1);
+          const migrated = migrateWidgetsToFinerGrid(parsed, savedVersion);
+          setDashboardWidgets(migrated);
+          if (savedVersion < DASHBOARD_GRID_VERSION) {
+            try { localStorage.setItem("trustnode_dashboard_grid_version", String(DASHBOARD_GRID_VERSION)); } catch {}
+          }
         }
+      } else {
+        try { localStorage.setItem("trustnode_dashboard_grid_version", String(DASHBOARD_GRID_VERSION)); } catch {}
       }
     } catch {}
     try {
@@ -6856,6 +7382,11 @@ function AppShell() {
             } catch (_) {
               setPowerStatus(statusRes.status);
             }
+            // Drive idle-mode gating: when no meter is connected
+            // the Overview goes light.
+            const statusDevices = Array.isArray(statusRes.status?.devices) ? statusRes.status.devices : [];
+            powerAnyConnectedRef.current = statusDevices.some((d) => d?.connected === true)
+              || statusRes.status?.connected === true;
           }
           const selectedDeviceId = String(cfgRes?.config?.selected_device_id || "");
           const selectedSample =
@@ -7016,47 +7547,86 @@ function AppShell() {
           } else {
             const nowMs = Date.now();
             const periodMsLocal = Number(powerHistoryPeriodMsRef.current || 60000);
-            // Operator 2026-06-16: wide windows are expensive, so
-            // throttle the refetch in proportion to the period.
-            // Short windows refresh every 2s; long ones every
-            // 5-15s so the UI stays smooth.
-            const throttleMs = periodMsLocal <= 5 * 60 * 1000 ? 2000
-                              : periodMsLocal <= 60 * 60 * 1000 ? 5000
-                              : periodMsLocal <= 6 * 60 * 60 * 1000 ? 10000
+            const idle = !powerAnyConnectedRef.current;
+            // Operator 2026-06-16: throttle the refetch in proportion
+            // to the period. Now that /api/power/history has been
+            // moved to the SQL-side source filter (~30ms median) we
+            // can safely refresh short windows every 1s so the chart
+            // tracks the meter's 1Hz cadence. Wide windows stay
+            // longer so we don't issue large fetches at 1Hz. Idle
+            // (no meter connected) backs off to 30s.
+            const throttleMs = idle
+              ? 30000
+              : periodMsLocal <= 5 * 60 * 1000 ? 1000
+                              : periodMsLocal <= 60 * 60 * 1000 ? 3000
+                              : periodMsLocal <= 6 * 60 * 60 * 1000 ? 8000
                               : 15000;
             if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= throttleMs) {
               powerHistoryLastFetchMsRef.current = nowMs;
               powerHistoryFetchInflightRef.current = true;
               if (periodMsLocal > 15 * 60 * 1000) {
-                // For wide periods, hit the historian range
-                // endpoint scoped to power-related tags via the
-                // tag-LIKE filter so the SQL prefilter trims most
-                // of the rows server-side. Then trim further on
-                // the client (insight.* + _raw tags). The endpoint
-                // accepts at most 50000 rows per call (server cap),
-                // so multiple narrow tag queries are cheaper than
-                // one mega query.
+                // Operator 2026-06-17: wide-period fetches now use the
+                // pre-aggregated `historian_agg_<bucket>` tables when
+                // the period is wide enough for minute/hour buckets to
+                // give plenty of resolution. A 24 h × Minute view
+                // returns ~1 440 rows instead of ~17 000 — ~12× less
+                // JSON, ~12× less browser work in every memo. Raw
+                // fetch is kept as the fallback for tags the agg
+                // tables don't carry (e.g. brand-new tags before
+                // first rollup).
                 try {
                   const fromUtc = new Date(nowMs - periodMsLocal).toISOString();
                   const toUtc = new Date(nowMs + 60_000).toISOString();
-                  // Single tag-LIKE pull. The historian column is
-                  // case-insensitive LIKE; we only need active power
-                  // + voltage + current for the Live chart.
-                  const fetchTag = async (pattern) => {
+                  const metric = String(powerMainMetricRef.current || "power_kw");
+                  const tagPattern = metric === "voltage_v" ? "voltage"
+                    : metric === "current_a" ? "current"
+                    : metric === "energy_kwh" ? "energy_"
+                    : "active_power";
+                  // Pick a bucket grain proportional to the window so
+                  // the chart never gets more than ~1500 points per
+                  // tag. > 7 days → day; > 36 h → hour; otherwise minute.
+                  const aggBucket = periodMsLocal > 7 * 24 * 3600_000 ? "day"
+                    : periodMsLocal > 36 * 3600_000 ? "hour"
+                    : "minute";
+                  const aggLim = Math.min(15000, Math.max(500, Math.ceil(periodMsLocal / (
+                    aggBucket === "day" ? 86400_000 : aggBucket === "hour" ? 3600_000 : 60_000
+                  )) * 6));
+                  // Two parallel pulls: chart-metric tag (LIKE) +
+                  // insight.* (LIKE), both pre-bucketed.
+                  const fetchAgg = async (pattern) => {
                     try {
-                      const res = await getAppStoreHistorianRange({
-                        fromUtc, toUtc, limit: 50000, offset: 0, tag: pattern,
+                      const res = await getAppStoreHistorianAgg({
+                        bucket: aggBucket, fromUtc, toUtc, tag: pattern,
+                        limit: aggLim, source: "power_modbus,power_insight",
                       });
                       return Array.isArray(res?.rows) ? res.rows : [];
                     } catch { return []; }
                   };
-                  const [powerRows, voltRows, currRows, insightRows] = await Promise.all([
-                    fetchTag("active_power"),
-                    fetchTag("voltage"),
-                    fetchTag("current"),
-                    fetchTag("insight."),
+                  const [metricRows, insightRows] = await Promise.all([
+                    fetchAgg(tagPattern),
+                    fetchAgg("insight."),
                   ]);
-                  applyPowerHistoryRows([...powerRows, ...voltRows, ...currRows, ...insightRows]);
+                  // Fallback: if the agg tables don't have rows for
+                  // this window yet (retention hasn't rolled them up),
+                  // pull a small raw window so the chart isn't empty.
+                  if (metricRows.length === 0 && insightRows.length === 0) {
+                    const lim = Math.min(20000, Math.max(1500, Math.ceil(periodMsLocal / 60000) * 12));
+                    const fetchRaw = async (pattern) => {
+                      try {
+                        const res = await getAppStoreHistorianRange({
+                          fromUtc, toUtc, limit: lim, offset: 0, tag: pattern,
+                        });
+                        return Array.isArray(res?.rows) ? res.rows : [];
+                      } catch { return []; }
+                    };
+                    const [rawMetric, rawInsight] = await Promise.all([
+                      fetchRaw(tagPattern),
+                      fetchRaw("insight."),
+                    ]);
+                    applyPowerHistoryRows([...rawMetric, ...rawInsight]);
+                  } else {
+                    applyPowerHistoryRows([...metricRows, ...insightRows]);
+                  }
                 } catch (_) { /* fall through */ }
               } else {
                 // Short windows: lighter row-count endpoint.
@@ -7086,12 +7656,37 @@ function AppShell() {
       }
     };
 
-    const pollMs =
-      activePage === "power_overview" || activePage === "power_configuration" || activePage === "dashboard" || activePage === "tags"
-        ? 1000
-        : 2500;
+    // Operator 2026-06-16: poll only on pages that visually depend
+    // on power data (Power Overview / Config, Dashboard, Tags,
+    // Historian). On every other page the poll was burning ~7 HTTP
+    // calls every 2.5 s for no visible benefit. When the operator
+    // navigates back to a power-relevant page the effect re-runs
+    // because activePage is in the dep list.
+    const POWER_RELEVANT_PAGES = new Set([
+      "power_overview",
+      "power_configuration",
+      "dashboard",
+      "tags",
+      "historian",
+    ]);
+    if (!POWER_RELEVANT_PAGES.has(activePage)) {
+      return () => { stopped = true; };
+    }
+    // Idle (no meter connected) bumps cadence to ~5x the base
+    // interval. Power-relevant pages run at 1 s base; nothing else
+    // ever reaches this code now.
+    const basePollMs = 1000;
     pollPower();
-    const timer = setInterval(pollPower, pollMs);
+    let idleSkipCounter = 0;
+    const timer = setInterval(() => {
+      if (powerAnyConnectedRef.current) {
+        idleSkipCounter = 0;
+        pollPower();
+        return;
+      }
+      idleSkipCounter = (idleSkipCounter + 1) % 5;
+      if (idleSkipCounter === 0) pollPower();
+    }, basePollMs);
     return () => {
       stopped = true;
       clearInterval(timer);
@@ -7342,6 +7937,26 @@ function AppShell() {
     } catch (_) {}
   }, [powerChartSettings]);
 
+  // Persist the top-strip view filter so the operator's last
+  // selection (mode/period/interval/aggregation/meter/From/To)
+  // survives EXE restart.
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        POWER_FILTER_LSKEY,
+        JSON.stringify({
+          viewMode: powerViewMode,
+          period: powerPeriod,
+          interval: powerInterval,
+          aggregation: powerAggregation,
+          meterId: powerFilterMeterId,
+          from: powerHistoricalFrom,
+          to: powerHistoricalTo,
+        })
+      );
+    } catch (_) {}
+  }, [powerViewMode, powerPeriod, powerInterval, powerAggregation, powerFilterMeterId, powerHistoricalFrom, powerHistoricalTo]);
+
   // Time-of-use tariff resolver. Operator 2026-06-15: Overview cost
   // calculations should consume the configured tariffs, not a single
   // flat rate. Returns the matching tariff rate for an epoch ms, or
@@ -7554,7 +8169,11 @@ function AppShell() {
     // → last 60 minutes ending at the current minute. We compute
     // the skeleton by stepping back from now in the matching
     // grain so the rightmost bucket is the active one.
-    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval, periodMs, displayTimeZone);
+    const histAnchor = (powerViewMode === "historical" && powerHistoricalRange) ? powerHistoricalRange.toMs : null;
+    const histSpan = (powerViewMode === "historical" && powerHistoricalRange)
+      ? (powerHistoricalRange.toMs - powerHistoricalRange.fromMs)
+      : periodMs;
+    const skeletonKeys = buildAnchoredSkeleton(effectiveInterval, histSpan, displayTimeZone, histAnchor);
     for (const k of skeletonKeys) {
       if (!buckets.has(k)) buckets.set(k, { ts: k, meterBuckets: {} });
     }
@@ -7584,7 +8203,7 @@ function AppShell() {
     });
     rows.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
     return { rows, meterIds };
-  }, [powerConfig, powerRowsFiltered, powerInterval, effectiveInterval, powerMainMetric, powerAggregation, selectedPowerChartMeters, displayTimeZone]);
+  }, [powerConfig, powerRowsFiltered, powerInterval, effectiveInterval, powerMainMetric, powerAggregation, selectedPowerChartMeters, displayTimeZone, powerViewMode, powerHistoricalRange, periodMs]);
 
   const powerMainYDomain = useMemo(() => {
     const keys = ["total", ...powerMainChartData.meterIds];
@@ -7666,7 +8285,11 @@ function AppShell() {
     // X-axis anchored to "now" (operator 2026-06-15) — see
     // buildAnchoredSkeleton above. Same logic as the main chart so
     // the two charts always share the same X domain.
-    const skeletonKeys = buildAnchoredSkeleton(sideInterval, periodMs, displayTimeZone);
+    const sideHistAnchor = (powerViewMode === "historical" && powerHistoricalRange) ? powerHistoricalRange.toMs : null;
+    const sideHistSpan = (powerViewMode === "historical" && powerHistoricalRange)
+      ? (powerHistoricalRange.toMs - powerHistoricalRange.fromMs)
+      : periodMs;
+    const skeletonKeys = buildAnchoredSkeleton(sideInterval, sideHistSpan, displayTimeZone, sideHistAnchor);
     for (const k of skeletonKeys) {
       if (!buckets.has(k)) buckets.set(k, { ts: k, total_kwh: 0 });
     }
@@ -8653,13 +9276,17 @@ function AppShell() {
       nextDevices[idx] = { ...nextDevices[idx], enabled: !!shouldRun };
       return { ...prev, devices: nextDevices };
     });
-    setPowerBusy(true);
+    // Operator 2026-06-16: do NOT set powerBusy here — it was
+    // disabling the Start/Stop button across every meter row for the
+    // entire HTTP round-trip, which read as "the click did nothing"
+    // even though the optimistic flip had already landed. The
+    // optimistic update + the post-response identity-skip is enough.
     try {
       const res = shouldRun ? await startPowerDevice(did) : await stopPowerDevice(did);
       if (res?.ok && res?.config) {
         const cfg = res.config || {};
         const cfgDevices = Array.isArray(cfg.devices) ? cfg.devices : [];
-        setPowerConfig({
+        const nextCfg = {
           ...cfg,
           devices: cfgDevices.map((d) => {
             const registers = d?.registers && typeof d.registers === "object" ? d.registers : {};
@@ -8669,7 +9296,19 @@ function AppShell() {
               register_scales: buildRegisterScaleMap(registers, d?.register_scales || {}),
             };
           }),
-        });
+        };
+        // Identity-skip so we don't invalidate every dependent memo
+        // when the response matches the optimistic flip already in
+        // place. powerConfigJsonRef is shared with the 1 Hz poll.
+        try {
+          const next = JSON.stringify(nextCfg);
+          if (powerConfigJsonRef.current !== next) {
+            powerConfigJsonRef.current = next;
+            setPowerConfig(nextCfg);
+          }
+        } catch (_) {
+          setPowerConfig(nextCfg);
+        }
       }
       setPowerResult(shouldRun ? `Power meter ${did} started.` : `Power meter ${did} stopped.`);
     } catch (err) {
@@ -8683,8 +9322,6 @@ function AppShell() {
         return { ...prev, devices: nextDevices };
       });
       setPowerResult(`Power meter control failed: ${String(err?.message || err)}`);
-    } finally {
-      setPowerBusy(false);
     }
   };
 
@@ -8791,6 +9428,8 @@ function AppShell() {
             : page === "database_inspector"
             ? "database"
             : page === "backup_and_retention"
+              ? "database"
+            : page === "customer_database"
               ? "database"
             : page === "website_and_env"
               ? "users_and_access_control"
@@ -9154,7 +9793,17 @@ function AppShell() {
     wsState,
   ]);
 
-  const LICENSE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+  // Operator 2026-06-17: validate-once-cache-for-30-days. The interval
+  // moved from 24 h to 30 d to support genuinely offline customers.
+  // The previous snapshot was in-memory only and lost on every refresh,
+  // which meant a boot offline always showed "license check pending"
+  // even when the cloud had returned ok the day before. We now persist
+  // the last positive snapshot to localStorage with a wall-clock
+  // timestamp and re-use it during the 30-day window with no cloud
+  // call. Operators can force a re-check via the License banner.
+  const LICENSE_CHECK_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000;
+  const LICENSE_SNAPSHOT_STORAGE_KEY = "trustnode_edge_license_snapshot_v1";
+  const LICENSE_SNAPSHOT_GRACE_MS = 7 * 24 * 60 * 60 * 1000; // 7d grace after 30d
   const formatLicenseGuardReason = useCallback((reason) => {
     const r = String(reason || "").trim();
     if (r === "edge_not_found") return "Edge not found in control-plane. Verify edge identity and activation code.";
@@ -9166,8 +9815,48 @@ function AppShell() {
     return r.replaceAll("_", " ");
   }, []);
 
-  const runLicenseComplianceCheck = useCallback(async () => {
+  const runLicenseComplianceCheck = useCallback(async (forceCloud = false) => {
     if (!currentUser || isHostedWebClient) return;
+    // Operator 2026-06-17: 30-day cache short-circuit. If the
+    // localStorage snapshot is fresh AND positive, mark the license
+    // OK and skip the cloud round-trip entirely. The operator can
+    // pass forceCloud=true via the "Re-check now" UI button to flush
+    // the cache and probe the cloud anyway.
+    if (!forceCloud) {
+      try {
+        const rawCached = localStorage.getItem(LICENSE_SNAPSHOT_STORAGE_KEY);
+        if (rawCached) {
+          const parsedCached = JSON.parse(rawCached);
+          const cachedAt = Number(parsedCached?.cached_at_ms || 0);
+          const cachedSnap = parsedCached?.snapshot;
+          if (
+            cachedSnap?.ok &&
+            Number.isFinite(cachedAt) &&
+            Date.now() - cachedAt < LICENSE_CHECK_INTERVAL_MS
+          ) {
+            // Cache hit, well inside the 30-day window. Honour the
+            // cached end_utc so an expired license still surfaces.
+            const endStr = String(cachedSnap?.license?.end_utc || "").trim();
+            const endMs = endStr ? Date.parse(endStr) : NaN;
+            const expired = Number.isFinite(endMs) && endMs <= Date.now();
+            if (!expired) {
+              if (!edgeLicenseSnapshot?.ok) setEdgeLicenseSnapshot(cachedSnap);
+              setLicenseGuardBlocked(false);
+              setLicenseGuardMessage("License active (cached)");
+              setLicenseGuardLastCheckedUtc(tsNow());
+              return;
+            }
+            // Cached snapshot says the license ended — fall through
+            // to the cloud probe so we can refresh.
+          }
+        }
+      } catch (_) {
+        // Bad cache JSON; fall through and treat as a normal probe.
+      }
+    } else {
+      // Force flush so the cloud answer overrides whatever's cached.
+      try { localStorage.removeItem(LICENSE_SNAPSHOT_STORAGE_KEY); } catch (_) {}
+    }
     const edgeId = String(edgeProfile?.edge_id || "").trim();
     const localLicense = edgeLicenseSnapshot?.license && typeof edgeLicenseSnapshot.license === "object"
       ? edgeLicenseSnapshot.license
@@ -9236,6 +9925,19 @@ function AppShell() {
       // snapshot when the new one is genuinely a positive answer.
       if (out && (out.ok || !edgeLicenseSnapshot?.ok)) {
         setEdgeLicenseSnapshot(out);
+        // Operator 2026-06-17: persist the positive snapshot so the
+        // next 30 days of boots can resolve the license without
+        // touching the cloud. We DO NOT persist negative answers —
+        // those should refetch every time so an expired license
+        // doesn't get re-cached as the source of truth.
+        if (out?.ok) {
+          try {
+            localStorage.setItem(
+              LICENSE_SNAPSHOT_STORAGE_KEY,
+              JSON.stringify({ snapshot: out, cached_at_ms: Date.now() })
+            );
+          } catch (_) {}
+        }
       }
       // Pick up trial-related fields whenever they appear on the
       // response — eligibility comes back on EVERY check, the active
@@ -9708,6 +10410,16 @@ function AppShell() {
             "insight.total_kwh",
             "insight.energy_cost_eur",
             "insight.downtime_cost_eur",
+            // Operator 2026-06-16: tariff insight tags so dashboard
+            // widgets can show active tariff index/rate and per-
+            // tariff kWh / cost. One tag per configured tariff
+            // (1-based index).
+            "insight.active_tariff_index",
+            "insight.active_tariff_rate_eur_kwh",
+            ...((powerConfig?.electricity_tariffs || []).flatMap((_t, i) => [
+              `insight.tariff_${i + 1}_kwh`,
+              `insight.tariff_${i + 1}_cost_eur`,
+            ])),
           ],
           power_meter: true,
           enabled: d?.enabled !== false,
@@ -14552,6 +15264,47 @@ const getGatewayHealth = (gateway) => {
   }, [activePage, appStoreHydrated, endpointVersion]);
 
   const makeTagKey = (gatewayId, tagName) => `${String(gatewayId || "")}::${String(tagName || "").trim()}`;
+
+  // Per-tag publish flags for OPC UA / MQTT (operator 2026-06-17, Phase 4).
+  // Stored under app_settings.tag_publish_flags; backend services read
+  // the same map on start to decide which tags get an OPC node /
+  // MQTT topic. Local mirror so toggling stays responsive.
+  const [tagPublishFlags, setTagPublishFlags] = useState({});
+  // Hydrate from app store bootstrap on mount + whenever the bootstrap
+  // refreshes elsewhere — keyed by app_settings.tag_publish_flags.
+  useEffect(() => {
+    const refresh = async () => {
+      try {
+        const data = await getAppStoreBootstrap();
+        const fl = (data?.app_settings?.tag_publish_flags && typeof data.app_settings.tag_publish_flags === "object")
+          ? data.app_settings.tag_publish_flags : {};
+        setTagPublishFlags(fl);
+      } catch (_) {}
+    };
+    refresh();
+  }, []);
+  const isTagPublishEnabled = (gatewayId, tagName, channel) => {
+    const k = makeTagKey(gatewayId, tagName);
+    const entry = tagPublishFlags[k] || {};
+    return Boolean(entry[channel]);
+  };
+  const setTagPublishEnabled = async (gatewayId, tagName, channel, enabled) => {
+    const k = makeTagKey(gatewayId, tagName);
+    const next = { ...tagPublishFlags };
+    const entry = { ...(next[k] || {}) };
+    if (enabled) entry[channel] = true; else delete entry[channel];
+    if (Object.keys(entry).length === 0) delete next[k]; else next[k] = entry;
+    setTagPublishFlags(next);
+    try {
+      const data = await getBootstrap();
+      const s = (data?.app_settings && typeof data.app_settings === "object") ? data.app_settings : {};
+      await saveAppStoreDomain("app_settings", { ...s, tag_publish_flags: next }, currentUser?.username || "system");
+    } catch (e) {
+      // Roll back the local toggle if save failed so UI stays accurate.
+      setTagPublishFlags(tagPublishFlags);
+    }
+  };
+
   const isTagAlarmEnabled = (gatewayId, tagName) => tagAlarmPrefsRef.current[makeTagKey(gatewayId, tagName)] !== false;
   const setTagAlarmEnabled = (gatewayId, tagName, enabled) => {
     const key = makeTagKey(gatewayId, tagName);
@@ -17432,6 +18185,17 @@ const getGatewayHealth = (gateway) => {
                   Manage License
                 </button>
               ) : null}
+              {/* Operator 2026-06-17: force a fresh cloud probe even
+                  if the 30-day cache says we are fine. Useful after
+                  the operator just renewed a license in the portal
+                  and wants the edge to pick it up immediately. */}
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => runLicenseComplianceCheck(true)}
+                title="Bypass the 30-day cache and re-validate against the cloud now"
+              >
+                Re-check now
+              </button>
               <button className="btn btn-secondary btn-sm" onClick={() => setLicenseBannerHidden(true)}>
                 Hide
               </button>
@@ -18036,19 +18800,31 @@ const getGatewayHealth = (gateway) => {
                   {powerViewMode === "historical" ? (
                     <>
                       <label className="field pwr-overview-field pwr-overview-date">
-                        <span>From</span>
+                        <span>From (DD/MM/YYYY HH:mm)</span>
                         <input
-                          type="datetime-local"
-                          value={powerHistoricalFrom}
-                          onChange={(e) => setPowerHistoricalFrom(e.target.value)}
+                          type="text"
+                          inputMode="numeric"
+                          placeholder="DD/MM/YYYY HH:mm"
+                          value={formatIsoLocalAsDmy(powerHistoricalFrom)}
+                          onChange={(e) => {
+                            const iso = parseDmyToIsoLocal(e.target.value);
+                            if (iso !== null) setPowerHistoricalFrom(iso);
+                          }}
+                          style={{ fontVariantNumeric: "tabular-nums" }}
                         />
                       </label>
                       <label className="field pwr-overview-field pwr-overview-date">
-                        <span>To</span>
+                        <span>To (DD/MM/YYYY HH:mm)</span>
                         <input
-                          type="datetime-local"
-                          value={powerHistoricalTo}
-                          onChange={(e) => setPowerHistoricalTo(e.target.value)}
+                          type="text"
+                          inputMode="numeric"
+                          placeholder="DD/MM/YYYY HH:mm"
+                          value={formatIsoLocalAsDmy(powerHistoricalTo)}
+                          onChange={(e) => {
+                            const iso = parseDmyToIsoLocal(e.target.value);
+                            if (iso !== null) setPowerHistoricalTo(iso);
+                          }}
+                          style={{ fontVariantNumeric: "tabular-nums" }}
                         />
                       </label>
                     </>
@@ -18201,7 +18977,7 @@ const getGatewayHealth = (gateway) => {
                         </div>
                       </div>
                     ) : (
-                    <ResponsiveContainer width="100%" height="100%" minHeight={260}>
+                    <ResponsiveContainer width="100%" height="100%" minHeight={140}>
                       <ComposedChart data={powerMainChartData.rows} margin={{ top: 6, right: 10, left: 6, bottom: 8 }}>
                         {/* Same grid/legend styling as the dashboard chart widget
                             so Power Overview charts visually match the rest of
@@ -18213,8 +18989,14 @@ const getGatewayHealth = (gateway) => {
                           minTickGap={22}
                           interval="preserveStartEnd"
                           allowDuplicatedCategory={false}
-                          height={24}
-                          tickMargin={14}
+                          /* Operator 2026-06-17: reserve a slightly
+                             taller band (30 px) so the tick labels
+                             never collide with the legend / card
+                             edge when the operator resizes the chart
+                             card. tickMargin shrunk to 6 px so the
+                             gap is mostly inside the band itself. */
+                          height={30}
+                          tickMargin={6}
                           tickFormatter={formatPowerMainXAxisTick}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
                           axisLine={{ stroke: powerChartAxisColor }}
@@ -18225,7 +19007,16 @@ const getGatewayHealth = (gateway) => {
                           width={62}
                           domain={powerMainYDomain}
                           ticks={buildYAxisTicks(powerMainYDomain, 0.5, Math.max(4, Math.floor(Number(powerChartSettings.main.height || 360) / 55)))}
-                          tickFormatter={(v) => `${formatChartValue(v, 3)}${powerChartSettings.main.y_unit ? " " + powerChartSettings.main.y_unit : ""}`}
+                          tickFormatter={(v) => {
+                            const customUnit = powerChartSettings.main.y_unit;
+                            const defaultUnit = powerMainMetric === "current_a" ? "A"
+                              : powerMainMetric === "voltage_v" ? "V"
+                              : powerMainMetric === "power_w" ? "W"
+                              : powerMainMetric === "energy_kwh" ? "kWh"
+                              : "kW";
+                            const unit = customUnit || defaultUnit;
+                            return `${formatChartValue(v, 3)} ${unit}`;
+                          }}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
                           axisLine={{ stroke: powerChartAxisColor }}
                           tickLine={{ stroke: powerChartAxisColor }}
@@ -18362,7 +19153,7 @@ const getGatewayHealth = (gateway) => {
                         Too many points — pick a coarser Interval.
                       </div>
                     ) : (
-                    <ResponsiveContainer width="100%" height="100%" minHeight={260}>
+                    <ResponsiveContainer width="100%" height="100%" minHeight={140}>
                       <ComposedChart
                         data={powerSideChartData.rows}
                         margin={{ top: 6, right: 8, left: 4, bottom: 8 }}
@@ -18374,8 +19165,12 @@ const getGatewayHealth = (gateway) => {
                           minTickGap={22}
                           interval="preserveStartEnd"
                           allowDuplicatedCategory={false}
-                          height={24}
-                          tickMargin={14}
+                          /* Operator 2026-06-17: same band/margin
+                             tweak as the main chart so labels never
+                             collide with the bottom edge when the
+                             card is resized. */
+                          height={30}
+                          tickMargin={6}
                           tickFormatter={formatPowerSideXAxisTick}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
                           axisLine={{ stroke: powerChartAxisColor }}
@@ -18385,7 +19180,7 @@ const getGatewayHealth = (gateway) => {
                           width={64}
                           domain={powerSideYDomain}
                           ticks={buildYAxisTicks(powerSideYDomain, 0.5, Math.max(4, Math.floor(Number(powerChartSettings.side.height || 280) / 55)))}
-                          tickFormatter={(v) => formatChartValue(v, 3)}
+                          tickFormatter={(v) => `${formatChartValue(v, 3)} ${powerChartSettings.side.y_unit || "kWh"}`}
                           tick={{ fontSize: 11, fill: powerChartAxisColor }}
                           axisLine={{ stroke: powerChartAxisColor }}
                           tickLine={{ stroke: powerChartAxisColor }}
@@ -18460,12 +19255,14 @@ const getGatewayHealth = (gateway) => {
                       </button>
                     </div>
                   </div>
-                  <div className="chart-wrap" style={{ position: "relative" }}>
+                  <div className="chart-wrap pwr-tariff-widget" style={{ position: "relative" }}>
                     {powerTariffBreakdown.items.length ? (
                       (powerChartSettings.donut?.chart_type || "donut") === "bars" ? (
-                        // Horizontal-bar variant (operator 2026-06-16).
-                        // Each tariff is a row; bar grows from the left
-                        // and the value label sits on the right.
+                        // Operator 2026-06-17: bars view now models the
+                        // dashboard EnergyTariffsWidget — header row +
+                        // one bar per tariff with name/track/value in a
+                        // 3-column grid that gracefully degrades on
+                        // narrow cards via container queries.
                         <div className="pwr-tariff-bars">
                           {powerTariffBreakdown.items.map((entry, idx) => {
                             const tariffObj = (powerConfig?.electricity_tariffs || [])[Number(entry.key)] || (powerConfig?.electricity_tariffs || []).find((x) => String(x.id) === String(entry.key)) || {};
@@ -18492,17 +19289,19 @@ const getGatewayHealth = (gateway) => {
                         </div>
                       ) : (
                       <>
-                      <ResponsiveContainer width="100%" height="100%" minHeight={260}>
+                      <ResponsiveContainer width="100%" height="100%" minHeight={180}>
                         <PieChart>
                           <Pie
                             data={powerTariffBreakdown.items}
                             dataKey={(powerChartSettings.donut?.mode || "cost") === "cost" ? "cost" : "kwh"}
                             nameKey="name"
-                            innerRadius={Number(powerChartSettings.donut?.height || 260) < 240 ? "55%" : "50%"}
-                            outerRadius={Number(powerChartSettings.donut?.height || 260) < 240 ? "82%" : "75%"}
+                            cx="50%"
+                            cy="50%"
+                            innerRadius="55%"
+                            outerRadius="80%"
                             paddingAngle={2}
                             isAnimationActive={false}
-                            label={Number(powerChartSettings.donut?.height || 260) < 220 ? false : (props) => {
+                            label={!(powerChartSettings.donut?.show_slice_labels) ? false : (props) => {
                               const total = (powerChartSettings.donut?.mode || "cost") === "cost"
                                 ? powerTariffBreakdown.total_cost
                                 : powerTariffBreakdown.total_kwh;
@@ -18546,22 +19345,45 @@ const getGatewayHealth = (gateway) => {
                               ? [`€${Number(item.cost || 0).toFixed(2)} • ${Number(item.kwh || 0).toFixed(2)} kWh • ${pct.toFixed(1)}%`, item.name]
                               : [`${Number(item.kwh || 0).toFixed(2)} kWh • €${Number(item.cost || 0).toFixed(2)} • ${pct.toFixed(1)}%`, item.name];
                           }} />
+                          {(powerChartSettings.donut?.show_legend !== false) ? (
+                            <Legend
+                              verticalAlign="bottom"
+                              align="center"
+                              height={28}
+                              iconType="circle"
+                              wrapperStyle={{ fontSize: 11, lineHeight: "14px", paddingTop: 4 }}
+                            />
+                          ) : null}
                         </PieChart>
                       </ResponsiveContainer>
+                      {/* Operator 2026-06-17: total amount must sit
+                          dead-centre in the donut hole regardless of
+                          legend height. Recharts puts the donut at
+                          cy=50% of (container_height - legend_height).
+                          Mirror that with a same-sized overlay so the
+                          text follows the donut's actual center, not
+                          the container's. */}
                       <div style={{
-                        position: "absolute", inset: 0, display: "flex", flexDirection: "column",
-                        alignItems: "center", justifyContent: "center", pointerEvents: "none",
+                        position: "absolute",
+                        left: 0,
+                        right: 0,
+                        top: 0,
+                        bottom: (powerChartSettings.donut?.show_legend !== false) ? 28 : 0,
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        pointerEvents: "none",
+                        textAlign: "center",
                       }}>
-                        <div style={{ fontSize: 10.5, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                          {(powerChartSettings.donut?.mode || "cost") === "cost" ? "Total cost" : "Total energy"}
-                        </div>
-                        <div style={{ fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums", marginTop: 2 }}>
+                        <div style={{
+                          fontSize: "clamp(14px, 4.5cqi, 26px)",
+                          fontWeight: 700,
+                          fontVariantNumeric: "tabular-nums",
+                          whiteSpace: "nowrap",
+                        }}>
                           {(powerChartSettings.donut?.mode || "cost") === "cost"
                             ? `€${powerTariffBreakdown.total_cost.toFixed(2)}`
                             : `${powerTariffBreakdown.total_kwh.toFixed(3)} kWh`}
-                        </div>
-                        <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
-                          {powerTariffBreakdown.items.length} tariff{powerTariffBreakdown.items.length === 1 ? "" : "s"}
                         </div>
                       </div>
                       </>
@@ -18574,57 +19396,80 @@ const getGatewayHealth = (gateway) => {
                   </div>
                 </article>
 
-                {/* Tariff rates + costs list view (operator
-                    2026-06-15). Replaces the inline donut legend
-                    with a scrollable name/kWh/€ table. */}
+                {/* Tariff rates + costs list view.
+                    Operator 2026-06-17: matches the dashboard
+                    EnergyTariffsWidget table model — Tariff / kWh /
+                    Cost / Share — using the shared dashboard-energy-
+                    tariffs-table CSS so the visual style stays in
+                    lockstep across Overview and dashboards. */}
                 <article className="card pwr-tariff-list-card">
                   <div className="row trend-header-row">
                     <h3 style={{ marginTop: 0, marginBottom: 0 }}>Tariff Rates &amp; Costs</h3>
                   </div>
-                  <div className="pwr-tariff-rows">
-                    {powerTariffBreakdown.items.length ? (<>
-                      <div className="pwr-tariff-row-compact pwr-tariff-row-c-header">
-                        <span />
-                        <span>Tariff</span>
-                        <span>Window</span>
-                        <span>Rate</span>
-                        <span>kWh</span>
-                        <span>€</span>
-                        <span>%</span>
-                      </div>
-                      {powerTariffBreakdown.items.map((t, idx) => {
-                        // Resolve tariff via index (the breakdown's
-                        // key is the position inside electricity_tariffs).
-                        const tariffObj = (powerConfig?.electricity_tariffs || [])[Number(t.key)] || (powerConfig?.electricity_tariffs || []).find((x) => String(x.id) === String(t.key)) || {};
-                        const tariffId = String(tariffObj.id || t.key);
-                        const sharePct = powerTariffBreakdown.total_kwh > 0
-                          ? (Number(t.kwh || 0) / powerTariffBreakdown.total_kwh) * 100
-                          : 0;
-                        const colorOverride = (powerChartSettings.donut?.series_colors || {})[tariffId];
-                        const color = colorOverride || getSeriesColor(idx);
-                        const typeText = String(t.type || "flat").replace("_", " ");
-                        return (
-                          <div key={`tariff-row-${t.key}`} className="pwr-tariff-row-compact">
-                            <span className="pwr-tariff-row-c-swatch" style={{ background: color }} />
-                            <span className="pwr-tariff-row-c-name" title={`${t.name} • ${typeText}`}>
-                              {t.name}
-                              <span className="muted" style={{ fontSize: 9.5, marginLeft: 4, textTransform: "uppercase", letterSpacing: "0.04em" }}>{typeText}</span>
-                            </span>
-                            <span className="pwr-tariff-row-c-window">{tariffObj.start_time || "—"}–{tariffObj.end_time || "—"}</span>
-                            <span className="pwr-tariff-row-c-rate">€{Number(tariffObj.rate_eur_kwh || 0).toFixed(3)}</span>
-                            <span className="pwr-tariff-row-c-kwh">{Number(t.kwh || 0).toFixed(3)} kWh</span>
-                            <span className="pwr-tariff-row-c-cost">€{Number(t.cost || 0).toFixed(2)}</span>
-                            <span className="pwr-tariff-row-c-share">{sharePct.toFixed(1)}%</span>
-                          </div>
-                        );
-                      })}
-                    </>) : (
+                  <div className="pwr-tariff-rows" style={{ overflow: "auto" }}>
+                    {powerTariffBreakdown.items.length ? (
+                      <table className="dashboard-energy-tariffs-table">
+                        <thead>
+                          <tr>
+                            <th>Tariff</th>
+                            <th>kWh</th>
+                            <th>Cost (€)</th>
+                            <th>Share</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {powerTariffBreakdown.items.map((t, idx) => {
+                            const tariffObj = (powerConfig?.electricity_tariffs || [])[Number(t.key)]
+                              || (powerConfig?.electricity_tariffs || []).find((x) => String(x.id) === String(t.key))
+                              || {};
+                            const tariffId = String(tariffObj.id || t.key);
+                            const colorOverride = (powerChartSettings.donut?.series_colors || {})[tariffId];
+                            const color = colorOverride || getSeriesColor(idx);
+                            const sharePct = powerTariffBreakdown.total_kwh > 0
+                              ? (Number(t.kwh || 0) / powerTariffBreakdown.total_kwh) * 100
+                              : 0;
+                            return (
+                              <tr key={`tariff-row-${t.key}`}>
+                                <td>
+                                  <span className="dashboard-et-swatch" style={{ background: color }} />
+                                  {t.name}
+                                </td>
+                                <td style={{ fontVariantNumeric: "tabular-nums" }}>
+                                  {Number(t.kwh || 0).toFixed(3)}
+                                </td>
+                                <td style={{ fontVariantNumeric: "tabular-nums" }}>
+                                  €{Number(t.cost || 0).toFixed(3)}
+                                </td>
+                                <td style={{ fontVariantNumeric: "tabular-nums" }}>
+                                  {sharePct.toFixed(1)}%
+                                </td>
+                              </tr>
+                            );
+                          })}
+                          <tr className="dashboard-et-total">
+                            <td><strong>Total</strong></td>
+                            <td style={{ fontVariantNumeric: "tabular-nums" }}>
+                              <strong>{powerTariffBreakdown.total_kwh.toFixed(3)}</strong>
+                            </td>
+                            <td style={{ fontVariantNumeric: "tabular-nums" }}>
+                              <strong>€{powerTariffBreakdown.total_cost.toFixed(2)}</strong>
+                            </td>
+                            <td></td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    ) : (
                       <div className="muted" style={{ padding: 14, textAlign: "center" }}>
                         No tariff usage in the selected window.
                       </div>
                     )}
                   </div>
-                  <div className="pwr-tariff-total">
+                  {/* Operator 2026-06-17: footer total kept hidden for
+                      now — it lives inline as the last <tr> with the
+                      dashboard-et-total class, matching the dashboard
+                      widget. Older operators that want the inline
+                      total bar can re-enable via CSS. */}
+                  <div className="pwr-tariff-total" style={{ display: "none" }}>
                     <span className="pwr-tariff-row-mlabel">Total</span>
                     <span>
                       <strong>{powerTariffBreakdown.total_kwh.toFixed(3)} kWh</strong>
@@ -19950,6 +20795,212 @@ const getGatewayHealth = (gateway) => {
             </>
           ) : null}
 
+          {activePage === "customer_database" ? (
+            <>
+              <section className="card">
+                <h3 style={{ marginTop: 0 }}>Customer Database (LAN-shared)</h3>
+                <p className="muted" style={{ fontSize: 13, lineHeight: 1.5 }}>
+                  Optional. When activated, the edge mirrors configurations,
+                  users, permissions, historian and live data into a
+                  PostgreSQL database on your LAN. The Local Lite web UI
+                  then reads from that database — letting customers without
+                  internet access view dashboards from any browser on the
+                  same network.
+                </p>
+                <div className="row" style={{ gap: 16, marginTop: 4 }}>
+                  <button
+                    className="btn btn-secondary"
+                    onClick={async () => {
+                      try {
+                        const s = await getCustomerDbStatus();
+                        setCustomerDbStatus(s);
+                        // If we have a target persisted, pre-fill the form
+                        // (without the password, which the backend never
+                        // returns) so the operator can edit it.
+                        if (s?.target) {
+                          setCustomerDbForm((p) => ({
+                            ...p,
+                            engine: String(s.target.engine || p.engine || "postgresql"),
+                            host: String(s.target.host || ""),
+                            port: Number(s.target.port || 5432),
+                            database: String(s.target.database || ""),
+                            schema: String(s.target.schema || "public"),
+                            username: String(s.target.username || ""),
+                            tls: !!s.target.tls,
+                            name: String(s.target.name || ""),
+                          }));
+                        }
+                      } catch (err) {
+                        setCustomerDbMessage(`Status fetch failed: ${err?.message || err}`);
+                      }
+                    }}
+                  >
+                    Refresh status
+                  </button>
+                  <div className="muted" style={{ alignSelf: "center" }}>
+                    {customerDbStatus
+                      ? `Mode: ${customerDbStatus.mode} · Supported engines: ${(customerDbStatus.supported_engines || []).join(", ")}`
+                      : "Click Refresh to load the current mode."}
+                  </div>
+                </div>
+              </section>
+
+              <section className="card">
+                <h3 style={{ marginTop: 0 }}>Connection</h3>
+                <div className="form-grid" style={{ gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
+                  <label>
+                    Friendly name (optional)
+                    <input
+                      value={customerDbForm.name}
+                      onChange={(e) => setCustomerDbForm((p) => ({ ...p, name: e.target.value }))}
+                      placeholder="e.g. Site DB"
+                    />
+                  </label>
+                  <label>
+                    Engine
+                    <select
+                      value={customerDbForm.engine}
+                      onChange={(e) => setCustomerDbForm((p) => ({ ...p, engine: e.target.value }))}
+                    >
+                      <option value="postgresql">PostgreSQL</option>
+                    </select>
+                  </label>
+                  <label>
+                    Host
+                    <input
+                      value={customerDbForm.host}
+                      onChange={(e) => setCustomerDbForm((p) => ({ ...p, host: e.target.value }))}
+                      placeholder="192.168.x.x or db.local"
+                    />
+                  </label>
+                  <label>
+                    Port
+                    <input
+                      type="number"
+                      value={customerDbForm.port}
+                      onChange={(e) => setCustomerDbForm((p) => ({ ...p, port: Number(e.target.value || 5432) }))}
+                    />
+                  </label>
+                  <label>
+                    Database
+                    <input
+                      value={customerDbForm.database}
+                      onChange={(e) => setCustomerDbForm((p) => ({ ...p, database: e.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Schema
+                    <input
+                      value={customerDbForm.schema}
+                      onChange={(e) => setCustomerDbForm((p) => ({ ...p, schema: e.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Username
+                    <input
+                      value={customerDbForm.username}
+                      onChange={(e) => setCustomerDbForm((p) => ({ ...p, username: e.target.value }))}
+                    />
+                  </label>
+                  <label>
+                    Password
+                    <input
+                      type="password"
+                      value={customerDbForm.password}
+                      onChange={(e) => setCustomerDbForm((p) => ({ ...p, password: e.target.value }))}
+                      placeholder={customerDbStatus?.target?.password_set ? "(password already set — leave blank to keep)" : ""}
+                    />
+                  </label>
+                  <label className="pwr-check" style={{ alignItems: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={!!customerDbForm.tls}
+                      onChange={(e) => setCustomerDbForm((p) => ({ ...p, tls: e.target.checked }))}
+                    />
+                    <span>Require TLS</span>
+                  </label>
+                </div>
+
+                <div className="row" style={{ gap: 12, marginTop: 12 }}>
+                  <button
+                    className="btn btn-secondary"
+                    disabled={customerDbBusy || !customerDbForm.host || !customerDbForm.database || !customerDbForm.username}
+                    onClick={async () => {
+                      setCustomerDbBusy(true);
+                      setCustomerDbMessage("");
+                      try {
+                        const r = await testCustomerDbConnection(customerDbForm);
+                        setCustomerDbTestResult(r);
+                        setCustomerDbMessage(r.ok
+                          ? `Connection OK in ${r.latency_ms} ms.`
+                          : `Connection failed: ${r.error || "unknown error"}`);
+                      } catch (err) {
+                        setCustomerDbMessage(`Test failed: ${err?.message || err}`);
+                      } finally {
+                        setCustomerDbBusy(false);
+                      }
+                    }}
+                  >
+                    Test connection
+                  </button>
+
+                  <label className="pwr-check" style={{ alignItems: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={customerDbActivateConfirm}
+                      onChange={(e) => setCustomerDbActivateConfirm(e.target.checked)}
+                    />
+                    <span>I have a backup of the current local data</span>
+                  </label>
+
+                  <button
+                    className="btn btn-primary"
+                    disabled={customerDbBusy || !customerDbActivateConfirm || !customerDbTestResult?.ok}
+                    onClick={async () => {
+                      setCustomerDbBusy(true);
+                      try {
+                        const r = await activateCustomerDb(customerDbForm, true);
+                        setCustomerDbMessage(`Customer DB mode activated. The edge will start mirroring data into ${customerDbForm.database}@${customerDbForm.host}.`);
+                        setCustomerDbStatus(await getCustomerDbStatus());
+                      } catch (err) {
+                        setCustomerDbMessage(`Activate failed: ${err?.message || err}`);
+                      } finally {
+                        setCustomerDbBusy(false);
+                      }
+                    }}
+                  >
+                    Activate Customer DB mode
+                  </button>
+
+                  <button
+                    className="btn btn-secondary"
+                    disabled={customerDbBusy || customerDbStatus?.mode !== "customer_sql"}
+                    onClick={async () => {
+                      setCustomerDbBusy(true);
+                      try {
+                        await deactivateCustomerDb();
+                        setCustomerDbMessage("Reverted to local SQLite mode.");
+                        setCustomerDbStatus(await getCustomerDbStatus());
+                      } catch (err) {
+                        setCustomerDbMessage(`Deactivate failed: ${err?.message || err}`);
+                      } finally {
+                        setCustomerDbBusy(false);
+                      }
+                    }}
+                  >
+                    Revert to local SQLite
+                  </button>
+                </div>
+
+                {customerDbMessage ? (
+                  <div className={String(customerDbMessage).toLowerCase().includes("fail") ? "error" : "info-note"} style={{ marginTop: 12 }}>
+                    {customerDbMessage}
+                  </div>
+                ) : null}
+              </section>
+            </>
+          ) : null}
+
           {activePage === "database_inspector" ? (
             <>
               <section className="page-tools">
@@ -20369,6 +21420,16 @@ const getGatewayHealth = (gateway) => {
                 </label>
               </section>
             </>
+          ) : null}
+
+          {activePage === "connections_overview" ? (
+            <ConnectionsOverviewPage />
+          ) : null}
+          {activePage === "opc_ua" ? (
+            <OpcuaSettingsPage canEdit={String(currentUser?.role || "").toLowerCase() === "admin"} />
+          ) : null}
+          {activePage === "mqtt" ? (
+            <MqttSettingsPage canEdit={String(currentUser?.role || "").toLowerCase() === "admin"} />
           ) : null}
 
           {activePage === "interface" ? (
@@ -21771,9 +22832,9 @@ const getGatewayHealth = (gateway) => {
             <div className="users-access-page">
               <section className="card">
                 <div className="table-scroll users-table-scroll">
-                  <div className="table users-table">
+                  <div className="table users-table users-table--lite-access">
                     <div className="thead">
-                      <span>User</span><span>Role</span><span>Client Modules</span><span>Gateway Config</span><span>Gateway Start/Stop</span><span>Database</span><span>User Admin</span><span>Actions</span>
+                      <span>User</span><span>Role</span><span>Client Modules</span><span>Gateway Config</span><span>Gateway Start/Stop</span><span>Database</span><span>User Admin</span><span title="Per-user read-only Lite access link (admin-only)">Lite Access</span><span>Actions</span>
                     </div>
                     {users.map((u) => (
                       <div key={u.username} className="trow">
@@ -21784,6 +22845,14 @@ const getGatewayHealth = (gateway) => {
                         <span>{u.permissions?.gateway_runtime_control ? "Yes" : "No"}</span>
                         <span>{u.permissions?.database ? "Yes" : "No"}</span>
                         <span>{u.permissions?.users_and_access_control ? "Yes" : "No"}</span>
+                        <span>
+                          <UserClientViewCell
+                            row={{ username: u.username }}
+                            tenantScope=""
+                            edgeId={String(edgeProfile?.edge_id || "")}
+                            isAdminViewer={canManageUsers}
+                          />
+                        </span>
                         <span className="row-actions">
                           <button className="icon-btn table-action-btn" onClick={() => openEditUser(u)} disabled={!canManageUsers} title="Edit user">
                             <EditIcon />
@@ -22381,7 +23450,7 @@ const getGatewayHealth = (gateway) => {
                         </label>
                       </div>
                       <div className="table-scroll" style={{ marginTop: 10 }}>
-                        <div className={`table cp-users-table ${isMasterAdmin ? "with-tenant" : ""}`}>
+                        <div className={`table cp-users-table cp-users-table--lite-access ${isMasterAdmin ? "with-tenant" : ""}`}>
                           <div className="thead">
                             <span><input type="checkbox" checked={cpUsersFiltered.length > 0 && cpUsersFiltered.every((row) => isCpRowSelected("users", row?.username))} onChange={(e) => setCpRowsSelectedAll("users", cpUsersFiltered, (row) => row?.username, e.target.checked)} /></span>
                             <span>Username</span>
@@ -22393,6 +23462,8 @@ const getGatewayHealth = (gateway) => {
                             <span>Email</span>
                             <span>Status</span>
                             <span>MFA</span>
+                            {/* Operator 2026-06-17: per-user Lite share token. Admin-only. */}
+                            <span title="Per-user read-only Lite access link (admin-only)">Lite Access</span>
                             <span style={{ textAlign: "right" }}>Actions</span>
                           </div>
                           {(cpUsersFiltered || []).map((row, idx) => {
@@ -22412,6 +23483,14 @@ const getGatewayHealth = (gateway) => {
                                 <span>{String(row?.email || "-")}</span>
                                 <span>{String(row?.status || "-")}</span>
                                 <span>{Boolean(row?.mfa_enabled) ? "yes" : "no"}</span>
+                                <span>
+                                  <UserClientViewCell
+                                    row={row}
+                                    tenantScope={getRowTenantScope(row)}
+                                    edgeId={String(edgeProfile?.edge_id || "")}
+                                    isAdminViewer={String(currentUser?.role || "").toLowerCase() === "admin"}
+                                  />
+                                </span>
                                 <span className="row-actions">
                                   <button
                                     className="icon-btn table-action-btn"
@@ -22435,7 +23514,7 @@ const getGatewayHealth = (gateway) => {
                               </div>
                             );
                           })}
-                          {!cpUsersFiltered?.length ? <div className="trow">{Array.from({ length: isMasterAdmin ? 9 : 8 }).map((_, i) => <span key={i}>{i === 3 ? "No users found" : "-"}</span>)}</div> : null}
+                          {!cpUsersFiltered?.length ? <div className="trow">{Array.from({ length: isMasterAdmin ? 10 : 9 }).map((_, i) => <span key={i}>{i === 3 ? "No users found" : "-"}</span>)}</div> : null}
                         </div>
                       </div>
                     </section>
@@ -23127,9 +24206,9 @@ const getGatewayHealth = (gateway) => {
               </section>
               <section className="card card-fill">
                 <div className="table-scroll fill-scroll">
-                  <div className="table tags-table">
+                  <div className="table tags-table tags-table--connections">
                     <div className="thead">
-                      <span>Tag Name</span><span>Device</span><span>Gateway</span><span>Last Value</span><span>Last Read</span><span>Alarms</span><span>Actions</span>
+                      <span>Tag Name</span><span>Device</span><span>Gateway</span><span>Last Value</span><span>Last Read</span><span>Alarms</span><span title="Publish to OPC UA server">OPC UA</span><span title="Publish to MQTT broker">MQTT</span><span>Actions</span>
                     </div>
                     {filteredTagRows.map((row) => (
                       <div key={row.key} className="trow">
@@ -23145,6 +24224,24 @@ const getGatewayHealth = (gateway) => {
                             onChange={(e) => setTagAlarmEnabled(row.gateway_id, row.tag_name, e.target.checked)}
                             disabled={!canEditPage("tags")}
                             title="Enable alarm monitoring for this tag"
+                          />
+                        </span>
+                        <span>
+                          <input
+                            type="checkbox"
+                            checked={isTagPublishEnabled(row.gateway_id, row.tag_name, "opcua")}
+                            onChange={(e) => setTagPublishEnabled(row.gateway_id, row.tag_name, "opcua", e.target.checked)}
+                            disabled={!canEditPage("tags")}
+                            title="Publish this tag through the OPC UA server"
+                          />
+                        </span>
+                        <span>
+                          <input
+                            type="checkbox"
+                            checked={isTagPublishEnabled(row.gateway_id, row.tag_name, "mqtt")}
+                            onChange={(e) => setTagPublishEnabled(row.gateway_id, row.tag_name, "mqtt", e.target.checked)}
+                            disabled={!canEditPage("tags")}
+                            title="Publish this tag through the MQTT broker"
                           />
                         </span>
                         <span className="row-actions tags-actions-cell">
@@ -26123,6 +27220,22 @@ const getGatewayHealth = (gateway) => {
                     <label className="pwr-check" style={{ marginTop: 6 }}>
                       <input type="checkbox" checked={Boolean(current.hide_title)} onChange={(e) => setField("hide_title", e.target.checked)} />
                       <span>Hide title bar</span>
+                    </label>
+                    <label className="pwr-check" style={{ marginTop: 4 }}>
+                      <input
+                        type="checkbox"
+                        checked={current.show_legend !== false}
+                        onChange={(e) => setField("show_legend", e.target.checked)}
+                      />
+                      <span>Show legend at bottom</span>
+                    </label>
+                    <label className="pwr-check" style={{ marginTop: 4 }}>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(current.show_slice_labels)}
+                        onChange={(e) => setField("show_slice_labels", e.target.checked)}
+                      />
+                      <span>Show labels on slices</span>
                     </label>
                     <div className="pwr-grid" style={{ marginTop: 6 }}>
                       <label><span>Chart type</span>

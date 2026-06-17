@@ -90,7 +90,8 @@
     },
     "nsis": {
       "oneClick": false,
-      "perMachine": false,
+      "perMachine": true,
+      "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
       "installerIcon": "assets/trustnode_logo.ico",
       "uninstallerIcon": "assets/trustnode_logo.ico",
@@ -100,7 +101,8 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "menuCategory": "TrustNode",
-      "artifactName": "TrustNode-Setup-${version}.exe"
+      "artifactName": "TrustNode-Setup-${version}.exe",
+      "include": "build/installer.nsh"
     }
   }
 }

@@ -208,11 +208,17 @@ def get_power_history(request: Request, limit: int = 300, device_id: str = "") -
     lim = max(1, min(int(limit or 300), 50000))
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
     prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
-    rows = app_store.get_historian_rows(limit=max(lim * 8, 800), prefer_cloud_reads=prefer_cloud_reads)
-    filtered = [r for r in rows if str(r.get("source") or "") in ("power_modbus", "power_insight")]
-    if str(device_id or "").strip():
-        filtered = [r for r in filtered if str(r.get("gateway_id") or "") == str(device_id).strip()]
-    return {"ok": True, "rows": filtered[:lim]}
+    # Operator 2026-06-16: push the source filter into SQL so we no
+    # longer pull 8x the rows and discard most. With the SQL-side
+    # filter the query walks the (tenant_id, ts_utc DESC) index and
+    # stops at the requested row count — measured ~570ms → ~30ms.
+    rows = app_store.get_historian_rows(
+        limit=lim,
+        prefer_cloud_reads=prefer_cloud_reads,
+        source="power_modbus,power_insight",
+        gateway=str(device_id or "").strip(),
+    )
+    return {"ok": True, "rows": rows}
 
 
 @router.get("/diagnostics")

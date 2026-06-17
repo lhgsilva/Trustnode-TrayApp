@@ -8,6 +8,7 @@ import {
   newWidgetId,
 } from "./widgetRegistry";
 import { compactWidgets, findFirstFreeSpot, normalizeWidgets, reflowWidgetsForMove, reflowWidgetsForMoveToPoint, reflowWidgetsForResize } from "./layoutUtils";
+import { materializePowerDashboardPayload } from "./powerDashboardTemplate";
 import { filterRowsByRange, getLatestTagRow, toTsMs } from "./dashboardAnalytics";
 import { listReportTemplates } from "../../api";
 import "./dashboard.css";
@@ -178,10 +179,13 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, Number(n) || min));
 }
 
-function formatHeaderValue(value) {
+function formatHeaderValue(value, decimals = 3) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "-";
-  return n.toFixed(3);
+  const d = Number.isFinite(Number(decimals))
+    ? Math.max(0, Math.min(6, Math.floor(Number(decimals))))
+    : 3;
+  return n.toFixed(d);
 }
 
 function normalizeDataSourceForType(type, sourceType) {
@@ -520,6 +524,19 @@ function buildDefaultForm(type = "line_chart") {
       data_source_type: "tag_direct",
       color_mode: "default",
       text: "",
+      unit_suffix: "",
+      // Operator 2026-06-16: KPI value precision in the body and the
+      // header strip. 0..6 — clamped by the renderer.
+      value_decimals: 3,
+      // Operator 2026-06-16: unit-suffix size multiplier of the value
+      // font. 1 = same size inline.
+      unit_size_scale: 1,
+      // Operator 2026-06-16: which pieces appear in the title bar
+      // (value | tag | title). New widgets start with all three.
+      header_parts: ["value", "tag", "title"],
+      // Energy Tariffs widget (operator 2026-06-16) defaults.
+      display_mode: "donut",
+      tariff_value_mode: "cost",
       source_url: "",
       camera_url: "",
       list_limit: 8,
@@ -739,50 +756,12 @@ export function DashboardDesigner({
     const meter = meters[0] || null;
     if (!meter) return null;
     const gwId = String(meter.id || "");
-    // Wider stat tiles (w=4) + taller charts (h=8) so the layout
-    // actually uses the page like the Power Overview does, instead
-    // of squeezing into 2x2 cells.
-    const makeStat = (key, title, tag, unit, x, y) => ({
-      id: `pd-stat-${key}-${gwId}`,
-      type: "stat",
-      title,
-      color: "#14a89a",
-      x, y, w: 4, h: 3,
-      config: {
-        gateway_id: gwId,
-        tag_name: tag,
-        data_source_type: "tag_direct",
-        chart_value_format: "auto",
-        text: unit ? `{value} ${unit}` : "{value}",
-      },
-    });
-    const makeChart = (key, title, tag, type, x, y, w, h) => ({
-      id: `pd-chart-${key}-${gwId}`,
-      type,
-      title,
-      color: "#16a34a",
-      x, y, w, h,
-      config: {
-        gateway_id: gwId,
-        tag_name: tag,
-        readings_count: 200,
-        interpolation: "stepAfter",
-        data_source_type: "tag_direct",
-        chart_show_legend: true,
-        chart_value_format: "auto",
-      },
-    });
-    const widgets = [
-      makeStat("voltage", "Voltage", "voltage_v", "V", 0, 0),
-      makeStat("current", "Current", "current_a", "A", 4, 0),
-      makeStat("power", "Active Power", "active_power_w", "W", 8, 0),
-      makeStat("pf", "Power Factor", "power_factor", "", 0, 3),
-      makeStat("freq", "Frequency", "frequency_hz", "Hz", 4, 3),
-      makeStat("energy", "Total Energy", "energy_wh", "Wh", 8, 3),
-      makeChart("power-trend", "Active Power (W) — Last 1h", "active_power_w", "line_chart", 0, 6, 8, 8),
-      makeChart("voltage-trend", "Voltage (V) — Last 1h", "voltage_v", "area_chart", 8, 6, 4, 8),
-    ];
-    return { name: "Power Default", widgets, mode: "grid", per_row: 12, tag_colors: {} };
+    // Operator 2026-06-16: load the richer Power dashboard template
+    // (8 KPI strip + 2 power trend charts + Energy Tariffs donut +
+    // bars). The template is shared so the same layout can be
+    // re-applied to any meter the operator chooses.
+    const payload = materializePowerDashboardPayload(gwId);
+    return { name: "Power Default", ...payload };
   }, [gatewayCatalog]);
 
   const applyPowerDefaultProfile = useCallback(() => {
@@ -790,7 +769,17 @@ export function DashboardDesigner({
     if (!payload) return;
     applyProfilePayload(payload);
     setActiveProfileName("Power Default");
-  }, [applyProfilePayload, buildPowerDefaultPayload]);
+    // Operator 2026-06-17: persist Power Default as a regular
+    // profile so it shows in the dropdown and the operator can
+    // edit / delete widgets and have the changes survive a
+    // reload. Without this it lived only as a transient name
+    // attached to dashboardWidgets, which confused operators
+    // who expected the profile dropdown to behave like the
+    // other entries.
+    if (!profiles.some((p) => p.name === "Power Default")) {
+      persistProfiles([...profiles, { ...payload, name: "Power Default" }]);
+    }
+  }, [applyProfilePayload, buildPowerDefaultPayload, profiles, persistProfiles]);
 
   /**
    * Pan the dashboard's historical window left (older) or right (newer) by a
@@ -983,11 +972,16 @@ export function DashboardDesigner({
     const typeLabel = String(widget?.title || getWidgetMeta(widget?.type)?.label || widget?.type || "-");
     const cfg = widget?.config || {};
     const isChartWidget = ["line_chart", "line_area_chart", "bar_chart", "pie_chart", "meter_chart"].includes(String(widget?.type || ""));
-    if (!isChartWidget) return null;
+    // Operator 2026-06-16: KPI widgets (text_kpi / value_kpi) also
+    // get the same "value | tag | title" header treatment as charts
+    // so the operator can see at a glance which tag a KPI maps to.
+    const isKpi = ["text_kpi", "value_kpi"].includes(String(widget?.type || ""));
+    if (!isChartWidget && !isKpi) return null;
     const gatewayId = String(cfg.gateway_id || "");
     const tagName = String(cfg.tag_name || "");
     const latest = getLatestTagRow(dashboardRows, gatewayId, tagName);
-    const latestValue = formatHeaderValue(latest?.last_value);
+    const headerDecimals = cfg.value_decimals;
+    const latestValue = formatHeaderValue(latest?.last_value, headerDecimals);
     const plcTag = formatTagForDisplay ? formatTagForDisplay(tagName) : tagName || "-";
     const lastTsMs = toTsMs(latest?.last_ts || "");
     const liveLatencyMs = Number.isFinite(lastTsMs) ? Math.max(0, Date.now() - lastTsMs) : null;
@@ -1010,7 +1004,10 @@ export function DashboardDesigner({
       if (u) return `${rawText} ${u}`;
       return rawText;
     };
-    const primaryUnit = String(cfg.primary_unit || "");
+    // KPI widgets store the unit under cfg.unit_suffix (operator
+    // 2026-06-16). Treat it as a unit (space-separated) so the
+    // header value reads "0.350 A" instead of "0.350A".
+    const primaryUnit = String(cfg.primary_unit || cfg.unit_suffix || "");
     const primarySuffix = String(cfg.primary_suffix || "");
     const seriesItems = [];
     if (gatewayId && tagName) {
@@ -1470,6 +1467,40 @@ export function DashboardDesigner({
   }, [form?.config, editingId, canEdit, modalOpen, queryModalOpen]);
 
   const saveWidget = () => {
+    // Operator 2026-06-16: trend widgets can carry multiple series
+    // (primary + series_extra) — but the X-axis is a single shared
+    // time axis. If two series come from gateways with different
+    // poll intervals (e.g. PLC at 1s, meter at 10s), the chart looks
+    // gappy because the slower series has missing union timestamps.
+    // Block save with a clear message instead of letting the
+    // operator chase visual artefacts.
+    if (["line_chart", "line_area_chart", "bar_chart"].includes(String(form.type))) {
+      const primaryGw = String(form?.config?.gateway_id || "").trim();
+      const extras = Array.isArray(form?.config?.series_extra) ? form.config.series_extra : [];
+      const intervalOf = (gid) => {
+        if (!gid) return null;
+        const g = (gatewayCatalog || []).find((x) => String(x.id || "") === String(gid));
+        const interval = Number(g?.interval_ms || g?.poll_interval_ms || 0);
+        return Number.isFinite(interval) && interval > 0 ? interval : null;
+      };
+      const primaryInterval = intervalOf(primaryGw);
+      const mismatches = [];
+      for (const s of extras) {
+        const sid = String(s?.gateway_id || "").trim() || primaryGw;
+        const si = intervalOf(sid);
+        if (primaryInterval && si && si !== primaryInterval) {
+          mismatches.push(`${sid} (${si} ms) ≠ ${primaryGw} (${primaryInterval} ms)`);
+        }
+      }
+      if (mismatches.length) {
+        const msg =
+          "This chart mixes gateways with different poll intervals:\n\n" +
+          mismatches.map((m) => `• ${m}`).join("\n") +
+          "\n\nA shared chart needs gateways that poll at the same rate, otherwise the slower series will look gappy. Match the intervals on the Gateway pages or use separate widgets.";
+        try { window.alert(msg); } catch (_) {}
+        return;
+      }
+    }
     const next = normalizeWidgets(widgets);
     const meta = getWidgetMeta(form.type);
     const candidate = {
@@ -1943,7 +1974,27 @@ export function DashboardDesigner({
               <strong>
                 {(() => {
                   const parts = widgetHeaderParts(widget);
-                  if (!parts) return String(getWidgetMeta(widget.type)?.label || widget.type);
+                  if (!parts) {
+                    // Operator 2026-06-16: non-chart widgets (KPIs,
+                    // text, table, image, …) should honour the
+                    // operator-edited title. Falling back to the
+                    // widget-type label ("Value KPI (Tag)") ignored
+                    // the title field entirely.
+                    return String(widget?.title || getWidgetMeta(widget.type)?.label || widget.type);
+                  }
+                  // Operator 2026-06-16: which header pieces show is
+                  // configurable per widget. cfg.header_parts is an
+                  // array of: "value" | "tag" | "title" (the
+                  // operator-edited widget title). Empty/missing →
+                  // legacy default of all three.
+                  const cfgParts = widget?.config?.header_parts;
+                  const enabled = Array.isArray(cfgParts) && cfgParts.length
+                    ? new Set(cfgParts.map((s) => String(s).toLowerCase()))
+                    : new Set(["value", "tag", "title"]);
+                  const showValue = enabled.has("value");
+                  const showTag = enabled.has("tag");
+                  const showTitle = enabled.has("title");
+                  const joiner = (key) => <span className="dashboard-widget-head-sep">|</span>;
                   const items = Array.isArray(parts.seriesItems) ? parts.seriesItems : [];
                   if (items.length > 1) {
                     // Multi-series widget: render one "value | tag" pair
@@ -1951,26 +2002,28 @@ export function DashboardDesigner({
                     // current value without opening the chart legend.
                     return (
                       <span className="dashboard-widget-head-text">
-                        {items.map((it, idx) => (
-                          <React.Fragment key={`hd-${idx}`}>
-                            {idx > 0 ? <span className="dashboard-widget-head-sep">·</span> : null}
-                            <span className="dashboard-widget-head-value" style={{ color: it.color }}>{it.value}</span>
-                            <span className="dashboard-widget-head-sep">|</span>
-                            <span>{it.tag}</span>
-                          </React.Fragment>
-                        ))}
-                        <span className="dashboard-widget-head-sep">|</span>
-                        <span>{parts.typeLabel}</span>
+                        {items.map((it, idx) => {
+                          const pieces = [];
+                          if (idx > 0) pieces.push(<span key={`sep-${idx}`} className="dashboard-widget-head-sep">·</span>);
+                          if (showValue) pieces.push(<span key={`v-${idx}`} className="dashboard-widget-head-value" style={{ color: it.color }}>{it.value}</span>);
+                          if (showValue && showTag) pieces.push(<span key={`vt-${idx}`} className="dashboard-widget-head-sep">|</span>);
+                          if (showTag) pieces.push(<span key={`t-${idx}`}>{it.tag}</span>);
+                          return <React.Fragment key={`hd-${idx}`}>{pieces}</React.Fragment>;
+                        })}
+                        {showTitle && (showValue || showTag) ? joiner("title") : null}
+                        {showTitle ? <span>{parts.typeLabel}</span> : null}
                       </span>
                     );
                   }
+                  const segments = [];
+                  if (showValue) segments.push(
+                    <span key="v" className="dashboard-widget-head-value" style={{ color: String(widget?.color || "#14a89a") }}>{parts.latestValue}</span>
+                  );
+                  if (showTag) segments.push(<span key="t">{parts.plcTag}</span>);
+                  if (showTitle) segments.push(<span key="ti">{parts.typeLabel}</span>);
                   return (
                     <span className="dashboard-widget-head-text">
-                      <span className="dashboard-widget-head-value" style={{ color: String(widget?.color || "#14a89a") }}>{parts.latestValue}</span>
-                      <span className="dashboard-widget-head-sep">|</span>
-                      <span>{parts.plcTag}</span>
-                      <span className="dashboard-widget-head-sep">|</span>
-                      <span>{parts.typeLabel}</span>
+                      {segments.flatMap((node, i) => i === 0 ? [node] : [<span key={`sep-${i}`} className="dashboard-widget-head-sep">|</span>, node])}
                     </span>
                   );
                 })()}
@@ -2220,13 +2273,23 @@ export function DashboardDesigner({
                           type="button"
                           className={`dashboard-type-btn ${form.type === t.key ? "active" : ""}`}
                           onClick={() => {
-                            setForm((prev) => ({
-                              ...prev,
-                              type: t.key,
-                              w: t.defaultSize.w,
-                              h: t.defaultSize.h,
-                              title: prev.title || t.label,
-                            }));
+                            setForm((prev) => {
+                              // Operator 2026-06-16: if the title is
+                              // still the previous widget type's
+                              // default label, swap it for the new
+                              // type's label so the operator doesn't
+                              // see "Line Chart" stuck after picking
+                              // Value KPI. Custom titles are kept.
+                              const prevDefault = getWidgetMeta(prev.type)?.label || "";
+                              const titleIsDefault = !prev.title || prev.title === prevDefault;
+                              return {
+                                ...prev,
+                                type: t.key,
+                                w: t.defaultSize.w,
+                                h: t.defaultSize.h,
+                                title: titleIsDefault ? t.label : prev.title,
+                              };
+                            });
                             setTab("config");
                           }}
                         >
@@ -2281,6 +2344,42 @@ export function DashboardDesigner({
                   <span className="slide-track" aria-hidden="true" />
                   <span className="slide-label">Hide widget title bar</span>
                 </div>
+
+                {/* Operator 2026-06-16: pick which pieces show in the
+                    title bar separated by "|". Available pieces:
+                      • value — current live value (with unit suffix)
+                      • tag   — PLC tag name
+                      • title — operator-edited widget title
+                    Default (no boxes ticked is treated as legacy
+                    behaviour = all three). */}
+                {!Boolean(form.config?.hide_widget_header) ? (
+                  <fieldset className="dashboard-full-row" style={{ border: "1px solid var(--stroke, rgba(255,255,255,0.1))", borderRadius: 6, padding: "8px 10px", margin: 0 }}>
+                    <legend style={{ fontSize: 11, color: "var(--muted)", padding: "0 6px" }}>Title bar — show</legend>
+                    {(() => {
+                      const stored = Array.isArray(form.config?.header_parts) ? form.config.header_parts : ["value", "tag", "title"];
+                      const has = (k) => stored.includes(k);
+                      const toggle = (k) => setForm((p) => {
+                        const cur = Array.isArray(p.config?.header_parts) ? p.config.header_parts : ["value", "tag", "title"];
+                        const next = cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k];
+                        return { ...p, config: { ...p.config, header_parts: next } };
+                      });
+                      const cell = (k, label) => (
+                        <label className="pwr-check" style={{ display: "inline-flex", alignItems: "center", gap: 6, marginRight: 16, fontSize: 12 }}>
+                          <input type="checkbox" checked={has(k)} onChange={() => toggle(k)} />
+                          <span>{label}</span>
+                        </label>
+                      );
+                      return (
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                          {cell("value", "Live value")}
+                          {cell("tag", "Tag name")}
+                          {cell("title", "Widget title")}
+                        </div>
+                      );
+                    })()}
+                  </fieldset>
+                ) : null}
+
                 {/* Body text scale used by dividers / fixed_text / table_list
                     captions / KPI labels. Range 0.6..2.5 covers the usual
                     "shrink to fit a card" and "make this label readable
@@ -2323,7 +2422,7 @@ export function DashboardDesigner({
                     so a redundant numeric input cluttered the dialog
                     without providing extra capability. The grid state
                     (form.w / form.h) is still persisted on save. */}
-                {["line_chart", "line_area_chart", "bar_chart", "meter_chart", "text_kpi", "value_kpi", "pie_chart", "table_list"].includes(form.type) ? (
+                {["line_chart", "line_area_chart", "bar_chart", "meter_chart", "text_kpi", "value_kpi", "pie_chart", "table_list", "energy_tariffs"].includes(form.type) ? (
                   <>
                     <label>
                       Gateway
@@ -2361,7 +2460,25 @@ export function DashboardDesigner({
                         Tag
                         <select
                           value={form.config.tag_name}
-                          onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, tag_name: e.target.value } }))}
+                          onChange={(e) => setForm((p) => {
+                            const tag = e.target.value;
+                            // Operator 2026-06-16: when the title is
+                            // still the widget-type default (or
+                            // empty), adopt the tag name so the new
+                            // widget gets an informative label
+                            // instead of "Value KPI". Custom titles
+                            // are preserved.
+                            const typeDefault = getWidgetMeta(p.type)?.label || "";
+                            const titleIsDefault = !p.title || p.title === typeDefault;
+                            const nextTitle = (tag && titleIsDefault)
+                              ? (formatTagForDisplay ? formatTagForDisplay(tag) : tag)
+                              : p.title;
+                            return {
+                              ...p,
+                              title: nextTitle,
+                              config: { ...p.config, tag_name: tag },
+                            };
+                          })}
                         >
                           <option value="">Select tag</option>
                           {selectedGatewayTags.map((tag) => (
@@ -2598,6 +2715,110 @@ export function DashboardDesigner({
                   </label>
                 ) : null}
 
+                {/* Operator 2026-06-16: optional unit suffix appended
+                    after the KPI's value (e.g. "A", "W", "kWh", "%"). */}
+                {["text_kpi", "value_kpi"].includes(form.type) ? (
+                  <label>
+                    Unit suffix
+                    <input
+                      type="text"
+                      placeholder="e.g. A, W, kWh, %"
+                      value={String(form.config.unit_suffix || "")}
+                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, unit_suffix: e.target.value } }))}
+                    />
+                  </label>
+                ) : null}
+                {/* Operator 2026-06-16: decimal places for the
+                    numeric KPI value (0..6). Applies to both the body
+                    value and the live value in the title strip. */}
+                {form.type === "value_kpi" ? (
+                  <label>
+                    Decimals
+                    <input
+                      type="number"
+                      min="0"
+                      max="6"
+                      step="1"
+                      value={Number.isFinite(Number(form.config.value_decimals)) ? Number(form.config.value_decimals) : 3}
+                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, value_decimals: clamp(e.target.value, 0, 6) } }))}
+                    />
+                  </label>
+                ) : null}
+
+                {/* Operator 2026-06-16: per-widget text colours.
+                    "Value color" recolours the big number / tag text
+                    in the body; "Unit color" recolours just the unit
+                    suffix span. Applies to text/value KPIs and
+                    fixed_text widgets. Leave blank for theme default. */}
+                {["text_kpi", "value_kpi", "fixed_text"].includes(form.type) ? (
+                  <>
+                    <label>
+                      Value color
+                      <input
+                        type="color"
+                        value={String(form.config.value_color || "#14a89a")}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, value_color: e.target.value } }))}
+                      />
+                    </label>
+                    {["text_kpi", "value_kpi"].includes(form.type) ? (
+                      <>
+                        <label>
+                          Unit color
+                          <input
+                            type="color"
+                            value={String(form.config.unit_color || "#94a3b8")}
+                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, unit_color: e.target.value } }))}
+                          />
+                        </label>
+                        {/* Operator 2026-06-16: unit-suffix font size
+                            independent of the value size. Expressed as
+                            a multiplier of the value font (0.3–2.0); 1
+                            matches the value. Default 1 — same size
+                            inline as the user originally requested. */}
+                        <label>
+                          Unit text size
+                          <input
+                            type="number"
+                            min="0.3"
+                            max="2"
+                            step="0.05"
+                            value={Number.isFinite(Number(form.config.unit_size_scale)) ? Number(form.config.unit_size_scale) : 1}
+                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, unit_size_scale: clamp(e.target.value, 0.3, 2) } }))}
+                          />
+                        </label>
+                      </>
+                    ) : null}
+                  </>
+                ) : null}
+
+                {/* Operator 2026-06-16: Energy Tariffs widget — pick
+                    a render mode and what to plot (€ cost or kWh). */}
+                {form.type === "energy_tariffs" ? (
+                  <>
+                    <label>
+                      View
+                      <select
+                        value={String(form.config.display_mode || "donut")}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, display_mode: e.target.value } }))}
+                      >
+                        <option value="donut">Donut chart</option>
+                        <option value="bars">Horizontal bars</option>
+                        <option value="table">Table</option>
+                      </select>
+                    </label>
+                    <label>
+                      Show
+                      <select
+                        value={String(form.config.tariff_value_mode || "cost")}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, tariff_value_mode: e.target.value } }))}
+                      >
+                        <option value="cost">€ Cost</option>
+                        <option value="kwh">kWh</option>
+                      </select>
+                    </label>
+                  </>
+                ) : null}
+
                 {form.type === "table_list" ? (
                   <label>
                     List limit
@@ -2789,6 +3010,39 @@ export function DashboardDesigner({
                     <option key={p.name} value={p.name}>{p.name}</option>
                   ))}
                 </select>
+                {/* Operator 2026-06-17: create a new empty profile.
+                    Asks for a name, then clears the canvas to zero
+                    widgets and persists the empty profile so the
+                    operator can start building from scratch instead
+                    of having to delete every widget from a loaded
+                    profile first. */}
+                <button
+                  type="button"
+                  className="dashboard-profile-btn"
+                  onClick={async () => {
+                    const rawName = await askProfileName("");
+                    const name = String(rawName || "").trim();
+                    if (!name) return;
+                    if (profiles.some((p) => p.name === name)) {
+                      try {
+                        if (!window.confirm(`Overwrite existing profile "${name}"?`)) return;
+                      } catch (_) {}
+                    }
+                    // Replace canvas with an empty payload so the
+                    // operator sees a blank slate immediately.
+                    applyProfilePayload({ widgets: [], mode: dashboardMode, per_row: dashboardPerRow, tag_colors: {} });
+                    const payload = { name, widgets: [], mode: dashboardMode, per_row: dashboardPerRow, tag_colors: {} };
+                    const next = profiles.some((p) => p.name === name)
+                      ? profiles.map((p) => (p.name === name ? payload : p))
+                      : [...profiles, payload];
+                    persistProfiles(next);
+                    setActiveProfileName(name);
+                  }}
+                  disabled={!canEdit}
+                  title="Create a new empty dashboard profile from scratch"
+                >
+                  New empty…
+                </button>
                 <button
                   type="button"
                   className="dashboard-profile-btn"

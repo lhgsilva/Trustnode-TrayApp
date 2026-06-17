@@ -7,6 +7,9 @@ requests==2.32.3
 psycopg[binary]==3.2.9
 SQLAlchemy==2.0.36
 opcua==0.98.13
+asyncua==1.1.5
+amqtt==0.11.1
+paho-mqtt==2.1.0
 pycomm3==1.2.14
 pylogix==1.0.3
 python-snap7==2.0.2

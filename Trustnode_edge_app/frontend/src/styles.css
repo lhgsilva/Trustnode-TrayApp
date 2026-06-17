@@ -1837,6 +1837,12 @@ body {
 .tags-table .trow {
   grid-template-columns: 1.5fr 1fr 1fr .8fr 1.1fr .7fr 120px;
 }
+/* Operator 2026-06-17: extra OPC UA + MQTT columns when the Connections
+   feature is on. Two narrow checkbox columns between Alarms and Actions. */
+.tags-table--connections .thead,
+.tags-table--connections .trow {
+  grid-template-columns: 1.5fr 1fr 1fr .8fr 1.1fr .7fr .65fr .65fr 120px;
+}
 
 .alarms-table .thead,
 .alarms-table .trow {
@@ -2628,6 +2634,17 @@ body {
   /* 9 columns when master-admin view shows the Tenant column. */
   grid-template-columns: 40px 1.1fr .9fr .9fr .7fr 1.2fr .6fr .45fr 180px;
 }
+/* Operator 2026-06-17: per-user "Lite Access" column.
+   Width sized to fit Copy + Rotate buttons; renders empty for non-admin
+   viewers (the cell returns "—" but still occupies the column). */
+.cp-users-table--lite-access .thead,
+.cp-users-table--lite-access .trow {
+  grid-template-columns: 40px 1.1fr .9fr .7fr 1.2fr .6fr .45fr 160px 180px;
+}
+.cp-users-table--lite-access.with-tenant .thead,
+.cp-users-table--lite-access.with-tenant .trow {
+  grid-template-columns: 40px 1.1fr .9fr .9fr .7fr 1.2fr .6fr .45fr 160px 180px;
+}
 .cp-users-table .row-actions {
   display: flex;
   gap: 4px;
@@ -2850,6 +2867,14 @@ body {
 .users-table .thead,
 .users-table .trow {
   grid-template-columns: 1.1fr .8fr 1.8fr 1fr 1.1fr .9fr .9fr .9fr;
+}
+/* Operator 2026-06-17: per-user Lite Access column on the local Users page. */
+.users-table--lite-access {
+  min-width: 920px;
+}
+.users-table--lite-access .thead,
+.users-table--lite-access .trow {
+  grid-template-columns: 1.1fr .8fr 1.6fr .9fr 1fr .8fr .8fr 170px .9fr;
 }
 
 .users-create-grid {
@@ -4042,7 +4067,9 @@ input[type="checkbox"] {
 }
 .pwr-row-two {
   display: grid;
-  grid-template-columns: 2fr 1fr 1fr;
+  /* 60% / 15% / 25% — operator 2026-06-16: tariff list needs more
+     horizontal room, donut needs less. */
+  grid-template-columns: 12fr 3fr 5fr;
   gap: 12px;
   min-width: 0;
 }
@@ -4083,6 +4110,24 @@ input[type="checkbox"] {
   padding: 3px 4px;
   font-size: 12px;
   border-bottom: 1px solid color-mix(in srgb, var(--stroke) 50%, transparent);
+}
+/* Operator 2026-06-17: tariff list must stay readable when the card
+   gets narrow. Container queries drop columns in stages so even in a
+   200 px column the swatch + tariff name + cost still fit on one
+   row instead of clipping mid-word. */
+.pwr-tariff-list-card { container-type: inline-size; }
+@container (max-width: 440px) {
+  .pwr-tariff-row-compact { grid-template-columns: 8px minmax(80px, 1fr) auto auto 42px; gap: 0 6px; }
+  .pwr-tariff-row-compact .pwr-tariff-row-c-window { display: none; }
+}
+@container (max-width: 340px) {
+  .pwr-tariff-row-compact { grid-template-columns: 8px minmax(70px, 1fr) auto 40px; gap: 0 6px; font-size: 11px; }
+  .pwr-tariff-row-compact .pwr-tariff-row-c-rate { display: none; }
+}
+@container (max-width: 260px) {
+  .pwr-tariff-row-compact { grid-template-columns: 8px minmax(60px, 1fr) auto; gap: 0 6px; }
+  .pwr-tariff-row-compact .pwr-tariff-row-c-kwh { display: none; }
+  .pwr-tariff-row-compact .pwr-tariff-row-c-share { display: none; }
 }
 .pwr-tariff-row-c-header {
   font-size: 9.5px;
@@ -4128,18 +4173,24 @@ input[type="checkbox"] {
 /* Horizontal-bar variant of the tariff donut card (operator
    2026-06-16: "show vertical chart where the bar goes horizontal
    from left to right and on the right the labels of values"). */
+/* Operator 2026-06-17: tariff bars view modelled after the
+   dashboard EnergyTariffsWidget. 3-column grid: name / track / value.
+   The track gets the bulk of horizontal space (4fr) so the bars are
+   visually dominant. Card uses container queries so the columns
+   collapse on narrow widths without overflowing. */
 .pwr-tariff-bars {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   width: 100%;
   height: 100%;
   padding: 8px 10px;
   overflow-y: auto;
+  container-type: inline-size;
 }
 .pwr-tariff-bar-row {
   display: grid;
-  grid-template-columns: minmax(70px, 0.9fr) 1.6fr minmax(80px, 0.9fr);
+  grid-template-columns: minmax(70px, 1fr) 4fr auto;
   align-items: center;
   gap: 8px;
   font-size: 12px;
@@ -4151,20 +4202,25 @@ input[type="checkbox"] {
   font-weight: 600;
 }
 .pwr-tariff-bar-track {
-  height: 16px;
-  background: color-mix(in srgb, var(--stroke) 50%, transparent);
-  border-radius: 4px;
+  height: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
   overflow: hidden;
 }
 .pwr-tariff-bar-fill {
   height: 100%;
-  border-radius: 4px;
+  border-radius: 6px;
   transition: width 200ms ease-out;
 }
 .pwr-tariff-bar-value {
   text-align: right;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  min-width: 64px;
+}
+@container (max-width: 280px) {
+  .pwr-tariff-bar-row { grid-template-columns: minmax(60px, 1fr) 2fr auto; gap: 6px; }
+  .pwr-tariff-bar-value { min-width: 50px; }
 }
 .pwr-tariff-row {
   background: color-mix(in srgb, var(--card) 92%, var(--bg) 8%);
@@ -4301,23 +4357,43 @@ input[type="checkbox"] {
 /* Operator 2026-06-15: charts should fill the available card space.
    The card becomes a flex column; the chart-wrap is the only growing
    child, so it expands to whatever room is left after the title row
-   and meta line. */
+   and meta line.
+   Operator 2026-06-17: ResponsiveContainer doesn't observe flex-grown
+   parents reliably across all Chromium versions — when the card is
+   resized via the corner drag handle, the chart inside doesn't reflow
+   and ends up stuck at min-height. Forcing position:relative on the
+   wrap + 100% on the inner Recharts root fixes it because the inner
+   container then queries the wrap's *layout* height instead of its
+   computed flex height. */
 .power-main-chart-card .chart-wrap,
 .power-side-chart-card .chart-wrap {
   width: 100%;
   flex: 1 1 0;
-  height: auto;
+  height: 0;             /* lets flex grow it; 0 forces flexbox to size */
+  min-height: 220px;     /* readable floor */
   overflow: hidden;
   padding: 0;
-  min-height: 0;
+  position: relative;
+}
+.power-main-chart-card .chart-wrap > .recharts-responsive-container,
+.power-side-chart-card .chart-wrap > .recharts-responsive-container,
+.power-main-chart-card .chart-wrap > div,
+.power-side-chart-card .chart-wrap > div {
+  position: absolute;
+  inset: 0;
+  width: 100% !important;
+  height: 100% !important;
 }
 .power-main-chart-card,
 .power-side-chart-card {
   /* Operator 2026-06-15: floor was 360 even for cards the operator
      intentionally shrunk; drop to 220 so the operator can use the
-     resize handle to make them as small as they want. */
+     resize handle to make them as small as they want.
+     Operator 2026-06-17: container-type lets the donut's centered
+     total scale with the card via `clamp(... 4.5cqi ...)`. */
   min-height: 220px;
   padding-bottom: 0;
+  container-type: inline-size;
 }
 /* Recharts wrappers — kill internal padding so the chart fills
    right to the card edge. The Legend gets a height={20} prop on

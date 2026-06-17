@@ -3641,7 +3641,18 @@ function _LegacyAppLogsAlarmsView() {
 
 // Tags the edge's power_manager emits per device. Kept in module scope so
 // PowerView and the synthetic chart widgets share one list.
+// Operator 2026-06-16: extend the Power-tab tag filter so insight.*
+// rows (emitted by the edge power_manager) also reach Lite. Without
+// this, dashboards built on insight.live_kw / insight.energy_cost_eur
+// / insight.tariff_<N>_* on the desktop show empty on cloud Lite.
 const POWER_METER_TAGS = ["voltage_v","current_a","active_power_w","energy_wh","power_factor","frequency_hz"];
+function isPowerTag(name) {
+  const t = String(name || "");
+  if (!t) return false;
+  if (POWER_METER_TAGS.includes(t)) return true;
+  if (t.startsWith("insight.")) return true;
+  return false;
+}
 
 // Build a synthetic chart-widget shape so we can reuse the existing
 // ChartWidget pipeline (useChartSeries + Recharts) without re-implementing
@@ -3673,7 +3684,7 @@ function PowerView({ liveRows }) {
 
   const byGw = new Map();
   for (const r of liveRows) {
-    if (!POWER_METER_TAGS.includes(r.tag_name)) continue;
+    if (!isPowerTag(r.tag_name)) continue;
     const gid = r.gateway_id || "—";
     if (!byGw.has(gid)) byGw.set(gid, { gateway_id: gid, gateway_name: r.gateway_name || gid, ts_utc: r.ts_utc, tags: {} });
     const e = byGw.get(gid);
@@ -3685,18 +3696,49 @@ function PowerView({ liveRows }) {
 
   const scoped = meterFilter === "all" ? list : list.filter((d) => String(d.gateway_id) === meterFilter);
 
-  // KPIs across the scoped meter set. Energy is best-effort (no
-  // historical aggregation client-side in lite); these mirror the
-  // desktop "live" values.
-  const liveKw = scoped.reduce((acc, d) => acc + (Number(d.tags.active_power_w) || 0) / 1000, 0);
+  // Operator 2026-06-17: read the insight.* aggregates the desktop
+  // already computes instead of the raw register tags. Two reasons:
+  //   1. `energy_wh` is the meter's lifetime cumulative counter (~4 kWh
+  //      after a few hours), not the consumption during the visible
+  //      window — Lite was showing that big number as "Total Energy"
+  //      and confusing operators.
+  //   2. If the cloud `live_latest` row for `active_power_w` is briefly
+  //      missing while `insight.live_kw` is present (or vice-versa),
+  //      a single-tag dependency means a "0" KPI; reading both lets
+  //      us fall back.
+  // The insight.* tags are published by power_manager every poll so
+  // they always travel with the rest of the meter's row stream.
+  const pickKw = (d) => {
+    const live = Number(d.tags["insight.live_kw"]);
+    if (Number.isFinite(live)) return live;
+    const raw = Number(d.tags.active_power_w);
+    return Number.isFinite(raw) ? raw / 1000 : 0;
+  };
+  const liveKw = scoped.reduce((acc, d) => acc + pickKw(d), 0);
   const totalVoltage = scoped.reduce((acc, d) => acc + (Number(d.tags.voltage_v) || 0), 0);
   const avgVoltage = scoped.length ? totalVoltage / scoped.length : 0;
-  const totalEnergyKwh = scoped.reduce((acc, d) => acc + (Number(d.tags.energy_wh) || 0) / 1000, 0);
+  const totalEnergyKwh = scoped.reduce((acc, d) => {
+    const insight = Number(d.tags["insight.total_kwh"]);
+    if (Number.isFinite(insight)) return acc + insight;
+    // Fallback: convert the meter's cumulative Wh counter, even
+    // though it's a lifetime total. Better than zero.
+    return acc + (Number(d.tags.energy_wh) || 0) / 1000;
+  }, 0);
   const avgPf = (() => {
     const vals = scoped.map((d) => Number(d.tags.power_factor)).filter((v) => Number.isFinite(v));
     return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
   })();
-  const peakKw = scoped.reduce((m, d) => Math.max(m, (Number(d.tags.active_power_w) || 0) / 1000), 0);
+  const peakKw = scoped.reduce((m, d) => {
+    const peak = Number(d.tags["insight.peak_kw"]);
+    if (Number.isFinite(peak)) return Math.max(m, peak);
+    return Math.max(m, pickKw(d));
+  }, 0);
+  // Pull energy cost + active-tariff index from insight.* so Lite's
+  // cost KPI lines up with the desktop's Tariff Rates card.
+  const totalCostEur = scoped.reduce((acc, d) => {
+    const c = Number(d.tags["insight.energy_cost_eur"]);
+    return acc + (Number.isFinite(c) ? c : 0);
+  }, 0);
 
   const periodMs = period === "1h" ? 3600_000 : period === "6h" ? 6 * 3600_000 : 24 * 3600_000;
 

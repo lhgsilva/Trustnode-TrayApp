@@ -742,6 +742,45 @@ export async function getAppStoreBootstrap() {
   return res.json();
 }
 
+// Operator 2026-06-17 (M2): customer-DB mode wrappers. Used by
+// Settings → Database → Customer Database to test, activate, and revert.
+// See backend/app/routers/customer_db.py.
+export async function getCustomerDbStatus() {
+  const res = await fetchWithTimeout(
+    withNoCache(`${getAppStoreApiBase()}/api/customer-db/status`),
+    { headers: { "Cache-Control": "no-store" } },
+    6000
+  );
+  if (!res.ok) throw new Error("customer-db status failed");
+  return res.json();
+}
+export async function testCustomerDbConnection(target) {
+  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/customer-db/test-connection`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target }),
+  }, 12000);
+  if (!res.ok) throw new Error("customer-db test-connection failed");
+  return res.json();
+}
+export async function activateCustomerDb(target, confirmBackup = false) {
+  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/customer-db/activate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target, confirm_backup: !!confirmBackup }),
+  }, 6000);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body?.detail || "customer-db activate failed");
+  return body;
+}
+export async function deactivateCustomerDb() {
+  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/customer-db/deactivate`, {
+    method: "POST",
+  }, 6000);
+  if (!res.ok) throw new Error("customer-db deactivate failed");
+  return res.json();
+}
+
 export async function saveAppStoreBootstrap(data, actor = "system") {
   const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store/bootstrap`, {
     method: "PUT",
@@ -927,6 +966,52 @@ export async function getAppStoreHistorianRange({
     }
   }
   throw lastErr || new Error("App store historian range fetch failed");
+}
+
+// Operator 2026-06-17: pre-aggregated historian read. `bucket` is one
+// of "minute" | "hour" | "day" and routes the query to the matching
+// historian_agg_<bucket> table. Cuts wide-window payloads ~12× vs the
+// raw /historian/range endpoint.
+export async function getAppStoreHistorianAgg({
+  bucket = "minute",
+  fromUtc = "",
+  toUtc = "",
+  gateway = "",
+  tag = "",
+  source = "",
+  limit = 50000,
+  cloudEdge = null,
+  timeoutMs = 15000,
+  maxAttempts = 2,
+} = {}) {
+  const params = new URLSearchParams();
+  params.set("bucket", String(bucket || "minute"));
+  if (fromUtc) params.set("from_utc", String(fromUtc));
+  if (toUtc) params.set("to_utc", String(toUtc));
+  if (gateway) params.set("gateway", String(gateway));
+  if (tag) params.set("tag", String(tag));
+  if (source) params.set("source", String(source));
+  params.set("limit", String(limit));
+  const baseUrl = `${getAppStoreApiBase()}/api/app-store/historian/agg?${params.toString()}`;
+  const url = appendCloudEdgeParams(baseUrl, cloudEdge);
+  let lastErr = null;
+  const attempts = Math.max(1, Number(maxAttempts || 1));
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const res = await fetchWithTimeout(
+        withNoCache(url),
+        { headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" } },
+        Math.max(1000, Number(timeoutMs || 15000)) + (attempt - 1) * 2000
+      );
+      if (!res.ok) throw new Error("Historian agg fetch failed");
+      return res.json();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientFetchError(err) || attempt === attempts) break;
+      await sleep(250 * attempt);
+    }
+  }
+  throw lastErr || new Error("Historian agg fetch failed");
 }
 
 export async function getAppStoreHistorianStats({
@@ -1645,6 +1730,138 @@ export async function revokeEdgeViewLink(edgeId, tenantId = "") {
 
 export function buildEdgeViewLinkUrl(token) {
   return token ? _viewLinkUrl(token) : "";
+}
+
+// --- Per-user Lite view-links (operator 2026-06-17) ---
+// Admin-only. Each row in the Users page can mint/copy/rotate its own
+// Lite token. NULL user_id = legacy edge-wide link (still shown on the
+// Edges page); non-NULL = per-user link. Same backend table.
+
+export async function getEdgeUserViewLink(edgeId, userId, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const eid = encodeURIComponent(String(edgeId || ""));
+  const uid = encodeURIComponent(String(userId || ""));
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges/${eid}/users/${uid}/view-link${suffix}`);
+  await ensureOk(res, "Fetching user view link failed");
+  return res.json();
+}
+
+export async function createEdgeUserViewLink(edgeId, userId, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const eid = encodeURIComponent(String(edgeId || ""));
+  const uid = encodeURIComponent(String(userId || ""));
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges/${eid}/users/${uid}/view-link${suffix}`, {
+    method: "POST",
+  });
+  await ensureOk(res, "Creating user view link failed");
+  return res.json();
+}
+
+export async function rotateEdgeUserViewLink(edgeId, userId, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const eid = encodeURIComponent(String(edgeId || ""));
+  const uid = encodeURIComponent(String(userId || ""));
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges/${eid}/users/${uid}/view-link/rotate${suffix}`, {
+    method: "POST",
+  });
+  await ensureOk(res, "Rotating user view link failed");
+  return res.json();
+}
+
+export async function revokeEdgeUserViewLink(edgeId, userId, tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const eid = encodeURIComponent(String(edgeId || ""));
+  const uid = encodeURIComponent(String(userId || ""));
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/edges/${eid}/users/${uid}/view-link${suffix}`, {
+    method: "DELETE",
+  });
+  await ensureOk(res, "Revoking user view link failed");
+  return res.json();
+}
+
+// LOCAL-LITE URL: the per-user token is meant for the LAN /lite/?token=...
+// landing page (not the cloud /lite/view/<token> deep link). We fetch the
+// LAN port from /api/lan-sharing/status and build URLs for each IP; if the
+// LAN socket isn't running, we fall back to the loopback URL the admin can
+// share by pasting the token straight into the Lite page.
+export async function getLiteLocalShareTargets() {
+  try {
+    const res = await fetchWithTimeout(`${getApiBase()}/api/lan-sharing/status`);
+    if (!res.ok) return { urls: [], port: 0, running: false };
+    const body = await res.json();
+    return {
+      urls: Array.isArray(body?.lite_urls) ? body.lite_urls : [],
+      port: Number(body?.lan_port || body?.port || 0),
+      running: !!body?.running,
+    };
+  } catch (_) {
+    return { urls: [], port: 0, running: false };
+  }
+}
+
+export function buildLiteLocalUrl(baseUrl, token) {
+  if (!token) return "";
+  const base = String(baseUrl || "").replace(/\/+$/, "");
+  if (!base) return "";
+  return `${base}?token=${encodeURIComponent(token)}`;
+}
+
+// --- Outbound connections (OPC UA / MQTT, operator 2026-06-17) ---
+
+export async function getOpcuaStatus() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/connections/opcua/status`);
+  await ensureOk(res, "Fetching OPC UA status failed");
+  return res.json();
+}
+
+export async function setOpcuaEnabled(config) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/connections/opcua/enable`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config || {}),
+  });
+  await ensureOk(res, "Enabling OPC UA server failed");
+  return res.json();
+}
+
+export async function setOpcuaDisabled() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/connections/opcua/disable`, {
+    method: "POST",
+  });
+  await ensureOk(res, "Disabling OPC UA server failed");
+  return res.json();
+}
+
+export async function getMqttStatus() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/connections/mqtt/status`);
+  await ensureOk(res, "Fetching MQTT status failed");
+  return res.json();
+}
+
+export async function setMqttEnabled(config) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/connections/mqtt/enable`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config || {}),
+  });
+  await ensureOk(res, "Enabling MQTT broker failed");
+  return res.json();
+}
+
+export async function setMqttDisabled() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/connections/mqtt/disable`, {
+    method: "POST",
+  });
+  await ensureOk(res, "Disabling MQTT broker failed");
+  return res.json();
 }
 
 export async function heartbeatControlPlaneEdge(edgeId, payload = {}, tenantId = "") {

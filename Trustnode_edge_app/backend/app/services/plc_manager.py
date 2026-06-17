@@ -1223,11 +1223,22 @@ class GatewayWorker:
                           retries INTEGER NOT NULL DEFAULT 0,
                           last_error TEXT NULL,
                           created_utc TEXT NOT NULL DEFAULT (datetime('now')),
-                          sent_utc TEXT NULL
+                          sent_utc TEXT NULL,
+                          sink_id TEXT NOT NULL DEFAULT ''
                         )
                         """
                     )
                 )
+                # Operator 2026-06-17 (M10): legacy installs miss the
+                # sink_id column. ADD COLUMN IF NOT EXISTS isn't valid
+                # in older SQLite; check the schema directly and ALTER
+                # only when the column is missing.
+                try:
+                    cols = [r[1] for r in conn.execute(text("PRAGMA table_info(outbox_readings)")).fetchall()]
+                    if "sink_id" not in cols:
+                        conn.execute(text("ALTER TABLE outbox_readings ADD COLUMN sink_id TEXT NOT NULL DEFAULT ''"))
+                except Exception:
+                    pass
                 conn.execute(text("CREATE INDEX IF NOT EXISTS idx_outbox_unsent ON outbox_readings(sent_remote, id)"))
                 conn.execute(
                     text(
@@ -1235,9 +1246,23 @@ class GatewayWorker:
                         "ON outbox_readings(gateway_id, sent_remote, id)"
                     )
                 )
+                # Per-sink backlog index — keeps the per-sink drain
+                # cheap when multiple parallel Postgres sinks coexist.
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_outbox_sink_unsent "
+                        "ON outbox_readings(sink_id, sent_remote, id)"
+                    )
+                )
         return self._buffer_engine
 
-    def _enqueue_outbox(self, readings: List[GatewayReading]) -> int:
+    def _enqueue_outbox(self, readings: List[GatewayReading], sink_id: str = "") -> int:
+        """Append a batch to the local outbox buffer.
+
+        Operator 2026-06-17 (M10): `sink_id` lets multiple parallel
+        Postgres sinks each keep their own backlog. Default "" means
+        "primary sink" — the legacy single-target outbox path.
+        """
         from sqlalchemy import text
 
         engine = self._ensure_buffer_engine()
@@ -1256,6 +1281,7 @@ class GatewayWorker:
                     "area": r.area,
                     "equipment": r.equipment,
                     "raw_payload": json.dumps(r.model_dump()),
+                    "sink_id": str(sink_id or ""),
                 }
             )
         with engine.begin() as conn:
@@ -1263,8 +1289,8 @@ class GatewayWorker:
                 text(
                     """
                     INSERT INTO outbox_readings
-                    (gateway_id, ts_utc, tag_name, value, quality, quality_label, source, site, area, equipment, raw_payload)
-                    VALUES (:gateway_id, :ts_utc, :tag_name, :value, :quality, :quality_label, :source, :site, :area, :equipment, :raw_payload)
+                    (gateway_id, ts_utc, tag_name, value, quality, quality_label, source, site, area, equipment, raw_payload, sink_id)
+                    VALUES (:gateway_id, :ts_utc, :tag_name, :value, :quality, :quality_label, :source, :site, :area, :equipment, :raw_payload, :sink_id)
                     """
                 ),
                 rows,
@@ -1406,18 +1432,17 @@ class GatewayWorker:
                     self._persist_txt_file_for_sink(sink, readings)
                 elif sink_engine == "sqlite":
                     self._persist_sqlite_for_sink(sink, readings)
-                elif sink_engine in ("postgresql", "legacy_http"):
-                    # Parallel cloud / legacy sinks aren't yet routed
-                    # through a sink-aware outbox column — the current
-                    # _enqueue_outbox is single-target. Surface this
-                    # explicitly so the operator doesn't think it's
-                    # silently working. File sinks (csv_file, txt_file,
-                    # sqlite) ARE fully functional in parallel.
+                elif sink_engine == "postgresql":
+                    # Operator 2026-06-17 (M4): parallel Postgres sinks
+                    # are now writable via the shared sinks_sql helper.
+                    # Schema is bootstrapped on first contact and the
+                    # writer uses the same row shape as the primary
+                    # historian sink. legacy_http is still unsupported.
+                    self._persist_postgres_parallel(sink, sink_label, readings)
+                elif sink_engine == "legacy_http":
                     self._mark_db_write_error(
-                        f"Parallel sink '{sink_label}' (engine {sink_engine}) "
-                        "is not yet supported. Use the primary database "
-                        "selector for the postgresql/legacy target and add "
-                        "csv_file / txt_file / sqlite sinks for mirrors."
+                        f"Parallel sink '{sink_label}' (engine legacy_http) "
+                        "is not yet supported."
                     )
                 else:
                     # Unknown engine on a parallel sink — log so the
@@ -1432,6 +1457,170 @@ class GatewayWorker:
                 self._mark_db_write_error(
                     f"Parallel sink '{sink_label}' write failed: {type(exc).__name__}: {exc}"
                 )
+
+        # Operator 2026-06-17 (M11b): mirror PLC rows into the
+        # Customer DB when `database_mode = customer_sql`, regardless
+        # of whether the operator has explicitly added it as a sink.
+        # This matches the symmetric behaviour in power_manager so a
+        # single Customer DB activation step in Settings → Database
+        # picks up both meter AND PLC data automatically.
+        try:
+            self._mirror_to_customer_db_if_active(readings)
+        except Exception:
+            # Mirror is never allowed to block / break the primary
+            # collection path — the local sink stays canonical.
+            pass
+
+        # Operator 2026-06-17 (Phase 3): outbound publish to OPC UA
+        # server / MQTT broker for tags that have opted in. Best-effort,
+        # never blocks the primary collection path. Both functions are
+        # no-ops when the respective service isn't running.
+        try:
+            self._publish_to_outbound_connections(readings)
+        except Exception:
+            pass
+
+    def _mirror_to_customer_db_if_active(self, readings: List[GatewayReading]) -> None:
+        """Best-effort PLC → Customer-DB mirror.
+
+        Reads `database_mode` + `customer_sql_target` from the edge's
+        local app_settings. When mode is `customer_sql` and a target
+        is configured, write the batch to that Postgres using the
+        shared sinks_sql helpers. Idempotent across reboots because
+        sinks_sql.bootstrap_customer_db short-circuits when the schema
+        is already in place.
+
+        Important: this path does NOT use the outbox (operator could
+        still add the customer DB as an explicit parallel sink to
+        get the M10 outbox guarantees). We chose best-effort here
+        because every PLC poll already enters the primary outbox
+        when the primary sink is Postgres — adding a second outbox
+        per parallel sink that the operator didn't ask for would
+        double the disk write rate.
+        """
+        if not readings:
+            return
+        # Skip mirroring if the customer DB is ALREADY one of the
+        # configured parallel sinks — that path uses the M10 outbox
+        # and would otherwise produce duplicate rows.
+        try:
+            settings = None
+            # Reuse the import-light path: pull settings directly via
+            # the global app_store singleton from app.state.
+            from app.state import app_store as _app_store
+            bootstrap = _app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+            settings = bootstrap.get("app_settings") if isinstance(bootstrap.get("app_settings"), dict) else {}
+        except Exception:
+            return
+        if not settings:
+            return
+        if str(settings.get("database_mode") or "local_sqlite").lower() != "customer_sql":
+            return
+        target = settings.get("customer_sql_target")
+        if not isinstance(target, dict) or not target.get("host"):
+            return
+        # If any configured sink (primary or parallel) already points
+        # at the same Postgres (host + database + schema), let that
+        # outbox-backed path own the write to avoid duplicates.
+        def _sink_matches_target(sink: Dict[str, Any]) -> bool:
+            try:
+                return (
+                    str(sink.get("engine") or "").strip().lower() == "postgresql"
+                    and str(sink.get("host") or "").strip() == str(target.get("host") or "").strip()
+                    and int(sink.get("port") or 5432) == int(target.get("port") or 5432)
+                    and str(sink.get("database") or "").strip() == str(target.get("database") or "").strip()
+                    and str(sink.get("schema") or "public").strip() == str(target.get("schema") or "public").strip()
+                )
+            except Exception:
+                return False
+        if self.db_sink and _sink_matches_target(self.db_sink):
+            return
+        for sink in (self.db_sinks or []):
+            if _sink_matches_target(sink):
+                return
+
+        try:
+            from app.services import customer_sql as _cs
+            from app.services import sinks_sql as _ss
+        except Exception:
+            return
+        engine, _err = _cs.get_engine(target)
+        if engine is None:
+            return
+        try:
+            boot = _ss.bootstrap_customer_db(
+                engine,
+                schema=str(target.get("schema") or "public"),
+                note=f"plc_manager:{self.gateway_id}",
+            )
+            if not boot.get("ok"):
+                return
+        except Exception:
+            return
+        rows = []
+        for r in readings:
+            rows.append({
+                "tenant_id": "default",
+                "ts_utc": str(getattr(r, "ts_utc", "") or ""),
+                "gateway_id": self.gateway_id,
+                "gateway_name": "",
+                "device_name": "",
+                "plc_ip": "",
+                "database_name": "",
+                "tag_name": str(getattr(r, "tag_name", "") or ""),
+                "value": getattr(r, "value", None),
+                "value_text": None,
+                "quality": getattr(r, "quality", None),
+                "quality_label": str(getattr(r, "quality_label", "") or ""),
+                "source": str(getattr(r, "source", "") or ""),
+            })
+        try:
+            _ss.write_historian_batch(engine, rows, schema=str(target.get("schema") or "public"))
+            _ss.upsert_live_latest(engine, rows, schema=str(target.get("schema") or "public"))
+        except Exception:
+            # Drop — local primary sink already has the rows. The
+            # operator can promote the customer DB to an explicit
+            # parallel sink for outbox-backed durability.
+            return
+
+    def _publish_to_outbound_connections(self, readings: List[GatewayReading]) -> None:
+        """Push each reading to whichever OPC UA / MQTT runtime is active
+        via the connections_publish dispatcher. No-op when the chosen
+        service isn't running or the tag isn't flagged for that protocol.
+        """
+        if not readings:
+            return
+        try:
+            from app.services import connections_publish as cp
+        except Exception:
+            return
+        gw_name = ""
+        device_name = ""
+        try:
+            cfg = self.config
+            gw_name = str(getattr(cfg, "name", "") or self.gateway_id)
+            device_name = str(getattr(cfg, "device_name", "") or "device")
+        except Exception:
+            gw_name = self.gateway_id
+            device_name = "device"
+        for r in readings:
+            cp.publish_opcua(
+                gateway_id=self.gateway_id,
+                device_name=device_name,
+                tag_name=r.tag_name,
+                value=r.value,
+                ts_utc=r.ts_utc,
+                quality=r.quality_label,
+            )
+            cp.publish_mqtt(
+                gateway_id=self.gateway_id,
+                gateway_name=gw_name,
+                device_name=device_name,
+                tag_name=r.tag_name,
+                value=r.value if r.value_text is None else r.value_text,
+                ts_utc=r.ts_utc,
+                quality=r.quality_label,
+            )
 
     def _filter_readings_for_sink(
         self,
@@ -1650,6 +1839,230 @@ class GatewayWorker:
                     engine.dispose()
                 except Exception:
                     pass
+
+    def _mark_outbox_drained(self, *, sink_id: str, count: int) -> int:
+        """Mark the last `count` unsent outbox rows for this gateway/sink
+        as sent. Returns the number of rows actually updated.
+
+        Operator 2026-06-17 (M10): used by the parallel-PG writer after
+        a successful sink write so the outbox tail follows the in-flight
+        batch.
+        """
+        if count <= 0:
+            return 0
+        from sqlalchemy import text
+        engine = self._ensure_buffer_engine()
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT id FROM outbox_readings "
+                    "WHERE gateway_id = :gid AND sink_id = :sid AND sent_remote = 0 "
+                    "ORDER BY id DESC LIMIT :n"
+                ),
+                {"gid": self.gateway_id, "sid": str(sink_id or ""), "n": int(count)},
+            ).fetchall()
+            ids = [r[0] for r in rows]
+            if not ids:
+                return 0
+            conn.execute(
+                text(
+                    "UPDATE outbox_readings "
+                    "SET sent_remote = 1, sent_utc = :su, last_error = NULL "
+                    "WHERE id IN (" + ",".join(str(i) for i in ids) + ")"
+                ),
+                {"su": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+            )
+            return len(ids)
+
+    def drain_parallel_sink_outbox(self, sink: Dict[str, Any], sink_label: str, max_batch: int = 500) -> int:
+        """Drain pending rows for a parallel Postgres sink that has
+        recovered. Called from the existing remote-flush scheduler.
+
+        Returns the number of rows successfully written; 0 on failure.
+        """
+        from sqlalchemy import text
+        sink_id = str(sink.get("id") or sink_label)
+        engine_buf = self._ensure_buffer_engine()
+        with engine_buf.begin() as conn:
+            pending = conn.execute(
+                text(
+                    "SELECT id, ts_utc, tag_name, value, quality, quality_label, source "
+                    "FROM outbox_readings "
+                    "WHERE sink_id = :sid AND sent_remote = 0 "
+                    "ORDER BY id ASC LIMIT :lim"
+                ),
+                {"sid": sink_id, "lim": int(max_batch)},
+            ).mappings().all()
+        if not pending:
+            return 0
+        try:
+            from app.services import customer_sql as _cs
+            from app.services import sinks_sql as _ss
+        except Exception:
+            return 0
+        target = {
+            "engine": "postgresql",
+            "host": str(sink.get("host") or "").strip(),
+            "port": int(sink.get("port") or 5432),
+            "database": str(sink.get("database") or "").strip(),
+            "schema": str(sink.get("schema") or "public").strip(),
+            "username": str(sink.get("username") or "").strip(),
+            "password": str(sink.get("password") or ""),
+            "tls": bool(sink.get("tls") or str(sink.get("ssl") or "").lower() in ("1", "true", "require")),
+        }
+        engine_pg, err = _cs.get_engine(target)
+        if engine_pg is None:
+            return 0
+        rows = []
+        for r in pending:
+            rows.append({
+                "tenant_id": "default",
+                "ts_utc": r["ts_utc"],
+                "gateway_id": self.gateway_id,
+                "gateway_name": "",
+                "device_name": "",
+                "plc_ip": "",
+                "database_name": str(sink.get("name") or sink_id),
+                "tag_name": r["tag_name"],
+                "value": r["value"],
+                "value_text": None,
+                "quality": r["quality"],
+                "quality_label": r["quality_label"] or "",
+                "source": r["source"] or "",
+            })
+        try:
+            _ss.write_historian_batch(engine_pg, rows, schema=target["schema"])
+            _ss.upsert_live_latest(engine_pg, rows, schema=target["schema"])
+        except Exception:
+            return 0
+        # All written — mark sent.
+        ids = [r["id"] for r in pending]
+        with engine_buf.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE outbox_readings "
+                    "SET sent_remote = 1, sent_utc = :su, last_error = NULL "
+                    "WHERE id IN (" + ",".join(str(i) for i in ids) + ")"
+                ),
+                {"su": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+            )
+        return len(ids)
+
+    def _persist_postgres_parallel(
+        self,
+        sink: Dict[str, Any],
+        sink_label: str,
+        readings: List[GatewayReading],
+    ) -> None:
+        """Write a batch to a parallel Postgres sink via sinks_sql.
+
+        Operator 2026-06-17 (M4): the legacy single-target outbox is
+        kept for the primary sink. For parallel Postgres sinks this
+        helper is used directly — best-effort, no store-and-forward
+        yet (M4 ships the writer; the per-sink outbox is M4b if/when
+        an operator complains about row loss during sink downtime).
+        """
+        try:
+            from app.services import customer_sql as _cs
+            from app.services import sinks_sql as _ss
+        except Exception as exc:
+            self._mark_db_write_error(
+                f"Parallel sink '{sink_label}' import failed: {exc}"
+            )
+            return
+
+        # Convert the sink config into the (engine,host,port,...) shape
+        # customer_sql expects. sinks may carry `tls` either as bool or
+        # as the legacy "ssl" string — normalise both.
+        target = {
+            "engine": "postgresql",
+            "host": str(sink.get("host") or "").strip(),
+            "port": int(sink.get("port") or 5432),
+            "database": str(sink.get("database") or "").strip(),
+            "schema": str(sink.get("schema") or "public").strip(),
+            "username": str(sink.get("username") or "").strip(),
+            "password": str(sink.get("password") or ""),
+            "tls": bool(sink.get("tls") or str(sink.get("ssl") or "").lower() in ("1", "true", "require")),
+        }
+        engine, err = _cs.get_engine(target)
+        if engine is None:
+            self._mark_db_write_error(
+                f"Parallel sink '{sink_label}' connect failed: {err}"
+            )
+            return
+
+        # Best-effort schema bootstrap. After the first success the
+        # cache short-circuits subsequent calls so this stays cheap.
+        try:
+            boot = _ss.bootstrap_customer_db(engine, schema=target["schema"], note=f"plc_manager:{sink_label}")
+            if not boot.get("ok"):
+                self._mark_db_write_error(
+                    f"Parallel sink '{sink_label}' schema bootstrap failed: {boot.get('error') or 'unknown'}"
+                )
+                return
+        except Exception as exc:
+            self._mark_db_write_error(
+                f"Parallel sink '{sink_label}' bootstrap raised: {type(exc).__name__}: {exc}"
+            )
+            return
+
+        # Convert GatewayReading instances → dict rows matching the
+        # historian schema in sinks_sql. The same row shape feeds both
+        # historian and live_latest.
+        rows: List[Dict[str, Any]] = []
+        for r in readings:
+            rows.append({
+                "tenant_id": str(getattr(r, "tenant_id", "") or "default"),
+                "ts_utc": str(getattr(r, "ts_utc", "") or ""),
+                "gateway_id": str(getattr(r, "gateway_id", "") or ""),
+                "gateway_name": str(getattr(r, "gateway_name", "") or ""),
+                "device_name": str(getattr(r, "device_name", "") or ""),
+                "plc_ip": str(getattr(r, "plc_ip", "") or ""),
+                "database_name": str(sink.get("name") or sink.get("id") or ""),
+                "tag_name": str(getattr(r, "tag_name", "") or ""),
+                "value": getattr(r, "value", None),
+                "value_text": None,
+                "quality": getattr(r, "quality", None),
+                "quality_label": str(getattr(r, "quality_label", "") or ""),
+                "source": str(getattr(r, "source", "") or ""),
+            })
+
+        # Operator 2026-06-17 (M10): outbox-first semantics. We enqueue
+        # to the per-sink backlog before attempting the network write
+        # so a transient PG outage doesn't drop rows. On a successful
+        # write the matching outbox rows are marked sent.
+        sink_id = str(sink.get("id") or sink_label)
+        try:
+            self._enqueue_outbox(readings, sink_id=sink_id)
+        except Exception as exc:
+            # If we can't even buffer locally we're in serious trouble —
+            # log and bail; the desktop SQLite is still authoritative.
+            self._mark_db_write_error(
+                f"Parallel sink '{sink_label}' enqueue failed: {type(exc).__name__}: {exc}"
+            )
+            return
+
+        try:
+            written = _ss.write_historian_batch(engine, rows, schema=target["schema"])
+            up = _ss.upsert_live_latest(engine, rows, schema=target["schema"])
+            # Mark these outbox rows as sent. We can't pinpoint the
+            # exact ids without re-querying, so we mark the most recent
+            # `len(readings)` unsent rows for this (gateway, sink) —
+            # safe because the writer queues + drains FIFO.
+            try:
+                self._mark_outbox_drained(sink_id=sink_id, count=len(rows))
+            except Exception:
+                pass
+            logger.debug(
+                "parallel pg sink '%s' wrote %d historian + %d live_latest",
+                sink_label, written, up,
+            )
+        except Exception as exc:
+            # Don't mark the outbox rows as drained; the next flush
+            # tick will retry them.
+            self._mark_db_write_error(
+                f"Parallel sink '{sink_label}' write failed (rows buffered): {type(exc).__name__}: {exc}"
+            )
 
     def _schedule_remote_flush(self, engine_name: str) -> None:
         now_mono = time.monotonic()

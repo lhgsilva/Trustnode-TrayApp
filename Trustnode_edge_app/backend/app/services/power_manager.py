@@ -770,15 +770,52 @@ class PowerManager:
                 "energy_wh": 0.0,
                 "downtime_wh": 0.0,
                 "last_mono": None,
+                # Operator 2026-06-16: per-tariff accumulators so the
+                # dashboard can show "kWh consumed under PEAK" etc.
+                # Keyed by tariff index (matches the active tariff
+                # list order at integration time).
+                "tariff_wh": {},      # {idx: float}
+                "tariff_cost": {},    # {idx: float}
+                # Operator 2026-06-16: throttle slow insight tags
+                # (cumulative kWh / cost / efficiency / per-tariff
+                # totals) to every Nth poll to relieve the SQLite
+                # write lock. Fast insights (live_kw / current_a /
+                # active_power_kw / active_tariff_index) still flush
+                # every poll so dashboards stay responsive.
+                "insight_skip": 0,
             }
             st[device_id] = bucket
         return bucket
 
     def _resolve_tariff_rate(self, ts: datetime) -> float:
+        rate, _idx = self._resolve_tariff_rate_indexed(ts)
+        return rate
+
+    def _resolve_tariff_rate_indexed(self, ts: datetime) -> tuple[float, int]:
+        """Like _resolve_tariff_rate but also returns the matching
+        tariff index (0-based) or -1 if none matched and the flat
+        fallback rate is in use. Operator 2026-06-16: dashboards need
+        to know WHICH tariff is currently active.
+
+        Operator 2026-06-17: tariff windows are entered by the
+        operator in their LOCAL time (e.g. "09:00–21:20"). The
+        previous implementation compared `ts.hour:ts.minute` of a UTC
+        timestamp directly, so in any non-UTC zone the resolver
+        silently returned -1 for the entire window and tariff cost
+        stayed at zero. Convert the UTC timestamp into the machine's
+        local time (matches what the UI displays) before extracting
+        the wall-clock minutes-of-day.
+        """
         tariffs = list(self._config.get("electricity_tariffs") or [])
         if tariffs:
-            minutes = ts.hour * 60 + ts.minute
-            for t in tariffs:
+            # Convert UTC → machine local. astimezone() without a
+            # target zone uses the host's TZ as configured in the OS.
+            try:
+                local_ts = ts.astimezone()
+            except Exception:
+                local_ts = ts
+            minutes = local_ts.hour * 60 + local_ts.minute
+            for idx, t in enumerate(tariffs):
                 try:
                     sh, sm = str(t.get("start_time") or "00:00").split(":")
                     eh, em = str(t.get("end_time") or "23:59").split(":")
@@ -789,13 +826,13 @@ class PowerManager:
                 in_window = (start <= end and start <= minutes <= end) or (start > end and (minutes >= start or minutes <= end))
                 if in_window:
                     try:
-                        return float(t.get("rate_eur_kwh") or 0.0)
+                        return float(t.get("rate_eur_kwh") or 0.0), idx
                     except Exception:
-                        return 0.0
+                        return 0.0, idx
         try:
-            return float(self._config.get("energy_price_eur_kwh") or 0.0)
+            return float(self._config.get("energy_price_eur_kwh") or 0.0), -1
         except Exception:
-            return 0.0
+            return 0.0, -1
 
     def _compute_insight_rows(self, device: dict[str, Any], values: dict[str, float], now: str) -> list[dict[str, Any]]:
         device_id = str(device.get("id") or "")
@@ -841,9 +878,18 @@ class PowerManager:
 
         # Tariff-aware cost for the window's accumulated kWh.
         ts_now = datetime.now(timezone.utc)
-        rate = self._resolve_tariff_rate(ts_now)
+        rate, active_idx = self._resolve_tariff_rate_indexed(ts_now)
         total_kwh = st["energy_wh"] / 1000.0
         total_cost = total_kwh * rate
+
+        # Accumulate per-tariff kWh / cost so dashboards can plot
+        # "consumption under PEAK" etc. Trapezoidal integration was
+        # already applied above into st["energy_wh"]; here we just
+        # split the increment into the active tariff bucket.
+        if dt_h > 0 and active_idx >= 0:
+            incr_kwh = live_kw * dt_h
+            st["tariff_wh"][active_idx] = float(st["tariff_wh"].get(active_idx, 0.0)) + incr_kwh * 1000.0
+            st["tariff_cost"][active_idx] = float(st["tariff_cost"].get(active_idx, 0.0)) + incr_kwh * rate
 
         # Downtime cost: when voltage >= min and active power <= max
         # for the matching rule, accumulate live_kw * dt(h) * rate.
@@ -883,17 +929,36 @@ class PowerManager:
         # Power (kW) and a "Power Usage (kWh)" alias for the
         # rolling-window kWh integral.
         current_a = float(values.get("current_a") or values.get("current_l1_a") or 0.0)
-        return [
+        # Operator 2026-06-16: every insight tag is written at the
+        # gateway's configured poll interval. The previous fast/slow
+        # split caused dashboard charts that included an "insight.*"
+        # tag with a different cadence to misalign visually with the
+        # raw register tags ("gaps"). The operator's invariant is
+        # explicit: "we should not have slow tags, fast tags for
+        # meters, all of them should follow the gateways collection".
+        rows = [
             _row("insight.live_kw", live_kw),
             _row("insight.active_power_kw", live_kw),       # alias for KPI strip
             _row("insight.current_a", current_a),
+            _row("insight.active_tariff_index", float(active_idx)),
             _row("insight.power_usage_kwh", total_kwh),     # window kWh
             _row("insight.peak_kw", peak_kw),
             _row("insight.energy_efficiency_pct", efficiency_pct),
             _row("insight.total_kwh", total_kwh),
             _row("insight.energy_cost_eur", total_cost),
             _row("insight.downtime_cost_eur", downtime_cost),
+            _row("insight.active_tariff_rate_eur_kwh", float(rate)),
         ]
+        # Per-tariff totals — one pair of tags per configured tariff,
+        # also written every poll so dashboards stay in lockstep.
+        if True:
+            configured = list(self._config.get("electricity_tariffs") or [])
+            for idx, _t in enumerate(configured):
+                kwh_i = float(st["tariff_wh"].get(idx, 0.0)) / 1000.0
+                cost_i = float(st["tariff_cost"].get(idx, 0.0))
+                rows.append(_row(f"insight.tariff_{idx + 1}_kwh", kwh_i))
+                rows.append(_row(f"insight.tariff_{idx + 1}_cost_eur", cost_i))
+        return rows
 
     def _enqueue_rows(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -952,6 +1017,108 @@ class PowerManager:
                 self._fan_out_rows_to_device_sinks(batch)
             except Exception:
                 pass
+            # Operator 2026-06-17 (M4): mirror power-meter rows into
+            # the customer DB when the operator has flipped
+            # database_mode = customer_sql. The local SQLite remains
+            # canonical for the desktop UI; the customer DB is the
+            # LAN-shared store the Lite reads from.
+            try:
+                self._mirror_to_customer_db(batch)
+            except Exception:
+                # Mirror failures must never block the local writer.
+                pass
+
+            # Operator 2026-06-17 (Phase 3): publish to OPC UA / MQTT.
+            try:
+                self._publish_to_outbound_connections(batch)
+            except Exception:
+                pass
+
+    def _publish_to_outbound_connections(self, batch: list[dict[str, Any]]) -> None:
+        if not batch:
+            return
+        try:
+            from app.services import connections_publish as cp
+        except Exception:
+            return
+        for r in batch:
+            try:
+                gid = str(r.get("gateway_id") or "")
+                gname = str(r.get("gateway_name") or gid)
+                dname = str(r.get("device_name") or "device")
+                tname = str(r.get("tag_name") or "")
+                value = r.get("value")
+                ts = str(r.get("ts_utc") or "")
+                quality = str(r.get("quality_label") or "good")
+                cp.publish_opcua(
+                    gateway_id=gid, device_name=dname, tag_name=tname,
+                    value=value, ts_utc=ts, quality=quality,
+                )
+                cp.publish_mqtt(
+                    gateway_id=gid, gateway_name=gname, device_name=dname,
+                    tag_name=tname, value=value, ts_utc=ts, quality=quality,
+                )
+            except Exception:
+                pass
+
+    def _mirror_to_customer_db(self, batch: list[dict[str, Any]]) -> None:
+        """Best-effort mirror of meter rows into the customer Postgres
+        (operator 2026-06-17, M4). Only runs when database_mode is
+        customer_sql AND a target is configured. Schema is bootstrapped
+        on first contact via sinks_sql.bootstrap_customer_db.
+        """
+        if not batch:
+            return
+        try:
+            settings = self._app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        except Exception:
+            return
+        app_settings = settings.get("app_settings") if isinstance(settings.get("app_settings"), dict) else {}
+        if str(app_settings.get("database_mode") or "local_sqlite").lower() != "customer_sql":
+            return
+        target = app_settings.get("customer_sql_target") if isinstance(app_settings.get("customer_sql_target"), dict) else None
+        if not target:
+            return
+        try:
+            from app.services import customer_sql as _cs
+            from app.services import sinks_sql as _ss
+        except Exception:
+            return
+        engine, _err = _cs.get_engine(target)
+        if engine is None:
+            return
+        # Re-bootstrap is cheap (cache short-circuit) but guarantees
+        # the schema is present even if the DBA recreated it.
+        try:
+            _ss.bootstrap_customer_db(engine, schema=str(target.get("schema") or "public"), note="power_manager")
+        except Exception:
+            return
+        # Convert the in-flight rows to the dict shape sinks_sql wants.
+        rows = []
+        for r in batch:
+            rows.append({
+                "tenant_id": str(r.get("tenant_id") or "default"),
+                "ts_utc": str(r.get("ts_utc") or ""),
+                "gateway_id": str(r.get("gateway_id") or ""),
+                "gateway_name": str(r.get("gateway_name") or ""),
+                "device_name": str(r.get("device_name") or ""),
+                "plc_ip": str(r.get("plc_ip") or ""),
+                "database_name": str(r.get("database_name") or ""),
+                "tag_name": str(r.get("tag_name") or r.get("tag") or ""),
+                "value": r.get("value"),
+                "value_text": r.get("value_text"),
+                "quality": r.get("quality"),
+                "quality_label": str(r.get("quality_label") or ""),
+                "source": str(r.get("source") or ""),
+            })
+        try:
+            _ss.write_historian_batch(engine, rows, schema=str(target.get("schema") or "public"))
+            _ss.upsert_live_latest(engine, rows, schema=str(target.get("schema") or "public"))
+        except Exception:
+            # Drop on the floor — the local SQLite already has the
+            # rows, and the next batch will retry the mirror. A real
+            # outbox for power-meter mirror lives in M4b if needed.
+            return
 
     def _lookup_db_connection(self, db_id: str) -> dict[str, Any] | None:
         if not db_id:

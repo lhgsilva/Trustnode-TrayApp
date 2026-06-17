@@ -602,6 +602,121 @@ def revoke_edge_view_link(request: Request, edge_id: str, tenant_id: str | None 
     return {"ok": True, "tenant_id": tid, "edge_id": eid, "revoked": revoked}
 
 
+# ────────────────────────────────────────────────────────────────────
+# Per-USER view-links (operator 2026-06-17). Same `cp_edge_view_links`
+# table, but with `user_id` set. Lets the local admin generate one
+# Lite token per user from the Users page, rotate/revoke individually
+# without affecting other users or the edge-wide shareable link.
+# All four endpoints are admin-only (require_admin_write=True).
+#   POST   /edges/{edge_id}/users/{user_id}/view-link        — mint/return
+#   POST   /edges/{edge_id}/users/{user_id}/view-link/rotate — revoke + mint
+#   GET    /edges/{edge_id}/users/{user_id}/view-link        — fetch active
+#   DELETE /edges/{edge_id}/users/{user_id}/view-link        — revoke
+# ────────────────────────────────────────────────────────────────────
+
+def _user_view_link_for(tenant_id: str, edge_id: str, user_id: str) -> dict[str, Any] | None:
+    try:
+        fn = getattr(control_plane_store, "list_edge_view_links_for_user", None)
+        if callable(fn):
+            rows = fn(tenant_id=tenant_id, edge_id=str(edge_id), user_id=str(user_id)) or []
+            for row in rows:
+                if str(row.get("status") or "active") == "active":
+                    return row
+    except Exception:
+        pass
+    return None
+
+
+@router.get("/edges/{edge_id}/users/{user_id}/view-link")
+def get_edge_user_view_link(request: Request, edge_id: str, user_id: str,
+                            tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=False)
+    eid = str(edge_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not eid or not uid:
+        raise HTTPException(status_code=400, detail="edge_id_and_user_id_required")
+    row = _user_view_link_for(tid, eid, uid)
+    return {"ok": True, "tenant_id": tid, "edge_id": eid, "user_id": uid, "link": row}
+
+
+@router.post("/edges/{edge_id}/users/{user_id}/view-link")
+def create_edge_user_view_link(request: Request, edge_id: str, user_id: str,
+                                tenant_id: str | None = None) -> dict[str, Any]:
+    """Mint a per-user token. Idempotent — returns the active one if any."""
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    eid = str(edge_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not eid or not uid:
+        raise HTTPException(status_code=400, detail="edge_id_and_user_id_required")
+    existing = _user_view_link_for(tid, eid, uid)
+    if existing:
+        return {"ok": True, "tenant_id": tid, "edge_id": eid, "user_id": uid, "link": existing}
+    customer_id = ""
+    try:
+        for e in control_plane_store.list_edges(tenant_id=tid) or []:
+            if str(e.get("edge_id") or "") == eid:
+                customer_id = str(e.get("customer_id") or "")
+                break
+    except Exception:
+        customer_id = ""
+    payload = getattr(request.state, "user_payload", {}) or {}
+    actor = str(payload.get("sub") or "admin")
+    token = _new_view_link_token()
+    try:
+        if hasattr(control_plane_store, "upsert_edge_view_link"):
+            control_plane_store.upsert_edge_view_link(
+                token=token, tenant_id=tid, edge_id=eid,
+                customer_id=customer_id, status="active",
+                created_by=actor, user_id=uid,
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"user_view_link_create_failed: {exc}") from exc
+    row = {
+        "token": token, "tenant_id": tid, "customer_id": customer_id,
+        "edge_id": eid, "user_id": uid, "status": "active", "created_by": actor,
+    }
+    _audit(request, tenant_id=tid, action="edge.user_view_link.create", outcome="ok",
+           details={"edge_id": eid, "user_id": uid, "token_prefix": token[:8]})
+    return {"ok": True, "tenant_id": tid, "edge_id": eid, "user_id": uid, "link": row}
+
+
+@router.post("/edges/{edge_id}/users/{user_id}/view-link/rotate")
+def rotate_edge_user_view_link(request: Request, edge_id: str, user_id: str,
+                                tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    eid = str(edge_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not eid or not uid:
+        raise HTTPException(status_code=400, detail="edge_id_and_user_id_required")
+    try:
+        fn = getattr(control_plane_store, "revoke_edge_view_links_for_user", None)
+        if callable(fn):
+            fn(tenant_id=tid, edge_id=eid, user_id=uid)
+    except Exception:
+        pass
+    return create_edge_user_view_link(request=request, edge_id=eid, user_id=uid, tenant_id=tid)
+
+
+@router.delete("/edges/{edge_id}/users/{user_id}/view-link")
+def revoke_edge_user_view_link(request: Request, edge_id: str, user_id: str,
+                                tenant_id: str | None = None) -> dict[str, Any]:
+    tid = _scoped_tenant(request, tenant_id, require_admin_write=True)
+    eid = str(edge_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not eid or not uid:
+        raise HTTPException(status_code=400, detail="edge_id_and_user_id_required")
+    revoked = 0
+    try:
+        fn = getattr(control_plane_store, "revoke_edge_view_links_for_user", None)
+        if callable(fn):
+            revoked = int(fn(tenant_id=tid, edge_id=eid, user_id=uid) or 0)
+    except Exception:
+        revoked = 0
+    _audit(request, tenant_id=tid, action="edge.user_view_link.revoke", outcome="ok",
+           details={"edge_id": eid, "user_id": uid, "revoked_count": revoked})
+    return {"ok": True, "tenant_id": tid, "edge_id": eid, "user_id": uid, "revoked": revoked}
+
+
 # Public resolver — NO auth. Returns the scope a Lite share-link viewer is
 # allowed to see. Defined outside the auth-protected router via a fresh
 # APIRouter-less callable mounted at the FastAPI app root in main.py.

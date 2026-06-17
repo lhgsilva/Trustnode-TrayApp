@@ -315,6 +315,7 @@ class ControlPlaneStore:
                       tenant_id TEXT NOT NULL,
                       customer_id TEXT,
                       edge_id TEXT NOT NULL,
+                      user_id TEXT,
                       status TEXT NOT NULL DEFAULT 'active',
                       created_by TEXT,
                       created_utc TEXT NOT NULL,
@@ -362,6 +363,15 @@ class ControlPlaneStore:
                     cur.execute("ALTER TABLE cp_edge_activation_codes ADD COLUMN license_id TEXT")
                 if "activation_code" not in cols:
                     cur.execute("ALTER TABLE cp_edge_activation_codes ADD COLUMN activation_code TEXT")
+                # Per-user Lite view-links (operator 2026-06-17). Existing
+                # rows have NULL user_id meaning "edge-wide" (legacy share-
+                # link visible on the Edges page); new rows minted from
+                # the Users page carry the user_id of the user they were
+                # issued for so admins can rotate/revoke per-user without
+                # affecting others.
+                view_link_cols = {str(r[1]) for r in cur.execute("PRAGMA table_info(cp_edge_view_links)").fetchall()}
+                if "user_id" not in view_link_cols:
+                    cur.execute("ALTER TABLE cp_edge_view_links ADD COLUMN user_id TEXT")
                 conn.commit()
 
     def _seed_defaults(self) -> None:
@@ -709,31 +719,64 @@ class ControlPlaneStore:
 
     def upsert_edge_view_link(self, *, token: str, tenant_id: str, edge_id: str,
                               customer_id: str = "", status: str = "active",
-                              created_by: str = "system") -> dict[str, Any]:
+                              created_by: str = "system",
+                              user_id: str = "") -> dict[str, Any]:
         tid = normalize_tenant_id(tenant_id)
         eid = str(edge_id or "").strip()
         if not eid or not token:
             raise ValueError("token_and_edge_required")
+        # NULL user_id = edge-wide legacy link; non-empty = per-user link.
+        uid_val = str(user_id).strip() or None
         now = self._utc_now()
         with self._lock:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO cp_edge_view_links(token, tenant_id, customer_id, edge_id, status, created_by, created_utc, last_used_utc, metadata_json)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, NULL, '{}')
+                    INSERT INTO cp_edge_view_links(token, tenant_id, customer_id, edge_id, user_id, status, created_by, created_utc, last_used_utc, metadata_json)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}')
                     ON CONFLICT(token) DO UPDATE SET
                       tenant_id=excluded.tenant_id,
                       customer_id=excluded.customer_id,
                       edge_id=excluded.edge_id,
+                      user_id=excluded.user_id,
                       status=excluded.status
                     """,
-                    (str(token), tid, str(customer_id or ""), eid, str(status or "active"), str(created_by or "system"), now),
+                    (str(token), tid, str(customer_id or ""), eid, uid_val, str(status or "active"), str(created_by or "system"), now),
                 )
                 conn.commit()
                 row = conn.execute(
                     "SELECT * FROM cp_edge_view_links WHERE token=?", (str(token),),
                 ).fetchone()
         return dict(row) if row else {}
+
+    def list_edge_view_links_for_user(self, *, tenant_id: str, edge_id: str, user_id: str,
+                                       include_revoked: bool = False) -> list[dict[str, Any]]:
+        """Active per-user view-links for a given (edge, user) pair."""
+        tid = normalize_tenant_id(tenant_id)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM cp_edge_view_links WHERE tenant_id=? AND edge_id=? AND user_id=? ORDER BY created_utc DESC",
+                    (tid, str(edge_id), str(user_id)),
+                ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            if not include_revoked and str(d.get("status") or "active") != "active":
+                continue
+            out.append(d)
+        return out
+
+    def revoke_edge_view_links_for_user(self, *, tenant_id: str, edge_id: str, user_id: str) -> int:
+        tid = normalize_tenant_id(tenant_id)
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE cp_edge_view_links SET status='revoked' WHERE tenant_id=? AND edge_id=? AND user_id=? AND status='active'",
+                    (tid, str(edge_id), str(user_id)),
+                )
+                conn.commit()
+                return int(cur.rowcount or 0)
 
     def get_edge_view_link_by_token(self, *, token: str) -> dict[str, Any] | None:
         t = str(token or "").strip()
@@ -747,6 +790,10 @@ class ControlPlaneStore:
         return dict(row) if row else None
 
     def revoke_edge_view_links(self, *, tenant_id: str, edge_id: str) -> int:
+        """Revoke ONLY the edge-wide (legacy) view-links for the edge.
+        Per-user links (user_id IS NOT NULL) are untouched; use
+        revoke_edge_view_links_for_user for those.
+        """
         tid = normalize_tenant_id(tenant_id)
         eid = str(edge_id or "").strip()
         if not eid:
@@ -754,7 +801,7 @@ class ControlPlaneStore:
         with self._lock:
             with self._connect() as conn:
                 cur = conn.execute(
-                    "UPDATE cp_edge_view_links SET status='revoked' WHERE tenant_id=? AND edge_id=? AND status='active'",
+                    "UPDATE cp_edge_view_links SET status='revoked' WHERE tenant_id=? AND edge_id=? AND status='active' AND (user_id IS NULL OR user_id='')",
                     (tid, eid),
                 )
                 conn.commit()

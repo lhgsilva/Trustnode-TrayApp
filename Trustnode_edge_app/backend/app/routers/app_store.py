@@ -357,6 +357,38 @@ def get_historian_range(
     }
 
 
+@router.get("/historian/agg")
+def get_historian_agg(
+    request: Request,
+    bucket: str = "minute",
+    from_utc: str = "",
+    to_utc: str = "",
+    gateway: str = "",
+    tag: str = "",
+    source: str = "",
+    limit: int = 50000,
+) -> dict:
+    """Operator 2026-06-17: serve pre-bucketed historian rows from the
+    `historian_agg_<bucket>` tables (populated by the retention worker).
+    Lets dashboards skip pulling 1 Hz raw rows when the window is wide
+    (e.g. 24 h × Minute → 1 440 rows instead of ~17 000)."""
+    safe_limit = max(50, min(int(limit or 50000), 100000))
+    return {
+        "ok": True,
+        "tenant_id": get_current_tenant(),
+        "bucket": bucket,
+        "rows": app_store.get_historian_agg_rows(
+            bucket=bucket,
+            from_utc=from_utc,
+            to_utc=to_utc,
+            gateway=gateway,
+            tag=tag,
+            source=source,
+            limit=safe_limit,
+        ),
+    }
+
+
 @router.get("/historian/stats")
 def get_historian_stats(
     request: Request,

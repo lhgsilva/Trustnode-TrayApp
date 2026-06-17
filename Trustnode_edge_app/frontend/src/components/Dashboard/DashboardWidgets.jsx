@@ -1408,10 +1408,21 @@ function LiveTagChart({
     })();
     return d.toLocaleTimeString([], opts);
   };
+  // Operator 2026-06-16: X axis now uses tsMs directly (numeric time
+  // scale), so the formatter receives raw ms — points space themselves
+  // by real time, matching the gateway's poll interval. Two charts
+  // showing the same 60 seconds of data look the same width
+  // regardless of how many samples each one has, and a paused window
+  // shows as a gap instead of compressing.
   const xTickFormatter = (v) => {
-    const r = renderedData.rows.find((p) => p.idx === v);
-    if (!r) return "";
-    return formatTickTime(new Date(r.tsMs));
+    if (typeof v !== "number" || !Number.isFinite(v)) {
+      // Legacy idx fallback (in case Recharts emits an idx instead of
+      // a tsMs during the very first render).
+      const r = renderedData.rows.find((p) => p.idx === v);
+      if (!r) return "";
+      return formatTickTime(new Date(r.tsMs));
+    }
+    return formatTickTime(new Date(v));
   };
   // X axis tick rotation. Empty / 0 = horizontal (default). 45 / 90 /
   // -45 / -90 supported. Bottom margin auto-expands when rotated to
@@ -1419,6 +1430,7 @@ function LiveTagChart({
   const xTickAngleRaw = Number(cfg.chart_x_tick_angle);
   const xTickAngle = Number.isFinite(xTickAngleRaw) ? xTickAngleRaw : 0;
   const labelFmt = (v) => {
+    if (typeof v === "number" && Number.isFinite(v)) return new Date(v).toLocaleString();
     const r = renderedData.rows.find((p) => p.idx === v);
     if (!r) return String(v);
     return new Date(r.tsMs).toLocaleString();
@@ -1478,7 +1490,10 @@ function LiveTagChart({
           <ComposedChart data={renderedData.rows} margin={margin}>
             <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
             <XAxis
-              dataKey="idx"
+              dataKey="tsMs"
+              type="number"
+              scale="time"
+              domain={["dataMin", "dataMax"]}
               tickFormatter={xTickFormatter}
               fontSize={10}
               interval="preserveStartEnd"
@@ -1583,7 +1598,11 @@ function LiveTagChart({
   );
 }
 
-export function DashboardWidgetCard({
+// Operator 2026-06-16: hot-rendered component. Wrapped in React.memo
+// at the bottom of this file so a 1 Hz poll that mutates dataLog
+// doesn't force every widget to re-render — only the ones whose
+// props actually change.
+function DashboardWidgetCardImpl({
   widget,
   dataLogView,
   tagRows,
@@ -3749,9 +3768,27 @@ export function DashboardWidgetCard({
     case "text_kpi":
       {
         const textSize = computeWidgetTextScale(widget, 14, 34);
+        // Operator 2026-06-16: KPIs can carry a unit suffix (A, W,
+        // kWh, %, …) so operators don't need to encode the unit in
+        // the tag name itself.
+        const unitSuffix = String(cfg.unit_suffix || "").trim();
+        // Operator 2026-06-16: per-widget text colours + unit size.
+        const valueColor = String(cfg.value_color || "").trim() || undefined;
+        const unitColor = String(cfg.unit_color || "").trim() || undefined;
+        const unitScale = Number.isFinite(Number(cfg.unit_size_scale))
+          ? Math.max(0.3, Math.min(2, Number(cfg.unit_size_scale)))
+          : 1;
+        const unitStyle = {
+          ...(unitColor ? { color: unitColor } : {}),
+          fontSize: `${unitScale}em`,
+        };
       return (
         <div className="dashboard-widget-block">
-          <div className="dashboard-kpi-text" style={{ fontSize: `${textSize}px` }}>{displayTag || "-"}</div>
+          <div className="dashboard-kpi-text" style={{ fontSize: `${textSize}px`, ...(valueColor ? { color: valueColor } : {}) }}>
+            <span>
+              {displayTag || "-"}{unitSuffix ? <span className="dashboard-kpi-unit" style={unitStyle}>{unitSuffix}</span> : null}
+            </span>
+          </div>
         </div>
       );
       }
@@ -3768,15 +3805,37 @@ export function DashboardWidgetCard({
         : null;
       const valueSize = computeWidgetTextScale(widget, 18, 46);
       const textSize = computeWidgetTextScale(widget, 12, 30);
+      const unitSuffix = String(cfg.unit_suffix || "").trim();
+      // Operator 2026-06-16: decimal places configurable per KPI. Clamp
+      // to 0..6 so the formatter never throws on a bad operator input.
+      const decimalsRaw = cfg.value_decimals;
+      const decimals = Number.isFinite(Number(decimalsRaw))
+        ? Math.max(0, Math.min(6, Math.floor(Number(decimalsRaw))))
+        : 3;
+      // Operator 2026-06-16: per-widget text colours + unit size.
+      // value_color beats the accent fallback; unit_color recolours
+      // just the unit suffix span; unit_size_scale is a multiplier of
+      // the value font (0.3..2, default 1 = inline same size).
+      const valueColor = String(cfg.value_color || "").trim() || getWidgetAccent(widget, "#14a89a");
+      const unitColor = String(cfg.unit_color || "").trim() || undefined;
+      const unitScale = Number.isFinite(Number(cfg.unit_size_scale))
+        ? Math.max(0.3, Math.min(2, Number(cfg.unit_size_scale)))
+        : 1;
+      const unitStyle = {
+        ...(unitColor ? { color: unitColor } : {}),
+        fontSize: `${unitScale}em`,
+      };
       if (textValue !== null) {
         return (
           <div className="dashboard-widget-block">
             <div
               className="dashboard-kpi-value dashboard-kpi-text-value"
-              style={{ color: getWidgetAccent(widget, "#14a89a"), fontSize: `${textSize}px` }}
+              style={{ color: valueColor, fontSize: `${textSize}px` }}
               title={textValue}
             >
-              {textValue || "-"}
+              <span>
+                {textValue || "-"}{unitSuffix ? <span className="dashboard-kpi-unit" style={unitStyle}>{unitSuffix}</span> : null}
+              </span>
             </div>
           </div>
         );
@@ -3785,9 +3844,11 @@ export function DashboardWidgetCard({
         <div className="dashboard-widget-block">
           <div
             className="dashboard-kpi-value"
-            style={{ color: getWidgetAccent(widget, "#14a89a"), fontSize: `${valueSize}px` }}
+            style={{ color: valueColor, fontSize: `${valueSize}px` }}
           >
-            {value === null ? "-" : value.toFixed(3)}
+            <span>
+              {value === null ? "-" : value.toFixed(decimals)}{unitSuffix ? <span className="dashboard-kpi-unit" style={unitStyle}>{unitSuffix}</span> : null}
+            </span>
           </div>
         </div>
       );
@@ -3795,9 +3856,11 @@ export function DashboardWidgetCard({
     case "fixed_text":
       {
         const fixedSize = computeWidgetTextScale(widget, 12, 30);
+        // Operator 2026-06-16: optional text colour for fixed_text.
+        const valueColor = String(cfg.value_color || "").trim() || undefined;
       return (
         <div className="dashboard-widget-block">
-          <div className="dashboard-fixed-text" style={{ fontSize: `${fixedSize}px` }}>
+          <div className="dashboard-fixed-text" style={{ fontSize: `${fixedSize}px`, ...(valueColor ? { color: valueColor } : {}) }}>
             {effectiveDataSourceType === "computed" ? (buildFixedText(cfg.text || "", computedItemsWithQuery) || cfg.text || "-") : (cfg.text || "-")}
           </div>
         </div>
@@ -4085,9 +4148,190 @@ export function DashboardWidgetCard({
       return <CloudSyncStatusWidget widget={widget} />;
     case "report_card":
       return <ReportCardWidget widget={widget} />;
+    case "energy_tariffs":
+      return (
+        <EnergyTariffsWidget
+          widget={widget}
+          tagRowsByGateway={tagRowsByGateway}
+        />
+      );
     default:
       return renderEmpty("Unsupported widget");
   }
+}
+
+// Operator 2026-06-16: memoise the widget card so a 1 Hz dataLog
+// merge that only touches one gateway's tags doesn't trigger every
+// widget on the dashboard to re-render. Default shallow equality
+// works because the parent already memoises tagRowsByGateway and
+// other indexed props.
+export const DashboardWidgetCard = React.memo(DashboardWidgetCardImpl);
+const EnergyTariffsWidget = React.memo(EnergyTariffsWidgetImpl);
+
+// =====================================================================
+// EnergyTariffsWidget — reads the per-tariff insight tags emitted by
+// power_manager (insight.tariff_<N>_kwh / _cost_eur) for the chosen
+// gateway and renders one of three views:
+//   * donut  — pie chart with center total
+//   * bars   — horizontal bars per tariff
+//   * table  — table list (name / kWh / cost / share %)
+// Operator 2026-06-16. Wrapped in React.memo at bottom of file.
+function EnergyTariffsWidgetImpl({ widget, tagRowsByGateway }) {
+  const cfg = widget?.config || {};
+  const gid = String(cfg.gateway_id || "");
+  const mode = String(cfg.tariff_value_mode || "cost"); // cost | kwh
+  const view = String(cfg.display_mode || "donut"); // donut | bars | table
+  const rows = (tagRowsByGateway && typeof tagRowsByGateway === "object" && tagRowsByGateway[gid])
+    ? tagRowsByGateway[gid]
+    : [];
+
+  // Build {idx: {kwh, cost}} from the most recent value seen per
+  // insight.tariff_<N>_<metric> tag.
+  const items = (() => {
+    const latestByTag = {};
+    for (const r of rows || []) {
+      const tag = String(r?.tag_name || r?.tag || "");
+      if (!tag.startsWith("insight.tariff_")) continue;
+      const prev = latestByTag[tag];
+      const ts = String(r?.last_ts || r?.ts || "");
+      if (!prev || String(prev.ts || "") < ts) {
+        latestByTag[tag] = { ts, value: Number(r?.last_value ?? r?.value ?? 0) };
+      }
+    }
+    const byIdx = {};
+    for (const [tag, v] of Object.entries(latestByTag)) {
+      const m = tag.match(/^insight\.tariff_(\d+)_(kwh|cost_eur)$/);
+      if (!m) continue;
+      const idx = Number(m[1]);
+      if (!byIdx[idx]) byIdx[idx] = { idx, name: `Tariff ${idx}`, kwh: 0, cost: 0 };
+      if (m[2] === "kwh") byIdx[idx].kwh = Number(v.value || 0);
+      else byIdx[idx].cost = Number(v.value || 0);
+    }
+    // Optional name overrides supplied via cfg.tariff_names (operator
+    // names per index, 1-based). Otherwise default "Tariff N".
+    const overrides = (cfg.tariff_names && typeof cfg.tariff_names === "object") ? cfg.tariff_names : {};
+    const out = Object.values(byIdx).map((r) => ({ ...r, name: overrides[r.idx] || r.name }));
+    out.sort((a, b) => (mode === "cost" ? b.cost - a.cost : b.kwh - a.kwh));
+    return out;
+  })();
+
+  const totalKwh = items.reduce((s, r) => s + (Number(r.kwh) || 0), 0);
+  const totalCost = items.reduce((s, r) => s + (Number(r.cost) || 0), 0);
+
+  if (!items.length) {
+    return (
+      <div className="dashboard-widget-block" style={{ display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <span className="muted">No tariff data yet. Select a power meter gateway and ensure tariffs are configured.</span>
+      </div>
+    );
+  }
+
+  const palette = ["#16a34a", "#3b82f6", "#f59e0b", "#dc2626", "#a855f7", "#0ea5e9", "#22c55e"];
+
+  if (view === "table") {
+    return (
+      <div className="dashboard-widget-block" style={{ overflow: "auto" }}>
+        <table className="dashboard-energy-tariffs-table">
+          <thead>
+            <tr>
+              <th>Tariff</th>
+              <th>kWh</th>
+              <th>Cost (€)</th>
+              <th>Share</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((r, i) => {
+              const denom = mode === "cost" ? totalCost : totalKwh;
+              const pct = denom > 0 ? ((mode === "cost" ? r.cost : r.kwh) / denom) * 100 : 0;
+              return (
+                <tr key={`et-${r.idx}`}>
+                  <td>
+                    <span className="dashboard-et-swatch" style={{ background: palette[i % palette.length] }} />
+                    {r.name}
+                  </td>
+                  <td style={{ fontVariantNumeric: "tabular-nums" }}>{Number(r.kwh).toFixed(3)}</td>
+                  <td style={{ fontVariantNumeric: "tabular-nums" }}>€{Number(r.cost).toFixed(3)}</td>
+                  <td style={{ fontVariantNumeric: "tabular-nums" }}>{pct.toFixed(1)}%</td>
+                </tr>
+              );
+            })}
+            <tr className="dashboard-et-total">
+              <td><strong>Total</strong></td>
+              <td style={{ fontVariantNumeric: "tabular-nums" }}><strong>{totalKwh.toFixed(3)}</strong></td>
+              <td style={{ fontVariantNumeric: "tabular-nums" }}><strong>€{totalCost.toFixed(2)}</strong></td>
+              <td></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  if (view === "bars") {
+    return (
+      <div className="dashboard-widget-block" style={{ display: "flex", flexDirection: "column", gap: 6, padding: 8 }}>
+        {items.map((r, i) => {
+          const denom = mode === "cost" ? totalCost : totalKwh;
+          const v = mode === "cost" ? r.cost : r.kwh;
+          const pct = denom > 0 ? (v / denom) * 100 : 0;
+          return (
+            <div key={`et-bar-${r.idx}`} style={{ display: "grid", gridTemplateColumns: "minmax(70px, 1fr) 4fr auto", gap: 8, alignItems: "center" }}>
+              <span style={{ fontSize: 12 }} title={r.name}>{r.name}</span>
+              <div style={{ height: 12, background: "rgba(255,255,255,0.06)", borderRadius: 6, overflow: "hidden" }}>
+                <div style={{ width: `${Math.max(1.5, Math.min(100, pct))}%`, height: "100%", background: palette[i % palette.length] }} />
+              </div>
+              <span style={{ fontSize: 12, fontVariantNumeric: "tabular-nums", minWidth: 64, textAlign: "right" }}>
+                {mode === "cost" ? `€${v.toFixed(2)}` : `${v.toFixed(3)} kWh`}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
+  // Default: donut
+  const total = mode === "cost" ? totalCost : totalKwh;
+  return (
+    <div className="dashboard-widget-block" style={{ position: "relative" }}>
+      <ResponsiveContainer width="100%" height="100%" minHeight={160}>
+        <PieChart>
+          <Pie
+            data={items}
+            dataKey={mode === "cost" ? "cost" : "kwh"}
+            nameKey="name"
+            innerRadius="55%"
+            outerRadius="80%"
+            isAnimationActive={false}
+            paddingAngle={2}
+            label={false}
+          >
+            {items.map((_r, i) => (
+              <Cell key={`et-c-${i}`} fill={palette[i % palette.length]} />
+            ))}
+          </Pie>
+          <Tooltip formatter={(_v, _n, p) => {
+            const it = p?.payload || {};
+            const pct = total > 0 ? ((mode === "cost" ? it.cost : it.kwh) / total) * 100 : 0;
+            return mode === "cost"
+              ? [`€${Number(it.cost || 0).toFixed(2)} • ${Number(it.kwh || 0).toFixed(3)} kWh • ${pct.toFixed(1)}%`, it.name]
+              : [`${Number(it.kwh || 0).toFixed(3)} kWh • €${Number(it.cost || 0).toFixed(2)} • ${pct.toFixed(1)}%`, it.name];
+          }} />
+          <Legend verticalAlign="bottom" height={24} iconType="circle" wrapperStyle={{ fontSize: 11, paddingTop: 2 }} />
+        </PieChart>
+      </ResponsiveContainer>
+      <div style={{
+        position: "absolute", left: 0, right: 0, top: 0, bottom: 28,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        pointerEvents: "none",
+      }}>
+        <div style={{ fontSize: 20, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
+          {mode === "cost" ? `€${total.toFixed(2)}` : `${total.toFixed(3)} kWh`}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // =====================================================================

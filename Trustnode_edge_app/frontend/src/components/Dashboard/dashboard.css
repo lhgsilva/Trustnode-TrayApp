@@ -584,12 +584,55 @@
   line-height: 1;
   flex: 1;
   display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: center;
   text-align: center;
   min-height: 0;
+  white-space: nowrap;
 }
 
+/* Operator 2026-06-16: unit suffix sits inline with the value at
+   the same font size, weight and color — no muting, no scaling.
+   `display: inline` so the span never starts a new flex row when
+   the parent's flex container would otherwise stretch it. */
+.dashboard-kpi-unit {
+  display: inline;
+  margin-left: 0.25em;
+}
+
+/* Energy Tariffs widget (operator 2026-06-16) — table view. */
+.dashboard-energy-tariffs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.dashboard-energy-tariffs-table th,
+.dashboard-energy-tariffs-table td {
+  padding: 6px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--line, rgba(255,255,255,0.06));
+}
+.dashboard-energy-tariffs-table th {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted, #94a3b8);
+  font-weight: 600;
+}
+.dashboard-energy-tariffs-table .dashboard-et-total td {
+  border-top: 1px solid var(--stroke, rgba(255,255,255,0.12));
+  border-bottom: none;
+}
+.dashboard-et-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
 .dashboard-kpi-text {
   font-size: 20px;
   font-weight: 700;

@@ -67,6 +67,58 @@ if (process.platform === "win32") {
 // Electron shell couldn't bind to its port. Kill silently — if the
 // process truly belongs to a running instance, the singleton lock
 // below will pick that up. ONLY runs on Windows.
+// Probe whether <port> is currently bound on 127.0.0.1. We use this
+// after a kill sweep to make sure Windows fully released the socket
+// before we spawn the new backend (Windows TIME_WAIT can keep the
+// port "in use" for a few hundred ms after the owner exits).
+function isPortBoundSync(port, host = "127.0.0.1", timeoutMs = 250) {
+  return new Promise((resolve) => {
+    const sk = new net.Socket();
+    let done = false;
+    const finish = (bound) => { if (done) return; done = true; try { sk.destroy(); } catch (_) {} resolve(bound); };
+    sk.setTimeout(timeoutMs);
+    sk.once("connect", () => finish(true));
+    sk.once("timeout", () => finish(false));
+    sk.once("error", () => finish(false));
+    try { sk.connect(port, host); } catch (_) { finish(false); }
+  });
+}
+
+// Find PIDs listening on <port> via netstat. Returns an array of
+// numeric PIDs (deduped). Used to take down a zombie that taskkill
+// /IM missed because the exe was renamed or running under a wrapper.
+function findPidsListeningOnPort(port) {
+  if (process.platform !== "win32") return [];
+  try {
+    const out = execFileSync("netstat.exe", ["-ano", "-p", "TCP"], {
+      encoding: "utf8",
+      timeout: 3000,
+    });
+    const pids = new Set();
+    const portTok = `:${port}`;
+    for (const line of out.split(/\r?\n/)) {
+      if (!line.includes("LISTENING")) continue;
+      if (!line.includes(portTok)) continue;
+      const parts = line.trim().split(/\s+/);
+      const pid = parseInt(parts[parts.length - 1], 10);
+      if (Number.isFinite(pid) && pid > 0) pids.add(pid);
+    }
+    return Array.from(pids);
+  } catch (_) { return []; }
+}
+
+function killPidsHard(pids) {
+  if (process.platform !== "win32" || !pids.length) return;
+  for (const pid of pids) {
+    try {
+      execFileSync("taskkill.exe", ["/F", "/T", "/PID", String(pid)], {
+        stdio: ["ignore", "ignore", "ignore"],
+        timeout: 3000,
+      });
+    } catch (_) {}
+  }
+}
+
 function sweepStaleBackend() {
   if (process.platform !== "win32") return;
   // We can't reliably tell ours apart from someone else's, so this is
@@ -416,9 +468,13 @@ function killBackendImageNamesWindows() {
   const imageNames = ["trustnode-service.exe", "backend.exe"];
   for (const imageName of imageNames) {
     try {
-      spawn("taskkill", ["/IM", imageName, "/T", "/F"], {
+      // Synchronous so before-quit actually finishes the kill before
+      // Electron tears the process down. Async spawn was racing the
+      // event loop shutdown and leaving zombies behind.
+      execFileSync("taskkill.exe", ["/IM", imageName, "/T", "/F"], {
         windowsHide: true,
-        stdio: "ignore"
+        stdio: ["ignore", "ignore", "ignore"],
+        timeout: 3000,
       });
     } catch (_) {}
   }
@@ -439,6 +495,43 @@ async function startBackend() {
       logBackend("Sent stop-all to reused backend on startup.");
     } catch (_) {}
     return;
+  }
+
+  // Pre-spawn port check: if the target port is bound by an unowned
+  // process (e.g. a zombie trustnode-service.exe from a previous
+  // crash, or a Python dev server left behind), clear it. We already
+  // ran sweepStaleBackend() at boot, but that's name-based and misses
+  // renamed/wrapped processes — netstat-by-port catches whatever is
+  // actually holding the socket.
+  if (process.platform === "win32") {
+    const bound = await isPortBoundSync(currentBackendPort, currentBackendHost);
+    if (bound) {
+      const pids = findPidsListeningOnPort(currentBackendPort);
+      logBackend(`Port ${currentBackendPort} busy at spawn; pids=${pids.join(",") || "?"}; killing`);
+      killPidsHard(pids);
+      // Wait up to 3s for the OS to actually release the socket.
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        if (!(await isPortBoundSync(currentBackendPort, currentBackendHost))) break;
+      }
+      const stillBound = await isPortBoundSync(currentBackendPort, currentBackendHost);
+      if (stillBound) {
+        logBackend(`Port ${currentBackendPort} still bound after kill — backend spawn will likely fail`);
+        try {
+          dialog.showMessageBox({
+            type: "warning",
+            title: "TrustNode port is busy",
+            message: `Port ${currentBackendPort} is still in use after the cleanup attempt.`,
+            detail:
+              `Another process is holding port ${currentBackendPort} and we could not stop it (it may require admin rights).\n\n` +
+              `PIDs detected: ${pids.join(", ") || "(unknown)"}\n\n` +
+              "Open Task Manager → End Task on those PIDs, then relaunch TrustNode.",
+          });
+        } catch (_) {}
+      } else {
+        logBackend(`Port ${currentBackendPort} freed; proceeding with spawn`);
+      }
+    }
   }
 
   backendExited = false;
@@ -578,12 +671,21 @@ async function startBackend() {
 
 function stopBackend() {
   if (!backendProc || !ownsBackendProcess) return;
+  const pid = backendProc.pid;
   try {
-    if (process.platform === "win32" && backendProc.pid) {
-      spawn("taskkill", ["/PID", String(backendProc.pid), "/T", "/F"], {
-        windowsHide: true,
-        stdio: "ignore"
-      });
+    if (process.platform === "win32" && pid) {
+      // Synchronous so before-quit actually waits for the tree to die
+      // (the async spawn() variant would race the process exit).
+      try {
+        execFileSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+          windowsHide: true,
+          stdio: ["ignore", "ignore", "ignore"],
+          timeout: 3000,
+        });
+      } catch (_) {
+        // Fallback to async — better than nothing if execFileSync was blocked.
+        try { spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" }); } catch (_) {}
+      }
     } else {
       backendProc.kill("SIGTERM");
     }
@@ -1091,6 +1193,69 @@ async function gracefulShutdownAndQuit() {
   }, 1000);
 }
 
+// Operator 2026-06-17 (M11): cached LAN sharing state so the tray
+// menu can render the right submenu labels + the right URLs without
+// re-fetching on every right-click.
+let lanSharingState = {
+  enabled: false,
+  running: false,
+  bind_host: "127.0.0.1",
+  ips: [],
+  lite_urls: [],
+  port: 8000,
+  primary_port: 8000,
+  lan_port: 0,
+  candidates_tried: [],
+  note: "",
+  last_error: "",
+  restart_required: false,
+};
+
+async function refreshLanSharingState() {
+  try {
+    const fetch = global.fetch || (await import("node-fetch")).default;
+    const res = await fetch(`http://127.0.0.1:${currentBackendPort || BACKEND_PORT || 8000}/api/lan-sharing/status`, { method: "GET" });
+    if (res.ok) {
+      const body = await res.json();
+      // Merge — don't replace. Replacing dropped `candidates_tried`,
+      // `last_error`, etc. when the status route omitted them, which
+      // is why the error dialog said "Candidates tried: (none)".
+      lanSharingState = Object.assign({}, lanSharingState, body || {});
+    }
+  } catch (err) {
+    lanSharingState.last_error = `status fetch failed: ${err && err.message || err}`;
+  }
+}
+
+async function postLanSharing(action) {
+  const url = `http://127.0.0.1:${currentBackendPort || BACKEND_PORT || 8000}/api/lan-sharing/${action}`;
+  try {
+    const fetch = global.fetch || (await import("node-fetch")).default;
+    const res = await fetch(url, { method: "POST" });
+    const text = await res.text();
+    let body = {};
+    try { body = JSON.parse(text); } catch (_) { body = { _raw: text }; }
+    if (!res.ok) {
+      lanSharingState = Object.assign({}, lanSharingState, body || {}, {
+        last_error: `HTTP ${res.status}: ${(body && (body.detail || body.note)) || text.slice(0, 200)}`,
+      });
+      return null;
+    }
+    lanSharingState = Object.assign({}, lanSharingState, body || {});
+    // After enable, fetch fresh status so candidates_tried + last_error
+    // reflect the server's current view (the POST body returns the
+    // start() result, but status returns the LAN socket's authoritative
+    // state including any post-start failure).
+    if (action === "enable") {
+      await refreshLanSharingState();
+    }
+    return body || {};
+  } catch (err) {
+    lanSharingState.last_error = `request failed: ${err && err.message || err} (${url})`;
+    return null;
+  }
+}
+
 function createTray() {
   const iconPath = app.isPackaged
     ? path.join(process.resourcesPath, "trustnode_logo.ico")
@@ -1098,19 +1263,113 @@ function createTray() {
   const icon = nativeImage.createFromPath(iconPath);
   tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
   tray.setToolTip(APP_DISPLAY_NAME);
+  rebuildTrayMenu();
+  tray.on("double-click", () => {
+    if (mainWindow) mainWindow.show();
+  });
+  // Refresh sharing state when the menu is about to be shown so URLs /
+  // IPs stay current.
+  tray.on("right-click", async () => {
+    await refreshLanSharingState();
+    rebuildTrayMenu();
+    if (process.platform === "win32" && tray.popUpContextMenu) {
+      try { tray.popUpContextMenu(); } catch (_) {}
+    }
+  });
+  // First-time fetch so the menu is already populated.
+  setTimeout(() => { refreshLanSharingState().then(rebuildTrayMenu); }, 2000);
+}
+
+function rebuildTrayMenu() {
+  if (!tray) return;
+  // Build a per-URL submenu so the operator can click to copy.
+  const liteSubmenu = (lanSharingState.lite_urls || []).map((u) => ({
+    label: u,
+    click: () => {
+      try {
+        const { clipboard, shell } = require("electron");
+        clipboard.writeText(u);
+        // Soft confirm via shell.openExternal so the URL opens in a browser
+        // — useful if the operator is testing locally.
+        shell.openExternal(u).catch(() => {});
+      } catch (_) {}
+    }
+  }));
+  if (!liteSubmenu.length) {
+    liteSubmenu.push({ label: "(no LAN IPs detected)", enabled: false });
+  }
+  const lanSubmenu = [
+    {
+      label: lanSharingState.running
+        ? `LAN sharing: ON (port ${lanSharingState.lan_port || lanSharingState.port || 8000})`
+        : (lanSharingState.enabled ? "LAN sharing: bind failed" : "LAN sharing: OFF"),
+      enabled: false,
+    },
+    { type: "separator" },
+    {
+      label: "Turn ON",
+      enabled: !lanSharingState.running,
+      click: async () => {
+        await postLanSharing("enable");
+        // Give the backend ~300 ms to bind the second socket and
+        // surface the new IPs in /status before we re-render the menu.
+        await new Promise((r) => setTimeout(r, 300));
+        await refreshLanSharingState();
+        rebuildTrayMenu();
+        if (!lanSharingState.running) {
+          const { dialog: dlg } = require("electron");
+          const tried = (lanSharingState.candidates_tried || []).join(", ");
+          const err = lanSharingState.last_error || lanSharingState.note || "unknown error";
+          dlg.showMessageBox({
+            type: "warning",
+            title: "LAN sharing failed to start",
+            message: "LAN sharing could not bind to any candidate port.",
+            detail:
+              `Candidates tried: ${tried || "(none)"}\n\n` +
+              `Backend reported: ${err}\n\n` +
+              "Most common causes:\n" +
+              "  • Another process is already listening on those ports — close it and try again.\n" +
+              "  • Windows Firewall blocked the bind: allow this app on Private + Public networks.\n" +
+              "  • Antivirus / endpoint protection is in the way.",
+          });
+        } else {
+          // Print the actual URLs the operator should share.
+          const port = lanSharingState.lan_port || lanSharingState.port;
+          console.log(`LAN sharing live on port ${port}, URLs:`, lanSharingState.lite_urls);
+        }
+      }
+    },
+    {
+      label: "Turn OFF",
+      enabled: lanSharingState.running,
+      click: async () => {
+        await postLanSharing("disable");
+        await new Promise((r) => setTimeout(r, 200));
+        await refreshLanSharingState();
+        rebuildTrayMenu();
+      }
+    },
+    { type: "separator" },
+    {
+      label: "Lite URLs (click to copy + open):",
+      enabled: false,
+    },
+    ...liteSubmenu,
+  ];
 
   const menu = Menu.buildFromTemplate([
     {
       label: "Open",
-      click: () => {
-        if (mainWindow) mainWindow.show();
-      }
+      click: () => { if (mainWindow) mainWindow.show(); }
     },
     {
       label: "Hide",
-      click: () => {
-        if (mainWindow) mainWindow.hide();
-      }
+      click: () => { if (mainWindow) mainWindow.hide(); }
+    },
+    { type: "separator" },
+    {
+      label: "LAN Sharing",
+      submenu: lanSubmenu,
     },
     {
       label: "Restart Backend",
@@ -1122,16 +1381,15 @@ function createTray() {
     { type: "separator" },
     {
       label: "Exit",
-      click: async () => {
-        await gracefulShutdownAndQuit();
-      }
+      click: async () => { await gracefulShutdownAndQuit(); }
     }
   ]);
-
   tray.setContextMenu(menu);
-  tray.on("double-click", () => {
-    if (mainWindow) mainWindow.show();
-  });
+  // Update tooltip with the LAN status for at-a-glance state.
+  const tip = lanSharingState.enabled
+    ? `${APP_DISPLAY_NAME} | LAN sharing ON (${(lanSharingState.ips || []).join(", ") || "no IPs"})`
+    : `${APP_DISPLAY_NAME} | LAN sharing OFF`;
+  try { tray.setToolTip(tip); } catch (_) {}
 }
 
 app.whenReady().then(async () => {

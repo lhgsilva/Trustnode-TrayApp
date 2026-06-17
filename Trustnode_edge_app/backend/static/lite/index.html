@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TrustNode Local Lite</title>
+  <style>
+    /* Brand tokens copied from frontend/src/styles.css so the look stays
+       identical to the desktop Login. */
+    :root {
+      --brand: #1f3a5f;
+      --brand-strong: #0e8479;
+      --teal: #14a89a;
+      --teal-deep: var(--brand-strong);
+      --auth-control-h: 40px;
+      --auth-font-main: 16px;
+      --auth-font-label: 12px;
+    }
+    html[data-theme="light"] {
+      --bg-page: #eceff3;
+      --bg-card: #ffffff;
+      --bg-card-edge: rgba(15, 23, 42, 0.08);
+      --field-bg: #ffffff;
+      --field-bg-focus: #ffffff;
+      --ink: #0f172a;
+      --ink-muted: #475569;
+      --ink-soft: #64748b;
+      --line: rgba(15, 23, 42, 0.08);
+      --line-strong: rgba(15, 23, 42, 0.16);
+      --accent: var(--teal);
+      --shadow-card: 0 24px 60px -24px rgba(14, 17, 22, 0.20), 0 4px 14px -6px rgba(14, 17, 22, 0.10);
+    }
+    html[data-theme="dark"] {
+      --bg-page: #111111;
+      --bg-card: #171717;
+      --bg-card-edge: #2a2a2a;
+      --field-bg: #1f1f1f;
+      --field-bg-focus: #262626;
+      --ink: #fcfcfc;
+      --ink-muted: #c7c7c7;
+      --ink-soft: #b3b3b3;
+      --line: rgba(255, 255, 255, 0.08);
+      --line-strong: rgba(255, 255, 255, 0.16);
+      --accent: var(--teal);
+      --shadow-card: 0 30px 80px -20px rgba(0, 0, 0, 0.7), 0 8px 24px -8px rgba(0, 0, 0, 0.55);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    .lite-login-container {
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      background: var(--bg-page);
+      color: var(--ink);
+      padding: 16px;
+      transition: background-color 0.3s ease, color 0.3s ease;
+      font-family: 'Manrope', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .lite-auth-card {
+      width: 100%; max-width: 480px;
+      background: var(--bg-card);
+      border: 1px solid var(--bg-card-edge);
+      border-radius: 24px;
+      padding: 24px;
+      display: flex; flex-direction: column; gap: 14px;
+      position: relative;
+      box-shadow: var(--shadow-card);
+    }
+    .lite-theme-toggle-btn {
+      position: absolute; top: 20px; right: 20px;
+      background: none; border: none;
+      color: var(--ink-soft); cursor: pointer; padding: 8px;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .lite-theme-toggle-btn:hover { color: var(--accent); }
+    .lite-theme-toggle-btn svg { width: 20px; height: 20px; }
+    .lite-auth-brand {
+      display: flex; flex-direction: column; align-items: center; gap: 4px;
+      margin: 20px 0 24px 0; text-align: center;
+    }
+    .lite-auth-logo { width: 300px; height: 104px; object-fit: contain; }
+    .lite-auth-heading { font-size: 15px; font-weight: 700; letter-spacing: -0.02em; margin: 0; }
+    .lite-auth-subtitle { font-size: 11px; color: var(--ink-soft); line-height: 1.28; margin: 0 0 4px 0; }
+    .lite-auth-label { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; font-size: var(--auth-font-main); }
+    .lite-auth-label > span { font-size: var(--auth-font-label); font-weight: 700; color: var(--ink-muted); letter-spacing: 0.06em; text-transform: uppercase; }
+    .lite-auth-card input[type="text"] {
+      width: 100%; padding: 8px 12px;
+      border: 1px solid var(--line-strong); border-radius: 12px;
+      background: var(--bg-page); color: var(--ink);
+      font-size: var(--auth-font-main); height: var(--auth-control-h);
+      font-family: 'Manrope', inherit;
+    }
+    .lite-auth-card input[type="text"]:focus {
+      outline: none; border-color: var(--accent);
+      background: var(--field-bg-focus);
+      box-shadow: 0 0 0 4px rgba(1, 105, 204, 0.18);
+    }
+    .lite-btn-primary {
+      width: 100%;
+      background: linear-gradient(90deg, var(--brand) 0%, var(--teal-deep) 100%);
+      border: 1px solid color-mix(in srgb, var(--teal-deep) 72%, #000000 28%);
+      color: white; padding: 13px 16px; height: var(--auth-control-h);
+      border-radius: 12px; font-family: 'Manrope', inherit;
+      font-size: var(--auth-font-main); font-weight: 700;
+      cursor: pointer; margin-top: 14px;
+      box-shadow: 0 12px 28px -14px rgba(1, 105, 204, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+    }
+    .lite-btn-primary:disabled { opacity: 0.6; cursor: wait; }
+    .lite-auth-err {
+      background: rgba(226, 88, 93, 0.1); color: #ffd7d9;
+      padding: 11px 13px; border-radius: 10px; font-size: 12px;
+      border: 1px solid rgba(226, 88, 93, 0.25); margin-top: 10px; line-height: 1.4;
+    }
+    html[data-theme="light"] .lite-auth-err { color: #d1242f; }
+    .lite-loading { color: var(--ink-soft); font-size: 13px; text-align: center; margin: 14px 0 0; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+// Token exchange landing for the local Lite. Same brand identity as the
+// desktop Login; reads a view-link token from ?token=... OR the input
+// field, exchanges it via /api/lite-local/validate, stores the auth JWT
+// in localStorage exactly as if the user had logged in via the React
+// app's normal flow, then redirects to /lite/app/ where the React Lite
+// (same bundle deployed at trustnode.lsapps.app/lite/) takes over.
+
+const AUTH_TOKEN_KEY = "trustnode_auth_token";
+const LITE_JWT_KEY = "trustnode_lite_jwt";
+const THEME_KEY = "tn_lite_theme";
+
+function getTheme() {
+  try { return localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark"; } catch (_) { return "dark"; }
+}
+function applyTheme(t) {
+  const v = t === "light" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", v);
+  try { localStorage.setItem(THEME_KEY, v); } catch (_) {}
+}
+function themeIconSvg(t) {
+  if (t === "dark") return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"})[c]);
+}
+
+async function exchangeToken(token) {
+  const res = await fetch("/api/lite-local/validate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: String(token || "") }),
+  });
+  let body = {};
+  try { body = await res.json(); } catch (_) {}
+  if (!res.ok) {
+    throw new Error((body && (body.detail || body.error)) || `validate ${res.status}`);
+  }
+  return body;
+}
+
+function storeSession(body) {
+  try {
+    // The React Lite reads `trustnode_auth_token` as its Bearer JWT for
+    // every /api/* call — same key the desktop login uses.
+    if (body && body.auth_token) {
+      localStorage.setItem(AUTH_TOKEN_KEY, String(body.auth_token));
+    }
+    if (body && body.jwt) {
+      localStorage.setItem(LITE_JWT_KEY, String(body.jwt));
+    }
+  } catch (_) {}
+}
+
+function redirectToApp() {
+  // /lite/app/ is mounted to the React Lite bundle (frontend/dist).
+  window.location.replace("/lite/app/");
+}
+
+function render(state) {
+  applyTheme(getTheme());
+  const root = document.getElementById("root");
+  root.innerHTML = "";
+  const shell = document.createElement("div");
+  shell.className = "lite-login-container";
+  shell.innerHTML = `
+    <div class="lite-auth-card">
+      <button class="lite-theme-toggle-btn" id="theme-btn" type="button" aria-label="Toggle theme">${themeIconSvg(getTheme())}</button>
+      <div class="lite-auth-brand">
+        <img src="/lite/assets/trustenode-002.png" alt="TrustNode" class="lite-auth-logo" onerror="this.style.display='none'" />
+      </div>
+      <h2 class="lite-auth-heading">Enter your access token</h2>
+      <p class="lite-auth-subtitle">Paste the read-only token your edge administrator generated for you.</p>
+      <form id="tk-form" autocomplete="off">
+        <label class="lite-auth-label">
+          <span>Access token</span>
+          <input id="tk-in" type="text" placeholder="paste token here" autocomplete="off" spellcheck="false" />
+        </label>
+        ${state.error ? `<div class="lite-auth-err" role="alert">${escapeHtml(state.error)}</div>` : ""}
+        <button id="tk-go" type="submit" class="lite-btn-primary">${state.busy ? "Validating..." : "Open dashboard"}</button>
+        ${state.busy ? `<div class="lite-loading">Exchanging token...</div>` : ""}
+      </form>
+    </div>
+  `;
+  root.appendChild(shell);
+  const inp = document.getElementById("tk-in");
+  const form = document.getElementById("tk-form");
+  const btn = document.getElementById("tk-go");
+  if (state.busy) { btn.disabled = true; inp.disabled = true; }
+  inp.focus();
+  document.getElementById("theme-btn").addEventListener("click", () => {
+    const next = getTheme() === "dark" ? "light" : "dark";
+    applyTheme(next);
+    document.getElementById("theme-btn").innerHTML = themeIconSvg(next);
+  });
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const tok = inp.value.trim();
+    if (!tok) return;
+    render({ busy: true });
+    try {
+      const body = await exchangeToken(tok);
+      storeSession(body);
+      redirectToApp();
+    } catch (e) {
+      render({ error: String(e && e.message || e) });
+    }
+  });
+}
+
+(async function init() {
+  // If we already have a session in localStorage, jump straight to the React app.
+  try {
+    const existing = localStorage.getItem(AUTH_TOKEN_KEY);
+    if (existing) { redirectToApp(); return; }
+  } catch (_) {}
+  // ?token=... in URL → auto-exchange and redirect.
+  const u = new URL(window.location.href);
+  const t = u.searchParams.get("token");
+  if (t) {
+    render({ busy: true });
+    try {
+      const body = await exchangeToken(t);
+      storeSession(body);
+      redirectToApp();
+      return;
+    } catch (e) {
+      render({ error: String(e && e.message || e) });
+      return;
+    }
+  }
+  render({});
+})();
+</script>
+</body>
+</html>

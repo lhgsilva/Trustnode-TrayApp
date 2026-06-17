@@ -77,6 +77,7 @@ _bootstrap_env_from_dotenv()
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 
 from app.auth import decode_access_token
@@ -91,6 +92,10 @@ from app.routers.notifications import router as notifications_router
 from app.routers.telemetry_v1 import router as telemetry_v1_router
 from app.routers.power import router as power_router
 from app.routers.control_plane import router as control_plane_router, resolve_edge_view_link_public
+from app.routers.customer_db import router as customer_db_router
+from app.routers.lan_sharing import router as lan_sharing_router
+from app.routers.lite_local import router as lite_local_router
+from app.routers.connections import router as connections_router
 from app.routers.reports import router as reports_router
 from app.routers.cloud_live import router as cloud_live_router
 from app.routers.historian_export import router as historian_export_router
@@ -215,6 +220,56 @@ app.include_router(notifications_router)
 app.include_router(telemetry_v1_router)
 app.include_router(power_router)
 app.include_router(control_plane_router)
+# Operator 2026-06-17 (M2): Customer DB mode + connectivity surface.
+app.include_router(customer_db_router)
+# Operator 2026-06-17 (M6): LAN sharing toggle + endpoint discovery.
+app.include_router(lan_sharing_router)
+# Operator 2026-06-17 (M7): public-token-gated Local Lite API.
+app.include_router(lite_local_router)
+# Operator 2026-06-17 (Phase 3): outbound connections (OPC UA / MQTT).
+app.include_router(connections_router)
+
+# Operator 2026-06-17 (M7 → Phase 2 rewrite): serve the REAL React Lite
+# UI (same bundle deployed at trustnode.lsapps.app/lite/) at /lite/app/,
+# and a tiny landing page at /lite/ that turns a view-link token into
+# the same JWT the React Lite expects, then redirects.
+#
+# Layout served by the backend:
+#   GET /lite/                  → landing.html (token entry / exchange)
+#   GET /lite/app/              → React Lite SPA (frontend/dist)
+#   GET /lite/app/assets/...    → React Lite assets
+#   GET /lite/assets/...        → landing assets (logo)
+#   GET /api/lite-local/...     → token-validate + scoped data
+#
+# Both static trees survive PyInstaller's _MEIPASS layout.
+try:
+    import sys as _sys
+    _landing_candidates = [
+        Path(__file__).resolve().parent.parent / "static" / "lite",
+    ]
+    _react_candidates = [
+        Path(__file__).resolve().parent.parent.parent / "frontend" / "dist",
+        # Packaged Electron layout — frontend/dist sits under resources/.
+        Path(__file__).resolve().parent.parent.parent.parent / "frontend" / "dist",
+    ]
+    if hasattr(_sys, "_MEIPASS"):
+        _meipass = Path(getattr(_sys, "_MEIPASS"))
+        _landing_candidates.append(_meipass / "static" / "lite")
+        _react_candidates.append(_meipass / "frontend" / "dist")
+    # Mount the React Lite first (more specific path), then the landing
+    # at the parent so the deeper mount wins. FastAPI route resolution
+    # is order-sensitive only when paths overlap; nested static mounts
+    # are fine.
+    for _react_dir in _react_candidates:
+        if _react_dir.exists() and (_react_dir / "index.html").exists():
+            app.mount("/lite/app", StaticFiles(directory=str(_react_dir), html=True), name="lite_app")
+            break
+    for _landing_dir in _landing_candidates:
+        if _landing_dir.exists():
+            app.mount("/lite", StaticFiles(directory=str(_landing_dir), html=True), name="lite")
+            break
+except Exception:
+    pass
 
 
 # Public resolver for read-only Lite share links. Mounted directly on the
@@ -266,6 +321,55 @@ async def startup_event() -> None:
     # Start the report scheduler daemon (15s tick, idle when no schedules).
     try:
         report_scheduler.start()
+    except Exception:
+        pass
+    # Operator 2026-06-17: bring the in-process LAN socket up if the
+    # operator previously turned LAN sharing on. This replaces the
+    # old "restart backend" requirement — the second uvicorn server
+    # runs in a daemon thread alongside the primary 127.0.0.1 one.
+    try:
+        from app.services import lan_socket as _lan_socket
+        s = bootstrap.get("app_settings") if isinstance(bootstrap, dict) and isinstance(bootstrap.get("app_settings"), dict) else {}
+        if bool(s.get("lan_sharing_enabled")):
+            _lan_socket.sync_with_settings(True, int(settings.trustnode_port))
+    except Exception:
+        pass
+    # Operator 2026-06-17 (Phase 3): re-apply previously enabled OPC UA
+    # / MQTT toggles on boot, same pattern as LAN sharing. Lazy imports
+    # so a stripped-down build without asyncua/amqtt still boots fine.
+    try:
+        s = bootstrap.get("app_settings") if isinstance(bootstrap, dict) and isinstance(bootstrap.get("app_settings"), dict) else {}
+        conn = s.get("connections") if isinstance(s, dict) and isinstance(s.get("connections"), dict) else {}
+        if isinstance(conn.get("opcua"), dict) and bool(conn["opcua"].get("enabled")):
+            cfg = conn["opcua"]
+            rt = str(cfg.get("runtime") or "python").lower()
+            if rt == "native":
+                from app.services import opcua_server_dotnet as _opcua
+            else:
+                from app.services import opcua_server as _opcua
+            _opcua.start(
+                port=int(cfg.get("port") or 4840),
+                server_name=str(cfg.get("server_name") or "TrustNode Edge OPC UA"),
+                anonymous=bool(cfg.get("anonymous", True)),
+                username=str(cfg.get("username") or ""),
+                password=str(cfg.get("password") or ""),
+            )
+        if isinstance(conn.get("mqtt"), dict) and bool(conn["mqtt"].get("enabled")):
+            cfg = conn["mqtt"]
+            rt = str(cfg.get("runtime") or "python").lower()
+            if rt == "native":
+                from app.services import mqtt_broker_mosquitto as _mqtt
+            else:
+                from app.services import mqtt_broker as _mqtt
+            tenant = str(s.get("tenant_id") or "default")
+            edge = str(s.get("edge_id") or "edge-01")
+            _mqtt.start(
+                port=int(cfg.get("port") or 1883),
+                anonymous=bool(cfg.get("anonymous", True)),
+                username=str(cfg.get("username") or ""),
+                password=str(cfg.get("password") or ""),
+                tenant_id=tenant, edge_id=edge,
+            )
     except Exception:
         pass
     # Drains the Supabase `lite_report_requests` queue (Lite "Generate" button).
@@ -358,6 +462,24 @@ async def auth_middleware(request: Request, call_next):
     # view can scope its queries. No JWT/auth required by design.
     if request.url.path.startswith("/api/lite-view/resolve/"):
         return _apply_no_cache_headers(await call_next(request))
+    # Operator 2026-06-17 (M7): the Local Lite API does its own token
+    # check inside each handler — let traffic through here.
+    if request.url.path.startswith("/api/lite-local/"):
+        return _apply_no_cache_headers(await call_next(request))
+    # Operator 2026-06-17: LAN sharing toggle is operator-local — the
+    # tray process calls it from 127.0.0.1 without a JWT. Allow only
+    # loopback callers through; any LAN/remote caller still needs a
+    # Bearer token, so a curious user on the LAN cannot flip the
+    # toggle without being logged in. The LAN socket itself only
+    # binds 0.0.0.0 AFTER an authenticated/loopback enable, so this
+    # cannot be used to bootstrap from nothing.
+    if request.url.path.startswith("/api/lan-sharing/") or request.url.path.startswith("/api/connections/"):
+        try:
+            client_host = (request.client.host if request.client else "") or ""
+        except Exception:
+            client_host = ""
+        if client_host in ("127.0.0.1", "::1", "localhost"):
+            return _apply_no_cache_headers(await call_next(request))
     auth = request.headers.get("Authorization", "")
     token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""
     if not token:
