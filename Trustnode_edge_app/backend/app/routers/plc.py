@@ -1266,8 +1266,33 @@ async def stop_all_gateway_runtime() -> dict[str, str | bool]:
 def list_gateway_runtime_status(request: Request) -> list[dict]:
     statuses = plc_manager.list_gateway_statuses()
     try:
-        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
-        cfg_rows = bootstrap.get("gateway_configurations") if isinstance(bootstrap, dict) else []
+        # Operator 2026-06-18: the filter list of "allowed" gateway ids
+        # must read from the SAME scope the UI sees. The customer's real
+        # gateways are saved under the per-edge scoped doc (because
+        # gateway_configurations is in _SHARED_EDGE_DOMAINS); the
+        # unscoped get_bootstrap only contains the legacy "gw-primary"
+        # seed. That caused the running worker for gw-1779098315351 to
+        # be filtered OUT of /api/plc/gateways/status — the UI then
+        # painted "Stopped" even though the backend was actively
+        # collecting and writing to the historian.
+        #
+        # Try the user's resolved scope first; fall back to unscoped if
+        # scope resolution yields nothing.
+        cfg_rows: list = []
+        try:
+            from app.routers.app_store import _build_scope_key, _SHARED_EDGE_DOMAINS  # type: ignore
+            scope_key = _build_scope_key(request, domain="gateway_configurations")
+            if scope_key:
+                scoped = app_store.get_bootstrap_scoped(scope_key, prefer_cloud_reads=False) or {}
+                cand = scoped.get("gateway_configurations") if isinstance(scoped, dict) else None
+                if isinstance(cand, list):
+                    cfg_rows = cand
+        except Exception:
+            cfg_rows = []
+        if not cfg_rows:
+            bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+            cand = bootstrap.get("gateway_configurations") if isinstance(bootstrap, dict) else []
+            cfg_rows = cand if isinstance(cand, list) else []
         allowed_ids = {
             str(row.get("id") or "").strip()
             for row in (cfg_rows or [])
