@@ -710,6 +710,97 @@ class ControlPlaneStore:
                 conn.commit()
                 return int(cur.rowcount or 0) > 0
 
+    # ----- Workspace export / import (operator 2026-06-18) -----
+    # These are the minimum tables needed to reproduce an activated edge
+    # after a full reinstall: the edge row itself, its license, the
+    # license's modules, and the activation-code receipt. Customers WERE
+    # losing all of this on "delete everything + reinstall" — these helpers
+    # let the tray's Settings → Export Workspace endpoint capture them as
+    # JSON so re-import skips the activation round-trip entirely.
+
+    def export_activation_state(self) -> dict[str, Any]:
+        """Dump the activation-relevant rows as serialisable JSON.
+
+        Caller is expected to be an admin; routing layer enforces auth.
+        Returns {} if the DB is empty (fresh install with no activation).
+        """
+        out: dict[str, Any] = {
+            "format_version": 1,
+            "edges": [],
+            "licenses": [],
+            "license_modules": [],
+            "activation_codes": [],
+        }
+        with self._lock:
+            with self._connect() as conn:
+                for row in conn.execute("SELECT * FROM cp_edges").fetchall():
+                    out["edges"].append({k: row[k] for k in row.keys()})
+                for row in conn.execute("SELECT * FROM cp_licenses").fetchall():
+                    out["licenses"].append({k: row[k] for k in row.keys()})
+                for row in conn.execute("SELECT * FROM cp_license_modules").fetchall():
+                    out["license_modules"].append({k: row[k] for k in row.keys()})
+                for row in conn.execute("SELECT * FROM cp_edge_activation_codes").fetchall():
+                    out["activation_codes"].append({k: row[k] for k in row.keys()})
+        return out
+
+    def import_activation_state(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Restore the activation rows from a workspace export.
+
+        Idempotent: uses INSERT OR REPLACE on the natural primary keys so
+        re-importing the same workspace is safe. Tables with autoincrement
+        keys (cp_license_modules) drop their `id` column on import so the
+        local autoincrement assigns fresh ids without colliding.
+        """
+        if not isinstance(payload, dict):
+            return {"ok": False, "reason": "payload not a dict"}
+        applied = {"edges": 0, "licenses": 0, "license_modules": 0, "activation_codes": 0}
+        with self._lock:
+            with self._connect() as conn:
+                for r in (payload.get("edges") or []):
+                    if not isinstance(r, dict) or not r.get("edge_id"):
+                        continue
+                    cols = list(r.keys())
+                    qmarks = ",".join(["?"] * len(cols))
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO cp_edges ({','.join(cols)}) VALUES ({qmarks})",
+                        tuple(r[c] for c in cols),
+                    )
+                    applied["edges"] += 1
+                for r in (payload.get("licenses") or []):
+                    if not isinstance(r, dict) or not r.get("license_id"):
+                        continue
+                    cols = list(r.keys())
+                    qmarks = ",".join(["?"] * len(cols))
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO cp_licenses ({','.join(cols)}) VALUES ({qmarks})",
+                        tuple(r[c] for c in cols),
+                    )
+                    applied["licenses"] += 1
+                for r in (payload.get("license_modules") or []):
+                    if not isinstance(r, dict) or not r.get("license_id") or not r.get("module_key"):
+                        continue
+                    # Strip the autoincrement primary key so we don't collide.
+                    rec = {k: v for k, v in r.items() if k != "id"}
+                    cols = list(rec.keys())
+                    qmarks = ",".join(["?"] * len(cols))
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO cp_license_modules ({','.join(cols)}) VALUES ({qmarks})",
+                        tuple(rec[c] for c in cols),
+                    )
+                    applied["license_modules"] += 1
+                for r in (payload.get("activation_codes") or []):
+                    if not isinstance(r, dict) or not r.get("code_hash"):
+                        continue
+                    cols = list(r.keys())
+                    qmarks = ",".join(["?"] * len(cols))
+                    conn.execute(
+                        f"INSERT OR REPLACE INTO cp_edge_activation_codes ({','.join(cols)}) VALUES ({qmarks})",
+                        tuple(r[c] for c in cols),
+                    )
+                    applied["activation_codes"] += 1
+                conn.commit()
+        return {"ok": True, "applied": applied}
+
     # ----- Read-only Client View share links -----
     # A "view link" is a long random URL token that grants read-only access
     # to a single edge's Lite app without requiring a login. Used by master

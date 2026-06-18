@@ -125,21 +125,29 @@ DEFAULT_POWER_CONFIG: dict[str, Any] = {
 
 class PowerManager:
     def __init__(self, app_store: Any) -> None:
+        # Operator 2026-06-18 (boot fix): __init__ must NOT block on the
+        # SQLite app_store lock. The customer's "service did not start"
+        # failure was traced to this: AppStore.__init__ kicks off ~5
+        # background threads (deferred outbox-init, cloud config sync,
+        # live-sync, cloud-live cache, retention scheduler) that ALL
+        # acquire app_store._lock. On a machine with a slow cloud HTTP
+        # call mid-sync the lock was held >90s, so the original
+        # __init__ call to app_store.get_bootstrap() hung past the
+        # tray's startup grace window — no diagnostic survived because
+        # we never reached the "PowerManager ready" print.
+        #
+        # New design: __init__ does ZERO app_store I/O. Config is loaded
+        # lazily on first read AND on the background _run_loop's first
+        # tick. Boot stays linear and fast even on slow machines.
         self._app_store = app_store
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="tn-power-manager")
         self._writer_stop = threading.Event()
         self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True, name="tn-power-writer")
-        self._config: dict[str, Any] = self._load_config()
-        # Manual-start safety default: keep power gateways stopped after app boot.
-        # Existing deployments can opt back into auto-start with TRUSTNODE_POWER_AUTO_START=1.
-        if str(os.environ.get("TRUSTNODE_POWER_AUTO_START", "0") or "0").strip().lower() not in {"1", "true", "yes", "on"}:
-            self._config = self._force_stopped_config(self._config)
-            try:
-                self._app_store.upsert_domain("power_management_config", self._config, actor="system")
-            except Exception:
-                pass
+        # Provisional config — the real config is loaded lazily.
+        self._config: dict[str, Any] = self._deep_copy(DEFAULT_POWER_CONFIG)
+        self._config_loaded = False
         self._clients: dict[str, ModbusTcpClient] = {}
         self._last_samples: dict[str, dict[str, Any]] = {}
         self._status_by_device: dict[str, dict[str, Any]] = {}
@@ -154,6 +162,30 @@ class PowerManager:
         self._writer_batches = 0
         self._thread.start()
         self._writer_thread.start()
+
+    def _ensure_config_loaded(self) -> dict[str, Any]:
+        """Idempotent lazy loader. Safe to call from any thread. Returns
+        the loaded config. Falls back to DEFAULT_POWER_CONFIG if app_store
+        is still locked or unreachable — caller always gets a usable dict.
+        """
+        if self._config_loaded:
+            return self._config
+        try:
+            cfg = self._load_config()
+        except Exception:
+            cfg = self._deep_copy(DEFAULT_POWER_CONFIG)
+        # Apply the manual-start-safety policy (same logic that used to
+        # live in __init__). We only force-stop ONCE per process.
+        if str(os.environ.get("TRUSTNODE_POWER_AUTO_START", "0") or "0").strip().lower() not in {"1", "true", "yes", "on"}:
+            cfg = self._force_stopped_config(cfg)
+            try:
+                self._app_store.upsert_domain("power_management_config", cfg, actor="system")
+            except Exception:
+                pass
+        with self._lock:
+            self._config = cfg
+            self._config_loaded = True
+        return cfg
 
     @staticmethod
     def _utc_now() -> str:
@@ -426,6 +458,15 @@ class PowerManager:
             return self._deep_copy(DEFAULT_POWER_CONFIG)
 
     def get_config(self) -> dict[str, Any]:
+        # Lazy-load on first read so HTTP routes called before the
+        # _run_loop's first tick still see the persisted config (not
+        # the provisional DEFAULT_POWER_CONFIG seed). Best-effort —
+        # falls back to the provisional default if app_store is locked.
+        if not self._config_loaded:
+            try:
+                self._ensure_config_loaded()
+            except Exception:
+                pass
         with self._lock:
             return self._deep_copy(self._config)
 
@@ -1461,8 +1502,15 @@ class PowerManager:
             th.start()
 
     def _run_loop(self) -> None:
+        # First tick: lazily load the real config. Safe even if it blocks
+        # on the app_store lock — we're in our own thread, not the boot
+        # critical path. Retried each tick until it succeeds so a slow
+        # cloud sync at startup just delays power management coming up
+        # without blocking the whole backend.
         while not self._stop.is_set():
             try:
+                if not self._config_loaded:
+                    self._ensure_config_loaded()
                 self._reconcile_workers()
             except Exception:
                 pass
