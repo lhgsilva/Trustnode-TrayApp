@@ -4709,68 +4709,49 @@ class AppStore:
         if not skey:
             return self.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
         out = self.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
-        # Operator 2026-06-18: READ-ONLY per-domain fallback. The
-        # customer's data may live under a scope key whose
-        # (tenant, customer, edge) triple differs from the running
-        # app's resolved scope (an EXE update may have flipped the
-        # tenant or edge id). Strategy:
-        #   1. For the REQUESTED scope, read every domain — that data
-        #      always wins.
-        #   2. For each MISSING / empty domain, fall back to the LARGEST
-        #      non-empty payload in the same SQLite where the scope
-        #      key contains the same customer_id. We use byte-length as
-        #      the richness signal because it correlates with operator
-        #      effort and is cheap to compute via SQLite's length().
-        #
-        # SQLite is read-only throughout. No INSERT, UPDATE, DELETE.
+        # Legacy-key fallback: edges activated before linked_customer_id was
+        # threaded into edge_profile saved scoped docs under
+        # `tenant|-|edge` (2-segment). After the fix the running EXE
+        # resolves scope to `tenant|customer|edge` (3-segment) and an
+        # otherwise-unmigrated install would see empty arrays for the
+        # picker dropdowns. Probe both and overlay so the operator never
+        # loses data because of a scope-key shape change.
+        legacy_skey = ""
         parts = skey.split("|")
-        customer_id = parts[1] if len(parts) >= 2 else ""
+        if len(parts) >= 3 and parts[1] and parts[1] != "-":
+            # 3-segment shared scope: legacy is the same with '-' for customer.
+            legacy_skey = "|".join([parts[0], "-", *parts[2:]])
+        candidate_keys = [skey]
+        if legacy_skey and legacy_skey != skey:
+            # Read legacy FIRST so the current-scope row overlays it.
+            candidate_keys.insert(0, legacy_skey)
+        # Operator 2026-06-18: cross-tenant fallback. The same (customer,
+        # edge) may have data saved under tenant 'default' from an
+        # earlier session before activation upgraded the tenant id to
+        # tenant-customer style. Try that scope FIRST so the customer
+        # sees their existing gateway/device/db configs after an update
+        # without modifying any saved state. The requested scope, when
+        # populated, still overlays the fallback at the end.
+        if len(parts) >= 3 and parts[0] and parts[0] != "default" and parts[1] and parts[1] != "-":
+            cross_tenant_skey = "|".join(["default", *parts[1:]])
+            if cross_tenant_skey != skey and cross_tenant_skey not in candidate_keys:
+                candidate_keys.insert(0, cross_tenant_skey)
         with self._lock:
             with self._connect() as conn:
-                # Step 1: load the requested-scope rows first.
-                seen_domains: set[str] = set()
-                rows = conn.execute(
-                    "SELECT domain, payload_json FROM config_documents_scoped WHERE scope_key = ?",
-                    (skey,),
-                ).fetchall()
-                for row in rows:
-                    domain = str(row["domain"] or "").strip()
-                    if not domain:
-                        continue
-                    payload_text = str(row["payload_json"] or "null")
-                    try:
-                        parsed = json.loads(payload_text)
-                    except Exception:
-                        parsed = None
-                    if parsed in (None, [], {}):
-                        continue
-                    out[domain] = parsed
-                    seen_domains.add(domain)
-                # Step 2: for each domain we haven't satisfied yet,
-                # find the largest non-trivial payload across every
-                # scope whose key contains this customer_id.
-                if customer_id and customer_id != "-":
-                    like_pat = f"%|{customer_id}|%"
-                    domain_rows = conn.execute(
-                        "SELECT domain, payload_json, length(payload_json) AS L "
-                        "FROM config_documents_scoped WHERE scope_key LIKE ? "
-                        "AND length(payload_json) > 4 "
-                        "ORDER BY domain, length(payload_json) DESC",
-                        (like_pat,),
+                for k in candidate_keys:
+                    rows = conn.execute(
+                        "SELECT domain, payload_json FROM config_documents_scoped WHERE scope_key = ?",
+                        (k,),
                     ).fetchall()
-                    for row in domain_rows:
+                    for row in rows:
                         domain = str(row["domain"] or "").strip()
-                        if not domain or domain in seen_domains:
+                        if not domain:
                             continue
                         payload_text = str(row["payload_json"] or "null")
                         try:
-                            parsed = json.loads(payload_text)
+                            out[domain] = json.loads(payload_text)
                         except Exception:
-                            continue
-                        if parsed in (None, [], {}):
-                            continue
-                        out[domain] = parsed
-                        seen_domains.add(domain)
+                            out[domain] = None
         if isinstance(out.get("metadata"), dict):
             out["metadata"]["scope_key"] = skey
         return out
