@@ -473,7 +473,98 @@ class AppStore:
             safe = f"edge-{safe}"
         return safe[:64]
 
+    def _find_richest_existing_edge_scope(self, conn: sqlite3.Connection) -> tuple[str, str, str] | None:
+        """Operator 2026-06-18 (data-loss fix): when this edge starts up
+        with a stale or empty edge_id, scan config_documents_scoped for
+        ANY existing scope-key whose (tenant, customer, edge) triple
+        carries real data for the SHARED edge domains (devices,
+        gateway_configurations, triggers_limits, etc.).
+
+        Returns (tenant_id, customer_id, edge_id) of the richest such
+        scope, or None if no usable existing data was found. The caller
+        adopts that edge_id so the customer sees their existing
+        configuration instead of an empty workspace.
+
+        Without this, a customer with months of configured gateways +
+        devices + triggers had them silently invisibilized whenever the
+        edge_id flipped (activation refresh, hostname change, schema
+        migration) — the data was still in SQLite at the OLD scope key
+        but the running app only looked at the NEW scope key.
+        """
+        try:
+            # Tally bytes-of-data per scope_key for the shared domains
+            # that matter. We weight gateway_configurations + devices +
+            # triggers_limits the heaviest — those are the ones whose
+            # loss the customer notices first.
+            shared_domains = (
+                "gateway_configurations",
+                "devices",
+                "triggers_limits",
+                "alarms_setup",
+                "database_configurations",
+                "power_management_config",
+                "reporting_setup",
+                "users_access",
+                "dashboard_configurations",
+            )
+            placeholders = ",".join(["?"] * len(shared_domains))
+            rows = conn.execute(
+                f"""
+                SELECT scope_key, domain, length(payload_json) AS bytes
+                FROM config_documents_scoped
+                WHERE domain IN ({placeholders})
+                """,
+                shared_domains,
+            ).fetchall()
+            weights = {
+                "gateway_configurations": 4.0,
+                "devices":                4.0,
+                "triggers_limits":        3.0,
+                "alarms_setup":           2.0,
+                "dashboard_configurations": 2.0,
+                "users_access":           2.0,
+                "database_configurations": 1.0,
+                "power_management_config": 1.0,
+                "reporting_setup":        1.0,
+            }
+            score_by_scope: dict[str, float] = {}
+            for row in rows:
+                skey = str(row["scope_key"] or "")
+                domain = str(row["domain"] or "")
+                # Skip user-scoped rows (4-segment); only consider
+                # shared (3-segment) scope keys here.
+                if skey.count("|") != 2:
+                    continue
+                # An empty-array payload is "[]" (2 bytes) or "{}" — skip
+                # those so a fresh-default doesn't out-rank real data.
+                b = int(row["bytes"] or 0)
+                if b <= 4:
+                    continue
+                score_by_scope[skey] = score_by_scope.get(skey, 0.0) + (b * weights.get(domain, 1.0))
+            if not score_by_scope:
+                return None
+            best_scope = max(score_by_scope.items(), key=lambda kv: kv[1])[0]
+            parts = best_scope.split("|")
+            if len(parts) != 3:
+                return None
+            return parts[0], parts[1], parts[2]
+        except Exception:
+            return None
+
     def _ensure_local_edge_profile(self) -> None:
+        """Set edge_id on first run. CRITICAL: never silently REPLACE
+        an existing edge_id, because the per-edge scope_key carries
+        every device / gateway / trigger / alarm config — flipping the
+        id strands the customer's data at the old scope. Three cases:
+
+          1. edge_id already set to a real (non-'edge-01') id → keep it.
+          2. edge_id absent or equals the legacy 'edge-01' AND the
+             SQLite already holds shared-edge data under some other
+             edge_id → ADOPT that existing edge_id so the customer's
+             data becomes visible at the new scope.
+          3. Empty DB (truly first run, no prior data) → set
+             edge_id to self._local_edge_id (hostname-derived).
+        """
         now = self._utc_now()
         with self._lock:
             with self._connect() as conn:
@@ -495,10 +586,35 @@ class AppStore:
                 if not isinstance(edge_profile, dict):
                     edge_profile = {}
                 current_edge_id = str(edge_profile.get("edge_id") or "").strip()
+                # Case 1: a real edge_id is already locked in. Never replace it.
                 if current_edge_id and current_edge_id != "edge-01":
                     return
-                edge_profile["edge_id"] = self._local_edge_id
-                edge_profile["edge_name"] = str(edge_profile.get("edge_name") or self._local_edge_id)
+                # Case 2: try to recover the customer's existing data by
+                # adopting whichever edge_id the SQLite already holds the
+                # richest shared-config for.
+                adopted: tuple[str, str, str] | None = self._find_richest_existing_edge_scope(conn)
+                if adopted:
+                    adopted_tenant, adopted_customer, adopted_edge = adopted
+                    try:
+                        print(
+                            f"[trustnode][boot] adopting existing edge_id={adopted_edge!r} "
+                            f"(tenant={adopted_tenant!r} customer={adopted_customer!r}) "
+                            f"so prior gateway/device/trigger data stays visible",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+                    edge_profile["edge_id"] = adopted_edge
+                    # Mirror customer_id into the canonical fields so
+                    # _build_scope_key resolves to the same scope.
+                    if adopted_customer and adopted_customer != "-":
+                        edge_profile["linked_customer_id"] = adopted_customer
+                        if not payload.get("customer_id"):
+                            payload["customer_id"] = adopted_customer
+                # Case 3: empty DB — first-ever boot. Use hostname id.
+                else:
+                    edge_profile["edge_id"] = self._local_edge_id
+                edge_profile["edge_name"] = str(edge_profile.get("edge_name") or edge_profile["edge_id"])
                 edge_profile["description"] = str(edge_profile.get("description") or "")
                 edge_profile["location"] = str(edge_profile.get("location") or "")
                 edge_profile["machine_group"] = str(edge_profile.get("machine_group") or "")
