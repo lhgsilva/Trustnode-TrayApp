@@ -148,6 +148,10 @@ import {
   testCustomerDbConnection,
   activateCustomerDb,
   deactivateCustomerDb,
+  // Operator 2026-06-18: workspace export/import — data-safety net for
+  // updates and reinstalls. Backed by /api/workspace/* on the edge.
+  exportWorkspace,
+  importWorkspace,
 } from "./api";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, ComposedChart, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
@@ -3714,6 +3718,15 @@ function AppShell() {
   const [cleanupResult, setCleanupResult] = useState("");
   const [retentionResultScope, setRetentionResultScope] = useState("global");
   const [cleanupResultScope, setCleanupResultScope] = useState("global");
+  // Operator 2026-06-18: workspace panel state (Backup and Retention page).
+  // `workspaceInfo` mirrors what the tray's workspace_detector found at
+  // boot; `workspaceBusy` and `workspaceResult` track the export/import/
+  // reset operations from the UI. resetConfirmText holds the live value
+  // of the "type DELETE" input so the button only enables on exact match.
+  const [workspaceInfo, setWorkspaceInfo] = useState({ current: "", detected: [] });
+  const [workspaceBusy, setWorkspaceBusy] = useState(false);
+  const [workspaceResult, setWorkspaceResult] = useState("");
+  const [workspaceResetText, setWorkspaceResetText] = useState("");
   const [emailSettings, setEmailSettings] = useState({
     transport: "smtp",
     host: "",
@@ -15566,6 +15579,147 @@ const getGatewayHealth = (gateway) => {
     );
   };
 
+  // Operator 2026-06-18: workspace export/import/reset handlers.
+  // Three operations:
+  //   refreshWorkspaceInfo — read what the tray's workspace_detector
+  //     found at boot (current + other detected workspaces). Best-effort:
+  //     when running under Electron we have IPC; in the cloud portal
+  //     (no Electron) we just hide the panel.
+  //   exportWorkspaceToFile — calls /api/workspace/export, triggers a
+  //     browser download of the JSON blob.
+  //   importWorkspaceFromFile — reads a .json from the user, POSTs to
+  //     /api/workspace/import.
+  //   resetWorkspaceAndRelaunch — IPC to the tray; the tray confirms
+  //     the "DELETE" token, renames the live DB out of the way, and
+  //     calls app.relaunch.
+  const refreshWorkspaceInfo = async () => {
+    try {
+      let current = "";
+      let detected = [];
+      if (window?.trustnodeWorkspace?.current) {
+        try {
+          const c = await window.trustnodeWorkspace.current();
+          current = String(c?.dataDir || "");
+        } catch (_) {}
+      }
+      if (window?.trustnodeWorkspace?.detect) {
+        try {
+          const d = await window.trustnodeWorkspace.detect();
+          if (d?.ok && Array.isArray(d?.workspaces)) detected = d.workspaces;
+        } catch (_) {}
+      }
+      setWorkspaceInfo({ current, detected });
+    } catch (_) {
+      setWorkspaceInfo({ current: "", detected: [] });
+    }
+  };
+
+  const exportWorkspaceToFile = async () => {
+    if (currentUser?.role !== "admin") {
+      setWorkspaceResult("Only admin can export the workspace.");
+      return;
+    }
+    setWorkspaceBusy(true);
+    setWorkspaceResult("");
+    try {
+      const blob = await exportWorkspace();
+      const json = JSON.stringify(blob, null, 2);
+      const file = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(file);
+      const a = document.createElement("a");
+      const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      a.href = url;
+      a.download = `trustnode-workspace-${ts}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      const domainCount = Object.keys(blob?.domains || {}).length;
+      setWorkspaceResult(`Exported ${domainCount} configuration domains + license activation. Keep this file safe.`);
+    } catch (err) {
+      setWorkspaceResult(`Export failed: ${String(err)}`);
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  };
+
+  const importWorkspaceFromFile = async (file) => {
+    if (currentUser?.role !== "admin") {
+      setWorkspaceResult("Only admin can import a workspace.");
+      return;
+    }
+    if (!file) return;
+    setWorkspaceBusy(true);
+    setWorkspaceResult("");
+    try {
+      const text = await file.text();
+      let payload;
+      try {
+        payload = JSON.parse(text);
+      } catch (_) {
+        throw new Error("File is not valid JSON");
+      }
+      if (String(payload?.format) !== "trustnode.workspace") {
+        throw new Error("Not a TrustNode workspace export");
+      }
+      // Note: withConfirm has no onCancel hook, so we clear workspaceBusy
+      // here BEFORE prompting; the confirm callback re-asserts it. If the
+      // user cancels we already exited the busy state.
+      setWorkspaceBusy(false);
+      withConfirm(
+        "Import Workspace",
+        `This will replace your current configuration with the contents of ${file.name}. Continue?`,
+        async () => {
+          setWorkspaceBusy(true);
+          try {
+            const res = await importWorkspace(payload);
+            const applied = (res?.applied || []).length;
+            const skipped = (res?.skipped || []).length;
+            const failed = Object.keys(res?.failed || {}).length;
+            const lic = res?.license_applied ? " License re-applied." : "";
+            setWorkspaceResult(`Imported ${applied} domains (${skipped} skipped, ${failed} failed).${lic} Reload the page to see the new configuration.`);
+          } catch (err) {
+            setWorkspaceResult(`Import failed: ${String(err)}`);
+          } finally {
+            setWorkspaceBusy(false);
+          }
+        },
+      );
+    } catch (err) {
+      setWorkspaceResult(`Import failed: ${String(err)}`);
+      setWorkspaceBusy(false);
+    }
+  };
+
+  const resetWorkspaceAndRelaunch = async () => {
+    if (currentUser?.role !== "admin") {
+      setWorkspaceResult("Only admin can reset the workspace.");
+      return;
+    }
+    if (workspaceResetText !== "DELETE") {
+      setWorkspaceResult('Type "DELETE" exactly to confirm.');
+      return;
+    }
+    if (!window?.trustnodeWorkspace?.reset) {
+      setWorkspaceResult("Workspace reset is only available in the desktop app.");
+      return;
+    }
+    setWorkspaceBusy(true);
+    setWorkspaceResult("");
+    try {
+      const res = await window.trustnodeWorkspace.reset("DELETE");
+      if (res?.ok) {
+        setWorkspaceResult(`Workspace cleared (backup at ${res?.backupPath || "(not created)"}). The app will relaunch...`);
+      } else {
+        setWorkspaceResult(`Reset failed: ${res?.error || "unknown error"}`);
+        setWorkspaceBusy(false);
+      }
+    } catch (err) {
+      setWorkspaceResult(`Reset failed: ${String(err)}`);
+      setWorkspaceBusy(false);
+    }
+  };
+
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (!["database", "database_overview", "database_inspector"].includes(activePage)) return;
@@ -15587,6 +15741,14 @@ const getGatewayHealth = (gateway) => {
       clearInterval(timer);
     };
   }, [activePage, appStoreHydrated, endpointVersion]);
+
+  // Operator 2026-06-18: refresh the workspace card whenever the user
+  // lands on Backup and Retention. Cheap (single IPC + single file
+  // stat per known data path) so we don't bother throttling.
+  useEffect(() => {
+    if (activePage !== "backup_and_retention") return;
+    refreshWorkspaceInfo();
+  }, [activePage]);
 
   const makeTagKey = (gatewayId, tagName) => `${String(gatewayId || "")}::${String(tagName || "").trim()}`;
 
@@ -21123,6 +21285,112 @@ const getGatewayHealth = (gateway) => {
                   ) : null}
                 </div>
               </section>
+              {/* Operator 2026-06-18: Workspace card. Exposes the
+                  data-safety primitives the customer can run without
+                  filesystem access: export the whole config + license
+                  to a JSON file, import a previously-exported file, and
+                  (last resort) reset the workspace via the tray IPC.
+                  The Workspace Detector at boot is what most customers
+                  will actually use; this card is for the "I want a
+                  backup before I touch anything" case and for support. */}
+              <section className="card">
+                <h3 className="card-title">Workspace</h3>
+                <p className="muted" style={{ marginTop: 0 }}>
+                  Your workspace holds users, dashboards, gateway
+                  configurations, alarms, report templates and the
+                  license activation. Use these tools to back it up
+                  before updates or to migrate to another machine.
+                </p>
+                {workspaceInfo.current ? (
+                  <div className="info-note" style={{ marginBottom: 10 }}>
+                    <strong>Active workspace:</strong> <code>{workspaceInfo.current}</code>
+                  </div>
+                ) : null}
+                {workspaceInfo.detected.length > 1 ? (
+                  <div className="info-note" style={{ marginBottom: 10 }}>
+                    <strong>Other workspaces detected ({workspaceInfo.detected.length - 1}):</strong>
+                    <ul style={{ margin: "6px 0 0 18px", padding: 0 }}>
+                      {workspaceInfo.detected
+                        .filter((w) => String(w.dir) !== String(workspaceInfo.current))
+                        .map((w) => (
+                          <li key={w.dir}><code>{w.dir}</code> — {w.sizeMb} MB</li>
+                        ))}
+                    </ul>
+                  </div>
+                ) : null}
+                <div className="cleanup-card-row" style={{ gap: 8, flexWrap: "wrap" }}>
+                  <button
+                    className="btn btn-primary"
+                    onClick={exportWorkspaceToFile}
+                    disabled={currentUser?.role !== "admin" || workspaceBusy}
+                  >
+                    {workspaceBusy ? "Working..." : "Export Workspace"}
+                  </button>
+                  <label
+                    className="btn btn-primary"
+                    style={{
+                      opacity: (currentUser?.role !== "admin" || workspaceBusy) ? 0.5 : 1,
+                      pointerEvents: (currentUser?.role !== "admin" || workspaceBusy) ? "none" : "auto",
+                      cursor: (currentUser?.role !== "admin" || workspaceBusy) ? "not-allowed" : "pointer",
+                    }}
+                  >
+                    Import Workspace
+                    <input
+                      type="file"
+                      accept="application/json,.json"
+                      style={{ display: "none" }}
+                      onChange={(e) => {
+                        const f = e.target.files && e.target.files[0];
+                        if (f) importWorkspaceFromFile(f);
+                        // Reset the input so re-selecting the same file fires onChange again.
+                        e.target.value = "";
+                      }}
+                    />
+                  </label>
+                </div>
+                {workspaceResult ? (
+                  <div
+                    className={String(workspaceResult).toLowerCase().includes("failed") ? "error" : "info-note"}
+                    style={{ marginTop: 10 }}
+                  >
+                    {workspaceResult}
+                  </div>
+                ) : null}
+                {/* Reset workspace — DESTRUCTIVE, kept behind a type-DELETE
+                    gate so neither an accidental click nor a renderer XSS
+                    can wipe data silently. Only shown in the desktop app
+                    (window.trustnodeWorkspace.reset is provided by the
+                    Electron preload; in the cloud portal the IPC is
+                    undefined and the button is hidden). */}
+                {window?.trustnodeWorkspace?.reset ? (
+                  <div style={{ marginTop: 16, paddingTop: 16, borderTop: "1px solid var(--line, rgba(255,255,255,0.07))" }}>
+                    <h4 style={{ margin: "0 0 6px" }}>Reset Workspace</h4>
+                    <p className="muted" style={{ marginTop: 0 }}>
+                      Clears the active workspace and prompts you to pick
+                      one on next launch. A backup copy is made first.
+                      Type <code>DELETE</code> to confirm.
+                    </p>
+                    <div className="cleanup-card-row" style={{ gap: 8 }}>
+                      <input
+                        type="text"
+                        value={workspaceResetText}
+                        onChange={(e) => setWorkspaceResetText(e.target.value)}
+                        placeholder='Type "DELETE"'
+                        disabled={currentUser?.role !== "admin" || workspaceBusy}
+                        style={{ flex: "0 0 200px" }}
+                      />
+                      <button
+                        className="btn btn-danger"
+                        onClick={resetWorkspaceAndRelaunch}
+                        disabled={currentUser?.role !== "admin" || workspaceBusy || workspaceResetText !== "DELETE"}
+                      >
+                        {workspaceBusy ? "Working..." : "Reset and Relaunch"}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </section>
+
               <section className="card">
                 <h3 className="card-title">Clean Data</h3>
                 <div className="cleanup-card-row">

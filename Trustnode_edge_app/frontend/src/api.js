@@ -232,6 +232,37 @@ export async function getHealth() {
   return res.json();
 }
 
+// Operator 2026-06-18: workspace export/import — the user-visible safety
+// net for "I'm afraid to update because I'll lose my data." See the
+// /api/workspace router on the backend. Admin-only, JWT-gated.
+export async function exportWorkspace() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/workspace/export`, {}, 60000);
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json())?.detail || ""; } catch (_) {}
+    throw new Error(detail || `Export failed (${res.status})`);
+  }
+  return res.json();
+}
+
+export async function importWorkspace(payload, opts = {}) {
+  const body = {
+    ...payload,
+    skip_domains: Array.isArray(opts?.skip_domains) ? opts.skip_domains : [],
+  };
+  const res = await fetchWithTimeout(`${getApiBase()}/api/workspace/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }, 60000);
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json())?.detail || ""; } catch (_) {}
+    throw new Error(detail || `Import failed (${res.status})`);
+  }
+  return res.json();
+}
+
 export async function getConfig() {
   let res;
   let lastErr = null;
