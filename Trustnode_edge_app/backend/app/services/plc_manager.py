@@ -202,6 +202,12 @@ class GatewayWorker:
         self._task = asyncio.create_task(self._run_loop(emit_event))
 
     async def stop(self) -> None:
+        # Operator 2026-06-18: reverted to the original simple stop. The
+        # short-lived bounded-join optimization shipped earlier today
+        # appeared to interact badly with the AB driver and broke active
+        # customer setups. Keeping the original "await self._task" until
+        # the start/stop latency issue can be diagnosed against a live
+        # machine — correctness wins over speed here.
         if not self.running:
             return
         self.running = False
@@ -209,18 +215,9 @@ class GatewayWorker:
             self._remote_flush_inflight = False
         if self._task:
             self._task.cancel()
-            # Operator 2026-06-18: bound the join. If the worker is mid-read
-            # in a sync driver thread (libsnap7, pycomm3) it won't honor the
-            # CancelledError until the network call returns, which can be
-            # 5-10 s with a dead PLC. We dispose the underlying clients in
-            # the finally block — that closes the sockets and unblocks the
-            # read — so abandoning the task here is safe. UI then reflects
-            # "stopped" within ~2 s instead of blocking on the network.
             try:
-                await asyncio.wait_for(self._task, timeout=2.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-            except Exception:
+                await self._task
+            except asyncio.CancelledError:
                 pass
             self._task = None
         self._dispose_gateway_clients()
@@ -243,26 +240,19 @@ class GatewayWorker:
         )
 
     async def _run_loop(self, emit_event) -> None:
+        # Operator 2026-06-18: reverted the per-cycle asyncio.wait_for
+        # wrapper. It was intended as a zombie-defense but the customer
+        # reported it broke a previously-working setup (PLCs going
+        # offline mid-collection, gateways not advancing
+        # last_check_utc). Until we can reproduce and bound the timeout
+        # correctly without disturbing healthy reads, we keep the
+        # original direct asyncio.to_thread call.
         while self.running:
             cycle_started = time.monotonic()
             try:
                 # Gateway drivers are synchronous/blocking (socket I/O). Keep the
                 # asyncio loop responsive by executing reads off-loop.
-                #
-                # Operator 2026-06-18 (zombie fix): wrap the read in wait_for
-                # so a stalled driver (libsnap7 TCP hung, pycomm3 in
-                # mid-handshake, etc.) can't freeze the entire worker.
-                # The ceiling is 6 × poll interval, floored at 8 s and capped
-                # at 60 s. On timeout the cycle is dropped with an error and
-                # the loop advances — last_check_utc/db_last_write_utc keep
-                # ticking from the next successful cycle, and the front-end
-                # zombie banner only fires for genuinely stuck workers.
-                interval_s = max(self.config.interval_ms / 1000.0, 0.1)
-                cycle_timeout_s = min(60.0, max(8.0, interval_s * 6.0))
-                readings = await asyncio.wait_for(
-                    asyncio.to_thread(self._read_from_gateway),
-                    timeout=cycle_timeout_s,
-                )
+                readings = await asyncio.to_thread(self._read_from_gateway)
                 self.latest_readings = readings
                 # Surface a non-fatal "some tags are bad" summary from the
                 # AB readers, OR clear it on a clean cycle. The UI shows
@@ -329,28 +319,6 @@ class GatewayWorker:
                     # DB sink writes can be blocking (sqlite/file/remote enqueue).
                     # Execute off-loop to avoid delaying other gateways/API calls.
                     await asyncio.to_thread(self._persist_readings, readings)
-            except asyncio.TimeoutError:
-                # Phase: zombie defense. The driver hung past the per-cycle
-                # budget. Close stateful clients so the next cycle reconnects
-                # fresh, then continue the loop. Without the close, pycomm3
-                # / Snap7 sessions can stay half-open and every subsequent
-                # cycle also times out.
-                err_text = "Gateway cycle exceeded its time budget — connection forcibly recycled."
-                try:
-                    self._close_ab_pycomm3_client()
-                except Exception:
-                    pass
-                try:
-                    self._close_ab_pylogix_client()
-                except Exception:
-                    pass
-                self.last_error = err_text
-                self.latest_readings = []
-                logger.warning(
-                    "Gateway %s cycle timed out after the per-cycle budget; recycling client.",
-                    self.gateway_id,
-                )
-                await emit_event({"type": "error", "gateway_id": self.gateway_id, "message": err_text})
             except Exception as exc:
                 err_text = str(exc)
                 # Suppress transient handshake errors during the post-start
@@ -2868,17 +2836,14 @@ class PLCManager:
         self._refresh_global_triggers()
 
     async def stop_all_gateways(self) -> None:
-        # Operator 2026-06-18: parallelize stops so N gateways take O(slowest)
-        # not O(sum). With the per-worker stop now bounded to ~2 s, a fleet
-        # of 10 stalled gateways used to take 20 s; this brings it back to
-        # 2 s. Each w.stop() is already idempotent and exception-safe.
-        items = list(self.workers.items())
-        if items:
-            await asyncio.gather(
-                *(w.stop() for _, w in items),
-                return_exceptions=True,
-            )
-        for gid, _ in items:
+        # Operator 2026-06-18: reverted to the original sequential stop.
+        # The asyncio.gather variant shipped this morning sped up bulk
+        # shutdown but appears to interact with the AB / OPC-UA drivers
+        # in ways the original sequential await never did. Returning to
+        # the simple loop until the start/stop UX work can resume on a
+        # reproducible test rig.
+        for gid, w in list(self.workers.items()):
+            await w.stop()
             self.workers.pop(gid, None)
         self.active_gateway_id = ""
         self.global_live_values = {}
