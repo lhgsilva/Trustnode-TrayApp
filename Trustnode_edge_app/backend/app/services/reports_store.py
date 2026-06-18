@@ -65,9 +65,44 @@ class ReportsStore:
     """
 
     def __init__(self) -> None:
+        # Operator 2026-06-18 (boot fix): __init__ must NOT call
+        # _resolve_reports_dir(). That helper resolves the reports
+        # directory via app.routers.directories.resolve_directory(),
+        # which calls app_store.get_bootstrap() — and get_bootstrap is
+        # blocked behind app_store._lock during boot when background
+        # threads (cloud config sync, mirror, retention scheduler) are
+        # contending. On a machine where Supabase pool is exhausted
+        # those threads hang, the lock never frees, ReportsStore.__init__
+        # hangs past the tray's 90s startup grace window, and the
+        # customer sees "Backend not healthy" with no obvious cause.
+        #
+        # New shape: db_path resolves from env vars only (no app_store
+        # touch). reports_dir is resolved lazily on first access via
+        # the `reports_dir` property. Same pattern PowerManager uses.
         self.db_path = _resolve_db_path()
-        self.reports_dir = _resolve_reports_dir()
+        self._reports_dir: Path | None = None
         self._write_lock = threading.Lock()
+
+    @property
+    def reports_dir(self) -> Path:
+        """Lazy reports-directory resolver. Caches the first successful
+        result. Falls back to the env/home default if the operator
+        override read fails (e.g. app_store lock still held)."""
+        if self._reports_dir is not None:
+            return self._reports_dir
+        try:
+            out = _resolve_reports_dir()
+        except Exception:
+            # Fall back to the default — never block report writes on
+            # a transient app_store lock.
+            base = os.environ.get("TRUSTNODE_DATA_DIR", "").strip()
+            out = (Path(base) / "reports") if base else (Path.home() / ".trustnode_edge" / "data" / "reports")
+            try:
+                out.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        self._reports_dir = out
+        return out
 
     # --- connection ---
     def _connect(self) -> sqlite3.Connection:

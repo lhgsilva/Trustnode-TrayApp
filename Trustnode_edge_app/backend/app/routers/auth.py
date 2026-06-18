@@ -113,37 +113,76 @@ class ChangePasswordRequest(BaseModel):
 
 
 def _load_users_payload(prefer_cloud_reads: bool = False) -> Dict[str, Any]:
-    # Local-first for speed; caller can request cloud-refreshed bootstrap when needed.
-    data = app_store.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads) or {}
-    users_access = data.get("users_access") or {}
-    # Merge in the SCOPED users_access rows the frontend writes via
-    # /api/app-store/domain. The unscoped row is the initial seed
-    # (admin/admin or post-activation admin); user-created accounts land
-    # in the scoped row(s) under the same edge. Login was reading ONLY
-    # the unscoped row, so new users created via the Users UI were
-    # invisible to authentication. We now union every users_access entry
-    # we can find under the current edge.
+    """Load the users_access config for login matching.
+
+    Operator 2026-06-18 (offline auth): login MUST work when the cloud is
+    unreachable AND when app_store's internal lock is held by a background
+    thread doing cloud I/O. The previous implementation called
+    app_store.get_bootstrap(), which acquires app_store._lock; on a
+    machine with an exhausted Supabase pool the lock could be held for
+    minutes, hanging login.
+
+    New shape: read users_access directly from the SQLite file in
+    read-only mode. SQLite WAL allows concurrent readers without blocking
+    on writers, so this returns even when the app_store's Python lock is
+    held by a stuck cloud sync. The `prefer_cloud_reads` flag is honored
+    only on its second use (the auth.py login fallback that explicitly
+    asks for a cloud-refreshed bootstrap) — at that point the caller has
+    already accepted that cloud may fail.
+    """
     merged_users: list[Dict[str, Any]] = []
     seen_usernames: set[str] = set()
-    if isinstance(users_access, dict) and isinstance(users_access.get("users"), list):
-        for u in users_access["users"]:
-            if not isinstance(u, dict): continue
-            uname = str(u.get("username") or "").strip()
-            if not uname or uname in seen_usernames: continue
-            seen_usernames.add(uname)
-            merged_users.append(u)
-    # Pull scoped users_access rows directly from SQLite. This is cheap
-    # (one SELECT) and avoids restructuring app_store.get_bootstrap.
+    unscoped_current_user = ""
+
+    if prefer_cloud_reads:
+        # Caller explicitly requested cloud-refreshed read — use the
+        # original path with get_bootstrap. This is best-effort; if the
+        # lock is held it falls through to the direct-SQLite read below.
+        try:
+            data = app_store.get_bootstrap(prefer_cloud_reads=True) or {}
+            ua = data.get("users_access") or {}
+            if isinstance(ua, dict):
+                unscoped_current_user = str(ua.get("current_user") or "")
+                for u in (ua.get("users") or []):
+                    if not isinstance(u, dict): continue
+                    uname = str(u.get("username") or "").strip()
+                    if not uname or uname in seen_usernames: continue
+                    seen_usernames.add(uname)
+                    merged_users.append(u)
+        except Exception:
+            pass
+
+    # Direct SQLite read (lock-free) — works even when app_store._lock is
+    # held. Pulls BOTH the unscoped users_access doc AND the scoped rows
+    # in a single open. Read-only mode + 3s timeout means it returns
+    # promptly even on a busy DB.
     try:
         import sqlite3, json as _json
-        # app_store exposes its db_path via _db_path private attr
         db_path = getattr(app_store, "_db_path", None)
         if db_path:
             con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3)
             try:
+                # Unscoped users_access (initial seed + master admin row).
+                row = con.execute(
+                    "SELECT payload_json FROM config_documents WHERE domain='users_access'"
+                ).fetchone()
+                if row:
+                    try:
+                        unscoped = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    except Exception:
+                        unscoped = None
+                    if isinstance(unscoped, dict):
+                        if not unscoped_current_user:
+                            unscoped_current_user = str(unscoped.get("current_user") or "")
+                        for u in (unscoped.get("users") or []):
+                            if not isinstance(u, dict): continue
+                            uname = str(u.get("username") or "").strip()
+                            if not uname or uname in seen_usernames: continue
+                            seen_usernames.add(uname)
+                            merged_users.append(u)
+                # Scoped users_access rows (per-edge user_access docs).
                 for row in con.execute(
-                    "SELECT payload_json FROM config_documents_scoped "
-                    "WHERE domain='users_access'"
+                    "SELECT payload_json FROM config_documents_scoped WHERE domain='users_access'"
                 ).fetchall():
                     raw = row[0]
                     try:
@@ -160,10 +199,12 @@ def _load_users_payload(prefer_cloud_reads: bool = False) -> Dict[str, Any]:
             finally:
                 con.close()
     except Exception:
-        # Best-effort: scoped merge must not break the unscoped-only path.
+        # Best-effort: direct read may fail on a brand-new install where
+        # the table doesn't exist yet. The default-admin fallback covers it.
         pass
+
     if merged_users:
-        return {"users": merged_users, "current_user": users_access.get("current_user", "") if isinstance(users_access, dict) else ""}
+        return {"users": merged_users, "current_user": unscoped_current_user}
     return {
         "users": [
             {
@@ -195,14 +236,30 @@ def _match_user(users_access: Dict[str, Any], username: str, password: str) -> D
 
 def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
     configured_tenant = "default"
+    # Operator 2026-06-18: lock-free read for tenant_login_realm so login
+    # never hangs on app_store._lock contention. Same rationale as
+    # _load_users_payload — direct read-only SQLite, falls back silently
+    # to "default" if the DB isn't accessible.
     try:
-        # Auth path must be fast and deterministic; use local cached bootstrap only.
-        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False)
-        app_settings = bootstrap.get("app_settings") if isinstance(bootstrap, dict) else {}
-        if isinstance(app_settings, dict):
-            configured_tenant = normalize_tenant_id(
-                str(app_settings.get("tenant_login_realm") or app_settings.get("tenant_id") or "").strip()
-            )
+        import sqlite3, json as _json
+        db_path = getattr(app_store, "_db_path", None)
+        if db_path:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+            try:
+                row = con.execute(
+                    "SELECT payload_json FROM config_documents WHERE domain='app_settings'"
+                ).fetchone()
+                if row:
+                    try:
+                        app_settings = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    except Exception:
+                        app_settings = None
+                    if isinstance(app_settings, dict):
+                        configured_tenant = normalize_tenant_id(
+                            str(app_settings.get("tenant_login_realm") or app_settings.get("tenant_id") or "").strip()
+                        )
+            finally:
+                con.close()
     except Exception:
         configured_tenant = "default"
     fallback_tenant = configured_tenant if configured_tenant != "default" else normalize_tenant_id(get_current_tenant())
