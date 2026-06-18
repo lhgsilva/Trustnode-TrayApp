@@ -340,10 +340,22 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
         except Exception:
             hit = None
     if not hit:
-        # Retry once with cloud-refreshed bootstrap so newly created legacy
-        # users_access users on cloud/local become valid after propagation.
+        # Operator 2026-06-18: cloud-refresh fallback bounded to 3 s.
+        # Previously this called _load_users_payload(prefer_cloud_reads=True)
+        # which calls app_store.get_bootstrap(prefer_cloud_reads=True) with
+        # no timeout. On a machine with a saturated Supabase pool (or any
+        # cloud-side stall), login would hang indefinitely — customer sees
+        # "Signing in..." spinner forever. The cp_users_puller already pulls
+        # portal-created users into local SQLite every ~30s, so this branch
+        # is purely a "convenience retry" for the seconds-after-creation
+        # window; never worth blocking login on. If it doesn't complete
+        # quickly, treat as a 401 — the next login attempt (after the
+        # puller catches up) will succeed.
+        import concurrent.futures as _cf
         try:
-            cloud_users_access = _load_users_payload(prefer_cloud_reads=True)
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                fut = _ex.submit(_load_users_payload, True)
+                cloud_users_access = fut.result(timeout=3.0)
             hit = _match_user(cloud_users_access, username, password)
             if hit:
                 users_access = cloud_users_access
