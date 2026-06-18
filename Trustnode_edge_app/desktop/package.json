@@ -36,6 +36,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "workspace_detector.js",
       "package.json"
     ],
     "extraResources": [
