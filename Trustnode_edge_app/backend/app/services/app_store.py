@@ -4201,6 +4201,35 @@ class AppStore:
         backup_path = os.path.join(backup_dir, filename)
         with self._lock:
             shutil.copy2(self._db_path, backup_path)
+        # Operator 2026-06-18: backup retention. Customer's C: drive
+        # filled to 100% (0.1 GB free) because 132 backups of ~2.4 GB
+        # each accumulated unbounded over 4 months — the EXE build then
+        # failed because NSIS couldn't allocate temp space. Cap to the
+        # N most recent so disk usage stays bounded. ENV-overridable:
+        #   TRUSTNODE_BACKUP_RETENTION_MAX (default 10)
+        try:
+            keep_n = max(1, int(os.environ.get("TRUSTNODE_BACKUP_RETENTION_MAX", "10") or "10"))
+        except Exception:
+            keep_n = 10
+        try:
+            entries = []
+            for name in os.listdir(backup_dir):
+                if not name.lower().endswith(".db"):
+                    continue
+                p = os.path.join(backup_dir, name)
+                try:
+                    entries.append((os.path.getmtime(p), p))
+                except Exception:
+                    pass
+            entries.sort(key=lambda r: r[0], reverse=True)  # newest first
+            for _ts, path in entries[keep_n:]:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        except Exception:
+            # Never let retention failure block the backup itself.
+            pass
         return {
             "ok": True,
             "actor": actor,
