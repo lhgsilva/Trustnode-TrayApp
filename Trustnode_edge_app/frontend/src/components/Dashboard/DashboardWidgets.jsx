@@ -1471,10 +1471,24 @@ function LiveTagChart({
   // a wide black gap appeared underneath the tick labels. Now the
   // margin only reserves the small legend gap; the axis handles its
   // own label space.
+  //
+  // Operator 2026-06-18: when every visible series is a bar, switch the
+  // X axis from time-scaled (continuous) to categorical (band) and add
+  // a tiny left margin so the Y-axis tick labels never overlap the
+  // first bar. Mixed bar+line keeps the time scale because lines look
+  // correct against a numeric X. Bar-only widgets get the same clean
+  // layout as the heavy-path bar charts in the historical view.
+  const allBars = Array.isArray(seriesDefs)
+    && seriesDefs.length > 0
+    && seriesDefs.every((s) => s?.chartKind === "bar");
   const margin = {
     top: 4,
     right: rightAxisLabel ? 32 : 8,
-    left: primaryAxisLabel ? 12 : 0,
+    // Bump the left margin a touch on bar-only charts so the longest
+    // Y-axis tick (e.g. "1,188.937") sits comfortably to the LEFT of
+    // the first bar slot. 12px is enough for 7–8 digit ticks at
+    // fontSize=10. Lines / areas still get 0/12 as before.
+    left: primaryAxisLabel ? 12 : (allBars ? 12 : 0),
     bottom: showLegend ? 4 : 0,
   };
 
@@ -1510,31 +1524,63 @@ function LiveTagChart({
         <ResponsiveContainer width="100%" height="100%">
           <ComposedChart data={renderedData.rows} margin={margin}>
             <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-            <XAxis
-              dataKey="tsMs"
-              type="number"
-              scale="time"
-              domain={["dataMin", "dataMax"]}
-              tickFormatter={xTickFormatter}
-              fontSize={10}
-              interval="preserveStartEnd"
-              angle={xTickAngle}
-              textAnchor={xTickAngle === 0 ? "middle" : (xTickAngle < 0 ? "end" : "start")}
-              /* Heights tuned so even the longest format (YYYY-MM-DD HH:MM,
-                 ~16 chars at fontSize 10 ≈ 80 px rendered, projected
-                 vertically at 90° ≈ 80 px) fits without the card's plot
-                 area collapsing. 0° flat → tiny strip. 30/45° → mid. 60°+
-                 → full vertical span. Stays under what we previously
-                 reserved with margin.bottom + height combined. */
-              height={(() => {
-                const a = Math.abs(xTickAngle);
-                if (a === 0) return 22;
-                if (a < 35) return 30;
-                if (a < 60) return 40;
-                if (a < 80) return 48;
-                return 56;
-              })()}
-            />
+            {/* Operator 2026-06-18: bar-only charts use a categorical
+                (band) X axis so each bar lives in its own slot. Time-
+                scaled X (the default for line/area) puts the first and
+                last bars HALF on the axis line — the first bar then
+                overlaps the Y-axis tick labels. The categorical axis
+                ticks read off renderedData.rows[idx].tsMs so the time
+                labels still display correctly, with a small left+right
+                padding so the bars don't sit flush against the axes. */}
+            {allBars ? (
+              <XAxis
+                dataKey="idx"
+                tickFormatter={(idx) => {
+                  const r = renderedData.rows.find((p) => p.idx === idx);
+                  return r ? formatTickTime(new Date(r.tsMs)) : "";
+                }}
+                fontSize={10}
+                interval="preserveStartEnd"
+                minTickGap={18}
+                padding={{ left: 6, right: 6 }}
+                angle={xTickAngle}
+                textAnchor={xTickAngle === 0 ? "middle" : (xTickAngle < 0 ? "end" : "start")}
+                height={(() => {
+                  const a = Math.abs(xTickAngle);
+                  if (a === 0) return 22;
+                  if (a < 35) return 30;
+                  if (a < 60) return 40;
+                  if (a < 80) return 48;
+                  return 56;
+                })()}
+              />
+            ) : (
+              <XAxis
+                dataKey="tsMs"
+                type="number"
+                scale="time"
+                domain={["dataMin", "dataMax"]}
+                tickFormatter={xTickFormatter}
+                fontSize={10}
+                interval="preserveStartEnd"
+                angle={xTickAngle}
+                textAnchor={xTickAngle === 0 ? "middle" : (xTickAngle < 0 ? "end" : "start")}
+                /* Heights tuned so even the longest format (YYYY-MM-DD HH:MM,
+                   ~16 chars at fontSize 10 ≈ 80 px rendered, projected
+                   vertically at 90° ≈ 80 px) fits without the card's plot
+                   area collapsing. 0° flat → tiny strip. 30/45° → mid. 60°+
+                   → full vertical span. Stays under what we previously
+                   reserved with margin.bottom + height combined. */
+                height={(() => {
+                  const a = Math.abs(xTickAngle);
+                  if (a === 0) return 22;
+                  if (a < 35) return 30;
+                  if (a < 60) return 40;
+                  if (a < 80) return 48;
+                  return 56;
+                })()}
+              />
+            )}
             <YAxis
               yAxisId="left"
               domain={yDomainLeft}
