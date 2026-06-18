@@ -473,6 +473,45 @@ class AppStore:
             safe = f"edge-{safe}"
         return safe[:64]
 
+    # Weighted byte-count for one scope. Used to compare scopes when
+    # deciding whether to adopt the richer one. Higher = more
+    # operator-configured data.
+    _SCOPE_DOMAIN_WEIGHTS = {
+        "gateway_configurations":   4.0,
+        "devices":                  4.0,
+        "triggers_limits":          3.0,
+        "alarms_setup":             2.0,
+        "dashboard_configurations": 2.0,
+        "users_access":             2.0,
+        "database_configurations":  1.0,
+        "power_management_config":  1.0,
+        "reporting_setup":          1.0,
+    }
+
+    def _score_edge_scope(self, conn: sqlite3.Connection,
+                          tenant_id: str, customer_id: str, edge_id: str) -> float:
+        """Return a weighted byte-count for the scope (tenant, customer,
+        edge). Used to compare two candidate scopes and pick the richer
+        one. Returns 0.0 when the scope has no shared-domain rows.
+        """
+        skey = f"{tenant_id}|{customer_id}|{edge_id}"
+        try:
+            rows = conn.execute(
+                "SELECT domain, length(payload_json) AS bytes "
+                "FROM config_documents_scoped WHERE scope_key = ?",
+                (skey,),
+            ).fetchall()
+        except Exception:
+            return 0.0
+        total = 0.0
+        for r in rows:
+            d = str(r["domain"] or "")
+            b = int(r["bytes"] or 0)
+            if b <= 4:  # "[]" or "{}" trivial
+                continue
+            total += b * self._SCOPE_DOMAIN_WEIGHTS.get(d, 0.5)
+        return total
+
     def _find_richest_existing_edge_scope(self, conn: sqlite3.Connection) -> tuple[str, str, str] | None:
         """Operator 2026-06-18 (data-loss fix): when this edge starts up
         with a stale or empty edge_id, scan config_documents_scoped for
@@ -492,21 +531,7 @@ class AppStore:
         but the running app only looked at the NEW scope key.
         """
         try:
-            # Tally bytes-of-data per scope_key for the shared domains
-            # that matter. We weight gateway_configurations + devices +
-            # triggers_limits the heaviest — those are the ones whose
-            # loss the customer notices first.
-            shared_domains = (
-                "gateway_configurations",
-                "devices",
-                "triggers_limits",
-                "alarms_setup",
-                "database_configurations",
-                "power_management_config",
-                "reporting_setup",
-                "users_access",
-                "dashboard_configurations",
-            )
+            shared_domains = tuple(self._SCOPE_DOMAIN_WEIGHTS.keys())
             placeholders = ",".join(["?"] * len(shared_domains))
             rows = conn.execute(
                 f"""
@@ -516,31 +541,20 @@ class AppStore:
                 """,
                 shared_domains,
             ).fetchall()
-            weights = {
-                "gateway_configurations": 4.0,
-                "devices":                4.0,
-                "triggers_limits":        3.0,
-                "alarms_setup":           2.0,
-                "dashboard_configurations": 2.0,
-                "users_access":           2.0,
-                "database_configurations": 1.0,
-                "power_management_config": 1.0,
-                "reporting_setup":        1.0,
-            }
             score_by_scope: dict[str, float] = {}
             for row in rows:
                 skey = str(row["scope_key"] or "")
                 domain = str(row["domain"] or "")
-                # Skip user-scoped rows (4-segment); only consider
-                # shared (3-segment) scope keys here.
+                # Only consider shared (3-segment) scope keys here.
                 if skey.count("|") != 2:
                     continue
-                # An empty-array payload is "[]" (2 bytes) or "{}" — skip
-                # those so a fresh-default doesn't out-rank real data.
                 b = int(row["bytes"] or 0)
-                if b <= 4:
+                if b <= 4:  # "[]" / "{}" trivial
                     continue
-                score_by_scope[skey] = score_by_scope.get(skey, 0.0) + (b * weights.get(domain, 1.0))
+                score_by_scope[skey] = (
+                    score_by_scope.get(skey, 0.0)
+                    + b * self._SCOPE_DOMAIN_WEIGHTS.get(domain, 0.5)
+                )
             if not score_by_scope:
                 return None
             best_scope = max(score_by_scope.items(), key=lambda kv: kv[1])[0]
@@ -555,14 +569,18 @@ class AppStore:
         """Set edge_id on first run. CRITICAL: never silently REPLACE
         an existing edge_id, because the per-edge scope_key carries
         every device / gateway / trigger / alarm config — flipping the
-        id strands the customer's data at the old scope. Three cases:
+        id strands the customer's data at the old scope. Four cases:
 
-          1. edge_id already set to a real (non-'edge-01') id → keep it.
-          2. edge_id absent or equals the legacy 'edge-01' AND the
+          1. edge_id already set to a real (non-'edge-01') id AND the
+             SQLite has real data under that scope → keep it.
+          2. edge_id already set BUT the SQLite has MUCH MORE data
+             under a different edge_id (same customer) → ADOPT the
+             richer one. This recovers customers stranded by a past
+             update that flipped the id mid-deployment.
+          3. edge_id absent or equals the legacy 'edge-01' AND the
              SQLite already holds shared-edge data under some other
-             edge_id → ADOPT that existing edge_id so the customer's
-             data becomes visible at the new scope.
-          3. Empty DB (truly first run, no prior data) → set
+             edge_id → ADOPT that existing edge_id.
+          4. Empty DB (truly first run, no prior data) → set
              edge_id to self._local_edge_id (hostname-derived).
         """
         now = self._utc_now()
@@ -586,12 +604,51 @@ class AppStore:
                 if not isinstance(edge_profile, dict):
                     edge_profile = {}
                 current_edge_id = str(edge_profile.get("edge_id") or "").strip()
-                # Case 1: a real edge_id is already locked in. Never replace it.
+                # Case 1/2: a real edge_id is set. Check if the SQLite
+                # is hiding richer data at a DIFFERENT edge_id — that
+                # happens when a past update or activation stranded the
+                # customer's gateways at the old scope. Adopt the
+                # alternate scope when it has at least 1.5× the weighted
+                # bytes of the current scope AND has a minimum absolute
+                # threshold of operator-configured data. The 1.5× factor
+                # rejects flips on tied-ish splits but is permissive
+                # enough to catch real stranding (a customer reported
+                # they lost gateways when alt was 2.08× richer).
                 if current_edge_id and current_edge_id != "edge-01":
+                    alt = self._find_richest_existing_edge_scope(conn)
+                    if alt and alt[2] != current_edge_id:
+                        alt_score = self._score_edge_scope(conn, alt[0], alt[1], alt[2])
+                        cur_score = self._score_edge_scope(conn, alt[0], alt[1], current_edge_id)
+                        if alt_score >= 4000.0 and alt_score >= cur_score * 1.5:
+                            try:
+                                print(
+                                    f"[trustnode][boot] migrating edge_id from {current_edge_id!r} "
+                                    f"-> {alt[2]!r} (alt scope has {alt_score:.0f} bytes-of-config vs "
+                                    f"current {cur_score:.0f}); customer data now visible",
+                                    flush=True,
+                                )
+                            except Exception:
+                                pass
+                            edge_profile["edge_id"] = alt[2]
+                            if alt[1] and alt[1] != "-":
+                                edge_profile["linked_customer_id"] = alt[1]
+                                if not payload.get("customer_id"):
+                                    payload["customer_id"] = alt[1]
+                            payload["edge_profile"] = edge_profile
+                            next_version = max(1, version + 1)
+                            conn.execute(
+                                """
+                                INSERT INTO config_documents(domain, payload_json, version, updated_utc)
+                                VALUES(?, ?, ?, ?)
+                                ON CONFLICT(domain) DO UPDATE SET
+                                  payload_json = excluded.payload_json,
+                                  version = excluded.version,
+                                  updated_utc = excluded.updated_utc
+                                """,
+                                ("app_settings", json.dumps(payload), next_version, now),
+                            )
                     return
-                # Case 2: try to recover the customer's existing data by
-                # adopting whichever edge_id the SQLite already holds the
-                # richest shared-config for.
+                # Case 3: empty / legacy edge_id, try to recover.
                 adopted: tuple[str, str, str] | None = self._find_richest_existing_edge_scope(conn)
                 if adopted:
                     adopted_tenant, adopted_customer, adopted_edge = adopted
