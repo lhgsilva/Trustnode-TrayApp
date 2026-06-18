@@ -165,6 +165,16 @@ def start(primary_port: int) -> dict:
             "candidates_tried": tried,
             "note": _lan_last_error,
         }
+    # Operator 2026-06-18: self-heal the Windows Firewall rule BEFORE we
+    # bind 0.0.0.0. If the installer's rule is missing (portable EXE,
+    # broken old-installer netsh, manual delete), this adds it silently
+    # so the user never sees the Defender prompt. Skipped on non-Windows
+    # and cached per-process so repeated toggles don't re-probe netsh.
+    try:
+        from app.services import windows_firewall as _fw
+        _fw.ensure_backend_rule()
+    except Exception:
+        pass
     with _lan_lock:
         _lan_port = chosen
         _lan_thread = threading.Thread(
