@@ -399,25 +399,20 @@ async def _deferred_startup() -> None:
     and start background pollers. Errors here only delay full feature
     availability; they never block boot.
     """
-    # Operator 2026-06-18: activation registry restore. When the local
-    # cp_edges/cp_licenses tables are empty (typical for a fresh
-    # install or after a full data-folder wipe), check the Windows
-    # registry for a previously-mirrored receipt and restore the
-    # license activation from it. No-op on non-Windows and when the
-    # local DB already has activation rows. Errors here never block
-    # boot — the customer can still re-activate via the cloud round-trip.
+    # Operator 2026-06-18: activation registry restore + mirror. Both
+    # take the SQLite lock and hit netsh on Windows — synchronous
+    # operations that, if run inline, BLOCK the asyncio event loop and
+    # prevent uvicorn from binding. Symptom: customer's backend started,
+    # printed [boot] markers, but /api/health never responded. Move to a
+    # worker thread via asyncio.to_thread so uvicorn keeps its loop free.
     try:
-        result = control_plane_store.restore_activation_from_registry_if_empty()
+        result = await asyncio.to_thread(control_plane_store.restore_activation_from_registry_if_empty)
         if result.get("restored"):
             print(f"[trustnode][boot] activation restored from registry: {result.get('applied')}", flush=True)
     except Exception as exc:
         print(f"[trustnode][boot] activation registry restore failed: {exc!r}", flush=True)
-    # Whether or not we restored, mirror whatever is in the DB back to
-    # the registry so a fresh activation receives the same protection
-    # going forward. mirror_activation_to_registry no-ops on empty
-    # tables, so this is safe to call unconditionally.
     try:
-        mirror = control_plane_store.mirror_activation_to_registry()
+        mirror = await asyncio.to_thread(control_plane_store.mirror_activation_to_registry)
         if mirror.get("ok"):
             print(f"[trustnode][boot] activation mirrored to registry: hive={mirror.get('hive')}", flush=True)
     except Exception:
@@ -428,7 +423,10 @@ async def _deferred_startup() -> None:
         pass
     bootstrap = None
     try:
-        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False)
+        # Same rationale: get_bootstrap acquires app_store._lock; if a
+        # cloud-sync thread holds it, this blocks the event loop and
+        # uvicorn can't serve. Run on a worker thread.
+        bootstrap = await asyncio.to_thread(app_store.get_bootstrap, False)
         telemetry_service.configure_from_bootstrap({"data": bootstrap})
     except Exception:
         bootstrap = None
