@@ -15,11 +15,21 @@ from app.services.lite_report_poller import LiteReportRequestPoller
 from app.services.cp_users_puller import CpUsersPuller, build_from_env as build_cp_users_puller
 from app.routers.notifications import send_email_request
 
+# Operator 2026-06-18: boot diagnostics. Each print is flushed so a hung
+# customer machine produces a log that pinpoints WHICH service init blocked.
+# Previously the only boot print was app_store_db; anything wedging between
+# that and uvicorn binding looked identical from the outside.
+print("[trustnode][boot] state: instantiating TelemetryService", flush=True)
 telemetry_service = TelemetryService()
+print("[trustnode][boot] state: instantiating IngestStore", flush=True)
 ingest_store = IngestStore()
+print("[trustnode][boot] state: instantiating PLCManager", flush=True)
 plc_manager = PLCManager()
+print("[trustnode][boot] state: instantiating AppStore", flush=True)
 app_store = AppStore()
+print("[trustnode][boot] state: AppStore ready, instantiating PowerManager", flush=True)
 power_manager = PowerManager(app_store)
+print("[trustnode][boot] state: PowerManager ready", flush=True)
 
 
 def _build_control_plane_store():
@@ -52,8 +62,11 @@ def _build_control_plane_store():
     return ControlPlaneStore()
 
 
+print("[trustnode][boot] state: building ControlPlaneStore", flush=True)
 control_plane_store = _build_control_plane_store()
+print("[trustnode][boot] state: ControlPlaneStore ready, instantiating ReportsStore", flush=True)
 reports_store = ReportsStore()
+print("[trustnode][boot] state: ReportsStore ready", flush=True)
 
 # cp_users puller is created lazily on startup (main.py) once app_settings
 # are loaded — we need the cloud URL + tenant from the bootstrap config.

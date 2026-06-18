@@ -502,12 +502,15 @@ async def startup_event() -> None:
     # startup handler returns immediately and uvicorn starts answering
     # /api/health. The 2026-06-17 in-process LAN socket + OPC UA/MQTT
     # re-apply moved into _deferred_startup() above.
+    print("[trustnode][boot] startup_event fired; scheduling deferred init", flush=True)
     import asyncio as _asyncio
     try:
         _asyncio.get_event_loop().create_task(_deferred_startup())
-    except Exception:
+        print("[trustnode][boot] deferred init scheduled — uvicorn should now serve /api/health", flush=True)
+    except Exception as exc:
         # If task creation fails, run inline as a safety net so functional
         # parity with the pre-Phase-4a code is preserved.
+        print(f"[trustnode][boot] WARN: create_task failed ({exc!r}); running deferred init inline", flush=True)
         try:
             await _deferred_startup()
         except Exception:

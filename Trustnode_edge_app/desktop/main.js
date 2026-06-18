@@ -145,18 +145,22 @@ function killPidsHard(pids) {
 
 function sweepStaleBackend() {
   if (process.platform !== "win32") return;
-  // We can't reliably tell ours apart from someone else's, so this is
-  // safe-by-omission: only act when the exe name matches AND it's not
-  // already our own child (it can't be — we haven't spawned anything
-  // yet). Use taskkill /F /T to take the tree down even if children
-  // are misbehaving.
-  try {
-    execFileSync("taskkill.exe", ["/F", "/T", "/IM", BACKEND_EXE_NAME], {
-      stdio: ["ignore", "ignore", "ignore"],
-      timeout: 4000,
-    });
-    bootLog("stale backend swept");
-  } catch (_) { /* nothing to kill is the happy path */ }
+  // Operator 2026-06-18: kill ALL legacy backend image names. Older
+  // builds shipped as "backend.exe"; the current name is
+  // "trustnode-service.exe". A machine upgraded from <0.0.9 may have a
+  // zombie of the old name still holding port 8000 and (worse) a write
+  // lock on the legacy app_store SQLite — which would otherwise make the
+  // freshly-spawned new backend hang on its first DB write.
+  const legacyImageNames = [BACKEND_EXE_NAME, "backend.exe", "trustnode-edge.exe"];
+  for (const imageName of legacyImageNames) {
+    try {
+      execFileSync("taskkill.exe", ["/F", "/T", "/IM", imageName], {
+        stdio: ["ignore", "ignore", "ignore"],
+        timeout: 4000,
+      });
+      bootLog(`stale backend swept: ${imageName}`);
+    } catch (_) { /* nothing to kill is the happy path */ }
+  }
 }
 try { sweepStaleBackend(); } catch (err) { bootLog(`sweep failed: ${err && err.message || err}`); }
 
@@ -456,27 +460,39 @@ function checkPortFree(host, port, timeoutMs = 1000) {
 }
 
 async function resolveBackendTarget() {
-  // Phase 4a-1 (operator 2026-06-18): probe port-free FIRST. Previously we
-  // ran a 1200 ms health check on every port before trying to bind — that
-  // burned a mandatory 1.2 s on the common case (port 8000 wide open, no
-  // backend running). Now we ask the OS if the port is free first (cheap,
-  // ~few ms on a free port) and only fall through to the health check when
-  // something is actually listening.
+  // Operator 2026-06-18 (revert of Phase 4a-1): the port-free-first order
+  // turned out to misbehave on machines with a previous TrustNode install:
+  // an older trustnode-service.exe leftover from a prior version could be
+  // holding port 8000 in a half-dead state where checkPortFree said "busy"
+  // but the old backend was no longer responding to /api/health and not
+  // identifying as compatible — so the new tray would walk past it to
+  // port 8001+, but then the old backend would die, then the new spawn at
+  // 8001 would not be what the renderer tried to load. Worse, on the
+  // FIRST iteration the brief gap between "old exited" and "new bound"
+  // sometimes made the port appear free → new backend spawned at 8000 but
+  // fought against the legacy app_store SQLite file lock.
+  //
+  // Going back to the original order (health-check first, then port-free)
+  // gives the system a proper chance to identify and reuse a running
+  // compatible backend. We pay an extra ~1.2s in the cold-boot case where
+  // nothing is on the port (we noticed this and shipped 4a-1 to fix it),
+  // but correctness on existing installs is non-negotiable. Phase 4a-2
+  // and 4a-3 still buy us most of the boot speedup.
   const maxPortsToTry = 10;
   for (let i = 0; i < maxPortsToTry; i += 1) {
     const port = BACKEND_PORT + i;
-    const free = await checkPortFree(BACKEND_HOST, port, 600);
-    if (free) return { host: BACKEND_HOST, port, reuse: false };
-    // Port is occupied — check if it's a reusable TrustNode backend.
-    const alive = await checkBackendHealth(BACKEND_HOST, port, 1000);
+    const alive = await checkBackendHealth(BACKEND_HOST, port, 1200);
     if (alive) {
       const compatible = await checkBackendCompatibility(BACKEND_HOST, port);
       if (compatible) {
         logBackend(`Backend already running at http://${BACKEND_HOST}:${port}; reusing compatible process.`);
         return { host: BACKEND_HOST, port, reuse: true };
       }
-      logBackend(`Backend already running at http://${BACKEND_HOST}:${port} but not compatible; trying next port.`);
+      logBackend(`Backend already running at http://${BACKEND_HOST}:${port} but not compatible; reserving this port.`);
+      continue;
     }
+    const free = await checkPortFree(BACKEND_HOST, port, 800);
+    if (free) return { host: BACKEND_HOST, port, reuse: false };
   }
   return { host: BACKEND_HOST, port: BACKEND_PORT, reuse: false };
 }
