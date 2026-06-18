@@ -209,9 +209,18 @@ class GatewayWorker:
             self._remote_flush_inflight = False
         if self._task:
             self._task.cancel()
+            # Operator 2026-06-18: bound the join. If the worker is mid-read
+            # in a sync driver thread (libsnap7, pycomm3) it won't honor the
+            # CancelledError until the network call returns, which can be
+            # 5-10 s with a dead PLC. We dispose the underlying clients in
+            # the finally block — that closes the sockets and unblocks the
+            # read — so abandoning the task here is safe. UI then reflects
+            # "stopped" within ~2 s instead of blocking on the network.
             try:
-                await self._task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception:
                 pass
             self._task = None
         self._dispose_gateway_clients()
@@ -239,7 +248,21 @@ class GatewayWorker:
             try:
                 # Gateway drivers are synchronous/blocking (socket I/O). Keep the
                 # asyncio loop responsive by executing reads off-loop.
-                readings = await asyncio.to_thread(self._read_from_gateway)
+                #
+                # Operator 2026-06-18 (zombie fix): wrap the read in wait_for
+                # so a stalled driver (libsnap7 TCP hung, pycomm3 in
+                # mid-handshake, etc.) can't freeze the entire worker.
+                # The ceiling is 6 × poll interval, floored at 8 s and capped
+                # at 60 s. On timeout the cycle is dropped with an error and
+                # the loop advances — last_check_utc/db_last_write_utc keep
+                # ticking from the next successful cycle, and the front-end
+                # zombie banner only fires for genuinely stuck workers.
+                interval_s = max(self.config.interval_ms / 1000.0, 0.1)
+                cycle_timeout_s = min(60.0, max(8.0, interval_s * 6.0))
+                readings = await asyncio.wait_for(
+                    asyncio.to_thread(self._read_from_gateway),
+                    timeout=cycle_timeout_s,
+                )
                 self.latest_readings = readings
                 # Surface a non-fatal "some tags are bad" summary from the
                 # AB readers, OR clear it on a clean cycle. The UI shows
@@ -306,6 +329,28 @@ class GatewayWorker:
                     # DB sink writes can be blocking (sqlite/file/remote enqueue).
                     # Execute off-loop to avoid delaying other gateways/API calls.
                     await asyncio.to_thread(self._persist_readings, readings)
+            except asyncio.TimeoutError:
+                # Phase: zombie defense. The driver hung past the per-cycle
+                # budget. Close stateful clients so the next cycle reconnects
+                # fresh, then continue the loop. Without the close, pycomm3
+                # / Snap7 sessions can stay half-open and every subsequent
+                # cycle also times out.
+                err_text = "Gateway cycle exceeded its time budget — connection forcibly recycled."
+                try:
+                    self._close_ab_pycomm3_client()
+                except Exception:
+                    pass
+                try:
+                    self._close_ab_pylogix_client()
+                except Exception:
+                    pass
+                self.last_error = err_text
+                self.latest_readings = []
+                logger.warning(
+                    "Gateway %s cycle timed out after the per-cycle budget; recycling client.",
+                    self.gateway_id,
+                )
+                await emit_event({"type": "error", "gateway_id": self.gateway_id, "message": err_text})
             except Exception as exc:
                 err_text = str(exc)
                 # Suppress transient handshake errors during the post-start
@@ -1841,12 +1886,22 @@ class GatewayWorker:
                     pass
 
     def _mark_outbox_drained(self, *, sink_id: str, count: int) -> int:
-        """Mark the last `count` unsent outbox rows for this gateway/sink
+        """Mark the oldest `count` unsent outbox rows for this gateway/sink
         as sent. Returns the number of rows actually updated.
 
         Operator 2026-06-17 (M10): used by the parallel-PG writer after
         a successful sink write so the outbox tail follows the in-flight
         batch.
+
+        Operator 2026-06-18 (data integrity): the SELECT MUST use ORDER BY
+        id ASC. The writer enqueues then flushes FIFO, so the rows just
+        written to Postgres are the OLDEST unsent rows. DESC marks the
+        newest (not-yet-flushed) rows as sent and leaves the
+        just-written rows pending — they'd then be re-sent on the next
+        flush cycle, producing duplicate rows in the customer DB and
+        leaking unsent rows that never drain. The race is exposed at any
+        sustained poll rate where the next batch enqueues before the
+        previous flush returns (i.e. the normal 1 Hz case).
         """
         if count <= 0:
             return 0
@@ -1857,7 +1912,7 @@ class GatewayWorker:
                 text(
                     "SELECT id FROM outbox_readings "
                     "WHERE gateway_id = :gid AND sink_id = :sid AND sent_remote = 0 "
-                    "ORDER BY id DESC LIMIT :n"
+                    "ORDER BY id ASC LIMIT :n"
                 ),
                 {"gid": self.gateway_id, "sid": str(sink_id or ""), "n": int(count)},
             ).fetchall()
@@ -2813,8 +2868,17 @@ class PLCManager:
         self._refresh_global_triggers()
 
     async def stop_all_gateways(self) -> None:
-        for gid, w in list(self.workers.items()):
-            await w.stop()
+        # Operator 2026-06-18: parallelize stops so N gateways take O(slowest)
+        # not O(sum). With the per-worker stop now bounded to ~2 s, a fleet
+        # of 10 stalled gateways used to take 20 s; this brings it back to
+        # 2 s. Each w.stop() is already idempotent and exception-safe.
+        items = list(self.workers.items())
+        if items:
+            await asyncio.gather(
+                *(w.stop() for _, w in items),
+                return_exceptions=True,
+            )
+        for gid, _ in items:
             self.workers.pop(gid, None)
         self.active_gateway_id = ""
         self.global_live_values = {}

@@ -613,12 +613,20 @@ class PowerManager:
             raise RuntimeError("Unable to connect")
         raw_values: dict[str, float] = {}
         addr_to_keys: dict[int, list[str]] = {}
+        # Track which register keys we SKIPPED this cycle due to per-address
+        # backoff. After the live reads finish, we'll carry forward the last
+        # known good value for those keys (with quality=UNCERTAIN_STALE) so
+        # the historian row stays consistent and dashboards don't see the
+        # backed-off register as a NULL gap. Without this, a 2 s backoff
+        # produced a 2 s discontinuity in the chart.
+        backed_off_keys: list[str] = []
         now_mono = time.monotonic()
         device_backoff = self._register_backoff_until.setdefault(device_id, {})
         for key, addr in registers.items():
             addr_int = int(addr)
             fail_until = float(device_backoff.get(addr_int, 0.0) or 0.0)
             if fail_until > now_mono:
+                backed_off_keys.append(str(key))
                 continue
             addr_to_keys.setdefault(addr_int, []).append(str(key))
         sorted_addrs = sorted(addr_to_keys.keys())
@@ -678,6 +686,23 @@ class PowerManager:
             if not raw_values:
                 raise RuntimeError("Read failed for all configured registers")
 
+        # Carry forward last-known values for keys that were skipped due
+        # to per-address backoff. Marked stale_keys for the row writer so
+        # those rows get quality=UNCERTAIN instead of GOOD.
+        stale_keys: set[str] = set()
+        if backed_off_keys:
+            with self._lock:
+                prev_sample = self._last_samples.get(device_id) or {}
+            prev_raw = dict(prev_sample.get("values_raw") or {})
+            for key in backed_off_keys:
+                if key in raw_values:
+                    continue
+                prev_val = prev_raw.get(key)
+                if prev_val is None:
+                    continue
+                raw_values[key] = float(prev_val)
+                stale_keys.add(key)
+
         # Operator 2026-06-16: modern power meters (Weidmüller EM525,
         # Carlo Gavazzi EM340/530, Schneider iEM/PM, Janitza UMG…)
         # report PRIMARY-side values directly when the CTs are
@@ -707,6 +732,12 @@ class PowerManager:
 
         rows: list[dict[str, Any]] = []
         for key, val in values_scaled.items():
+            # Stale carry-forward rows (the register was in per-address
+            # backoff this cycle) are tagged UNCERTAIN so reporting and
+            # downstream consumers can distinguish "actually GOOD now"
+            # from "we re-used the last sample because the meter was
+            # transiently unreachable on this register."
+            is_stale = str(key) in stale_keys
             rows.append(
                 {
                     "ts_utc": now,
@@ -717,8 +748,8 @@ class PowerManager:
                     "database_name": "Power Management",
                     "tag_name": str(key),
                     "value": float(val),
-                    "quality": 192,
-                    "quality_label": "GOOD",
+                    "quality": 64 if is_stale else 192,
+                    "quality_label": "UNCERTAIN" if is_stale else "GOOD",
                     "source": "power_modbus",
                 }
             )
