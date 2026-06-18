@@ -3426,58 +3426,18 @@ function AppShell() {
   const [otherDbPickerType, setOtherDbPickerType] = useState("sqlite");
   const [retentionRuns, setRetentionRuns] = useState([]);
   const [retentionBusy, setRetentionBusy] = useState(false);
+  // Operator 2026-06-18: fresh installs start with NO power meters.
+  // The previous initial state pre-populated a "power_meter_01" with
+  // the demo Weidmuller IP 192.168.10.117, which the customer asked
+  // to remove. Operators add their own meter via the UI's "Add device"
+  // button — that flow uses POWER_PROFILE_DEFAULTS to seed the form
+  // fields, so customers still get sensible per-mode register defaults
+  // without a pre-existing device entry.
   const [powerConfig, setPowerConfig] = useState({
-    enabled: true,
+    enabled: false,
     energy_price_eur_kwh: DEFAULT_ENERGY_COST_PER_KWH,
-    selected_device_id: "power_meter_01",
-    devices: [
-      {
-        id: "power_meter_01",
-        name: "Power Meter 01",
-        description: "Weidmuller meter",
-        enabled: true,
-        type: "modbus_tcp",
-        protocol: "modbus_tcp",
-        ip: "192.168.10.117",
-        port: 502,
-        unit_id: 1,
-        poll_interval_ms: 1000,
-        electrical_mode: "single_phase",
-        register_profile: POWER_PROFILE_DEFAULTS.single_phase,
-        use_custom_registers: true,
-        wiring_type: "single_phase",
-        voltage_connected: true,
-        ct_connected: true,
-        ct_primary: 80,
-        ct_secondary: 5,
-        vt_primary: 230,
-        vt_secondary: 230,
-        registers: {
-          voltage_v: 19000,
-          current_a: 19012,
-          active_power_w: 19020,
-          power_factor: 19044,
-          frequency_hz: 19050,
-          energy_wh: 19054,
-          active_power_total_w: 19026,
-          energy_total_wh: 19060,
-          energy_consumed_total_wh: 19068,
-          energy_delivered_total_wh: 19076,
-        },
-        register_scales: {
-          voltage_v: 1,
-          current_a: 1,
-          active_power_w: 1,
-          power_factor: 1,
-          frequency_hz: 1,
-          energy_wh: 1,
-          active_power_total_w: 1,
-          energy_total_wh: 1,
-          energy_consumed_total_wh: 1,
-          energy_delivered_total_wh: 1,
-        },
-      },
-    ],
+    selected_device_id: "",
+    devices: [],
   });
   const [powerProfiles, setPowerProfiles] = useState({
     profiles: {},

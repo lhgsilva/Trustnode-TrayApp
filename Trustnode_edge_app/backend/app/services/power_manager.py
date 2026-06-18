@@ -361,14 +361,15 @@ class PowerManager:
                     continue
                 seen.add(d["id"])
                 devices.append(d)
-        # Only seed the example meter when the caller didn't pass a `devices`
-        # key at all (first-run / migration). If the caller explicitly sent
-        # an empty list (deletion of the last device) honor that — re-adding
-        # DEFAULT_DEVICE here made it impossible for operators to either
-        # remove the seeded "power_meter_01" or replace it with their own
-        # meter on a different IP.
-        if "devices" not in (raw or {}) and not devices:
-            devices = [self._deep_copy(DEFAULT_DEVICE)]
+        # Operator 2026-06-18: fresh installs start with NO power meter
+        # devices at all. Previously, when _normalize_config saw no
+        # `devices` key (truly first-run / first-time migration), it
+        # seeded the example "power_meter_01" entry pre-filled with the
+        # Weidmuller demo IP 192.168.10.117. Customer reported that as
+        # "hard-coded device on every new install" and asked for it gone.
+        # Now: empty list every time. Operators add their own meter via
+        # the UI; the DEFAULT_DEVICE template is still used by the "Add
+        # device" button to give the form sensible default field values.
         base["devices"] = devices
         requested_selected = str(raw.get("selected_device_id") or "").strip()
         if requested_selected and any(str(d.get("id")) == requested_selected for d in devices):
