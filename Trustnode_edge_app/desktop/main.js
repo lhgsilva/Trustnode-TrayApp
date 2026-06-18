@@ -1,4 +1,5 @@
-const { app, BrowserWindow, Menu, Tray, nativeImage, dialog, ipcMain } = require("electron");
+const electron = require("electron");
+const { app, BrowserWindow, Menu, Tray, nativeImage, dialog, ipcMain } = electron;
 const { spawn, execFileSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
@@ -6,6 +7,12 @@ const http = require("http");
 const net = require("net");
 const os = require("os");
 const { URL } = require("url");
+const workspaceDetector = require("./workspace_detector");
+
+// Set by detectAndChooseWorkspace() before backend spawn. Read by
+// resolveBackendDataDir() (legacy auto-detect kept as fallback). Forces
+// the backend to a known, user-chosen location.
+let chosenWorkspaceDataDir = "";
 
 // Phase 3d (operator 2026-06-18): initialize Sentry as early as possible
 // so any uncaught error in main.js boot is captured. Opt-in via the
@@ -240,7 +247,13 @@ let currentOverlayTheme = "dark";
 // must keep using it — switching paths would orphan the historian DB, license
 // state, gateway configs and dashboards.
 function resolveBackendDataDir() {
+  // Operator 2026-06-18: the workspace detector (workspace_detector.js)
+  // runs BEFORE the backend spawn and writes its choice here. When set,
+  // it's the authoritative source — overrides every legacy auto-detect.
+  if (chosenWorkspaceDataDir) return chosenWorkspaceDataDir;
   if (process.env.TRUSTNODE_DATA_DIR) return process.env.TRUSTNODE_DATA_DIR;
+  // Fallback path retained so launches that bypass the detector (dev mode,
+  // TRUSTNODE_BACKEND_CMD, harness scripts) still locate data sensibly.
   const legacyDir = path.join(app.getPath("home"), ".trustnode_edge", "data");
   try {
     if (fs.existsSync(legacyDir)) {
@@ -1139,6 +1152,46 @@ function createWindow() {
     } catch (_) {}
   });
 
+  // Operator 2026-06-18: workspace inspection + reset for the
+  // Settings page. The renderer NEVER touches disk directly; everything
+  // routes through these IPCs so the file operations always run with
+  // the tray's privileges (matters for ProgramData).
+  ipcMain.removeHandler("workspace:detect");
+  ipcMain.handle("workspace:detect", async () => {
+    try {
+      return { ok: true, workspaces: workspaceDetector.detectWorkspaces() };
+    } catch (err) {
+      return { ok: false, error: String(err && err.message || err) };
+    }
+  });
+  ipcMain.removeHandler("workspace:current");
+  ipcMain.handle("workspace:current", async () => {
+    return { ok: true, dataDir: chosenWorkspaceDataDir || "" };
+  });
+  ipcMain.removeHandler("workspace:reset");
+  ipcMain.handle("workspace:reset", async (_event, payload = {}) => {
+    // Caller must echo the literal string "DELETE" so a renderer XSS or
+    // an errant click can't wipe a workspace silently. Real confirmation
+    // UI lives in the Settings page.
+    if (String(payload?.confirm || "") !== "DELETE") {
+      return { ok: false, error: "confirmation token missing" };
+    }
+    try {
+      const userDataDir = app.getPath("userData");
+      const result = workspaceDetector.resetCurrentWorkspace(userDataDir);
+      // Force the tray to relaunch so the user picks a workspace fresh.
+      if (result.ok) {
+        setTimeout(() => {
+          try { app.relaunch(); } catch (_) {}
+          try { app.exit(0); } catch (_) {}
+        }, 250);
+      }
+      return result;
+    } catch (err) {
+      return { ok: false, error: String(err && err.message || err) };
+    }
+  });
+
   ipcMain.removeHandler("dialog:pick-folder");
   ipcMain.handle("dialog:pick-folder", async (_event, options = {}) => {
     if (!mainWindow || mainWindow.isDestroyed()) return null;
@@ -1535,6 +1588,38 @@ app.whenReady().then(async () => {
     }
   }
   Menu.setApplicationMenu(null);
+
+  // Operator 2026-06-18: workspace detection runs BEFORE the splash so
+  // the user makes the keep-existing-or-fresh choice on a clean dialog
+  // (not over a splash). The dialog only shows on installs that find
+  // existing data AND haven't been answered yet; subsequent launches go
+  // straight through.
+  try {
+    const userDataDir = app.getPath("userData");
+    const choice = await workspaceDetector.detectAndChooseWorkspace({
+      userDataDir,
+      electron,
+    });
+    if (choice === null) {
+      // User picked "Cancel" — quit gracefully without spawning backend.
+      bootLog("workspace detector: user cancelled at first-launch dialog");
+      app.quit();
+      return;
+    }
+    chosenWorkspaceDataDir = String(choice.dataDir || "");
+    bootLog(
+      `workspace detector: dataDir=${chosenWorkspaceDataDir} ` +
+      `reason=${choice.reason} ` +
+      `fresh=${choice.fresh} ` +
+      `backup=${choice.backupPath || "(none)"} ` +
+      `detected=${(choice.detectedPaths || []).length}`,
+    );
+  } catch (err) {
+    // Detector must never block boot. On unexpected failure, fall back
+    // to the legacy auto-detect path inside resolveBackendDataDir().
+    bootLog(`workspace detector failed (continuing with legacy auto-detect): ${String(err && err.message || err)}`);
+  }
+
   // Show the splash IMMEDIATELY so the user gets feedback the moment
   // the EXE is launched. startBackend() can take 5–20 s on a fresh
   // SmartScreen-scanning machine; without a splash the user sees a

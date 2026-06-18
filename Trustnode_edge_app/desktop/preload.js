@@ -14,6 +14,16 @@ contextBridge.exposeInMainWorld("trustnodeDialogs", {
   pickFolder: (options) => ipcRenderer.invoke("dialog:pick-folder", options || {})
 });
 
+// Operator 2026-06-18: workspace inspection + reset for the Settings
+// page. The renderer never touches disk directly; everything routes
+// through these IPCs so file ops always run with the tray's privileges.
+// resetWorkspace requires {confirm: "DELETE"} or the main process refuses.
+contextBridge.exposeInMainWorld("trustnodeWorkspace", {
+  detect: () => ipcRenderer.invoke("workspace:detect"),
+  current: () => ipcRenderer.invoke("workspace:current"),
+  reset: (confirm) => ipcRenderer.invoke("workspace:reset", { confirm })
+});
+
 // Splash screen bridge. The splash window's inline HTML calls
 // window.electronAPI.onSplashStatus to subscribe; the main UI never
 // receives `splash:status` events. Exposed via the same preload because
