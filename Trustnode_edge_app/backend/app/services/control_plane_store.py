@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -11,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 from app.tenant import normalize_tenant_id
+
+logger = logging.getLogger(__name__)
 
 
 class ControlPlaneStore:
@@ -742,6 +745,63 @@ class ControlPlaneStore:
                 for row in conn.execute("SELECT * FROM cp_edge_activation_codes").fetchall():
                     out["activation_codes"].append({k: row[k] for k in row.keys()})
         return out
+
+    def mirror_activation_to_registry(self) -> dict[str, Any]:
+        """Snapshot the current activation state into the Windows registry.
+
+        Called from three places:
+          1. Backend boot (after schema is ready) — so a fresh activation
+             is registry-mirrored as soon as it lands.
+          2. After import_activation_state — so workspace-imported
+             licenses gain the same registry protection.
+          3. (Future) After any upsert into cp_edges / cp_licenses /
+             cp_license_modules if we wire it to those code paths.
+
+        No-op on non-Windows. Never raises — registry I/O is purely
+        belt-and-braces; the SQLite DB remains authoritative.
+        """
+        try:
+            from app.services import activation_registry as _ar
+            payload = self.export_activation_state()
+            if not payload or not (payload.get("edges") or payload.get("licenses")):
+                return {"ok": False, "reason": "no activation state to mirror"}
+            return _ar.write_activation_receipt(payload)
+        except Exception as exc:
+            return {"ok": False, "reason": f"mirror failed: {exc}"}
+
+    def restore_activation_from_registry_if_empty(self) -> dict[str, Any]:
+        """If the local activation tables are empty (e.g. after a full
+        data-folder wipe + reinstall) AND a registry receipt exists,
+        restore the activation rows from the receipt.
+
+        Returns a status dict. No-op on non-Windows. Idempotent — once
+        any row exists in cp_edges, the restore is skipped on every
+        subsequent boot.
+        """
+        try:
+            with self._lock:
+                with self._connect() as conn:
+                    row = conn.execute("SELECT COUNT(*) AS c FROM cp_edges").fetchone()
+                    edge_count = int(row["c"]) if row else 0
+                    row = conn.execute("SELECT COUNT(*) AS c FROM cp_licenses").fetchone()
+                    license_count = int(row["c"]) if row else 0
+            if edge_count > 0 or license_count > 0:
+                return {"restored": False, "reason": "activation already present"}
+            from app.services import activation_registry as _ar
+            payload = _ar.read_activation_receipt()
+            if not payload or not isinstance(payload, dict):
+                return {"restored": False, "reason": "no registry receipt"}
+            result = self.import_activation_state(payload)
+            if result.get("ok"):
+                logger.info(
+                    "activation_registry: restored activation from %s (edges=%s licenses=%s)",
+                    payload.get("__source_hive") or "?",
+                    (result.get("applied") or {}).get("edges"),
+                    (result.get("applied") or {}).get("licenses"),
+                )
+            return {"restored": bool(result.get("ok")), "applied": result.get("applied")}
+        except Exception as exc:
+            return {"restored": False, "reason": f"restore failed: {exc}"}
 
     def import_activation_state(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Restore the activation rows from a workspace export.

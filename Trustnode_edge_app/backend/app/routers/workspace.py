@@ -124,6 +124,13 @@ def import_workspace(payload: WorkspaceImportRequest, request: Request) -> Dict[
         try:
             control_plane_store.import_activation_state(payload.license)
             license_applied = True
+            # Re-mirror the freshly-imported activation into the Windows
+            # registry so a future "wipe + reinstall" auto-restores from
+            # the registry without needing the JSON file again.
+            try:
+                control_plane_store.mirror_activation_to_registry()
+            except Exception:
+                pass
         except Exception as exc:
             failed["__license__"] = f"{type(exc).__name__}: {exc}"
     return {

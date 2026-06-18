@@ -1144,6 +1144,14 @@ def apply_activation_code(payload: ActivationCodeApplyRequest, request: Request)
             correlation_id=request.headers.get("X-Correlation-Id", "") or request.headers.get("X-Request-Id", "") or "-",
             details={"edge_id": payload.edge_id},
         )
+        # Operator 2026-06-18: mirror the freshly-activated edge into the
+        # Windows registry so a future data-folder wipe + reinstall
+        # auto-restores the license. Best-effort: failure here doesn't
+        # affect the activation itself.
+        try:
+            control_plane_store.mirror_activation_to_registry()
+        except Exception:
+            pass
         return {"ok": True, "row": row}
     except Exception as exc:
         control_plane_store.audit(

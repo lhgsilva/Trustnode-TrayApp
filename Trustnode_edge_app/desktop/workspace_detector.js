@@ -283,6 +283,38 @@ async function detectAndChooseWorkspace({ userDataDir, electron }) {
   };
 }
 
+// Operator 2026-06-18: clears the backend's activation-receipt mirror
+// in the Windows registry. Otherwise a workspace reset followed by a
+// relaunch would immediately re-restore the license from the registry,
+// defeating the "clean slate" intent.
+function clearActivationRegistry() {
+  if (process.platform !== "win32") return { cleared: false, reason: "non-windows" };
+  const child = require("child_process");
+  const keys = [
+    "HKLM\\Software\\TrustNode\\Activation",
+    "HKCU\\Software\\TrustNode\\Activation",
+  ];
+  const errors = [];
+  for (const k of keys) {
+    try {
+      // reg.exe delete /f succeeds even when the key is absent on some
+      // Windows versions; on others it returns 1. Either way the
+      // outcome is "key is gone or was never there" — both fine.
+      child.execFileSync("reg.exe", ["delete", k, "/f"], {
+        stdio: ["ignore", "ignore", "ignore"],
+        windowsHide: true,
+        timeout: 5000,
+      });
+    } catch (err) {
+      // Code 1 = key not found, which is the happy path.
+      if (err && err.status !== 1) {
+        errors.push(`${k}: ${String(err.message || err)}`);
+      }
+    }
+  }
+  return { cleared: errors.length === 0, errors };
+}
+
 // Exposed for the Settings → Reset Workspace flow. NOT called on first
 // launch; the caller is responsible for the type-DELETE confirm.
 function resetCurrentWorkspace(userDataDir) {
@@ -301,7 +333,11 @@ function resetCurrentWorkspace(userDataDir) {
   } catch (_) {}
   // Force re-prompt on next launch by clearing the persisted choice.
   try { fs.unlinkSync(path.join(userDataDir, "workspace-choice.json")); } catch (_) {}
-  return { ok: true, backupPath };
+  // Clear the activation registry mirror so the relaunch starts truly
+  // clean. Failure here is non-fatal — the SQLite wipe + workspace
+  // choice reset are the authoritative bits.
+  const registryResult = clearActivationRegistry();
+  return { ok: true, backupPath, registry: registryResult };
 }
 
 module.exports = {
