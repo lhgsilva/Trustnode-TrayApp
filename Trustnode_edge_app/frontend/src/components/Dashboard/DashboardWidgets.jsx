@@ -373,18 +373,15 @@ function _formatChartTickTime(ms, formatKey) {
   } catch (_) { return ""; }
 }
 
-function buildXAxisProps(series, cfg = {}) {
+function buildXAxisProps(series, cfg = {}, opts = {}) {
   const sample = Array.isArray(series) ? series.length : 0;
   const fmt = String(cfg?.chart_x_time_format || "hh_mm_ss");
   const angleRaw = Number(cfg?.chart_x_tick_angle);
   const angle = Number.isFinite(angleRaw) ? angleRaw : 0;
+  const categorical = !!opts?.categorical;
   const rotatedProps = angle === 0
     ? { height: 22 }
     : (() => {
-        // Same heights as LiveTagChart so the heavy + light renderers
-        // present the same chart footprint at any rotation. Tighter
-        // than the earlier 44/60 px steps so the plot area keeps as
-        // much vertical room as possible.
         const a = Math.abs(angle);
         const h = a < 35 ? 30 : a < 60 ? 40 : a < 80 ? 48 : 56;
         return {
@@ -393,6 +390,30 @@ function buildXAxisProps(series, cfg = {}) {
           height: h,
         };
       })();
+  // Operator 2026-06-18: bar charts must use a categorical (band) X axis
+  // so each bar occupies its own slot starting at the Y axis. The time-
+  // scaled axis used by line/area charts centers the first/last points on
+  // the axis edges — correct for points, wrong for bars (first bar straddles
+  // the Y axis instead of sitting to its right).
+  if (categorical) {
+    return {
+      dataKey: "idx",
+      tickFormatter: (idx) => {
+        const hit = Array.isArray(series) ? series.find((p) => p?.idx === idx) : null;
+        const ts = String(hit?.ts || "");
+        if (!ts) return String(idx);
+        const ms = toTsMs(ts);
+        if (Number.isFinite(ms)) return _formatChartTickTime(ms, fmt);
+        const t = ts.includes("T") ? ts.split("T")[1] : ts.split(" ")[1];
+        return String(t || ts).slice(0, 8);
+      },
+      minTickGap: 18,
+      tick: { fill: "var(--ink-soft, #8a98ab)", fontSize: 11 },
+      axisLine: { stroke: "var(--line, rgba(255,255,255,0.07))" },
+      tickLine: false,
+      ...rotatedProps,
+    };
+  }
   if (!sample) return { dataKey: "idx", ...rotatedProps };
   const tsMsLookup = new Map();
   let hasReal = false;
@@ -3069,7 +3090,7 @@ function DashboardWidgetCardImpl({
                     <BarChart data={series} margin={chartMargin} barCategoryGap="20%" barGap={2}>
                       {renderBarPattern(primaryColor)}
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                      <XAxis {...buildXAxisProps(series, cfg)} padding={{ left: 12, right: 12 }} />
+                      <XAxis {...buildXAxisProps(series, cfg, { categorical: true })} />
                       <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
@@ -3209,7 +3230,12 @@ function DashboardWidgetCardImpl({
                 <ComposedChart data={data} margin={{ ...chartMargin, right: anyRightAxis ? 32 : chartMargin.right }}>
                   {renderBarPattern(primaryColor)}
                   <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                  <XAxis {...buildXAxisProps(data, cfg)} />
+                  {/* Operator 2026-06-18: if every series in this composed
+                      chart is a bar, switch the X axis to categorical so
+                      the first bar sits to the right of the Y axis instead
+                      of straddling it (same fix as the dedicated BarChart
+                      branch above). Mixed bar+line keeps the time scale. */}
+                  <XAxis {...buildXAxisProps(data, cfg, { categorical: seriesDescriptors.length > 0 && seriesDescriptors.every((s) => s.kind === "bar_chart") })} />
                   <YAxis
                     yAxisId="left"
                     {...yAxisPresetProps}

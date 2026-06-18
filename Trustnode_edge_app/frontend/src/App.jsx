@@ -4972,8 +4972,13 @@ function AppShell() {
           // The license guard still re-routes when needed.
           setActivePage("dashboard");
         }
-        await refreshControlPlaneRuntimeContext();
-        await refreshControlPlaneUsers(u?.tenant_id || currentTenantId || "default");
+        // Boot perf (2026-06-18): these two have no data dependency on each
+        // other — both only need the identity fields resolved above. Run them
+        // in parallel so boot waits for the slower of the two, not both.
+        await Promise.all([
+          refreshControlPlaneRuntimeContext(),
+          refreshControlPlaneUsers(u?.tenant_id || currentTenantId || "default"),
+        ]);
       } catch (_) {
         clearAuthToken();
       }
@@ -6553,11 +6558,18 @@ function AppShell() {
           let cfg = null;
           let st = null;
           let usedBootstrapFallback = false;
-          try {
-            cfg = await getConfig();
-          } catch (cfgErr) {
+          // Boot perf (2026-06-18): getConfig and getStatus have no dependency
+          // on each other. Fire both in parallel; handle errors independently.
+          const [cfgResult, stResult] = await Promise.allSettled([
+            getConfig(),
+            getStatus(),
+          ]);
+          if (cfgResult.status === "fulfilled") {
+            cfg = cfgResult.value;
+          } else {
             // Cloud UX must stay available even if PLC config endpoint is temporarily unhealthy.
             // Try deriving a safe fallback from bootstrap before showing blocking loader.
+            const cfgErr = cfgResult.reason;
             try {
               const boot = await withTimeout(getAppStoreBootstrap(), 15000, "getAppStoreBootstrap");
               const gwCfgs = Array.isArray(boot?.data?.gateway_configurations)
@@ -6582,11 +6594,8 @@ function AppShell() {
               throw cfgErr;
             }
           }
-          try {
-            st = await getStatus();
-          } catch {
-            st = {};
-          }
+          // getStatus failure is always non-fatal — degrade to empty object.
+          st = stResult.status === "fulfilled" ? stResult.value : {};
           if (cancelled) return;
           setConfig(cfg || { ...FALLBACK_PLC_CONFIG });
           setStatus(st || {});

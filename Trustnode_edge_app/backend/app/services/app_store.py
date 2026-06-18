@@ -158,9 +158,6 @@ class AppStore:
         self._ensure_required_config_domains()
         self._ensure_local_edge_profile()
         self._ensure_default_database_configuration()
-        if not self._disable_config_push:
-            self._compact_sync_outbox_for_domains()
-            self._backfill_outbox_for_existing_domains()
         # Operator diagnostics: when a portable EXE runs with a different
         # working directory than expected, two app_store DBs can exist
         # in parallel. Logging the absolute path on every startup makes
@@ -169,32 +166,41 @@ class AppStore:
             print(f"[trustnode] app_store_db = {os.path.abspath(self._db_path)}", flush=True)
         except Exception:
             pass
-        # Reconcile the sync_targets row against the actual cloud target
-        # resolved from database_configurations once at startup, so a
-        # stale "no enabled cloud target" error from a previous run gets
-        # cleared as soon as a valid cloud config is present.
-        try:
-            self._reconcile_sync_targets_with_config()
-        except Exception:
-            pass
-        # Best-effort one-shot push of the Lite-readable mirror tables on
-        # startup. The periodic loop will do this every 5s anyway, but
-        # kicking it once at boot means a freshly-started backend doesn't
-        # leave the Lite app showing "no dashboards yet" for the first
-        # five-second window after a restart. Errors are swallowed; the
-        # periodic loop will retry.
-        try:
-            self._reconcile_lite_mirror_tables_once()
-        except Exception:
-            pass
-        # Seed demo report templates + push the local templates list to the
-        # cloud once on boot. Each demo is keyed by a stable id so seeding
-        # is idempotent — re-running it on subsequent boots won't duplicate
-        # rows or overwrite a customer-edited copy.
-        try:
-            self._seed_and_reconcile_report_templates_once()
-        except Exception:
-            pass
+        # Boot perf (2026-06-18): the four operations below (outbox compaction,
+        # outbox backfill, sync-target reconciliation, lite-mirror reconciliation,
+        # and report-template seeding) are all idempotent and post-schema.
+        # None is needed before the first HTTP request (/api/health or otherwise)
+        # — they are therefore moved to a background daemon thread so uvicorn
+        # binds and starts accepting connections sooner.  The config-sync loop
+        # already handles any gaps they would have filled (it runs every ~0.2 s).
+        _disable_push = self._disable_config_push
+
+        def _deferred_init(store: "AppStore") -> None:
+            try:
+                if not _disable_push:
+                    store._compact_sync_outbox_for_domains()
+                    store._backfill_outbox_for_existing_domains()
+            except Exception:
+                pass
+            try:
+                store._reconcile_sync_targets_with_config()
+            except Exception:
+                pass
+            try:
+                store._reconcile_lite_mirror_tables_once()
+            except Exception:
+                pass
+            try:
+                store._seed_and_reconcile_report_templates_once()
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_deferred_init,
+            args=(self,),
+            name="tn-appstore-deferred-init",
+            daemon=True,
+        ).start()
         # Boot-time mirror: republish every Lite-visible scoped doc so an
         # edge that just upgraded to a build with cloud-mirror support
         # backfills its history into Supabase WITHOUT requiring the

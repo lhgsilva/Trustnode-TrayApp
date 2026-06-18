@@ -456,21 +456,27 @@ function checkPortFree(host, port, timeoutMs = 1000) {
 }
 
 async function resolveBackendTarget() {
+  // Phase 4a-1 (operator 2026-06-18): probe port-free FIRST. Previously we
+  // ran a 1200 ms health check on every port before trying to bind — that
+  // burned a mandatory 1.2 s on the common case (port 8000 wide open, no
+  // backend running). Now we ask the OS if the port is free first (cheap,
+  // ~few ms on a free port) and only fall through to the health check when
+  // something is actually listening.
   const maxPortsToTry = 10;
   for (let i = 0; i < maxPortsToTry; i += 1) {
     const port = BACKEND_PORT + i;
-    const alive = await checkBackendHealth(BACKEND_HOST, port, 1200);
+    const free = await checkPortFree(BACKEND_HOST, port, 600);
+    if (free) return { host: BACKEND_HOST, port, reuse: false };
+    // Port is occupied — check if it's a reusable TrustNode backend.
+    const alive = await checkBackendHealth(BACKEND_HOST, port, 1000);
     if (alive) {
       const compatible = await checkBackendCompatibility(BACKEND_HOST, port);
       if (compatible) {
         logBackend(`Backend already running at http://${BACKEND_HOST}:${port}; reusing compatible process.`);
         return { host: BACKEND_HOST, port, reuse: true };
       }
-      logBackend(`Backend already running at http://${BACKEND_HOST}:${port} but not compatible; reserving this port.`);
-      continue;
+      logBackend(`Backend already running at http://${BACKEND_HOST}:${port} but not compatible; trying next port.`);
     }
-    const free = await checkPortFree(BACKEND_HOST, port, 800);
-    if (free) return { host: BACKEND_HOST, port, reuse: false };
   }
   return { host: BACKEND_HOST, port: BACKEND_PORT, reuse: false };
 }
@@ -1524,19 +1530,23 @@ app.whenReady().then(async () => {
   startBackendSupervisor();
   // Poll the backend health endpoint once so the splash transitions
   // to "Loading UI…" only after the backend is actually responsive.
-  // 8 s ceiling so a slow backend doesn't hold the splash forever —
+  // Ceiling raised to 12 s (from 8 s) to cover AV-heavy machines;
   // monitorBackendStartup keeps polling once the main window is up.
-  const splashHealthDeadline = Date.now() + 8000;
+  // Per-attempt timeout cut to 500 ms (loopback ECONNREFUSED arrives
+  // in <1 ms, so 1500 ms was pure wasted wall-clock). Inter-poll sleep
+  // cut to 100 ms so a backend that starts in ~3 s is detected within
+  // ~3.6 s instead of up to ~5.9 s with the old 400 ms cadence.
+  const splashHealthDeadline = Date.now() + 12000;
   while (Date.now() < splashHealthDeadline) {
     try {
       const alive = await checkBackendHealth(
         currentBackendHost,
         currentBackendPort,
-        1500,
+        500,
       );
       if (alive) break;
     } catch (_) { /* keep polling */ }
-    await new Promise((r) => setTimeout(r, 400));
+    await new Promise((r) => setTimeout(r, 100));
   }
   updateSplashStatus("Loading interface…");
   createWindow();

@@ -115,6 +115,31 @@ from app.services.cp_users_puller import build_from_env as build_cp_users_puller
 import app.state as _state
 from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
 
+# Boot perf (2026-06-18): pre-warm the asyncua (and amqtt) import in a
+# background thread the moment this module is loaded by uvicorn.  By the
+# time startup_event fires (after ASGI wiring, usually 300–800 ms later)
+# asyncua is already in sys.modules so the lazy import inside opcua_server
+# becomes a free dict-lookup instead of a 1–3 s parse-and-compile.
+# Python's import lock serialises concurrent imports safely; this is a
+# no-op if either library is absent (stripped build) or already imported.
+def _prewarm_optional_imports() -> None:
+    try:
+        import asyncua  # noqa: F401
+    except Exception:
+        pass
+    try:
+        import amqtt  # noqa: F401
+    except Exception:
+        pass
+
+import threading as _threading_prewarm
+_threading_prewarm.Thread(
+    target=_prewarm_optional_imports,
+    name="tn-prewarm-opcua-mqtt",
+    daemon=True,
+).start()
+del _threading_prewarm
+
 
 # Phase 3d (operator 2026-06-18): initialize Sentry crash reporting BEFORE
 # the FastAPI app so unhandled exceptions during route setup get captured.
@@ -364,37 +389,33 @@ _cloud_live_app.include_router(_cloud_live_inner_router)
 _cloud_live_app.add_middleware(CloudLiveAuthMiddleware)
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    # Manual-control default: never auto-run gateways on backend boot.
-    # Users start gateways explicitly from UI/runtime controls.
+async def _deferred_startup() -> None:
+    """Phase 4a-2 (operator 2026-06-18): heavy boot work moved off the
+    startup_event handler so uvicorn can answer /api/health the moment
+    it binds. None of these steps are required before the first request
+    arrives — they re-apply persistent state (LAN sharing, OPC UA, MQTT)
+    and start background pollers. Errors here only delay full feature
+    availability; they never block boot.
+    """
     try:
         await plc_manager.stop_all_gateways()
     except Exception:
         pass
-    # Ensure telemetry ingest URL and tenant context are hydrated even before
-    # any gateway loop iteration runs.
+    bootstrap = None
     try:
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False)
         telemetry_service.configure_from_bootstrap({"data": bootstrap})
     except Exception:
         bootstrap = None
-    # One-shot migration: lift templates/schedules out of the legacy
-    # `reporting_setup` JSON blob into the dedicated tables.
     try:
         if isinstance(bootstrap, dict):
             reports_store.migrate_from_bootstrap(bootstrap, tenant_id="default")
     except Exception:
         pass
-    # Start the report scheduler daemon (15s tick, idle when no schedules).
     try:
         report_scheduler.start()
     except Exception:
         pass
-    # Operator 2026-06-17: bring the in-process LAN socket up if the
-    # operator previously turned LAN sharing on. This replaces the
-    # old "restart backend" requirement — the second uvicorn server
-    # runs in a daemon thread alongside the primary 127.0.0.1 one.
     try:
         from app.services import lan_socket as _lan_socket
         s = bootstrap.get("app_settings") if isinstance(bootstrap, dict) and isinstance(bootstrap.get("app_settings"), dict) else {}
@@ -402,9 +423,6 @@ async def startup_event() -> None:
             _lan_socket.sync_with_settings(True, int(settings.trustnode_port))
     except Exception:
         pass
-    # Operator 2026-06-17 (Phase 3): re-apply previously enabled OPC UA
-    # / MQTT toggles on boot, same pattern as LAN sharing. Lazy imports
-    # so a stripped-down build without asyncua/amqtt still boots fine.
     try:
         s = bootstrap.get("app_settings") if isinstance(bootstrap, dict) and isinstance(bootstrap.get("app_settings"), dict) else {}
         conn = s.get("connections") if isinstance(s, dict) and isinstance(s.get("connections"), dict) else {}
@@ -476,6 +494,24 @@ async def startup_event() -> None:
                 _state.cp_users_puller = puller
     except Exception:
         pass
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    # Phase 4a-2: kick the deferred boot work onto the event loop so the
+    # startup handler returns immediately and uvicorn starts answering
+    # /api/health. The 2026-06-17 in-process LAN socket + OPC UA/MQTT
+    # re-apply moved into _deferred_startup() above.
+    import asyncio as _asyncio
+    try:
+        _asyncio.get_event_loop().create_task(_deferred_startup())
+    except Exception:
+        # If task creation fails, run inline as a safety net so functional
+        # parity with the pre-Phase-4a code is preserved.
+        try:
+            await _deferred_startup()
+        except Exception:
+            pass
 
 
 PUBLIC_PATHS = {
