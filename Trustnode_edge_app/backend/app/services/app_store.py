@@ -569,19 +569,23 @@ class AppStore:
         """Set edge_id on first run. CRITICAL: never silently REPLACE
         an existing edge_id, because the per-edge scope_key carries
         every device / gateway / trigger / alarm config — flipping the
-        id strands the customer's data at the old scope. Four cases:
+        id strands the customer's data at the old scope. Two cases:
 
-          1. edge_id already set to a real (non-'edge-01') id AND the
-             SQLite has real data under that scope → keep it.
-          2. edge_id already set BUT the SQLite has MUCH MORE data
-             under a different edge_id (same customer) → ADOPT the
-             richer one. This recovers customers stranded by a past
-             update that flipped the id mid-deployment.
-          3. edge_id absent or equals the legacy 'edge-01' AND the
-             SQLite already holds shared-edge data under some other
-             edge_id → ADOPT that existing edge_id.
-          4. Empty DB (truly first run, no prior data) → set
-             edge_id to self._local_edge_id (hostname-derived).
+          1. edge_id already set (anything non-empty, INCLUDING the
+             legacy 'edge-01') → keep it untouched. We do NOT rewrite
+             customer state from this function anymore.
+          2. Empty DB / no app_settings row yet (truly first run) →
+             try to ADOPT an existing edge_id from another scope in
+             the SAME SQLite (so users who imported a workspace see
+             their data at the right scope), else fall back to the
+             hostname-derived self._local_edge_id.
+
+        The read-time fallback (find_visible_scope_with_data, used by
+        get_bootstrap_scoped) is responsible for finding the customer's
+        actual configuration when scope_key shape changed across
+        versions. That path is purely read-only — never modifies the
+        SQLite. This keeps "the software must never delete or modify
+        the customer's data" as a hard invariant.
         """
         now = self._utc_now()
         with self._lock:
@@ -604,51 +608,13 @@ class AppStore:
                 if not isinstance(edge_profile, dict):
                     edge_profile = {}
                 current_edge_id = str(edge_profile.get("edge_id") or "").strip()
-                # Case 1/2: a real edge_id is set. Check if the SQLite
-                # is hiding richer data at a DIFFERENT edge_id — that
-                # happens when a past update or activation stranded the
-                # customer's gateways at the old scope. Adopt the
-                # alternate scope when it has at least 1.5× the weighted
-                # bytes of the current scope AND has a minimum absolute
-                # threshold of operator-configured data. The 1.5× factor
-                # rejects flips on tied-ish splits but is permissive
-                # enough to catch real stranding (a customer reported
-                # they lost gateways when alt was 2.08× richer).
-                if current_edge_id and current_edge_id != "edge-01":
-                    alt = self._find_richest_existing_edge_scope(conn)
-                    if alt and alt[2] != current_edge_id:
-                        alt_score = self._score_edge_scope(conn, alt[0], alt[1], alt[2])
-                        cur_score = self._score_edge_scope(conn, alt[0], alt[1], current_edge_id)
-                        if alt_score >= 4000.0 and alt_score >= cur_score * 1.5:
-                            try:
-                                print(
-                                    f"[trustnode][boot] migrating edge_id from {current_edge_id!r} "
-                                    f"-> {alt[2]!r} (alt scope has {alt_score:.0f} bytes-of-config vs "
-                                    f"current {cur_score:.0f}); customer data now visible",
-                                    flush=True,
-                                )
-                            except Exception:
-                                pass
-                            edge_profile["edge_id"] = alt[2]
-                            if alt[1] and alt[1] != "-":
-                                edge_profile["linked_customer_id"] = alt[1]
-                                if not payload.get("customer_id"):
-                                    payload["customer_id"] = alt[1]
-                            payload["edge_profile"] = edge_profile
-                            next_version = max(1, version + 1)
-                            conn.execute(
-                                """
-                                INSERT INTO config_documents(domain, payload_json, version, updated_utc)
-                                VALUES(?, ?, ?, ?)
-                                ON CONFLICT(domain) DO UPDATE SET
-                                  payload_json = excluded.payload_json,
-                                  version = excluded.version,
-                                  updated_utc = excluded.updated_utc
-                                """,
-                                ("app_settings", json.dumps(payload), next_version, now),
-                            )
+                # Case 1: any existing edge_id — leave it untouched.
+                # The read-time scope fallback handles cross-version
+                # scope mismatches without writes.
+                if current_edge_id:
                     return
-                # Case 3: empty / legacy edge_id, try to recover.
+                # Case 2: empty edge_id, try to recover by adopting the
+                # richest existing scope.
                 adopted: tuple[str, str, str] | None = self._find_richest_existing_edge_scope(conn)
                 if adopted:
                     adopted_tenant, adopted_customer, adopted_edge = adopted
@@ -4656,43 +4622,155 @@ class AppStore:
         }
         return out
 
+    def _build_read_fallback_scope_keys(self, conn: sqlite3.Connection, skey: str) -> list[str]:
+        """READ-ONLY: build an ordered list of candidate scope_keys to
+        probe when serving get_bootstrap_scoped. The requested skey is
+        always first; alternates from the same SQLite are appended so
+        the customer never sees an empty workspace when the scope key
+        shape changed between EXE versions.
+
+        Operator 2026-06-18: customer reported that after a version
+        update, gateways/devices/triggers disappeared from the UI even
+        though the SQLite still held them — at a DIFFERENT scope key.
+        The previous mitigation re-wrote app_settings.edge_id, which
+        the customer explicitly forbade ("the software should never
+        delete or modify the customer data"). This function is the
+        pure-read replacement: we find the alternate scopes and let
+        the caller overlay their rows on top of the requested-scope
+        rows. SQLite is read-only throughout.
+
+        Candidates in priority order (later overlays earlier so the
+        requested scope, when populated, takes precedence over alts):
+
+          1. Legacy 2-segment shape: tenant|-|edge
+          2. Same (customer, edge) under any other tenant — fixes
+             tenant_id changes between login and persistence.
+          3. Same customer, any edge — fixes the "we have data at
+             customer/edge-A and the running app asks for
+             customer/edge-B" case the customer hit.
+          4. Any 3-segment scope that holds richer data than what we
+             have so far (last-resort safety net).
+        """
+        parts = skey.split("|")
+        candidates: list[str] = []
+        # 1. Legacy 2-segment shape.
+        if len(parts) >= 3 and parts[1] and parts[1] != "-":
+            legacy = "|".join([parts[0], "-", *parts[2:]])
+            if legacy != skey:
+                candidates.append(legacy)
+        if len(parts) != 3:
+            return candidates + [skey]
+        tenant, customer, edge = parts[0], parts[1], parts[2]
+        try:
+            seen: set[str] = {skey, *candidates}
+            # 2. Same (customer, edge) under any other tenant.
+            for r in conn.execute(
+                "SELECT DISTINCT scope_key FROM config_documents_scoped "
+                "WHERE scope_key LIKE ? AND scope_key != ?",
+                (f"%|{customer}|{edge}", skey),
+            ).fetchall():
+                k = str(r["scope_key"] or "")
+                # 3-segment only (no user-scoped).
+                if k.count("|") == 2 and k not in seen:
+                    candidates.append(k)
+                    seen.add(k)
+            # 3. Same customer, any edge — pick the richest first.
+            scope_scores: list[tuple[float, str]] = []
+            for r in conn.execute(
+                "SELECT scope_key, domain, length(payload_json) AS L "
+                "FROM config_documents_scoped WHERE scope_key LIKE ?",
+                (f"%|{customer}|%",),
+            ).fetchall():
+                k = str(r["scope_key"] or "")
+                if k.count("|") != 2 or k in seen:
+                    continue
+                weight = self._SCOPE_DOMAIN_WEIGHTS.get(str(r["domain"] or ""), 0.0)
+                if weight <= 0 or int(r["L"] or 0) <= 4:
+                    continue
+                scope_scores.append((int(r["L"]) * weight, k))
+            scope_scores.sort(reverse=True)
+            seen_in_3 = set()
+            for _score, k in scope_scores:
+                if k in seen_in_3:
+                    continue
+                seen_in_3.add(k)
+                if k not in seen:
+                    candidates.append(k)
+                    seen.add(k)
+        except Exception:
+            pass
+        # Always probe the requested scope LAST so its rows overlay the
+        # fallback rows (current scope wins when populated).
+        candidates.append(skey)
+        return candidates
+
     def get_bootstrap_scoped(self, scope_key: str, prefer_cloud_reads: bool | None = None) -> Dict[str, Any]:
         skey = str(scope_key or "").strip()
         if not skey:
             return self.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
         out = self.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
-        # Legacy-key fallback: edges activated before linked_customer_id was
-        # threaded into edge_profile saved scoped docs under
-        # `tenant|-|edge` (2-segment). After the fix the running EXE
-        # resolves scope to `tenant|customer|edge` (3-segment) and an
-        # otherwise-unmigrated install would see empty arrays for the
-        # picker dropdowns. Probe both and overlay so the operator never
-        # loses data because of a scope-key shape change.
-        legacy_skey = ""
+        # Operator 2026-06-18: READ-ONLY per-domain fallback. The
+        # customer's data may live under a scope key whose
+        # (tenant, customer, edge) triple differs from the running
+        # app's resolved scope (an EXE update may have flipped the
+        # tenant or edge id). Strategy:
+        #   1. For the REQUESTED scope, read every domain — that data
+        #      always wins.
+        #   2. For each MISSING / empty domain, fall back to the LARGEST
+        #      non-empty payload in the same SQLite where the scope
+        #      key contains the same customer_id. We use byte-length as
+        #      the richness signal because it correlates with operator
+        #      effort and is cheap to compute via SQLite's length().
+        #
+        # SQLite is read-only throughout. No INSERT, UPDATE, DELETE.
         parts = skey.split("|")
-        if len(parts) >= 3 and parts[1] and parts[1] != "-":
-            # 3-segment shared scope: legacy is the same with '-' for customer.
-            legacy_skey = "|".join([parts[0], "-", *parts[2:]])
-        candidate_keys = [skey]
-        if legacy_skey and legacy_skey != skey:
-            # Read legacy FIRST so the current-scope row overlays it.
-            candidate_keys.insert(0, legacy_skey)
+        customer_id = parts[1] if len(parts) >= 2 else ""
         with self._lock:
             with self._connect() as conn:
-                for k in candidate_keys:
-                    rows = conn.execute(
-                        "SELECT domain, payload_json FROM config_documents_scoped WHERE scope_key = ?",
-                        (k,),
+                # Step 1: load the requested-scope rows first.
+                seen_domains: set[str] = set()
+                rows = conn.execute(
+                    "SELECT domain, payload_json FROM config_documents_scoped WHERE scope_key = ?",
+                    (skey,),
+                ).fetchall()
+                for row in rows:
+                    domain = str(row["domain"] or "").strip()
+                    if not domain:
+                        continue
+                    payload_text = str(row["payload_json"] or "null")
+                    try:
+                        parsed = json.loads(payload_text)
+                    except Exception:
+                        parsed = None
+                    if parsed in (None, [], {}):
+                        continue
+                    out[domain] = parsed
+                    seen_domains.add(domain)
+                # Step 2: for each domain we haven't satisfied yet,
+                # find the largest non-trivial payload across every
+                # scope whose key contains this customer_id.
+                if customer_id and customer_id != "-":
+                    like_pat = f"%|{customer_id}|%"
+                    domain_rows = conn.execute(
+                        "SELECT domain, payload_json, length(payload_json) AS L "
+                        "FROM config_documents_scoped WHERE scope_key LIKE ? "
+                        "AND length(payload_json) > 4 "
+                        "ORDER BY domain, length(payload_json) DESC",
+                        (like_pat,),
                     ).fetchall()
-                    for row in rows:
+                    for row in domain_rows:
                         domain = str(row["domain"] or "").strip()
-                        if not domain:
+                        if not domain or domain in seen_domains:
                             continue
                         payload_text = str(row["payload_json"] or "null")
                         try:
-                            out[domain] = json.loads(payload_text)
+                            parsed = json.loads(payload_text)
                         except Exception:
-                            out[domain] = None
+                            continue
+                        if parsed in (None, [], {}):
+                            continue
+                        out[domain] = parsed
+                        seen_domains.add(domain)
         if isinstance(out.get("metadata"), dict):
             out["metadata"]["scope_key"] = skey
         return out

@@ -522,11 +522,18 @@ export async function downloadHistorianXlsxReferenceTemplate() {
 }
 
 export async function discoverPlcNetwork(payload) {
+  // Operator 2026-06-18: the network scan walks every IP on every
+  // local /24 attached to the edge — on a multi-NIC plant box this
+  // is several hundred TCP probes that legitimately take 20-60s.
+  // The default fetchWithTimeout cap (12s) aborted the request mid-
+  // scan with "signal is aborted without reason" and the UI claimed
+  // "Discovery failed". Cap raised to 90s here so the operator sees
+  // the real result list when the network is large and slow.
   const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/discover-network`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {}),
-  });
+  }, 90000);
   if (!res.ok) {
     let detail = "";
     try {
