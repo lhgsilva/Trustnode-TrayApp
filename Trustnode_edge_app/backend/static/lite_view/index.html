@@ -8,12 +8,15 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="TrustNode" />
   <title>TrustNode Lite</title>
-  <link rel="manifest" href="/lite/manifest.json" />
-  <link rel="icon" href="/lite/trustnode_app_icon.png" type="image/png" />
-  <link rel="apple-touch-icon" href="/lite/trustnode_app_icon_180.png" />
-  <link rel="stylesheet" href="/lite/styles.css?v=20260612-1700" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="trustnode_app_icon.png" type="image/png" />
+  <link rel="apple-touch-icon" href="trustnode_app_icon_180.png" />
+  <link rel="stylesheet" href="styles.css?v=20260618" />
 
-  <!-- Import map so all React + Recharts modules resolve via esm.sh. -->
+  <!-- Operator 2026-06-18: LAN-served fork of the cloud Lite.
+       supabase-js is replaced by a local shim that routes all
+       supabase.from(...) calls to /api/lite-local/*. See
+       ./local_supabase_shim.js. -->
   <script type="importmap">
   {
     "imports": {
@@ -21,7 +24,7 @@
       "react-dom": "https://esm.sh/react-dom@18.3.1",
       "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
       "recharts": "https://esm.sh/recharts@2.13.3?deps=react@18.3.1",
-      "@supabase/supabase-js": "https://esm.sh/@supabase/supabase-js@2.45.4"
+      "@supabase/supabase-js": "./local_supabase_shim.js"
     }
   }
   </script>
@@ -48,18 +51,21 @@ let cfg = null;
 let supabase = null;
 
 async function loadConfig() {
-  // Use an absolute URL so the share-link route /lite/view/<token> still
-  // hits /lite/config.json instead of /lite/view/<token>/config.json
-  // (relative resolution against the current pathname).
-  const res = await fetch("/lite/config.json", { cache: "no-cache" });
-  if (!res.ok) throw new Error(`config.json HTTP ${res.status}`);
-  cfg = await res.json();
-  if (!cfg?.supabase_url || !cfg?.supabase_anon_key) {
-    throw new Error("config.json is missing supabase_url or supabase_anon_key");
-  }
-  supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key, {
-    auth: { persistSession: true, storageKey: "tnlite-auth", autoRefreshToken: true },
-  });
+  // Operator 2026-06-18: LAN-served fork. No config.json here — the
+  // shim already knows it talks to the local backend. Token comes from
+  // the URL (?token=…) and is stored in sessionStorage by the shim.
+  cfg = {
+    supabase_url: "local://lan",
+    supabase_anon_key: "local",
+    customer_label: "TrustNode Local",
+    show_dashboard_tab: true,
+    show_alarms_tab: true,
+    show_power_tab: true,
+    live_poll_ms: 2000,
+    history_default_limit: 300,
+    default_chart_range_minutes: 60,
+  };
+  supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key, {});
 }
 
 // ============================================================
@@ -4549,29 +4555,48 @@ function App({ viewLink = null }) {
 // a {tenant_id, customer_id, edge_id} scope the anonymous viewer is
 // allowed to see. App renders in read-only mode pinned to that tenant.
 function _detectViewLink() {
+  // Operator 2026-06-18: LAN slim Lite. Token can arrive three ways:
+  //   1. /trustnode/lite/app/?token=<TOKEN>          (landing redirect)
+  //   2. /lite/view/<TOKEN>                          (legacy cloud path)
+  //   3. sessionStorage from a previous landing      (within the tab)
   try {
-    const path = String(window.location.pathname || "");
-    const m = path.match(/\/lite\/view\/([^/?#]+)/);
-    return m ? decodeURIComponent(m[1]) : "";
+    const u = new URL(window.location.href);
+    const q = u.searchParams.get("token");
+    if (q) {
+      try { sessionStorage.setItem("tn_lite_local_token", q); } catch (_) {}
+      return q;
+    }
+    const m = String(u.pathname || "").match(/\/lite\/view\/([^/?#]+)/);
+    if (m) return decodeURIComponent(m[1]);
+    return sessionStorage.getItem("tn_lite_local_token") || "";
   } catch (_) { return ""; }
 }
 
 async function _resolveViewLink(token) {
   if (!token) return null;
-  // Resolver is mounted at the same origin (nginx proxies /api/* to the
-  // backend). Public — no Authorization header required.
+  // LAN slim Lite: call /api/lite-local/validate which returns the
+  // token's tenant/customer/edge scope. The Lite anchors every query
+  // to this scope so the dashboard, live data, etc. load correctly.
   try {
-    const res = await fetch(`/api/lite-view/resolve/${encodeURIComponent(token)}`, {
+    const res = await fetch(`/api/lite-local/validate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
       credentials: "omit",
+      body: JSON.stringify({ token: String(token) }),
     });
     if (res.status !== 200) return null;
     const body = await res.json();
     if (!body?.ok) return null;
-    return {
-      tenant_id: String(body.tenant_id || ""),
-      customer_id: String(body.customer_id || ""),
-      edge_id: String(body.edge_id || ""),
+    const out = {
+      tenant_id: String(body?.scope?.tenant_id || ""),
+      customer_id: String(body?.scope?.customer_id || ""),
+      edge_id: String(body?.scope?.edge_id || ""),
     };
+    // The supabase shim reads this to synthesize rows that match the
+    // cloud Lite's effectiveTenantId filter. Without it the dashboard
+    // loader's defensive tenant gate drops every row.
+    try { sessionStorage.setItem("tn_lite_local_scope", JSON.stringify(out)); } catch (_) {}
+    return out;
   } catch (_) { return null; }
 }
 
@@ -4599,6 +4624,29 @@ async function _resolveViewLink(token) {
   // gate entirely.
   const viewToken = _detectViewLink();
   let viewLink = null;
+  // Operator 2026-06-18: if the user signed in (has trustnode_auth_token
+  // in localStorage), we don't need a view-link token. We still ASK
+  // /api/lite-local/bootstrap for the scope so the dashboard tenant
+  // gate aligns with the local app_settings.
+  const hasJwt = (() => { try { return !!localStorage.getItem("trustnode_auth_token"); } catch (_) { return false; } })();
+  if (!viewToken && hasJwt) {
+    try {
+      const r = await fetch("/api/lite-local/bootstrap", {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${localStorage.getItem("trustnode_auth_token")}` },
+      });
+      if (r.ok) {
+        const body = await r.json();
+        const s = body?.session || {};
+        const scope = {
+          tenant_id: String(s.tenant_id || ""),
+          customer_id: String(s.customer_id || ""),
+          edge_id: String(s.edge_id || ""),
+        };
+        try { sessionStorage.setItem("tn_lite_local_scope", JSON.stringify(scope)); } catch (_) {}
+      }
+    } catch (_) {}
+  }
   if (viewToken) {
     viewLink = await _resolveViewLink(viewToken);
     if (!viewLink) {

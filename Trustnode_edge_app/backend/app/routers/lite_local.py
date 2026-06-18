@@ -139,9 +139,40 @@ def _extract_session(request: Request, token_qs: Optional[str]) -> Dict[str, Any
     if auth.lower().startswith("bearer "):
         bearer = auth[7:].strip()
     if bearer:
+        # 1. Try a Lite-local session JWT (issued by /validate).
         body = _verify_session_jwt(bearer)
         if body:
             return body
+        # 2. Operator 2026-06-18: accept the MAIN auth JWT too (issued
+        # by /api/auth/login). A logged-in LAN viewer doesn't have a
+        # view-link token, but they can still hit lite-local endpoints
+        # to load the dashboard. Scope comes from app_settings since
+        # the JWT is unscoped (tray-style login).
+        try:
+            from app.auth import decode_access_token
+            jwt_body = decode_access_token(bearer)
+            if jwt_body:
+                # Pull tenant/customer/edge from app_settings so the
+                # response carries a sensible scope for the shim's
+                # dashboard_configurations gate.
+                try:
+                    bootstrap = app_store.get_bootstrap() or {}
+                except Exception:
+                    bootstrap = {}
+                s = bootstrap.get("app_settings") or {}
+                if not isinstance(s, dict):
+                    s = {}
+                return {
+                    "tenant_id": str(jwt_body.get("tenant_id") or s.get("tenant_id") or "default"),
+                    "edge_id": str(s.get("edge_id") or ""),
+                    "customer_id": str(jwt_body.get("customer_id") or s.get("customer_id") or ""),
+                    "user_id": str(jwt_body.get("sub") or jwt_body.get("username") or ""),
+                    "scope_key": "",
+                    "token_id": "auth-jwt",
+                    "auth_source": "jwt",
+                }
+        except Exception:
+            pass
     if token_qs:
         row = control_plane_store.get_edge_view_link_by_token(token=token_qs)
         if row and str(row.get("status") or "").lower() == "active":
@@ -178,6 +209,64 @@ def _customer_target_or_none() -> Optional[Dict[str, Any]]:
 # ----------------------------------------------------------------------
 # Endpoints
 # ----------------------------------------------------------------------
+
+class AccessCheckRequest(BaseModel):
+    variant: str  # "full" | "lite" | "client"
+
+
+_VARIANT_FLAG = {
+    "full": "access_full",
+    "lite": "access_lite",
+    "client": "access_client",
+}
+
+
+@router.post("/check-access")
+def post_check_access(payload: AccessCheckRequest, request: Request) -> dict:
+    """Operator 2026-06-18 — LAN variant access gate.
+
+    Reads the Bearer JWT (set by /api/auth/login), looks up the user's
+    permissions, and returns 200 if access_<variant> is set, 403 otherwise.
+
+    The check intentionally ALSO succeeds if the user has role=admin or
+    role=super so the operator can always rescue themselves into any view.
+    """
+    variant = str(payload.variant or "lite").strip().lower()
+    flag = _VARIANT_FLAG.get(variant)
+    if not flag:
+        raise HTTPException(status_code=400, detail=f"unknown variant: {variant}")
+    auth_h = request.headers.get("authorization") or ""
+    token = ""
+    if auth_h.lower().startswith("bearer "):
+        token = auth_h[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    try:
+        from app.auth import decode_access_token
+        body = decode_access_token(token)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"invalid token: {exc}") from exc
+    username = str(body.get("sub") or body.get("username") or "").strip()
+    role = str(body.get("role") or "").strip().lower()
+    # Admin and super can access anything regardless of flag.
+    if role in ("admin", "super"):
+        return {"ok": True, "username": username, "variant": variant, "reason": "role"}
+    # Pull the latest permissions from app_store (not from the JWT — they
+    # may have been updated since the token was issued).
+    try:
+        bootstrap = app_store.get_bootstrap() or {}
+    except Exception:
+        bootstrap = {}
+    users_access = bootstrap.get("users_access") if isinstance(bootstrap.get("users_access"), dict) else {}
+    perms: Dict[str, Any] = {}
+    for u in (users_access.get("users") or []) if isinstance(users_access, dict) else []:
+        if str(u.get("username") or "") == username:
+            perms = u.get("permissions") or {}
+            break
+    if not bool(perms.get(flag)):
+        raise HTTPException(status_code=403, detail=f"user '{username}' lacks {flag}")
+    return {"ok": True, "username": username, "variant": variant, "reason": "permission"}
+
 
 class ValidateRequest(BaseModel):
     token: str

@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import sys
 import threading
 import shutil
 import hashlib
@@ -690,14 +691,42 @@ class AppStore:
             self._cloud_schema_ready_keys.add(target_key)
 
     def _resolve_db_path(self) -> str:
+        # Resolution order (operator 2026-06-18):
+        #   1. TRUSTNODE_APP_STORE_PATH env var (explicit override)
+        #   2. TRUSTNODE_DATA_DIR env var (legacy)
+        #   3. Windows: %ProgramData%\TrustNode\edge\trustnode_app_store.db
+        #      (set by the installer with restrictive ACL so casual users
+        #      can't open the DB in a SQLite editor)
+        #   4. Linux/Mac: ~/.trustnode_edge/data/trustnode_app_store.db
+        #
+        # The %ProgramData% move + ACL is the Phase 2b protection — it
+        # stops a customer's regular Windows user from editing the SQLite
+        # to flip license flags. An Administrator can still get in; the
+        # license SIGNATURE (Phase 2a) catches tampering even at that level.
         env_path = os.environ.get("TRUSTNODE_APP_STORE_PATH", "").strip()
         if env_path:
             base = env_path
         else:
             data_dir = os.environ.get("TRUSTNODE_DATA_DIR", "").strip()
             if not data_dir:
-                data_dir = os.path.join(os.path.expanduser("~"), ".trustnode_edge", "data")
+                if sys.platform == "win32":
+                    program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+                    data_dir = os.path.join(program_data, "TrustNode", "edge")
+                else:
+                    data_dir = os.path.join(os.path.expanduser("~"), ".trustnode_edge", "data")
             os.makedirs(data_dir, exist_ok=True)
+            # Migrate from the legacy ~\.trustnode_edge\data location to
+            # %ProgramData% if a legacy DB exists and the new one doesn't.
+            if sys.platform == "win32":
+                legacy = os.path.join(os.path.expanduser("~"), ".trustnode_edge", "data", "trustnode_app_store.db")
+                new = os.path.join(data_dir, "trustnode_app_store.db")
+                if os.path.exists(legacy) and not os.path.exists(new):
+                    try:
+                        import shutil
+                        shutil.copy2(legacy, new)
+                        print(f"[trustnode] migrated app store from {legacy} → {new}", flush=True)
+                    except Exception as exc:
+                        print(f"[trustnode] WARN: app store migration failed: {exc}", flush=True)
             base = os.path.join(data_dir, "trustnode_app_store.db")
         base = os.path.abspath(base)
         os.makedirs(os.path.dirname(base), exist_ok=True)

@@ -1814,6 +1814,35 @@ export function buildLiteLocalUrl(baseUrl, token) {
   return `${base}?token=${encodeURIComponent(token)}`;
 }
 
+// Operator 2026-06-18: build a LAN URL for a specific UI variant.
+// baseUrl is something like "http://10.7.0.1:8088/trustnode/lite/".
+// variant is "full" | "lite" | "client". The base URL's last segment
+// is swapped to match the variant. If the base doesn't have a known
+// trustnode/<variant>/ tail, returns as-is + ?token=.
+export function buildLanUrlForVariant(baseUrl, token, variant) {
+  if (!token || !baseUrl) return "";
+  const known = ["full", "lite", "client"];
+  const v = known.includes(String(variant)) ? variant : "lite";
+  let base = String(baseUrl).replace(/\/+$/, "");
+  // Replace the trailing /trustnode/<known>/ with /trustnode/<v>/.
+  base = base.replace(/\/trustnode\/(full|lite|client)$/, `/trustnode/${v}`);
+  // If the base didn't have /trustnode/<variant>, append it.
+  if (!/\/trustnode\/(full|lite|client)$/.test(base)) {
+    base = `${base}/trustnode/${v}`;
+  }
+  return `${base}/?token=${encodeURIComponent(token)}`;
+}
+
+// Pick the user's preferred LAN variant given their permission flags.
+// Preference: full → lite → client. Returns null if user has no access.
+export function pickLanVariantForUser(permissions) {
+  const p = permissions || {};
+  if (p.access_full) return "full";
+  if (p.access_lite) return "lite";
+  if (p.access_client) return "client";
+  return null;
+}
+
 // --- Outbound connections (OPC UA / MQTT, operator 2026-06-17) ---
 
 export async function getOpcuaStatus() {
@@ -1861,6 +1890,40 @@ export async function setMqttDisabled() {
     method: "POST",
   });
   await ensureOk(res, "Disabling MQTT broker failed");
+  return res.json();
+}
+
+// --- Directories (operator 2026-06-18) ---
+
+export async function getDirectories() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/directories`);
+  await ensureOk(res, "Fetching directories failed");
+  return res.json();
+}
+
+export async function setDirectories(overrides) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/directories`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ overrides: overrides || {} }),
+  });
+  await ensureOk(res, "Saving directories failed");
+  return res.json();
+}
+
+export async function resetDirectory(key) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/directories/reset/${encodeURIComponent(key)}`, {
+    method: "POST",
+  });
+  await ensureOk(res, "Resetting directory failed");
+  return res.json();
+}
+
+export async function openDirectory(key) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/directories/open/${encodeURIComponent(key)}`, {
+    method: "POST",
+  });
+  await ensureOk(res, "Opening directory failed");
   return res.json();
 }
 

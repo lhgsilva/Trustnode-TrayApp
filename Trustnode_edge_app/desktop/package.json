@@ -13,7 +13,7 @@
     "dev:electron": "cross-env TRUSTNODE_UI_URL=http://127.0.0.1:5173 electron .",
     "dev": "concurrently -k \"npm:dev:ui\" \"npm:dev:electron\"",
     "start": "electron .",
-    "build:ui": "npm --prefix ../frontend install && npm --prefix ../frontend run build",
+    "build:ui": "npm --prefix ../frontend install && npm --prefix ../frontend run build && npm --prefix ../frontend run build:clientview",
     "build:backend": "powershell -ExecutionPolicy Bypass -File ..\\scripts\\build-backend.ps1",
     "build:prepare": "npm run build:ui && npm run build:backend",
     "dist:installer": "npm run build:prepare && electron-builder --win nsis",
@@ -48,9 +48,15 @@
         "to": "frontend/dist"
       },
       {
+        "from": "../frontend/dist_client_view",
+        "to": "frontend/dist_client_view"
+      },
+      {
         "from": "../backend/dist/trustnode-service",
         "to": "backend",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "assets/trustnode_logo.ico",
@@ -104,5 +110,8 @@
       "artifactName": "TrustNode-Setup-${version}.exe",
       "include": "build/installer.nsh"
     }
+  },
+  "dependencies": {
+    "@sentry/electron": "^7.13.0"
   }
 }

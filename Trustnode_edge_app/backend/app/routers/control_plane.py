@@ -2718,7 +2718,135 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
         or check_edge_id
         or ""
     ).strip()
-    return {"ok": bool(out.get("ok")), "tenant_id": resolved_tenant, "edge_id": resolved_edge_id, **out}
+    # Operator 2026-06-18: grandfather features the customer was already
+    # running BEFORE the new license-module gate landed. On first boot
+    # after the EXE upgrade, app_settings.grandfathered_modules captures
+    # the currently-in-use connection/LAN feature keys. The frontend
+    # treats these as licensed even if the license doesn't include them.
+    grandfathered: list[str] = []
+    try:
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        s = bootstrap.get("app_settings") or {}
+        if isinstance(s, dict):
+            existing = s.get("grandfathered_modules")
+            if isinstance(existing, list):
+                grandfathered = [str(k).strip().lower() for k in existing if str(k).strip()]
+            else:
+                # First-boot capture: any feature toggled on or running RIGHT NOW
+                # gets grandfathered. Persist so next boots are stable.
+                derived: list[str] = []
+                if bool(s.get("lan_sharing_enabled")):
+                    derived.append("lan_access")
+                conn = s.get("connections") if isinstance(s.get("connections"), dict) else {}
+                if isinstance(conn.get("opcua"), dict) and bool(conn["opcua"].get("enabled")):
+                    derived.append("opcua")
+                if isinstance(conn.get("mqtt"), dict) and bool(conn["mqtt"].get("enabled")):
+                    derived.append("mqtt")
+                # Persist even if empty so the field exists (subsequent boots
+                # skip the derivation branch and trust the persisted list).
+                try:
+                    s_new = dict(s)
+                    s_new["grandfathered_modules"] = derived
+                    app_store.upsert_domain("app_settings", s_new, actor="license_grandfather")
+                    grandfathered = derived
+                except Exception:
+                    grandfathered = derived
+    except Exception:
+        pass
+    # Operator 2026-06-18: SIGN the license payload server-side IF this
+    # backend is running on the dev portal VPS (TRUSTNODE_LICENSE_SIGNING_PRIVATE_PEM
+    # env var present). The customer's tray then verifies the signature
+    # on every boot with the bundled public key. No private key on the
+    # customer machine, no forging.
+    try:
+        import os as _os
+        private_pem_str = _os.environ.get("TRUSTNODE_LICENSE_SIGNING_PRIVATE_PEM", "").strip()
+        if private_pem_str and isinstance(out.get("license"), dict):
+            from app.services.license_signature import sign_license_payload
+            lic = dict(out["license"])
+            # Strip any old signature before re-signing so the canonical
+            # payload reflects the current modules + dates.
+            lic.pop("signature", None)
+            try:
+                # If license has no "modules" yet (sometimes it's a separate
+                # query), attach the latest from the store so the signature
+                # actually covers what the customer will see.
+                mod_rows = control_plane_store.list_license_modules(
+                    license_id=str(lic.get("license_id") or ""),
+                )
+                lic["modules"] = [m for m in (mod_rows or []) if m.get("enabled")]
+            except Exception:
+                pass
+            out["license"] = sign_license_payload(lic, private_pem_str.encode("utf-8"))
+    except Exception as _exc:
+        logger.warning("license_signature: server-side signing failed: %s", _exc)
+
+    # Now verify on the response — the tray does the same check on its
+    # end with the bundled public key. Verifying here too gives the dev
+    # portal a sanity check.
+    sig_status = {"verified": False, "reason": "not checked"}
+    try:
+        from app.services.license_signature import verify_license_signature
+        # The license dict lives at out["license"] when out["ok"] is True.
+        license_payload = out.get("license") if isinstance(out.get("license"), dict) else None
+        sig_status = verify_license_signature(license_payload)
+        # Persist last successful verification for the offline-grace
+        # window. Used by the UI to decide whether to keep features open
+        # when the tray boots offline.
+        if sig_status.get("verified"):
+            try:
+                bs = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+                s2 = dict(bs.get("app_settings") or {})
+                from datetime import datetime, timezone
+                s2["license_last_verified_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                # Phase 3b: persist the latest signature status so the
+                # license_gate has it without re-verifying.
+                s2["license_signature_status"] = dict(sig_status)
+                app_store.upsert_domain("app_settings", s2, actor="license_verifier")
+            except Exception:
+                pass
+        else:
+            # Phase 3c (operator 2026-06-18): TAMPER ALERT.
+            # Signature was supplied but failed verification. Could be
+            # someone editing the local SQLite to flip license flags,
+            # someone moving a license file between machines, or a
+            # corrupted boot. Either way it's an event the operator
+            # MUST see in the logs.
+            if sig_status.get("signature_present"):
+                try:
+                    from datetime import datetime, timezone
+                    app_store.append_log_rows([{
+                        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "level": "error",
+                        "category": "license_tamper",
+                        "message": f"License signature INVALID — reason={sig_status.get('reason') or 'unknown'}. "
+                                   f"Premium modules locked until a valid license is re-issued.",
+                        "gateway_id": "",
+                        "gateway_name": "",
+                        "device_name": "",
+                        "database_name": "License",
+                    }])
+                except Exception:
+                    pass
+                # Also persist the bad status so license_gate can block writes.
+                try:
+                    bs = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+                    s2 = dict(bs.get("app_settings") or {})
+                    s2["license_signature_status"] = dict(sig_status)
+                    app_store.upsert_domain("app_settings", s2, actor="license_verifier")
+                except Exception:
+                    pass
+    except Exception as exc:
+        sig_status = {"verified": False, "reason": f"verifier error: {type(exc).__name__}"}
+
+    return {
+        "ok": bool(out.get("ok")),
+        "tenant_id": resolved_tenant,
+        "edge_id": resolved_edge_id,
+        "grandfathered_modules": grandfathered,
+        "license_signature": sig_status,
+        **out,
+    }
 
 
 # ---------------------------------------------------------------------------

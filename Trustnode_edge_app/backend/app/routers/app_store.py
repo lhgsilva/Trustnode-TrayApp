@@ -287,6 +287,25 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
 
 @router.post("/append/historian")
 def append_historian(payload: AppendRowsRequest) -> dict:
+    # Phase 3b (operator 2026-06-18): refuse data writes when the
+    # license is expired (no active trial) or the signature is invalid.
+    # The frontend already locks the UI in this state; this is the
+    # data-layer enforcement so a customer can't keep collecting
+    # historian data on an expired or tampered license.
+    try:
+        from app.services.license_gate import is_data_writes_allowed
+        allowed, reason = is_data_writes_allowed()
+        if not allowed:
+            raise HTTPException(
+                status_code=403,
+                detail=f"data writes blocked: {reason}",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        # License gate failure is never allowed to block data writes —
+        # see the comment in license_gate.py.
+        pass
     count = app_store.append_historian_rows(payload.rows)
     return {"ok": True, "tenant_id": get_current_tenant(), "count": count}
 

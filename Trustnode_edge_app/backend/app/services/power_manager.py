@@ -519,7 +519,13 @@ class PowerManager:
         now_mono: float,
         device_backoff: dict[int, float],
         min_span: int = 8,
+        budget_deadline_mono: float | None = None,
     ) -> None:
+        # Operator 2026-06-18: hard budget so a single slow block doesn't
+        # cascade and miss the next poll cycle entirely (which silently
+        # dropped every reading on every dashboard tag).
+        if budget_deadline_mono is not None and time.monotonic() > budget_deadline_mono:
+            return
         count = max(2, int(block_end - block_start + 1))
         try:
             res = client.read_input_registers(address=int(block_start), count=count, slave=unit_id)
@@ -542,6 +548,11 @@ class PowerManager:
             pass
 
         # Fallback strategy: split failed blocks into smaller ranges.
+        # Operator 2026-06-18: the previous 12s per-register backoff
+        # turned transient network blips into 12-second blackouts in
+        # the dashboard. Most meter glitches resolve in 1-2 polls;
+        # back off only briefly and let the next cycle retry.
+        backoff_s = max(0.5, float(os.environ.get("TRUSTNODE_POWER_REG_BACKOFF_S", "2.0") or "2.0"))
         span = int(block_end - block_start)
         if span <= min_span:
             for addr in range(int(block_start), int(block_end) + 1):
@@ -558,7 +569,7 @@ class PowerManager:
                         raw_values[key] = val
                     device_backoff.pop(int(addr), None)
                 except Exception:
-                    device_backoff[int(addr)] = now_mono + 12.0
+                    device_backoff[int(addr)] = now_mono + backoff_s
             return
 
         mid = int((block_start + block_end) // 2)
@@ -572,6 +583,7 @@ class PowerManager:
             now_mono,
             device_backoff,
             min_span=min_span,
+            budget_deadline_mono=budget_deadline_mono,
         )
         self._read_block_pairs(
             client,
@@ -583,6 +595,7 @@ class PowerManager:
             now_mono,
             device_backoff,
             min_span=min_span,
+            budget_deadline_mono=budget_deadline_mono,
         )
 
     def _poll_device(self, device: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
@@ -624,6 +637,12 @@ class PowerManager:
                 start = addr
                 end = addr + 1
             blocks.append((start, end))
+        # Operator 2026-06-18: cap total Modbus time at 80% of the
+        # poll interval so we always have time to enqueue + schedule
+        # the next cycle. Without this, a slow connection cascaded
+        # into "skipped" cycles and missing dashboard readings.
+        interval_s = max(0.25, float(device.get("poll_interval_ms") or 1000) / 1000.0)
+        budget_deadline = now_mono + (interval_s * 0.80)
         for block_start, block_end in blocks:
             self._read_block_pairs(
                 client=client,
@@ -635,9 +654,29 @@ class PowerManager:
                 now_mono=now_mono,
                 device_backoff=device_backoff,
                 min_span=max(4, int(float(os.environ.get("TRUSTNODE_POWER_BLOCK_MIN_SPAN", "8") or "8"))),
+                budget_deadline_mono=budget_deadline,
             )
+            if time.monotonic() > budget_deadline:
+                break
         if not raw_values:
-            raise RuntimeError("Read failed for all configured registers")
+            # Operator 2026-06-18: previously this raised → worker loop
+            # marked the device as errored and wrote NO rows for the
+            # cycle. Now we treat a fully-failed read as a transient
+            # blip and still emit insight tags from the LAST GOOD
+            # sample where possible so dashboards keep a continuous
+            # line instead of gaping. We do still raise if the device
+            # has never produced a sample yet (initial connection bug).
+            with self._lock:
+                prev_sample = self._last_samples.get(device_id)
+            if not prev_sample:
+                raise RuntimeError("Read failed for all configured registers")
+            # Reuse the last sample's values_scaled so insight rows can
+            # still be computed (peak_kw, total_kwh, etc. don't change
+            # if the meter didn't report). The worker still marks the
+            # cycle as a soft-error in metrics.
+            raw_values = dict(prev_sample.get("values_raw") or {})
+            if not raw_values:
+                raise RuntimeError("Read failed for all configured registers")
 
         # Operator 2026-06-16: modern power meters (Weidmüller EM525,
         # Carlo Gavazzi EM340/530, Schneider iEM/PM, Janitza UMG…)

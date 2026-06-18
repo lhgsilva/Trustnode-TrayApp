@@ -39,6 +39,14 @@ def _resolve_db_path() -> Path:
 
 
 def _resolve_reports_dir() -> Path:
+    # Operator 2026-06-18: honor app_settings.directories.reports first.
+    try:
+        from app.routers.directories import resolve_directory
+        out = resolve_directory("reports", create=True)
+        if out and Path(out).exists():
+            return Path(out)
+    except Exception:
+        pass
     base = os.environ.get("TRUSTNODE_DATA_DIR", "").strip()
     if base:
         out = Path(base) / "reports"

@@ -88,9 +88,11 @@ def get_status() -> dict:
     lan_port = lan_socket.current_port()
     ips = _local_ip_addresses() if lan_live else []
     primary_port = int(settings.trustnode_port)
-    # Lite URLs use the LAN-side port (not the primary 127.0.0.1 port)
-    # so LAN clients hit the 0.0.0.0 socket.
-    lite_urls = [f"http://{ip}:{lan_port}/lite/" for ip in ips] if lan_port else []
+    # Operator 2026-06-18: two LAN URLs per IP — slim Lite and full app.
+    # The legacy `lite_urls` field stays (now pointing at the new slim
+    # path) so existing tray code and copy-link buttons keep working.
+    lite_urls = [f"http://{ip}:{lan_port}/trustnode/lite/" for ip in ips] if lan_port else []
+    full_urls = [f"http://{ip}:{lan_port}/trustnode/full/" for ip in ips] if lan_port else []
     return {
         "ok": True,
         "enabled": enabled,
@@ -104,6 +106,7 @@ def get_status() -> dict:
         "lan_port": lan_port,
         "ips": ips,
         "lite_urls": lite_urls,
+        "full_urls": full_urls,
         "restart_required": False,
         "last_error": lan_socket.last_error(),
     }

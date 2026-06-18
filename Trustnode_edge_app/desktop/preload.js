@@ -25,5 +25,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     const listener = (_event, msg) => cb(msg);
     ipcRenderer.on("splash:status", listener);
     return () => ipcRenderer.removeListener("splash:status", listener);
-  }
+  },
+  // Operator 2026-06-18: renderer pushes the signed-in user's role so
+  // the tray can gate the LAN Sharing submenu to admin/super only.
+  setAuthRole: (payload) => ipcRenderer.send("auth:role", payload || {})
 });

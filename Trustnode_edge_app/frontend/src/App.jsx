@@ -101,12 +101,18 @@ import {
   rotateEdgeUserViewLink,
   getLiteLocalShareTargets,
   buildLiteLocalUrl,
+  buildLanUrlForVariant,
+  pickLanVariantForUser,
   getOpcuaStatus,
   setOpcuaEnabled,
   setOpcuaDisabled,
   getMqttStatus,
   setMqttEnabled,
   setMqttDisabled,
+  getDirectories,
+  setDirectories,
+  resetDirectory,
+  openDirectory,
   getControlPlaneLicenses,
   upsertControlPlaneLicense,
   deleteControlPlaneLicense,
@@ -230,15 +236,17 @@ const NAV_SECTIONS = [
   },
   // Operator 2026-06-17 (Phase 3): outbound Connections menu —
   // OPC UA + MQTT services the edge exposes to LAN clients.
+  // Operator 2026-06-18: LAN Sharing moved IN here as a sub-page so
+  // the admin can see endpoints + the toggle in one place.
   {
     id: "connections",
     title: "Connections",
-    items: ["Connections Overview", "OPC UA", "MQTT"]
+    items: ["Connections Overview", "LAN Sharing", "OPC UA", "MQTT"]
   },
   {
     id: "administration",
     title: "Settings",
-    items: ["Edge", "Interface", "Users and Access Control"]
+    items: ["Edge", "Interface", "Directories", "Users and Access Control"]
   }
 ];
 
@@ -276,6 +284,8 @@ function pageTitle(page) {
   if (page === "connections_overview") return "Connections Overview";
   if (page === "opc_ua") return "OPC UA";
   if (page === "mqtt") return "MQTT";
+  if (page === "lan_sharing") return "LAN Sharing";
+  if (page === "directories") return "Directories";
   return page.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
@@ -1818,6 +1828,9 @@ const PERMISSION_LABELS = {
   email_and_notifications: "Email and Notifications",
   scheduled_reports: "Scheduled Reports",
   users_and_access_control: "Users and Access",
+  access_full: "Full app (LAN web)",
+  access_lite: "Lite (LAN web — read-only)",
+  access_client: "Client View (LAN web)",
 };
 
 const PERMISSION_GROUPS = [
@@ -1829,6 +1842,13 @@ const PERMISSION_GROUPS = [
   { title: "Reporting", items: ["reporting", "scheduled_reports"] },
   { title: "Notifications", items: ["alarms", "email_and_notifications"] },
   { title: "Administration", items: ["interface", "database", "backup_and_retention", "control_plane", "users_and_access_control", "data_log"] },
+  // Operator 2026-06-18: per-user LAN-served UI access.
+  // - access_full   → /trustnode/full/app/   (FULL admin/editor React)
+  // - access_lite   → /trustnode/lite/app/   (SLIM cloud-style read-only Lite)
+  // - access_client → /trustnode/client/app/ (Client View React clientview)
+  // Admin generates a per-user view-link token; tray copy-URL picks the
+  // first allowed mode (Full first if it's set; else Lite; else Client).
+  { title: "LAN Web Access", items: ["access_full", "access_lite", "access_client"] },
 ];
 
 const CLIENT_MODULE_DEFS = [
@@ -1871,6 +1891,14 @@ const MODULE_KEY_BY_PAGE = {
   alarms: "alarms",
   reporting: "reporting",
   interface: "interface",
+  // Operator 2026-06-18: new license modules.
+  // - lan_access → gates LAN sharing toggle + per-user LAN web access
+  // - opcua      → gates the OPC UA server toggle on Connections page
+  // - mqtt       → gates the MQTT broker toggle on Connections page
+  connections_overview: "lan_access",
+  lan_sharing: "lan_access",
+  opc_ua: "opcua",
+  mqtt: "mqtt",
 };
 
 function deriveModuleKeysFromPermissions(perms = {}) {
@@ -2405,15 +2433,19 @@ function UserClientViewCell({ row, tenantScope, edgeId, isAdminViewer }) {
     }
   };
 
-  const onCopy = async () => {
+  // Operator 2026-06-18: per-user LAN URL respects the user's
+  // access_full / access_lite / access_client permission flags. If the
+  // admin clicked plain Copy, we pick the highest variant the user is
+  // allowed to open. The three explicit copy buttons below force a
+  // specific variant (only enabled when the user has that access).
+  const copyWithVariant = async (forced) => {
     const lk = await ensureLink();
     if (!lk?.token) return;
-    // Prefer a LAN URL — that's what the user is supposed to open in a
-    // browser. If LAN sharing isn't running we just copy the raw token so
-    // the user can paste it into the existing Lite landing prompt.
+    const perms = row?.permissions || {};
+    const variant = forced || pickLanVariantForUser(perms) || "lite";
     let textToCopy = lk.token;
     if (lanTargets?.urls?.length) {
-      textToCopy = buildLiteLocalUrl(lanTargets.urls[0], lk.token);
+      textToCopy = buildLanUrlForVariant(lanTargets.urls[0], lk.token, variant);
     }
     try {
       await navigator.clipboard.writeText(textToCopy);
@@ -2432,6 +2464,7 @@ function UserClientViewCell({ row, tenantScope, edgeId, isAdminViewer }) {
       } catch (_) {}
     }
   };
+  const onCopy = () => copyWithVariant(null);
 
   const onRotate = async () => {
     if (!userId || !edgeId) return;
@@ -2451,17 +2484,32 @@ function UserClientViewCell({ row, tenantScope, edgeId, isAdminViewer }) {
 
   if (!isAdminViewer) return <span style={{ color: "#666", fontSize: 11 }}>—</span>;
   if (!userId || !edgeId) return <span>-</span>;
+  const perms = row?.permissions || {};
+  const canFull = !!perms.access_full;
+  const canLite = !!perms.access_lite;
+  const canClient = !!perms.access_client;
+  const hasAnyAccess = canFull || canLite || canClient;
+  const variantBtn = (variant, label, enabled, title) => (
+    <button
+      key={variant}
+      type="button"
+      className="btn btn-secondary btn-sm"
+      onClick={() => copyWithVariant(variant)}
+      disabled={busy || !enabled}
+      title={enabled ? title : `Grant '${label}' access on this user to enable`}
+    >{label}</button>
+  );
   return (
-    <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
-      <button
-        type="button"
-        className="btn btn-secondary btn-sm"
-        onClick={onCopy}
-        disabled={busy}
-        title={lanTargets?.running
-          ? `Copy LAN Lite URL (port ${lanTargets.port || ""}) for this user`
-          : "Copy the user's Lite token (LAN sharing not on — paste the token into the Lite page)"}
-      >{justCopied ? "Copied!" : (link?.token ? "Copy" : "Generate")}</button>
+    <span style={{ display: "inline-flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
+      {!hasAnyAccess ? (
+        <span style={{ color: "#777", fontSize: 11 }}>no access flags</span>
+      ) : (
+        <>
+          {variantBtn("full", "Full",   canFull,   `Copy /trustnode/full/?token=… for ${userId}`)}
+          {variantBtn("lite", "Lite",   canLite,   `Copy /trustnode/lite/?token=… for ${userId}`)}
+          {variantBtn("client","Client",canClient, `Copy /trustnode/client/?token=… for ${userId}`)}
+        </>
+      )}
       <button
         type="button"
         className="btn btn-danger btn-sm"
@@ -2469,6 +2517,7 @@ function UserClientViewCell({ row, tenantScope, edgeId, isAdminViewer }) {
         disabled={busy || !link}
         title="Invalidate the current link and mint a new one"
       >Rotate</button>
+      {justCopied ? <span style={{ color: "#5eead4", fontSize: 11, marginLeft: 2 }}>copied</span> : null}
       {error ? <span style={{ color: "#d35454", fontSize: 11, marginLeft: 4 }} title={error}>!</span> : null}
     </span>
   );
@@ -2676,6 +2725,208 @@ function MqttSettingsPage({ canEdit }) {
           Eclipse Mosquitto is not bundled in this build. Selecting it will report "not installed" until <code>mosquitto.exe</code> is dropped in <code>backend/sidecars/mosquitto/</code>.
         </div>
       ) : null}
+    </section>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// LAN Sharing sub-page under Connections (operator 2026-06-18).
+// Admin-only. Reuses /api/lan-sharing/* endpoints. Shows the toggle
+// + endpoints list (one row per IP/URL pair: Lite / Full / Client).
+// ──────────────────────────────────────────────────────────────────────
+function LanSharingPage({ canEdit }) {
+  const [state, setState] = useState({
+    enabled: false, running: false, port: 0, lan_port: 0,
+    ips: [], lite_urls: [], full_urls: [], last_error: "",
+  });
+  const [busy, setBusy] = useState(false);
+  const refresh = useCallback(async () => {
+    try {
+      const res = await fetch("/api/lan-sharing/status", { method: "GET" });
+      if (res.ok) {
+        const body = await res.json();
+        setState((s) => ({ ...s, ...body }));
+      }
+    } catch (_) {}
+  }, []);
+  useEffect(() => { refresh(); const t = setInterval(refresh, 3000); return () => clearInterval(t); }, [refresh]);
+  const onToggle = async (enable) => {
+    setBusy(true);
+    try {
+      const action = enable ? "enable" : "disable";
+      await fetch(`/api/lan-sharing/${action}`, { method: "POST" });
+      await refresh();
+    } finally { setBusy(false); }
+  };
+  const rows = [];
+  for (let i = 0; i < (state.ips || []).length; i++) {
+    rows.push({
+      ip: state.ips[i],
+      lite: state.lite_urls?.[i] || "",
+      full: state.full_urls?.[i] || "",
+    });
+  }
+  return (
+    <section className="card">
+      <h3 style={{ marginTop: 0 }}>LAN Sharing</h3>
+      <p className="muted">When ON, the local edge backend binds to <code>0.0.0.0</code> so users on the same network can open Lite / Client View / Full URLs from their browser.</p>
+      <div className="row" style={{ alignItems: "center", gap: 10 }}>
+        <span className={`status-pill ${state.running ? "status-online" : "status-offline"}`}>
+          {state.running ? `Running on port ${state.lan_port || state.port}` : (state.enabled ? "Bind failed" : "Stopped")}
+        </span>
+        {!state.running && canEdit ? <button className="btn btn-primary" disabled={busy} onClick={() => onToggle(true)}>Turn ON</button> : null}
+        {state.running && canEdit  ? <button className="btn btn-danger"  disabled={busy} onClick={() => onToggle(false)}>Turn OFF</button> : null}
+      </div>
+      {state.last_error ? <div className="lock-note" style={{ marginTop: 10 }}>Last error: {state.last_error}</div> : null}
+
+      <h4 style={{ marginTop: 22 }}>Endpoints</h4>
+      {rows.length === 0 ? (
+        <div className="muted">No LAN endpoints active. Turn ON LAN Sharing to expose URLs.</div>
+      ) : (
+        <div className="table-scroll">
+          <div className="table directories-table">
+            <div className="thead">
+              <span>IP</span><span>Lite URL</span><span>Full URL</span><span>Actions</span>
+            </div>
+            {rows.map((r, idx) => (
+              <div key={`lan-${idx}`} className="trow">
+                <span>{r.ip}</span>
+                <span title={r.lite} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.lite}</span>
+                <span title={r.full} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.full}</span>
+                <span className="row-actions">
+                  <button className="btn btn-secondary btn-sm" title="Copy Lite URL" onClick={() => navigator.clipboard?.writeText(r.lite)}>Copy Lite</button>
+                  <button className="btn btn-secondary btn-sm" title="Copy Full URL" onClick={() => navigator.clipboard?.writeText(r.full)}>Copy Full</button>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Directories sub-page under Settings (operator 2026-06-18).
+// Admin-only. List of standard output folders with default + current
+// path, an "Open" button (reveals in OS file manager) and a path
+// input + Pick button to override per row.
+// ──────────────────────────────────────────────────────────────────────
+function DirectoriesPage({ canEdit }) {
+  const [rows, setRows] = useState([]);
+  const [draft, setDraft] = useState({});
+  const [busy, setBusy] = useState(false);
+  const refresh = useCallback(async () => {
+    try {
+      const data = await getDirectories();
+      setRows(Array.isArray(data?.rows) ? data.rows : []);
+      setDraft({});
+    } catch (_) {}
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const onPick = async (key) => {
+    if (!window?.trustnodeDialogs?.pickFolder) {
+      window.alert("Folder picker is only available in the desktop tray app. Type the path manually instead.");
+      return;
+    }
+    const picked = await window.trustnodeDialogs.pickFolder({ title: "Pick folder" });
+    if (!picked) return;
+    setDraft((d) => ({ ...d, [key]: picked }));
+  };
+  const onSave = async () => {
+    if (!canEdit) return;
+    setBusy(true);
+    try {
+      const overrides = {};
+      for (const r of rows) {
+        const next = draft[r.key];
+        if (typeof next === "string") overrides[r.key] = next;
+      }
+      // Anything not in draft stays untouched: backend merges with stored.
+      // Build a full overrides map by taking current_path for rows in
+      // draft, default_path stays default for rows we reset.
+      const fullMap = {};
+      for (const r of rows) {
+        if (r.key in overrides) fullMap[r.key] = overrides[r.key];
+        else if (r.is_overridden) fullMap[r.key] = r.current_path;
+      }
+      const updated = await setDirectories(fullMap);
+      setRows(Array.isArray(updated?.rows) ? updated.rows : []);
+      setDraft({});
+    } finally { setBusy(false); }
+  };
+  const onReset = async (key) => {
+    if (!canEdit) return;
+    setBusy(true);
+    try {
+      const updated = await resetDirectory(key);
+      setRows(Array.isArray(updated?.rows) ? updated.rows : []);
+      setDraft((d) => { const c = { ...d }; delete c[key]; return c; });
+    } finally { setBusy(false); }
+  };
+  const onOpen = async (key) => {
+    try { await openDirectory(key); } catch (_) {}
+  };
+  const dirty = Object.keys(draft).length > 0;
+
+  return (
+    <section className="card">
+      <h3 style={{ marginTop: 0 }}>Directories</h3>
+      <p className="muted">Pick where the app saves generated files. Defaults work for most installs; override per row if you need a shared network folder or a customer-specific path.</p>
+      <div className="table-scroll" style={{ marginTop: 12 }}>
+        <div className="table directories-table">
+          <div className="thead">
+            <span>Folder</span>
+            <span>Current location</span>
+            <span>Status</span>
+            <span>Actions</span>
+          </div>
+          {rows.map((r) => {
+            const next = draft[r.key];
+            const shownPath = typeof next === "string" ? next : r.current_path;
+            const statusBadge = !r.exists
+              ? <span className="status-pill status-warn">missing</span>
+              : !r.writable
+                ? <span className="status-pill status-warn">read-only</span>
+                : r.is_overridden
+                  ? <span className="status-pill status-online">custom</span>
+                  : <span className="status-pill">default</span>;
+            return (
+              <div key={r.key} className="trow">
+                <span>
+                  <div style={{ fontWeight: 600 }}>{r.label}</div>
+                  <div className="muted" style={{ fontSize: 11, marginTop: 2 }}>{r.hint}</div>
+                </span>
+                <span>
+                  <input
+                    style={{ width: "100%" }}
+                    value={shownPath || ""}
+                    onChange={(e) => setDraft((d) => ({ ...d, [r.key]: e.target.value }))}
+                    disabled={!canEdit}
+                    placeholder={r.default_path}
+                  />
+                  {r.is_overridden ? <div className="muted" style={{ fontSize: 10, marginTop: 4 }}>default: {r.default_path}</div> : null}
+                </span>
+                <span>{statusBadge}</span>
+                <span className="row-actions" style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  <button className="btn btn-secondary btn-sm" onClick={() => onOpen(r.key)} title="Open in file manager">Open</button>
+                  <button className="btn btn-secondary btn-sm" onClick={() => onPick(r.key)} disabled={!canEdit} title="Pick a folder">Pick…</button>
+                  {r.is_overridden ? (
+                    <button className="btn btn-danger btn-sm" onClick={() => onReset(r.key)} disabled={!canEdit} title="Revert to default">Reset</button>
+                  ) : null}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div className="row" style={{ marginTop: 12, gap: 8 }}>
+        <button className="btn btn-primary" onClick={onSave} disabled={!canEdit || !dirty || busy}>
+          {busy ? "Saving…" : (dirty ? "Save changes" : "No changes")}
+        </button>
+        <button className="btn btn-secondary" onClick={refresh} disabled={busy}>Refresh</button>
+      </div>
     </section>
   );
 }
@@ -3566,6 +3817,29 @@ function AppShell() {
 
   const [users, setUsers] = useState([]);
   const [currentUser, setCurrentUser] = useState(null);
+  // Operator 2026-06-18: push the signed-in user's role into the tray
+  // process so it can gate the LAN Sharing submenu to admin/super only.
+  // No-op in non-Electron contexts (web browser, LAN visitor) — the
+  // window.electronAPI bridge only exists in the desktop tray.
+  useEffect(() => {
+    try {
+      if (typeof window !== "undefined" && window?.electronAPI?.setAuthRole) {
+        // Phase 3a (operator 2026-06-18): also push the JWT. The tray
+        // calls /api/auth/me with this token on every right-click —
+        // the role field below is informational only and gets
+        // overwritten by the server's reply. Closes the spoof path
+        // where a compromised renderer claims role=admin without
+        // having a valid admin JWT.
+        let token = "";
+        try { token = localStorage.getItem("trustnode_auth_token") || ""; } catch (_) {}
+        window.electronAPI.setAuthRole({
+          username: String(currentUser?.username || ""),
+          role:     String(currentUser?.role || "").toLowerCase(),
+          token,
+        });
+      }
+    } catch (_) {}
+  }, [currentUser?.username, currentUser?.role]);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(getFullscreenState);
   const [edgeLinked, setEdgeLinked] = useState(() => {
@@ -9365,6 +9639,29 @@ function AppShell() {
     () => normalizeLicenseModuleKeys(edgeLicenseSnapshot?.license?.modules),
     [edgeLicenseSnapshot?.license?.modules]
   );
+  // Operator 2026-06-18: grandfathered modules — features the customer
+  // was already running BEFORE the new license-module check rolled out.
+  // Set on first boot by the backend; clients receive it via the
+  // license snapshot. Treat as licensed so upgrading the EXE never
+  // breaks running plants until the dev-portal admin grants a real
+  // license.
+  const grandfatheredModules = useMemo(() => {
+    const raw = edgeLicenseSnapshot?.grandfathered_modules;
+    if (!Array.isArray(raw)) return new Set();
+    return new Set(raw.map((k) => String(k || "").toLowerCase()).filter(Boolean));
+  }, [edgeLicenseSnapshot?.grandfathered_modules]);
+  // Operator 2026-06-18: license signature tamper detection.
+  //   - signature.verified=true        → normal licensing rules
+  //   - signature.signature_present=false (legacy build) → trust grandfather
+  //   - signature.verified=false AND signature.signature_present=true
+  //     → tampered license. Lock everything beyond the 30-day grace
+  //       window, measured from last_verified_utc in the snapshot.
+  const licenseTampered = useMemo(() => {
+    const sig = edgeLicenseSnapshot?.license_signature;
+    if (!sig || sig.signature_present !== true) return false;
+    if (sig.verified) return false;
+    return true;
+  }, [edgeLicenseSnapshot?.license_signature]);
   const isPageLicensed = useCallback(
     (page) => {
       const required = MODULE_KEY_BY_PAGE[page];
@@ -9377,10 +9674,16 @@ function AppShell() {
       // calls remain the authoritative gate.
       if (isClientView) return true;
       if (!edgeLicenseSnapshot?.ok) return false;
+      // Tampered license → everything locked, period. No grandfather
+      // override here on purpose — the whole point of the signature is
+      // to defeat the "edit the SQLite to flip flags" attack.
+      if (licenseTampered) return false;
+      const key = String(required || "").toLowerCase();
+      if (grandfatheredModules.has(key)) return true;
       if (!licensedModuleKeys.length) return false;
-      return licensedModuleKeys.includes(String(required || "").toLowerCase());
+      return licensedModuleKeys.includes(key);
     },
-    [isClientView, edgeLicenseSnapshot?.ok, licensedModuleKeys]
+    [isClientView, edgeLicenseSnapshot?.ok, licensedModuleKeys, grandfatheredModules, licenseTampered]
   );
 
   const hasClientModuleAccess = useCallback(
@@ -9457,6 +9760,19 @@ function AppShell() {
     const isAdmin = role === "admin" || role === "super";
     if (!isAdmin && !isPageLicensed(page) && ["dashboard", "power_overview", "historian", "alarms", "reporting", "interface"].includes(page)) {
       return false;
+    }
+    // Operator 2026-06-18: new license-gated pages.
+    //   - connections_overview / opc_ua / mqtt → require lan_access/opcua/mqtt modules
+    // In the FULL edge app: page stays open but the page body shows a lock
+    // (handled by the page renderer + renderLock); we still allow navigation
+    // so the operator can see what they're missing.
+    // In the LITE / CLIENT VIEW: hide the menu item entirely when missing.
+    if (["connections_overview", "lan_sharing", "opc_ua", "mqtt"].includes(page)) {
+      if (!isPageLicensed(page)) {
+        if (isClientView) return false; // hide entirely in lite/client view
+        // Full edge app: allow open so the lock icon explains the gate.
+        return true;
+      }
     }
     // Single-file customer portal build: block ONLY edge-runtime config
     // pages that don't make sense to expose to the web (gateway runtime
@@ -18032,7 +18348,18 @@ const getGatewayHealth = (gateway) => {
     );
   }
 
-  const renderLock = (page) => (!canEditPage(page) ? <span className="lock-tag">LOCK</span> : null);
+  // Operator 2026-06-18: also surface a LOCK when the license module
+  // for this page is missing (lan_access / opcua / mqtt). For dashboard /
+  // power / historian / etc., canEditPage already covers it via the role
+  // check + isPageLicensed. The Connections pages are admin-permission
+  // by default so they need their own license fallback.
+  const renderLock = (page) => {
+    if (!canEditPage(page)) return <span className="lock-tag">LOCK</span>;
+    if (["connections_overview", "lan_sharing", "opc_ua", "mqtt"].includes(page) && !isPageLicensed(page)) {
+      return <span className="lock-tag" title="Feature not included in your license">LOCK</span>;
+    }
+    return null;
+  };
   const appSurface = isPortalOnly ? "portal" : (isHostedWebClient ? "client" : "local");
 
   const showTopLicenseBanner = !isPortalOnly && currentUser && !isHostedWebClient && !licenseBannerHidden;
@@ -18136,6 +18463,21 @@ const getGatewayHealth = (gateway) => {
           </button>
         </div>
       </header>
+      {licenseTampered ? (
+        <div className="license-banner license-banner-tampered" style={{
+          background: "rgba(220, 38, 38, 0.15)",
+          color: "#fca5a5",
+          border: "1px solid rgba(220, 38, 38, 0.4)",
+          padding: "10px 16px",
+          fontSize: 13,
+          fontWeight: 600,
+          textAlign: "center",
+        }}>
+          ⚠ License signature is invalid. All premium modules are locked.
+          Contact TrustNode support — the license file may have been modified
+          since it was issued.
+        </div>
+      ) : null}
       {showTopLicenseBanner ? (() => {
         // Three banner states:
         //   1. license valid — GREEN, no action.
@@ -21423,13 +21765,19 @@ const getGatewayHealth = (gateway) => {
           ) : null}
 
           {activePage === "connections_overview" ? (
-            <ConnectionsOverviewPage />
+            <ConnectionsOverviewPage canEdit={isPageLicensed("connections_overview") && String(currentUser?.role || "").toLowerCase() === "admin"} />
           ) : null}
           {activePage === "opc_ua" ? (
-            <OpcuaSettingsPage canEdit={String(currentUser?.role || "").toLowerCase() === "admin"} />
+            <OpcuaSettingsPage canEdit={isPageLicensed("opc_ua") && String(currentUser?.role || "").toLowerCase() === "admin"} />
           ) : null}
           {activePage === "mqtt" ? (
-            <MqttSettingsPage canEdit={String(currentUser?.role || "").toLowerCase() === "admin"} />
+            <MqttSettingsPage canEdit={isPageLicensed("mqtt") && String(currentUser?.role || "").toLowerCase() === "admin"} />
+          ) : null}
+          {activePage === "lan_sharing" ? (
+            <LanSharingPage canEdit={isPageLicensed("connections_overview") && String(currentUser?.role || "").toLowerCase() === "admin"} />
+          ) : null}
+          {activePage === "directories" ? (
+            <DirectoriesPage canEdit={String(currentUser?.role || "").toLowerCase() === "admin"} />
           ) : null}
 
           {activePage === "interface" ? (
@@ -22847,7 +23195,7 @@ const getGatewayHealth = (gateway) => {
                         <span>{u.permissions?.users_and_access_control ? "Yes" : "No"}</span>
                         <span>
                           <UserClientViewCell
-                            row={{ username: u.username }}
+                            row={u}
                             tenantScope=""
                             edgeId={String(edgeProfile?.edge_id || "")}
                             isAdminViewer={canManageUsers}

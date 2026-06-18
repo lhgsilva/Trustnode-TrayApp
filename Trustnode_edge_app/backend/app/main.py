@@ -96,6 +96,7 @@ from app.routers.customer_db import router as customer_db_router
 from app.routers.lan_sharing import router as lan_sharing_router
 from app.routers.lite_local import router as lite_local_router
 from app.routers.connections import router as connections_router
+from app.routers.directories import router as directories_router
 from app.routers.reports import router as reports_router
 from app.routers.cloud_live import router as cloud_live_router
 from app.routers.historian_export import router as historian_export_router
@@ -113,6 +114,40 @@ from app.state import (
 from app.services.cp_users_puller import build_from_env as build_cp_users_puller
 import app.state as _state
 from app.tenant import resolve_request_tenant, resolve_websocket_tenant, set_current_tenant
+
+
+# Phase 3d (operator 2026-06-18): initialize Sentry crash reporting BEFORE
+# the FastAPI app so unhandled exceptions during route setup get captured.
+# Opt-in via TRUSTNODE_SENTRY_DSN env var — no DSN means no telemetry.
+# The free-tier Sentry plan (5K events/month) is plenty for plant edges.
+def _init_sentry() -> None:
+    import os as _os
+    dsn = _os.environ.get("TRUSTNODE_SENTRY_DSN", "").strip()
+    if not dsn:
+        return
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        from sentry_sdk.integrations.logging import LoggingIntegration
+        sentry_sdk.init(
+            dsn=dsn,
+            traces_sample_rate=0.0,  # disable perf tracing — only crashes
+            send_default_pii=False,  # never send usernames / IPs by default
+            release=_os.environ.get("TRUSTNODE_RELEASE_TAG", "edge-dev"),
+            environment=_os.environ.get("TRUSTNODE_SENTRY_ENV", "production"),
+            integrations=[
+                FastApiIntegration(transaction_style="endpoint"),
+                LoggingIntegration(level=None, event_level=None),  # logs only as breadcrumbs
+            ],
+            # Anything below ERROR isn't worth our 5K-event budget.
+            before_send=lambda event, _hint: event if event.get("level") in (None, "error", "fatal") else None,
+        )
+    except Exception:
+        # Never let telemetry block boot.
+        pass
+
+
+_init_sentry()
 
 app = FastAPI(title="Trustnode Edge API", version="0.1.0")
 
@@ -228,45 +263,78 @@ app.include_router(lan_sharing_router)
 app.include_router(lite_local_router)
 # Operator 2026-06-17 (Phase 3): outbound connections (OPC UA / MQTT).
 app.include_router(connections_router)
+# Operator 2026-06-18: directories management (Settings → Directories).
+app.include_router(directories_router)
 
-# Operator 2026-06-17 (M7 → Phase 2 rewrite): serve the REAL React Lite
-# UI (same bundle deployed at trustnode.lsapps.app/lite/) at /lite/app/,
-# and a tiny landing page at /lite/ that turns a view-link token into
-# the same JWT the React Lite expects, then redirects.
+# Operator 2026-06-18: THREE LAN-served UIs, distinct paths.
 #
-# Layout served by the backend:
-#   GET /lite/                  → landing.html (token entry / exchange)
-#   GET /lite/app/              → React Lite SPA (frontend/dist)
-#   GET /lite/app/assets/...    → React Lite assets
-#   GET /lite/assets/...        → landing assets (logo)
-#   GET /api/lite-local/...     → token-validate + scoped data
-#
-# Both static trees survive PyInstaller's _MEIPASS layout.
+#   GET /trustnode/lite/               → landing (token entry) — SLIM
+#   GET /trustnode/lite/app/           → SLIM Lite (forked cloud Lite, vanilla JS,
+#                                        wired to /api/lite-local/*) — same design
+#                                        as trustnode.lsapps.app/lite/
+#   GET /trustnode/full/               → landing — FULL
+#   GET /trustnode/full/app/           → FULL React app (frontend/dist) — admin
+#   GET /trustnode/client/             → landing — CLIENT VIEW
+#   GET /trustnode/client/app/         → React clientview (frontend/dist_client_view)
+#   GET /api/lite-local/...            → token-validate + scoped data (shared)
 try:
     import sys as _sys
     _landing_candidates = [
         Path(__file__).resolve().parent.parent / "static" / "lite",
     ]
+    _login_candidates = [
+        Path(__file__).resolve().parent.parent / "static" / "login",
+    ]
+    # SLIM Lite = fork of cloud Lite, wired to /api/lite-local/*
+    _slim_lite_candidates = [
+        Path(__file__).resolve().parent.parent / "static" / "lite_view",
+    ]
+    # CLIENT VIEW = Vite build:clientview output
+    _clientview_candidates = [
+        Path(__file__).resolve().parent.parent.parent / "frontend" / "dist_client_view",
+        Path(__file__).resolve().parent.parent.parent.parent / "frontend" / "dist_client_view",
+    ]
+    # FULL = Vite default build
     _react_candidates = [
         Path(__file__).resolve().parent.parent.parent / "frontend" / "dist",
-        # Packaged Electron layout — frontend/dist sits under resources/.
         Path(__file__).resolve().parent.parent.parent.parent / "frontend" / "dist",
     ]
     if hasattr(_sys, "_MEIPASS"):
         _meipass = Path(getattr(_sys, "_MEIPASS"))
         _landing_candidates.append(_meipass / "static" / "lite")
+        _login_candidates.append(_meipass / "static" / "login")
+        _slim_lite_candidates.append(_meipass / "static" / "lite_view")
+        _clientview_candidates.append(_meipass / "frontend" / "dist_client_view")
         _react_candidates.append(_meipass / "frontend" / "dist")
-    # Mount the React Lite first (more specific path), then the landing
-    # at the parent so the deeper mount wins. FastAPI route resolution
-    # is order-sensitive only when paths overlap; nested static mounts
-    # are fine.
+
+    # Mount specific /app/ paths FIRST (more specific wins on route lookup).
+    for _slim_dir in _slim_lite_candidates:
+        if _slim_dir.exists() and (_slim_dir / "index.html").exists():
+            app.mount("/trustnode/lite/app", StaticFiles(directory=str(_slim_dir), html=True), name="trustnode_lite_app")
+            break
+    for _cv_dir in _clientview_candidates:
+        if _cv_dir.exists() and (_cv_dir / "index.html").exists():
+            app.mount("/trustnode/client/app", StaticFiles(directory=str(_cv_dir), html=True), name="trustnode_client_app")
+            break
     for _react_dir in _react_candidates:
         if _react_dir.exists() and (_react_dir / "index.html").exists():
-            app.mount("/lite/app", StaticFiles(directory=str(_react_dir), html=True), name="lite_app")
+            app.mount("/trustnode/full/app", StaticFiles(directory=str(_react_dir), html=True), name="trustnode_full_app")
             break
+    # Then the three landings at the parents. Landing reads
+    # window.location.pathname to decide which /app/ to redirect to.
     for _landing_dir in _landing_candidates:
         if _landing_dir.exists():
-            app.mount("/lite", StaticFiles(directory=str(_landing_dir), html=True), name="lite")
+            app.mount("/trustnode/lite", StaticFiles(directory=str(_landing_dir), html=True), name="trustnode_lite_landing")
+            app.mount("/trustnode/full", StaticFiles(directory=str(_landing_dir), html=True), name="trustnode_full_landing")
+            app.mount("/trustnode/client", StaticFiles(directory=str(_landing_dir), html=True), name="trustnode_client_landing")
+            break
+    # Shared LAN login page (operator 2026-06-18). Lives at
+    # /trustnode/login/. Pages under /trustnode/{full|lite|client}/app/
+    # check the JWT client-side; this page issues it via /api/auth/login
+    # and then verifies access via /api/lite-local/check-access.
+    for _login_dir in _login_candidates:
+        if _login_dir.exists():
+            app.mount("/trustnode/login", StaticFiles(directory=str(_login_dir), html=True), name="trustnode_login")
             break
 except Exception:
     pass

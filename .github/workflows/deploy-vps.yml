@@ -1,0 +1,115 @@
+name: Deploy VPS
+
+# Phase 3f (operator 2026-06-18): replaces the ad-hoc "SSH in and
+# git pull" deploy flow.
+#
+# Trigger: push to main that touches backend/, frontend/, db/, scripts/,
+#   or this workflow file.
+# Steps:
+#   1. Checkout
+#   2. Build the frontend (so the VPS doesn't have to install Node)
+#   3. Upload backend + frontend dist + db/migrations to the VPS
+#      via rsync over SSH
+#   4. Run a remote command: pip install -r requirements.txt + restart
+#      the systemd unit
+#   5. Curl the public /api/health endpoint to confirm the deploy is
+#      serving traffic
+#
+# Required GitHub repo secrets (set under Settings → Secrets and variables):
+#   VPS_HOST            e.g. 87.106.7.67
+#   VPS_USER            e.g. root
+#   VPS_SSH_PRIVATE_KEY raw OpenSSH private key (NOT path)
+#   PUBLIC_HEALTH_URL   e.g. https://trustnode.lsapps.app/api/health
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Trustnode_edge_app/backend/**"
+      - "Trustnode_edge_app/frontend/**"
+      - "Trustnode_edge_app/db/**"
+      - "Trustnode_edge_app/scripts/**"
+      - ".github/workflows/deploy-vps.yml"
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: Trustnode_edge_app/frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: Trustnode_edge_app/frontend
+        run: |
+          npm ci
+          npm run build
+          npm run build:clientview
+
+      - name: Install ssh key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Rsync backend
+        run: |
+          rsync -az --delete \
+            --exclude='__pycache__' --exclude='.pytest_cache' --exclude='*.pyc' \
+            --exclude='.venv' --exclude='build/' --exclude='dist/' \
+            --exclude='sidecars/opcua-cs/bin' --exclude='sidecars/opcua-cs/obj' \
+            -e "ssh -i ~/.ssh/id_ed25519" \
+            Trustnode_edge_app/backend/ \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/opt/trustnode-edge/app/Trustnode_edge_app/backend/
+
+      - name: Rsync frontend dist (default + clientview)
+        run: |
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            Trustnode_edge_app/frontend/dist/ \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/var/www/trustnode/
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            Trustnode_edge_app/frontend/dist_client_view/ \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/var/www/trustnode-clientview/
+
+      - name: Rsync db migrations + scripts
+        run: |
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            Trustnode_edge_app/db/ \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/opt/trustnode-edge/app/Trustnode_edge_app/db/
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            Trustnode_edge_app/scripts/ \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/opt/trustnode-edge/app/Trustnode_edge_app/scripts/
+
+      - name: Install deps + restart service
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} bash <<'EOF'
+          set -e
+          cd /opt/trustnode-edge/app/Trustnode_edge_app/backend
+          ./.venv/bin/pip install -r requirements.txt --quiet
+          sudo systemctl restart trustnode-backend.service
+          sleep 3
+          sudo systemctl is-active trustnode-backend.service
+          EOF
+
+      - name: Health check
+        run: |
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${{ secrets.PUBLIC_HEALTH_URL }}" || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "Health check OK on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $code — retrying in 5s..."
+            sleep 5
+          done
+          echo "Health check FAILED — public endpoint not responding 200"
+          exit 1

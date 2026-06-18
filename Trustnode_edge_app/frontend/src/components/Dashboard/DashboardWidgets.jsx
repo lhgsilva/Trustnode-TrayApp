@@ -3061,10 +3061,15 @@ function DashboardWidgetCardImpl({
                   </ResponsiveContainer>
                 ) : widgetKind === "bar_chart" ? (
                   <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={series} margin={chartMargin}>
+                    {/* Operator 2026-06-18: barCategoryGap + barGap keep
+                        bars inside their slot. XAxis padding stops the
+                        first/last bar from straddling the axis line.
+                        maxBarSize caps width on sparse data so a tall
+                        bar doesn't bleed past the right edge. */}
+                    <BarChart data={series} margin={chartMargin} barCategoryGap="20%" barGap={2}>
                       {renderBarPattern(primaryColor)}
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                      <XAxis {...buildXAxisProps(series, cfg)} />
+                      <XAxis {...buildXAxisProps(series, cfg)} padding={{ left: 12, right: 12 }} />
                       <YAxis {...yAxisPresetProps} domain={yDomain} ticks={manualYTicks || undefined} allowDataOverflow={!!manualY} />
                       <Tooltip
                         {...chartTooltipProps}
@@ -3080,6 +3085,7 @@ function DashboardWidgetCardImpl({
                         fillOpacity={barPatternKind === "solid" ? barOpacity : 1}
                         stroke={primaryColor}
                         strokeWidth={barPatternKind === "solid" ? 0 : 1}
+                        maxBarSize={barWidthPx > 0 ? barWidthPx : 40}
                         {...barSizeProp}
                       />
                     </BarChart>
@@ -4617,9 +4623,9 @@ function ReportHtmlPreview({ data }) {
                 {s.title ? <h3>{s.title}</h3> : null}
                 <div style={{ width: "100%", height: 180 }}>
                   <ResponsiveContainer width="100%" height="100%">
-                    <ComposedChart data={rows} margin={{ top: 4, right: 8, left: 0, bottom: 18 }}>
+                    <ComposedChart data={rows} margin={{ top: 4, right: 8, left: 0, bottom: 18 }} barCategoryGap="20%" barGap={2}>
                       <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
-                      <XAxis dataKey="ts" tickFormatter={(v) => String(v).slice(11, 19)} fontSize={10} />
+                      <XAxis dataKey="ts" tickFormatter={(v) => String(v).slice(11, 19)} fontSize={10} padding={{ left: 12, right: 12 }} />
                       <YAxis fontSize={10} />
                       <Tooltip labelFormatter={(v) => String(v)} />
                       <Legend wrapperStyle={{ fontSize: 11 }} />
@@ -4635,7 +4641,7 @@ function ReportHtmlPreview({ data }) {
                           isAnimationActive: false,
                           connectNulls: true,
                         };
-                        if (s.type === "bar_chart") return <Bar {...props} />;
+                        if (s.type === "bar_chart") return <Bar {...props} maxBarSize={40} />;
                         if (s.type === "area_chart") return <Area {...props} />;
                         return <Line {...props} dot={false} />;
                       })}

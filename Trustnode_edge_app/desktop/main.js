@@ -7,6 +7,30 @@ const net = require("net");
 const os = require("os");
 const { URL } = require("url");
 
+// Phase 3d (operator 2026-06-18): initialize Sentry as early as possible
+// so any uncaught error in main.js boot is captured. Opt-in via the
+// TRUSTNODE_SENTRY_DSN env var (set by the installer or systemd unit
+// on customer machines, NOT bundled in the EXE). Free tier suffices.
+try {
+  const dsn = String(process.env.TRUSTNODE_SENTRY_DSN || "").trim();
+  if (dsn) {
+    const Sentry = require("@sentry/electron/main");
+    Sentry.init({
+      dsn,
+      release: process.env.TRUSTNODE_RELEASE_TAG || "edge-dev",
+      environment: process.env.TRUSTNODE_SENTRY_ENV || "production",
+      tracesSampleRate: 0.0,
+      sendDefaultPii: false,
+      // Only ship errors and fatals — preserve the 5K/month budget.
+      beforeSend(event) {
+        const lvl = String(event.level || "error").toLowerCase();
+        if (lvl === "error" || lvl === "fatal") return event;
+        return null;
+      },
+    });
+  }
+} catch (_) { /* never block boot on telemetry */ }
+
 // ── Early boot-error logger (operator 2026-06-15: "the exe never
 // even shows the splash on the other PC"). Anything that throws
 // before the splash window opens lands in
@@ -1077,6 +1101,21 @@ function createWindow() {
     const mode = String(payload?.mode || currentOverlayTheme || "dark").toLowerCase() === "light" ? "light" : "dark";
     return applyOverlayTheme(resolveOverlayPalette(mode));
   });
+  // Operator 2026-06-18: renderer pushes auth state changes here. The
+  // tray no longer TRUSTS the role field directly — it stores the JWT
+  // and re-verifies via /api/auth/me on every right-click (Phase 3a).
+  // This closes the spoof path where a compromised renderer could just
+  // send {role:"admin"} to unlock LAN sharing.
+  ipcMain.on("auth:role", async (_e, payload = {}) => {
+    try {
+      currentAuthToken = String(payload?.token || "");
+      currentUsername  = String(payload?.username || "");
+      // Best-effort initial verify — the right-click handler does the
+      // authoritative check before showing the menu.
+      await refreshAuthRole();
+      try { rebuildTrayMenu(); } catch (_) {}
+    } catch (_) {}
+  });
 
   ipcMain.removeHandler("dialog:pick-folder");
   ipcMain.handle("dialog:pick-folder", async (_event, options = {}) => {
@@ -1193,6 +1232,58 @@ async function gracefulShutdownAndQuit() {
   }, 1000);
 }
 
+// Operator 2026-06-18: tray remembers the renderer's auth state so the
+// LAN Sharing submenu can be gated to admin/super only. The React app
+// pushes updates via ipcMain "auth:role" on login/logout. Defaults to
+// "" so the menu shows "(admin login required)" until the operator
+// signs into the app.
+let currentUserRole = "";
+let currentUsername = "";
+let currentAuthToken = "";
+let lastAuthVerifyAt = 0;
+
+// Phase 3a (operator 2026-06-18): server-verify the renderer-supplied
+// JWT via /api/auth/me. Resets currentUserRole and currentUsername to
+// whatever the BACKEND says — not what the renderer claims. Cheap
+// enough to call on every right-click; the backend resolves the JWT
+// against its own cp_users table.
+async function refreshAuthRole() {
+  if (!currentAuthToken) {
+    currentUserRole = "";
+    currentUsername = "";
+    return;
+  }
+  try {
+    const port = currentBackendPort || BACKEND_PORT || 8000;
+    const url = `http://127.0.0.1:${port}/api/auth/me`;
+    const fetchFn = global.fetch || (await import("node-fetch")).default;
+    const res = await fetchFn(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${currentAuthToken}` },
+      timeout: 1500,
+    });
+    if (!res.ok) {
+      // Invalid / expired token — clear cached state.
+      currentUserRole = "";
+      currentUsername = "";
+      return;
+    }
+    const body = await res.json();
+    const u = body?.user || body || {};
+    currentUserRole = String(u?.role || "").toLowerCase();
+    currentUsername = String(u?.username || "");
+    lastAuthVerifyAt = Date.now();
+  } catch (_) {
+    // Network blip / backend just restarted. Don't blank the cached
+    // role — better to keep the previous truthy state for ~5s than
+    // flicker the menu disabled mid-right-click.
+    if (Date.now() - lastAuthVerifyAt > 5000) {
+      currentUserRole = "";
+      currentUsername = "";
+    }
+  }
+}
+
 // Operator 2026-06-17 (M11): cached LAN sharing state so the tray
 // menu can render the right submenu labels + the right URLs without
 // re-fetching on every right-click.
@@ -1270,7 +1361,11 @@ function createTray() {
   // Refresh sharing state when the menu is about to be shown so URLs /
   // IPs stay current.
   tray.on("right-click", async () => {
-    await refreshLanSharingState();
+    // Operator 2026-06-18 (Phase 3a): server-verify the auth role on
+    // EVERY right-click instead of trusting whatever the renderer
+    // pushed last. A compromised renderer can't spoof admin past
+    // this gate because we re-read from the backend each time.
+    await Promise.all([refreshLanSharingState(), refreshAuthRole()]);
     rebuildTrayMenu();
     if (process.platform === "win32" && tray.popUpContextMenu) {
       try { tray.popUpContextMenu(); } catch (_) {}
@@ -1367,10 +1462,21 @@ function rebuildTrayMenu() {
       click: () => { if (mainWindow) mainWindow.hide(); }
     },
     { type: "separator" },
-    {
-      label: "LAN Sharing",
-      submenu: lanSubmenu,
-    },
+    // Operator 2026-06-18: LAN Sharing is admin-only. When no admin has
+    // signed into the app yet, the item is shown but disabled with a
+    // hint so the operator knows what to do.
+    (() => {
+      const isAdmin = currentUserRole === "admin" || currentUserRole === "super";
+      if (isAdmin) {
+        return { label: `LAN Sharing  (${currentUsername || "admin"})`, submenu: lanSubmenu };
+      }
+      return {
+        label: currentUsername
+          ? `LAN Sharing — admin only (signed in as ${currentUsername})`
+          : "LAN Sharing — sign in as admin",
+        enabled: false,
+      };
+    })(),
     {
       label: "Restart Backend",
       click: () => {

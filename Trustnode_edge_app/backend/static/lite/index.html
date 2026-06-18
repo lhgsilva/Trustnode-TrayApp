@@ -173,8 +173,19 @@ function storeSession(body) {
 }
 
 function redirectToApp() {
-  // /lite/app/ is mounted to the React Lite bundle (frontend/dist).
-  window.location.replace("/lite/app/");
+  // Detect the entry path and redirect to the matching /app/.
+  // Operator 2026-06-18 — three LAN-served UIs:
+  //   /trustnode/lite/    → /trustnode/lite/app/    (SLIM cloud-style Lite)
+  //   /trustnode/full/    → /trustnode/full/app/    (FULL React app)
+  //   /trustnode/client/  → /trustnode/client/app/  (CLIENT VIEW React)
+  const p = String(window.location.pathname || "");
+  if (p.startsWith("/trustnode/full/")) {
+    window.location.replace("/trustnode/full/app/");
+  } else if (p.startsWith("/trustnode/client/")) {
+    window.location.replace("/trustnode/client/app/");
+  } else {
+    window.location.replace("/trustnode/lite/app/");
+  }
 }
 
 function render(state) {
@@ -187,7 +198,7 @@ function render(state) {
     <div class="lite-auth-card">
       <button class="lite-theme-toggle-btn" id="theme-btn" type="button" aria-label="Toggle theme">${themeIconSvg(getTheme())}</button>
       <div class="lite-auth-brand">
-        <img src="/lite/assets/trustenode-002.png" alt="TrustNode" class="lite-auth-logo" onerror="this.style.display='none'" />
+        <img src="assets/trustenode-002.png" alt="TrustNode" class="lite-auth-logo" onerror="this.style.display='none'" />
       </div>
       <h2 class="lite-auth-heading">Enter your access token</h2>
       <p class="lite-auth-subtitle">Paste the read-only token your edge administrator generated for you.</p>
@@ -229,13 +240,26 @@ function render(state) {
 }
 
 (async function init() {
-  // If we already have a session in localStorage, jump straight to the React app.
-  try {
-    const existing = localStorage.getItem(AUTH_TOKEN_KEY);
-    if (existing) { redirectToApp(); return; }
-  } catch (_) {}
-  // ?token=... in URL → auto-exchange and redirect.
+  // Operator 2026-06-18: token (view-link) flow is OPTIONAL. Default
+  // entry now goes through /trustnode/login/ (email + password). Token
+  // flow is kept for kiosk displays and admin-shared read-only links.
+  //
+  // Decision tree on landing:
+  //   1. ?token=<...> in URL    → exchange + redirect to /app/
+  //   2. existing JWT in storage → redirect to /app/
+  //   3. otherwise               → redirect to /trustnode/login/?variant=...&return=/trustnode/<v>/app/
   const u = new URL(window.location.href);
+  const variant = (() => {
+    const p = String(window.location.pathname || "");
+    if (p.startsWith("/trustnode/full/")) return "full";
+    if (p.startsWith("/trustnode/client/")) return "client";
+    return "lite";
+  })();
+  const appPath = (variant === "full") ? "/trustnode/full/app/"
+                : (variant === "client") ? "/trustnode/client/app/"
+                : "/trustnode/lite/app/";
+
+  // 1. ?token=... → view-link path
   const t = u.searchParams.get("token");
   if (t) {
     render({ busy: true });
@@ -249,7 +273,14 @@ function render(state) {
       return;
     }
   }
-  render({});
+  // 2. Existing JWT
+  try {
+    const existing = localStorage.getItem(AUTH_TOKEN_KEY);
+    if (existing) { redirectToApp(); return; }
+  } catch (_) {}
+  // 3. Send to shared login page
+  const loginUrl = `/trustnode/login/?variant=${encodeURIComponent(variant)}&return=${encodeURIComponent(appPath)}`;
+  window.location.replace(loginUrl);
 })();
 </script>
 </body>

@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>TrustNode — Sign in</title>
+  <style>
+    /* Brand tokens from frontend/src/styles.css + Login.css so this
+       LAN login looks identical to the desktop tray's Login. */
+    :root {
+      --brand:        #1f3a5f;
+      --brand-strong: #0e8479;
+      --teal:         #14a89a;
+      --teal-deep:    var(--brand-strong);
+      --auth-control-h: 40px;
+      --auth-font-main: 16px;
+      --auth-font-label: 12px;
+    }
+    html[data-theme="dark"] {
+      --bg-page:       #111111;
+      --bg-card:       #171717;
+      --bg-card-edge:  #2a2a2a;
+      --field-bg:      #1f1f1f;
+      --field-bg-focus:#262626;
+      --ink:           #fcfcfc;
+      --ink-muted:     #c7c7c7;
+      --ink-soft:      #b3b3b3;
+      --line-strong:   rgba(255,255,255,0.16);
+      --accent:        var(--teal);
+      --shadow-card:   0 30px 80px -20px rgba(0,0,0,0.7),
+                       0 8px 24px -8px rgba(0,0,0,0.55);
+    }
+    html[data-theme="light"] {
+      --bg-page:       #eceff3;
+      --bg-card:       #ffffff;
+      --bg-card-edge:  rgba(15,23,42,0.08);
+      --field-bg:      #ffffff;
+      --field-bg-focus:#ffffff;
+      --ink:           #0f172a;
+      --ink-muted:     #475569;
+      --ink-soft:      #64748b;
+      --line-strong:   rgba(15,23,42,0.16);
+      --accent:        var(--teal);
+      --shadow-card:   0 24px 60px -24px rgba(14,17,22,0.20),
+                       0 4px 14px -6px rgba(14,17,22,0.10);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    .tn-login-shell {
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      background: var(--bg-page);
+      color: var(--ink);
+      padding: 16px;
+      font-family: 'Manrope', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      transition: background 0.2s ease, color 0.2s ease;
+    }
+    .tn-auth-card {
+      width: 100%; max-width: 480px;
+      background: var(--bg-card);
+      border: 1px solid var(--bg-card-edge);
+      border-radius: 24px;
+      padding: 24px;
+      display: flex; flex-direction: column; gap: 14px;
+      position: relative;
+      box-shadow: var(--shadow-card);
+    }
+    .tn-theme-btn {
+      position: absolute; top: 20px; right: 20px;
+      background: none; border: none; cursor: pointer;
+      padding: 8px;
+      color: var(--ink-soft);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .tn-theme-btn:hover { color: var(--accent); }
+    .tn-theme-btn svg { width: 20px; height: 20px; }
+    .tn-brand {
+      display: flex; flex-direction: column; align-items: center;
+      margin: 20px 0 24px;
+    }
+    .tn-brand img { width: 300px; height: 104px; object-fit: contain; }
+    .tn-variant-pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+      background: rgba(20,168,154,0.14);
+      color: var(--accent);
+      font-weight: 700;
+      margin-top: 6px;
+    }
+    .tn-heading {
+      font-size: 15px; font-weight: 700; letter-spacing: -0.02em; margin: 0;
+    }
+    .tn-subtitle {
+      font-size: 11px; color: var(--ink-soft); line-height: 1.28; margin: 0 0 4px;
+    }
+    .tn-label {
+      display: flex; flex-direction: column; gap: 4px;
+      margin-bottom: 12px;
+      font-size: var(--auth-font-main);
+    }
+    .tn-label > span {
+      font-size: var(--auth-font-label);
+      font-weight: 700;
+      color: var(--ink-muted);
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .tn-input {
+      width: 100%;
+      padding: 8px 12px;
+      border: 1px solid var(--line-strong);
+      border-radius: 12px;
+      background: var(--bg-page);
+      color: var(--ink);
+      font: 400 var(--auth-font-main)/1.2 'Manrope', inherit;
+      height: var(--auth-control-h);
+    }
+    .tn-input:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: var(--field-bg-focus);
+      box-shadow: 0 0 0 4px rgba(1,105,204,0.18);
+    }
+    .tn-btn {
+      width: 100%;
+      background: linear-gradient(90deg, var(--brand) 0%, var(--teal-deep) 100%);
+      border: 1px solid color-mix(in srgb, var(--teal-deep) 72%, #000 28%);
+      color: white;
+      padding: 13px 16px;
+      height: var(--auth-control-h);
+      border-radius: 12px;
+      font: 700 var(--auth-font-main) 'Manrope', inherit;
+      cursor: pointer;
+      margin-top: 14px;
+      box-shadow: 0 12px 28px -14px rgba(1,105,204,0.55),
+                  inset 0 1px 0 rgba(255,255,255,0.22);
+      transition: filter 0.2s ease, transform 80ms ease;
+    }
+    .tn-btn:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.06); }
+    .tn-btn:disabled { opacity: 0.6; cursor: wait; }
+    .tn-err {
+      background: rgba(226,88,93,0.1); color: #ffd7d9;
+      border: 1px solid rgba(226,88,93,0.25);
+      padding: 11px 13px; border-radius: 10px;
+      font-size: 12px; line-height: 1.4;
+      margin-top: 10px;
+    }
+    html[data-theme="light"] .tn-err { color: #d1242f; }
+    .tn-footer {
+      margin-top: 22px; padding-top: 16px;
+      border-top: 1px solid rgba(255,255,255,0.06);
+      font-size: 11px; color: var(--ink-soft); text-align: center;
+    }
+    html[data-theme="light"] .tn-footer { border-top-color: rgba(15,23,42,0.08); }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+// Shared LAN login (operator 2026-06-18). User comes here from any of
+// /trustnode/{full|lite|client}/. We accept the variant + return path
+// via the URL so we can show a tiny "signing into Full" pill and
+// redirect cleanly after success.
+//
+// Auth: POST /api/auth/login → JWT in localStorage at trustnode_auth_token.
+// Variant access gate: POST /api/lite-local/check-access verifies the
+// user has the matching access_full/lite/client permission. If not, we
+// show an error and let them try a different account.
+
+const THEME_KEY = "tn_lan_login_theme";
+const AUTH_TOKEN_KEY = "trustnode_auth_token";
+
+function $(s, r = document) { return r.querySelector(s); }
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+function getTheme() {
+  try { return localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark"; } catch (_) { return "dark"; }
+}
+function applyTheme(t) {
+  const v = t === "light" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", v);
+  try { localStorage.setItem(THEME_KEY, v); } catch (_) {}
+}
+function themeIcon(t) {
+  if (t === "dark") return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+}
+
+function parseQuery() {
+  const u = new URL(window.location.href);
+  return {
+    variant: (u.searchParams.get("variant") || "lite").toLowerCase(),
+    ret:     u.searchParams.get("return")  || "",
+  };
+}
+function variantLabel(v) {
+  if (v === "full")   return "Full App";
+  if (v === "client") return "Client View";
+  return "Lite";
+}
+function defaultReturnFor(variant) {
+  if (variant === "full")   return "/trustnode/full/app/";
+  if (variant === "client") return "/trustnode/client/app/";
+  return "/trustnode/lite/app/";
+}
+function safeReturn(ret, variant) {
+  // Only allow returns within /trustnode/<variant>/app/ to prevent
+  // open-redirect via the return param.
+  if (!ret) return defaultReturnFor(variant);
+  if (!/^\/trustnode\/(full|lite|client)\//.test(ret)) return defaultReturnFor(variant);
+  return ret;
+}
+
+async function checkAccess(variant) {
+  // Server-side gate. Reads the Bearer JWT, checks access_<variant>.
+  const token = localStorage.getItem(AUTH_TOKEN_KEY) || "";
+  if (!token) return { ok: false, error: "no token" };
+  try {
+    const res = await fetch("/api/lite-local/check-access", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+      body: JSON.stringify({ variant }),
+    });
+    if (!res.ok) {
+      let body = {}; try { body = await res.json(); } catch (_) {}
+      return { ok: false, error: body.detail || `HTTP ${res.status}` };
+    }
+    return { ok: true };
+  } catch (e) { return { ok: false, error: String(e?.message || e) }; }
+}
+
+function render(state) {
+  applyTheme(getTheme());
+  const { variant, ret } = parseQuery();
+  const root = $("#root");
+  root.innerHTML = "";
+  const shell = document.createElement("div");
+  shell.className = "tn-login-shell";
+  shell.innerHTML = `
+    <div class="tn-auth-card">
+      <button class="tn-theme-btn" id="tn-theme" type="button" aria-label="Toggle theme">${themeIcon(getTheme())}</button>
+      <div class="tn-brand">
+        <img src="trustenode-002.png" alt="TrustNode" onerror="this.style.display='none'" />
+        <span class="tn-variant-pill">${esc(variantLabel(variant))}</span>
+      </div>
+      <h2 class="tn-heading">Sign in</h2>
+      <p class="tn-subtitle">Use your TrustNode account. Your administrator decides which views you can open.</p>
+      <form id="tn-form" autocomplete="off">
+        <label class="tn-label">
+          <span>Username</span>
+          <input id="tn-user" class="tn-input" type="text" autocomplete="username" placeholder="username" />
+        </label>
+        <label class="tn-label">
+          <span>Password</span>
+          <input id="tn-pass" class="tn-input" type="password" autocomplete="current-password" placeholder="••••••••" />
+        </label>
+        ${state.error ? `<div class="tn-err" role="alert">${esc(state.error)}</div>` : ""}
+        <button id="tn-go" type="submit" class="tn-btn">${state.busy ? "Signing in…" : "Sign in"}</button>
+      </form>
+      <div class="tn-footer">Powered by TrustNode · LAN authentication</div>
+    </div>
+  `;
+  root.appendChild(shell);
+  $("#tn-theme").addEventListener("click", () => {
+    const next = getTheme() === "dark" ? "light" : "dark";
+    applyTheme(next);
+    $("#tn-theme").innerHTML = themeIcon(next);
+  });
+  const username = $("#tn-user");
+  const password = $("#tn-pass");
+  const btn = $("#tn-go");
+  if (state.busy) { btn.disabled = true; username.disabled = true; password.disabled = true; }
+  username.focus();
+  $("#tn-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const u = username.value.trim();
+    const p = password.value;
+    if (!u || !p) return;
+    render({ busy: true });
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: u, password: p }),
+      });
+      let body = {}; try { body = await res.json(); } catch (_) {}
+      if (!res.ok || !body?.token) {
+        render({ error: body?.detail || `Sign-in failed (${res.status})` });
+        return;
+      }
+      localStorage.setItem(AUTH_TOKEN_KEY, body.token);
+      // Server-side variant gate.
+      const gate = await checkAccess(variant);
+      if (!gate.ok) {
+        render({ error: `Account does not have access to ${variantLabel(variant)}: ${gate.error || "denied"}` });
+        return;
+      }
+      window.location.replace(safeReturn(ret, variant));
+    } catch (e) {
+      render({ error: String(e?.message || e) });
+    }
+  });
+}
+
+(function init() {
+  const { variant, ret } = parseQuery();
+  // Already signed in AND has access? Skip the form.
+  const existing = localStorage.getItem(AUTH_TOKEN_KEY);
+  if (existing) {
+    checkAccess(variant).then((gate) => {
+      if (gate.ok) {
+        window.location.replace(safeReturn(ret, variant));
+      } else {
+        render({});
+      }
+    });
+    return;
+  }
+  render({});
+})();
+</script>
+</body>
+</html>

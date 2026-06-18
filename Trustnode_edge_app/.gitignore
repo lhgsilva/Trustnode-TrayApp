@@ -22,3 +22,18 @@ backend/sidecars/opcua/
 
 # Old release backup folder — local only.
 desktop/last working version/
+
+# Standalone fork (operator 2026-06-18). Has its OWN .git/ inside; the
+# outer repo ignores it entirely so commits in either repo never leak
+# into the other. Push the inner repo to its own GitHub remote.
+0.0.0.1000/
+
+# Operator 2026-06-18 — License signing private key.
+# The PUBLIC key (license_signing_public.pem) IS committed and bundled
+# into the tray EXE so it can verify license signatures offline.
+# The PRIVATE key NEVER leaves the dev portal VPS — it lives in
+# TRUSTNODE_LICENSE_SIGNING_PRIVATE_PEM env var. If it's accidentally
+# generated locally during dev, it must NOT be committed.
+backend/keys/license_signing_private.pem
+backend/keys/*.private.pem
+
