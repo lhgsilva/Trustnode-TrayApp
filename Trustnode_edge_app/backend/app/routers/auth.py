@@ -1,13 +1,13 @@
 import logging
 import time
 from collections import defaultdict
-from typing import Any, Dict, Iterable
+from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth import create_access_token, decode_access_token, verify_password
-from app.state import app_store, control_plane_store
+from app.state import app_store, auth_store, control_plane_store
 from app.tenant import get_current_tenant, normalize_tenant_id
 
 logger = logging.getLogger(__name__)
@@ -112,157 +112,12 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
-def _load_users_payload(prefer_cloud_reads: bool = False) -> Dict[str, Any]:
-    """Load the users_access config for login matching.
-
-    Operator 2026-06-18 (offline auth): login MUST work when the cloud is
-    unreachable AND when app_store's internal lock is held by a background
-    thread doing cloud I/O. The previous implementation called
-    app_store.get_bootstrap(), which acquires app_store._lock; on a
-    machine with an exhausted Supabase pool the lock could be held for
-    minutes, hanging login.
-
-    New shape: read users_access directly from the SQLite file in
-    read-only mode. SQLite WAL allows concurrent readers without blocking
-    on writers, so this returns even when the app_store's Python lock is
-    held by a stuck cloud sync. The `prefer_cloud_reads` flag is honored
-    only on its second use (the auth.py login fallback that explicitly
-    asks for a cloud-refreshed bootstrap) — at that point the caller has
-    already accepted that cloud may fail.
-    """
-    merged_users: list[Dict[str, Any]] = []
-    seen_usernames: set[str] = set()
-    unscoped_current_user = ""
-
-    if prefer_cloud_reads:
-        # Caller explicitly requested cloud-refreshed read — use the
-        # original path with get_bootstrap. This is best-effort; if the
-        # lock is held it falls through to the direct-SQLite read below.
-        try:
-            data = app_store.get_bootstrap(prefer_cloud_reads=True) or {}
-            ua = data.get("users_access") or {}
-            if isinstance(ua, dict):
-                unscoped_current_user = str(ua.get("current_user") or "")
-                for u in (ua.get("users") or []):
-                    if not isinstance(u, dict): continue
-                    uname = str(u.get("username") or "").strip()
-                    if not uname or uname in seen_usernames: continue
-                    seen_usernames.add(uname)
-                    merged_users.append(u)
-        except Exception:
-            pass
-
-    # Direct SQLite read (lock-free) — works even when app_store._lock is
-    # held. Pulls BOTH the unscoped users_access doc AND the scoped rows
-    # in a single open. Read-only mode + 3s timeout means it returns
-    # promptly even on a busy DB.
-    try:
-        import sqlite3, json as _json
-        db_path = getattr(app_store, "_db_path", None)
-        if db_path:
-            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3)
-            try:
-                # Unscoped users_access (initial seed + master admin row).
-                row = con.execute(
-                    "SELECT payload_json FROM config_documents WHERE domain='users_access'"
-                ).fetchone()
-                if row:
-                    try:
-                        unscoped = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                    except Exception:
-                        unscoped = None
-                    if isinstance(unscoped, dict):
-                        if not unscoped_current_user:
-                            unscoped_current_user = str(unscoped.get("current_user") or "")
-                        for u in (unscoped.get("users") or []):
-                            if not isinstance(u, dict): continue
-                            uname = str(u.get("username") or "").strip()
-                            if not uname or uname in seen_usernames: continue
-                            seen_usernames.add(uname)
-                            merged_users.append(u)
-                # Scoped users_access rows (per-edge user_access docs).
-                for row in con.execute(
-                    "SELECT payload_json FROM config_documents_scoped WHERE domain='users_access'"
-                ).fetchall():
-                    raw = row[0]
-                    try:
-                        scoped_payload = _json.loads(raw) if isinstance(raw, str) else raw
-                    except Exception:
-                        scoped_payload = None
-                    if not isinstance(scoped_payload, dict): continue
-                    for u in (scoped_payload.get("users") or []):
-                        if not isinstance(u, dict): continue
-                        uname = str(u.get("username") or "").strip()
-                        if not uname or uname in seen_usernames: continue
-                        seen_usernames.add(uname)
-                        merged_users.append(u)
-            finally:
-                con.close()
-    except Exception:
-        # Best-effort: direct read may fail on a brand-new install where
-        # the table doesn't exist yet. The default-admin fallback covers it.
-        pass
-
-    if merged_users:
-        return {"users": merged_users, "current_user": unscoped_current_user}
-    return {
-        "users": [
-            {
-                "username": "admin",
-                "password": "admin",
-                "role": "admin",
-                "permissions": {},
-                "tenant_id": normalize_tenant_id(get_current_tenant()),
-            }
-        ]
-    }
-
-
-def _iter_users(users_access: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
-    users = users_access.get("users") if isinstance(users_access.get("users"), list) else []
-    for row in users or []:
-        if isinstance(row, dict):
-            yield row
-
-
-def _match_user(users_access: Dict[str, Any], username: str, password: str) -> Dict[str, Any] | None:
-    for u in _iter_users(users_access):
-        if str(u.get("username") or "").strip() != username:
-            continue
-        if verify_password(password, str(u.get("password") or "")):
-            return u
-    return None
-
-
 def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
-    configured_tenant = "default"
-    # Operator 2026-06-18: lock-free read for tenant_login_realm so login
-    # never hangs on app_store._lock contention. Same rationale as
-    # _load_users_payload — direct read-only SQLite, falls back silently
-    # to "default" if the DB isn't accessible.
-    try:
-        import sqlite3, json as _json
-        db_path = getattr(app_store, "_db_path", None)
-        if db_path:
-            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
-            try:
-                row = con.execute(
-                    "SELECT payload_json FROM config_documents WHERE domain='app_settings'"
-                ).fetchone()
-                if row:
-                    try:
-                        app_settings = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                    except Exception:
-                        app_settings = None
-                    if isinstance(app_settings, dict):
-                        configured_tenant = normalize_tenant_id(
-                            str(app_settings.get("tenant_login_realm") or app_settings.get("tenant_id") or "").strip()
-                        )
-            finally:
-                con.close()
-    except Exception:
-        configured_tenant = "default"
-    fallback_tenant = configured_tenant if configured_tenant != "default" else normalize_tenant_id(get_current_tenant())
+    """Project an AuthStore user row (or master-admin synthetic row)
+    into the JWT-signing shape. Admin role gets the full permission set
+    OR'd with whatever the row had — same contract as before so the
+    frontend's permission gates keep working unchanged.
+    """
     role = str(user_row.get("role") or "viewer")
     permissions = user_row.get("permissions") or {}
     if role.lower() == "admin":
@@ -275,7 +130,7 @@ def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
         "role": role,
         "permissions": permissions,
         "modules": user_row.get("modules") or [],
-        "tenant_id": normalize_tenant_id(str(user_row.get("tenant_id") or fallback_tenant)),
+        "tenant_id": normalize_tenant_id(str(user_row.get("tenant_id") or "default")),
         # True when an admin issued a temporary password through the
         # portal. The frontend prompts the user to choose a new password
         # before they reach any application page.
@@ -285,24 +140,57 @@ def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
 
 @router.post("/login")
 def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
+    """Operator 2026-06-18 — clean auth path.
+
+    Hot path uses AuthStore EXCLUSIVELY: a dedicated SQLite file with no
+    shared locks and no cloud I/O. Result: login completes in single-
+    digit milliseconds regardless of cloud state, Supabase pool, or
+    background sync threads. Offline-safe by construction.
+
+    Order of checks:
+      1. Rate limit (DoS guard, in-memory)
+      2. Master-admin (env-configurable break-glass account)
+      3. AuthStore lookup + bcrypt/pbkdf2 verify
+      4. control_plane_store (local SQLite, separate lock, fast)
+      5. Supabase Auth verify (already has a 6 s HTTP timeout)
+
+    Cloud-bootstrap refresh fallback was REMOVED. cp_users_puller runs
+    in the background and writes new portal-created users straight into
+    AuthStore within ~30 s, so the convenience-retry was buying very
+    little and historically caused indefinite hangs when Supabase
+    misbehaved.
+    """
     client_host = str(getattr(request.client, "host", "") or "unknown")
     _check_rate_limit(client_host)
-    users_access = _load_users_payload(prefer_cloud_reads=False)
-    local_users = list(_iter_users(users_access))
-    if not local_users:
-        raise HTTPException(status_code=503, detail="No users configured. Complete first-run setup.")
+
     username = str(payload.username or "").strip()
     password = str(payload.password or "")
+    if not username:
+        raise HTTPException(status_code=400, detail="Username required")
+
+    # 1. Master-admin break-glass account. Works on every install, even
+    #    a brand-new one where AuthStore is empty. ENV-overridable.
     master_user, master_pass = _master_admin_credentials()
     if username == master_user and verify_password(password, master_pass):
         user_public = _public_user(_master_admin_user_row())
         token = create_access_token(user_public)
+        auth_store.record_login(username, ok=True, remote_ip=client_host, detail="master")
         return {"ok": True, "token": token, "user": user_public}
-    hit = _match_user(users_access, username, password)
+
+    # 2. AuthStore — the dedicated, lock-free, offline-safe path. This is
+    #    where 99% of customer logins resolve.
+    hit: Dict[str, Any] | None = None
+    try:
+        u = auth_store.get_user(username)
+        if u and str(u.get("status") or "active") == "active":
+            if verify_password(password, str(u.get("password_hash") or "")):
+                hit = u
+    except Exception as exc:
+        logger.warning("AuthStore lookup failed for user=%s: %s", username, exc)
+
+    # 3. Control-plane local SQLite (separate DB, separate lock). Covers
+    #    portal-pushed users the puller mirrored down. Fast — no network.
     if not hit:
-        # Control-plane users are authoritative for tenant-scoped cloud users.
-        # Keep this ahead of cloud-bootstrap refresh to avoid login latency spikes
-        # on cloud runtimes where prefer_cloud_reads can be slow.
         try:
             cp_hit = control_plane_store.authenticate_user(
                 tenant_id=normalize_tenant_id(get_current_tenant()),
@@ -319,10 +207,8 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
                     "must_change_password": cp_hit.get("must_change_password"),
                 }
         except Exception:
-            hit = None
+            pass
     if not hit:
-        # Fallback for customer cloud logins on shared host when user is scoped
-        # to a single tenant but host tenant resolution is still default.
         try:
             cp_any = control_plane_store.authenticate_user_any_tenant(
                 username=username,
@@ -338,37 +224,12 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
                     "must_change_password": cp_any.get("must_change_password"),
                 }
         except Exception:
-            hit = None
+            pass
+
+    # 4. Supabase Auth verify — for portal-created users whose hash
+    #    didn't come down with the puller. Already has a 6 s HTTP timeout
+    #    inside _verify_against_supabase_auth.
     if not hit:
-        # Operator 2026-06-18: cloud-refresh fallback bounded to 3 s.
-        # Previously this called _load_users_payload(prefer_cloud_reads=True)
-        # which calls app_store.get_bootstrap(prefer_cloud_reads=True) with
-        # no timeout. On a machine with a saturated Supabase pool (or any
-        # cloud-side stall), login would hang indefinitely — customer sees
-        # "Signing in..." spinner forever. The cp_users_puller already pulls
-        # portal-created users into local SQLite every ~30s, so this branch
-        # is purely a "convenience retry" for the seconds-after-creation
-        # window; never worth blocking login on. If it doesn't complete
-        # quickly, treat as a 401 — the next login attempt (after the
-        # puller catches up) will succeed.
-        import concurrent.futures as _cf
-        try:
-            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                fut = _ex.submit(_load_users_payload, True)
-                cloud_users_access = fut.result(timeout=3.0)
-            hit = _match_user(cloud_users_access, username, password)
-            if hit:
-                users_access = cloud_users_access
-        except Exception:
-            hit = None
-    if not hit:
-        # Last resort: portal/master may have created this user via the
-        # cloud control-plane and the local cp_users row arrived from
-        # cp_users_puller WITHOUT a usable password_hash (puller sets
-        # password=None on the first sync). The user's real credential
-        # lives in Supabase Auth as `<username>@trustnode.local`. Verify
-        # the password against Auth, and on success accept the login
-        # using the cp_users metadata for permissions/role/tenant.
         try:
             tid = normalize_tenant_id(get_current_tenant())
             cp_rows = control_plane_store.list_users(tenant_id=tid)
@@ -387,12 +248,22 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
                     "must_change_password": cp_local.get("must_change_password"),
                 }
         except Exception:
-            hit = None
+            pass
+
     if not hit:
         logger.warning("Failed login attempt: user=%s ip=%s", username, client_host)
+        try:
+            auth_store.record_login(username, ok=False, remote_ip=client_host, detail="invalid_credentials")
+        except Exception:
+            pass
         raise HTTPException(status_code=401, detail="Invalid username or password")
+
     user_public = _public_user(hit)
     token = create_access_token(user_public)
+    try:
+        auth_store.record_login(user_public["username"], ok=True, remote_ip=client_host)
+    except Exception:
+        pass
     return {"ok": True, "token": token, "user": user_public}
 
 

@@ -47,10 +47,27 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 def _secret_key() -> str:
+    """Return the JWT signing secret.
+
+    Operator 2026-06-18: source-of-truth moved from app_store (which
+    takes a contended global lock and can be held by stuck cloud-sync
+    threads) to AuthStore (dedicated SQLite file, no shared lock, no
+    cloud I/O). app_store remains the FALLBACK for the brief window
+    during boot before AuthStore is constructed.
+
+    Order:
+      1. TRUSTNODE_AUTH_SECRET env override (ops + tests)
+      2. AuthStore (the new home — fast, lock-free)
+      3. app_store (legacy compat for the boot fallback window)
+    """
     env = os.environ.get("TRUSTNODE_AUTH_SECRET", "").strip()
     if env:
         return env
-    return app_store.get_or_create_auth_secret()
+    try:
+        from app.state import auth_store as _auth_store
+        return _auth_store.get_or_create_secret()
+    except Exception:
+        return app_store.get_or_create_auth_secret()
 
 
 def create_access_token(user: Dict[str, Any], expires_seconds: int = 12 * 3600) -> str:

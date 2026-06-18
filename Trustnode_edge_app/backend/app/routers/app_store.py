@@ -263,6 +263,18 @@ def save_bootstrap(payload: BootstrapSaveRequest, request: Request) -> dict:
         versions.update(app_store.save_bootstrap_scoped(user_scope, user_payload, actor=payload.actor))
     if shared_payload and shared_scope:
         versions.update(app_store.save_bootstrap_scoped(shared_scope, shared_payload, actor=payload.actor))
+    # Operator 2026-06-18: same AuthStore mirror as /domain — multi-
+    # domain saves can carry users_access too, mirror those into the
+    # auth DB so newly-saved users can log in without a reboot.
+    ua_payload = (payload.data or {}).get("users_access") if isinstance(payload.data, dict) else None
+    if isinstance(ua_payload, dict):
+        try:
+            from app.state import auth_store as _auth_store
+            _auth_store.migrate_from_app_store_payload(
+                ua_payload, actor=f"ui_bootstrap_save:{payload.actor or 'admin'}"
+            )
+        except Exception:
+            pass
     return {
         "ok": True, "tenant_id": get_current_tenant(),
         "scope_key": user_scope, "shared_scope_key": shared_scope,
@@ -282,6 +294,20 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
         if scope_key
         else app_store.upsert_domain(payload.domain, payload.payload, actor=payload.actor)
     )
+    # Operator 2026-06-18: mirror users_access changes into AuthStore so
+    # users created/edited via the "Users and Access Control" UI can log
+    # in immediately. AuthStore is the auth hot path; without this hook
+    # a brand-new user could only log in after the next boot migration.
+    if str(payload.domain or "").strip() == "users_access":
+        try:
+            from app.state import auth_store as _auth_store
+            _auth_store.migrate_from_app_store_payload(
+                payload.payload if isinstance(payload.payload, dict) else None,
+                actor=f"ui_save:{payload.actor or 'admin'}",
+            )
+        except Exception:
+            # Never let a mirror failure block the legacy save path.
+            pass
     return {"ok": True, "tenant_id": get_current_tenant(), "scope_key": scope_key, "result": result}
 
 

@@ -30,7 +30,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from app.state import app_store, control_plane_store
+from app.state import app_store, auth_store, control_plane_store
 
 
 router = APIRouter(prefix="/api/workspace", tags=["workspace"])
@@ -71,6 +71,15 @@ def export_workspace(request: Request) -> Dict[str, Any]:
         license_snapshot = control_plane_store.export_activation_state() or {}
     except Exception:
         license_snapshot = {}
+    # Operator 2026-06-18: AuthStore snapshot. Includes every user row
+    # plus the JWT signing secret — restoring an export onto a fresh
+    # machine gives the customer the same login experience instantly.
+    auth_snapshot: Dict[str, Any] = {"users": [], "secret": ""}
+    try:
+        auth_snapshot["users"] = auth_store.list_users() or []
+        auth_snapshot["secret"] = auth_store.get_or_create_secret()
+    except Exception:
+        pass
     return {
         "format": "trustnode.workspace",
         "format_version": WORKSPACE_FORMAT_VERSION,
@@ -78,6 +87,7 @@ def export_workspace(request: Request) -> Dict[str, Any]:
         "exported_by": actor,
         "domains": domains,
         "license": license_snapshot,
+        "auth": auth_snapshot,
     }
 
 
@@ -86,8 +96,9 @@ class WorkspaceImportRequest(BaseModel):
     format_version: int = WORKSPACE_FORMAT_VERSION
     domains: Dict[str, Any] = {}
     license: Dict[str, Any] = {}
+    auth: Dict[str, Any] = {}
     # Allow callers to opt out of overwriting specific high-risk domains
-    # (license, users_access). Defaults to importing everything.
+    # (license, users_access, auth). Defaults to importing everything.
     skip_domains: list[str] = []
 
 
@@ -133,10 +144,55 @@ def import_workspace(payload: WorkspaceImportRequest, request: Request) -> Dict[
                 pass
         except Exception as exc:
             failed["__license__"] = f"{type(exc).__name__}: {exc}"
+    # Operator 2026-06-18: AuthStore restore. Brings users + the JWT
+    # secret back so logins on the freshly-imported machine work
+    # immediately. Skip when caller explicitly opted out.
+    auth_users_applied = 0
+    if isinstance(payload.auth, dict) and "auth" not in skip:
+        try:
+            for u in (payload.auth.get("users") or []):
+                if not isinstance(u, dict): continue
+                if not str(u.get("username") or "").strip(): continue
+                try:
+                    auth_store.upsert_user(
+                        username=str(u.get("username")),
+                        password_hash=str(u.get("password_hash") or ""),
+                        role=str(u.get("role") or "viewer"),
+                        permissions=u.get("permissions") if isinstance(u.get("permissions"), dict) else None,
+                        modules=u.get("modules") if isinstance(u.get("modules"), list) else None,
+                        tenant_id=str(u.get("tenant_id") or "default"),
+                        status=str(u.get("status") or "active"),
+                        must_change_password=bool(u.get("must_change_password")),
+                    )
+                    auth_users_applied += 1
+                except Exception:
+                    pass
+            # JWT secret restore is intentionally guarded: we only adopt
+            # the imported secret when AuthStore had none, otherwise we
+            # would invalidate every active session on the current
+            # machine.
+            imported_secret = str(payload.auth.get("secret") or "").strip()
+            if imported_secret:
+                try:
+                    current = auth_store.get_or_create_secret()
+                    if not current:
+                        # Direct write only allowed via internal helper.
+                        with auth_store._write_lock:  # type: ignore[attr-defined]
+                            with auth_store._connect() as _con:  # type: ignore[attr-defined]
+                                _con.execute(
+                                    "INSERT OR REPLACE INTO auth_settings(id, secret, updated_utc) VALUES(1, ?, ?)",
+                                    (imported_secret, datetime.now(timezone.utc).isoformat()),
+                                )
+                                _con.commit()
+                except Exception:
+                    pass
+        except Exception as exc:
+            failed["__auth__"] = f"{type(exc).__name__}: {exc}"
     return {
         "ok": True,
         "applied": applied,
         "skipped": skipped,
+        "auth_users_applied": auth_users_applied,
         "failed": failed,
         "license_applied": license_applied,
     }

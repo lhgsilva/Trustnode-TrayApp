@@ -430,6 +430,42 @@ async def _deferred_startup() -> None:
         telemetry_service.configure_from_bootstrap({"data": bootstrap})
     except Exception:
         bootstrap = None
+    # Operator 2026-06-18: one-shot migration of existing customer users
+    # from app_store.users_access (unscoped + scoped) into the dedicated
+    # AuthStore. Idempotent: only runs when AuthStore is empty. Customer's
+    # users + passwords + roles + permissions + modules are preserved.
+    # Wrapped in to_thread so a hot bootstrap dict doesn't ever block the
+    # loop. Errors here only mean the migration is retried next boot —
+    # never a crash.
+    try:
+        from app.state import auth_store as _auth_store
+        if _auth_store.is_empty() and isinstance(bootstrap, dict):
+            def _migrate():
+                unscoped = bootstrap.get("users_access") if isinstance(bootstrap.get("users_access"), dict) else None
+                # Pull every scoped users_access doc directly — lock-free.
+                scoped_payloads = []
+                try:
+                    import sqlite3, json as _json
+                    db_path = getattr(app_store, "_db_path", None)
+                    if db_path:
+                        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
+                        try:
+                            for row in con.execute(
+                                "SELECT payload_json FROM config_documents_scoped WHERE domain='users_access'"
+                            ).fetchall():
+                                try:
+                                    scoped_payloads.append(_json.loads(row[0]) if isinstance(row[0], str) else row[0])
+                                except Exception:
+                                    pass
+                        finally:
+                            con.close()
+                except Exception:
+                    pass
+                return _auth_store.migrate_from_app_store_payload(unscoped, scoped_payloads)
+            counts = await asyncio.to_thread(_migrate)
+            print(f"[trustnode][boot] AuthStore migration: {counts}", flush=True)
+    except Exception as exc:
+        print(f"[trustnode][boot] AuthStore migration skipped: {exc!r}", flush=True)
     try:
         if isinstance(bootstrap, dict):
             reports_store.migrate_from_bootstrap(bootstrap, tenant_id="default")

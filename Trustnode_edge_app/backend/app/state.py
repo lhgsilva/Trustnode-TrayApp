@@ -4,6 +4,7 @@ from typing import Any
 
 from app.services.plc_manager import PLCManager
 from app.services.app_store import AppStore
+from app.services.auth_store import AuthStore
 from app.services.control_plane_store import ControlPlaneStore
 from app.services.telemetry_service import TelemetryService
 from app.services.ingest_store import IngestStore
@@ -27,7 +28,16 @@ print("[trustnode][boot] state: instantiating PLCManager", flush=True)
 plc_manager = PLCManager()
 print("[trustnode][boot] state: instantiating AppStore", flush=True)
 app_store = AppStore()
-print("[trustnode][boot] state: AppStore ready, instantiating PowerManager", flush=True)
+print("[trustnode][boot] state: AppStore ready, instantiating AuthStore", flush=True)
+# Operator 2026-06-18: AuthStore is a dedicated SQLite file separate
+# from app_store. It owns the users table and the JWT signing secret.
+# Critical: AuthStore takes NONE of app_store's locks and does NO cloud
+# I/O — that's what makes login latency deterministic even when the
+# cloud is unreachable or app_store's lock is held by a stuck sync
+# thread. See services/auth_store.py for the design.
+auth_store = AuthStore()
+print(f"[trustnode][boot] state: AuthStore ready at {auth_store.db_path}", flush=True)
+print("[trustnode][boot] state: instantiating PowerManager", flush=True)
 power_manager = PowerManager(app_store)
 print("[trustnode][boot] state: PowerManager ready", flush=True)
 
