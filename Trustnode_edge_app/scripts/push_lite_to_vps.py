@@ -3,9 +3,14 @@
 Use after a local rewrite so the production /lite/ updates without waiting
 for a CI rebuild. The CI deploy will still rewrite these files on its next
 run (sourcing from git), so this is for fast-iteration testing.
+
+SAFETY GATE (operator 2026-06-21): refuses to push when web_cloud_readonly/lite/
+has uncommitted modifications, since CI overwrites from git anyway and we
+don't want to deploy an artifact that can't be reproduced from a commit.
+Pass --force to bypass.
 """
 from __future__ import annotations
-import io, sys
+import argparse, io, subprocess, sys
 from pathlib import Path
 
 try: sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -21,6 +26,26 @@ FILES = ["index.html", "styles.css", "manifest.json", "sw.js", "config.json",
          "trustnode_app_icon.png", "trustnode_app_icon_180.png"]
 
 
+def _git(args):
+    try:
+        proc = subprocess.run(["git", *args], cwd=str(HERE), capture_output=True, text=True, timeout=30)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except FileNotFoundError:
+        return 127, "git not found"
+
+
+def _safety_gate(force: bool) -> int:
+    rc, out = _git(["status", "--porcelain", "web_cloud_readonly/lite"])
+    if rc == 0 and out.strip():
+        print("BLOCKED: uncommitted changes under web_cloud_readonly/lite/:")
+        for line in out.strip().splitlines():
+            print(f"   {line}")
+        if not force:
+            print("\nCommit the changes first, or re-run with --force to bypass.")
+            return 2
+    return 0
+
+
 def load_env(p: Path) -> dict[str, str]:
     out = {}
     if p.is_file():
@@ -32,6 +57,16 @@ def load_env(p: Path) -> dict[str, str]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Push Lite bundle to VPS")
+    parser.add_argument("--force", action="store_true",
+                        help="Bypass the uncommitted-changes safety gate.")
+    args = parser.parse_args()
+    gate_rc = _safety_gate(args.force)
+    if gate_rc != 0:
+        return gate_rc
+    if args.force:
+        print("WARNING: --force used; safety gate bypassed.")
+
     env = load_env(HERE / ".env")
     pwd = env["VPS_PASSWORD"]
     c = paramiko.SSHClient()

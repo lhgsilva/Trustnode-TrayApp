@@ -5,9 +5,24 @@ Mirrors push_lite_to_vps.py but for `frontend/dist_cloud_readonly` →
 portal at https://trustnode.lsapps.app picks up new code without waiting
 for CI. CI's next deploy will rewrite the same files from git, so this is
 fast-iteration only.
+
+SAFETY GATE (operator 2026-06-21): the previous behavior silently shipped
+whatever was sitting in `dist_cloud_readonly/`, including bundles built from
+uncommitted source changes. That bit us on Jun 21 — an experimental edit to
+App.jsx broke the master-admin developer-portal in production. The gate
+below refuses to push when:
+
+  1. There are uncommitted modifications to frontend/src/ (the source the
+     portal bundle is built from). Source must be committed first so we
+     have a rollback point.
+  2. The committed `frontend/dist_cloud_readonly/` does not match the local
+     dist (i.e. the operator rebuilt without committing the rebuild). The
+     git-tracked dist must be the source of truth for what's deployed.
+
+Pass --force to bypass (logs a loud warning).
 """
 from __future__ import annotations
-import io, os, sys
+import argparse, io, os, subprocess, sys
 from pathlib import Path
 
 try:
@@ -20,6 +35,54 @@ import paramiko
 HERE = Path(__file__).resolve().parent.parent
 DIST_DIR = HERE / "frontend" / "dist_cloud_readonly"
 REMOTE_DIR = "/var/www/trustnode"
+
+
+def _git(args: list[str]) -> tuple[int, str]:
+    """Run a git command in the repo. Returns (returncode, stdout+stderr)."""
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(HERE),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except FileNotFoundError:
+        return 127, "git not found"
+
+
+def _safety_gate(force: bool) -> int:
+    """Return 0 if push is allowed, non-zero if it must abort. Prints reasons."""
+    # 1. Check for uncommitted changes under frontend/src/
+    rc, out = _git(["status", "--porcelain", "frontend/src"])
+    if rc != 0:
+        print(f"WARN: git status failed: {out.strip()}")
+    elif out.strip():
+        print("BLOCKED: uncommitted changes under frontend/src/:")
+        for line in out.strip().splitlines():
+            print(f"   {line}")
+        if not force:
+            print("\nCommit the source first, or re-run with --force to bypass.")
+            return 2
+
+    # 2. Check that the dist matches the committed dist (i.e. someone rebuilt
+    #    locally but didn't commit the new bundle).
+    rc, out = _git(["status", "--porcelain", "frontend/dist_cloud_readonly"])
+    if rc == 0 and out.strip():
+        print("BLOCKED: uncommitted changes under frontend/dist_cloud_readonly/:")
+        for line in out.strip().splitlines():
+            print(f"   {line}")
+        print("\nThe committed dist must match what's deployed. Either:")
+        print("  - commit the rebuild:    git add frontend/dist_cloud_readonly && git commit")
+        print("  - revert to last known-good:    git checkout HEAD -- frontend/dist_cloud_readonly")
+        print("  - bypass at your own risk:    re-run with --force")
+        if not force:
+            return 3
+    return 0
+
+
+def load_env(p: Path) -> dict[str, str]:
 
 
 def load_env(p: Path) -> dict[str, str]:
@@ -67,9 +130,25 @@ def upload_tree(sftp: paramiko.SFTPClient, local_root: Path, remote_root: str) -
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Push portal bundle to VPS")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass the uncommitted-changes safety gate. Use sparingly — this is how Jun 21 broke production.",
+    )
+    args = parser.parse_args()
+
     if not DIST_DIR.is_dir():
         print(f"ERROR: {DIST_DIR} not found. Run `npm run build:cloudro` first.")
         return 1
+
+    # Safety gate — refuse to ship uncommitted source.
+    gate_rc = _safety_gate(args.force)
+    if gate_rc != 0:
+        return gate_rc
+    if args.force:
+        print("WARNING: --force used; safety gate bypassed. Hope you tested the bundle.")
+
     env = load_env(HERE / ".env")
     pwd = env.get("VPS_PASSWORD") or os.environ.get("VPS_PASSWORD") or ""
     host = env.get("VPS_HOST") or ""

@@ -65,6 +65,12 @@ New-Item -ItemType Directory -Path $outputRoot | Out-Null
 Copy-Item -Recurse -Force (Join-Path $frontendRoot "dist_cloud_readonly\*") $outputRoot
 
 # Create dedicated standalone portal entry path, outside the main app route flow.
+# Operator 2026-06-21: rewrite relative asset paths (./assets/...) to absolute
+# (/assets/...). When the developer-portal stub is served at /developer-portal/
+# the browser resolves ./assets/ against /developer-portal/, fetches a 404,
+# and nginx's SPA fallback returns HTML — which the browser refuses to
+# execute as a JS module (strict MIME type checking). Absolute paths skip
+# that trap. This was the root cause of the Jun 21 production outage.
 $rootIndexPath = Join-Path $outputRoot "index.html"
 $portalDir = Join-Path $outputRoot "developer-portal"
 if (-not (Test-Path $portalDir)) {
@@ -73,6 +79,8 @@ if (-not (Test-Path $portalDir)) {
 if (Test-Path $rootIndexPath) {
     $idx = Get-Content -Path $rootIndexPath -Raw
     $idx = $idx -replace "<title>Trustnode Edge</title>", "<title>Trustnode Developer Portal</title>"
+    $idx = $idx -replace 'src="\./assets/', 'src="/assets/'
+    $idx = $idx -replace 'href="\./assets/', 'href="/assets/'
     Set-Content -Path (Join-Path $portalDir "index.html") -Value $idx -Encoding UTF8
 }
 
