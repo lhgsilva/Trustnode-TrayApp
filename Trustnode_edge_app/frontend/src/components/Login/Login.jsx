@@ -3,6 +3,8 @@ import {
   loginAuth,
   issuePublicPasswordReset,
   applyPublicPasswordReset,
+  emailPasswordReset,
+  applyEmailPasswordReset,
   registerControlPlaneEdgeLink,
   registerControlPlaneEdgeLinkLogin,
   getAuthMe,
@@ -138,16 +140,73 @@ export const Login = ({
     }
   };
 
-  const applyForgotPasswordReset = async () => {
-    const username = String(forgotForm.username || "").trim();
-    const reset_token = String(forgotForm.reset_token || "").trim();
-    const new_password = String(forgotForm.new_password || "");
-    if (!username || !reset_token || !new_password) {
-      setForgotResult("Username, verification code and new password are required.");
+  // Operator 2026-06-24: email-based forgot-password. Asks the edge
+  // to send a reset link to the user's registered email via SMTP.
+  // The endpoint always returns ok=True to avoid leaking whether the
+  // account exists.
+  const requestForgotPasswordEmail = async () => {
+    const identifier = String(forgotForm.username || "").trim();
+    if (!identifier) {
+      setForgotResult("Enter your username or email first.");
       return;
     }
     setForgotBusy(true);
     setForgotResult("");
+    try {
+      await emailPasswordReset(identifier);
+      setForgotResult("If a matching account exists, a reset email has been sent. Check your inbox.");
+    } catch (err) {
+      setForgotResult(`Email request failed: ${String(err?.message || err)}`);
+    } finally {
+      setForgotBusy(false);
+    }
+  };
+
+  // Auto-fill the verification-code field when the user clicked an
+  // email reset link (URL carries ?reset_token=...). The Apply Reset
+  // button below then drives a single-step email-token apply via the
+  // new /api/auth/reset-password endpoint.
+  React.useEffect(() => {
+    try {
+      const sp = new URLSearchParams(window.location.search || "");
+      const tok = String(sp.get("reset_token") || "").trim();
+      if (tok && !forgotForm.reset_token) {
+        setForgotForm((p) => ({ ...p, reset_token: tok }));
+        setForgotMode(true);
+        setForgotResult("Reset link detected. Enter a new password and click Apply Reset.");
+      }
+    } catch { /* ignore */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const applyForgotPasswordReset = async () => {
+    const username = String(forgotForm.username || "").trim();
+    const reset_token = String(forgotForm.reset_token || "").trim();
+    const new_password = String(forgotForm.new_password || "");
+    if (!reset_token || !new_password) {
+      setForgotResult("Reset code and new password are required.");
+      return;
+    }
+    setForgotBusy(true);
+    setForgotResult("");
+    // Operator 2026-06-24: try the edge-local email-reset path first
+    // (no username needed — the token IS the identifier). If that
+    // fails, fall back to the existing portal-issued-code flow which
+    // requires the username + tenant.
+    try {
+      await applyEmailPasswordReset(reset_token, new_password);
+      setForgotResult("Password reset completed. You can login now.");
+      if (username) setLoginForm((prev) => ({ ...prev, username }));
+      return;
+    } catch (err) {
+      // Fall through to portal-code path only if the user provided
+      // a username (the portal flow requires one).
+      if (!username) {
+        setForgotResult(`Reset failed: ${String(err?.message || err)}`);
+        setForgotBusy(false);
+        return;
+      }
+    }
     try {
       await applyPublicPasswordReset({
         username,
@@ -583,22 +642,33 @@ export const Login = ({
                     </button>
                   </div>
                 </label>
-                <div className="row" style={{ gap: 8 }}>
+                <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
                   <button
                     className="btn btn-primary"
                     type="button"
                     onClick={requestForgotPasswordCode}
                     disabled={forgotBusy}
-                    style={{ flex: 1 }}
+                    style={{ flex: "1 1 130px" }}
+                    title="Generate a one-time code via the cloud portal"
                   >
                     {forgotBusy ? "Requesting..." : "Request Code"}
+                  </button>
+                  <button
+                    className="btn btn-secondary"
+                    type="button"
+                    onClick={requestForgotPasswordEmail}
+                    disabled={forgotBusy}
+                    style={{ flex: "1 1 130px" }}
+                    title="Email a reset link to the address registered on this user"
+                  >
+                    {forgotBusy ? "Sending..." : "Email reset link"}
                   </button>
                   <button
                     className="btn btn-primary"
                     type="button"
                     onClick={applyForgotPasswordReset}
                     disabled={forgotBusy}
-                    style={{ flex: 1 }}
+                    style={{ flex: "1 1 130px" }}
                   >
                     Apply Reset
                   </button>

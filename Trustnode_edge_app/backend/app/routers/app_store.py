@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Any, Dict, Literal
 
 from fastapi import APIRouter, Request
@@ -149,6 +150,13 @@ class RetentionPolicyPayload(BaseModel):
     minute_keep_days: int = 30
     hour_keep_days: int = 180
     day_keep_days: int = 730
+    # Operator 2026-06-20: sub-day TTLs. When > 0 the *_keep_minutes value
+    # overrides the *_keep_days for that tier (lets the customer pick
+    # "keep raw last hour" = raw_keep_minutes=60). 0 means "use days".
+    raw_keep_minutes: int = 0
+    minute_keep_minutes: int = 0
+    hour_keep_minutes: int = 0
+    day_keep_minutes: int = 0
     backup_before_cleanup: bool = True
     max_delete_rows_per_run: int = 50000
 
@@ -224,12 +232,52 @@ def get_bootstrap(request: Request) -> dict:
                     data[d] = shared[d]
         except Exception:
             pass
+    # Data Continuity (operator 2026-06-19): when the local historian
+    # has rows under tenant_ids OTHER than the one this user is
+    # currently logged in under, surface a non-blocking summary so the
+    # UI can show a banner pointing at the Data Continuity page. We
+    # only emit this when the decision is still pending — once the
+    # operator has bridged / archived / discarded, app_settings stores
+    # data_continuity.decision so the banner stays dismissed.
+    data_continuity: Dict[str, Any] = {}
+    try:
+        current = get_current_tenant()
+        inventory = app_store.list_historian_tenant_inventory() or []
+        prior = [
+            row for row in inventory
+            if str(row.get("tenant_id") or "").strip().lower() != str(current or "").strip().lower()
+            and int(row.get("row_count") or 0) > 0
+        ]
+        current_row = next(
+            (row for row in inventory
+             if str(row.get("tenant_id") or "").strip().lower() == str(current or "").strip().lower()),
+            None,
+        )
+        # Has the operator already decided? Look at app_settings.data_continuity.
+        app_settings = data.get("app_settings") if isinstance(data.get("app_settings"), dict) else {}
+        decision = app_settings.get("data_continuity") if isinstance(app_settings.get("data_continuity"), dict) else {}
+        already_decided = bool(decision.get("decided_at"))
+        # Always include the inventory so the Data Continuity page can
+        # render even after the decision was made (operator can change
+        # their mind). `decision_pending` is the banner trigger.
+        data_continuity = {
+            "current_tenant_id": current,
+            "current_row_count": int(current_row.get("row_count") or 0) if current_row else 0,
+            "current_max_ts": str(current_row.get("max_ts") or "") if current_row else "",
+            "prior_tenants": prior,
+            "decision": decision or {},
+            "decision_pending": bool(prior) and not already_decided,
+        }
+    except Exception:
+        # Never let the continuity scan break bootstrap.
+        data_continuity = {}
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
         "scope_key": user_scope,
         "shared_scope_key": shared_scope,
         "data": data,
+        "data_continuity": data_continuity,
     }
 
 
@@ -367,6 +415,117 @@ def get_historian(
             edge_id=edge_id,
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Data Continuity (operator 2026-06-19)
+# ---------------------------------------------------------------------------
+# Three endpoints power the Data Continuity page:
+#   GET  /tenants/inventory     — per-tenant row counts + ts ranges
+#   GET  /tenant-aliases        — list bridges for the current tenant
+#   POST /tenant-aliases        — bridge / archive a prior tenant
+#   DELETE /tenant-aliases/{id} — remove the bridge entirely
+#
+# Plus a small helper that the page calls AFTER the operator picks
+# (bridge / archive / discard / later) so app_settings.data_continuity
+# carries the decision and the banner stops appearing.
+
+
+class TenantAliasUpsertRequest(BaseModel):
+    alias_tenant_id: str
+    reason: str = ""
+    archived: bool = False
+
+
+class DataContinuityDecisionRequest(BaseModel):
+    choice: str  # 'bridge' | 'archive' | 'discard' | 'later'
+    note: str = ""
+
+
+@router.get("/tenants/inventory")
+def get_tenant_inventory(request: Request) -> dict:
+    """Per-tenant row count + ts range across the LOCAL historian. NOT
+    tenant-scoped: explicitly returns every tenant_id so the operator
+    can compare what's under the active tenant vs prior tenants."""
+    try:
+        inventory = app_store.list_historian_tenant_inventory() or []
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "rows": []}
+    return {
+        "ok": True,
+        "current_tenant_id": get_current_tenant(),
+        "rows": inventory,
+    }
+
+
+@router.get("/tenant-aliases")
+def list_tenant_aliases(request: Request, include_archived: bool = False) -> dict:
+    primary = get_current_tenant()
+    rows = app_store.list_tenant_aliases(primary, include_archived=include_archived)
+    return {"ok": True, "primary_tenant_id": primary, "rows": rows}
+
+
+@router.post("/tenant-aliases")
+def upsert_tenant_alias(payload: TenantAliasUpsertRequest, request: Request) -> dict:
+    primary = get_current_tenant()
+    user = ""
+    try:
+        user = str((getattr(request.state, "user_payload", {}) or {}).get("sub") or "")
+    except Exception:
+        user = ""
+    return app_store.upsert_tenant_alias(
+        primary_tenant_id=primary,
+        alias_tenant_id=payload.alias_tenant_id,
+        reason=payload.reason,
+        actor=user,
+        archived=payload.archived,
+    )
+
+
+@router.delete("/tenant-aliases/{alias_tenant_id}")
+def delete_tenant_alias(alias_tenant_id: str, request: Request) -> dict:
+    primary = get_current_tenant()
+    return app_store.delete_tenant_alias(primary, alias_tenant_id)
+
+
+@router.post("/data-continuity/decision")
+def record_data_continuity_decision(payload: DataContinuityDecisionRequest, request: Request) -> dict:
+    """Persist the operator's choice into app_settings.data_continuity
+    so the bootstrap stops emitting decision_pending=true. This does NOT
+    perform the choice — bridging happens via /tenant-aliases above;
+    discarding is a separate endpoint that requires explicit confirm.
+    This call only records that the choice was made."""
+    choice = str(payload.choice or "").strip().lower()
+    if choice not in {"bridge", "archive", "discard", "later"}:
+        return {"ok": False, "error": "invalid_choice"}
+    user = ""
+    try:
+        user = str((getattr(request.state, "user_payload", {}) or {}).get("sub") or "")
+    except Exception:
+        user = ""
+    now = datetime.now(timezone.utc).isoformat()
+    # Read current app_settings, merge, write back via the same scoped
+    # path the rest of app_settings uses.
+    scope = _build_scope_key(request, domain="app_settings")
+    if scope:
+        current = app_store.get_bootstrap_scoped(scope) or {}
+    else:
+        current = app_store.get_bootstrap() or {}
+    settings = dict(current.get("app_settings") or {})
+    decision = dict(settings.get("data_continuity") or {})
+    # Only stamp decided_at if this is a real decision (not "later").
+    if choice != "later":
+        decision["decided_at"] = now
+        decision["decided_by_user"] = user
+    decision["choice"] = choice
+    decision["note"] = payload.note or ""
+    settings["data_continuity"] = decision
+    actor = f"data_continuity:{user or 'admin'}"
+    if scope:
+        app_store.upsert_domain_scoped(scope, "app_settings", settings, actor=actor)
+    else:
+        app_store.upsert_domain("app_settings", settings, actor=actor)
+    return {"ok": True, "decision": decision}
 
 
 @router.get("/historian/range")

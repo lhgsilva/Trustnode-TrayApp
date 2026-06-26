@@ -8,6 +8,15 @@ import {
   getReportTemplatePreviewData,
   getGeneratedReportFileUrl,
 } from "../../api";
+// Batch Management module widgets — kept in their own file so the
+// module surface is easy to find and easy to disable as a unit.
+import {
+  BatchCurrentWidget,
+  BatchListWidget,
+  BatchKpiWidget,
+  BatchTimelineWidget,
+  BatchInputWidget,
+} from "../BatchManagement/BatchManagementWidgets";
 import {
   ResponsiveContainer,
   LineChart,
@@ -743,6 +752,14 @@ function LiveTagChart({
   // intervals on the same chart each get a sensible cadence-based
   // threshold automatically.
   const pollMs = Math.max(200, Number(gatewayIntervalMs || 1000));
+  // Operator 2026-06-24: `show_gaps=false` means "draw a continuous
+  // line through the data we actually collected, ignore the dead
+  // windows". We use this in three places: skip the midpoint null
+  // marker (rows builder), bridge any remaining nulls in Recharts
+  // (connectNulls), and switch the X axis from time-scaled to
+  // categorical so the visible width is driven by sample count, not
+  // wall-clock elapsed.
+  const showGaps = cfg?.show_gaps !== false;
 
   // Series definitions: primary + non-limit extras. Recomputed only when
   // the operator changes the tag or extras (cheap memo key).
@@ -974,8 +991,22 @@ function LiveTagChart({
   // newer than the last seen ts for that series. Runs on every parent
   // re-render — that's cheap because lastSeenTs makes the per-series
   // scan O(new rows) and the ring buffer cap stays bounded.
+  //
+  // Operator 2026-06-24: this effect used to be gated on `seedReady`,
+  // which meant a fresh-started gateway's first WS sample was
+  // DROPPED while the seed fetch was still in flight. On a freshly-
+  // started gateway with no historian rows yet, the seed fetcher
+  // would wait up to 8s for rows that never arrived, and during that
+  // window every live sample was discarded — the chart sat on
+  // "Waiting for first sample" until the seed gave up. We now ingest
+  // independently of seedReady: live samples populate the buffer the
+  // moment they arrive, and the seed merges in older history when it
+  // completes. The render-side `seedReady` gate still hides the
+  // chart until the seed has had its chance, so we never paint a
+  // partial picture; but the buffer is already warm by then.
   useEffect(() => {
-    if (!seedReady || !seriesDefs.length || !Array.isArray(dataLogView) || dataLogView.length === 0) return;
+    if (!seriesDefs.length || !Array.isArray(dataLogView) || dataLogView.length === 0) return;
+    if (!buffersRef.current || !lastSeenTsRef.current) return;
     const buffers = buffersRef.current;
     const lastSeen = lastSeenTsRef.current;
     if (!buffers || !lastSeen) return;
@@ -1017,10 +1048,9 @@ function LiveTagChart({
     }
     if (didAppend) setTick((t) => t + 1);
   // seriesDefs intentionally omitted; we read its current value via
-  // the ref. dataLogView and seedReady are the only signals that drive
-  // ingest.
+  // the ref. dataLogView is the only signal that drives ingest.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataLogView, seedReady, capacity]);
+  }, [dataLogView, capacity]);
 
   // Re-seed when the WS appears to have stalled — heuristic: if no new
   // sample has hit the buffer for 3× the poll interval (and we ARE
@@ -1264,9 +1294,14 @@ function LiveTagChart({
         // Carry-forward: if THIS series has emitted at-or-before tsMs,
         // and that sample isn't older than the per-series gap
         // threshold, use it. Otherwise null (line breaks).
+        // Operator 2026-06-24: when showGaps=false the operator wants
+        // a continuous line — disable the staleness cap entirely so
+        // carry-forward never returns null. Recharts then draws a
+        // single connected line across the whole buffer.
         const ageMs = tsMs - w.lastTs;
         const cap = gapByIdMs.get(w.def.id) || (pollMs * 10);
-        row[w.def.id] = (w.lastTs > -Infinity && ageMs <= cap) ? w.lastValue : null;
+        const allowCarry = w.lastTs > -Infinity && (!showGaps || ageMs <= cap);
+        row[w.def.id] = allowCarry ? w.lastValue : null;
       }
       rows.push(row);
 
@@ -1276,8 +1311,11 @@ function LiveTagChart({
       // as empty space instead of straight-lining across it. The row
       // carries null for EVERY series so the gap applies to all of
       // them — the line resumes at the next real row.
+      // Operator 2026-06-24: skip this insertion when showGaps=false
+      // so the line stays continuous through stopped/disconnected
+      // periods.
       const next = sorted[i + 1];
-      if (next !== undefined && next - tsMs > smallestGapMs) {
+      if (showGaps && next !== undefined && next - tsMs > smallestGapMs) {
         const midTs = tsMs + Math.floor((next - tsMs) / 2);
         const nullRow = { idx: rows.length + 1, tsMs: midTs, ts: new Date(midTs).toISOString() };
         for (const s of seriesDefs) nullRow[s.id] = null;
@@ -1288,7 +1326,7 @@ function LiveTagChart({
     return { rows, hasRightAxis };
     // tick changes are the signal that buffers mutated.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tick, seriesDefs, capacity, pollMs, groupBucketMs, reducerKey]);
+  }, [tick, seriesDefs, capacity, pollMs, groupBucketMs, reducerKey, showGaps]);
 
   // Y axis: auto (data-fit) or manual. When manual is ON but the
   // operator has not yet typed values, we still pin the axis to a
@@ -1501,7 +1539,13 @@ function LiveTagChart({
       </div>
     );
   }
-  if (!seedReady) {
+  // Operator 2026-06-24: render the chart the moment ANY samples
+  // exist in the buffer — even if the seed fetch is still pending.
+  // The seed will merge older context in when it lands. This
+  // eliminates the "Loading…" pause after Gateway Start, where the
+  // user previously waited for the seed to time out before the
+  // first WS sample was allowed to paint.
+  if (!seedReady && renderedData.rows.length === 0) {
     return (
       <div className="dashboard-widget-block dashboard-widget-block-chart">
         <div className="dashboard-widget-empty muted">Loading…</div>
@@ -1512,8 +1556,10 @@ function LiveTagChart({
     return (
       <div className="dashboard-widget-block dashboard-widget-block-chart">
         <div className="dashboard-widget-empty muted">
-          No points yet — waiting for the gateway to publish samples for{" "}
-          <code>{tagName || "(no tag)"}</code>.
+          Waiting for first sample of <code>{tagName || "(no tag)"}</code>…
+          <div style={{ fontSize: 11, marginTop: 4, opacity: 0.7 }}>
+            Gateway interval drives the first point — typically 1 s after Start.
+          </div>
         </div>
       </div>
     );
@@ -1532,7 +1578,12 @@ function LiveTagChart({
                 ticks read off renderedData.rows[idx].tsMs so the time
                 labels still display correctly, with a small left+right
                 padding so the bars don't sit flush against the axes. */}
-            {allBars ? (
+            {(allBars || !showGaps) ? (
+              /* Categorical axis: one slot per row regardless of
+                 elapsed time. Used for bar-only charts (operator
+                 2026-06-18) AND for any chart when showGaps=false
+                 (operator 2026-06-24) so a continuous line fills the
+                 full plot width with no time-driven voids. */
               <XAxis
                 dataKey="idx"
                 tickFormatter={(idx) => {
@@ -1627,7 +1678,9 @@ function LiveTagChart({
                 yAxisId: yId,
                 stroke: s.color,
                 isAnimationActive: false,
-                connectNulls: false,
+                // showGaps=false → bridge any nulls so the line stays
+                // continuous across stopped/disconnected periods.
+                connectNulls: !showGaps,
               };
               if (s.chartKind === "bar") {
                 const barProps = { ...common, fill: s.color };
@@ -2788,6 +2841,14 @@ function DashboardWidgetCardImpl({
     // connectNulls=true does NOT bridge the gap. Without this the chart
     // drew a straight diagonal across hours of downtime, which made
     // every stopped-gateway period look like a smooth drift.
+    //
+    // Operator 2026-06-20: when the operator sets `show_gaps=false`
+    // (a.k.a. "Hide gaps" / "Show Disconnected Periods OFF") we SKIP the
+    // midpoint null insertion entirely. The chart still connects samples
+    // chronologically but does NOT carve out the downtime — useful for
+    // batch processes where the operator wants a continuous line showing
+    // "the data we actually collected" without visual blank spans.
+    const gapsVisible = cfg?.show_gaps !== false;
     const tickMs = Math.max(500, Number(gatewayIntervalMs || 1000));
     const gapThresholdMs = tickMs * 3;
     const out = [];
@@ -2804,9 +2865,9 @@ function DashboardWidgetCardImpl({
         }, {}),
       });
       const next = sortedTs[i + 1];
-      if (next !== undefined && (next - tsMs) > gapThresholdMs) {
+      if (gapsVisible && next !== undefined && (next - tsMs) > gapThresholdMs) {
         // Insert a midpoint null row. Every series's value goes null
-        // so connectNulls=true visually breaks each line at the gap.
+        // so connectNulls=false visually breaks each line at the gap.
         const gapMs = tsMs + Math.floor((next - tsMs) / 2);
         const nullRow = { idx: out.length + 1, ts: new Date(gapMs).toISOString(), value: null };
         for (const st of extraNormalized) nullRow[`s_${st.def.id}`] = null;
@@ -2814,7 +2875,7 @@ function DashboardWidgetCardImpl({
       }
     }
     return out;
-  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, cfgReadingsCount, gatewayIntervalMs]);
+  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, cfgReadingsCount, gatewayIntervalMs, cfg?.show_gaps]);
 
   const hasMultiSeries = extraSeriesDefs.length > 0 || resolvedLimitLines.length > 0;
   const anyRightAxis =
@@ -2930,6 +2991,13 @@ function DashboardWidgetCardImpl({
   // the charts for the time labels".
   const chartMargin = { top: 4, right: 8, left: 0, bottom: 18 };
   const interpolation = getChartInterpolation(widget);
+  // Operator 2026-06-20: gap visibility toggle. Default = true (matches
+  // prior behavior — operator sees "data missing here" visually). When
+  // false, the line is drawn straight from sample to sample, hiding the
+  // disconnected period. Both branches still use the SAME computed
+  // dataset; the difference is connectNulls + skipping null insertion
+  // upstream (see computedRowsTimeFiltered).
+  const showDisconnectedPeriods = cfg?.show_gaps !== false;
   const chartValueFormat = String(cfg.chart_value_format || "auto");
   const showChartLegend = cfg.chart_show_legend === true;
   const showPointLabels = cfg.chart_show_point_labels === true;
@@ -3390,7 +3458,7 @@ function DashboardWidgetCardImpl({
                           dot={seriesDot}
                           activeDot={seriesActiveDot}
                           isAnimationActive={false}
-                          connectNulls={false}
+                          connectNulls={!showDisconnectedPeriods}
                         />
                       );
                     }
@@ -3406,7 +3474,7 @@ function DashboardWidgetCardImpl({
                         dot={seriesDot}
                         activeDot={seriesActiveDot}
                         isAnimationActive={false}
-                        connectNulls={false}
+                        connectNulls={!showDisconnectedPeriods}
                       />
                     );
                   })}
@@ -4233,6 +4301,20 @@ function DashboardWidgetCardImpl({
           tagRowsByGateway={tagRowsByGateway}
         />
       );
+    // Batch Management module widgets (2026-06-23). Each renders a
+    // lightweight, self-contained view backed by the batch-management
+    // API. Heavy lifting (queries, polling) lives inside each widget
+    // component so this switch stays a thin dispatcher.
+    case "batch_current":
+      return <BatchCurrentWidget widget={widget} />;
+    case "batch_list":
+      return <BatchListWidget widget={widget} />;
+    case "batch_kpi":
+      return <BatchKpiWidget widget={widget} />;
+    case "batch_timeline":
+      return <BatchTimelineWidget widget={widget} />;
+    case "batch_input":
+      return <BatchInputWidget widget={widget} />;
     default:
       return renderEmpty("Unsupported widget");
   }

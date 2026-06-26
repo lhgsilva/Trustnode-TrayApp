@@ -1,9 +1,49 @@
 import asyncio
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Operator 2026-06-23: wire Python logging so the `trustnode.gateway`
+# and `trustnode.watchdog` loggers reach stdout (which Electron pipes
+# into backend.log). Without this, INFO records are silently dropped —
+# only WARNING+ reaches stderr via Python's lastResort handler. The
+# Invariant A audit-trail requires INFO transitions (start, stop,
+# run-loop-exit, historian-buffer-drained) to land in the log too.
+#
+# CRITICAL: keep the ROOT level at WARNING. Setting root=INFO in build
+# 5 turned on the `trustnode.mirror` logger which emits 2 lines every
+# 5 s, plus uvicorn.access at ~10 lines/s. The Electron parent does a
+# synchronous fs.appendFileSync per stdout line — at ~20 lines/s into
+# a multi-MB log, the writer back-pressures uvicorn's stdout pipe,
+# which back-pressures the worker, and cycles stall. We saw this live
+# at 15:21-15:25 on 2026-06-23 (gateway "running" but no rows).
+# Solution: route only OUR loggers to INFO; everything else stays at
+# WARNING. Same audit trail, no spam.
+if not logging.getLogger().handlers:
+    _h = logging.StreamHandler(stream=sys.stdout)
+    _h.setFormatter(logging.Formatter(
+        "%(asctime)sZ %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    ))
+    logging.getLogger().addHandler(_h)
+    logging.getLogger().setLevel(logging.WARNING)
+# Promote only the trustnode operational loggers we explicitly added
+# in this round of hardening. Anything else stays at WARNING.
+for _name in ("trustnode.gateway", "trustnode.watchdog"):
+    try:
+        logging.getLogger(_name).setLevel(logging.INFO)
+    except Exception:
+        pass
+# Defensive: explicitly quiet known-chatty INFO loggers in case some
+# other module elevates them later.
+for _name in ("trustnode.mirror", "uvicorn.access"):
+    try:
+        logging.getLogger(_name).setLevel(logging.WARNING)
+    except Exception:
+        pass
 
 
 def _bootstrap_env_from_dotenv() -> None:
@@ -377,6 +417,14 @@ app.include_router(reports_router)
 app.include_router(historian_export_router)
 app.include_router(workspace_router)
 
+# Operator 2026-06-23: Batch Management & Traceability module. Always
+# mounted — every endpoint inside the router is individually gated by
+# require_batch_management_license(), so the module is invisible (404)
+# to customers without the license. Code lives at
+# app/modules/batch_management/* so it is easy to find and to detach.
+from app.modules.batch_management import batch_router  # noqa: E402
+app.include_router(batch_router)
+
 # The cloud-live SSE endpoint lives in a SEPARATE FastAPI app so it does
 # NOT inherit the main app's BaseHTTPMiddleware (which buffers responses
 # and breaks `StreamingResponse` with "No response returned"). A top-level
@@ -421,6 +469,46 @@ async def _deferred_startup() -> None:
         await plc_manager.stop_all_gateways()
     except Exception:
         pass
+
+    # Operator 2026-06-19 (L5): SQLite integrity check on boot. Quick
+    # PRAGMA quick_check is O(N) over pages but bounded — typically a
+    # few hundred ms on a healthy 500MB DB. We log the result and DO
+    # NOT block boot on failure, but we surface the result in the
+    # health endpoint so support can spot a corrupted DB before the
+    # operator does. A failed integrity check usually points at a
+    # disk-full / power-loss event that left the WAL inconsistent;
+    # the operator should restore from .preVACUUM_* / .bak_* backup.
+    try:
+        import sqlite3 as _sqlite_check
+        integrity_results = {}
+        for label, path_attr in (("app_store", "_db_path"), ("telemetry", "_db_path")):
+            try:
+                target = app_store if label == "app_store" else telemetry_service
+                db_path = getattr(target, path_attr, None)
+                if not db_path:
+                    continue
+
+                def _check(p):
+                    con = _sqlite_check.connect(f"file:{p}?mode=ro", uri=True, timeout=10.0)
+                    try:
+                        return str((con.execute("PRAGMA quick_check").fetchone() or ["unknown"])[0])
+                    finally:
+                        con.close()
+                result = await asyncio.to_thread(_check, db_path)
+                integrity_results[label] = result
+                if result.lower() != "ok":
+                    print(f"[trustnode][boot][integrity] {label} quick_check returned {result!r} — investigate before extended use", flush=True)
+            except Exception as exc:
+                integrity_results[label] = f"error: {exc!r}"
+                print(f"[trustnode][boot][integrity] {label} check raised: {exc!r}", flush=True)
+        # Stash the result on app_store so /api/health can surface it.
+        try:
+            setattr(app_store, "_last_integrity_results", integrity_results)
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[trustnode][boot][integrity] check skipped: {exc!r}", flush=True)
+
     bootstrap = None
     try:
         # Same rationale: get_bootstrap acquires app_store._lock; if a
@@ -430,6 +518,158 @@ async def _deferred_startup() -> None:
         telemetry_service.configure_from_bootstrap({"data": bootstrap})
     except Exception:
         bootstrap = None
+
+    # Operator 2026-06-19: auto-resume gateways that were running before
+    # this backend process restarted. The customer hit "I started the
+    # gateway after re-activation but historian shows only 1 cycle" —
+    # exactly the symptom of a backend restart wiping in-memory worker
+    # state. We persist `last_running` in telemetry_service on every
+    # /gateways/start and /stop call; here we walk that list and
+    # re-issue the start for each still-configured gateway.
+    try:
+        running_ids = telemetry_service.list_running_gateways()
+        scoped_bootstrap = bootstrap
+        if running_ids and isinstance(bootstrap, dict):
+            # The customer's gateway lives in a SCOPED config doc
+            # (tenant|customer|edge), not the unscoped one. Walk the
+            # scope-key candidates that match this install's app_settings
+            # so we can find the same gateway_configurations array the
+            # UI's bootstrap returns to the operator.
+            try:
+                app_settings = bootstrap.get("app_settings") if isinstance(bootstrap.get("app_settings"), dict) else {}
+                tenant_seg = str(app_settings.get("tenant_id") or "").strip().lower() or "default"
+                customer_seg = str(app_settings.get("customer_id") or "").strip().lower() or "-"
+                edge_seg = str(app_settings.get("edge_id") or "").strip().lower()
+                if not edge_seg:
+                    try:
+                        edge_seg = str(getattr(app_store, "_local_edge_id", "") or "").strip().lower()
+                    except Exception:
+                        edge_seg = ""
+                if edge_seg:
+                    scope_key = f"{tenant_seg}|{customer_seg}|{edge_seg}"
+                    scoped_bootstrap = await asyncio.to_thread(
+                        app_store.get_bootstrap_scoped, scope_key, False
+                    )
+            except Exception:
+                scoped_bootstrap = bootstrap
+
+        if running_ids and isinstance(scoped_bootstrap, dict):
+            from app.models import GatewayConfig as _GwCfg
+            # Set the tenant ContextVar so the auto-resumed worker
+            # writes historian rows under the same tenant the operator
+            # would have on a normal /gateways/start call. asyncio.Task
+            # copies the parent context at creation time, so this needs
+            # to be set BEFORE plc_manager.start_gateway spawns the loop.
+            try:
+                app_settings = (scoped_bootstrap.get("app_settings") if isinstance(scoped_bootstrap.get("app_settings"), dict) else {}) or {}
+                effective_tenant = str(app_settings.get("tenant_id") or "").strip() or "default"
+                set_current_tenant(effective_tenant)
+            except Exception:
+                pass
+            gw_rows = scoped_bootstrap.get("gateway_configurations") or []
+            db_rows = scoped_bootstrap.get("database_configurations") or []
+            # Index gateways and databases for O(1) lookup.
+            by_id = {str(g.get("id") or ""): g for g in gw_rows if isinstance(g, dict)}
+            db_by_id = {str(d.get("id") or ""): d for d in db_rows if isinstance(d, dict)}
+
+            def _to_sink(c: dict) -> dict:
+                return {
+                    "id": str(c.get("id") or ""),
+                    "name": str(c.get("name") or ""),
+                    "engine": c.get("engine"),
+                    "host": str(c.get("host") or ""),
+                    "port": int(c.get("port") or 0),
+                    "database": str(c.get("database") or ""),
+                    "username": str(c.get("username") or ""),
+                    "password": c.get("password") or "",
+                    "sqlite_path": str(c.get("sqlite_path") or ""),
+                    "file_path": str(c.get("file_path") or ""),
+                    "legacy_url": str(c.get("legacy_url") or ""),
+                    "legacy_api_token": str(c.get("legacy_api_token") or ""),
+                    "source": str(c.get("source") or ""),
+                    "site": str(c.get("site") or ""),
+                    "area": str(c.get("area") or ""),
+                    "equipment": str(c.get("equipment") or ""),
+                    "schema": str(c.get("schema") or "public"),
+                    "table": str(c.get("table") or "plc_readings"),
+                    "tls": bool(c.get("tls")),
+                    "tag_filters": [],
+                    "gateway_filters": [],
+                    "csv_format": "",
+                    "csv_header": "",
+                }
+
+            resumed = 0
+            skipped_opt_out = 0
+            for gid in running_ids:
+                gw = by_id.get(gid)
+                if not gw:
+                    # Stale flag — gateway was deleted while stopped. Clear it
+                    # so we don't keep retrying on every boot.
+                    try:
+                        telemetry_service.mark_gateway_running(gid, False)
+                    except Exception:
+                        pass
+                    continue
+                # Operator 2026-06-25 (final-fix): auto-resume is now
+                # the DEFAULT. The watchdog-restores-running-gateways
+                # contract requires any gateway whose last_running=1
+                # to come back after a backend restart, unless the
+                # operator EXPLICITLY suppressed it via
+                # auto_recover_enabled=False on this gateway. The old
+                # auto_resume opt-in was an unsafe footgun: a
+                # production gateway whose backend crashed at 3am
+                # would silently stay down until someone clicked
+                # Start in the morning. The same explicit-Stop set
+                # used by the supervisor is honored here too — if the
+                # operator stopped it before the crash, it stays
+                # stopped (last_running would be 0 in that case).
+                disable_recover = (gw.get("auto_recover_enabled") is False)
+                if disable_recover:
+                    try:
+                        telemetry_service.mark_gateway_running(gid, False)
+                    except Exception:
+                        pass
+                    skipped_opt_out += 1
+                    continue
+                db_id = str(gw.get("database_id") or "")
+                db_cfg = db_by_id.get(db_id) or {}
+                primary = _to_sink(db_cfg) if db_cfg else None
+                config = _GwCfg(
+                    gateway_type=str(gw.get("gateway_type") or ""),
+                    plc_ip=str(gw.get("plc_ip") or ""),
+                    opc_url=str(gw.get("opc_url") or ""),
+                    tags=list(gw.get("tags") or []),
+                    interval_ms=int(gw.get("interval_ms") or 1000),
+                    site=str(gw.get("site") or ""),
+                    area=str(gw.get("area") or ""),
+                    equipment=str(gw.get("equipment") or ""),
+                )
+                try:
+                    await plc_manager.start_gateway(
+                        gateway_id=gid,
+                        config=config,
+                        db_sink=primary,
+                        db_sinks=[primary] if primary else [],
+                    )
+                    resumed += 1
+                except Exception as exc:
+                    print(f"[trustnode][boot] auto-resume failed for {gid}: {exc!r}", flush=True)
+            if resumed:
+                print(f"[trustnode][boot] auto-resumed {resumed} gateway(s)", flush=True)
+            if skipped_opt_out:
+                print(f"[trustnode][boot] skipped {skipped_opt_out} gateway(s) — auto_resume=false (opt-in)", flush=True)
+    except Exception as exc:
+        print(f"[trustnode][boot] gateway auto-resume scan failed: {exc!r}", flush=True)
+    # Operator 2026-06-25: kick the watchdog/supervisor task so the
+    # schedule + auto-recover policies can run even when no gateway
+    # is currently started in-memory. The task is idempotent — if a
+    # start_gateway call already spawned it, this is a no-op.
+    try:
+        plc_manager._ensure_watchdog_running()
+        print("[trustnode][boot] watchdog/supervisor task ensured", flush=True)
+    except Exception as exc:
+        print(f"[trustnode][boot] watchdog ensure failed: {exc!r}", flush=True)
     # Operator 2026-06-18: one-shot migration of existing customer users
     # from app_store.users_access (unscoped + scoped) into the dedicated
     # AuthStore. Idempotent: only runs when AuthStore is empty. Customer's
@@ -575,11 +815,90 @@ async def startup_event() -> None:
         except Exception:
             pass
 
+    # Operator 2026-06-25 (proven in 4h soak): if the asyncio event loop
+    # wedges (stdio backpressure, blocking syscall in a coroutine, etc.)
+    # nothing INSIDE the loop can detect or recover from it. The
+    # in-process worker watchdog runs in the SAME loop and is just as
+    # dead. We need recovery that LIVES OUTSIDE the loop.
+    #
+    # This thread does ONE thing: a coroutine on the event loop bumps a
+    # monotonic timestamp every 5 s; the thread checks the timestamp
+    # every 10 s; if it hasn't moved in 60 s the loop is dead and we
+    # os._exit(1) so the Electron supervisor respawns the backend in
+    # a fresh process. The whole gateway comes back within ~15 s of any
+    # wedge — the same recovery target users had configured per-gateway,
+    # now enforced at the process level.
+    try:
+        import threading as _threading
+        import time as _time
+        from app.state import plc_manager as _pm  # type: ignore
+        _loop_heartbeat = [_time.monotonic()]  # mutable container
+
+        async def _loop_heartbeat_bump() -> None:
+            # Operator 2026-06-26: bump every 2 s (was 5 s) so the
+            # watchdog's freshness check has finer resolution. A
+            # healthy loop ticks thousands of times per second so 2 s
+            # is still negligible overhead.
+            while True:
+                try:
+                    _loop_heartbeat[0] = _time.monotonic()
+                    await asyncio.sleep(2.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await asyncio.sleep(2.0)
+
+        def _wedge_watchdog_thread() -> None:
+            # Operator 2026-06-26: aggressive recovery target (~25 s
+            # end-to-end). Loop must heartbeat every 2 s; if silent
+            # for 15 s the loop is wedged. Check every 5 s so we
+            # detect within at most STALE_S + CHECK_S = 20 s. Then
+            # os._exit + Electron respawn + auto-resume = ~25 s total.
+            # Daemon thread — never blocks process exit on its own.
+            STALE_S = float(os.environ.get("TRUSTNODE_WEDGE_TIMEOUT_S", "15") or "15")
+            CHECK_S = 5.0
+            # Grace period after process start so a slow boot doesn't
+            # trip — kept at 60 s because PyInstaller cold-start +
+            # AppStore init can take that long on a fresh boot.
+            BOOT_GRACE_S = 60.0
+            boot_mono = _time.monotonic()
+            while True:
+                _time.sleep(CHECK_S)
+                age = _time.monotonic() - (_loop_heartbeat[0] or 0)
+                if (_time.monotonic() - boot_mono) < BOOT_GRACE_S:
+                    continue
+                if age > STALE_S:
+                    print(
+                        f"[trustnode][wedge-watchdog] event loop stale for {age:.0f}s "
+                        f"(threshold {STALE_S:.0f}s) — killing process so supervisor "
+                        f"can respawn a fresh backend.",
+                        flush=True,
+                    )
+                    # Hard exit so Electron sees the process drop and
+                    # respawns. os._exit skips atexit and finalizers —
+                    # exactly what we want from a wedged loop where
+                    # nothing finalizes cleanly anyway.
+                    try:
+                        os._exit(2)
+                    except Exception:
+                        pass
+                    return
+
+        _asyncio.get_event_loop().create_task(_loop_heartbeat_bump())
+        _t = _threading.Thread(target=_wedge_watchdog_thread, name="trustnode-wedge-watchdog", daemon=True)
+        _t.start()
+        print("[trustnode][boot] wedge watchdog armed (60s loop-stale threshold)", flush=True)
+    except Exception as exc:
+        print(f"[trustnode][boot] WARN: wedge watchdog setup failed: {exc!r}", flush=True)
+
 
 PUBLIC_PATHS = {
     "/api/health",
+    "/api/boot-probe",
     "/api/auth/login",
     "/api/auth/me",
+    "/api/auth/forgot-password",
+    "/api/auth/reset-password",
     "/api/control-plane/portal-context",
     "/api/control-plane/activation-code/apply",
     "/api/control-plane/edge-link/bootstrap",
@@ -662,6 +981,18 @@ async def auth_middleware(request: Request, call_next):
             tenant_id = normalized_token_tenant
         elif tenant_id:
             set_current_tenant(tenant_id)
+        # Operator 2026-06-23: refresh view-session liveness on every
+        # authenticated request so the concurrent-session counter
+        # accurately reflects who is actively using the View UI right
+        # now. Failure here MUST NOT block the request.
+        try:
+            from app.services import view_sessions
+            view_sessions.mark_active(
+                str(payload.get("sub") or payload.get("username") or ""),
+                str(payload.get("role") or ""),
+            )
+        except Exception:
+            pass
     except Exception as exc:
         return _apply_no_cache_headers(JSONResponse(status_code=401, content={"detail": f"Invalid token: {exc}"}))
     return _apply_no_cache_headers(await call_next(request))

@@ -4,7 +4,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # Operator 2026-06-19: pydantic-settings v2 defaults to extra='forbid'
+    # which crashes the EXE on boot whenever the operator's .env contains
+    # any field not declared below (Supabase keys, cloud DB credentials,
+    # VPS creds, etc. — all stuff the local edge doesn't need but ops
+    # tooling drops into .env). Switch to 'ignore' so unknown keys are
+    # silently passed through; the per-feature env-var lookups elsewhere
+    # in the codebase still pick them up via os.environ.get(...).
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     trustnode_env: str = "dev"
     trustnode_host: str = "127.0.0.1"

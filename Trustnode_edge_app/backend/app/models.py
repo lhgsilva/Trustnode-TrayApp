@@ -17,6 +17,22 @@ class GatewayConfig(BaseModel):
     area: str = "LineA"
     collection_triggers: List[dict] = Field(default_factory=list)
     collection_trigger_mode: Literal["any", "all"] = "any"
+    # Operator 2026-06-25: daily-window scheduler. When enabled, the
+    # supervisor starts the gateway at schedule_start and stops it at
+    # schedule_stop every day (interpreted in the edge's local
+    # timezone). Disabled by default — existing gateways keep their
+    # manual start/stop behavior.
+    schedule_enabled: bool = False
+    schedule_start: str = "08:00"  # HH:MM, 24h, local time
+    schedule_stop: str = "18:00"   # HH:MM, 24h, local time
+    # Operator 2026-06-25: auto-recover defaults to ON. If the
+    # gateway was running and stopped unexpectedly (PLC drop, DB
+    # write failure, watchdog give-up, backend restart), the
+    # supervisor restarts it within ~30s. Operator can flip this OFF
+    # per-gateway to suppress baseline recovery. Explicit Stop button
+    # clicks are honored — they keep the gateway down regardless of
+    # this flag, until the next Start click.
+    auto_recover_enabled: bool = True
 
 
 class GatewayReading(BaseModel):

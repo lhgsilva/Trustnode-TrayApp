@@ -259,9 +259,33 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     user_public = _public_user(hit)
+    # Operator 2026-06-23: enforce `max_view_users` for view-role logins.
+    # Admins, engineers, and master-admin are NOT counted. Failure of
+    # the helper itself fails OPEN (login proceeds).
+    try:
+        from app.services import view_sessions
+        ok_login, why = view_sessions.check_view_login_allowed(
+            username=user_public.get("username", ""),
+            role=str(user_public.get("role") or ""),
+        )
+        if not ok_login:
+            try:
+                auth_store.record_login(username, ok=False, remote_ip=client_host, detail="view_limit")
+            except Exception:
+                pass
+            raise HTTPException(status_code=429, detail=why)
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     token = create_access_token(user_public)
     try:
         auth_store.record_login(user_public["username"], ok=True, remote_ip=client_host)
+    except Exception:
+        pass
+    try:
+        from app.services import view_sessions
+        view_sessions.mark_active(user_public.get("username", ""), str(user_public.get("role") or ""))
     except Exception:
         pass
     return {"ok": True, "token": token, "user": user_public}
@@ -363,3 +387,172 @@ def change_password(payload: ChangePasswordRequest, request: Request) -> Dict[st
     }
     new_token = create_access_token(new_user)
     return {"ok": True, "token": new_token, "user": new_user}
+
+
+# =====================================================================
+# Password reset (Operator 2026-06-24)
+# =====================================================================
+# Two endpoints:
+#   POST /api/auth/forgot-password  { identifier }  → emails a one-time
+#       reset link to the user's registered email.
+#   POST /api/auth/reset-password   { token, new_password } → consumes
+#       the token and sets the new password hash.
+#
+# Privacy: forgot-password always returns ok=True, EVEN IF the user
+# doesn't exist or has no email. Otherwise the endpoint becomes a
+# user-enumeration oracle. The customer sees the same "if an account
+# matches, an email is on the way" message either way.
+
+class _ForgotPasswordPayload(BaseModel):
+    identifier: str = ""
+
+
+class _ResetPasswordPayload(BaseModel):
+    token: str = ""
+    new_password: str = ""
+
+
+def _send_password_reset_email(email_to: str, username: str, token: str) -> tuple[bool, str]:
+    """Build + send the reset email using the customer's configured
+    SMTP server. Returns (ok, reason). Reason is operator-facing so
+    we can surface why a send failed in the audit log (NEVER in the
+    API response — see the privacy note above)."""
+    if not str(email_to or "").strip():
+        return False, "no_email_for_user"
+    try:
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+    except Exception:
+        bootstrap = {}
+    email_cfg = (bootstrap.get("email_notifications") or {}) if isinstance(bootstrap, dict) else {}
+    smtp = email_cfg.get("smtp") if isinstance(email_cfg, dict) else {}
+    if not isinstance(smtp, dict) or not str(smtp.get("host") or "").strip():
+        return False, "no_smtp_configured"
+    # The reset link points at the edge's own login page with a query
+    # parameter the frontend interprets. Operator can change the host
+    # via TRUSTNODE_PUBLIC_URL if they front the edge with nginx.
+    import os as _os
+    public_url = _os.environ.get("TRUSTNODE_PUBLIC_URL", "").strip().rstrip("/")
+    if not public_url:
+        host = str(smtp.get("from_origin_host") or "").strip().rstrip("/")
+        public_url = host or "http://localhost:8000"
+    reset_link = f"{public_url}/?reset_token={token}"
+    subject = "TrustNode Edge — password reset"
+    text_body = (
+        f"Hello {username},\n\n"
+        f"A password reset was requested for your TrustNode Edge account.\n"
+        f"If this was you, open the link below within 30 minutes to set a new password:\n\n"
+        f"  {reset_link}\n\n"
+        f"If you didn't request this, ignore this email — your account is unchanged.\n\n"
+        f"— TrustNode Edge"
+    )
+    html_body = (
+        f"<p>Hello <strong>{username}</strong>,</p>"
+        f"<p>A password reset was requested for your TrustNode Edge account.</p>"
+        f"<p><a href=\"{reset_link}\">Click here to set a new password</a> "
+        f"(link expires in 30 minutes).</p>"
+        f"<p>If you didn't request this, ignore this email — your account is unchanged.</p>"
+        f"<p style=\"color:#888;font-size:12px;\">— TrustNode Edge</p>"
+    )
+    try:
+        from app.routers.notifications import _send_email, EmailRequest, SMTPConfig  # type: ignore
+        req = EmailRequest(
+            to=[email_to],
+            cc=[],
+            bcc=[],
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+            smtp=SMTPConfig(**smtp),
+            attachments=[],
+        )
+        result = _send_email(req)
+        return bool(getattr(result, "ok", False)), str(getattr(result, "message", ""))
+    except Exception as exc:
+        return False, f"send_failed:{type(exc).__name__}:{exc}"
+
+
+@router.post("/forgot-password")
+def forgot_password(payload: _ForgotPasswordPayload, request: Request) -> Dict[str, Any]:
+    """Email a password-reset link to the user. Always returns ok=True
+    to avoid user-enumeration attacks."""
+    client_host = str(getattr(request.client, "host", "") or "unknown")
+    _check_rate_limit(client_host)
+    identifier = str(payload.identifier or "").strip()
+    if not identifier:
+        return {"ok": True, "message": "If a matching account exists, a reset email has been sent."}
+    try:
+        u = auth_store.find_user_by_email_or_username(identifier)
+    except Exception:
+        u = None
+    if not u:
+        # User doesn't exist — return the same generic response. Audit it
+        # so security folk can see suspicious patterns without revealing
+        # to the caller.
+        try:
+            auth_store.record_login(identifier, ok=False, remote_ip=client_host, detail="forgot_password_unknown_user")
+        except Exception:
+            pass
+        return {"ok": True, "message": "If a matching account exists, a reset email has been sent."}
+    username = str(u.get("username") or "")
+    email = str(u.get("email") or "")
+    token = None
+    try:
+        token = auth_store.issue_reset_token(username, ttl_seconds=1800)
+    except Exception:
+        token = None
+    if not token:
+        try:
+            auth_store.record_login(username, ok=False, remote_ip=client_host, detail="forgot_password_token_failed")
+        except Exception:
+            pass
+        return {"ok": True, "message": "If a matching account exists, a reset email has been sent."}
+    sent_ok, reason = _send_password_reset_email(email, username, token)
+    try:
+        auth_store.record_login(
+            username, ok=bool(sent_ok), remote_ip=client_host,
+            detail=f"forgot_password:{'sent' if sent_ok else reason}",
+        )
+    except Exception:
+        pass
+    return {"ok": True, "message": "If a matching account exists, a reset email has been sent."}
+
+
+@router.post("/reset-password")
+def reset_password(payload: _ResetPasswordPayload, request: Request) -> Dict[str, Any]:
+    """Consume a reset token and set a new password."""
+    client_host = str(getattr(request.client, "host", "") or "unknown")
+    _check_rate_limit(client_host)
+    token = str(payload.token or "").strip()
+    new_password = str(payload.new_password or "")
+    if not token or len(new_password) < 8:
+        raise HTTPException(status_code=400, detail="Token and a password (min 8 chars) are required")
+    try:
+        username = auth_store.consume_reset_token(token)
+    except Exception:
+        username = None
+    if not username:
+        try:
+            auth_store.record_login("", ok=False, remote_ip=client_host, detail="reset_password_invalid_token")
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+    # Hash with the same scheme app_store uses.
+    try:
+        new_hash = app_store._hash_password_if_needed(new_password)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Password hashing failed: {exc}")
+    ok = False
+    try:
+        ok = auth_store.set_user_password(username, new_hash)
+    except Exception:
+        ok = False
+    try:
+        auth_store.record_login(
+            username, ok=bool(ok), remote_ip=client_host,
+            detail="reset_password:set" if ok else "reset_password:db_failed",
+        )
+    except Exception:
+        pass
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not update password")
+    return {"ok": True, "message": "Password updated. You can now sign in."}

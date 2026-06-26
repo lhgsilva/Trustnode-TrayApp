@@ -126,13 +126,19 @@ def _gateway_port(gateway_type: str) -> int:
 
 
 def _ping_host(host: str, timeout_ms: int) -> tuple[bool, str]:
+    """Operator 2026-06-24: single-shot ping with a tight timeout, no
+    retry. The previous implementation did 2 pings + a retry with +1.5s
+    timeout, totaling 5-8 seconds on a healthy host. That made the
+    Devices page sit on 'Checking…' for several seconds at boot before
+    flipping to Online. For the UI check we only need a quick yes/no;
+    the TCP port check is the authoritative signal anyway."""
     timeout_ms = max(500, min(timeout_ms, 10_000))
     is_windows = platform.system().lower().startswith("win")
     if is_windows:
-        cmd = ["ping", "-n", "2", "-w", str(timeout_ms), host]
+        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), host]
     else:
         timeout_s = max(1, int(timeout_ms / 1000))
-        cmd = ["ping", "-c", "2", "-W", str(timeout_s), host]
+        cmd = ["ping", "-c", "1", "-W", str(timeout_s), host]
 
     try:
         proc = subprocess.run(
@@ -140,28 +146,11 @@ def _ping_host(host: str, timeout_ms: int) -> tuple[bool, str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=max(2.0, timeout_ms / 1000.0 + 1.0),
-            check=False
+            timeout=max(1.5, timeout_ms / 1000.0 + 0.5),
+            check=False,
         )
         if proc.returncode == 0:
             return True, "IP reachable by ping"
-        # Some environments have flaky first ICMP reply; retry once with a higher timeout.
-        retry_timeout = str(min(timeout_ms + 1500, 10_000))
-        retry_cmd = cmd.copy()
-        if is_windows:
-            retry_cmd[4] = retry_timeout
-        else:
-            retry_cmd[4] = str(max(1, int(int(retry_timeout) / 1000)))
-        retry = subprocess.run(
-            retry_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=max(3.0, int(retry_timeout) / 1000.0 + 1.0),
-            check=False
-        )
-        if retry.returncode == 0:
-            return True, "IP reachable by ping (retry)"
         out = (proc.stdout or proc.stderr or "").strip()
         return False, f"Ping failed: {out[:220]}"
     except Exception as err:  # pragma: no cover - runtime/network dependent
@@ -629,9 +618,25 @@ def _discover_ab_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
                     return out
 
                 # Build the candidate list: scalars stay as-is, arrays are
-                # expanded into [0]..[N-1] indices.
+                # expanded into [0]..[N-1] indices. For struct-typed arrays
+                # (UDTs, module-defined data types like `PANEL_1:I`) we ALSO
+                # emit the bare base name so the operator can spot it in the
+                # picker — pycomm3 sometimes fails the per-element probe on
+                # struct elements even though the array head reads fine, and
+                # the operator can always type a specific element via Manual
+                # Tag Entry on the UI.
                 seen: set[str] = set()
                 candidates: list[str] = []
+
+                def _is_struct(td: dict) -> bool:
+                    tt = str(td.get("tag_type") or "").lower()
+                    if tt == "struct":
+                        return True
+                    dt = td.get("data_type")
+                    if isinstance(dt, dict) and dt.get("internal_tags"):
+                        return True
+                    return False
+
                 for td in tag_defs:
                     if not isinstance(td, dict):
                         continue
@@ -645,6 +650,11 @@ def _discover_ab_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
                             seen.add(base); candidates.append(base)
                         continue
                     dims = _array_dims(td)
+                    is_struct = _is_struct(td)
+                    # Struct arrays: emit the bare name first so a per-
+                    # element probe failure still leaves something visible.
+                    if dims and is_struct and base not in seen:
+                        seen.add(base); candidates.append(base)
                     for nm in _enumerate_indexed_names(base, dims):
                         if nm in seen:
                             continue
@@ -1235,6 +1245,41 @@ async def start_gateway_runtime(payload: GatewayRuntimeStartRequest) -> dict[str
     gateway_id = payload.gateway_id.strip()
     if not gateway_id:
         return {"started": False, "message": "gateway_id is required"}
+    # Operator 2026-06-23: enforce license limits on the canonical
+    # operation that activates collection. Failing OPEN: if the
+    # license helper can't be reached, we let the start through.
+    # Operator 2026-06-24: short-circuit — only call the heavy
+    # count_configured_* helpers when a limit is ACTUALLY set. On
+    # legacy/unlicensed installs both limits are 0, so we skip the
+    # bootstrap walk entirely and the start endpoint stays instant.
+    try:
+        from app.services import license_inspect
+        max_tags = license_inspect.get_limit("max_tags")
+        max_gw = license_inspect.get_limit("max_gateways_per_edge")
+        if max_tags or max_gw:
+            if max_tags:
+                other_tags = max(0, license_inspect.count_configured_tags() - len(list(payload.config.tags or [])))
+                new_total = other_tags + len(list(payload.config.tags or []))
+                if new_total > max_tags:
+                    return {
+                        "started": False,
+                        "message": (
+                            f"License limit reached: {new_total} tags requested, "
+                            f"max is {max_tags}. Upgrade the license or reduce tags."
+                        ),
+                    }
+            if max_gw:
+                existing = license_inspect.count_configured_gateways()
+                if existing > max_gw:
+                    return {
+                        "started": False,
+                        "message": (
+                            f"License limit reached: {existing} gateways configured, "
+                            f"max is {max_gw}."
+                        ),
+                    }
+    except Exception:
+        pass
     try:
         await plc_manager.start_gateway(
             gateway_id=gateway_id,
@@ -1242,6 +1287,23 @@ async def start_gateway_runtime(payload: GatewayRuntimeStartRequest) -> dict[str
             db_sink=payload.db_sink,
             db_sinks=payload.db_sinks,
         )
+        # Operator 2026-06-25: clear any prior user-stopped flag so
+        # auto-recover can supervise this gateway again.
+        try:
+            plc_manager._user_stopped.discard(gateway_id)
+        except Exception:
+            pass
+        # Operator 2026-06-19: persist running state so the gateway
+        # auto-resumes after a backend restart (auto-update, crash,
+        # Windows reboot). The customer reported only 1 historian
+        # cycle after re-activation — the backend silently restarted
+        # and the in-memory gateway runtime was lost. Now the worker
+        # comes back on its own.
+        try:
+            from app.state import telemetry_service
+            telemetry_service.mark_gateway_running(gateway_id, True)
+        except Exception:
+            pass
         return {"started": True, "message": f"Gateway '{gateway_id}' started"}
     except ValueError as err:
         return {"started": False, "message": str(err)}
@@ -1252,12 +1314,45 @@ async def stop_gateway_runtime(payload: GatewayRuntimeStopRequest) -> dict[str, 
     gateway_id = payload.gateway_id.strip()
     if not gateway_id:
         return {"stopped": False, "message": "gateway_id is required"}
+    # Operator 2026-06-25: set the user-stopped flag BEFORE the actual
+    # stop so the supervisor scan can NEVER observe a window where the
+    # gateway is stopped but the flag isn't set yet — which would let
+    # auto-recover resurrect it ~10s after the operator's click.
+    try:
+        plc_manager._user_stopped.add(gateway_id)
+    except Exception:
+        pass
+    try:
+        from app.state import telemetry_service
+        telemetry_service.mark_gateway_running(gateway_id, False)
+    except Exception:
+        pass
     await plc_manager.stop_gateway(gateway_id)
     return {"stopped": True, "message": f"Gateway '{gateway_id}' stopped"}
 
 
 @router.post("/gateways/stop-all")
 async def stop_all_gateway_runtime() -> dict[str, str | bool]:
+    # Capture which gateways were running before we clear, so we can
+    # clear last_running for all of them (not just the ones we know
+    # were active in-memory — the DB record may reference stale ones).
+    try:
+        from app.state import telemetry_service
+        running_ids = telemetry_service.list_running_gateways()
+    except Exception:
+        running_ids = []
+    # Operator 2026-06-25: mark every targeted gateway as user-stopped
+    # BEFORE the actual stop call, so the supervisor scan can never
+    # observe a stopped-but-not-flagged window and resurrect them.
+    for gid in running_ids:
+        try:
+            plc_manager._user_stopped.add(gid)
+        except Exception:
+            pass
+        try:
+            telemetry_service.mark_gateway_running(gid, False)
+        except Exception:
+            pass
     await plc_manager.stop_all_gateways()
     return {"stopped": True, "message": "All gateways stopped"}
 

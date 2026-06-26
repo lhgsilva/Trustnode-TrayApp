@@ -232,6 +232,40 @@ export async function getHealth() {
   return res.json();
 }
 
+// Operator 2026-06-25: lightweight TCP-probe of every configured
+// device + DB. Public endpoint (no auth) — same one the Electron
+// splash uses on boot. Cards poll this on a short interval to show
+// ONLINE/OFFLINE without ever sitting on "Checking…".
+export async function getBootProbe() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/boot-probe`, {}, 8000);
+  if (!res.ok) throw new Error("Boot probe failed");
+  return res.json();
+}
+
+// Operator 2026-06-25: POST variant — the UI tells the backend
+// exactly which IPs/hosts to probe. Bypasses tenant-scoping mismatch
+// where bootstrap couldn't see the active scope's devices.
+export async function postBootProbe(payload) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/boot-probe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  }, 8000);
+  if (!res.ok) throw new Error("Boot probe failed");
+  return res.json();
+}
+
+// Operator 2026-06-24: admin toggle for the canonical-DB read routing.
+export async function setForceSqliteReads(enabled) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/historian/force-sqlite-reads`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: Boolean(enabled) }),
+  });
+  if (!res.ok) throw new Error(`Force SQLite toggle failed (${res.status})`);
+  return res.json();
+}
+
 // Operator 2026-06-18: workspace export/import — the user-visible safety
 // net for "I'm afraid to update because I'll lose my data." See the
 // /api/workspace router on the backend. Admin-only, JWT-gated.
@@ -401,32 +435,27 @@ export async function stopAllGatewayInstances() {
 }
 
 export async function testPlcConnection(payload) {
+  // Operator 2026-06-24: single attempt @ 5s. The previous 3 retries
+  // × 20s was waiting 60+ seconds before giving the operator a
+  // result, which felt broken. A real PLC on a local network
+  // responds in <100 ms; if it doesn't respond in 5 s it's not
+  // going to respond in 60 either. The periodic check timer will
+  // re-fire in 15 s anyway.
   const request = {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   };
   let res;
-  let lastErr = null;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      // PLC checks can be slow on first hit (ARP/NIC wakeups/edge startup).
-      res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/test-connection`, request, 20000);
-      lastErr = null;
-      break;
-    } catch (err) {
-      lastErr = err;
-      if (!isTransientFetchError(err) || attempt === 3) break;
-      await sleep(300 * attempt);
-    }
-  }
-  if (!res) {
-    if (isTransientFetchError(lastErr)) {
+  try {
+    res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/test-connection`, request, 5000);
+  } catch (err) {
+    if (isTransientFetchError(err)) {
       throw new Error(
-        "Connection test transport timeout. Backend may still be starting or local network route is unstable. Please retry."
+        "Connection test timed out (5s). The next periodic check will retry automatically."
       );
     }
-    throw lastErr || new Error("Connection test request failed");
+    throw err;
   }
   if (!res.ok) {
     let detail = "";
@@ -857,6 +886,50 @@ export async function getAppStoreTenantContext() {
     headers: { "Cache-Control": "no-store, no-cache, max-age=0", Pragma: "no-cache" }
   });
   if (!res.ok) throw new Error("Tenant context fetch failed");
+  return res.json();
+}
+
+// Data Continuity (operator 2026-06-19) ----------------------------------
+
+export async function getTenantInventory() {
+  const res = await fetchWithTimeout(withNoCache(`${getAppStoreApiBase()}/api/app-store/tenants/inventory`));
+  if (!res.ok) throw new Error("Tenant inventory fetch failed");
+  return res.json();
+}
+
+export async function listTenantAliases(includeArchived = false) {
+  const q = includeArchived ? "?include_archived=1" : "";
+  const res = await fetchWithTimeout(withNoCache(`${getAppStoreApiBase()}/api/app-store/tenant-aliases${q}`));
+  if (!res.ok) throw new Error("Tenant aliases fetch failed");
+  return res.json();
+}
+
+export async function upsertTenantAlias({ aliasTenantId, reason = "", archived = false }) {
+  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store/tenant-aliases`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ alias_tenant_id: aliasTenantId, reason, archived }),
+  });
+  if (!res.ok) throw new Error("Tenant alias upsert failed");
+  return res.json();
+}
+
+export async function deleteTenantAlias(aliasTenantId) {
+  const res = await fetchWithTimeout(
+    `${getAppStoreApiBase()}/api/app-store/tenant-aliases/${encodeURIComponent(aliasTenantId)}`,
+    { method: "DELETE" }
+  );
+  if (!res.ok) throw new Error("Tenant alias delete failed");
+  return res.json();
+}
+
+export async function recordDataContinuityDecision({ choice, note = "" }) {
+  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store/data-continuity/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ choice, note }),
+  });
+  if (!res.ok) throw new Error("Data continuity decision failed");
   return res.json();
 }
 
@@ -2579,6 +2652,28 @@ export async function applyPublicPasswordReset(payload) {
   return res.json();
 }
 
+// Operator 2026-06-24: email-based reset (edge-local, no portal).
+// Sends a reset link to the user's email via the configured SMTP.
+export async function emailPasswordReset(identifier) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/forgot-password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ identifier: String(identifier || "") }),
+  });
+  await ensureOk(res, "Forgot password failed");
+  return res.json();
+}
+
+export async function applyEmailPasswordReset(token, newPassword) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/reset-password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token: String(token || ""), new_password: String(newPassword || "") }),
+  });
+  await ensureOk(res, "Reset password failed");
+  return res.json();
+}
+
 export async function provisionControlPlaneCustomerBundle(payload) {
   const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/provision/customer-bundle`, {
     method: "POST",
@@ -2885,4 +2980,157 @@ export async function pushSchedulerEmailSettings(emailSettings) {
   });
   await ensureOk(res, "Push scheduler email settings failed");
   return res.json();
+}
+
+
+// ====================================================================
+// Batch Management & Traceability module (2026-06-23)
+// Every endpoint is gated server-side by require_batch_management_license.
+// When the customer doesn't have the license, every call returns 404 with
+// {detail:{module:"batch_management", reason:"not_in_license"}}. The
+// frontend hides the menu in that case (canOpenPage), so these helpers
+// are only invoked when the license is active.
+// ====================================================================
+const _BM_BASE = () => `${getControlApiBase()}/api/batch-management`;
+
+export async function getBatchManagementStatus() {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/status`, {}, 6000);
+  if (!res.ok) return { module: "batch_management", enabled: false };
+  return res.json();
+}
+
+export async function listBatchTypes() {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batch-types`);
+  await ensureOk(res, "List batch types failed");
+  return (await res.json()).rows || [];
+}
+
+export async function saveBatchType(payload, id = null) {
+  const url = id ? `${_BM_BASE()}/batch-types/${encodeURIComponent(id)}` : `${_BM_BASE()}/batch-types`;
+  const res = await fetchWithTimeout(url, {
+    method: id ? "PUT" : "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  await ensureOk(res, "Save batch type failed");
+  return (await res.json()).row;
+}
+
+export async function deleteBatchType(id) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batch-types/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  await ensureOk(res, "Delete batch type failed");
+  return true;
+}
+
+export async function listBatches(params = {}) {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v === undefined || v === null || v === "") continue;
+    qs.set(k, String(v));
+  }
+  const url = `${_BM_BASE()}/batches${qs.toString() ? `?${qs.toString()}` : ""}`;
+  const res = await fetchWithTimeout(url);
+  await ensureOk(res, "List batches failed");
+  return res.json();
+}
+
+export async function getBatch(id) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}`);
+  await ensureOk(res, "Get batch failed");
+  return (await res.json()).row;
+}
+
+export async function createBatch(payload) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  await ensureOk(res, "Create batch failed");
+  return (await res.json()).row;
+}
+
+export async function startBatch(id, payload = {}) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  await ensureOk(res, "Start batch failed");
+  return (await res.json()).row;
+}
+
+export async function stopBatch(id, payload = {}) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  await ensureOk(res, "Stop batch failed");
+  return (await res.json()).row;
+}
+
+export async function validateBatch(id, payload) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  await ensureOk(res, "Validate batch failed");
+  return (await res.json()).row;
+}
+
+export async function listBatchEvents(id, limit = 200) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/events?limit=${limit}`);
+  await ensureOk(res, "List batch events failed");
+  return (await res.json()).rows || [];
+}
+
+export async function addBatchEvent(id, payload) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  await ensureOk(res, "Add batch event failed");
+  return res.json();
+}
+
+export async function listBatchSummaries(id) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/summaries`);
+  await ensureOk(res, "List batch summaries failed");
+  return (await res.json()).rows || [];
+}
+
+export async function recomputeBatchSummaries(id) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/recompute-summaries`, {
+    method: "POST",
+  });
+  await ensureOk(res, "Recompute summaries failed");
+  return res.json();
+}
+
+export async function listBatchHistorianRows(id, limit = 5000) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/historian?limit=${limit}`);
+  await ensureOk(res, "List batch historian rows failed");
+  return (await res.json()).rows || [];
+}
+
+export async function deleteBatch(id) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  await ensureOk(res, "Delete batch failed");
+  return true;
+}
+
+export async function listBatchAudit(limit = 200, batchId = null) {
+  const qs = new URLSearchParams();
+  qs.set("limit", String(limit));
+  if (batchId) qs.set("batch_id", String(batchId));
+  const res = await fetchWithTimeout(`${_BM_BASE()}/audit?${qs.toString()}`);
+  await ensureOk(res, "List batch audit failed");
+  return (await res.json()).rows || [];
 }

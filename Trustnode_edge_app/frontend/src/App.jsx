@@ -4,8 +4,14 @@ import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
 import { DASHBOARD_GRID_VERSION, migrateWidgetsToFinerGrid } from "./components/Dashboard/widgetRegistry";
 import { ReportTemplateDesigner } from "./components/Reports/ReportTemplateDesigner";
 import { ScheduledReportsManager } from "./components/Reports/ScheduledReportsManager";
+// Batch Management module pages. Self-contained file; license gating in
+// canOpenPage hides the menu when batch_management is not licensed.
+import { BatchesPage, BatchTypesPage, BatchAuditPage } from "./components/BatchManagement/BatchManagementPages";
 import {
   getHealth,
+  getBootProbe,
+  postBootProbe,
+  setForceSqliteReads,
   getBackendTarget,
   getConfig,
   getStatus,
@@ -26,6 +32,11 @@ import {
   testPlcConnection,
   getAppStoreBootstrap,
   getAppStoreTenantContext,
+  getTenantInventory,
+  listTenantAliases,
+  upsertTenantAlias,
+  deleteTenantAlias,
+  recordDataContinuityDecision,
   saveAppStoreBootstrap,
   saveAppStoreDomain,
   appendAppStoreLogs,
@@ -233,6 +244,11 @@ const NAV_SECTIONS = [
   { id: "reporting", title: "Reporting", items: ["Reports", "Scheduled Reports"] },
   { id: "notifications", title: "Notifications", items: ["Alarms", "Email and Notifications"] },
   { id: "data_log", title: "Data History", items: ["Historian", "Logs"] },
+  // Operator 2026-06-23: Batch Management & Traceability module. Each
+  // item is license-gated through canOpenPage(); when the license
+  // module is absent the items are filtered out and the whole group
+  // collapses to zero items and renders nothing.
+  { id: "batch_management", title: "Batch Management", items: ["Batches", "Batch Types", "Batch Audit"] },
   {
     id: "settings",
     title: "Database and Backup",
@@ -266,7 +282,23 @@ function pageId(label) {
   if (label.toLowerCase() === "historian") return "historian";
   if (label.toLowerCase() === "logs") return "logs";
   if (label.toLowerCase() === "reports") return "reporting";
+  // Batch Management module pages
+  if (label.toLowerCase() === "batches") return "batches";
+  if (label.toLowerCase() === "batch types") return "batch_types";
+  if (label.toLowerCase() === "batch audit") return "batch_audit";
   return label.toLowerCase().replace(/\s+/g, "_");
+}
+
+// Operator 2026-06-24: tri-state DB connection status renderer.
+// connection_ok=true  -> ONLINE (green)
+// connection_ok=false -> OFFLINE (red)
+// neither (never probed yet) -> CHECKING (amber)
+// The previous binary ternary printed OFFLINE for every freshly-loaded
+// DB row, alarming operators on completely healthy systems.
+function dbStatusInfo(c) {
+  if (c && c.connection_ok === true) return { cls: "status-online", label: "ONLINE" };
+  if (c && c.connection_ok === false) return { cls: "status-offline", label: "OFFLINE" };
+  return { cls: "status-warning", label: "CHECKING" };
 }
 
 function pageTitle(page) {
@@ -279,6 +311,10 @@ function pageTitle(page) {
   if (page === "customer_database") return "Customer Database";
   if (page === "website_and_env") return "Website and Environment";
   if (page === "email_and_notifications") return "Email and Notifications";
+  // Batch Management module pages
+  if (page === "batches") return "Batches";
+  if (page === "batch_types") return "Batch Types";
+  if (page === "batch_audit") return "Batch Audit";
   if (page === "scheduled_reports") return "Scheduled Reports";
   if (page === "reports") return "Reports";
   if (page === "power_overview") return "Power Overview";
@@ -422,6 +458,22 @@ const CLOUD_LOG_FETCH_LIMIT = 800;
 const CLOUD_EDGE_ALL_KEY = "__all_edges__";
 const UI_RENDER_TICK_MS = 500;
 const RETENTION_PRESETS = {
+  // Operator 2026-06-20: sub-day TTLs. The *_keep_minutes fields override
+  // *_keep_days when > 0 (engine-side). Hour preset sets raw to 60 minutes
+  // so "keep last hour" is one click. Day-and-up presets keep the *_keep_minutes
+  // at 0 so the days field remains authoritative — matches prior behavior.
+  hour: {
+    key: "hour",
+    label: "Last hour",
+    raw_keep_days: 1,
+    minute_keep_days: 1,
+    hour_keep_days: 1,
+    day_keep_days: 7,
+    raw_keep_minutes: 60,
+    minute_keep_minutes: 180,
+    hour_keep_minutes: 1440,
+    day_keep_minutes: 0,
+  },
   day: {
     key: "day",
     label: "Last day",
@@ -429,6 +481,10 @@ const RETENTION_PRESETS = {
     minute_keep_days: 3,
     hour_keep_days: 7,
     day_keep_days: 60,
+    raw_keep_minutes: 0,
+    minute_keep_minutes: 0,
+    hour_keep_minutes: 0,
+    day_keep_minutes: 0,
   },
   week: {
     key: "week",
@@ -437,6 +493,10 @@ const RETENTION_PRESETS = {
     minute_keep_days: 21,
     hour_keep_days: 90,
     day_keep_days: 365,
+    raw_keep_minutes: 0,
+    minute_keep_minutes: 0,
+    hour_keep_minutes: 0,
+    day_keep_minutes: 0,
   },
   month: {
     key: "month",
@@ -445,10 +505,19 @@ const RETENTION_PRESETS = {
     minute_keep_days: 90,
     hour_keep_days: 365,
     day_keep_days: 730,
+    raw_keep_minutes: 0,
+    minute_keep_minutes: 0,
+    hour_keep_minutes: 0,
+    day_keep_minutes: 0,
   },
 };
 
 function detectRetentionPreset(policy) {
+  // Operator 2026-06-20: when raw_keep_minutes > 0, it overrides days
+  // for tier-raw. We surface that as the "hour" preset when minutes is
+  // anywhere in the sub-day band; otherwise fall through to the days view.
+  const rawMins = Number(policy?.raw_keep_minutes || 0);
+  if (rawMins > 0 && rawMins < 1440) return "hour";
   const rawDays = Number(policy?.raw_keep_days || 0);
   if (rawDays <= 1) return "day";
   if (rawDays <= 7) return "week";
@@ -1482,6 +1551,13 @@ function MenuIcon({ page }) {
       return <svg {...common}><rect x="3" y="11" width="18" height="10" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /><circle cx="12" cy="16" r="1.5" /></svg>;
     case "portal_interface":
       return <svg {...common}><rect x="3" y="4" width="18" height="14" rx="2" /><path d="M3 9h18" /><path d="M8 21h8" /><path d="M12 18v3" /></svg>;
+    // Batch Management module icons (2026-06-23)
+    case "batches":
+      return <svg {...common}><rect x="3" y="6" width="18" height="14" rx="2" /><path d="M8 6V4h8v2" /><path d="M8 10h8M8 14h6" /></svg>;
+    case "batch_types":
+      return <svg {...common}><path d="M4 6h16M4 12h16M4 18h10" /><circle cx="20" cy="18" r="2" /></svg>;
+    case "batch_audit":
+      return <svg {...common}><path d="M4 4h12l4 4v12H4z" /><path d="M16 4v4h4" /><path d="M8 14l2 2 4-4" /></svg>;
     default:
       return <svg {...common}><circle cx="12" cy="12" r="8" /></svg>;
   }
@@ -2935,6 +3011,368 @@ function DirectoriesPage({ canEdit }) {
   );
 }
 
+// Data Continuity page (operator 2026-06-19).
+// Operator 2026-06-23: read-only License Details panel for the Edge
+// settings page. Shows the live license_summary from /api/health:
+// package, each numeric limit + usage, and the full module list.
+function LicenseDetailsPanel() {
+  const [s, setS] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      try {
+        // Operator 2026-06-24: use getHealth() so the call lands on the
+        // resolved backend base URL — a raw fetch("/api/...") goes to
+        // the Electron file:// origin and silently 404s, which left
+        // the panel blank and the package banner stuck on default
+        // values.
+        const j = await getHealth();
+        if (alive) setS(j?.license_summary || null);
+      } catch { /* ignore */ }
+    };
+    tick();
+    // Operator 2026-06-24: 60s poll. License usage doesn't change often
+    // and this panel is only rendered when the operator visits Edge
+    // settings.
+    const t = setInterval(tick, 60000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+  if (!s) return null;
+  const limits = s.limits || {};
+  const usage = s.usage || {};
+  const row = (label, used, cap) => {
+    const u = Number(used || 0);
+    const c = Number(cap || 0);
+    const over = c > 0 && u > c;
+    return (
+      <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid var(--line)" }}>
+        <span>{label}</span>
+        <strong style={{ color: over ? "var(--err, #c0382b)" : "inherit" }}>
+          {c > 0 ? `${u}/${c}` : `${u} (unlimited)`}
+        </strong>
+      </div>
+    );
+  };
+  return (
+    <div style={{ marginTop: 12, padding: 12, border: "1px solid var(--line)", borderRadius: 6 }}>
+      <div style={{ fontWeight: 600, marginBottom: 8 }}>
+        Package: <span style={{ textTransform: "capitalize" }}>{s.package_key || "edge"}</span>
+      </div>
+      {row("Tags configured", usage.tags, limits.max_tags)}
+      {row("Gateways configured", usage.gateways, limits.max_gateways_per_edge)}
+      {row("Admin / engineer accounts", usage.admin_users, limits.max_studio_admins)}
+      {row("Active View sessions", usage.active_view_sessions, limits.max_view_users)}
+      {Array.isArray(s.grandfathered) && s.grandfathered.length ? (
+        <div style={{ marginTop: 8, fontSize: 12, color: "var(--ink-muted)" }}>
+          Grandfathered modules: {s.grandfathered.join(", ")}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+
+// Operator 2026-06-23: package + limits banner.
+// Self-contained: fetches /api/health every 30s and renders a single
+// line showing the package the customer is on plus tag/gateway/user
+// usage vs limits. Hidden when the backend doesn't return a
+// license_summary (legacy installs).
+function LicensePackageBanner() {
+  const [summary, setSummary] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const tick = async () => {
+      try {
+        const j = await getHealth();
+        if (alive) setSummary(j?.license_summary || null);
+      } catch { /* ignore */ }
+    };
+    tick();
+    const t = setInterval(tick, 30000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+  if (!summary || !summary.package_key) return null;
+  const limits = summary.limits || {};
+  const usage = summary.usage || {};
+  const fmt = (used, cap) => {
+    const u = Number(used || 0);
+    const c = Number(cap || 0);
+    if (!c) return `${u} (unlimited)`;
+    return `${u}/${c}`;
+  };
+  const pkg = String(summary.package_key || "edge");
+  const pkgLabel = pkg.charAt(0).toUpperCase() + pkg.slice(1);
+  return (
+    <div className="license-banner license-banner-ok" style={{ fontSize: 12 }}>
+      <span className="license-banner-pill">PACKAGE</span>
+      <span className="license-banner-text">
+        <strong>{pkgLabel}</strong>
+        {" · "}Tags {fmt(usage.tags, limits.max_tags)}
+        {" · "}Gateways {fmt(usage.gateways, limits.max_gateways_per_edge)}
+        {" · "}Admins {fmt(usage.admin_users, limits.max_studio_admins)}
+        {limits.max_view_users ? <> {" · "}View users {fmt(usage.active_view_sessions, limits.max_view_users)}</> : null}
+      </span>
+    </div>
+  );
+}
+
+
+// Operator 2026-06-23: Canonical-customer-DB read-routing banner.
+// Shows where historian reads currently come from (customer Postgres
+// vs local SQLite spill buffer), why, and lets admins flip a
+// emergency-override toggle.
+function ReadRoutingStatusCard({ isAdmin }) {
+  const [status, setStatus] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const fetchStatus = useCallback(async () => {
+    try {
+      const j = await getHealth();
+      setStatus(j?.historian_read_routing || null);
+      setError("");
+    } catch (e) { setError(String(e?.message || e || "")); }
+  }, []);
+  useEffect(() => {
+    fetchStatus();
+    const t = setInterval(fetchStatus, 10000);
+    return () => clearInterval(t);
+  }, [fetchStatus]);
+  const forced = !!status && status.reason === "env_force_sqlite" || (status?.target === "sqlite" && status?.reason === "fallback");
+  const target = status?.target || "sqlite";
+  const reason = status?.reason || "";
+  const label =
+    target === "customer_db" ? "Customer DB" :
+    reason === "no_customer_db_configured" ? "SQLite (no customer DB configured)" :
+    reason === "backfill_pending" ? "SQLite (backfill in progress)" :
+    reason === "circuit_open" ? "SQLite (customer DB unreachable, auto-fallback)" :
+    reason === "env_force_sqlite" ? "SQLite (forced via env)" :
+    "SQLite";
+  const pillClass =
+    target === "customer_db" ? "status-online" :
+    reason === "circuit_open" ? "status-offline" :
+    "status-warning";
+  const toggleForce = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const newVal = !(reason === "env_force_sqlite" || target === "sqlite");
+      await setForceSqliteReads(newVal);
+      await fetchStatus();
+    } catch (e) { setError(String(e?.message || e || "")); }
+    finally { setBusy(false); }
+  };
+  return (
+    <section className="card">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <h3 style={{ margin: 0 }}>Historian Read Routing</h3>
+          <div style={{ marginTop: 6 }}>
+            <span className={`status-pill ${pillClass}`}>{label}</span>
+            {status?.customer_db_name ? (
+              <span style={{ marginLeft: 8 }} className="muted">via {status.customer_db_name}</span>
+            ) : null}
+            {status && status.fail_counter > 0 ? (
+              <span style={{ marginLeft: 8 }} className="muted">
+                customer DB recent failures: {status.fail_counter}
+              </span>
+            ) : null}
+          </div>
+        </div>
+        {isAdmin ? (
+          <div>
+            <button className="btn btn-secondary btn-sm" disabled={busy} onClick={toggleForce}>
+              {target === "customer_db" ? "Force SQLite reads (emergency)" : "Restore customer-DB reads"}
+            </button>
+          </div>
+        ) : null}
+      </div>
+      {error ? <div className="alert alert-error" style={{ marginTop: 8 }}>{error}</div> : null}
+    </section>
+  );
+}
+
+
+// Lets the operator pick what to do with historian rows that live under
+// tenant_ids OTHER than the current one (e.g. data accumulated before
+// re-activation to a new company). NEVER rewrites tenant_id on rows.
+// Bridges are an alias table; the chart read path joins through it.
+function DataContinuityPage({ currentTenantId, dataContinuity, onDecisionRecorded, canEdit }) {
+  const [inventory, setInventory] = useState([]);
+  const [aliases, setAliases] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      const [inv, al] = await Promise.all([
+        getTenantInventory().catch(() => ({ rows: [] })),
+        listTenantAliases(true).catch(() => ({ rows: [] })),
+      ]);
+      setInventory(Array.isArray(inv?.rows) ? inv.rows : []);
+      setAliases(Array.isArray(al?.rows) ? al.rows : []);
+    } catch (e) {
+      setError(String(e?.message || e));
+    }
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const aliasByTenant = useMemo(() => {
+    const map = {};
+    for (const a of aliases) {
+      map[String(a.alias_tenant_id || "")] = a;
+    }
+    return map;
+  }, [aliases]);
+
+  const priorRows = useMemo(() => {
+    return inventory.filter((row) => String(row.tenant_id || "").trim().toLowerCase() !== String(currentTenantId || "").trim().toLowerCase());
+  }, [inventory, currentTenantId]);
+
+  const onBridge = async (aliasTenantId, reason) => {
+    if (!canEdit) return;
+    setBusy(true); setError(""); setInfo("");
+    try {
+      await upsertTenantAlias({ aliasTenantId, reason: reason || "operator_bridge", archived: false });
+      await refresh();
+      setInfo(`Bridge added for ${aliasTenantId}. Chart now includes its rows.`);
+    } catch (e) { setError(String(e?.message || e)); }
+    finally { setBusy(false); }
+  };
+  const onArchive = async (aliasTenantId) => {
+    if (!canEdit) return;
+    setBusy(true); setError(""); setInfo("");
+    try {
+      await upsertTenantAlias({ aliasTenantId, reason: "operator_archive", archived: true });
+      await refresh();
+      setInfo(`Archived ${aliasTenantId}. Rows preserved on disk but hidden from charts.`);
+    } catch (e) { setError(String(e?.message || e)); }
+    finally { setBusy(false); }
+  };
+  const onRemoveBridge = async (aliasTenantId) => {
+    if (!canEdit) return;
+    setBusy(true); setError(""); setInfo("");
+    try {
+      await deleteTenantAlias(aliasTenantId);
+      await refresh();
+      setInfo(`Bridge removed for ${aliasTenantId}. Its rows are no longer included in charts.`);
+    } catch (e) { setError(String(e?.message || e)); }
+    finally { setBusy(false); }
+  };
+  const onRecordDecision = async (choice) => {
+    if (!canEdit) return;
+    setBusy(true); setError(""); setInfo("");
+    try {
+      const res = await recordDataContinuityDecision({ choice });
+      if (typeof onDecisionRecorded === "function") onDecisionRecorded({ decision: res.decision });
+      setInfo(`Decision recorded: ${choice}.`);
+    } catch (e) { setError(String(e?.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  const fmtTs = (ts) => String(ts || "").slice(0, 19).replace("T", " ");
+  const fmtCount = (n) => Number(n || 0).toLocaleString();
+
+  return (
+    <section className="card">
+      <h3 style={{ marginTop: 0 }}>Data Continuity</h3>
+      <p className="muted">
+        When this edge is re-activated to a new company, the local historian still contains rows from before.
+        Choose how to bridge them. Rows are <strong>never rewritten</strong> — bridging is a reversible alias.
+      </p>
+
+      <div className="row" style={{ gap: 12, alignItems: "flex-start", marginTop: 8 }}>
+        <div style={{ flex: 1, padding: "10px 12px", border: "1px solid var(--border)", borderRadius: 6 }}>
+          <div className="muted" style={{ fontSize: 11 }}>Current tenant</div>
+          <div style={{ fontWeight: 600, marginTop: 4 }}>{currentTenantId || "—"}</div>
+          <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>
+            {fmtCount(dataContinuity?.current_row_count)} rows · last write {fmtTs(dataContinuity?.current_max_ts) || "—"}
+          </div>
+        </div>
+      </div>
+
+      {error ? <div className="error" style={{ marginTop: 8 }}>{error}</div> : null}
+      {info ? <div className="info-note" style={{ marginTop: 8 }}>{info}</div> : null}
+
+      <h4 style={{ marginTop: 20, marginBottom: 6 }}>Prior tenants in the local historian</h4>
+      {priorRows.length === 0 ? (
+        <div className="muted">No prior-tenant rows found. Nothing to bridge.</div>
+      ) : (
+        <div className="table-scroll">
+          <div className="table" style={{ gridTemplateColumns: "minmax(180px,2fr) 90px 200px 200px 200px minmax(220px,2fr)" }}>
+            <div className="thead">
+              <span>Tenant ID</span>
+              <span>Rows</span>
+              <span>First write (UTC)</span>
+              <span>Last write (UTC)</span>
+              <span>Status</span>
+              <span>Actions</span>
+            </div>
+            {priorRows.map((row) => {
+              const al = aliasByTenant[row.tenant_id];
+              const isBridged = al && !al.archived;
+              const isArchived = al && al.archived;
+              return (
+                <div key={row.tenant_id} className="trow">
+                  <span style={{ fontFamily: "monospace", fontSize: 12 }}>{row.tenant_id}</span>
+                  <span>{fmtCount(row.row_count)}</span>
+                  <span>{fmtTs(row.min_ts)}</span>
+                  <span>{fmtTs(row.max_ts)}</span>
+                  <span>
+                    {isBridged ? <span className="status-pill status-online">bridged</span>
+                      : isArchived ? <span className="status-pill status-warn">archived</span>
+                      : <span className="status-pill">unbridged</span>}
+                  </span>
+                  <span className="row" style={{ gap: 4 }}>
+                    {!isBridged ? (
+                      <button className="btn btn-success btn-sm" disabled={!canEdit || busy} onClick={() => onBridge(row.tenant_id)}>
+                        Bridge
+                      </button>
+                    ) : (
+                      <button className="btn btn-secondary btn-sm" disabled={!canEdit || busy} onClick={() => onRemoveBridge(row.tenant_id)}>
+                        Remove bridge
+                      </button>
+                    )}
+                    {!isArchived ? (
+                      <button className="btn btn-secondary btn-sm" disabled={!canEdit || busy} onClick={() => onArchive(row.tenant_id)}>
+                        Archive
+                      </button>
+                    ) : (
+                      <button className="btn btn-success btn-sm" disabled={!canEdit || busy} onClick={() => onBridge(row.tenant_id)}>
+                        Restore
+                      </button>
+                    )}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      <h4 style={{ marginTop: 20, marginBottom: 6 }}>Record your decision</h4>
+      <p className="muted">Optional — stops the dashboard banner from re-appearing on every login.</p>
+      <div className="row" style={{ gap: 8, marginTop: 4 }}>
+        <button className="btn btn-primary" disabled={!canEdit || busy} onClick={() => onRecordDecision("bridge")}>
+          I've bridged what I needed
+        </button>
+        <button className="btn btn-secondary" disabled={!canEdit || busy} onClick={() => onRecordDecision("archive")}>
+          Archive everything else
+        </button>
+        <button className="btn btn-secondary" disabled={!canEdit || busy} onClick={() => onRecordDecision("later")}>
+          Decide later
+        </button>
+      </div>
+
+      {dataContinuity?.decision?.decided_at ? (
+        <div className="muted" style={{ marginTop: 12, fontSize: 11 }}>
+          Last decision: {dataContinuity.decision.choice} on {fmtTs(dataContinuity.decision.decided_at)} by {dataContinuity.decision.decided_by_user || "—"}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 function AppShell() {
   const isReadonlyCloudMode = isForcedReadonlyCloudMode();
   const isClientView = isClientViewMode();
@@ -3148,6 +3586,7 @@ function AppShell() {
   const [gatewayOpcValidatedFor, setGatewayOpcValidatedFor] = useState("");
   const [gatewaySelectedTags, setGatewaySelectedTags] = useState([]);
   const [gatewayBrowseSearch, setGatewayBrowseSearch] = useState("");
+  const [gatewayManualTagInput, setGatewayManualTagInput] = useState("");
   const [gatewayOpcNodeSummary, setGatewayOpcNodeSummary] = useState({ total: 0, objects: 0, variables: 0, methods: 0 });
   const [gatewayForm, setGatewayForm] = useState({
     name: "",
@@ -3157,6 +3596,13 @@ function AppShell() {
     opc_url: "",
     database_id: "",
     interval_ms: 1000,
+    auto_resume: false,
+    schedule_enabled: false,
+    schedule_start: "08:00",
+    schedule_stop: "18:00",
+    // Default ON — baseline policy is "restore gateways that were
+    // running". Operator can flip OFF per-gateway to disable it.
+    auto_recover_enabled: true,
     tags_text: ""
   });
   const [showDbModal, setShowDbModal] = useState(false);
@@ -3323,6 +3769,19 @@ function AppShell() {
   const tagMonitorDomainRef = useRef(null);
   const [cloudProviderDbId, setCloudProviderDbId] = useState("");
   const [currentTenantId, setCurrentTenantId] = useState("default");
+  // Operator 2026-06-19: Data Continuity. Populated from /bootstrap's
+  // data_continuity block. When decision_pending is true and there are
+  // prior tenants with rows, the UI shows a banner pointing at the
+  // Data Continuity page.
+  const [dataContinuity, setDataContinuity] = useState({
+    current_tenant_id: "",
+    current_row_count: 0,
+    current_max_ts: "",
+    prior_tenants: [],
+    decision: {},
+    decision_pending: false,
+  });
+  const [dataContinuityDismissed, setDataContinuityDismissed] = useState(false);
   const [cloudAutoSyncEnabled, setCloudAutoSyncEnabled] = useState(true);
   const [tenantWebClientUrl, setTenantWebClientUrl] = useState("https://trustnode.lsapps.app");
   const [tenantCompanyName, setTenantCompanyName] = useState("");
@@ -3366,6 +3825,8 @@ function AppShell() {
       return null;
     }
   });
+  const edgeLicenseSnapshotRef = useRef(edgeLicenseSnapshot);
+  useEffect(() => { edgeLicenseSnapshotRef.current = edgeLicenseSnapshot; }, [edgeLicenseSnapshot]);
   const [edgeLicenseBusy, setEdgeLicenseBusy] = useState(false);
   const [licenseGuardBlocked, setLicenseGuardBlocked] = useState(false);
   const [licenseGuardMessage, setLicenseGuardMessage] = useState("");
@@ -4035,6 +4496,42 @@ function AppShell() {
   // port list on the backend; the responding port gets reported.
   const [deviceScanAnyTcp, setDeviceScanAnyTcp] = useState(true);
   const [appStoreHydrated, setAppStoreHydrated] = useState(false);
+  // Operator 2026-06-24: startup splash gate. Stays true (= splash
+  // visible) from app boot until the BOOT PROBE finishes (or the 8 s
+  // safety-net fires). The probe runs ONCE — a fast TCP check per
+  // configured device (parallel, ~1 s each) and an instant
+  // filesystem stat per SQLite DB. After the probe completes,
+  // device/DB status is maintained solely by the gateway-runtime
+  // signal (no more periodic sweeps). The splash is the user's only
+  // "the app is checking your local connections" moment; afterwards
+  // the UI is open and trustworthy.
+  // Operator 2026-06-25: default TRUE — Electron splash already
+  // gated boot. No React-side overlay needed.
+  const [startupSplashDone, setStartupSplashDone] = useState(true);
+  const [bootProbeStatus, setBootProbeStatus] = useState("Loading application…");
+  // Failures list — array of "<name>: <reason>" strings. Empty means
+  // probe hasn't failed yet. Non-empty + splash still up → render
+  // Retry / Continue Anyway buttons.
+  const [bootProbeFailures, setBootProbeFailures] = useState([]);
+  const [bootProbeBusy, setBootProbeBusy] = useState(false);
+  // Bumped to retrigger the probe.
+  const [bootProbeNonce, setBootProbeNonce] = useState(0);
+  const bootProbeRanRef = useRef(false);
+  // Safety net: if the probe never completes (offline edge, network
+  // glitch, race), dismiss the splash after 8 s so the user can use
+  // the app even in a degraded state. ALSO force-flip hydration so
+  // every effect gated on `appStoreHydrated` (including the
+  // gatewayConfigs auto-save POST) can run — otherwise the user can
+  // edit-and-Save indefinitely with zero PUTs hitting the backend.
+  // Operator 2026-06-25: this was the regression that prevented the
+  // schedule edits from persisting.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setStartupSplashDone(true);
+      setAppStoreHydrated(true);
+    }, 8000);
+    return () => clearTimeout(t);
+  }, []);
   const reconnectTimerRef = useRef(null);
   const fileSinkPickerRef = useRef(null);
   const footerRef = useRef(null);
@@ -4393,17 +4890,66 @@ function AppShell() {
     gatewayBootstrapAppliedRef.current = true;
     gatewaySeedAttemptedRef.current = true;
     if (Array.isArray(data.database_configurations) && data.database_configurations.length > 0) {
-      setDbConnections(normalizeDbConnections(data.database_configurations));
+      // Operator 2026-06-24: pre-seed connection_ok for trivially-
+      // healthy engines so the first paint never shows CHECKING /
+      // OFFLINE for a DB we know is fine. SQLite is always ONLINE
+      // (backend wrote the bootstrap from it); other engines stay
+      // undefined and resolve via the fast-path sweep below.
+      const seeded = normalizeDbConnections(data.database_configurations).map((c) => {
+        if (String(c?.engine || "").toLowerCase() === "sqlite") {
+          return { ...c, connection_ok: true, last_test: "Local file (always online)", last_check_utc: tsNow() };
+        }
+        return c;
+      });
+      // Operator 2026-06-25: GUARANTEE a Local SQLite entry exists.
+      // Some tenant scopes don't deliver one in their bootstrap; without
+      // it the gateway dropdown is empty and Start fails with "DB not
+      // found". The synthetic row matches what backend.app_store opens
+      // by default, so writes land in the same file.
+      const hasSqlite = seeded.some((c) => String(c?.engine || "").toLowerCase() === "sqlite");
+      if (!hasSqlite) {
+        seeded.unshift({
+          id: "local-sqlite-default",
+          name: "Local SQLite",
+          engine: "sqlite",
+          sqlite_path: "./data/trustnode_app_store.db",
+          table: "plc_readings",
+          enabled: true,
+          use_gateway: true,
+          use_app: true,
+          use_backup: false,
+          connection_ok: true,
+          last_test: "Local file (always online)",
+          last_check_utc: tsNow(),
+        });
+      }
+      setDbConnections(seeded);
     } else if (Array.isArray(data.database_configurations)) {
-      // Bootstrap returned an EMPTY array — distinct from "missing key".
-      // Don't overwrite a populated dbConnections with [] mid-session; it
-      // wipes the dropdown the operator just used to pick a sink. The
-      // backend bootstrap can legitimately return [] when the user-scoped
-      // doc has no overlay yet AND the legacy scope fallback hasn't
-      // resolved data — in either case the existing in-memory list is
-      // closer to the truth than the empty payload.
-      // (If you genuinely want to clear all DBs, do it through the
-      // Database Overview UI which calls setDbConnections([]) directly.)
+      // Bootstrap returned an EMPTY array. Inject the synthetic Local
+      // SQLite so the dropdown is never empty, but only if we don't
+      // already have one in memory from a previous tick (avoids
+      // wiping the operator's just-picked DB).
+      setDbConnections((prev) => {
+        const hasSqlite = (prev || []).some((c) => String(c?.engine || "").toLowerCase() === "sqlite");
+        if (hasSqlite) return prev;
+        return [
+          {
+            id: "local-sqlite-default",
+            name: "Local SQLite",
+            engine: "sqlite",
+            sqlite_path: "./data/trustnode_app_store.db",
+            table: "plc_readings",
+            enabled: true,
+            use_gateway: true,
+            use_app: true,
+            use_backup: false,
+            connection_ok: true,
+            last_test: "Local file (always online)",
+            last_check_utc: tsNow(),
+          },
+          ...(prev || []),
+        ];
+      });
     }
     if (Array.isArray(triggers.collection_triggers)) setCollectionTriggers(triggers.collection_triggers);
     if (triggers.collection_trigger_mode === "any" || triggers.collection_trigger_mode === "all") {
@@ -5362,6 +5908,19 @@ function AppShell() {
         if (res?.ok && res?.data && Object.keys(res.data).length) {
           applyAppStorePayload(res.data);
         }
+        // Data Continuity (operator 2026-06-19): pull the prior-tenant
+        // summary so the banner can render before any user interaction.
+        if (res?.data_continuity && typeof res.data_continuity === "object") {
+          setDataContinuity({
+            current_tenant_id: String(res.data_continuity.current_tenant_id || ""),
+            current_row_count: Number(res.data_continuity.current_row_count || 0),
+            current_max_ts: String(res.data_continuity.current_max_ts || ""),
+            prior_tenants: Array.isArray(res.data_continuity.prior_tenants) ? res.data_continuity.prior_tenants : [],
+            decision: res.data_continuity.decision || {},
+            decision_pending: Boolean(res.data_continuity.decision_pending),
+          });
+          setDataContinuityDismissed(false);
+        }
       } catch (_) {
         // Keep localStorage fallback behavior when app-store is unavailable.
       } finally {
@@ -5658,14 +6217,17 @@ function AppShell() {
       await refreshEdgeIngestDiagnostics();
     };
     run();
-    const timer = setInterval(run, 5000);
+    // Operator 2026-06-19 (perf): 5s → 15s. Diagnostics is a
+    // status snapshot that updates slowly (sync backlog, last
+    // error). 3× less HTTP + DB load with no UX impact.
+    const timer = setInterval(run, 15000);
     return () => {
       stopped = true;
       clearInterval(timer);
     };
   }, [appStoreHydrated, currentUser, endpointMode, isHostedWebClient]);
 
-  // Poll the lighter /api/app-store/sync/status every 2s. Drives the new
+  // Poll the lighter /api/app-store/sync/status. Drives the new
   // sync-status card and the backlog-too-big popup. Cheap call — backend
   // just reads counters from the in-memory inspector snapshot.
   // Cloud portal mode has no local sync backlog, so this poll is pure noise
@@ -5679,7 +6241,11 @@ function AppShell() {
       await refreshCloudSyncStatus();
     };
     run();
-    const timer = setInterval(run, 2000);
+    // Operator 2026-06-19 (perf): 2s → 10s. Sync backlog moves
+    // on the order of seconds-to-minutes, not 2s. The popup
+    // threshold is "10k pending OR 1 hour stale" — neither is
+    // worth a 2s poll. 5× less HTTP + DB load.
+    const timer = setInterval(run, 10000);
     return () => {
       stopped = true;
       clearInterval(timer);
@@ -5888,10 +6454,7 @@ function AppShell() {
       // Seed baseline from hydrated data and skip first implicit write.
       // This prevents stale browser sessions from overwriting cloud config
       // immediately on page load.
-      if (!appStoreLastPersistSignatureRef.current) {
-        appStoreLastPersistSignatureRef.current = signature;
-        return;
-      }
+      // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       if (signature === appStoreLastPersistSignatureRef.current) return;
       appStorePersistInFlightRef.current = true;
       try {
@@ -6011,10 +6574,7 @@ function AppShell() {
       if (alarmsDomainPersistInFlightRef.current) return;
       const payload = { alarms: Array.isArray(alarms) ? alarms : [] };
       const signature = JSON.stringify(payload);
-      if (!alarmsDomainLastPersistSignatureRef.current) {
-        alarmsDomainLastPersistSignatureRef.current = signature;
-        return;
-      }
+      // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       if (signature === alarmsDomainLastPersistSignatureRef.current) return;
       alarmsDomainPersistInFlightRef.current = true;
       try {
@@ -6052,10 +6612,7 @@ function AppShell() {
         trigger_rules: Array.isArray(triggerRules) ? triggerRules : [],
       };
       const signature = JSON.stringify(payload);
-      if (!triggersDomainLastPersistSignatureRef.current) {
-        triggersDomainLastPersistSignatureRef.current = signature;
-        return;
-      }
+      // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       if (signature === triggersDomainLastPersistSignatureRef.current) return;
       triggersDomainPersistInFlightRef.current = true;
       try {
@@ -6098,10 +6655,18 @@ function AppShell() {
       if (gatewayConfigsPersistInFlightRef.current) return;
       const payload = Array.isArray(gatewayConfigs) ? gatewayConfigs : [];
       const signature = JSON.stringify(payload);
-      if (!gatewayConfigsLastPersistSignatureRef.current) {
-        gatewayConfigsLastPersistSignatureRef.current = signature;
-        return;
-      }
+      // Operator 2026-06-25 (final fix): the prior `if (!ref) { ref =
+      // sig; return; }` skip-first-run guard MEANT to avoid an
+      // immediate re-persist of bootstrap data, but the guard fires
+      // on the FIRST signature observation regardless of WHERE
+      // appStoreHydrated flipped. When the splash safety-net or the
+      // Continue Anyway button flipped hydration AFTER the user had
+      // already edited the modal, the first effect run captured the
+      // edited (unsaved) state as the baseline — and the edit never
+      // PUT. Removed: the equality check below is sufficient. The
+      // worst case is one redundant PUT right after bootstrap (the
+      // backend skips no-op upserts anyway, so the cost is one round
+      // trip — preferable to silently losing user edits).
       if (signature === gatewayConfigsLastPersistSignatureRef.current) return;
       gatewayConfigsPersistInFlightRef.current = true;
       try {
@@ -6126,10 +6691,7 @@ function AppShell() {
       if (devicesPersistInFlightRef.current) return;
       const payload = Array.isArray(devices) ? devices : [];
       const signature = JSON.stringify(payload);
-      if (!devicesLastPersistSignatureRef.current) {
-        devicesLastPersistSignatureRef.current = signature;
-        return;
-      }
+      // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       if (signature === devicesLastPersistSignatureRef.current) return;
       devicesPersistInFlightRef.current = true;
       try {
@@ -6154,10 +6716,7 @@ function AppShell() {
       if (dbConnectionsPersistInFlightRef.current) return;
       const payload = Array.isArray(dbConnections) ? dbConnections : [];
       const signature = JSON.stringify(payload);
-      if (!dbConnectionsLastPersistSignatureRef.current) {
-        dbConnectionsLastPersistSignatureRef.current = signature;
-        return;
-      }
+      // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       if (signature === dbConnectionsLastPersistSignatureRef.current) return;
       dbConnectionsPersistInFlightRef.current = true;
       try {
@@ -6182,10 +6741,7 @@ function AppShell() {
       if (powerConfigPersistInFlightRef.current) return;
       const payload = powerConfig && typeof powerConfig === "object" ? powerConfig : {};
       const signature = JSON.stringify(payload);
-      if (!powerConfigLastPersistSignatureRef.current) {
-        powerConfigLastPersistSignatureRef.current = signature;
-        return;
-      }
+      // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       if (signature === powerConfigLastPersistSignatureRef.current) return;
       powerConfigPersistInFlightRef.current = true;
       try {
@@ -6240,207 +6796,242 @@ function AppShell() {
   // (or a user adding their first gateway via the UI) is the only
   // legitimate source of gatewayConfigs entries.
 
+  // Operator 2026-06-25: ONE poller drives the device + DB cards.
+  // /api/boot-probe is a public TCP-probe endpoint that runs on the
+  // backend and returns {devices:[{id, ok, reason}], databases:[...]}
+  // for every configured device + non-SQLite DB. We poll it every
+  // 10 s and merge the results into the local state. No more
+  // "Checking…" stuck rows: the very first probe (within 10 s of
+  // boot) decides ONLINE or OFFLINE for every row, and the user gets
+  // a real reason on failure.
   useEffect(() => {
     if (isHostedWebClient && endpointMode === "cloud") return;
     let stopped = false;
-    let running = false;
-    const checkDevices = async () => {
-      const current = devicesRef.current;
-      if (running || !current.length) return;
-      // If a gateway is actively running against this PLC, the device is
-      // reachable by definition — mark it ONLINE from the runtime status
-      // without re-probing the PLC (which would compete with the running
-      // collector for socket time).
-      const gwStatuses = gatewayRuntimeStatusesRef.current || {};
-      const hasRunningGateway = Object.values(gwStatuses).some((s) => s?.running === true);
-      if (hasRunningGateway) {
-        const runningIps = new Set();
-        for (const gid of Object.keys(gwStatuses)) {
-          const st = gwStatuses[gid];
-          if (!st?.running) continue;
-          const g = (gatewayConfigsRef.current || []).find((x) => String(x?.id || "") === String(gid));
-          if (g?.plc_ip) runningIps.add(String(g.plc_ip));
-        }
-        if (runningIps.size > 0) {
+    const runProbe = async () => {
+      if (stopped) return;
+      try {
+        // Operator 2026-06-25: POST what the UI is showing, so the
+        // backend probes the SAME devices the user sees — no tenant
+        // scoping race that left rows on "Checking…" forever.
+        const devsPayload = (devicesRef.current || []).map((d) => ({
+          id: d?.id,
+          name: d?.name,
+          ip: d?.plc_ip,
+          gateway_type: d?.gateway_type,
+          opc_url: d?.opc_url,
+        })).filter((d) => d.id);
+        const dbsPayload = (dbConnectionsRef.current || []).map((c) => ({
+          id: c?.id,
+          name: c?.name,
+          engine: c?.engine,
+          host: c?.host,
+          port: c?.port,
+        })).filter((c) => c.id);
+        const probe = await postBootProbe({ devices: devsPayload, databases: dbsPayload });
+        if (stopped || !probe) return;
+        const devById = new Map(
+          (probe.devices || []).map((d) => [String(d.id || ""), d])
+        );
+        if (devById.size > 0) {
           setDevices((prev) =>
-            prev.map((d) =>
-              runningIps.has(String(d?.plc_ip || ""))
-                ? { ...d, connection_ok: true, ping_ok: true, port_ok: true, protocol_ok: true, last_test: "Gateway running", last_check_utc: tsNow() }
-                : d
-            )
+            prev.map((d) => {
+              const hit = devById.get(String(d?.id || ""));
+              if (!hit) return d;
+              return {
+                ...d,
+                connection_ok: Boolean(hit.ok),
+                ping_ok: Boolean(hit.ok),
+                port_ok: Boolean(hit.ok),
+                protocol_ok: Boolean(hit.ok),
+                last_test: hit.ok
+                  ? `${hit.ip || d.plc_ip || "device"}:${hit.port || ""} reachable`
+                  : String(hit.reason || "Not reachable"),
+                last_check_utc: tsNow(),
+              };
+            })
           );
         }
-        return;
-      }
-      running = true;
-      try {
-        const checks = await Promise.all(
-          current.map(async (d) => {
-            try {
-              const res = await testPlcConnection({
-                gateway_type: d.gateway_type,
-                plc_ip: d.plc_ip,
-                opc_url: d.opc_url || "",
-                opc_node_id: d.opc_node_id || "",
-                opc_node_ids: Array.isArray(d.opc_node_ids) && d.opc_node_ids.length
-                  ? d.opc_node_ids
-                  : parseOpcNodeIds(d.opc_node_ids_text || d.opc_node_id || ""),
-                timeout_ms: d.gateway_type === "siemens_opcua" ? 7000 : 2500
-              });
-              const hasOpcField = Object.prototype.hasOwnProperty.call(res || {}, "opc_session_ok");
-              return {
-                id: d.id,
-                connection_ok: res.ok,
-                ping_ok: res.ping_ok,
-                port_ok: res.port_ok,
-                protocol_ok:
-                  d.gateway_type === "siemens_opcua"
-                    ? Boolean(hasOpcField ? res.opc_session_ok : res.port_ok)
-                    : Boolean(res.port_ok),
-                last_test: res.message
-              };
-            } catch (err) {
-              return {
-                id: d.id,
-                connection_ok: false,
-                ping_ok: false,
-                port_ok: false,
-                protocol_ok: false,
-                last_test: String(err)
-              };
-            }
-          })
+        const dbById = new Map(
+          (probe.databases || []).map((c) => [String(c.id || ""), c])
         );
-        if (stopped) return;
-        setDevices((prev) =>
-          prev.map((d) => {
-            const hit = checks.find((c) => c.id === d.id);
-            return hit ? { ...d, ...hit } : d;
-          })
-        );
-      } finally {
-        running = false;
-      }
+        if (dbById.size > 0) {
+          setDbConnections((prev) =>
+            prev.map((c) => {
+              const hit = dbById.get(String(c?.id || ""));
+              if (!hit) return c;
+              return {
+                ...c,
+                connection_ok: Boolean(hit.ok),
+                last_test: hit.ok
+                  ? (hit.engine === "sqlite"
+                      ? "Local file"
+                      : `${hit.host || ""}:${hit.port || ""} reachable`)
+                  : String(hit.reason || "Not reachable"),
+                last_check_utc: tsNow(),
+              };
+            })
+          );
+        }
+      } catch (_) { /* keep last-known state until next tick */ }
     };
-    checkDevices();
-    const timer = setInterval(checkDevices, 15000);
+    runProbe();  // fire immediately on mount
+    const timer = setInterval(runProbe, 10000);
     return () => {
       stopped = true;
       clearInterval(timer);
     };
-  }, [endpointMode, isHostedWebClient]);
+  }, [endpointMode, isHostedWebClient, devices.length, dbConnections.length]);
 
+  // Operator 2026-06-24: BOOT PROBE. Runs after hydration and on
+  // every Retry click (bootProbeNonce bump). Verifies every
+  // configured device's TCP port and every non-SQLite DB connection
+  // in parallel with a tight budget. Updates connection_ok per row.
+  // On failures: keeps the splash up and shows Retry / Continue
+  // Anyway buttons. On success: dismisses the splash so the UI
+  // opens with verified status.
   useEffect(() => {
-    if (isHostedWebClient && endpointMode === "cloud") return;
-    let stopped = false;
-    let running = false;
-    const checkDbConnections = async () => {
-      const current = dbConnectionsRef.current;
-      if (running || !current.length) return;
-      // If at least one gateway is actively writing into a DB, that DB
-      // sink is reachable by definition. Use the runtime "writes count
-      // is advancing" / "no db_last_error" signal to flip connection_ok
-      // ONLINE without re-running the heavyweight test query (which
-      // contended with the live writes and left the badge stuck on
-      // OFFLINE even though the historian was filling).
-      const gwStatuses = gatewayRuntimeStatusesRef.current || {};
-      const runningDbIds = new Set();
-      let anyGatewayRunning = false;
-      for (const gid of Object.keys(gwStatuses)) {
-        const st = gwStatuses[gid] || {};
-        if (st.running === true) {
-          anyGatewayRunning = true;
-          if (!st.db_last_error) {
-            const g = (gatewayConfigsRef.current || []).find((x) => String(x?.id || "") === String(gid));
-            const dbId = String(g?.database_id || "");
-            if (dbId) runningDbIds.add(dbId);
-          }
-        }
-      }
-      if (runningDbIds.size > 0) {
+    if (!appStoreHydrated) return;
+    if (startupSplashDone) return;
+    let cancelled = false;
+    setBootProbeBusy(true);
+    setBootProbeFailures([]);
+    (async () => {
+      const devices = devicesRef.current || [];
+      const dbs = dbConnectionsRef.current || [];
+      setBootProbeStatus(`Checking ${devices.length} device(s) and ${dbs.length} database(s)…`);
+      // SQLite probe: always ONLINE (the backend wrote the bootstrap
+      // from it; if the file were missing the bootstrap itself would
+      // have failed). Patch in one shot.
+      const sqliteIds = new Set(
+        dbs.filter((c) => String(c?.engine || "").toLowerCase() === "sqlite")
+           .map((c) => String(c?.id || ""))
+      );
+      if (sqliteIds.size > 0) {
         setDbConnections((prev) =>
           prev.map((c) =>
-            runningDbIds.has(String(c?.id || ""))
-              ? { ...c, connection_ok: true, last_test: "Gateway writes succeeding", last_check_utc: tsNow() }
+            sqliteIds.has(String(c?.id || ""))
+              ? { ...c, connection_ok: true, last_test: "Local file verified at boot", last_check_utc: tsNow() }
               : c
           )
         );
       }
-      // Skip the explicit probe only when at least one gateway is
-      // running — otherwise we want the periodic test to keep the badge
-      // honest on idle systems.
-      if (anyGatewayRunning) return;
-      running = true;
-      try {
-        const checks = await Promise.all(
-          current.map(async (c) => {
-            try {
-              const res = await testDatabaseConnection({
-                engine: c.engine,
-                host: c.host || "",
-                port: Number(c.port || 0),
-                database: c.database || "",
-                username: c.username || "",
-                password: c.password || "",
-                sqlite_path: c.sqlite_path || "",
-                file_path: c.file_path || "",
-                legacy_url: c.legacy_url || "",
-                legacy_api_token: c.legacy_api_token || "",
-                tls: Boolean(c.tls),
-                timeout_ms: String(c.engine || "").toLowerCase() === "postgresql" ? 5000 : 3000
-              });
-              return { id: c.id, connection_ok: Boolean(res.ok), last_test: res.message, last_check_utc: tsNow() };
-            } catch (err) {
-              const rawMsg = String(err?.message || err || "");
-              const transient = /aborterror|signal is aborted|failed to fetch|networkerror|load failed/i.test(rawMsg);
-              // Replace the cryptic browser AbortError text with
-              // something the operator can act on. "Signal is aborted
-              // without reason" was triggering helpdesk tickets that
-              // turned out to be "Supabase pooler unreachable from
-              // this network" or "VPS firewall blocked our IP".
-              const friendly = transient
-                ? `Connection test timed out after ${c.engine === "postgresql" ? 5 : 3} s — server didn't respond. Likely causes: DB host unreachable, firewall, Supabase pooler offline, or wrong port.`
-                : rawMsg;
-              return { id: c.id, connection_ok: false, last_test: friendly, last_check_utc: tsNow(), transient };
-            }
+      // Non-SQLite DBs: probe with a tight 2.5s budget. Failures
+      // leave the row at OFFLINE so the operator can see why.
+      const dbsToProbe = dbs.filter((c) => {
+        const eng = String(c?.engine || "").toLowerCase();
+        return eng && eng !== "sqlite";
+      });
+      const dbProbes = dbsToProbe.map(async (c) => {
+        try {
+          const res = await testDatabaseConnection({
+            engine: c.engine,
+            host: c.host || "",
+            port: Number(c.port || 0),
+            database: c.database || "",
+            username: c.username || "",
+            password: c.password || "",
+            sqlite_path: c.sqlite_path || "",
+            file_path: c.file_path || "",
+            legacy_url: c.legacy_url || "",
+            legacy_api_token: c.legacy_api_token || "",
+            tls: Boolean(c.tls),
+            timeout_ms: 2500,
+          });
+          return { id: c.id, connection_ok: Boolean(res?.ok), last_test: res?.message || "" };
+        } catch (err) {
+          return { id: c.id, connection_ok: false, last_test: String(err?.message || err || "Probe failed") };
+        }
+      });
+      // Device probe: TCP-port check per configured device, 1.5s
+      // budget each, all in parallel.
+      const devProbes = devices.map(async (d) => {
+        if (!d?.plc_ip) return { id: d.id, connection_ok: false, last_test: "No IP configured" };
+        try {
+          const res = await testPlcConnection({
+            gateway_type: d.gateway_type,
+            plc_ip: d.plc_ip,
+            opc_url: d.opc_url || "",
+            opc_node_id: d.opc_node_id || "",
+            opc_node_ids: Array.isArray(d.opc_node_ids) && d.opc_node_ids.length
+              ? d.opc_node_ids
+              : parseOpcNodeIds(d.opc_node_ids_text || d.opc_node_id || ""),
+            timeout_ms: 1500,
+          });
+          return {
+            id: d.id,
+            connection_ok: Boolean(res?.ok),
+            ping_ok: Boolean(res?.ping_ok),
+            port_ok: Boolean(res?.port_ok),
+            protocol_ok: d.gateway_type === "siemens_opcua"
+              ? Boolean(res?.opc_session_ok)
+              : Boolean(res?.port_ok),
+            last_test: res?.message || "",
+            last_check_utc: tsNow(),
+          };
+        } catch (err) {
+          return {
+            id: d.id,
+            connection_ok: false,
+            ping_ok: false, port_ok: false, protocol_ok: false,
+            last_test: String(err?.message || err || "Probe timed out"),
+            last_check_utc: tsNow(),
+          };
+        }
+      });
+      const [devResults, dbResults] = await Promise.all([
+        Promise.all(devProbes),
+        Promise.all(dbProbes),
+      ]);
+      if (cancelled) return;
+      if (devResults.length > 0) {
+        setDevices((prev) =>
+          prev.map((d) => {
+            const hit = devResults.find((r) => r.id === d.id);
+            return hit ? { ...d, ...hit } : d;
           })
         );
-        if (stopped) return;
+      }
+      if (dbResults.length > 0) {
         setDbConnections((prev) =>
           prev.map((c) => {
-            const hit = checks.find((x) => x.id === c.id);
-            if (!hit) return c;
-            const key = String(c.id || "");
-            if (hit.connection_ok) {
-              dbCheckFailuresRef.current[key] = 0;
-              return { ...c, connection_ok: true, last_test: hit.last_test, last_check_utc: hit.last_check_utc };
-            }
-            const prevFails = Number(dbCheckFailuresRef.current[key] || 0);
-            const nextFails = prevFails + 1;
-            dbCheckFailuresRef.current[key] = nextFails;
-            const keepOnline = Boolean(hit.transient) && Boolean(c.connection_ok) && nextFails < 3;
-            if (keepOnline) {
-              return {
-                ...c,
-                connection_ok: true,
-                last_test: `Transient check issue (retrying): ${hit.last_test}`,
-                last_check_utc: hit.last_check_utc
-              };
-            }
-            return { ...c, connection_ok: false, last_test: hit.last_test, last_check_utc: hit.last_check_utc };
+            const hit = dbResults.find((r) => r.id === c.id);
+            return hit ? { ...c, ...hit, last_check_utc: tsNow() } : c;
           })
         );
-      } finally {
-        running = false;
       }
-    };
-    checkDbConnections();
-    const timer = setInterval(checkDbConnections, 20000);
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
-  }, [endpointMode, isHostedWebClient]);
+      // Build the failure list. SQLite is always considered passing
+      // (verified at bootstrap). Devices and other DBs fail closed.
+      const fails = [];
+      for (const r of devResults) {
+        if (!r.connection_ok) {
+          const d = (devicesRef.current || []).find((x) => x.id === r.id);
+          const name = String(d?.name || d?.plc_ip || r.id || "Device");
+          fails.push(`${name} — ${String(r.last_test || "unreachable").slice(0, 140)}`);
+        }
+      }
+      for (const r of dbResults) {
+        if (!r.connection_ok) {
+          const c = (dbConnectionsRef.current || []).find((x) => x.id === r.id);
+          const name = String(c?.name || c?.engine || r.id || "Database");
+          fails.push(`${name} — ${String(r.last_test || "unreachable").slice(0, 140)}`);
+        }
+      }
+      setBootProbeBusy(false);
+      setBootProbeFailures(fails);
+      if (fails.length === 0) {
+        bootProbeRanRef.current = true;
+        setStartupSplashDone(true);
+      } else {
+        setBootProbeStatus(
+          `${fails.length} connection${fails.length === 1 ? "" : "s"} failed — fix the issue and Retry, or Continue Anyway.`
+        );
+      }
+    })();
+    return () => { cancelled = true; };
+    // Re-run on every Retry (bootProbeNonce bump). Refs are read
+    // inline so seriesDefs etc. don't need to be in the dep array.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appStoreHydrated, bootProbeNonce]);
 
   useEffect(() => {
     if (currentUser?.username && rememberUser) {
@@ -6645,6 +7236,23 @@ function AppShell() {
               message: `Gateway ${gateway?.name || gatewayId || "unknown"} runtime error: ${msg}`
             });
           }
+          // Operator 2026-06-25: backend now broadcasts a `gateway_status`
+          // event on stop. Flip the pill immediately so the "Gateway
+          // not collecting" banner doesn't fire on a clean stop.
+          if (data.type === "gateway_status") {
+            const gatewayId = String(data.gateway_id || "");
+            if (gatewayId) {
+              setGatewayRuntimeStatuses((prev) => ({
+                ...(prev || {}),
+                [gatewayId]: {
+                  ...((prev || {})[gatewayId] || { gateway_id: gatewayId }),
+                  gateway_id: gatewayId,
+                  running: Boolean(data.running),
+                  last_check_utc: tsNow(),
+                },
+              }));
+            }
+          }
           if (Array.isArray(data.readings)) {
             setReadings(data.readings);
             const first = data.readings[0];
@@ -6769,7 +7377,7 @@ function AppShell() {
                   gateway_name: gateway?.name || "",
                   device_name: device?.name || "",
                   plc_ip: gateway?.plc_ip || device?.plc_ip || "",
-                  database_name: db?.name || "",
+                  database_name: db?.name || (gateway?.database_id ? "Local SQLite" : ""),
                   tag: r.tag_name,
                   value: r.value,
                   quality: r.quality,
@@ -7794,6 +8402,15 @@ function AppShell() {
           // Overview is in Historical mode so our snapshot from
           // getAppStoreHistorianRange isn't overwritten by the
           // last-1500-row tail.
+          //
+          // Operator 2026-06-19 (perf): historian-range fetches were
+          // *also* firing for dashboard/tags/historian pages via the
+          // POWER_RELEVANT_PAGES set, each pulling up to 5000 rows
+          // per insight tag every ~2 s. The Customer's Task Manager
+          // showed trustnode-service at 70% CPU because of this.
+          // Heavy historian polling is now confined to the actual
+          // Power Overview / Configuration pages — other pages only
+          // get the cheap getPowerLatest live-values poll above.
           if (activePage === "power_overview" && powerViewMode === "historical") {
             // no-op
           } else if (powerHistoryFetchInflightRef.current) {
@@ -7866,7 +8483,10 @@ function AppShell() {
                   // this window yet (retention hasn't rolled them up),
                   // pull a small raw window so the chart isn't empty.
                   if (metricRows.length === 0 && insightRows.length === 0) {
-                    const lim = Math.min(20000, Math.max(1500, Math.ceil(periodMsLocal / 60000) * 12));
+                    // perf: 20000→8000 cap; this is a one-shot fallback
+                    // when the agg tables haven't rolled up yet — the
+                    // chart down-samples anyway.
+                    const lim = Math.min(8000, Math.max(1500, Math.ceil(periodMsLocal / 60000) * 12));
                     const fetchRaw = async (pattern) => {
                       try {
                         const res = await getAppStoreHistorianRange({
@@ -7886,9 +8506,16 @@ function AppShell() {
                 } catch (_) { /* fall through */ }
               } else {
                 // Short windows: lighter row-count endpoint.
+                // Operator 2026-06-19 (perf): clamped the upper limit
+                // from 50000 → 10000. 50k rows × 9 insight tags = 450k
+                // rows per poll, parsed every 1-3 s. The chart cannot
+                // render that density anyway — recharts down-samples
+                // visually. 10k caps the JSON payload + SQL scan + UI
+                // memo cost while still giving > 1 row per second for
+                // the widest 6-hour short window.
                 const tagsPerSec = 25;
                 const desired = Math.max(1500, Math.ceil(periodMsLocal / 1000) * tagsPerSec);
-                const lim = Math.min(50000, desired);
+                const lim = Math.min(10000, desired);
                 try {
                   const histRes = await getPowerHistory(lim, "");
                   if (histRes?.ok && Array.isArray(histRes.rows)) applyPowerHistoryRows(histRes.rows);
@@ -7912,20 +8539,36 @@ function AppShell() {
       }
     };
 
-    // Operator 2026-06-16: poll only on pages that visually depend
-    // on power data (Power Overview / Config, Dashboard, Tags,
-    // Historian). On every other page the poll was burning ~7 HTTP
-    // calls every 2.5 s for no visible benefit. When the operator
-    // navigates back to a power-relevant page the effect re-runs
-    // because activePage is in the dep list.
+    // Operator 2026-06-19 (perf): the prior list included dashboard,
+    // tags, and historian — but Power polling on those pages was
+    // firing /historian/range fetches with limit=5000 for ~9 insight
+    // tags every 1-3 s, which drove trustnode-service.exe to ~70%
+    // sustained CPU on the customer machine. Those pages already
+    // have their own polling for their primary data (chart polls,
+    // historian endpoint polls). They do NOT need a parallel power
+    // history feed running unless the operator is on a power page.
+    // Reducing this set is the single biggest CPU win.
+    //
+    // Power Overview / Power Configuration are the only pages whose
+    // KPIs and Registers table actually depend on this poll. If a
+    // dashboard widget references a power tag, the live-values
+    // websocket + the dashboard's own polling already covers it.
+    //
+    // Also: skip the effect entirely when the user has no Power
+    // Management module access — admins still see it (they don't
+    // have a modules list that excludes anything).
     const POWER_RELEVANT_PAGES = new Set([
       "power_overview",
       "power_configuration",
-      "dashboard",
-      "tags",
-      "historian",
     ]);
     if (!POWER_RELEVANT_PAGES.has(activePage)) {
+      return () => { stopped = true; };
+    }
+    // Gate on module entitlement: non-admin users without the
+    // power_overview module never reach Power pages anyway (the
+    // sidebar hides them), but check explicitly to defend against
+    // direct-URL navigation.
+    if (!userHasModuleForPage(currentUser, "power_overview")) {
       return () => { stopped = true; };
     }
     // Idle (no meter connected) bumps cadence to ~5x the base
@@ -9644,6 +10287,25 @@ function AppShell() {
     if (sig.verified) return false;
     return true;
   }, [edgeLicenseSnapshot?.license_signature]);
+  // Operator 2026-06-20: free-standing check for license modules that
+  // are NOT tied to a single page (cloud_database, lan_access, etc.).
+  // Same gates as isPageLicensed but takes the raw module key.
+  const hasLicenseModule = useCallback(
+    (moduleKey) => {
+      const key = String(moduleKey || "").trim().toLowerCase();
+      if (!key) return true;
+      // Same exemptions as isPageLicensed below: client portal users have
+      // cloud-backend gating; tampered license locks everything.
+      if (isClientView) return true;
+      if (!edgeLicenseSnapshot?.ok) return false;
+      if (licenseTampered) return false;
+      if (grandfatheredModules.has(key)) return true;
+      if (!licensedModuleKeys.length) return false;
+      return licensedModuleKeys.includes(key);
+    },
+    [isClientView, edgeLicenseSnapshot?.ok, licensedModuleKeys, grandfatheredModules, licenseTampered]
+  );
+
   const isPageLicensed = useCallback(
     (page) => {
       const required = MODULE_KEY_BY_PAGE[page];
@@ -9788,6 +10450,42 @@ function AppShell() {
     if (page === "alarms") return hasClientModuleAccess("alarms");
     if (page === "reporting") return hasClientModuleAccess("reporting");
     if (page === "interface") return hasClientModuleAccess("interface");
+    // Operator 2026-06-20: Database and Backup is admin-only. The
+    // permission flag was historically settable per-user, but in
+    // practice every operator without admin role should NEVER see the
+    // raw database / backup / retention controls — touching them
+    // wrong loses data. Hard-gate by role.
+    if (["database", "database_overview", "database_inspector", "backup_and_retention", "customer_database"].includes(page)) {
+      return isAdmin;
+    }
+    // Operator 2026-06-23: Batch Management module pages — license-gated
+    // AND role-gated. Hide entirely when the license module isn't
+    // active so the menu stays clean (we don't want an empty group).
+    if (["batches", "batch_types", "batch_audit"].includes(page)) {
+      if (!hasLicenseModule("batch_management")) return false;
+      // batch_types is configuration: admins only. The other two are
+      // operational and follow the normal per-user permission check.
+      if (page === "batch_types") return isAdmin;
+      return isAdmin || canEditPage(page) || canEditPage("batches");
+    }
+    // Operator 2026-06-23: studio.* license-module gating.
+    // Fail-OPEN by design — only enforced when at least one studio.*
+    // key is present in the customer's license (i.e. a packaged
+    // license has been issued). Legacy licenses with no studio.* keys
+    // pass through to canEditPage() unchanged so existing customers
+    // never lose access mid-renewal cycle.
+    const STUDIO_PAGE_TO_MODULE = {
+      gateway_configuration: "studio.gateway_configuration",
+      tags: "studio.tags",
+      devices: "studio.devices",
+      triggers_and_limits: "studio.triggers_limits",
+      users_and_access_control: "studio.users_access",
+    };
+    const studioKey = STUDIO_PAGE_TO_MODULE[page];
+    if (studioKey) {
+      const anyStudioKeyPresent = (licensedModuleKeys || []).some((k) => String(k).startsWith("studio."));
+      if (anyStudioKeyPresent && !hasLicenseModule(studioKey)) return false;
+    }
     return canEditPage(page);
   };
 
@@ -10138,7 +10836,7 @@ function AppShell() {
             const endMs = endStr ? Date.parse(endStr) : NaN;
             const expired = Number.isFinite(endMs) && endMs <= Date.now();
             if (!expired) {
-              if (!edgeLicenseSnapshot?.ok) setEdgeLicenseSnapshot(cachedSnap);
+              if (!edgeLicenseSnapshotRef.current?.ok) setEdgeLicenseSnapshot(cachedSnap);
               setLicenseGuardBlocked(false);
               setLicenseGuardMessage("License active (cached)");
               setLicenseGuardLastCheckedUtc(tsNow());
@@ -10156,8 +10854,9 @@ function AppShell() {
       try { localStorage.removeItem(LICENSE_SNAPSHOT_STORAGE_KEY); } catch (_) {}
     }
     const edgeId = String(edgeProfile?.edge_id || "").trim();
-    const localLicense = edgeLicenseSnapshot?.license && typeof edgeLicenseSnapshot.license === "object"
-      ? edgeLicenseSnapshot.license
+    const _snapForLocal = edgeLicenseSnapshotRef.current;
+    const localLicense = _snapForLocal?.license && typeof _snapForLocal.license === "object"
+      ? _snapForLocal.license
       : {};
     // Local "looks active" must actually check end_utc against now.
     // Otherwise a cached snapshot from a license that has SINCE
@@ -10172,10 +10871,10 @@ function AppShell() {
       ? _localEndMs > Date.now()
       : false;
     const _snapshotActiveAndFresh = Boolean(
-      edgeLicenseSnapshot?.ok &&
+      edgeLicenseSnapshotRef.current?.ok &&
       (() => {
         const snapEnd = String(
-          edgeLicenseSnapshot?.license?.end_utc || ""
+          edgeLicenseSnapshotRef.current?.license?.end_utc || ""
         ).trim();
         if (!snapEnd) return true; // perpetual / unbounded
         const ms = Date.parse(snapEnd);
@@ -10221,7 +10920,7 @@ function AppShell() {
       // tripped the "License Activation Required" modal repeatedly
       // every time cloud connectivity blipped. Only replace the
       // snapshot when the new one is genuinely a positive answer.
-      if (out && (out.ok || !edgeLicenseSnapshot?.ok)) {
+      if (out && (out.ok || !edgeLicenseSnapshotRef.current?.ok)) {
         setEdgeLicenseSnapshot(out);
         // Operator 2026-06-17: persist the positive snapshot so the
         // next 30 days of boots can resolve the license without
@@ -10345,16 +11044,22 @@ function AppShell() {
       }
       setLicenseGuardLastCheckedUtc(tsNow());
     }
-  }, [currentUser, isHostedWebClient, edgeProfile?.edge_id, currentTenantId, edgeLinked, formatLicenseGuardReason, edgeLicenseSnapshot]);
+  }, [currentUser, isHostedWebClient, edgeProfile?.edge_id, currentTenantId, edgeLinked, formatLicenseGuardReason]);
 
+  const runLicenseComplianceCheckRef = useRef(runLicenseComplianceCheck);
+  useEffect(() => { runLicenseComplianceCheckRef.current = runLicenseComplianceCheck; }, [runLicenseComplianceCheck]);
   useEffect(() => {
     if (!currentUser || isHostedWebClient) return;
-    runLicenseComplianceCheck();
-    const timer = setInterval(runLicenseComplianceCheck, LICENSE_CHECK_INTERVAL_MS);
-    return () => {
-      clearInterval(timer);
-    };
-  }, [currentUser, isHostedWebClient, runLicenseComplianceCheck]);
+    // Operator 2026-06-22: read the callback through a ref so identity
+    // churn never tears down and immediately re-fires the effect — that
+    // pattern produced a runaway request storm against
+    // /api/control-plane/edge-link/license-check that starved gateways,
+    // historian reads, and the export tab.
+    const call = () => { runLicenseComplianceCheckRef.current?.(); };
+    call();
+    const timer = setInterval(call, LICENSE_CHECK_INTERVAL_MS);
+    return () => { clearInterval(timer); };
+  }, [currentUser, isHostedWebClient]);
 
   // Remember the page the user was on before the license guard forced a jump
   // to the "edge" activation screen, so we can put them back once the guard
@@ -11151,6 +11856,15 @@ const getGatewayHealth = (gateway) => {
         sqliteRows[0] ||
         null;
       if (preferred) return [preferred];
+      // Operator 2026-06-24: the fallback row appears ONLY when
+      // dbConnections hasn't loaded a SQLite entry yet (cold boot,
+      // pre-bootstrap). The DB-probe fast path patches actual
+      // dbConnections rows, but this synthetic row is never in that
+      // list — so its connection_ok must default to a truthful value
+      // here. Local SQLite is, by definition, always present on the
+      // edge (the backend wouldn't have served the bootstrap request
+      // otherwise). Default to true so the card never flashes OFFLINE
+      // on a fresh install before databaseInspector has arrived.
       return [
         {
           id: MAIN_LOCAL_SQLITE_FALLBACK_ID,
@@ -11162,8 +11876,9 @@ const getGatewayHealth = (gateway) => {
           use_gateway: true,
           use_app: true,
           use_backup: false,
-          connection_ok: Boolean(databaseInspector?.db_exists),
+          connection_ok: true,
           last_check_utc: String(databaseInspector?.data_sync?.last_data_sync_utc || ""),
+          last_test: "Local file (always online)",
         },
       ];
     },
@@ -11252,7 +11967,12 @@ const getGatewayHealth = (gateway) => {
     }
     if (!gateway?.database_id) return "No DB selected";
     const db = dbConnections.find((c) => c.id === gateway.database_id);
-    const dbName = db?.name || "Unknown DB";
+    // Operator 2026-06-25: same fallback as Start path + row dbName —
+    // if the configured DB isn't in dbConnections (tenant scope race
+    // or fallback-resolved DB), show Local SQLite instead of confusing
+    // "Unknown DB".
+    const dbName = db?.name
+      || (String(gateway.database_id || "") === "local-sqlite-default" ? "Local SQLite" : "Local SQLite");
     const runtimeStatus = resolveGatewayRuntimeStatus(gateway);
     const writes = Number(runtimeStatus?.db_write_count || 0);
     const lastCheckUtc = String(runtimeStatus?.last_check_utc || "");
@@ -11710,6 +12430,12 @@ const getGatewayHealth = (gateway) => {
               !String(runtimeStatus?.db_last_error || "").trim()
           );
         const protocolOk = d.protocol_ok ?? d.port_ok;
+        // Operator 2026-06-24: distinguish "never probed yet" from
+        // "probed and failed". A fresh load with undefined ping_ok
+        // should NOT show as Offline / FAIL / FAIL — that frightened
+        // operators into thinking their PLC was unreachable when
+        // really the periodic check just hadn't run yet.
+        const everTested = d.last_test !== undefined && d.last_test !== null;
         let status = "Offline";
         let statusKey = "offline";
         if (allStoppedClean) {
@@ -11724,8 +12450,11 @@ const getGatewayHealth = (gateway) => {
         } else if (!d.ping_ok && protocolOk) {
           status = "Protocol OK / Ping Fail";
           statusKey = "warning";
+        } else if (!everTested) {
+          status = "Checking…";
+          statusKey = "warning";
         }
-        return { ...d, protocolOk, status, statusKey };
+        return { ...d, protocolOk, status, statusKey, everTested };
       });
       const meterRows = (powerConfig?.devices || []).map((m) => {
         const did = String(m?.id || "");
@@ -12685,9 +13414,26 @@ const getGatewayHealth = (gateway) => {
 
   const buildGatewayRuntimePayload = (gateway) => {
     if (!gateway) throw new Error("Gateway configuration not found.");
-    if (!gateway.database_id) throw new Error("Gateway has no database connection selected.");
-    const db = dbConnectionsRef.current.find((c) => c.id === gateway.database_id);
-    if (!db) throw new Error("Selected database connection was not found.");
+    // Operator 2026-06-25 (simplification): if the gateway has a
+    // database_id we can't resolve (different tenant scope, deleted
+    // DB, stale id), fall back to the canonical Local SQLite. The
+    // backend's app_store is always writable and historian rows go
+    // to the same file. This makes Start work in every state where
+    // it COULD work, instead of throwing "DB not found".
+    let db = gateway.database_id
+      ? dbConnectionsRef.current.find((c) => c.id === gateway.database_id)
+      : null;
+    if (!db) {
+      // Try an existing SQLite row in scope; else synthesize the canonical one.
+      db = dbConnectionsRef.current.find((c) => String(c?.engine || "").toLowerCase() === "sqlite")
+        || {
+          id: "local-sqlite-default",
+          name: "Local SQLite",
+          engine: "sqlite",
+          sqlite_path: "./data/trustnode_app_store.db",
+          table: "plc_readings",
+        };
+    }
     const toSink = (conn) => ({
       id: conn.id || "",
       name: conn.name || "",
@@ -13004,8 +13750,21 @@ const getGatewayHealth = (gateway) => {
     await refreshGatewayRuntimes();
   };
 
+  // Operator 2026-06-25: in-flight tracking so the user can't
+  // double-click Start/Stop and create the race that produced
+  // "AbortError: signal is aborted". The same gateway can have at
+  // most ONE start-or-stop call in flight at a time; subsequent
+  // clicks are ignored until that one resolves.
+  const gatewayToggleInFlightRef = useRef(new Set());
   const toggleGatewayProfile = async (gateway) => {
     if (!gateway) return;
+    const gid = String(gateway?.id || "");
+    if (!gid) return;
+    if (gatewayToggleInFlightRef.current.has(gid)) {
+      // Already starting/stopping — ignore the extra click.
+      return;
+    }
+    gatewayToggleInFlightRef.current.add(gid);
     try {
       if (isGatewayRunning(gateway)) {
         await stopGatewayProfile(gateway.id);
@@ -13013,7 +13772,13 @@ const getGatewayHealth = (gateway) => {
       }
       await startGatewayProfile(gateway);
     } catch (err) {
-      setError(`Gateway toggle failed: ${String(err)}`);
+      const raw = String(err?.message || err || "");
+      const friendly = /aborterror|signal is aborted|networkerror|failed to fetch/i.test(raw)
+        ? "Gateway request timed out — backend is still processing. Wait a moment and check status."
+        : raw;
+      setError(`Gateway toggle failed: ${friendly}`);
+    } finally {
+      gatewayToggleInFlightRef.current.delete(gid);
     }
   };
 
@@ -13538,6 +14303,7 @@ const getGatewayHealth = (gateway) => {
     setGatewayOpcBrowseNodes([]);
     setGatewaySelectedTags([]);
     setGatewayBrowseSearch("");
+    setGatewayManualTagInput("");
     setGatewayOpcNodeSummary({ total: 0, objects: 0, variables: 0, methods: 0 });
     setGatewayOpcValidationResult("");
     setGatewayOpcValidationRows([]);
@@ -13550,6 +14316,12 @@ const getGatewayHealth = (gateway) => {
       opc_url: devices[0]?.opc_url || "",
       database_id: dbConnections[0]?.id || "",
       interval_ms: Number(config?.interval_ms || 1000),
+      auto_resume: false,
+      schedule_enabled: false,
+      schedule_start: "08:00",
+      schedule_stop: "18:00",
+      // Default ON — see useState default above.
+      auto_recover_enabled: true,
       tags_text: Array.isArray(config?.tags) ? config.tags.join(";") : ""
     });
     setShowGatewayModal(true);
@@ -13564,6 +14336,7 @@ const getGatewayHealth = (gateway) => {
     setGatewayOpcBrowseNodes([]);
     setGatewaySelectedTags([]);
     setGatewayBrowseSearch("");
+    setGatewayManualTagInput("");
     setGatewayOpcNodeSummary({ total: 0, objects: 0, variables: 0, methods: 0 });
     setGatewayOpcValidationResult("");
     setGatewayOpcValidationRows([]);
@@ -13578,6 +14351,13 @@ const getGatewayHealth = (gateway) => {
       opc_url: gateway.opc_url || "",
       database_id: gateway.database_id || "",
       interval_ms: Number(gateway.interval_ms || 1000),
+      auto_resume: Boolean(gateway.auto_resume),
+      schedule_enabled: Boolean(gateway.schedule_enabled),
+      schedule_start: String(gateway.schedule_start || "08:00"),
+      schedule_stop: String(gateway.schedule_stop || "18:00"),
+      // Undefined => default ON (baseline restore policy). Only an
+      // explicit `false` in the saved config keeps it off.
+      auto_recover_enabled: gateway.auto_recover_enabled !== false,
       tags_text: (gateway.tags || []).join(";")
     });
     setShowGatewayModal(true);
@@ -13659,7 +14439,20 @@ const getGatewayHealth = (gateway) => {
       plc_ip: plcIp,
       opc_url: gatewayForm.gateway_type === "siemens_opcua" ? gatewayForm.opc_url.trim() : "",
       database_id: gatewayForm.database_id || "",
-      interval_ms: Math.max(100, Number(gatewayForm.interval_ms || 1000)),
+      // Operator 2026-06-20: floor bumped from 100 ms to 200 ms. The 100 ms
+      // floor was theoretical — actual cycles take 500-1000 ms with 4 tags
+      // because the per-cycle work (PLC read + telemetry SQLite + app_store
+      // SQLite + customer SQLite + WebSocket broadcast) saturates a single
+      // worker thread. The new floor lets the loop hit the target.
+      interval_ms: Math.max(200, Number(gatewayForm.interval_ms || 1000)),
+      // Operator 2026-06-21: opt-in auto-resume per gateway. Default
+      // false — the worker only comes back after a backend restart if
+      // the operator explicitly checked "Resume on restart" in Edit.
+      auto_resume: Boolean(gatewayForm.auto_resume),
+      schedule_enabled: Boolean(gatewayForm.schedule_enabled),
+      schedule_start: String(gatewayForm.schedule_start || "08:00"),
+      schedule_stop: String(gatewayForm.schedule_stop || "18:00"),
+      auto_recover_enabled: Boolean(gatewayForm.auto_recover_enabled),
       tags
     };
     setGatewayConfigs((prev) => {
@@ -13769,6 +14562,26 @@ const getGatewayHealth = (gateway) => {
       ...gatewaySelectedTags
     ]);
     setGatewayForm((prev) => ({ ...prev, tags_text: Array.from(merged).join(";") }));
+    setGatewayOpcValidationResult("");
+    setGatewayOpcValidationRows([]);
+    setGatewayOpcValidatedFor("");
+  };
+
+  const appendManualGatewayTags = () => {
+    const raw = String(gatewayManualTagInput || "").trim();
+    if (!raw) return;
+    // Accept ; , or newline separators so a paste of a list works.
+    const incoming = raw
+      .split(/[;,\n\r]+/)
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (!incoming.length) return;
+    const merged = new Set([
+      ...parseGatewayTagsByType(gatewayForm.gateway_type, gatewayForm.tags_text),
+      ...incoming,
+    ]);
+    setGatewayForm((prev) => ({ ...prev, tags_text: Array.from(merged).join(";") }));
+    setGatewayManualTagInput("");
     setGatewayOpcValidationResult("");
     setGatewayOpcValidationRows([]);
     setGatewayOpcValidatedFor("");
@@ -15061,6 +15874,12 @@ const getGatewayHealth = (gateway) => {
       minute_keep_days: preset.minute_keep_days,
       hour_keep_days: preset.hour_keep_days,
       day_keep_days: preset.day_keep_days,
+      // Operator 2026-06-20: propagate the *_keep_minutes overrides. The
+      // hour preset uses these; the day/week/month presets pass 0 to clear.
+      raw_keep_minutes: preset.raw_keep_minutes || 0,
+      minute_keep_minutes: preset.minute_keep_minutes || 0,
+      hour_keep_minutes: preset.hour_keep_minutes || 0,
+      day_keep_minutes: preset.day_keep_minutes || 0,
     }));
   };
 
@@ -15218,19 +16037,18 @@ const getGatewayHealth = (gateway) => {
     if (!isAdminDatabaseUser) return;
     const mode = String(cloudDbPickerType || "supabase").toLowerCase();
     if (mode === "dolibarr") {
-      const existingDolibarr = (dbConnections || []).find((db) => {
-        const engine = String(db.engine || "").toLowerCase();
-        return engine === "legacy_http" && dbLocationFromEngine(db.engine) === "remote";
-      });
+      // Operator 2026-06-20: same data-leak fix as Supabase path —
+      // the legacy_url and legacy_api_token below were hard-coded to
+      // a specific customer's endpoint. Start blank.
       openAddDbConnection("gateway", {
-        name: String(existingDolibarr?.name || "Dolibarr"),
+        name: "",
         engine: "legacy_http",
-        legacy_url: String(existingDolibarr?.legacy_url || "https://www.rcltd.ie/Trustnode/htdocs/custom/mfp/api_trustnode_write.php"),
-        legacy_api_token: String(existingDolibarr?.legacy_api_token || "qVeH6tCUeGe9Qe4qQmzYqZC3PdEYwHEAaI4h3"),
-        source: String(existingDolibarr?.source || "edge-01"),
-        site: String(existingDolibarr?.site || "Limerick"),
-        area: String(existingDolibarr?.area || "LineA"),
-        equipment: String(existingDolibarr?.equipment || "MACHINE-01"),
+        legacy_url: "",
+        legacy_api_token: "",
+        source: "",
+        site: "",
+        area: "",
+        equipment: "",
         enabled: true,
         use_gateway: true,
         use_app: true,
@@ -15238,43 +16056,38 @@ const getGatewayHealth = (gateway) => {
         cloud_sync_enabled: true,
       });
     } else {
-      const existingSupabase = (dbConnections || []).find((db) => {
-        const engine = String(db.engine || "").toLowerCase();
-        if (engine !== "postgresql" || dbLocationFromEngine(db.engine) !== "remote") return false;
-        return String(db.host || "").toLowerCase().includes("supabase");
-      });
-      const source = existingSupabase || KNOWN_SUPABASE_DEFAULTS;
-      const profile = resolveSupabaseConnectionProfile(
-        cloudSupabaseMode,
-        cloudSupabaseHasIpv4AddOn,
-        source
-      );
-      const normalizedUsername =
-        profile.effectiveMode === "direct_ipv4"
-          ? "postgres"
-          : String(source.username || KNOWN_SUPABASE_DEFAULTS.username);
+      // Operator 2026-06-20: do NOT prefill host / port / username /
+      // password / metadata for a NEW cloud connection. Sharing one
+      // customer's Supabase credentials into another customer's add
+      // dialog is a data-leak risk (the customer screenshot showed
+      // someone else's pooler URL + username already populated). Only
+      // the schema (`public`) and the destination table (`plc_readings`)
+      // are safe defaults — they're not customer-specific.
+      //
+      // The Edit flow (openEditDbConnection) still loads the saved
+      // values from the stored connection; only Add starts blank.
       openAddDbConnection("gateway", {
-        name: String(existingSupabase?.name || "Supabase"),
+        name: "",
         engine: "postgresql",
-        host: String(profile.host || source.host || KNOWN_SUPABASE_DEFAULTS.host),
-        port: String(profile.port || source.port || KNOWN_SUPABASE_DEFAULTS.port),
-        database: String(source.database || KNOWN_SUPABASE_DEFAULTS.database),
-        username: normalizedUsername,
-        password: String(source.password || KNOWN_SUPABASE_DEFAULTS.password),
-        schema: String(source.schema || KNOWN_SUPABASE_DEFAULTS.schema),
-        table: String(source.table || KNOWN_SUPABASE_DEFAULTS.table),
-        source: String(source.source || KNOWN_SUPABASE_DEFAULTS.source),
-        site: String(source.site || KNOWN_SUPABASE_DEFAULTS.site),
-        area: String(source.area || KNOWN_SUPABASE_DEFAULTS.area),
-        equipment: String(source.equipment || KNOWN_SUPABASE_DEFAULTS.equipment),
-        tls: existingSupabase ? Boolean(existingSupabase.tls) : true,
+        host: "",
+        port: "5432",
+        database: "",
+        username: "",
+        password: "",
+        schema: "public",
+        table: "plc_readings",
+        source: "",
+        site: "",
+        area: "",
+        equipment: "",
+        tls: true,
         enabled: true,
         use_gateway: true,
         use_app: true,
         use_backup: false,
         cloud_sync_enabled: true,
       });
-      setCloudSupabaseApplyResult(`Prepared Supabase form with ${profile.summary} (user ${normalizedUsername}).`);
+      setCloudSupabaseApplyResult("New cloud connection — fill in the host, credentials, and metadata.");
     }
     setShowCloudDbPickerModal(false);
   };
@@ -18493,11 +19306,105 @@ const getGatewayHealth = (gateway) => {
   };
   const appSurface = isPortalOnly ? "portal" : (isHostedWebClient ? "client" : "local");
 
-  const showTopLicenseBanner = !isPortalOnly && currentUser && !isHostedWebClient && !licenseBannerHidden;
+  // Operator 2026-06-24: hide the top banner when the license is
+  // valid (green "LICENSE ACTIVE") — it just consumes vertical space
+  // for no actionable info. Only show during TRIAL (countdown) or
+  // EXPIRED (activation CTA). Tampered case still renders via its
+  // own block above.
+  const _trialActiveBanner = Boolean(edgeTrialActive && edgeTrialActive.active);
+  const _expiredBanner = Boolean(licenseGuardBlocked && !_trialActiveBanner);
+  const showTopLicenseBanner = !isPortalOnly && currentUser && !isHostedWebClient && !licenseBannerHidden && (_trialActiveBanner || _expiredBanner);
   return (
     <div
       className={`shell surface-${appSurface} ${useDesktopFramelessHeader ? "desktop-frameless-shell with-window-bar" : ""} ${showTopLicenseBanner ? "with-license-banner" : ""}`}
     >
+      {/* Operator 2026-06-25: React splash REMOVED. The Electron
+          splash window (managed in desktop/main.js) now blocks the
+          entire boot until /api/boot-probe reports OK or the user
+          clicks Skip. The main window only opens when boot is
+          healthy, so by the time React mounts there's nothing to
+          gate. The local startupSplashDone state is forced true
+          immediately to disable any residual overlay UI. */}
+      {false ? (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 9999,
+            background: "var(--bg-app, #0b1220)",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 18,
+            color: "var(--ink, #e6edf6)",
+            fontFamily: "var(--font-sans, system-ui, sans-serif)",
+            padding: 24,
+          }}
+        >
+          {bootProbeBusy || !appStoreHydrated ? (
+            <div style={{
+              width: 56, height: 56, borderRadius: "50%",
+              border: "4px solid rgba(20, 168, 154, 0.25)",
+              borderTopColor: "#14a89a",
+              animation: "trustnodeSpin 0.9s linear infinite",
+            }} />
+          ) : (
+            <div style={{
+              width: 56, height: 56, borderRadius: "50%",
+              background: "rgba(220, 38, 38, 0.15)",
+              border: "3px solid rgba(220, 38, 38, 0.6)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              color: "#fca5a5", fontSize: 28, fontWeight: 700,
+            }}>!</div>
+          )}
+          <div style={{ fontSize: 16, fontWeight: 600, letterSpacing: 0.4 }}>TrustNode</div>
+          <div style={{ fontSize: 12, opacity: 0.8, maxWidth: 520, textAlign: "center" }}>
+            {appStoreHydrated ? bootProbeStatus : "Loading application…"}
+          </div>
+          {bootProbeFailures.length > 0 ? (
+            <div style={{
+              maxWidth: 560,
+              maxHeight: 220,
+              overflowY: "auto",
+              background: "rgba(255,255,255,0.04)",
+              border: "1px solid rgba(255,255,255,0.08)",
+              borderRadius: 6,
+              padding: "10px 14px",
+              fontSize: 12,
+              lineHeight: 1.55,
+              color: "#fca5a5",
+            }}>
+              {bootProbeFailures.map((f, i) => (
+                <div key={i} style={{ marginBottom: i === bootProbeFailures.length - 1 ? 0 : 6 }}>• {f}</div>
+              ))}
+            </div>
+          ) : null}
+          {bootProbeFailures.length > 0 && !bootProbeBusy ? (
+            <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
+              <button
+                className="btn btn-primary"
+                onClick={() => setBootProbeNonce((n) => n + 1)}
+              >
+                Retry
+              </button>
+              <button
+                className="btn btn-secondary"
+                onClick={() => {
+                  bootProbeRanRef.current = true;
+                  setStartupSplashDone(true);
+                  // Force-hydrate so auto-save and other hydration-
+                  // gated effects can run in degraded mode too.
+                  setAppStoreHydrated(true);
+                }}
+              >
+                Continue Anyway
+              </button>
+            </div>
+          ) : null}
+          <style>{"@keyframes trustnodeSpin{from{transform:rotate(0)}to{transform:rotate(360deg)}}"}</style>
+        </div>
+      ) : null}
       {useDesktopFramelessHeader ? (
         <div className="window-bar-strip">
           <div className="window-bar-left-controls" onMouseDown={stopTopBarDrag}>
@@ -18676,6 +19583,11 @@ const getGatewayHealth = (gateway) => {
           </div>
         );
       })() : null}
+
+      {/* Operator 2026-06-24: package/limits banner removed from the
+          top bar — it was breaking the chart layout below the License
+          banner. Same data is still available on the Edge settings
+          page via <LicenseDetailsPanel /> for admins who need it. */}
 
       <div className={`body ${sidebarCollapsed ? "sidebar-hidden" : ""}`}>
         <aside className={`sidebar ${sidebarCollapsed ? "hidden" : ""}`}>
@@ -18881,10 +19793,72 @@ const getGatewayHealth = (gateway) => {
               <div className="error">Database write error: {status.db_last_error}</div>
             )
           ) : null}
+          {/* Operator 2026-06-19 (L3a): aggregate write-failure banner.
+              The single-gateway db_last_error above only covers the
+              ACTIVE gateway. This walks gatewayRuntimeStatuses and
+              surfaces every RUNNING gateway whose writes are failing
+              right now. Hidden when the underlying error is transient
+              (cloud connectivity) so we don't double-noise the operator
+              with the existing store-and-forward note. */}
+          {!isPortalOnly && (() => {
+            const failing = Object.values(gatewayRuntimeStatuses || {})
+              .filter((rt) => rt && rt.running === true && rt.db_last_error)
+              .filter((rt) => !isTransientCloudDbError(String(rt.db_last_error || "")));
+            if (failing.length === 0) return null;
+            const names = failing.map((rt) => {
+              const gid = String(rt.gateway_id || "");
+              const cfg = (gatewayConfigsRef.current || []).find((g) => String(g?.id || "") === gid);
+              return cfg?.name || gid || "?";
+            }).join(", ");
+            return (
+              <div className="error" style={{ marginBottom: 10 }}>
+                <strong>Database writes failing on running gateway(s):</strong> {names}.
+                Collection continues into the local buffer but rows are NOT reaching the configured sink.
+                Open Database and Backup to check the connection.
+              </div>
+            );
+          })()}
           {!isPortalOnly && activePage === "gateway_configuration" && appStoreHydrated && startupWarningsReady && unknownRunningGateways.length ? (
             <div className="error">
               Found running gateway workers not mapped in this page ({unknownRunningGateways.map((g) => g.gateway_id).join(", ")}).
               Use "Stop All" to stop every worker.
+            </div>
+          ) : null}
+          {/* Data Continuity banner (operator 2026-06-19). Shows when the
+              local historian has rows under tenant_ids OTHER than the
+              currently logged-in tenant AND the operator hasn't picked
+              a bridge / archive / discard option yet. Non-blocking — the
+              operator can dismiss for this session and visit later via
+              Settings → Data Continuity. */}
+          {!isPortalOnly && appStoreHydrated && !dataContinuityDismissed
+              && dataContinuity?.decision_pending
+              && Array.isArray(dataContinuity?.prior_tenants)
+              && dataContinuity.prior_tenants.length ? (
+            <div className="info-note" style={{ display: "flex", gap: 12, alignItems: "center", padding: "10px 14px", borderLeft: "4px solid #f0a500", marginBottom: 8 }}>
+              <strong style={{ flexShrink: 0 }}>Local data from a previous install detected</strong>
+              <span style={{ flex: 1 }}>
+                {dataContinuity.prior_tenants.length === 1
+                  ? `${(dataContinuity.prior_tenants[0].row_count || 0).toLocaleString()} rows under tenant "${dataContinuity.prior_tenants[0].tenant_id}" (last write ${String(dataContinuity.prior_tenants[0].max_ts || "").slice(0, 19)})`
+                  : `${dataContinuity.prior_tenants.length} prior tenants with ${dataContinuity.prior_tenants.reduce((s, t) => s + (Number(t.row_count) || 0), 0).toLocaleString()} total rows`}
+                {" — "}
+                <button
+                  type="button"
+                  className="link-button"
+                  onClick={() => setActivePage("data_continuity")}
+                  style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", padding: 0, textDecoration: "underline" }}
+                >
+                  Review options
+                </button>
+              </span>
+              <button
+                type="button"
+                className="btn btn-sm"
+                onClick={() => setDataContinuityDismissed(true)}
+                title="Hide for this session"
+                style={{ flexShrink: 0 }}
+              >
+                Dismiss
+              </button>
             </div>
           ) : null}
           {/* Hide the global "Control Plane" page title in the cloud portal
@@ -19171,6 +20145,7 @@ const getGatewayHealth = (gateway) => {
                 });
                 return Array.isArray(res?.rows) ? res.rows : [];
               }}
+              isLicenseModuleEnabled={(key) => hasLicenseModule(key)}
             />
           ) : null}
 
@@ -20351,11 +21326,16 @@ const getGatewayHealth = (gateway) => {
                       <span>{d.plc_ip}</span>
                       <span>
                         <div className={`status-pill status-${d.statusKey}`}>{d.status}</div>
-                        <div className="muted status-sub" title={d.last_test || ""}>
-                          <span className={d.ping_ok ? "status-chip ok" : "status-chip fail"}>IP: {d.ping_ok ? "OK" : "FAIL"}</span>
-                          {" "}
-                          <span className={d.protocolOk ? "status-chip ok" : "status-chip fail"}>Type: {d.protocolOk ? "OK" : "FAIL"}</span>
-                        </div>
+                        {/* Only show IP/Type sub-chips after the first probe
+                            has run; until then we don't know either way and
+                            "FAIL/FAIL" was misleading. */}
+                        {d.everTested ? (
+                          <div className="muted status-sub" title={d.last_test || ""}>
+                            <span className={d.ping_ok ? "status-chip ok" : "status-chip fail"}>IP: {d.ping_ok ? "OK" : "FAIL"}</span>
+                            {" "}
+                            <span className={d.protocolOk ? "status-chip ok" : "status-chip fail"}>Type: {d.protocolOk ? "OK" : "FAIL"}</span>
+                          </div>
+                        ) : null}
                         {d.last_test ? (
                           <div className="muted status-sub" title={d.last_test}>
                             {String(d.last_test).slice(0, 140)}
@@ -20482,7 +21462,17 @@ const getGatewayHealth = (gateway) => {
                     );
                   })}
                   {gatewayConfigsView.map((g) => {
-                    const dbName = dbConnections.find((db) => db.id === g.database_id)?.name || "-";
+                    // Operator 2026-06-25: when dbConnections doesn't carry the gateway's
+                    // database (tenant-scope mismatch with the bootstrap), fall back to
+                    // a friendly name. The gateway IS writing to the backend's local
+                    // SQLite — show that, not a confusing dash.
+                    const dbName = (() => {
+                      const hit = dbConnections.find((db) => db.id === g.database_id);
+                      if (hit?.name) return hit.name;
+                      if (String(g.database_id || "") === "local-sqlite-default") return "Local SQLite";
+                      if (g.database_id) return "Local SQLite";  // fallback used by Start path
+                      return "-";
+                    })();
                     const deviceName = devices.find((d) => d.id === g.device_id)?.name || "-";
                     const runtimeStatus = resolveGatewayRuntimeStatus(g);
                     const running = Boolean(runtimeStatus?.running);
@@ -20549,6 +21539,14 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "database" ? (
             <>
+              {/* Operator 2026-06-24 (cleanup pass): removed the
+                  Read-Routing card from the Database page render.
+                  It polled /api/health every 10s on top of two other
+                  health pollers, and most customers don't have a
+                  canonical customer DB configured so the card just
+                  said "SQLite (no customer DB configured)" forever.
+                  The same info is still exposed via /api/health for
+                  diagnostics. */}
               <section className="card db-simple-card">
                 <div className="db-simple-head">
                   <div className="db-head-title-wrap">
@@ -20620,9 +21618,9 @@ const getGatewayHealth = (gateway) => {
                       <span className="db-cell">{`Last ${retentionPresetKey} | ${Number(retentionPolicy.schedule_minutes || 60)}m`}</span>
                       <span className="db-cell">{`${formatBytes(localDbUsage.sizeBytes)} | ${localDbUsage.label} ${localDbUsage.percent}%`}</span>
                       <span className="db-cell">
-                        <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
-                          {c.connection_ok ? "ONLINE" : "OFFLINE"}
-                        </span>
+                        {(() => { const _s = dbStatusInfo(c); return (
+                        <span className={`status-pill ${_s.cls}`}>{_s.label}</span>
+                        ); })()}
                       </span>
                       <span className="db-cell db-last-check-cell" title={c.last_check_utc || ""}>{getDbSyncLastCheckLabel(c)}</span>
                           <span className="row-actions db-actions-cell">
@@ -20708,9 +21706,9 @@ const getGatewayHealth = (gateway) => {
                       </span>
                       <span className="db-cell db-writing-cell" title={getDbSyncWritingTooltip(c)}>{getDbSyncWritingLabel(c)}</span>
                       <span className="db-cell">
-                        <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
-                          {c.connection_ok ? "ONLINE" : "OFFLINE"}
-                        </span>
+                        {(() => { const _s = dbStatusInfo(c); return (
+                        <span className={`status-pill ${_s.cls}`}>{_s.label}</span>
+                        ); })()}
                       </span>
                       <span className="db-cell db-last-check-cell" title={c.last_check_utc || ""}>{getDbSyncLastCheckLabel(c)}</span>
                       <span className="row-actions db-actions-cell">
@@ -20936,9 +21934,9 @@ const getGatewayHealth = (gateway) => {
                       <span className="db-cell db-url-cell" title={getDbEndpointLabel(c)}>{getDbEndpointLabel(c)}</span>
                       <span className="db-cell">{getDbRoleLabel(c)}</span>
                       <span className="db-cell">
-                        <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
-                          {c.connection_ok ? "ONLINE" : "OFFLINE"}
-                        </span>
+                        {(() => { const _s = dbStatusInfo(c); return (
+                        <span className={`status-pill ${_s.cls}`}>{_s.label}</span>
+                        ); })()}
                       </span>
                       <span className="db-cell db-last-check-cell" title={c.last_check_utc || ""}>{getDbSyncLastCheckLabel(c)}</span>
                       <span className="row-actions db-actions-cell">
@@ -21029,9 +22027,9 @@ const getGatewayHealth = (gateway) => {
                       </span>
                       <span className="db-cell">{c.engine === "sqlite" ? (c.table || "plc_readings") : (c.database || "-")}</span>
                       <span className="db-cell">
-                        <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
-                          {c.connection_ok ? "ONLINE" : "OFFLINE"}
-                        </span>
+                        {(() => { const _s = dbStatusInfo(c); return (
+                        <span className={`status-pill ${_s.cls}`}>{_s.label}</span>
+                        ); })()}
                       </span>
                       <span className="db-cell db-writing-cell" title={getDbSyncWritingTooltip(c)}>{getDbSyncWritingLabel(c)}</span>
                       <span className="db-cell">{getDbSyncLastCheckLabel(c)}</span>
@@ -21104,9 +22102,9 @@ const getGatewayHealth = (gateway) => {
                         </span>
                       </span>
                       <span className="db-cell">
-                        <span className={`status-pill ${c.connection_ok ? "status-online" : "status-offline"}`}>
-                          {c.connection_ok ? "ONLINE" : "OFFLINE"}
-                        </span>
+                        {(() => { const _s = dbStatusInfo(c); return (
+                        <span className={`status-pill ${_s.cls}`}>{_s.label}</span>
+                        ); })()}
                       </span>
                       <span className="db-cell db-last-check-cell" title={c.last_check_utc || ""}>{getDbSyncLastCheckLabel(c)}</span>
                       <span className="row-actions db-actions-cell">
@@ -21206,6 +22204,7 @@ const getGatewayHealth = (gateway) => {
                   <label>
                     Keep PLC Tag Data
                     <select value={retentionPresetKey} onChange={(e) => applyRetentionPreset(e.target.value)} disabled={!canEditPage("backup_and_retention")}>
+                      <option value="hour">Last hour</option>
                       <option value="day">Last day</option>
                       <option value="week">Last week</option>
                       <option value="month">Last month</option>
@@ -21221,6 +22220,20 @@ const getGatewayHealth = (gateway) => {
                     <input type="checkbox" checked={Boolean(retentionPolicy.backup_before_cleanup)} onChange={(e) => setRetentionPolicy((p) => ({ ...p, backup_before_cleanup: e.target.checked }))} disabled={!canEditPage("backup_and_retention")} />
                     <span className="remember-label">Backup before cleanup</span>
                   </label>
+                  {/* Operator 2026-06-20: sub-day TTLs. When > 0, each
+                      `keep_minutes` overrides the corresponding `keep_days`
+                      above. Leave at 0 to keep the days-based behavior. */}
+                  <div className="gateway-span-2" style={{ fontWeight: 600, marginTop: 8 }}>
+                    Sub-day TTLs (override days when &gt; 0)
+                    <small className="muted" style={{ display: "block", fontWeight: 400, fontSize: 11, marginTop: 2 }}>
+                      Set "Raw (minutes) = 60" to keep raw historian data only for the last hour.
+                      Each minute value, when above 0, overrides its days counterpart.
+                    </small>
+                  </div>
+                  <label>Keep Raw (minutes)<input type="number" min="0" step="10" value={retentionPolicy.raw_keep_minutes || 0} onChange={(e) => setRetentionPolicy((p) => ({ ...p, raw_keep_minutes: Math.max(0, Number(e.target.value || 0)) }))} disabled={!canEditPage("backup_and_retention")} /></label>
+                  <label>Keep Minute (minutes)<input type="number" min="0" step="10" value={retentionPolicy.minute_keep_minutes || 0} onChange={(e) => setRetentionPolicy((p) => ({ ...p, minute_keep_minutes: Math.max(0, Number(e.target.value || 0)) }))} disabled={!canEditPage("backup_and_retention")} /></label>
+                  <label>Keep Hour (minutes)<input type="number" min="0" step="60" value={retentionPolicy.hour_keep_minutes || 0} onChange={(e) => setRetentionPolicy((p) => ({ ...p, hour_keep_minutes: Math.max(0, Number(e.target.value || 0)) }))} disabled={!canEditPage("backup_and_retention")} /></label>
+                  <label>Keep Day (minutes)<input type="number" min="0" step="60" value={retentionPolicy.day_keep_minutes || 0} onChange={(e) => setRetentionPolicy((p) => ({ ...p, day_keep_minutes: Math.max(0, Number(e.target.value || 0)) }))} disabled={!canEditPage("backup_and_retention")} /></label>
                 </div>
                 {retentionResult && retentionResultScope === "global" ? <div className={retentionResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 10 }}>{retentionResult}</div> : null}
                 <div className="table retention-runs-table" style={{ marginTop: 12 }}>
@@ -21997,6 +23010,11 @@ const getGatewayHealth = (gateway) => {
                       .join(", ") || "-"}
                   />
                 </label>
+                {/* Operator 2026-06-23: package + limits + live usage,
+                    sourced from /api/health.license_summary so the
+                    operator can see exactly what the edge thinks is
+                    licensed and where they stand against each limit. */}
+                <LicenseDetailsPanel />
               </section>
             </>
           ) : null}
@@ -22015,6 +23033,32 @@ const getGatewayHealth = (gateway) => {
           ) : null}
           {activePage === "directories" ? (
             <DirectoriesPage canEdit={String(currentUser?.role || "").toLowerCase() === "admin"} />
+          ) : null}
+
+          {activePage === "data_continuity" ? (
+            <DataContinuityPage
+              currentTenantId={currentTenantId}
+              dataContinuity={dataContinuity}
+              onDecisionRecorded={(updated) => {
+                setDataContinuity((prev) => ({ ...prev, ...updated, decision_pending: false }));
+                setDataContinuityDismissed(true);
+              }}
+              canEdit={String(currentUser?.role || "").toLowerCase() === "admin"}
+            />
+          ) : null}
+
+          {/* Operator 2026-06-23: Batch Management module pages. License
+              gating is handled in canOpenPage; if we got here the user
+              has access. Pages live in their own component file under
+              components/BatchManagement/ to keep this file manageable. */}
+          {activePage === "batches" ? (
+            <BatchesPage currentUser={currentUser} allGatewayOptions={allGatewayOptions} />
+          ) : null}
+          {activePage === "batch_types" ? (
+            <BatchTypesPage />
+          ) : null}
+          {activePage === "batch_audit" ? (
+            <BatchAuditPage />
           ) : null}
 
           {activePage === "interface" ? (
@@ -22834,8 +23878,12 @@ const getGatewayHealth = (gateway) => {
                   Export
                 </button>
                 {historianTab === "export" ? (
+                  // Operator 2026-06-20: clarify that gateway collection
+                  // keeps running. The prior copy ("Live polling paused")
+                  // led the operator to believe COLLECTION had stopped —
+                  // it had not, only the in-UI Live Table refresh.
                   <span className="muted" style={{ fontSize: 12, alignSelf: "center", marginLeft: 8 }}>
-                    Live polling paused on this tab — switch back to <strong>Live Table</strong> to resume.
+                    Gateway collection continues in the background. The Live Table refresh is paused here to keep the export query fast — switch back to <strong>Live Table</strong> to resume the refresh.
                   </span>
                 ) : null}
               </div>
@@ -22906,20 +23954,57 @@ const getGatewayHealth = (gateway) => {
                   muted: "Cloud sync disabled"
                 }[verdict];
                 return (
-                  <section className="card" style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
-                    <span className="status-pill" style={{ background: verdictColor, color: "#fff" }}>
+                  // Operator 2026-06-20: clamped to a single row with
+                  // ellipsis overflow on the long fields (timestamp +
+                  // error). Prior version used flexWrap which let the
+                  // banner grow to 3-4 lines on a long error message and
+                  // pushed the Historian table off-screen. Hover-title
+                  // keeps the full text accessible.
+                  <section
+                    className="card"
+                    style={{
+                      display: "flex",
+                      gap: 16,
+                      alignItems: "center",
+                      flexWrap: "nowrap",
+                      overflow: "hidden",
+                      minHeight: 44,
+                      padding: "8px 12px",
+                    }}
+                  >
+                    <span className="status-pill" style={{ background: verdictColor, color: "#fff", flexShrink: 0 }}>
                       {verdictLabel}
                     </span>
-                    <span>
+                    <span style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
                       Cloud backlog: <b>{backlog.toLocaleString()}</b> row{backlog === 1 ? "" : "s"}
                     </span>
-                    <span>
+                    <span
+                      style={{
+                        flex: "1 1 0",
+                        minWidth: 0,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                      title={lastUtc ? `Last push ${fmtTs(lastUtc)}` : "no push yet"}
+                    >
                       Last push: <b>{lastUtc ? fmtTs(lastUtc) : "never"}</b>
                       {ageSeconds != null ? ` (${ageSeconds < 60 ? `${ageSeconds}s` : `${Math.floor(ageSeconds / 60)}m`} ago)` : ""}
                     </span>
                     {lastDataError ? (
-                      <span style={{ color: "#d35454", fontSize: 12 }} title={lastDataError}>
-                        Error: {lastDataError.slice(0, 100)}
+                      <span
+                        style={{
+                          color: "#d35454",
+                          fontSize: 12,
+                          flex: "1 1 0",
+                          minWidth: 0,
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        }}
+                        title={lastDataError}
+                      >
+                        Error: {lastDataError}
                       </span>
                     ) : null}
                     <button
@@ -22936,7 +24021,7 @@ const getGatewayHealth = (gateway) => {
                           }));
                         } catch (_) {}
                       }}
-                      style={{ marginLeft: "auto" }}
+                      style={{ marginLeft: "auto", flexShrink: 0 }}
                       title="Hide this banner for 1 hour"
                     >
                       Dismiss
@@ -22966,26 +24051,42 @@ const getGatewayHealth = (gateway) => {
                   and Export all moved to the Export tab. Filtering
                   here narrows the live dataLogView buffer in place. */}
               <section className="card">
-                <div className="historian-filter-row" style={{ gridTemplateColumns: "repeat(4, minmax(0, 1fr))" }}>
-                  <label>
-                    Tag
-                    <input
-                      placeholder="Filter by tag"
-                      value={historianFilters.tag}
-                      onChange={(e) => setHistorianFilters((p) => ({ ...p, tag: e.target.value }))}
-                    />
-                  </label>
+                {/* Operator 2026-06-20: Tag is a Gateway-scoped dropdown.
+                    When a gateway is selected we list its configured tags;
+                    otherwise the union of all gateways' tags. "All tags"
+                    means no tag filter — same as the old empty input. */}
+                <div className="historian-filter-row" style={{ gridTemplateColumns: "repeat(5, minmax(0, 1fr))" }}>
                   <label>
                     Gateway
                     <select
                       value={historianFilters.gatewayId}
-                      onChange={(e) => setHistorianFilters((p) => ({ ...p, gatewayId: e.target.value }))}
+                      onChange={(e) => setHistorianFilters((p) => ({ ...p, gatewayId: e.target.value, tag: "" }))}
                     >
                       <option value="">All gateways</option>
                       {allGatewayOptions.map((g) => (
                         <option key={g.id} value={g.id}>{g.power_meter ? `${g.name} (Power Meter)` : g.name}</option>
                       ))}
                     </select>
+                  </label>
+                  <label>
+                    Tag
+                    {(() => {
+                      const gw = String(historianFilters.gatewayId || "");
+                      const tags = gw
+                        ? (triggerTagsByGateway[gw] || [])
+                        : Array.from(new Set(Object.values(triggerTagsByGateway || {}).flat())).sort();
+                      return (
+                        <select
+                          value={historianFilters.tag || ""}
+                          onChange={(e) => setHistorianFilters((p) => ({ ...p, tag: e.target.value }))}
+                        >
+                          <option value="">All tags</option>
+                          {tags.map((t) => (
+                            <option key={t} value={t}>{t}</option>
+                          ))}
+                        </select>
+                      );
+                    })()}
                   </label>
                   <label>
                     Device
@@ -23095,25 +24196,38 @@ const getGatewayHealth = (gateway) => {
                           onChange={(e) => setHistorianExportFilters((p) => ({ ...p, to: e.target.value }))}
                         />
                       </label>
-                      <label>
-                        Tag
-                        <input
-                          placeholder="Filter by tag"
-                          value={historianExportFilters.tag}
-                          onChange={(e) => setHistorianExportFilters((p) => ({ ...p, tag: e.target.value }))}
-                        />
-                      </label>
+                      {/* Operator 2026-06-20: same Gateway → Tag wiring as Live. */}
                       <label>
                         Gateway
                         <select
                           value={historianExportFilters.gatewayId}
-                          onChange={(e) => setHistorianExportFilters((p) => ({ ...p, gatewayId: e.target.value }))}
+                          onChange={(e) => setHistorianExportFilters((p) => ({ ...p, gatewayId: e.target.value, tag: "" }))}
                         >
                           <option value="">All gateways</option>
                           {allGatewayOptions.map((g) => (
                             <option key={g.id} value={g.id}>{g.power_meter ? `${g.name} (Power Meter)` : g.name}</option>
                           ))}
                         </select>
+                      </label>
+                      <label>
+                        Tag
+                        {(() => {
+                          const gw = String(historianExportFilters.gatewayId || "");
+                          const tags = gw
+                            ? (triggerTagsByGateway[gw] || [])
+                            : Array.from(new Set(Object.values(triggerTagsByGateway || {}).flat())).sort();
+                          return (
+                            <select
+                              value={historianExportFilters.tag || ""}
+                              onChange={(e) => setHistorianExportFilters((p) => ({ ...p, tag: e.target.value }))}
+                            >
+                              <option value="">All tags</option>
+                              {tags.map((t) => (
+                                <option key={t} value={t}>{t}</option>
+                              ))}
+                            </select>
+                          );
+                        })()}
                       </label>
                       <label>
                         Device
@@ -23151,14 +24265,24 @@ const getGatewayHealth = (gateway) => {
                                   const ms = new Date(s).getTime();
                                   return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
                                 };
+                                // Operator 2026-06-20: pass the active
+                                // tag filter (the prior code hardcoded
+                                // tag:"" so the backend scanned every
+                                // tag's rows). Also cap the preview at
+                                // 20 k rows — backend max is 50 k anyway,
+                                // and 100 k was a fiction. The Load query
+                                // now hits the (tenant,gateway,tag,ts)
+                                // composite index when both gateway+tag
+                                // are picked, which drops a 30 s scan
+                                // to a 50 ms seek on the customer DB.
                                 const res = await getAppStoreHistorianRange({
                                   fromUtc: toIso(historianExportFilters.from),
                                   toUtc: toIso(historianExportFilters.to),
-                                  limit: 100000,
+                                  limit: 20000,
                                   offset: 0,
                                   gateway: String(historianExportFilters.gatewayId || ""),
-                                  tag: "",
-                                  timeoutMs: 90000,
+                                  tag: String(historianExportFilters.tag || ""),
+                                  timeoutMs: 60000,
                                   maxAttempts: 1,
                                 });
                                 const rows = Array.isArray(res?.rows) ? res.rows : [];
@@ -25835,6 +26959,27 @@ const getGatewayHealth = (gateway) => {
                 >
                   <option value="">Select database…</option>
                   {(() => {
+                    // Operator 2026-06-25: ALWAYS include Local SQLite
+                    // as an option. When bootstrap hasn't delivered a
+                    // SQLite entry (tenant scope race, etc.) the
+                    // dropdown would otherwise be empty and the user
+                    // couldn't pick anything. We inject the same
+                    // synthetic SQLite row the Database Overview page
+                    // already uses, so the dropdown matches the page.
+                    const hasSqlite = (dbConnections || []).some(
+                      (db) => String(db?.engine || "").toLowerCase() === "sqlite"
+                    );
+                    const effectiveDbList = hasSqlite
+                      ? (dbConnections || [])
+                      : [
+                          {
+                            id: "local-sqlite-default",
+                            name: "Local SQLite",
+                            engine: "sqlite",
+                            sqlite_path: "./data/trustnode_app_store.db",
+                          },
+                          ...(dbConnections || []),
+                        ];
                     // Group by engine so the picker scales when many DBs exist
                     // (Local SQLite at top, then engines, then file sinks).
                     const groups = [
@@ -25847,7 +26992,7 @@ const getGatewayHealth = (gateway) => {
                     const used = new Set();
                     const nodes = [];
                     for (const g of groups) {
-                      const rows = (dbConnections || []).filter((db) => g.engines.includes(String(db.engine || "").toLowerCase()));
+                      const rows = effectiveDbList.filter((db) => g.engines.includes(String(db.engine || "").toLowerCase()));
                       if (!rows.length) continue;
                       nodes.push(
                         <optgroup key={g.label} label={g.label}>
@@ -25860,7 +27005,7 @@ const getGatewayHealth = (gateway) => {
                       );
                     }
                     // Catch-all for any engine we didn't explicitly group.
-                    const others = (dbConnections || []).filter((db) => !used.has(String(db.id || "")));
+                    const others = effectiveDbList.filter((db) => !used.has(String(db.id || "")));
                     if (others.length) {
                       nodes.push(
                         <optgroup key="_other" label="Other">
@@ -25878,11 +27023,181 @@ const getGatewayHealth = (gateway) => {
                 Interval (ms)
                 <input
                   type="number"
-                  min="100"
+                  min="200"
+                  step="100"
                   value={gatewayForm.interval_ms}
                   onChange={(e) => setGatewayForm({ ...gatewayForm, interval_ms: Number(e.target.value) })}
                   disabled={!canEditPage("gateway_configuration")}
                 />
+                {(() => {
+                  const v = Number(gatewayForm.interval_ms || 0);
+                  if (v && v < 200) {
+                    return (
+                      <small className="warn" style={{ display: "block", color: "#f0a500", marginTop: 4 }}>
+                        Minimum 200 ms. Values below are clamped on save.
+                      </small>
+                    );
+                  }
+                  if (v && v < 500) {
+                    return (
+                      <small className="muted" style={{ display: "block", marginTop: 4 }}>
+                        Sub-500 ms cycles require headroom on every step (PLC read + 2&times; SQLite writes + WebSocket emit).
+                        With many tags or slow PLCs the cycle may exceed the target; the gateway will run as fast as
+                        the workload allows and the Status footer will show the real cadence.
+                      </small>
+                    );
+                  }
+                  return null;
+                })()}
+              </label>
+              {/* Operator 2026-06-21: opt-in auto-resume per gateway.
+                  Default OFF — the worker only re-starts itself after a
+                  backend crash / Windows reboot if the operator
+                  explicitly opted in. Without this flag, a stopped
+                  gateway stays stopped until the operator clicks Start
+                  again. Auto-resume is convenient for unattended
+                  industrial deployments where the edge must keep
+                  collecting through power events; for ops where you
+                  want explicit control, leave it OFF. */}
+              <label className="gateway-span-2" style={{ display: "flex", alignItems: "center", gap: 10, paddingTop: 4 }}>
+                <input
+                  type="checkbox"
+                  checked={Boolean(gatewayForm.auto_resume)}
+                  onChange={(e) => setGatewayForm({ ...gatewayForm, auto_resume: e.target.checked })}
+                  disabled={!canEditPage("gateway_configuration")}
+                />
+                <span>
+                  Resume on backend restart
+                  <small className="muted" style={{ display: "block", marginTop: 2, fontSize: 11 }}>
+                    When ON, this gateway auto-starts after a backend restart, Windows reboot, or auto-update,
+                    if it was running when the backend went down. Default is OFF: the operator must click Start
+                    explicitly after any restart.
+                  </small>
+                </span>
+              </label>
+              {/* Operator 2026-06-25: Schedule — daily start/stop time window. */}
+              {/* Operator 2026-06-25: schedule controls — single
+                  centered row. Pill toggle + label + two large time
+                  inputs. No helper text; tooltip on the pill explains
+                  the feature for first-timers. */}
+              <div className="gateway-span-2" style={{
+                display: "flex",
+                flexWrap: "nowrap",
+                justifyContent: "center",
+                alignItems: "center",
+                gap: 18,
+                padding: "12px 16px",
+                background: "rgba(255,255,255,0.03)",
+                border: "1px solid rgba(255,255,255,0.06)",
+                borderRadius: 6,
+              }}>
+                <label
+                  style={{ display: "flex", alignItems: "center", gap: 10, cursor: canEditPage("gateway_configuration") ? "pointer" : "not-allowed" }}
+                  title="When ON, start at the first time and stop at the second every day (local time). Wraps midnight if stop < start."
+                >
+                  <span style={{
+                    position: "relative",
+                    display: "inline-block",
+                    width: 40,
+                    height: 20,
+                    borderRadius: 10,
+                    background: gatewayForm.schedule_enabled ? "#14a89a" : "rgba(255,255,255,0.15)",
+                    transition: "background 0.15s",
+                  }}>
+                    <span style={{
+                      position: "absolute",
+                      top: 2,
+                      left: gatewayForm.schedule_enabled ? 22 : 2,
+                      width: 16,
+                      height: 16,
+                      borderRadius: "50%",
+                      background: "#fff",
+                      transition: "left 0.15s",
+                    }} />
+                  </span>
+                  <input
+                    type="checkbox"
+                    style={{ display: "none" }}
+                    checked={Boolean(gatewayForm.schedule_enabled)}
+                    onChange={(e) => setGatewayForm({ ...gatewayForm, schedule_enabled: e.target.checked })}
+                    disabled={!canEditPage("gateway_configuration")}
+                  />
+                  <span style={{ fontWeight: 600, letterSpacing: 0.3 }}>SCHEDULE</span>
+                </label>
+                <input
+                  type="time"
+                  value={String(gatewayForm.schedule_start || "08:00")}
+                  onChange={(e) => setGatewayForm({ ...gatewayForm, schedule_start: e.target.value })}
+                  disabled={!canEditPage("gateway_configuration") || !gatewayForm.schedule_enabled}
+                  style={{
+                    width: 170,
+                    padding: "8px 12px",
+                    fontSize: 15,
+                    textAlign: "center",
+                    opacity: gatewayForm.schedule_enabled ? 1 : 0.5,
+                  }}
+                />
+                <span style={{ opacity: 0.55, fontSize: 18 }}>→</span>
+                <input
+                  type="time"
+                  value={String(gatewayForm.schedule_stop || "18:00")}
+                  onChange={(e) => setGatewayForm({ ...gatewayForm, schedule_stop: e.target.value })}
+                  disabled={!canEditPage("gateway_configuration") || !gatewayForm.schedule_enabled}
+                  style={{
+                    width: 170,
+                    padding: "8px 12px",
+                    fontSize: 15,
+                    textAlign: "center",
+                    opacity: gatewayForm.schedule_enabled ? 1 : 0.5,
+                  }}
+                />
+              </div>
+              {/* Operator 2026-06-25: Auto-recover — restart the gateway after unexpected stops. */}
+              <label className="gateway-span-2" style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "10px 12px",
+                background: "rgba(255,255,255,0.03)",
+                border: "1px solid rgba(255,255,255,0.06)",
+                borderRadius: 6,
+                cursor: canEditPage("gateway_configuration") ? "pointer" : "not-allowed",
+              }}>
+                <span style={{
+                  position: "relative",
+                  display: "inline-block",
+                  width: 40,
+                  height: 20,
+                  borderRadius: 10,
+                  background: (gatewayForm.auto_recover_enabled !== false) ? "#14a89a" : "rgba(255,255,255,0.15)",
+                  transition: "background 0.15s",
+                }}>
+                  <span style={{
+                    position: "absolute",
+                    top: 2,
+                    left: (gatewayForm.auto_recover_enabled !== false) ? 22 : 2,
+                    width: 16,
+                    height: 16,
+                    borderRadius: "50%",
+                    background: "#fff",
+                    transition: "left 0.15s",
+                  }} />
+                </span>
+                <input
+                  type="checkbox"
+                  style={{ display: "none" }}
+                  checked={gatewayForm.auto_recover_enabled !== false}
+                  onChange={(e) => setGatewayForm({ ...gatewayForm, auto_recover_enabled: e.target.checked })}
+                  disabled={!canEditPage("gateway_configuration")}
+                />
+                <span>
+                  <span style={{ fontWeight: 600 }}>Auto-recover</span>
+                  <small className="muted" style={{ display: "block", marginTop: 2, fontSize: 11 }}>
+                    When ON (default), restart this gateway automatically within ~30 s if it stops unexpectedly —
+                    PLC drop, DB error, watchdog give-up, backend restart. Explicit Stop button clicks are honored
+                    and the gateway stays down until you click Start again.
+                  </small>
+                </span>
               </label>
               {/* Operator request 2026-06-12 (re-rev): "we don't need
                   the field where the tags are separated by ';', we
@@ -25946,6 +27261,47 @@ const getGatewayHealth = (gateway) => {
                   </div>
                 );
               })()}
+              {/* Operator 2026-06-19: manual tag entry. Discovery sometimes
+                  collapses struct arrays or omits module-defined tags
+                  (`PANEL:I`), and some operators already know the exact
+                  tag string they want. Typing it in and pressing Enter
+                  (or clicking Add) appends to the selected-tags grid via
+                  the same tags_text storage path. Accepts ; or newline
+                  separators so a paste of multiple tags works too. */}
+              <label className="gateway-span-2">
+                Manual Tag Entry
+                <div className="row" style={{ gap: 8 }}>
+                  <input
+                    type="text"
+                    placeholder={
+                      gatewayForm.gateway_type === "siemens_opcua"
+                        ? "e.g. ns=3;s=MyNode  (press Enter to add)"
+                        : "e.g. SimREAL[3] or ABB_ROBOT_STATUS  (press Enter to add)"
+                    }
+                    value={gatewayManualTagInput}
+                    onChange={(e) => setGatewayManualTagInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        appendManualGatewayTags();
+                      }
+                    }}
+                    disabled={!canEditPage("gateway_configuration")}
+                    style={{ flex: 1, minWidth: 0 }}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={appendManualGatewayTags}
+                    disabled={
+                      !canEditPage("gateway_configuration") ||
+                      !gatewayManualTagInput.trim()
+                    }
+                  >
+                    Add
+                  </button>
+                </div>
+              </label>
               <div className="gateway-span-2 row">
                 <button
                   type="button"

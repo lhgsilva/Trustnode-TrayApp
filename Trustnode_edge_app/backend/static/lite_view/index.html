@@ -66,6 +66,34 @@ async function loadConfig() {
     default_chart_range_minutes: 60,
   };
   supabase = createClient(cfg.supabase_url, cfg.supabase_anon_key, {});
+
+  // Operator 2026-06-23: license-module gating for Lite tabs. Read the
+  // edge's /api/health → license_summary.modules. If the license
+  // carries explicit view.lan_* keys, only show tabs whose key is
+  // listed (fail-CLOSED). If no view.lan_* keys are present at all
+  // (legacy install), every tab stays visible (fail-OPEN). This
+  // preserves existing customers while letting packaged licenses
+  // restrict the UI.
+  try {
+    const r = await fetch("/api/health", { cache: "no-store" });
+    const j = await r.json();
+    const modules = (j && j.license_summary && Array.isArray(j.license_summary.modules))
+      ? j.license_summary.modules.map((k) => String(k).toLowerCase())
+      : [];
+    const hasAnyViewLan = modules.some((k) => k.startsWith("view.lan"));
+    if (hasAnyViewLan) {
+      cfg.show_dashboard_tab = modules.includes("view.lan_dashboards");
+      cfg.show_history_tab = modules.includes("view.lan_historian");
+      cfg.show_alarms_tab = modules.includes("view.lan_alarms");
+      cfg.show_reporting_tab = modules.includes("view.lan_reports");
+      cfg.show_power_tab = modules.includes("view.lan_power") || modules.includes("power_overview");
+      cfg.allow_export = modules.includes("view.lan_export");
+    }
+    cfg.license_modules = modules;
+    cfg.license_package = j?.license_summary?.package_key || "";
+  } catch (_) {
+    // Fail-OPEN — never let a license probe failure hide tabs.
+  }
 }
 
 // ============================================================
@@ -2352,9 +2380,14 @@ function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, 
 }
 
 const NAV_ITEMS = (cfgIn) => {
-  const items = [["dashboard", icGrid, "Dashboard"]];
+  // Operator 2026-06-23: each flag is tri-state — `false` hides, `true`
+  // shows, `undefined` defaults to show. The license loader sets
+  // explicit booleans only when packaged view.lan_* keys are present,
+  // so legacy installs keep all tabs visible.
+  const items = [];
+  if (cfgIn?.show_dashboard_tab !== false) items.push(["dashboard", icGrid, "Dashboard"]);
   if (cfgIn?.show_power_tab !== false) items.push(["power", icBolt, "Power"]);
-  items.push(["history", icList, "Historian"]);
+  if (cfgIn?.show_history_tab !== false) items.push(["history", icList, "Historian"]);
   if (cfgIn?.show_reporting_tab !== false) items.push(["reporting", icReport, "Reporting"]);
   if (cfgIn?.show_alarms_tab !== false) items.push(["alarms", icBell, "Alarms"]);
   return items;

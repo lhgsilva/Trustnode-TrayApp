@@ -32,6 +32,16 @@ export const WIDGET_TYPES = [
   // as a donut, bar chart or table. Powered by the per-tariff
   // insight tags emitted by power_manager.
   { key: "energy_tariffs", label: "Energy Tariffs", group: "Charts", defaultSize: { w: 14, h: 10 } },
+
+  // ----- Batch Management module widgets (2026-06-23) -----
+  // Each carries `licenseModule: "batch_management"` so the designer
+  // hides them in the picker when the license is off, and existing
+  // dashboards that use them render an "unlicensed" placeholder.
+  { key: "batch_current",   label: "Current Batch",      group: "Batch", licenseModule: "batch_management", defaultSize: { w: 12, h: 6 } },
+  { key: "batch_list",      label: "Recent Batches",     group: "Batch", licenseModule: "batch_management", defaultSize: { w: 14, h: 10 } },
+  { key: "batch_kpi",       label: "Batch KPI",          group: "Batch", licenseModule: "batch_management", defaultSize: { w: 10, h: 6 } },
+  { key: "batch_timeline",  label: "Batch Timeline",     group: "Batch", licenseModule: "batch_management", defaultSize: { w: 20, h: 6 } },
+  { key: "batch_input",     label: "Batch ID Input",     group: "Batch", licenseModule: "batch_management", defaultSize: { w: 10, h: 4 } },
 ];
 
 // One-shot migration: walk a widget list and double every w/h/x/y if

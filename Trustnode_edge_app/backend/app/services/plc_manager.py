@@ -1,11 +1,19 @@
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Set
 from urllib.parse import quote_plus
+
+# Operator 2026-06-23: dedicated logger for the gateway worker so every
+# operationally-relevant transition lands in backend.log with a stable
+# tag. The user invariant is "a healthy gateway never stops without a
+# logged reason" — the only way to honor that is to write a log line
+# for EVERY stop / error / restart from inside the worker.
+_GW_LOG = logging.getLogger("trustnode.gateway")
 
 from app.models import GatewayConfig, GatewayReading, GatewayStatus
 from app.opcua_utils import resolve_requested_nodes, split_requested_identifiers
@@ -119,6 +127,35 @@ class GatewayWorker:
         # so the operator can see WHICH tags are unhappy without losing
         # the rest of the cycle.
         self._last_partial_error: str = ""
+        # Operator 2026-06-19 (L3b): bounded read-timeout. If a driver
+        # call hangs indefinitely (e.g. half-open TCP after a NIC flap),
+        # the worker would silently stop collecting forever. We wrap the
+        # read in asyncio.wait_for and force a driver-session reset on
+        # timeout so the next cycle reconnects. The counter is for
+        # observability — surfaced via get_status() in last_error.
+        self._stalled_read_cycles: int = 0
+        # Operator 2026-06-20: cadence observability. _measured_cycle_ms
+        # is the wall-clock duration of the most recent cycle; the streak
+        # counts consecutive cycles where measured > 1.5× configured. A
+        # streak of 3 triggers a cadence warning in last_error.
+        self._measured_cycle_ms: float = 0.0
+        self._cycle_overrun_streak: int = 0
+        # Operator 2026-06-19 (L3c): per-sink circuit breaker. After N
+        # consecutive write errors against the SAME sink (by id) we
+        # stop attempting writes to that sink for COOLDOWN_S seconds.
+        # Local collection continues unchanged — only the failing sink
+        # is paused, preventing a broken Postgres / CSV path from
+        # eating CPU on every cycle and drowning the audit log. After
+        # cooldown one probe write is allowed; success closes the
+        # breaker, failure resets the cooldown.
+        self._sink_breaker_fails: Dict[str, int] = {}
+        self._sink_breaker_open_until_mono: Dict[str, float] = {}
+        self._SINK_BREAKER_THRESHOLD = max(2, int(
+            os.environ.get("TRUSTNODE_SINK_BREAKER_THRESHOLD", "5") or "5"
+        ))
+        self._SINK_BREAKER_COOLDOWN_S = max(5.0, float(
+            os.environ.get("TRUSTNODE_SINK_BREAKER_COOLDOWN_SECONDS", "60") or "60"
+        ))
         self._opc_resolve_cache_key = ""
         self._opc_resolved_targets: list[tuple[str, str]] = []
         # Persistent OPC-UA client. The previous behaviour was to
@@ -127,6 +164,22 @@ class GatewayWorker:
         self._opc_client = None
         self._opc_endpoint: str = ""
         self._telemetry_runtime_refresh_monotonic = 0.0
+        # Operator 2026-06-23: liveness counter. Bumped on every
+        # successful read cycle. get_status().running is computed from
+        # this rather than from the bare self.running flag, so a worker
+        # whose coroutine is wedged (e.g. blocked in a driver socket
+        # read with no exception) reports running=False to the UI and
+        # to the supervisor watchdog. Previously `self.running` stayed
+        # True forever in that case and the UI showed "RUNNING but no
+        # data" — the failure mode observed 2026-06-22.
+        self._last_progress_mono: float = 0.0
+        # Stall threshold: max(3 × interval_ms, 30 s). Computed per
+        # cycle from the live config.
+        self._stall_threshold_s: float = 30.0
+        # Watchdog restart count for the current PlcManager lifetime,
+        # exposed via get_status().restart_count for the UI.
+        self.restart_count: int = 0
+        self._last_restart_utc: str | None = None
 
     def set_config(self, config: GatewayConfig) -> None:
         if (
@@ -199,7 +252,53 @@ class GatewayWorker:
         self.collection_blocked = False
         self.collection_block_reason = None
         self._startup_started_monotonic = time.monotonic()
+        # Prime the liveness counter so the supervisor doesn't flag a
+        # freshly-started worker as stalled before its first cycle
+        # completes.
+        self._last_progress_mono = time.monotonic()
+        _GW_LOG.info(
+            "start gateway=%s type=%s ip=%s opc=%s interval=%dms tags=%d",
+            self.gateway_id,
+            self.config.gateway_type,
+            self.config.plc_ip or "",
+            self.config.opc_url or "",
+            int(self.config.interval_ms or 0),
+            len(self.config.tags or []),
+        )
+        # Operator 2026-06-25: run prewarm in BACKGROUND (was awaited).
+        # The user reported the Start button hanging 1-3s, leading to
+        # double-clicks that produced AbortError. The prewarm is an
+        # optimization (skips the first-cycle handshake cost); it is
+        # NOT required for correctness — the run loop's reconnect
+        # handles a cold first cycle just fine. Fire-and-forget here
+        # so the HTTP /api/plc/gateways/start returns instantly.
+        asyncio.create_task(asyncio.to_thread(self._prewarm_client))
         self._task = asyncio.create_task(self._run_loop(emit_event))
+
+        def _on_run_loop_done(t: "asyncio.Task[Any]", gid: str = self.gateway_id) -> None:
+            # Invariant A: a run-loop coroutine that exits — for ANY
+            # reason — must leave a log line. Previously a silently-
+            # returning loop produced 18 h of zero rows with nothing in
+            # the log. With this callback the supervisor, the operator,
+            # and the postmortem reader all see the exit cause.
+            try:
+                if t.cancelled():
+                    _GW_LOG.info("run-loop-exit gateway=%s reason=cancelled", gid)
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    _GW_LOG.error(
+                        "run-loop-exit gateway=%s reason=exception exc=%s: %s",
+                        gid, type(exc).__name__, exc,
+                    )
+                    return
+                _GW_LOG.info("run-loop-exit gateway=%s reason=clean-return", gid)
+            except Exception:
+                # Defensive only — never let the callback itself die
+                # silently and rob us of the postmortem.
+                pass
+
+        self._task.add_done_callback(_on_run_loop_done)
 
     async def stop(self) -> None:
         # Operator 2026-06-18: reverted to the original simple stop. The
@@ -211,6 +310,14 @@ class GatewayWorker:
         if not self.running:
             return
         self.running = False
+        # Invariant A: every stop must leave a logged reason. The
+        # explicit "operator/manager stop" reason is set here; watchdog
+        # restarts log their own reason via the supervisor before they
+        # call stop().
+        _GW_LOG.info(
+            "stop gateway=%s reason=requested last_error=%r writes=%d",
+            self.gateway_id, self.last_error, int(self.db_write_count or 0),
+        )
         with self._remote_flush_lock:
             self._remote_flush_inflight = False
         if self._task:
@@ -222,14 +329,48 @@ class GatewayWorker:
             self._task = None
         self._dispose_gateway_clients()
 
+    def is_stalled(self) -> tuple[bool, float]:
+        """True iff the worker is supposed to be running but hasn't
+        made progress within the configured stall window. Returns
+        (stalled, idle_seconds).
+
+        A worker that never completed its first cycle (and is still
+        inside the startup grace window) is NOT considered stalled —
+        the watchdog must not restart a worker that is simply slow to
+        connect for the first time.
+        """
+        if not self.running:
+            return (False, 0.0)
+        last = self._last_progress_mono or 0.0
+        if last <= 0.0:
+            return (False, 0.0)
+        idle = time.monotonic() - last
+        threshold = max(5.0, float(self._stall_threshold_s or 30.0))
+        return (idle > threshold, idle)
+
     def get_status(self) -> GatewayStatus:
+        # Compute a "healthy-running" flag from the liveness counter so
+        # the UI never sees the contradiction "running=True but no fresh
+        # rows" that the customer hit on 2026-06-22. The bare
+        # self.running flag is now an *intent* flag (the worker is
+        # supposed to be running); the supervisor watchdog converts
+        # intent + liveness into an honest report.
+        stalled, _idle = self.is_stalled()
+        effective_running = bool(self.running and not stalled)
+        last_error = self.last_error
+        if stalled and (not last_error or "stalled" not in last_error.lower()):
+            last_error = (
+                f"Worker stalled — no read cycle completed for "
+                f"{_idle:.0f}s (threshold {self._stall_threshold_s:.0f}s). "
+                f"Supervisor will restart it."
+            )
         return GatewayStatus(
-            running=self.running,
+            running=effective_running,
             gateway_type=self.config.gateway_type,
             plc_ip=self.config.plc_ip,
             interval_ms=self.config.interval_ms,
             tags=self.config.tags,
-            last_error=self.last_error,
+            last_error=last_error,
             db_sink_engine=(self.db_sink or {}).get("engine"),
             db_write_count=self.db_write_count,
             db_last_write_utc=self.db_last_write_utc,
@@ -250,10 +391,24 @@ class GatewayWorker:
         while self.running:
             cycle_started = time.monotonic()
             try:
-                # Gateway drivers are synchronous/blocking (socket I/O). Keep the
-                # asyncio loop responsive by executing reads off-loop.
+                # Operator 2026-06-20: matches the 0.0.0.1000 reference exactly.
+                # The earlier wait_for wrapper added during L3b had two effects
+                # that broke working customer setups: (a) a 30-second floor that
+                # was way too long for a sub-second collection cycle to recover
+                # from, (b) eager driver-session disposal on timeout that fed
+                # back into the next cycle as another timeout. Reference's
+                # plain to_thread call is the right shape — the bare `except`
+                # at the bottom of the cycle catches any read exception and
+                # the next cycle reconnects through `_ensure_ab_pycomm3_client`
+                # / `_ensure_opc_client`, which already handle stale sessions.
                 readings = await asyncio.to_thread(self._read_from_gateway)
                 self.latest_readings = readings
+                # Liveness stamp — successful read = worker is alive.
+                # The supervisor watchdog reads this to decide whether
+                # to hard-restart a stalled coroutine. We stamp BEFORE
+                # persistence so a slow/dead sink doesn't make a healthy
+                # PLC look dead.
+                self._last_progress_mono = time.monotonic()
                 # Surface a non-fatal "some tags are bad" summary from the
                 # AB readers, OR clear it on a clean cycle. The UI shows
                 # this in the gateway status footer; the historian still
@@ -298,11 +453,19 @@ class GatewayWorker:
                             self.collection_blocked = True
                             self.collection_block_reason = f"Local persistence failed: {err}"
                             self.last_error = self.collection_block_reason
+                            _GW_LOG.warning(
+                                "persist-fail gateway=%s reason=%s",
+                                self.gateway_id, err,
+                            )
                     except Exception as exc:
                         collection_allowed = False
                         self.collection_blocked = True
                         self.collection_block_reason = f"Local persistence failed: {exc}"
                         self.last_error = self.collection_block_reason
+                        _GW_LOG.exception(
+                            "persist-exception gateway=%s exc=%s",
+                            self.gateway_id, exc,
+                        )
                 await emit_event(
                     {
                         "type": "reading",
@@ -330,11 +493,65 @@ class GatewayWorker:
                 in_grace = started_at > 0 and (time.monotonic() - started_at) < self._startup_grace_seconds
                 if not in_grace:
                     self.last_error = err_text
+                    # Invariant A: every non-grace cycle failure goes into
+                    # backend.log so the operator can reconstruct what
+                    # happened without needing the worker's in-memory
+                    # last_error string. We log at warning because the
+                    # next cycle will likely recover (driver is
+                    # self-healing); a sustained outage manifests as the
+                    # watchdog firing, which logs at warning too.
+                    _GW_LOG.warning(
+                        "cycle-error gateway=%s exc=%s: %s",
+                        self.gateway_id, type(exc).__name__, err_text,
+                    )
                 # Do not keep stale values visible when a read cycle fails.
                 self.latest_readings = []
                 await emit_event({"type": "error", "gateway_id": self.gateway_id, "message": err_text})
-            target_s = max(self.config.interval_ms / 1000.0, 0.1)
+            # Operator 2026-06-20: interval safe-guards.
+            #   - Floor at 200 ms. The 100 ms minimum was theoretical — actual
+            #     cycles with 4 tags take 500-1000 ms because the per-cycle
+            #     work (PLC read + 2-3 SQLite writes + WebSocket emit + 10s
+            #     bootstrap refresh) saturates a single worker thread. Cycles
+            #     below this floor will sleep ~10 ms and run as fast as the
+            #     workload allows; clamping here matches the frontend.
+            #   - Ceiling at 60 s. Above 60 s the operator probably meant
+            #     "off" — surface as an error rather than silently allow
+            #     a 10-minute cycle.
+            #   - Track measured cycle duration. When the measured cycle is
+            #     consistently > 1.5× the configured interval (3 consecutive
+            #     cycles), surface a clear cadence-warning in last_error so
+            #     the UI status footer shows "configured 100ms, actual 1010ms"
+            #     without silently lying about throughput.
+            # Operator 2026-06-25: cap raised to 1 hour (was 60s).
+            # Users can legitimately configure 5-min / 30-min / 1-hour
+            # cadences (slow process, audit-trail dumps, hourly totals).
+            # Silently clamping to 60 s caused those workers to wake up
+            # way too often and surface "no readings in 30s" stalls.
+            configured_ms = max(200, min(3_600_000, int(self.config.interval_ms or 1000)))
+            target_s = configured_ms / 1000.0
+            # Stall threshold = max(30 s, 3 × cycle interval). 30 s
+            # floor protects sub-second pollers from spurious restarts
+            # on a single missed cycle; the multiplier covers slow
+            # cadences — a 5-min interval is "stalled" only after 15 min
+            # of silence, a 1-hour interval after 3 hours.
+            self._stall_threshold_s = max(30.0, 3.0 * target_s)
             elapsed_s = max(0.0, time.monotonic() - cycle_started)
+            self._measured_cycle_ms = elapsed_s * 1000.0
+            if elapsed_s * 1000.0 > configured_ms * 1.5:
+                self._cycle_overrun_streak = (getattr(self, "_cycle_overrun_streak", 0) or 0) + 1
+            else:
+                self._cycle_overrun_streak = 0
+            if self._cycle_overrun_streak >= 3:
+                # Surface a cadence-warning. Doesn't override a real error;
+                # the run loop's `last_error` may already carry a partial
+                # tag failure, in which case we leave it alone.
+                if not self.last_error or "cadence" not in self.last_error.lower():
+                    self.last_error = (
+                        f"Cadence warning: configured {configured_ms} ms, actual "
+                        f"{elapsed_s*1000:.0f} ms — collection is running as fast as "
+                        f"the workload allows. Raise the interval or reduce tag count "
+                        f"to hit the target."
+                    )
             await asyncio.sleep(max(0.01, target_s - elapsed_s))
 
     def _is_collection_allowed(self, readings: List[GatewayReading]) -> tuple[bool, str | None]:
@@ -414,6 +631,40 @@ class GatewayWorker:
         if gateway_type == "siemens_snap7":
             return self._read_from_snap7()
         raise RuntimeError(f"Gateway type '{self.config.gateway_type}' is not implemented for real-time reads.")
+
+    def _prewarm_client(self) -> None:
+        """Open the PLC driver session before the run loop starts.
+
+        Called from start() via asyncio.to_thread so the handshake +
+        init_tags cost is paid during the Start button click, not on
+        the first chart tick. The next `_ensure_*_client()` inside the
+        run loop returns the cached instance and the first read cycle
+        completes in milliseconds. Failure is non-fatal: the run loop
+        will reconnect on its own — we just don't get the speedup.
+        """
+        gateway_type = (self.config.gateway_type or "").strip().lower()
+        if gateway_type == "allen_bradley":
+            ip = (self.config.plc_ip or "").strip()
+            if not ip:
+                return
+            try:
+                from pycomm3 import LogixDriver  # type: ignore
+            except Exception:
+                return
+            path = ip if "/" in ip else ip
+            self._ensure_ab_pycomm3_client(path, LogixDriver)
+            return
+        if gateway_type == "siemens_opcua":
+            url = (self.config.opc_url or "").strip()
+            if not url:
+                return
+            try:
+                self._ensure_opc_client(url)
+            except Exception:
+                return
+            return
+        # snap7 + others: skip — their driver state machines may not
+        # tolerate an out-of-band open here.
 
     def _coerce_value(self, raw: Any, tag_name: str) -> tuple[float, str | None]:
         """Return (numeric_value, text_value).
@@ -531,6 +782,12 @@ class GatewayWorker:
                             f"Configured AB tags not found in controller ({len(missing)}): {', '.join(missing[:8])}"
                         )
 
+                # Operator 2026-06-24: benchmark proved single plc.read(
+                # *tags) is fastest (~11 ms avg vs 21 ms batched) and
+                # never stalls when run in isolation. The stalls we
+                # saw in the edge app come from the watchdog restart
+                # sequence, not from the driver itself. Keep this
+                # simple.
                 try:
                     results = plc.read(*tags)
                 except Exception:
@@ -538,7 +795,6 @@ class GatewayWorker:
                     self._close_ab_pycomm3_client()
                     plc = self._ensure_ab_pycomm3_client(path, LogixDriver)
                     results = plc.read(*tags)
-
                 if not isinstance(results, list):
                     results = [results]
                 if not results:
@@ -795,6 +1051,25 @@ class GatewayWorker:
 
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         client = snap7.client.Client()
+        # Operator 2026-06-23 (Item 10): bound Snap7 connect+send+recv so
+        # a half-open S7 session cannot hang the cycle for >8s. The
+        # snap7 ParamNumber.PingTimeout / SendTimeout / RecvTimeout
+        # values are in milliseconds.
+        try:
+            from snap7.type import Parameter  # type: ignore  # newer python-snap7
+            client.set_param(Parameter.PingTimeout, 2000)
+            client.set_param(Parameter.SendTimeout, 4000)
+            client.set_param(Parameter.RecvTimeout, 8000)
+        except Exception:
+            # older python-snap7 layouts: ParamNumber lives elsewhere or
+            # the param ids are exposed as ints. Best-effort only — the
+            # watchdog still catches anything that escapes this.
+            try:
+                client.set_param(3, 2000)   # PingTimeout
+                client.set_param(7, 4000)   # SendTimeout
+                client.set_param(8, 8000)   # RecvTimeout
+            except Exception:
+                pass
         out: List[GatewayReading] = []
         try:
             # Standard rack/slot for S7-1200/1500; make env-configurable.
@@ -1078,6 +1353,46 @@ class GatewayWorker:
         )
         self.last_error = None if transient else text
 
+    # ----------------------------------------------------------------
+    # L3c: sink circuit breaker
+    # ----------------------------------------------------------------
+    def _sink_breaker_skip(self, sink_id: str) -> bool:
+        """Return True if writes to this sink should be skipped right now."""
+        sid = str(sink_id or "").strip()
+        if not sid:
+            return False
+        open_until = self._sink_breaker_open_until_mono.get(sid, 0.0)
+        if open_until and time.monotonic() < open_until:
+            return True
+        # Cooldown elapsed (or breaker never opened) — let one probe through.
+        if open_until and time.monotonic() >= open_until:
+            self._sink_breaker_open_until_mono.pop(sid, None)
+            self._sink_breaker_fails[sid] = 0
+        return False
+
+    def _sink_breaker_record_success(self, sink_id: str) -> None:
+        sid = str(sink_id or "").strip()
+        if not sid:
+            return
+        if sid in self._sink_breaker_fails:
+            self._sink_breaker_fails[sid] = 0
+        self._sink_breaker_open_until_mono.pop(sid, None)
+
+    def _sink_breaker_record_failure(self, sink_id: str, label: str = "") -> None:
+        sid = str(sink_id or "").strip()
+        if not sid:
+            return
+        n = self._sink_breaker_fails.get(sid, 0) + 1
+        self._sink_breaker_fails[sid] = n
+        if n >= self._SINK_BREAKER_THRESHOLD:
+            self._sink_breaker_open_until_mono[sid] = time.monotonic() + self._SINK_BREAKER_COOLDOWN_S
+            # Surface so the UI banner picks it up.
+            self._mark_db_write_error(
+                f"Sink '{label or sid}' circuit-breaker tripped after {n} consecutive errors; "
+                f"writes paused for {int(self._SINK_BREAKER_COOLDOWN_S)}s. "
+                f"Local collection continues."
+            )
+
     def _dispose_db_engine(self) -> None:
         if self._db_engine is not None:
             try:
@@ -1100,7 +1415,36 @@ class GatewayWorker:
         # poll program-scoped tags from this code path, and fetching
         # them roughly doubles connect time on real PLCs.
         plc = logix_driver_cls(path, init_tags=True, init_program_tags=False)
+        # Operator 2026-06-24: write directly to _cfg["socket_timeout"]
+        # BEFORE plc.open(). pycomm3 1.2.14 reads this key when it
+        # constructs the underlying Socket(timeout=…). Note the typo
+        # in pycomm3's property setter (`socket_timout`) means
+        # `plc.socket_timeout = X` doesn't take effect; we have to
+        # set the dict key directly.
+        # Value 2.0s: each per-fragment recv() will time out in 2s,
+        # so a maximally-fragmented response can complete in <30s
+        # before the watchdog 30s threshold fires. Combined with the
+        # read-batching at the read site, a healthy cycle now
+        # completes in ~150ms total.
+        try:
+            sock_timeout = float(
+                os.environ.get("TRUSTNODE_AB_SOCKET_TIMEOUT_SECONDS", "2.0") or "2.0"
+            )
+            plc._cfg["socket_timeout"] = sock_timeout
+        except Exception:
+            pass
         plc.open()
+        # Also force-apply the timeout to the live socket after open(),
+        # in case the open path cached a socket created with a default
+        # value before our _cfg update propagated.
+        try:
+            sock = getattr(getattr(plc, "_sock", None), "sock", None)
+            if sock is not None:
+                sock.settimeout(float(
+                    os.environ.get("TRUSTNODE_AB_SOCKET_TIMEOUT_SECONDS", "2.0") or "2.0"
+                ))
+        except Exception:
+            pass
         self._ab_pycomm3_client = plc
         self._ab_pycomm3_path = path
         return plc
@@ -1151,8 +1495,23 @@ class GatewayWorker:
         if self._opc_client is not None and self._opc_endpoint == endpoint:
             return self._opc_client
         self._close_opc_client()
-        client = Client(endpoint, timeout=4.0)
+        # Operator 2026-06-23 (Item 10): client-level timeout bounds the
+        # OPC-UA protocol response time. We also apply a socket-level
+        # timeout AFTER connect so a half-open TCP can't hang a CIP
+        # read indefinitely — same defense-in-depth as pycomm3.
+        opc_timeout = float(os.environ.get("TRUSTNODE_OPC_TIMEOUT_SECONDS", "4.0") or "4.0")
+        client = Client(endpoint, timeout=opc_timeout)
         client.connect()
+        try:
+            sock = getattr(getattr(client, "uaclient", None), "_uasocket", None)
+            real_sock = getattr(sock, "_socket", None) if sock is not None else None
+            if real_sock is not None:
+                real_sock.settimeout(max(opc_timeout, 8.0))
+        except Exception:
+            # python-opcua's internals are version-specific; if we
+            # can't reach the socket the protocol-level timeout still
+            # applies and the watchdog catches the rest.
+            pass
         self._opc_client = client
         self._opc_endpoint = endpoint
         return client
@@ -1390,6 +1749,12 @@ class GatewayWorker:
             except Exception as exc:
                 self._mark_db_write_error(f"Store-forward pipeline error: {exc}")
         elif engine == "sqlite":
+            # Matches the 0.0.0.1000 reference: write to the user-configured
+            # SQLite file. The earlier no-op shortcut broke `db_write_count`
+            # accounting AND left users without their explicit "Local SQLite"
+            # export, which is the only thing visible in the Database page's
+            # row counter. _broadcast still writes to app_store.historian_readings
+            # (the chart-feeding store) independently — both happen.
             self._persist_sqlite(readings)
             self.db_pending_count = 0
         elif engine == "csv_file":
@@ -1438,6 +1803,11 @@ class GatewayWorker:
                 continue
             sink_engine = str(sink.get("engine") or "").strip().lower()
             sink_label = str(sink.get("name") or sink.get("id") or sink_engine)
+            # L3c: skip this sink while its breaker is open. Local
+            # collection has already succeeded via the primary path —
+            # the parallel sinks are best-effort mirrors.
+            if self._sink_breaker_skip(sink_id):
+                continue
             try:
                 if sink_engine == "csv_file":
                     self._persist_csv_file_for_sink(sink, readings)
@@ -1463,6 +1833,7 @@ class GatewayWorker:
                     self._mark_db_write_error(
                         f"Parallel sink '{sink_label}' has unsupported engine '{sink_engine}'"
                     )
+                self._sink_breaker_record_success(sink_id)
             except Exception as exc:
                 # Parallel sinks are best-effort and should not block
                 # primary flow — but they must NOT be silent. Surface
@@ -1470,6 +1841,7 @@ class GatewayWorker:
                 self._mark_db_write_error(
                     f"Parallel sink '{sink_label}' write failed: {type(exc).__name__}: {exc}"
                 )
+                self._sink_breaker_record_failure(sink_id, sink_label)
 
         # Operator 2026-06-17 (M11b): mirror PLC rows into the
         # Customer DB when `database_mode = customer_sql`, regardless
@@ -2549,6 +2921,65 @@ class PLCManager:
         self.global_trigger_latches: Dict[str, bool] = {}
         self.global_collection_allowed: bool = True
         self.global_collection_reason: str | None = None
+        # Operator 2026-06-23: per-gateway watchdog. A single asyncio
+        # task scans every running worker every 10 s. If a worker's
+        # liveness counter says it has stalled, the watchdog cancels
+        # the wedged read coroutine, disposes its driver clients, and
+        # spawns a fresh run loop. Tracks restart attempts to back off
+        # if the gateway keeps stalling (= the PLC is the problem, not
+        # the worker).
+        self._watchdog_task: asyncio.Task | None = None
+        # Operator 2026-06-26: scan every 5 s (was 10 s) so stalls are
+        # caught within ~5 s instead of ~10 s. Negligible CPU cost — the
+        # scan just compares timestamps for each worker.
+        self._watchdog_interval_s: float = max(
+            2.0, float(os.environ.get("TRUSTNODE_WATCHDOG_INTERVAL_SECONDS", "5") or "5")
+        )
+        # Per-gateway restart history: list of monotonic timestamps of
+        # the last N restarts. If more than _watchdog_burst_threshold
+        # restarts happen inside _watchdog_burst_window_s, the
+        # watchdog enters backoff for that gateway (stops trying until
+        # the operator restarts manually).
+        self._restart_history: Dict[str, list[float]] = {}
+        self._watchdog_burst_threshold: int = max(
+            1, int(os.environ.get("TRUSTNODE_WATCHDOG_BURST_THRESHOLD", "5") or "5")
+        )
+        self._watchdog_burst_window_s: float = max(
+            30.0, float(os.environ.get("TRUSTNODE_WATCHDOG_BURST_WINDOW_SECONDS", "300") or "300")
+        )
+        # Gateways currently in cooldown after a restart burst.
+        self._restart_cooldown_until_mono: Dict[str, float] = {}
+        self._restart_cooldown_s: float = max(
+            60.0, float(os.environ.get("TRUSTNODE_WATCHDOG_COOLDOWN_SECONDS", "300") or "300")
+        )
+        # Operator 2026-06-25: schedule + auto-recover supervisor.
+        # `_user_stopped` tracks gateways the operator explicitly
+        # stopped via the Stop button — auto-recover honors this set
+        # and does NOT bring them back. Cleared when the operator
+        # clicks Start or when the schedule turns the gateway on.
+        # `_last_supervisor_action_mono` rate-limits supervisor
+        # actions so a flapping start/stop loop can't hammer the PLC.
+        self._user_stopped: Set[str] = set()
+        self._last_supervisor_action_mono: Dict[str, float] = {}
+        self._supervisor_min_interval_s: float = 30.0
+        # Operator 2026-06-23 (Item 1 / no-data-loss): in-memory
+        # store-and-forward buffer for historian rows whose write to
+        # the local SQLite failed. The previous behaviour was a bare
+        # except: pass at the broadcast site that silently dropped
+        # the cycle's rows. With this buffer we capture the rows
+        # instead and replay them on the next successful write
+        # attempt. The buffer is bounded so a sustained DB outage
+        # cannot grow memory without limit; once the cap is reached
+        # we drop the OLDEST rows (FIFO) and log a single warning
+        # per drop event so the operator knows data is being shed.
+        from collections import deque
+        self._historian_buffer: "deque[list[dict[str, Any]]]" = deque(
+            maxlen=max(60, int(os.environ.get("TRUSTNODE_HISTORIAN_BUFFER_CYCLES", "600") or "600"))
+        )
+        self._historian_buffer_total_rows: int = 0
+        self._historian_buffer_dropped: int = 0
+        self._historian_buffer_last_drain_mono: float = 0.0
+        self._historian_buffer_lock = threading.Lock()
 
     def _normalize_tag(self, raw: str) -> str:
         return str(raw or "").strip().lower()
@@ -2749,11 +3180,22 @@ class PLCManager:
                         }
                     )
                 if rows:
-                    # SQLite writes can be heavy; keep event loop free.
-                    await asyncio.to_thread(app_store.append_historian_rows, rows)
-        except Exception:
-            # Never block runtime broadcast due historian persistence error.
-            pass
+                    # Operator 2026-06-23 (Item 1): drain any previously
+                    # buffered rows BEFORE this cycle's rows so we don't
+                    # reorder writes. Then attempt the current cycle. If
+                    # either fails, the unwritten rows go into the FIFO
+                    # buffer for the next attempt. No bare-except drop.
+                    await asyncio.to_thread(self._flush_historian_buffer_then_write, rows)
+        except Exception as exc:
+            # We must NEVER drop rows silently here. If we reached this
+            # point with a non-empty rows list it means the helper above
+            # threw before it could enqueue — push the rows into the
+            # buffer and log so the operator sees what happened.
+            try:
+                if 'rows' in locals() and rows:
+                    self._buffer_historian_rows(rows, f"broadcast exception: {exc}")
+            except Exception:
+                pass
 
         dead: List[asyncio.Queue] = []
         for q in self._subscribers:
@@ -2765,6 +3207,639 @@ class PLCManager:
                 dead.append(q)
         for q in dead:
             self._subscribers.discard(q)
+
+    # ------------------------------------------------------------------
+    # Historian store-and-forward (Item 1, 2026-06-23)
+    # ------------------------------------------------------------------
+    def _buffer_historian_rows(self, rows: list[dict[str, Any]], reason: str) -> None:
+        """Push rows into the in-memory FIFO buffer. Bounded — if full,
+        the oldest cycle is dropped and a count of dropped rows is
+        tracked. Logs at WARNING the first time we buffer anything in
+        a new outage, and again whenever data is shed (rare).
+        """
+        if not rows:
+            return
+        with self._historian_buffer_lock:
+            buf = self._historian_buffer
+            buf_was_empty = (len(buf) == 0)
+            at_cap = (len(buf) >= (buf.maxlen or 0) > 0)
+            if at_cap:
+                # deque.append at maxlen drops the leftmost cycle.
+                # Capture its size first so we can record the loss.
+                try:
+                    dropped_cycle = buf[0]
+                    self._historian_buffer_dropped += len(dropped_cycle or [])
+                    self._historian_buffer_total_rows -= len(dropped_cycle or [])
+                except Exception:
+                    pass
+            buf.append(list(rows))
+            self._historian_buffer_total_rows += len(rows)
+            buf_len = len(buf)
+            total_rows = self._historian_buffer_total_rows
+            dropped = self._historian_buffer_dropped
+        try:
+            if buf_was_empty:
+                _GW_LOG.warning(
+                    "historian-buffer-open reason=%s cycles=%d rows=%d",
+                    reason, buf_len, total_rows,
+                )
+            if at_cap:
+                _GW_LOG.error(
+                    "historian-buffer-overflow reason=%s buffered_cycles=%d total_dropped_rows=%d",
+                    reason, buf_len, dropped,
+                )
+        except Exception:
+            pass
+
+    def _flush_historian_buffer_then_write(self, current_rows: list[dict[str, Any]]) -> None:
+        """Drain the buffer in FIFO order, then write the current
+        cycle. Runs on a worker thread (called via asyncio.to_thread)
+        so it can block on SQLite without stalling the event loop.
+
+        Failure modes:
+          * A buffered cycle fails to write → we stop draining, push
+            the failed cycle BACK to the front of the buffer along
+            with the current cycle, and return without raising. The
+            next broadcast will retry.
+          * The current cycle fails to write (but the buffer drain
+            succeeded) → push the current rows into the buffer.
+
+        This ordering preserves chronological insert order across
+        recoveries — older rows always commit before newer ones.
+        """
+        from app.state import app_store  # local import to avoid circular import timing
+
+        # Pop all buffered cycles into a local list so we don't hold
+        # the buffer lock during SQLite I/O. If a write fails we'll
+        # rebuild the buffer from whatever's left.
+        with self._historian_buffer_lock:
+            pending = list(self._historian_buffer)
+            self._historian_buffer.clear()
+            self._historian_buffer_total_rows = 0
+
+        pending.append(list(current_rows))
+
+        written_cycles = 0
+        for idx, cycle_rows in enumerate(pending):
+            try:
+                app_store.append_historian_rows(cycle_rows)
+                written_cycles += 1
+            except Exception as exc:
+                # Re-buffer this cycle and everything after it. Order
+                # preserved.
+                with self._historian_buffer_lock:
+                    for remaining in pending[idx:]:
+                        self._historian_buffer.append(list(remaining))
+                        self._historian_buffer_total_rows += len(remaining or [])
+                try:
+                    _GW_LOG.warning(
+                        "historian-write-fail buffered=%d cycles_drained=%d exc=%s: %s",
+                        len(pending) - idx,
+                        written_cycles,
+                        type(exc).__name__,
+                        exc,
+                    )
+                except Exception:
+                    pass
+                return
+
+        # All cycles drained successfully. If the buffer was non-empty
+        # before this call, log the recovery.
+        if len(pending) > 1:
+            try:
+                self._historian_buffer_last_drain_mono = time.monotonic()
+                _GW_LOG.info(
+                    "historian-buffer-drained cycles=%d (incl. current); buffer now empty",
+                    len(pending),
+                )
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Supervisor watchdog
+    # ------------------------------------------------------------------
+    def _ensure_watchdog_running(self) -> None:
+        """Start the watchdog task if it isn't already. Called from
+        start_gateway. We use a single task for all gateways so the
+        manager can scan them collectively and never spawn duplicates."""
+        if self._watchdog_task and not self._watchdog_task.done():
+            return
+        try:
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+        except RuntimeError:
+            # No running event loop yet — start_gateway is the only
+            # caller and it always runs inside the FastAPI loop, so
+            # this branch is defensive.
+            self._watchdog_task = None
+
+    async def _stop_watchdog(self) -> None:
+        task = self._watchdog_task
+        self._watchdog_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    def _record_restart_attempt(self, gateway_id: str) -> bool:
+        """Record a watchdog-initiated restart for gateway_id. Returns
+        True if the restart should proceed, False if the gateway has
+        hit the burst threshold and must enter cooldown.
+        """
+        now_mono = time.monotonic()
+        # If we're already in cooldown, refuse.
+        until = self._restart_cooldown_until_mono.get(gateway_id, 0.0)
+        if until and now_mono < until:
+            return False
+        history = self._restart_history.setdefault(gateway_id, [])
+        history.append(now_mono)
+        # Trim to the burst window.
+        cutoff = now_mono - self._watchdog_burst_window_s
+        self._restart_history[gateway_id] = [t for t in history if t >= cutoff]
+        if len(self._restart_history[gateway_id]) > self._watchdog_burst_threshold:
+            self._restart_cooldown_until_mono[gateway_id] = now_mono + self._restart_cooldown_s
+            return False
+        return True
+
+    async def _restart_worker_due_to_stall(self, gateway_id: str, idle_s: float) -> None:
+        """Tear down the wedged read loop and spawn a fresh one.
+
+        Steps:
+          1. Cancel the running task and wait up to 5 s for it to exit
+             (it may be blocked in a driver call — that's fine, we move
+             on and let the OS clean up the abandoned thread).
+          2. Dispose all driver clients so the next cycle reconnects.
+          3. Reset liveness counters and reuse the existing worker
+             instance (preserves config, sinks, trigger state).
+          4. Spawn a brand new run-loop task and bump restart counters.
+        """
+        w = self.workers.get(gateway_id)
+        if not w:
+            return
+        if not self._record_restart_attempt(gateway_id):
+            try:
+                import logging
+                logging.getLogger("trustnode.watchdog").warning(
+                    "gateway %s exceeded restart burst threshold (%d in %.0fs); "
+                    "entering cooldown for %.0fs",
+                    gateway_id,
+                    self._watchdog_burst_threshold,
+                    self._watchdog_burst_window_s,
+                    self._restart_cooldown_s,
+                )
+            except Exception:
+                pass
+            w.last_error = (
+                f"Worker stalled and watchdog cooled down after "
+                f"{self._watchdog_burst_threshold} consecutive restarts in "
+                f"{self._watchdog_burst_window_s:.0f}s. Manual stop+start required."
+            )
+            w.running = False
+            # Operator 2026-06-24: also clear the runtime-state flag so
+            # the heartbeat-writer's _has_running_gateway() returns
+            # False, and the sidecar therefore considers an idle
+            # heartbeat acceptable. Without this we'd loop: cooldown
+            # → no rows → heartbeat stale → sidecar kills backend →
+            # respawn (no auto_resume) → still no rows → kill again.
+            try:
+                from app.state import telemetry_service
+                telemetry_service.mark_gateway_running(gateway_id, False)
+            except Exception:
+                pass
+            return
+        try:
+            import logging
+            logging.getLogger("trustnode.watchdog").warning(
+                "gateway %s stalled %.0fs (threshold %.0fs) — restarting worker",
+                gateway_id,
+                idle_s,
+                w._stall_threshold_s,
+            )
+        except Exception:
+            pass
+        # Operator 2026-06-24: instrumented restart sequence. Every
+        # step prints a breadcrumb to stdout BEFORE running. If a
+        # stall recurs and we see "trace=N" lines stop at some N,
+        # that's exactly the line that wedged. Replaces speculation
+        # with measurement. Cheap (printf at most once per ~40 min).
+        def _trace(step: str) -> None:
+            try:
+                print(f"[trustnode][watchdog-restart] gw={gateway_id} {step}", flush=True)
+            except Exception:
+                pass
+
+        # 1. Cancel the wedged task.
+        _trace("1.cancel.begin")
+        task = w._task
+        w._task = None
+        if task and not task.done():
+            try:
+                task.cancel()
+                _trace("1.cancel.done")
+            except Exception as exc:
+                _trace(f"1.cancel.exc={type(exc).__name__}:{exc}")
+        else:
+            _trace("1.cancel.skip (no task or done)")
+
+        # 2. Shut down the socket so the worker thread's recv returns.
+        import socket as _socket
+        def _shutdown_socket(label: str, obj):
+            _trace(f"2.shutdown.{label}.begin")
+            try:
+                sock_wrap = getattr(obj, "_sock", None)
+                raw = getattr(sock_wrap, "sock", None) if sock_wrap is not None else None
+                if raw is None:
+                    _trace(f"2.shutdown.{label}.no_socket")
+                    return
+                try:
+                    raw.shutdown(_socket.SHUT_RDWR)
+                    _trace(f"2.shutdown.{label}.shutdown_ok")
+                except Exception as exc:
+                    _trace(f"2.shutdown.{label}.shutdown_exc={type(exc).__name__}:{exc}")
+            except Exception as exc:
+                _trace(f"2.shutdown.{label}.outer_exc={type(exc).__name__}:{exc}")
+        _shutdown_socket("ab_pycomm3", w._ab_pycomm3_client)
+        _shutdown_socket("opc", w._opc_client)
+
+        # 3. Null the client references.
+        _trace("3.null_refs.begin")
+        try:
+            w._ab_pycomm3_client = None
+            w._ab_pycomm3_path = None
+            w._ab_pylogix_client = None
+            w._ab_pylogix_ip = None
+            w._ab_pylogix_slot = None
+            w._opc_client = None
+            w._opc_endpoint = ""
+            _trace("3.null_refs.done")
+        except Exception as exc:
+            _trace(f"3.null_refs.exc={type(exc).__name__}:{exc}")
+
+        # 4. Operator 2026-06-25 (12h soak finding): the prior
+        # asyncio.wait_for(asyncio.shield(task), timeout=2.0) was the
+        # wedge point. After the socket shutdown in step 2 (verified
+        # by 2.shutdown.ab_pycomm3.shutdown_ok in traces) the
+        # cancelled task unwinds asynchronously on its own — the
+        # `run-loop-exit reason=cancelled` log line confirms it
+        # always finishes. The await on the shielded task NEVER
+        # returned in 4 separate stall events across the 12h soak;
+        # whether asyncio's shield + cancel ordering deadlocks here
+        # or a future state issue, the await is the bug.
+        #
+        # We don't actually need to wait: the task's own teardown is
+        # non-blocking once the socket is closed, and the new run
+        # loop we spawn in step 6 doesn't share state with the old
+        # one (we nulled all client refs in step 3). Worst case, the
+        # cancelled task lingers a few ms before its run-loop-exit
+        # callback fires — harmless.
+        _trace("4.wait_for.skipped (no-await design)")
+
+        # 5. Reset runtime state.
+        _trace("5.reset_state.begin")
+        w._last_progress_mono = 0.0
+        w._startup_started_monotonic = time.monotonic()
+        w._stalled_read_cycles = 0
+        w._cycle_overrun_streak = 0
+        w.last_error = (
+            f"Restarted by supervisor watchdog after {idle_s:.0f}s stall."
+        )
+        w.latest_readings = []
+        _trace("5.reset_state.done")
+
+        # 6. Mark restart bookkeeping and spawn fresh task.
+        _trace("6.spawn.begin")
+        w.restart_count += 1
+        w._last_restart_utc = datetime.now(timezone.utc).isoformat()
+        w.running = True
+        w._last_progress_mono = time.monotonic()
+        try:
+            w._task = asyncio.create_task(w._run_loop(self._broadcast))
+            _trace("6.spawn.done")
+        except Exception as exc:
+            _trace(f"6.spawn.exc={type(exc).__name__}:{exc}")
+            raise
+
+        def _on_restart_done(t: "asyncio.Task[Any]", gid: str = gateway_id) -> None:
+            try:
+                if t.cancelled():
+                    _GW_LOG.info("run-loop-exit gateway=%s reason=cancelled (watchdog-restarted)", gid)
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    _GW_LOG.error(
+                        "run-loop-exit gateway=%s reason=exception (watchdog-restarted) exc=%s: %s",
+                        gid, type(exc).__name__, exc,
+                    )
+                    return
+                _GW_LOG.info("run-loop-exit gateway=%s reason=clean-return (watchdog-restarted)", gid)
+            except Exception:
+                pass
+
+        w._task.add_done_callback(_on_restart_done)
+
+    async def _watchdog_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    await asyncio.sleep(self._watchdog_interval_s)
+                    # 1. Stall scan over running workers.
+                    for gid, w in list(self.workers.items()):
+                        try:
+                            stalled, idle = w.is_stalled()
+                            if stalled:
+                                await self._restart_worker_due_to_stall(gid, idle)
+                        except Exception:
+                            continue
+                    # 2. Schedule + auto-recover supervisor scan over
+                    # the CONFIGURED gateway list (includes stopped
+                    # ones). Wrapped so any failure here can't take
+                    # down the stall watchdog.
+                    try:
+                        await self._supervisor_scan()
+                    except Exception:
+                        try:
+                            import logging
+                            logging.getLogger("trustnode.supervisor").exception(
+                                "supervisor scan failed"
+                            )
+                        except Exception:
+                            pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    try:
+                        import logging
+                        logging.getLogger("trustnode.watchdog").exception(
+                            "watchdog scan failed"
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(self._watchdog_interval_s)
+        except asyncio.CancelledError:
+            pass
+
+    async def _supervisor_scan(self) -> None:
+        """Schedule + auto-recover supervisor.
+
+        For every CONFIGURED gateway, decide what to do based on the
+        per-gateway `schedule_enabled` and `auto_recover_enabled`
+        flags + the operator's explicit-stop state.
+
+        Policy:
+        - SCHEDULE: if schedule_enabled, the gateway must be running
+          inside [schedule_start, schedule_stop] (local time, daily)
+          and stopped outside. The start crossing also clears the
+          user-stopped flag so auto-recover takes over for the day.
+        - AUTO-RECOVER: if auto_recover_enabled and the gateway is
+          NOT currently running and was NOT explicitly stopped by
+          the operator, restart it. Honors the existing burst
+          cooldown so a flapping PLC doesn't get hammered.
+        Rate-limited to one action per gateway per 30s.
+        """
+        now_mono = time.monotonic()
+        from datetime import datetime as _dt
+        # Local time-of-day for schedule comparison.
+        local_now = _dt.now()
+        cur_minutes = local_now.hour * 60 + local_now.minute
+
+        # Read configured gateways from the app_store bootstrap.
+        # Operator 2026-06-25 (tenant-scoping fix): scan EVERY scope's
+        # gateway_configurations doc, not just the unscoped bootstrap.
+        # The unscoped bootstrap is often empty for tenants whose
+        # gateways live in per-tenant scoped docs (e.g. tenant-cust-*
+        # |cust-*|edge-*). Reading directly from SQLite catches every
+        # gateway regardless of scope.
+        try:
+            from app.state import app_store as _store
+            db_path = getattr(_store, "_db_path", None)
+            if not db_path:
+                return
+            import sqlite3 as _sqlite3
+            import json as _json
+            gw_rows: list = []
+            db_rows: list = []
+            seen_gw_ids: set = set()
+            seen_db_ids: set = set()
+            con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
+            try:
+                for (payload,) in con.execute(
+                    "SELECT payload_json FROM config_documents_scoped WHERE domain='gateway_configurations'"
+                ):
+                    try:
+                        data = _json.loads(payload) if isinstance(payload, str) else payload
+                    except Exception:
+                        continue
+                    items = data if isinstance(data, list) else (data.get('gateways') or data.get('items') or [])
+                    for g in items:
+                        if not isinstance(g, dict): continue
+                        gid = str(g.get('id') or '').strip()
+                        if not gid or gid in seen_gw_ids: continue
+                        seen_gw_ids.add(gid)
+                        gw_rows.append(g)
+                for (payload,) in con.execute(
+                    "SELECT payload_json FROM config_documents_scoped WHERE domain='database_configurations'"
+                ):
+                    try:
+                        data = _json.loads(payload) if isinstance(payload, str) else payload
+                    except Exception:
+                        continue
+                    items = data if isinstance(data, list) else (data.get('databases') or data.get('items') or [])
+                    for d in items:
+                        if not isinstance(d, dict): continue
+                        did = str(d.get('id') or '').strip()
+                        if not did or did in seen_db_ids: continue
+                        seen_db_ids.add(did)
+                        db_rows.append(d)
+            finally:
+                con.close()
+        except Exception:
+            return
+
+        db_by_id = {str(d.get("id") or ""): d for d in db_rows if isinstance(d, dict)}
+
+        def _hhmm_to_minutes(text: str, default: int) -> int:
+            try:
+                parts = str(text or "").split(":")
+                h = int(parts[0]); m = int(parts[1]) if len(parts) > 1 else 0
+                return max(0, min(23 * 60 + 59, h * 60 + m))
+            except Exception:
+                return default
+
+        # Read the persisted last_running set once per scan — used by
+        # the baseline restart policy below. Best-effort: if telemetry
+        # is briefly unavailable we just skip baseline recovery this
+        # tick (the next 10s scan retries).
+        last_running_ids: set[str] = set()
+        try:
+            from app.state import telemetry_service as _ts
+            last_running_ids = set(_ts.list_running_gateways() or [])
+        except Exception:
+            pass
+
+        for gw in gw_rows:
+            if not isinstance(gw, dict):
+                continue
+            gid = str(gw.get("id") or "").strip()
+            if not gid:
+                continue
+            # Rate limit.
+            last = self._last_supervisor_action_mono.get(gid, 0.0)
+            if now_mono - last < self._supervisor_min_interval_s:
+                continue
+
+            schedule_on = bool(gw.get("schedule_enabled"))
+            # auto_recover_enabled is now a DISABLE switch (default
+            # True). Operator can flip it off to suppress baseline
+            # recovery for a specific gateway. The default behavior is
+            # "if it was running and isn't, bring it back" — the
+            # explicit Stop button is the only way to keep a gateway
+            # down by user intent.
+            auto_recover = bool(gw.get("auto_recover_enabled", True))
+            in_window = True
+            if schedule_on:
+                start_m = _hhmm_to_minutes(gw.get("schedule_start"), 8 * 60)
+                stop_m = _hhmm_to_minutes(gw.get("schedule_stop"), 18 * 60)
+                if start_m == stop_m:
+                    in_window = False
+                elif start_m < stop_m:
+                    in_window = start_m <= cur_minutes < stop_m
+                else:
+                    # Wraps midnight.
+                    in_window = cur_minutes >= start_m or cur_minutes < stop_m
+
+            running = gid in self.workers and self.workers[gid].running
+            should_run = (not schedule_on) or in_window
+
+            # Decide.
+            if schedule_on and not in_window and running:
+                try:
+                    await self.stop_gateway(gid)
+                    self._user_stopped.discard(gid)  # schedule, not user
+                    self._last_supervisor_action_mono[gid] = now_mono
+                except Exception:
+                    pass
+                continue
+
+            if schedule_on and in_window and not running:
+                # Schedule says go. Clear user-stopped (new shift =
+                # fresh state) and start.
+                self._user_stopped.discard(gid)
+                if await self._supervisor_try_start(gid, gw, db_by_id):
+                    self._last_supervisor_action_mono[gid] = now_mono
+                continue
+
+            # Baseline recovery: if the gateway was last persisted as
+            # running, the operator did NOT explicitly Stop it, the
+            # disable-recover switch is OFF, and the schedule (if any)
+            # allows it — bring it back. This is the "watchdog
+            # restores the gateway that was running" guarantee: a PLC
+            # drop, a worker crash, even a backend restart can never
+            # leave a previously-running gateway down for more than
+            # the next supervisor tick (~10s) + start latency.
+            was_running = gid in last_running_ids
+            if (
+                auto_recover
+                and was_running
+                and not running
+                and gid not in self._user_stopped
+                and should_run
+            ):
+                if await self._supervisor_try_start(gid, gw, db_by_id):
+                    self._last_supervisor_action_mono[gid] = now_mono
+                continue
+
+    async def _supervisor_try_start(self, gateway_id: str, gw: Dict[str, Any], db_by_id: Dict[str, Dict[str, Any]]) -> bool:
+        """Start a gateway from its persisted config + db_sink.
+        Returns True on success, False on any failure (logged)."""
+        try:
+            db_id = str(gw.get("database_id") or "")
+            db_cfg = db_by_id.get(db_id) or {}
+            # Operator 2026-06-25: same fallback the frontend uses.
+            # If the configured database_id can't be resolved in any
+            # scope, default to the Local SQLite — historian rows
+            # land in app_store. Avoids "DB not found" deadlock when
+            # config refers to a deleted/cross-scope DB.
+            if not db_cfg:
+                for cand in db_by_id.values():
+                    if str(cand.get("engine") or "").lower() == "sqlite":
+                        db_cfg = cand
+                        break
+            if not db_cfg:
+                db_cfg = {
+                    "id": "local-sqlite-default",
+                    "name": "Local SQLite",
+                    "engine": "sqlite",
+                    "sqlite_path": "./data/trustnode_app_store.db",
+                    "table": "plc_readings",
+                }
+            sink = None
+            if db_cfg:
+                sink = {
+                    "id": str(db_cfg.get("id") or ""),
+                    "name": str(db_cfg.get("name") or ""),
+                    "engine": db_cfg.get("engine"),
+                    "host": str(db_cfg.get("host") or ""),
+                    "port": int(db_cfg.get("port") or 0),
+                    "database": str(db_cfg.get("database") or ""),
+                    "username": str(db_cfg.get("username") or ""),
+                    "password": db_cfg.get("password") or "",
+                    "sqlite_path": str(db_cfg.get("sqlite_path") or ""),
+                    "file_path": str(db_cfg.get("file_path") or ""),
+                    "legacy_url": str(db_cfg.get("legacy_url") or ""),
+                    "legacy_api_token": str(db_cfg.get("legacy_api_token") or ""),
+                    "source": str(db_cfg.get("source") or ""),
+                    "site": str(db_cfg.get("site") or ""),
+                    "area": str(db_cfg.get("area") or ""),
+                    "equipment": str(db_cfg.get("equipment") or ""),
+                    "schema": str(db_cfg.get("schema") or "public"),
+                    "table": str(db_cfg.get("table") or "plc_readings"),
+                    "tls": bool(db_cfg.get("tls")),
+                    "tag_filters": [],
+                    "gateway_filters": [],
+                    "csv_format": "",
+                    "csv_header": "",
+                }
+            config = GatewayConfig(
+                gateway_type=str(gw.get("gateway_type") or "allen_bradley"),
+                plc_ip=str(gw.get("plc_ip") or ""),
+                opc_url=str(gw.get("opc_url") or ""),
+                tags=list(gw.get("tags") or []),
+                interval_ms=int(gw.get("interval_ms") or 1000),
+                site=str(gw.get("site") or ""),
+                area=str(gw.get("area") or ""),
+                equipment=str(gw.get("equipment") or ""),
+                collection_triggers=list(gw.get("collection_triggers") or []),
+                collection_trigger_mode=str(gw.get("collection_trigger_mode") or "any"),
+                schedule_enabled=bool(gw.get("schedule_enabled")),
+                schedule_start=str(gw.get("schedule_start") or "08:00"),
+                schedule_stop=str(gw.get("schedule_stop") or "18:00"),
+                auto_recover_enabled=bool(gw.get("auto_recover_enabled")),
+            )
+            await self.start_gateway(
+                gateway_id=gateway_id,
+                config=config,
+                db_sink=sink,
+                db_sinks=[sink] if sink else [],
+            )
+            try:
+                import logging
+                logging.getLogger("trustnode.supervisor").info(
+                    "supervisor-start gateway=%s", gateway_id,
+                )
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            try:
+                import logging
+                logging.getLogger("trustnode.supervisor").warning(
+                    "supervisor-start-failed gateway=%s exc=%s: %s",
+                    gateway_id, type(exc).__name__, exc,
+                )
+            except Exception:
+                pass
+            return False
 
     def _get_or_create_worker(
         self,
@@ -2822,7 +3897,13 @@ class PLCManager:
         w = self._get_or_create_worker(gateway_id, config, db_sink, db_sinks)
         self._refresh_global_triggers()
         self.active_gateway_id = gateway_id
+        # Clear any prior watchdog cooldown so a manual restart frees
+        # the gateway from a "gave up" state.
+        self._restart_cooldown_until_mono.pop(gateway_id, None)
+        self._restart_history.pop(gateway_id, None)
         await w.start(self._broadcast)
+        # Make sure the supervisor watchdog is running. Cheap no-op if it is.
+        self._ensure_watchdog_running()
 
     async def stop_gateway(self, gateway_id: str) -> None:
         w = self.workers.get(gateway_id)
@@ -2834,6 +3915,20 @@ class PLCManager:
             self.active_gateway_id = ""
         self._clear_gateway_live_values(gateway_id)
         self._refresh_global_triggers()
+        # Operator 2026-06-25: broadcast a status event so the UI knows
+        # to flip the pill from RUNNING to STOPPED IMMEDIATELY,
+        # without waiting for the 20s "no fresh sample" heuristic that
+        # was triggering the "Gateway not collecting" banner after a
+        # legitimate Stop.
+        try:
+            await self._broadcast({
+                "type": "gateway_status",
+                "gateway_id": gateway_id,
+                "running": False,
+                "reason": "stopped",
+            })
+        except Exception:
+            pass
 
     async def stop_all_gateways(self) -> None:
         # Operator 2026-06-18: reverted to the original sequential stop.
@@ -2848,6 +3943,8 @@ class PLCManager:
         self.active_gateway_id = ""
         self.global_live_values = {}
         self._refresh_global_triggers()
+        # No workers left -> watchdog has nothing to scan.
+        await self._stop_watchdog()
 
     def list_gateway_statuses(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []

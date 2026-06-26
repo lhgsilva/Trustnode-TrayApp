@@ -51,6 +51,28 @@ class AppStore:
             1.0,
             float(os.environ.get("TRUSTNODE_CLOUD_TARGET_CACHE_SECONDS", "5") or "5"),
         )
+        # Operator 2026-06-23 (canonical-customer-DB routing): cache for
+        # the customer-DB read target. When a customer DB is configured
+        # AND verified ready, historian reads go there first; SQLite
+        # only fills the "spill window" of rows newer than the last
+        # successful push. See customer_database_read_target() below.
+        # _customer_read_fail_counter implements the auto-fallback rail:
+        # 3 consecutive read failures -> 60s SQLite-only window.
+        self._customer_read_target_cache_lock = threading.Lock()
+        self._customer_read_target_cache_value: Dict[str, Any] | None = None
+        self._customer_read_target_cache_ts: float = 0.0
+        self._customer_read_target_cache_ttl: float = max(
+            1.0,
+            float(os.environ.get("TRUSTNODE_CUSTOMER_READ_CACHE_SECONDS", "5") or "5"),
+        )
+        self._customer_read_fail_counter: int = 0
+        self._customer_read_circuit_open_until_mono: float = 0.0
+        # Operator override: when True, ALL historian reads stay on
+        # SQLite regardless of customer DB readiness. Surfaced as an
+        # admin toggle for emergencies. Persisted via app_settings.
+        self._force_sqlite_reads_env = str(
+            os.environ.get("TRUSTNODE_FORCE_SQLITE_READS", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._db_path = self._resolve_db_path()
         self._stop_event = threading.Event()
         self._sync_wakeup_event = threading.Event()
@@ -887,6 +909,28 @@ class AppStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _connect_readonly(self) -> sqlite3.Connection:
+        # Invariant B (2026-06-23): the Historian Export tab MUST NOT
+        # be able to slow or stop the gateway. In WAL mode, readers
+        # don't block writers — but a long-running read that holds a
+        # shared snapshot can delay the writer's WAL checkpoint, and
+        # an Export Load that errors mid-flight on the SAME connection
+        # the writer uses risks a cross-thread sqlite handle issue.
+        # Solution: a per-query read-only connection with a short
+        # busy_timeout so Export can never wedge for more than ~3s
+        # waiting on the writer. URI mode also tells SQLite the
+        # connection is read-only at the driver level (no upgrade to
+        # write lock possible).
+        uri = f"file:{self._db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=3.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA busy_timeout=3000")
+        except Exception:
+            pass
+        return conn
+
     def _utc_now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
@@ -903,14 +947,18 @@ class AppStore:
                 dt = dt.replace(tzinfo=timezone.utc)
             else:
                 dt = dt.astimezone(timezone.utc)
-            # Operator 2026-06-16: ts_utc column stores ISO format
-            # with `T` separator + microseconds + +00:00, e.g.
-            # "2026-06-16T09:06:35.270897+00:00". Returning the
-            # legacy "YYYY-MM-DD HH:MM:SS" format made lexicographic
-            # comparisons against ISO rows wrong (every row's `T`
-            # > the filter's space, so `ts_utc <= :to_utc` excluded
-            # everything). Emit ISO matching the column shape.
-            return dt.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
+            # Operator 2026-06-23: the actual historian writer emits
+            # `YYYY-MM-DD HH:MM:SS.fff` (space separator, no timezone
+            # suffix, milliseconds — see PLC worker / app_store
+            # append_historian_rows). The previous L906-912 comment
+            # claimed `T`+`+00:00`, which is true for SOME tables in
+            # this DB but NOT for `historian_readings`. Returning the
+            # T-form here made lexicographic `ts_utc >= :from_utc`
+            # filter out 100% of rows (because space < T), and the
+            # Export tab always rendered "No rows in the selected
+            # range." Emit the space-separated form so the range
+            # filter actually hits the stored rows.
+            return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         except Exception:
             return ""
 
@@ -1778,6 +1826,254 @@ class AppStore:
             self._cloud_target_cache_value = dict(chosen)
             self._cloud_target_cache_ts = now
         return chosen
+
+    # ------------------------------------------------------------------
+    # Customer database READ routing (canonical-DB architecture, 2026-06-23)
+    # ------------------------------------------------------------------
+    # When a Postgres/MySQL/MSSQL row in database_configurations is enabled
+    # (regardless of cloud_sync_enabled), we treat it as the customer's
+    # canonical historian. After a one-time backfill, all historian reads
+    # come from there, with any SQLite rows newer than last_pushed_id
+    # unioned in to cover the sync-lag window.
+    #
+    # A customer DB is "ready" when:
+    #   - configured + enabled
+    #   - engine connectable
+    #   - schema bootstrapped (historian_readings table exists)
+    #   - backfill_complete=True in its config (set by the one-time job)
+    # Until ready, reads stay on SQLite — no behavior change for the
+    # operator.
+    def _customer_database_targets(self) -> list[Dict[str, Any]]:
+        """Return every enabled database_configurations entry. Includes both
+        cloud_sync_enabled=True (the cloud mirror) and =False (a local
+        LAN customer DB). Caller filters by use case."""
+        targets: list[Dict[str, Any]] = []
+        try:
+            configs = self.get_config_domain("database_configurations") or []
+        except Exception:
+            return []
+        if not isinstance(configs, list):
+            return []
+        for item in configs:
+            if not isinstance(item, dict):
+                continue
+            if item.get("enabled") is False:
+                continue
+            engine = str(item.get("engine") or "").strip().lower()
+            # Only Postgres is supported as a READ target today; other engines
+            # remain WRITE-only sinks (CSV/MySQL/MSSQL come later).
+            if engine != "postgresql":
+                continue
+            host = str(item.get("host") or "").strip()
+            username = str(item.get("username") or "").strip()
+            password = str(item.get("password") or "")
+            if not host or not username or not password:
+                continue
+            targets.append({
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or ""),
+                "engine": "postgresql",
+                "host": host,
+                "port": int(item.get("port") or 5432),
+                "database": str(item.get("database") or "postgres") or "postgres",
+                "username": username,
+                "password": password,
+                "schema": str(item.get("schema") or "public") or "public",
+                "tls": bool(item.get("tls", True)),
+                "cloud_sync_enabled": bool(item.get("cloud_sync_enabled", False)),
+                "backfill_complete": bool(item.get("backfill_complete", False)),
+                "_raw_item": item,
+            })
+        return targets
+
+    def customer_database_read_target(self) -> Dict[str, Any] | None:
+        """Return the customer DB to route reads through, or None if reads
+        should stay on SQLite. Implements:
+          - admin force-sqlite override
+          - circuit breaker after 3 failures
+          - readiness probe (configured + backfill_complete)
+          - 5s cache so 60+ requests/sec don't re-probe
+        The returned dict carries fields _get_or_create_cloud_engine
+        understands, so the same engine factory serves both the cloud
+        mirror and the customer DB.
+        """
+        if self._force_sqlite_reads_env:
+            return None
+        # App-settings toggle: operator can flip this in the UI without
+        # restarting the backend. Cached read inside _get_app_settings.
+        try:
+            settings = self._get_app_settings() or {}
+            if bool(settings.get("force_sqlite_reads")) is True:
+                return None
+        except Exception:
+            pass
+
+        # Circuit breaker — if recent reads failed, force-fallback to
+        # SQLite for the cooldown window.
+        if self._customer_read_circuit_open_until_mono > time.monotonic():
+            return None
+
+        now = time.time()
+        with self._customer_read_target_cache_lock:
+            if self._customer_read_target_cache_ts > 0 and (now - self._customer_read_target_cache_ts) < self._customer_read_target_cache_ttl:
+                cached = self._customer_read_target_cache_value
+                return dict(cached) if cached else None
+
+        # Prefer a non-cloud (LAN customer) target over the cloud mirror —
+        # if both exist, the customer's local DB is the canonical store
+        # they wired up; cloud is for off-site visibility.
+        targets = self._customer_database_targets()
+        # Operator 2026-06-24 (cleanup pass): when NO customer DB is
+        # configured at all, cache the "no target" decision for 60 s
+        # instead of 5 s. The overwhelming majority of installs have
+        # no canonical DB configured; the previous 5 s cache walked
+        # the bootstrap every 5 s for no reason and added steady
+        # SQLite read pressure to the hot historian-read path.
+        if not targets:
+            with self._customer_read_target_cache_lock:
+                self._customer_read_target_cache_value = None
+                self._customer_read_target_cache_ts = now
+                # Extend the cache TTL to 60s for this empty-result case.
+                # The cache check above still uses _customer_read_target_cache_ttl
+                # but we offset the timestamp so the next check falls inside the
+                # long window.
+                # Simpler: just stamp 55s in the future so the next call
+                # short-circuits at the cache check.
+                self._customer_read_target_cache_ts = now + 55.0
+            return None
+        non_cloud = [t for t in targets if not t.get("cloud_sync_enabled")]
+        cloud = [t for t in targets if t.get("cloud_sync_enabled")]
+        candidates = non_cloud + cloud
+
+        chosen: Dict[str, Any] | None = None
+        for c in candidates:
+            # backfill_complete is either an explicit flag (set by the
+            # one-shot job once it confirms historical parity) OR an
+            # implicit probe: if the data-sync watermark has caught up
+            # to within 90% of the local row count, the customer DB
+            # carries enough history to serve reads. The probe is cheap
+            # — one SELECT MAX(id) on a unique-index column.
+            if c.get("backfill_complete"):
+                chosen = c
+                break
+            if self._customer_db_backfill_caught_up(c):
+                # Stamp the config so subsequent calls skip the probe.
+                self._mark_customer_db_backfill_complete(c)
+                chosen = c
+                break
+
+        with self._customer_read_target_cache_lock:
+            self._customer_read_target_cache_value = dict(chosen) if chosen else None
+            self._customer_read_target_cache_ts = now
+        return chosen
+
+    def _customer_db_backfill_caught_up(self, target: dict[str, Any]) -> bool:
+        """Probe: is the data-sync watermark close enough to the local
+        row count to consider the customer DB authoritative for reads?
+        Threshold is intentionally lenient (90%) because new writes
+        flow into BOTH SQLite and the customer DB on every cycle, so a
+        small running gap is normal and won't cause data loss thanks
+        to the spill-merge."""
+        try:
+            with self._connect_readonly() as c:
+                row = c.execute("SELECT MAX(id), COUNT(*) FROM historian_readings").fetchone()
+                local_max = int(row[0] or 0) if row else 0
+                local_count = int(row[1] or 0) if row else 0
+                if local_count == 0:
+                    # No local rows yet — nothing to backfill, customer DB
+                    # immediately authoritative.
+                    return True
+                state_row = c.execute(
+                    "SELECT last_historian_id FROM data_sync_state WHERE id = 1"
+                ).fetchone()
+                watermark = int(state_row[0] or 0) if state_row else 0
+        except Exception:
+            return False
+        if local_max <= 0:
+            return True
+        # 90% threshold so we don't bounce between "ready" and "not ready"
+        # while the worker is mid-burst pushing thousands of rows.
+        return watermark >= int(local_max * 0.9)
+
+    def _mark_customer_db_backfill_complete(self, target: dict[str, Any]) -> None:
+        """Persist `backfill_complete=True` on the database_configurations
+        row so the readiness probe doesn't run on every call. Idempotent."""
+        target_id = str(target.get("id") or "").strip()
+        if not target_id:
+            return
+        try:
+            configs = self.get_config_domain("database_configurations") or []
+            if not isinstance(configs, list):
+                return
+            modified = False
+            for item in configs:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("id") or "") == target_id and not item.get("backfill_complete"):
+                    item["backfill_complete"] = True
+                    item["backfill_complete_utc"] = self._utc_now()
+                    modified = True
+                    break
+            if modified:
+                self.upsert_domain("database_configurations", configs, actor="system:backfill-probe")
+        except Exception:
+            # Non-fatal: the probe will simply run again next call.
+            pass
+
+    def _record_customer_read_failure(self, exc: Exception) -> None:
+        """Called by read paths when a customer-DB query throws. After 3
+        consecutive failures opens a 60s SQLite-only window so a sick
+        customer DB doesn't take the whole UI down."""
+        self._customer_read_fail_counter += 1
+        if self._customer_read_fail_counter >= 3:
+            self._customer_read_circuit_open_until_mono = time.monotonic() + 60.0
+            self._customer_read_fail_counter = 0
+            try:
+                import logging
+                logging.getLogger("trustnode.read-routing").warning(
+                    "customer DB read failed 3x; falling back to SQLite for 60s. Last error: %s: %s",
+                    type(exc).__name__, exc,
+                )
+            except Exception:
+                pass
+
+    def _record_customer_read_success(self) -> None:
+        if self._customer_read_fail_counter:
+            self._customer_read_fail_counter = 0
+
+    def invalidate_customer_read_target_cache(self) -> None:
+        """Force a re-probe — call after the operator saves a new DB
+        config or after the backfill job completes."""
+        with self._customer_read_target_cache_lock:
+            self._customer_read_target_cache_value = None
+            self._customer_read_target_cache_ts = 0.0
+
+    def get_historian_read_routing_status(self) -> dict[str, Any]:
+        """Diagnostic — exposed via /api/health and the Database
+        Overview page so operators can see where reads currently go."""
+        target = self.customer_database_read_target()
+        reason = None
+        if target is None:
+            if self._force_sqlite_reads_env:
+                reason = "env_force_sqlite"
+            elif self._customer_read_circuit_open_until_mono > time.monotonic():
+                reason = "circuit_open"
+            else:
+                tgts = self._customer_database_targets()
+                if not tgts:
+                    reason = "no_customer_db_configured"
+                elif not any(t.get("backfill_complete") for t in tgts):
+                    reason = "backfill_pending"
+                else:
+                    reason = "fallback"
+        return {
+            "target": "customer_db" if target else "sqlite",
+            "customer_db_id": target.get("id") if target else None,
+            "customer_db_name": target.get("name") if target else None,
+            "reason": reason,
+            "fail_counter": self._customer_read_fail_counter,
+            "circuit_open_seconds_remaining": max(0.0, self._customer_read_circuit_open_until_mono - time.monotonic()),
+        }
 
     def _get_app_settings(self) -> Dict[str, Any]:
         with self._lock:
@@ -3749,6 +4045,29 @@ class AppStore:
                     CREATE INDEX IF NOT EXISTS idx_hist_tenant_gw_ts
                       ON historian_readings(tenant_id, gateway_id, ts_utc DESC);
 
+                    -- Operator 2026-06-19: tenant aliases for data continuity
+                    -- across re-activations. When the edge is re-activated to
+                    -- a new company in the portal, app_settings.tenant_id
+                    -- changes. Historian rows under the OLD tenant_id become
+                    -- invisible to the new admin because /historian/range
+                    -- filters WHERE tenant_id = :tenant. We never rewrite
+                    -- those rows (audit-trail integrity) — instead the
+                    -- operator opts into bridging via a Data Continuity
+                    -- decision. Each bridge is one row in this table.
+                    -- The chart read path widens its WHERE to
+                    -- tenant_id IN (primary, ...alias WHERE archived=0).
+                    CREATE TABLE IF NOT EXISTS tenant_aliases (
+                      primary_tenant_id TEXT NOT NULL,
+                      alias_tenant_id   TEXT NOT NULL,
+                      reason            TEXT NULL,
+                      created_utc       TEXT NOT NULL,
+                      created_by_user   TEXT NULL,
+                      archived          INTEGER NOT NULL DEFAULT 0,
+                      PRIMARY KEY (primary_tenant_id, alias_tenant_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_tenant_aliases_primary
+                      ON tenant_aliases(primary_tenant_id, archived);
+
                     CREATE TABLE IF NOT EXISTS app_logs (
                       id INTEGER PRIMARY KEY AUTOINCREMENT,
                       tenant_id TEXT NOT NULL DEFAULT 'default',
@@ -3865,6 +4184,16 @@ class AppStore:
                       minute_keep_days INTEGER NOT NULL DEFAULT 30,
                       hour_keep_days INTEGER NOT NULL DEFAULT 180,
                       day_keep_days INTEGER NOT NULL DEFAULT 730,
+                      -- Operator 2026-06-20: sub-day TTLs. When any of these
+                      -- *_keep_minutes column is > 0 it OVERRIDES the
+                      -- corresponding *_keep_days field. Lets the operator
+                      -- pick "keep last hour" (raw_keep_minutes=60) without
+                      -- a schema rebuild. Defaulting to 0 keeps the existing
+                      -- days-based behavior for installs that don't migrate.
+                      raw_keep_minutes INTEGER NOT NULL DEFAULT 0,
+                      minute_keep_minutes INTEGER NOT NULL DEFAULT 0,
+                      hour_keep_minutes INTEGER NOT NULL DEFAULT 0,
+                      day_keep_minutes INTEGER NOT NULL DEFAULT 0,
                       backup_before_cleanup INTEGER NOT NULL DEFAULT 1,
                       max_delete_rows_per_run INTEGER NOT NULL DEFAULT 50000,
                       updated_utc TEXT NOT NULL
@@ -3961,6 +4290,137 @@ class AppStore:
                     );
                     CREATE INDEX IF NOT EXISTS idx_generated_reports_tenant_created ON generated_reports(tenant_id, created_utc DESC);
                     CREATE INDEX IF NOT EXISTS idx_generated_reports_schedule ON generated_reports(schedule_id, created_utc DESC);
+
+                    /* ============================================================
+                       Batch Management & Traceability module (2026-06-23)
+                       Lives behind license module "batch_management". Tables are
+                       always created (CREATE IF NOT EXISTS is idempotent and
+                       costs nothing) so a customer who later activates the
+                       license never needs a schema migration. Read/write of
+                       these tables is gated at the router layer by
+                       require_module("batch_management").
+                       ============================================================ */
+                    CREATE TABLE IF NOT EXISTS batch_types (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      name TEXT NOT NULL,
+                      description TEXT NULL,
+                      parent_type_id TEXT NULL,
+                      start_method TEXT NOT NULL DEFAULT 'manual',
+                      end_method TEXT NOT NULL DEFAULT 'manual',
+                      start_config_json TEXT NULL,
+                      end_config_json TEXT NULL,
+                      collection_profile TEXT NOT NULL DEFAULT 'continuous',
+                      report_template_id TEXT NULL,
+                      identifier_method TEXT NOT NULL DEFAULT 'auto',
+                      identifier_prefix TEXT NULL,
+                      summary_tags_json TEXT NULL,
+                      enabled INTEGER NOT NULL DEFAULT 1,
+                      created_utc TEXT NOT NULL,
+                      updated_utc TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_batch_types_tenant ON batch_types(tenant_id);
+
+                    CREATE TABLE IF NOT EXISTS batches (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      batch_type_id TEXT NULL,
+                      parent_batch_id TEXT NULL,
+                      identifier TEXT NULL,
+                      identifier_method TEXT NULL,
+                      status TEXT NOT NULL DEFAULT 'created',
+                      started_utc TEXT NULL,
+                      ended_utc TEXT NULL,
+                      operator TEXT NULL,
+                      source TEXT NULL,
+                      gateway_id TEXT NULL,
+                      product TEXT NULL,
+                      recipe TEXT NULL,
+                      notes TEXT NULL,
+                      metadata_json TEXT NULL,
+                      created_utc TEXT NOT NULL,
+                      updated_utc TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_batches_tenant_status ON batches(tenant_id, status);
+                    CREATE INDEX IF NOT EXISTS idx_batches_parent ON batches(parent_batch_id);
+                    CREATE INDEX IF NOT EXISTS idx_batches_type ON batches(batch_type_id);
+                    CREATE INDEX IF NOT EXISTS idx_batches_started ON batches(tenant_id, started_utc DESC);
+                    CREATE INDEX IF NOT EXISTS idx_batches_identifier ON batches(identifier);
+
+                    /* Side table: historian rows are NEVER modified. We join on
+                       (gateway_id, ts_utc) within [ts_utc_start, ts_utc_end]. */
+                    CREATE TABLE IF NOT EXISTS batch_membership (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      batch_id TEXT NOT NULL,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      gateway_id TEXT NULL,
+                      ts_utc_start TEXT NOT NULL,
+                      ts_utc_end TEXT NULL,
+                      created_utc TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_batch_membership_batch ON batch_membership(batch_id);
+                    CREATE INDEX IF NOT EXISTS idx_batch_membership_window
+                        ON batch_membership(tenant_id, gateway_id, ts_utc_start, ts_utc_end);
+
+                    CREATE TABLE IF NOT EXISTS batch_events (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      batch_id TEXT NOT NULL,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      ts_utc TEXT NOT NULL,
+                      kind TEXT NOT NULL,
+                      severity TEXT NOT NULL DEFAULT 'info',
+                      actor TEXT NULL,
+                      source TEXT NULL,
+                      message TEXT NULL,
+                      meta_json TEXT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_batch_events_batch ON batch_events(batch_id, ts_utc DESC);
+
+                    CREATE TABLE IF NOT EXISTS batch_summaries (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      batch_id TEXT NOT NULL,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      tag_name TEXT NOT NULL,
+                      gateway_id TEXT NULL,
+                      sample_count INTEGER NOT NULL DEFAULT 0,
+                      min_value REAL NULL,
+                      max_value REAL NULL,
+                      avg_value REAL NULL,
+                      first_value REAL NULL,
+                      last_value REAL NULL,
+                      stdev_value REAL NULL,
+                      computed_utc TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_batch_summaries_batch ON batch_summaries(batch_id, tag_name);
+
+                    CREATE TABLE IF NOT EXISTS batch_validation (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      batch_id TEXT NOT NULL,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      decision TEXT NOT NULL,
+                      actor TEXT NOT NULL,
+                      decided_utc TEXT NOT NULL,
+                      notes TEXT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_batch_validation_batch ON batch_validation(batch_id, decided_utc DESC);
+
+                    /* Immutable audit trail. Application code never updates or
+                       deletes rows in this table. */
+                    CREATE TABLE IF NOT EXISTS batch_audit_log (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      batch_id TEXT NULL,
+                      batch_type_id TEXT NULL,
+                      ts_utc TEXT NOT NULL,
+                      actor TEXT NULL,
+                      action TEXT NOT NULL,
+                      before_json TEXT NULL,
+                      after_json TEXT NULL,
+                      meta_json TEXT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_batch_audit_tenant_ts
+                        ON batch_audit_log(tenant_id, ts_utc DESC);
+                    CREATE INDEX IF NOT EXISTS idx_batch_audit_batch ON batch_audit_log(batch_id);
                     """
                 )
                 hist_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(historian_readings)").fetchall()}
@@ -4004,6 +4464,17 @@ class AppStore:
                         conn.execute(f'DROP INDEX IF EXISTS {_legacy_ix}')
                     except Exception:
                         pass
+                # 2026-06-20: sub-day TTLs. Existing installs predate the
+                # *_keep_minutes columns; add them with DEFAULT 0 so the
+                # engine continues to fall back to the *_keep_days values
+                # until the operator explicitly picks a minute-grained TTL.
+                ret_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(retention_policy)").fetchall()}
+                for col in ("raw_keep_minutes", "minute_keep_minutes", "hour_keep_minutes", "day_keep_minutes"):
+                    if col not in ret_cols:
+                        try:
+                            conn.execute(f"ALTER TABLE retention_policy ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+                        except Exception:
+                            pass
                 now = self._utc_now()
                 # Retention defaults: enabled by default with 7d raw / 30d
                 # minute / 180d hour / 730d day. Without retention the
@@ -4217,6 +4688,16 @@ class AppStore:
             self._cloud_engine_cache.clear()
 
     def _retention_scheduler_loop(self) -> None:
+        # Operator 2026-06-20: sleep FIRST so the very first retention run
+        # doesn't fire while the rest of the backend is still finishing boot.
+        # On a multi-GB historian the rollup queries take 5-30 s under
+        # self._lock; if that lands during boot it blocks every API endpoint
+        # for that window and the desktop supervisor sees a health-check
+        # failure + restart, then the new boot fires the immediate run
+        # again — a livelock that masquerades as "backend won't boot".
+        # The deferred-first-run shape matches the report scheduler.
+        first_delay = 30  # 30 s — long enough for uvicorn to be serving
+        self._stop_event.wait(timeout=first_delay)
         while not self._stop_event.is_set():
             try:
                 policy = self.get_retention_policy()
@@ -4242,9 +4723,19 @@ class AppStore:
                         "minute_keep_days": 30,
                         "hour_keep_days": 180,
                         "day_keep_days": 730,
+                        "raw_keep_minutes": 0,
+                        "minute_keep_minutes": 0,
+                        "hour_keep_minutes": 0,
+                        "day_keep_minutes": 0,
                         "backup_before_cleanup": True,
                         "max_delete_rows_per_run": 50000,
                     }
+                # Tolerate older rows that predate the *_keep_minutes columns
+                # (the schema migration adds them with DEFAULT 0; this guard
+                # protects against a partial-migration race during boot).
+                row_keys = set(row.keys())
+                def _int_or(col: str, default: int = 0) -> int:
+                    return int(row[col]) if col in row_keys and row[col] is not None else default
                 return {
                     "enabled": bool(row["enabled"]),
                     "schedule_minutes": int(row["schedule_minutes"]),
@@ -4252,6 +4743,10 @@ class AppStore:
                     "minute_keep_days": int(row["minute_keep_days"]),
                     "hour_keep_days": int(row["hour_keep_days"]),
                     "day_keep_days": int(row["day_keep_days"]),
+                    "raw_keep_minutes": _int_or("raw_keep_minutes"),
+                    "minute_keep_minutes": _int_or("minute_keep_minutes"),
+                    "hour_keep_minutes": _int_or("hour_keep_minutes"),
+                    "day_keep_minutes": _int_or("day_keep_minutes"),
                     "backup_before_cleanup": bool(row["backup_before_cleanup"]),
                     "max_delete_rows_per_run": int(row["max_delete_rows_per_run"]),
                     "updated_utc": row["updated_utc"],
@@ -4260,6 +4755,11 @@ class AppStore:
     def set_retention_policy(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         now = self._utc_now()
         current = self.get_retention_policy()
+        # Sub-day TTLs: allow 0 (the "fall back to days" sentinel) or any
+        # positive integer. We DON'T floor these to 1 like the days field
+        # because 0 has a real meaning here.
+        def _nonneg(name: str, dflt: int = 0) -> int:
+            return max(0, int(payload.get(name, current.get(name, dflt))))
         merged = {
             **current,
             **{
@@ -4269,6 +4769,10 @@ class AppStore:
                 "minute_keep_days": max(1, int(payload.get("minute_keep_days", current.get("minute_keep_days", 30)))),
                 "hour_keep_days": max(1, int(payload.get("hour_keep_days", current.get("hour_keep_days", 180)))),
                 "day_keep_days": max(1, int(payload.get("day_keep_days", current.get("day_keep_days", 730)))),
+                "raw_keep_minutes": _nonneg("raw_keep_minutes"),
+                "minute_keep_minutes": _nonneg("minute_keep_minutes"),
+                "hour_keep_minutes": _nonneg("hour_keep_minutes"),
+                "day_keep_minutes": _nonneg("day_keep_minutes"),
                 "backup_before_cleanup": bool(payload.get("backup_before_cleanup", current.get("backup_before_cleanup", True))),
                 "max_delete_rows_per_run": max(1000, int(payload.get("max_delete_rows_per_run", current.get("max_delete_rows_per_run", 50000)))),
             },
@@ -4279,6 +4783,7 @@ class AppStore:
                     """
                     UPDATE retention_policy
                     SET enabled = ?, schedule_minutes = ?, raw_keep_days = ?, minute_keep_days = ?, hour_keep_days = ?, day_keep_days = ?,
+                        raw_keep_minutes = ?, minute_keep_minutes = ?, hour_keep_minutes = ?, day_keep_minutes = ?,
                         backup_before_cleanup = ?, max_delete_rows_per_run = ?, updated_utc = ?
                     WHERE id = 1
                     """,
@@ -4289,6 +4794,10 @@ class AppStore:
                         merged["minute_keep_days"],
                         merged["hour_keep_days"],
                         merged["day_keep_days"],
+                        merged["raw_keep_minutes"],
+                        merged["minute_keep_minutes"],
+                        merged["hour_keep_minutes"],
+                        merged["day_keep_minutes"],
                         1 if merged["backup_before_cleanup"] else 0,
                         merged["max_delete_rows_per_run"],
                         now,
@@ -4443,12 +4952,27 @@ class AppStore:
         minute_keep_days = int(policy.get("minute_keep_days", 30))
         hour_keep_days = int(policy.get("hour_keep_days", 180))
         day_keep_days = int(policy.get("day_keep_days", 730))
+        # Operator 2026-06-20: sub-day TTLs. When > 0 the *_keep_minutes
+        # value OVERRIDES the *_keep_days for that tier — lets the customer
+        # set "keep raw for 60 minutes" without redesigning the schema.
+        # 0 means "fall back to days" (the prior behavior).
+        raw_keep_minutes = int(policy.get("raw_keep_minutes", 0) or 0)
+        minute_keep_minutes = int(policy.get("minute_keep_minutes", 0) or 0)
+        hour_keep_minutes = int(policy.get("hour_keep_minutes", 0) or 0)
+        day_keep_minutes = int(policy.get("day_keep_minutes", 0) or 0)
         max_delete = int(policy.get("max_delete_rows_per_run", 50000))
 
-        raw_cutoff = (now_dt - timedelta(days=raw_keep_days)).strftime("%Y-%m-%d %H:%M:%S")
-        minute_cutoff = (now_dt - timedelta(days=minute_keep_days)).strftime("%Y-%m-%d %H:%M:%S")
-        hour_cutoff = (now_dt - timedelta(days=hour_keep_days)).strftime("%Y-%m-%d %H:%M:%S")
-        day_cutoff = (now_dt - timedelta(days=day_keep_days)).strftime("%Y-%m-%d %H:%M:%S")
+        def _cutoff(keep_minutes: int, keep_days: int) -> str:
+            if keep_minutes and keep_minutes > 0:
+                delta = timedelta(minutes=keep_minutes)
+            else:
+                delta = timedelta(days=keep_days)
+            return (now_dt - delta).strftime("%Y-%m-%d %H:%M:%S")
+
+        raw_cutoff = _cutoff(raw_keep_minutes, raw_keep_days)
+        minute_cutoff = _cutoff(minute_keep_minutes, minute_keep_days)
+        hour_cutoff = _cutoff(hour_keep_minutes, hour_keep_days)
+        day_cutoff = _cutoff(day_keep_minutes, day_keep_days)
 
         details: Dict[str, Any] = {
             "actor": actor,
@@ -6109,6 +6633,393 @@ class AppStore:
         self._sync_wakeup_event.set()
         return len(safe_rows)
 
+    # -----------------------------------------------------------------------
+    # Tenant aliases (Data Continuity, operator 2026-06-19)
+    # -----------------------------------------------------------------------
+    # The chart / live / log read paths historically filtered
+    # `WHERE tenant_id = :tenant`. After an edge is re-activated to a new
+    # company, app_settings.tenant_id changes and the operator silently
+    # loses visibility of prior historian rows. Rewriting tenant_id on
+    # those rows would compromise the audit trail; instead we widen the
+    # read clause to `tenant_id IN (primary, ...aliases)` and let the
+    # operator opt in to bridging from the Data Continuity page.
+    #
+    # The helpers below are read-side; writes never use them, so new
+    # collection cycles always go in under the CURRENT tenant_id.
+
+    def list_tenant_aliases(self, primary_tenant_id: str, include_archived: bool = False) -> list[dict[str, Any]]:
+        """Return alias rows for one primary tenant. UI uses this on the
+        Data Continuity page; the read path uses _tenant_alias_ids."""
+        primary = normalize_tenant_id(str(primary_tenant_id or "").strip() or self._current_tenant_id())
+        out: list[dict[str, Any]] = []
+        try:
+            with self._connect() as conn:
+                if include_archived:
+                    rows = conn.execute(
+                        "SELECT primary_tenant_id, alias_tenant_id, reason, created_utc, created_by_user, archived "
+                        "FROM tenant_aliases WHERE primary_tenant_id = ? ORDER BY created_utc DESC",
+                        (primary,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT primary_tenant_id, alias_tenant_id, reason, created_utc, created_by_user, archived "
+                        "FROM tenant_aliases WHERE primary_tenant_id = ? AND archived = 0 ORDER BY created_utc DESC",
+                        (primary,),
+                    ).fetchall()
+                for r in rows:
+                    out.append(dict(r))
+        except Exception:
+            pass
+        return out
+
+    def _tenant_alias_ids(self, primary_tenant_id: str) -> list[str]:
+        """Active alias tenant_ids for the given primary, or [] on error.
+        Hot path — called on every historian read — so this stays small."""
+        primary = normalize_tenant_id(str(primary_tenant_id or ""))
+        if not primary:
+            return []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT alias_tenant_id FROM tenant_aliases "
+                    "WHERE primary_tenant_id = ? AND archived = 0",
+                    (primary,),
+                ).fetchall()
+                return [str(r[0]) for r in rows if r and r[0]]
+        except Exception:
+            return []
+
+    def _tenant_filter_clause(self, column: str = "tenant_id") -> tuple[str, dict[str, Any]]:
+        """Return (sql_fragment, params) for `column IN (primary, ...aliases)`.
+
+        Single-tenant installs (no aliases configured — i.e. 99% of the
+        time) collapse to `column = :tenant` so we don't disturb the
+        composite indexes. Only when the operator has bridged tenants
+        does the IN list expand."""
+        primary = self._current_tenant_id()
+        aliases = self._tenant_alias_ids(primary)
+        if not aliases:
+            return f"{column} = :tenant", {"tenant": primary}
+        all_ids = [primary, *aliases]
+        # Named placeholders — avoid positional/?, this is mixed with other
+        # named params elsewhere in the queries.
+        named = {f"tnt_{i}": tid for i, tid in enumerate(all_ids)}
+        placeholders = ", ".join(f":{k}" for k in named.keys())
+        return f"{column} IN ({placeholders})", named
+
+    def upsert_tenant_alias(
+        self,
+        primary_tenant_id: str,
+        alias_tenant_id: str,
+        reason: str = "",
+        actor: str = "",
+        archived: bool = False,
+    ) -> dict[str, Any]:
+        """Operator chose to bridge / archive an alias. Persisted in one row."""
+        primary = normalize_tenant_id(str(primary_tenant_id or ""))
+        alias = normalize_tenant_id(str(alias_tenant_id or ""))
+        if not primary or not alias or primary == alias:
+            return {"ok": False, "error": "invalid_tenant_ids"}
+        now = self._utc_now()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO tenant_aliases(primary_tenant_id, alias_tenant_id, reason, created_utc, created_by_user, archived)
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(primary_tenant_id, alias_tenant_id) DO UPDATE SET
+                      reason = excluded.reason,
+                      archived = excluded.archived,
+                      created_by_user = COALESCE(NULLIF(excluded.created_by_user,''), tenant_aliases.created_by_user)
+                    """,
+                    (primary, alias, str(reason or ""), now, str(actor or ""), 1 if archived else 0),
+                )
+        return {"ok": True, "primary_tenant_id": primary, "alias_tenant_id": alias, "archived": bool(archived)}
+
+    def delete_tenant_alias(self, primary_tenant_id: str, alias_tenant_id: str) -> dict[str, Any]:
+        """Hard-remove an alias. Reverts visibility instantly. Idempotent."""
+        primary = normalize_tenant_id(str(primary_tenant_id or ""))
+        alias = normalize_tenant_id(str(alias_tenant_id or ""))
+        if not primary or not alias:
+            return {"ok": False, "error": "invalid_tenant_ids"}
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM tenant_aliases WHERE primary_tenant_id = ? AND alias_tenant_id = ?",
+                    (primary, alias),
+                )
+        return {"ok": True}
+
+    def list_historian_tenant_inventory(self) -> list[dict[str, Any]]:
+        """Per-tenant row count + ts range across the LOCAL historian.
+        Used by /api/app-store/tenants/inventory and the Data Continuity
+        page. NOT tenant-scoped — explicitly returns every tenant_id."""
+        out: list[dict[str, Any]] = []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT tenant_id,
+                           COUNT(*) AS row_count,
+                           MIN(ts_utc) AS min_ts,
+                           MAX(ts_utc) AS max_ts
+                    FROM historian_readings
+                    GROUP BY tenant_id
+                    ORDER BY row_count DESC
+                    """
+                ).fetchall()
+                for r in rows:
+                    out.append({
+                        "tenant_id": str(r["tenant_id"] or ""),
+                        "row_count": int(r["row_count"] or 0),
+                        "min_ts": str(r["min_ts"] or ""),
+                        "max_ts": str(r["max_ts"] or ""),
+                    })
+        except Exception:
+            pass
+        return out
+
+    # ------------------------------------------------------------------
+    # Read routing helpers (2026-06-23, canonical-customer-DB architecture)
+    # ------------------------------------------------------------------
+    def _fetch_historian_from_target(
+        self,
+        target: dict[str, Any],
+        limit: int,
+        *,
+        gateway: str = "",
+        device: str = "",
+        tag: str = "",
+        from_utc: str = "",
+        to_utc: str = "",
+        offset: int = 0,
+        source: str = "",
+    ) -> list[dict[str, Any]]:
+        """Query the canonical historian_readings table on an arbitrary
+        Postgres target (cloud OR customer LAN DB). Mirrors the schema
+        the mirror writer creates. Returns [] on any error and records
+        a failure for the circuit breaker."""
+        try:
+            from sqlalchemy import text  # type: ignore
+        except Exception:
+            return []
+        schema = str(target.get("schema") or "public")
+        lim = max(1, min(int(limit or 1000), 50000))
+        off = max(0, int(offset or 0))
+        tenant_id = self._current_tenant_id()
+        params: dict[str, Any] = {"tenant": tenant_id, "lim": lim, "off": off}
+        filters_sql = ""
+        gtxt = str(gateway or "").strip()
+        dtxt = str(device or "").strip()
+        ttxt = str(tag or "").strip()
+        from_txt = self._normalize_utc_filter(from_utc)
+        to_txt = self._normalize_utc_filter(to_utc)
+        if gtxt:
+            filters_sql += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+            params["gateway"] = gtxt
+        if dtxt:
+            filters_sql += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
+            params["device_like"] = f"%{dtxt}%"
+        if ttxt:
+            filters_sql += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+            params["tag_like"] = f"%{ttxt}%"
+        if from_txt:
+            filters_sql += " AND ts_utc >= :from_utc"
+            params["from_utc"] = from_txt
+        if to_txt:
+            filters_sql += " AND ts_utc <= :to_utc"
+            params["to_utc"] = to_txt
+        source_txt = str(source or "").strip()
+        if source_txt:
+            source_values = [s.strip() for s in source_txt.split(",") if s.strip()]
+            if source_values:
+                placeholders = []
+                for idx, sv in enumerate(source_values):
+                    key = f"src{idx}"
+                    placeholders.append(f":{key}")
+                    params[key] = sv
+                filters_sql += f" AND source IN ({', '.join(placeholders)})"
+        try:
+            engine, _ = self._get_or_create_cloud_engine(target, schema)
+            with engine.begin() as conn:
+                rs = conn.execute(
+                    text(
+                        f"""
+                        SELECT local_id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                               tag_name, value, value_text, quality, quality_label
+                        FROM "{schema}"."historian_readings"
+                        WHERE tenant_id = :tenant{filters_sql}
+                        ORDER BY ts_utc DESC
+                        LIMIT :lim OFFSET :off
+                        """
+                    ),
+                    params,
+                ).fetchall()
+            out: list[dict[str, Any]] = []
+            for r in rs:
+                out.append({
+                    "id": int(r[0] or 0),
+                    "ts": str(r[2] or ""),
+                    "tenant_id": str(r[1] or tenant_id),
+                    "source": r[3] or "",
+                    "gateway_id": r[4] or "",
+                    "gateway_name": r[5] or "",
+                    "device_name": r[6] or "",
+                    "plc_ip": r[7] or "",
+                    "database_name": r[8] or "",
+                    "tag_name": r[9] or "",
+                    "value": r[10],
+                    "value_text": r[11],
+                    "quality": r[12],
+                    "quality_label": r[13] or "",
+                    "_origin": "customer_db",
+                })
+            self._record_customer_read_success()
+            return out
+        except Exception as exc:
+            self._record_customer_read_failure(exc)
+            return []
+
+    def _fetch_sqlite_spill_rows(
+        self,
+        last_pushed_id: int,
+        *,
+        gateway: str = "",
+        device: str = "",
+        tag: str = "",
+        from_utc: str = "",
+        to_utc: str = "",
+        source: str = "",
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        """Return rows that exist locally but have not yet been pushed to
+        the customer DB. Used to union with customer-DB query results so
+        the user sees data as live as the edge has it."""
+        tenant_clause, tenant_params = self._tenant_filter_clause("tenant_id")
+        where = f"WHERE {tenant_clause} AND id > :last_pushed_id"
+        params: dict[str, Any] = {**tenant_params, "last_pushed_id": int(last_pushed_id or 0), "lim": max(1, min(int(limit or 5000), 50000))}
+        gtxt = str(gateway or "").strip()
+        dtxt = str(device or "").strip()
+        ttxt = str(tag or "").strip()
+        from_txt = self._normalize_utc_filter(from_utc)
+        to_txt = self._normalize_utc_filter(to_utc)
+        if gtxt:
+            if gtxt.lower().startswith("gw-"):
+                where += " AND gateway_id = :gateway"
+            else:
+                where += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+            params["gateway"] = gtxt
+        if dtxt:
+            where += " AND LOWER(COALESCE(device_name,'')) LIKE LOWER(:device_like)"
+            params["device_like"] = f"%{dtxt}%"
+        if ttxt:
+            where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+            params["tag_like"] = f"%{ttxt}%"
+        if from_txt:
+            where += " AND ts_utc >= :from_utc"
+            params["from_utc"] = from_txt
+        if to_txt:
+            where += " AND ts_utc <= :to_utc"
+            params["to_utc"] = to_txt
+        source_txt = str(source or "").strip()
+        if source_txt:
+            source_values = [s.strip() for s in source_txt.split(",") if s.strip()]
+            if source_values:
+                placeholders = []
+                for idx, sv in enumerate(source_values):
+                    key = f"src{idx}"
+                    placeholders.append(f":{key}")
+                    params[key] = sv
+                where += f" AND source IN ({', '.join(placeholders)})"
+        try:
+            with self._connect_readonly() as conn:
+                rs = conn.execute(
+                    f"""
+                    SELECT id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
+                           tag_name, value, value_text, quality, quality_label
+                    FROM historian_readings
+                    {where}
+                    ORDER BY ts_utc DESC
+                    LIMIT :lim
+                    """,
+                    params,
+                ).fetchall()
+        except Exception:
+            return []
+        out: list[dict[str, Any]] = []
+        for r in rs:
+            out.append({
+                "id": int(r["id"] or 0),
+                "ts": r["ts_utc"],
+                "tenant_id": str(r["tenant_id"] or ""),
+                "source": r["source"] or "",
+                "gateway_id": r["gateway_id"] or "",
+                "gateway_name": r["gateway_name"] or "",
+                "device_name": r["device_name"] or "",
+                "plc_ip": r["plc_ip"] or "",
+                "database_name": r["database_name"] or "",
+                "tag_name": r["tag_name"] or "",
+                "value": r["value"],
+                "value_text": r["value_text"],
+                "quality": r["quality"],
+                "quality_label": r["quality_label"] or "",
+                "_origin": "sqlite_spill",
+            })
+        return out
+
+    def _last_pushed_id_for_target(self, target: dict[str, Any]) -> int:
+        """Watermark of the most recent SQLite row that has reached the
+        customer DB. Today the data-sync worker tracks one watermark
+        (data_sync_state.last_historian_id) shared with the cloud
+        mirror; we re-use it since the same writer feeds both targets.
+        Under the canonical-DB model the customer DB is at least as
+        up-to-date as the cloud, so any row id <= watermark is
+        guaranteed already present in the customer DB too."""
+        try:
+            with self._connect_readonly() as c:
+                row = c.execute(
+                    "SELECT last_historian_id FROM data_sync_state WHERE id = 1"
+                ).fetchone()
+                return int(row[0] or 0) if row else 0
+        except Exception:
+            return 0
+
+    def _route_historian_read_with_spill(
+        self,
+        target: dict[str, Any],
+        *,
+        limit: int,
+        gateway: str = "",
+        device: str = "",
+        tag: str = "",
+        from_utc: str = "",
+        to_utc: str = "",
+        offset: int = 0,
+        source: str = "",
+    ) -> list[dict[str, Any]]:
+        """Top-level entry: try customer DB, union SQLite spill, return
+        the most-recent rows up to limit. Returns [] only on full
+        failure — in which case the caller falls back to the SQLite
+        path."""
+        primary = self._fetch_historian_from_target(
+            target, limit=limit, gateway=gateway, device=device, tag=tag,
+            from_utc=from_utc, to_utc=to_utc, offset=offset, source=source,
+        )
+        if not primary and self._customer_read_circuit_open_until_mono > time.monotonic():
+            # Circuit just opened; return [] so caller falls back to SQLite.
+            return []
+        watermark = self._last_pushed_id_for_target(target)
+        spill = self._fetch_sqlite_spill_rows(
+            watermark, gateway=gateway, device=device, tag=tag,
+            from_utc=from_utc, to_utc=to_utc, source=source, limit=limit,
+        )
+        # Merge: spill rows are strictly newer than primary's most recent
+        # synced row (by definition: id > watermark). Sort by ts_utc DESC
+        # and trim to limit.
+        merged = spill + primary
+        merged.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
+        return merged[: max(1, int(limit or 1000))]
+
     def get_historian_rows(
         self,
         limit: int = 1000,
@@ -6139,8 +7050,26 @@ class AppStore:
             if cloud_rows:
                 return self._filter_rows_by_edge(cloud_rows, edge_filter)[:lim]
 
-        where = "WHERE tenant_id = :tenant"
-        params: dict[str, Any] = {"tenant": tenant_id, "lim": fetch_lim}
+        # Canonical-customer-DB routing (2026-06-23): if a ready customer
+        # DB is configured, route the read through it with SQLite spill
+        # merge. Returns [] only if the customer DB is unreachable AND
+        # the circuit breaker has opened — in which case we fall through
+        # to the SQLite path below.
+        ct = self.customer_database_read_target() if not prefer_cloud else None
+        if ct:
+            merged = self._route_historian_read_with_spill(
+                ct, limit=fetch_lim,
+                gateway=gateway_txt, device=device_txt, tag=tag_txt,
+                source=source,
+            )
+            if merged:
+                return self._filter_rows_by_edge(merged, edge_filter)[:lim]
+
+        # Data Continuity: when the operator has bridged a prior tenant
+        # via tenant_aliases, expand the filter to IN (primary, ...aliases).
+        tenant_clause, tenant_params = self._tenant_filter_clause("tenant_id")
+        where = f"WHERE {tenant_clause}"
+        params: dict[str, Any] = {**tenant_params, "lim": fetch_lim}
         if gateway_txt:
             if gateway_txt.lower().startswith("gw-"):
                 where += " AND gateway_id = :gateway"
@@ -6376,9 +7305,24 @@ class AppStore:
             if cloud_rows:
                 return self._filter_rows_by_edge(cloud_rows, edge_filter)[:lim]
 
-        where = "WHERE tenant_id = :tenant"
+        # Canonical-customer-DB routing (2026-06-23) — same shape as
+        # get_historian_rows but carries the range filter through.
+        ct = self.customer_database_read_target() if not prefer_cloud else None
+        if ct:
+            merged = self._route_historian_read_with_spill(
+                ct, limit=lim,
+                gateway=gateway_txt, device=device_txt, tag=tag_txt,
+                from_utc=from_txt, to_utc=to_txt, offset=off,
+            )
+            if merged:
+                return self._filter_rows_by_edge(merged, edge_filter)[:lim]
+
+        # Data Continuity: expand `tenant_id = :tenant` to IN list when
+        # the operator has bridged a prior tenant.
+        tenant_clause, tenant_params = self._tenant_filter_clause("tenant_id")
+        where = f"WHERE {tenant_clause}"
         where_unscoped = "WHERE 1=1"
-        params: dict[str, Any] = {"tenant": tenant_id, "lim": lim, "off": off}
+        params: dict[str, Any] = {**tenant_params, "lim": lim, "off": off}
         params_unscoped: dict[str, Any] = {"lim": lim, "off": off}
         if gateway_txt:
             # Index-friendly: direct equality on gateway_id when caller passes a
@@ -6437,7 +7381,11 @@ class AppStore:
                     last_pushed_id = int(state_row[0] or 0)
         except Exception:
             last_pushed_id = 0
-        with self._connect() as conn:
+        # Invariant B (2026-06-23): use the read-only connection so a
+        # heavy Export Load cannot share a write-capable handle with
+        # the worker. mode=ro at the URI level prevents lock upgrades;
+        # busy_timeout=3s prevents indefinite waiting on the writer.
+        with self._connect_readonly() as conn:
             # ORDER BY ts_utc DESC alone matches idx_hist_tenant_gw_tag_ts so
             # SQLite can stream the LIMIT N most recent rows in index order
             # (no temp B-tree). The trailing `id DESC` tie-breaker was only
@@ -6523,9 +7471,11 @@ class AppStore:
             if cloud_stats:
                 return cloud_stats
 
-        where = "WHERE tenant_id = :tenant"
+        # Data Continuity: stats span all bridged tenants too.
+        tenant_clause, tenant_params = self._tenant_filter_clause("tenant_id")
+        where = f"WHERE {tenant_clause}"
         where_unscoped = "WHERE 1=1"
-        params: dict[str, Any] = {"tenant": tenant_id}
+        params: dict[str, Any] = dict(tenant_params)
         params_unscoped: dict[str, Any] = {}
         if gateway_txt:
             # Index-friendly direct equality when caller passes a canonical gw-* id.
@@ -6792,8 +7742,10 @@ class AppStore:
         def _build_group_where(gw: str, tag: str, scoped: bool) -> tuple[str, dict[str, Any]]:
             params_g: dict[str, Any] = {}
             if scoped:
-                where_g = "WHERE tenant_id = :tenant"
-                params_g["tenant"] = tenant_id
+                # Data Continuity: aggregates span bridged tenants too.
+                tnt_clause, tnt_params = self._tenant_filter_clause("tenant_id")
+                where_g = f"WHERE {tnt_clause}"
+                params_g.update(tnt_params)
             else:
                 where_g = "WHERE 1=1"
             gw_txt = (gw or "").strip()
@@ -7506,7 +8458,6 @@ class AppStore:
         return result
 
     def cleanup_data(self, mode: str, actor: str = "manual") -> Dict[str, Any]:
-        tenant_id = self._current_tenant_id()
         mode_clean = str(mode or "").strip().lower()
         now_dt = datetime.now(timezone.utc)
         cutoff: datetime | None
@@ -7533,21 +8484,38 @@ class AppStore:
             "historian_agg_day": 0,
         }
 
+        # Operator 2026-06-24: cleanup operates across ALL tenants on
+        # this edge — it's a local admin action, not a tenant-scoped
+        # one. The previous tenant-scoped DELETE left rows owned by
+        # other tenants (e.g. a previous activation under
+        # tenant-cust-XXXX, or rows tagged 'default' before scope was
+        # introduced) untouched, so a user-reported "wipe" left 692k
+        # historian rows in place. For "all" we drop the tenant
+        # filter; for time-based modes we still drop it because the
+        # cutoff alone is the right scope for "clean up old data".
         with self._lock:
             with self._connect() as conn:
                 if cutoff is None:
-                    deleted["historian_readings"] = int(conn.execute("DELETE FROM historian_readings WHERE tenant_id = ?", (tenant_id,)).rowcount or 0)
-                    deleted["app_logs"] = int(conn.execute("DELETE FROM app_logs WHERE tenant_id = ?", (tenant_id,)).rowcount or 0)
+                    deleted["historian_readings"] = int(conn.execute("DELETE FROM historian_readings").rowcount or 0)
+                    deleted["app_logs"] = int(conn.execute("DELETE FROM app_logs").rowcount or 0)
                     deleted["historian_agg_minute"] = int(conn.execute("DELETE FROM historian_agg_minute").rowcount or 0)
                     deleted["historian_agg_hour"] = int(conn.execute("DELETE FROM historian_agg_hour").rowcount or 0)
                     deleted["historian_agg_day"] = int(conn.execute("DELETE FROM historian_agg_day").rowcount or 0)
                 else:
                     cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-                    deleted["historian_readings"] = int(conn.execute("DELETE FROM historian_readings WHERE tenant_id = ? AND ts_utc < ?", (tenant_id, cutoff_text)).rowcount or 0)
-                    deleted["app_logs"] = int(conn.execute("DELETE FROM app_logs WHERE tenant_id = ? AND ts_utc < ?", (tenant_id, cutoff_text)).rowcount or 0)
+                    deleted["historian_readings"] = int(conn.execute("DELETE FROM historian_readings WHERE ts_utc < ?", (cutoff_text,)).rowcount or 0)
+                    deleted["app_logs"] = int(conn.execute("DELETE FROM app_logs WHERE ts_utc < ?", (cutoff_text,)).rowcount or 0)
                     deleted["historian_agg_minute"] = int(conn.execute("DELETE FROM historian_agg_minute WHERE bucket_utc < ?", (cutoff_text,)).rowcount or 0)
                     deleted["historian_agg_hour"] = int(conn.execute("DELETE FROM historian_agg_hour WHERE bucket_utc < ?", (cutoff_text,)).rowcount or 0)
                     deleted["historian_agg_day"] = int(conn.execute("DELETE FROM historian_agg_day WHERE bucket_utc < ?", (cutoff_text,)).rowcount or 0)
+                # Reclaim the freed pages so the file shrinks on disk.
+                # Without VACUUM the SQLite file stays the same size
+                # even after a full delete, which makes "Delete Data"
+                # look like a no-op to anyone watching disk usage.
+                try:
+                    conn.execute("VACUUM")
+                except Exception:
+                    pass
 
         summary = (
             f"Cleanup '{mode_clean}' complete by {actor}. "

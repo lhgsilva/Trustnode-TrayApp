@@ -61,7 +61,7 @@ import secrets
 import sqlite3
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -172,6 +172,24 @@ class AuthStore:
                     CREATE INDEX IF NOT EXISTS ix_login_audit_ts ON login_audit(ts_utc DESC);
                     """
                 )
+                # Operator 2026-06-24: idempotent migration for the
+                # password-reset feature. ALTER ADD COLUMN throws
+                # OperationalError if the column already exists; we
+                # swallow it so the migration is safe on repeat runs.
+                for stmt in (
+                    "ALTER TABLE users ADD COLUMN email TEXT",
+                    "ALTER TABLE users ADD COLUMN reset_token TEXT",
+                    "ALTER TABLE users ADD COLUMN reset_token_expires_utc TEXT",
+                ):
+                    try:
+                        conn.execute(stmt)
+                    except sqlite3.OperationalError:
+                        pass
+                try:
+                    conn.execute("CREATE INDEX IF NOT EXISTS ix_users_email ON users(email)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS ix_users_reset_token ON users(reset_token)")
+                except Exception:
+                    pass
                 conn.commit()
 
     # ---- secret -------------------------------------------------------------
@@ -317,8 +335,95 @@ class AuthStore:
         with self._write_lock:
             with self._connect() as conn:
                 cur = conn.execute(
-                    "UPDATE users SET password_hash = ?, must_change_password = 0, updated_utc = ? WHERE LOWER(username) = LOWER(?)",
+                    "UPDATE users SET password_hash = ?, must_change_password = 0, updated_utc = ?, reset_token = NULL, reset_token_expires_utc = NULL WHERE LOWER(username) = LOWER(?)",
                     (str(password_hash), now, uname),
+                )
+                conn.commit()
+                return int(cur.rowcount or 0) > 0
+
+    # ---- password reset helpers (Operator 2026-06-24) ------------------
+    def find_user_by_email_or_username(self, identifier: str) -> Optional[Dict[str, Any]]:
+        """Look up a user by either their email OR username. Used by the
+        forgot-password endpoint so the operator can type whichever they
+        remember. Case-insensitive on both fields."""
+        ident = str(identifier or "").strip()
+        if not ident:
+            return None
+        with self._connect(read_only=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE LOWER(username) = LOWER(?) OR LOWER(COALESCE(email,'')) = LOWER(?) LIMIT 1",
+                (ident, ident),
+            ).fetchone()
+            return self._row_to_user(row) if row else None
+
+    def issue_reset_token(self, username: str, ttl_seconds: int = 1800) -> Optional[str]:
+        """Generate a one-time password-reset token for the user and
+        persist it with an expiry. Returns the raw token to be embedded
+        in the email link, or None if the user doesn't exist. TTL
+        defaults to 30 minutes — long enough for the email to arrive,
+        short enough to limit damage if intercepted."""
+        uname = str(username or "").strip()
+        if not uname:
+            return None
+        token = secrets.token_urlsafe(32)
+        now_iso = _utc_now()
+        try:
+            expires_dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00")) + timedelta(seconds=max(60, int(ttl_seconds or 1800)))
+            expires_iso = expires_dt.isoformat().replace("+00:00", "Z")
+        except Exception:
+            expires_iso = now_iso
+        with self._write_lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE users SET reset_token = ?, reset_token_expires_utc = ?, updated_utc = ? WHERE LOWER(username) = LOWER(?)",
+                    (token, expires_iso, now_iso, uname),
+                )
+                conn.commit()
+                if int(cur.rowcount or 0) == 0:
+                    return None
+        return token
+
+    def consume_reset_token(self, token: str) -> Optional[str]:
+        """Verify a reset token and return the username it belongs to
+        if it's valid and unexpired. The token is NOT cleared here —
+        set_user_password() does that on the successful new-password
+        commit so the operator can't get stuck in a 'token used but
+        password not set' window."""
+        tok = str(token or "").strip()
+        if not tok:
+            return None
+        with self._connect(read_only=True) as conn:
+            row = conn.execute(
+                "SELECT username, reset_token_expires_utc FROM users WHERE reset_token = ? LIMIT 1",
+                (tok,),
+            ).fetchone()
+            if not row:
+                return None
+            expires = str(row["reset_token_expires_utc"] or "").strip()
+            if expires:
+                try:
+                    exp_dt = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+                    now_dt = datetime.fromisoformat(_utc_now().replace("Z", "+00:00"))
+                    if exp_dt < now_dt:
+                        return None
+                except Exception:
+                    pass
+            return str(row["username"])
+
+    def set_user_email(self, username: str, email: str) -> bool:
+        """Set or update a user's email address. Used by Settings →
+        Users so operators can register an email to enable forgot-
+        password recovery."""
+        uname = str(username or "").strip()
+        if not uname:
+            return False
+        clean_email = str(email or "").strip()
+        now = _utc_now()
+        with self._write_lock:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE users SET email = ?, updated_utc = ? WHERE LOWER(username) = LOWER(?)",
+                    (clean_email or None, now, uname),
                 )
                 conn.commit()
                 return int(cur.rowcount or 0) > 0

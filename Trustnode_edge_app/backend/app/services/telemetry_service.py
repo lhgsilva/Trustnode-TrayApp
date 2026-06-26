@@ -172,7 +172,14 @@ class TelemetryService:
                   gateway_id TEXT PRIMARY KEY,
                   last_seq INTEGER NOT NULL DEFAULT 0,
                   gateway_config_version TEXT NOT NULL DEFAULT '',
-                  updated_utc TEXT NOT NULL DEFAULT (datetime('now'))
+                  updated_utc TEXT NOT NULL DEFAULT (datetime('now')),
+                  -- Operator 2026-06-19: autostart flag. Set to 1 by
+                  -- /api/plc/gateways/start, cleared by /stop and
+                  -- /stop-all. On backend boot the _deferred_startup
+                  -- handler re-starts any gateway with last_running=1
+                  -- so the customer's collection survives a backend
+                  -- restart (auto-update, crash, Windows reboot).
+                  last_running INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS collection_config_versions (
@@ -204,6 +211,16 @@ class TelemetryService:
                 CREATE INDEX IF NOT EXISTS ix_outbox_v1_status_seq ON sync_outbox_v1(status, sample_ts_utc, edge_monotonic_seq);
                 """
             )
+            # Online migration for installs whose gateway_runtime_state was
+            # created before last_running existed. ALTER TABLE … ADD COLUMN
+            # is idempotent in SQLite when guarded by a column-list check,
+            # so we don't need a separate migration framework.
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(gateway_runtime_state)").fetchall()}
+                if "last_running" not in cols:
+                    conn.execute("ALTER TABLE gateway_runtime_state ADD COLUMN last_running INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass
 
     def configure_from_bootstrap(self, bootstrap: Dict[str, Any]) -> None:
         data: Dict[str, Any] = {}
@@ -346,6 +363,42 @@ class TelemetryService:
         if cached:
             return True, cached
         return self._issue_gateway_device_token(conn, gateway_id)
+
+    def mark_gateway_running(self, gateway_id: str, running: bool) -> None:
+        """Persist whether a gateway is currently running so _deferred_startup
+        can auto-resume it after a backend restart. The gateway_id alone
+        is enough — start_gateway loads config from the bootstrap doc."""
+        gid = str(gateway_id or "").strip()
+        if not gid:
+            return
+        flag = 1 if running else 0
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO gateway_runtime_state(gateway_id, last_seq, last_running, updated_utc)
+                        VALUES (?, 0, ?, ?)
+                        ON CONFLICT(gateway_id) DO UPDATE SET
+                          last_running=excluded.last_running,
+                          updated_utc=excluded.updated_utc
+                        """,
+                        (gid, flag, self._utc_now_text()),
+                    )
+            except Exception:
+                pass
+
+    def list_running_gateways(self) -> list[str]:
+        """Return gateway_ids that were running at last persisted state.
+        Called by _deferred_startup to decide which workers to auto-resume."""
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT gateway_id FROM gateway_runtime_state WHERE last_running = 1"
+                ).fetchall()
+                return [str(r[0]) for r in rows if r and r[0]]
+        except Exception:
+            return []
 
     def _gateway_next_seq(self, conn: sqlite3.Connection, gateway_id: str) -> int:
         row = conn.execute("SELECT last_seq FROM gateway_runtime_state WHERE gateway_id = ?", (gateway_id,)).fetchone()

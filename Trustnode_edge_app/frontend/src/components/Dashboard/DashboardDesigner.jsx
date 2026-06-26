@@ -13,7 +13,7 @@ import { filterRowsByRange, getLatestTagRow, toTsMs } from "./dashboardAnalytics
 import { listReportTemplates } from "../../api";
 import "./dashboard.css";
 
-const TYPE_GROUPS = ["Charts", "KPI", "Content", "Layout", "Media", "Reports", "System"];
+const TYPE_GROUPS = ["Charts", "KPI", "Content", "Layout", "Media", "Reports", "System", "Batch"];
 const DASHBOARD_TIME_MODE_KEY = "trustnode_dashboard_time_mode";
 const DASHBOARD_TIME_RANGE_KEY = "trustnode_dashboard_time_range";
 const DASHBOARD_PROFILES_KEY = "trustnode_dashboard_profiles";
@@ -597,6 +597,11 @@ export function DashboardDesigner({
   fetchWidgetRows,
   fetchWidgetStats,
   fetchWidgetRuleStats,
+  // Optional gating: returns true iff the given license-module key is
+  // active for this customer. Used to hide module-locked widgets in the
+  // picker. Defaults to "always true" when not provided (existing
+  // dashboards keep working in non-edge contexts like cloud preview).
+  isLicenseModuleEnabled = null,
 }) {
   const [modalOpen, setModalOpen] = useState(false);
   const [tab, setTab] = useState("type");
@@ -2263,11 +2268,23 @@ export function DashboardDesigner({
 
             {tab === "type" ? (
               <div className="dashboard-type-groups">
-                {TYPE_GROUPS.map((group) => (
+                {TYPE_GROUPS.map((group) => {
+                  // Operator 2026-06-23: hide license-locked widgets in
+                  // the picker. The same registry still ships every
+                  // widget so existing dashboards render correctly; we
+                  // just don't offer them in the New Widget menu when
+                  // the module is off.
+                  const groupWidgets = WIDGET_TYPES.filter((t) => t.group === group).filter((t) => {
+                    if (!t.licenseModule) return true;
+                    if (typeof isLicenseModuleEnabled !== "function") return true;
+                    return Boolean(isLicenseModuleEnabled(t.licenseModule));
+                  });
+                  if (!groupWidgets.length) return null;
+                  return (
                   <div key={group} className="dashboard-type-group">
                     <div className="dashboard-type-group-title">{group}</div>
                     <div className="dashboard-type-grid">
-                      {WIDGET_TYPES.filter((t) => t.group === group).map((t) => (
+                      {groupWidgets.map((t) => (
                         <button
                           key={t.key}
                           type="button"
@@ -2298,7 +2315,8 @@ export function DashboardDesigner({
                       ))}
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <div className="form-grid dashboard-form-grid">
@@ -2415,6 +2433,61 @@ export function DashboardDesigner({
                         </option>
                       ))}
                     </select>
+                  </label>
+                ) : null}
+                {/* Operator 2026-06-20: gap visibility toggle. When ON
+                    (default), every period where the gateway wasn't
+                    collecting renders as a visible break in the line —
+                    the operator can see "data is missing here". When OFF,
+                    the chart bridges across the gap with a straight line,
+                    showing only the actual collected samples connected
+                    chronologically. Useful for batch processes where the
+                    operator only cares about "when collection was on". */}
+                {["line_chart", "line_area_chart"].includes(form.type) ? (
+                  <label className="row" style={{ alignItems: "center", gap: 12, justifyContent: "space-between" }}>
+                    <span>Show Disconnected Periods</span>
+                    <span
+                      role="switch"
+                      aria-checked={form.config.show_gaps !== false}
+                      onClick={() => setForm((p) => ({
+                        ...p,
+                        config: { ...p.config, show_gaps: !(p.config?.show_gaps !== false) ? true : false },
+                      }))}
+                      style={{
+                        cursor: "pointer",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 8,
+                        userSelect: "none",
+                      }}
+                    >
+                      <span
+                        style={{
+                          position: "relative",
+                          width: 38,
+                          height: 20,
+                          borderRadius: 10,
+                          background: form.config.show_gaps !== false ? "var(--accent, #14a89a)" : "var(--border, #555)",
+                          transition: "background 0.15s",
+                        }}
+                      >
+                        <span
+                          style={{
+                            position: "absolute",
+                            top: 2,
+                            left: form.config.show_gaps !== false ? 20 : 2,
+                            width: 16,
+                            height: 16,
+                            borderRadius: "50%",
+                            background: "#fff",
+                            transition: "left 0.15s",
+                          }}
+                        />
+                      </span>
+                      <span style={{ fontSize: 12 }}>
+                        {form.config.show_gaps !== false ? "Show gaps" : "Hide gaps"}
+                      </span>
+                    </span>
                   </label>
                 ) : null}
                 {/* Width / Height inputs removed: the widget is resized

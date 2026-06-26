@@ -2912,11 +2912,12 @@ def edge_link_trial_start(request: Request, payload: _TrialStartPayload, tenant_
             actor = str(request.state.user.get("username") or "") if hasattr(request, "state") and getattr(request.state, "user", None) else ""
         except Exception:
             actor = ""
-    # Try the cloud first so the portal sees the trial event in
-    # near-real-time. If the cloud is unreachable, fall back to the
-    # local SQLite write so the edge still unlocks for the operator
-    # mid-shift (machinery uptime trumps audit completeness; the
-    # next successful mirror will sync the row up).
+    # Operator 2026-06-24: try the cloud as a BEST-EFFORT mirror, but
+    # with a short timeout (3s) so a slow/unreachable portal can never
+    # push the round-trip over the frontend's 12s AbortController
+    # window. The local SQLite write below is the authoritative path
+    # — machinery uptime trumps audit completeness; the cloud mirror
+    # catches up via the existing sync worker.
     cloud_ok = False
     try:
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
@@ -2933,18 +2934,22 @@ def edge_link_trial_start(request: Request, payload: _TrialStartPayload, tenant_
                 "actor": actor or "edge_operator",
                 "metadata": dict(payload.metadata or {}),
             }
-            resp = requests.post(
-                f"{cloud_url}/api/control-plane/edge-link/trial/start",
-                json=cloud_body,
-                headers=fwd_headers,
-                timeout=8,
-            )
-            if resp.status_code < 400:
-                cloud_ok = True
-                try:
-                    return resp.json()
-                except Exception:
-                    pass
+            try:
+                resp = requests.post(
+                    f"{cloud_url}/api/control-plane/edge-link/trial/start",
+                    json=cloud_body,
+                    headers=fwd_headers,
+                    timeout=3,
+                )
+                if resp.status_code < 400:
+                    cloud_ok = True
+                    try:
+                        return resp.json()
+                    except Exception:
+                        pass
+            except requests.exceptions.RequestException:
+                # Network/timeout/connect error → fall through to local.
+                cloud_ok = False
     except Exception:
         cloud_ok = False
     out = control_plane_store.start_trial(

@@ -311,14 +311,81 @@ function applyOverlayTheme(modeOrPalette) {
   }
 }
 
+// Operator 2026-06-23: rotating backend.log. The previous unbounded
+// fs.appendFileSync grew to 1.58 GB and was the proximate cause of an
+// 18-hour collection outage — every Python stdout line blocked the
+// Electron main loop while the OS appended to the giant file, which
+// in turn blocked uvicorn's worker (because backpressure across the
+// stdout pipe stalls the writer). We now:
+//   1. Cap the live log at LOG_MAX_BYTES (25 MB).
+//   2. On overflow, rotate backend.log -> backend.log.1, keeping 4
+//      historic files for postmortems.
+//   3. Use synchronous I/O for now (lockless, same shape as before)
+//      but bounded — at 25 MB, an append is microseconds, not seconds.
+const LOG_MAX_BYTES = 25 * 1024 * 1024;
+const LOG_KEEP_FILES = 4;
+let _logSizeCache = -1;
+
+function _rotateBackendLog(logFile) {
+  // backend.log.4 (oldest) is dropped; .3 -> .4 ... .1 -> .2; current -> .1.
+  for (let i = LOG_KEEP_FILES; i >= 1; i--) {
+    const src = i === 1 ? logFile : `${logFile}.${i - 1}`;
+    const dst = `${logFile}.${i}`;
+    try {
+      if (fs.existsSync(dst)) fs.unlinkSync(dst);
+    } catch (_) {}
+    try {
+      if (fs.existsSync(src)) fs.renameSync(src, dst);
+    } catch (_) {}
+  }
+  _logSizeCache = 0;
+}
+
 function logBackend(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
   backendLogs.push(line);
   if (backendLogs.length > 200) backendLogs.shift();
   try {
     const logFile = path.join(app.getPath("userData"), "backend.log");
-    fs.appendFileSync(logFile, `${line}\n`);
+    const payload = `${line}\n`;
+    // Refresh the cached size occasionally (every ~256 KB written).
+    if (_logSizeCache < 0 || (_logSizeCache % 262144) < payload.length) {
+      try {
+        _logSizeCache = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0;
+      } catch (_) {
+        _logSizeCache = 0;
+      }
+    }
+    if (_logSizeCache + payload.length > LOG_MAX_BYTES) {
+      _rotateBackendLog(logFile);
+    }
+    fs.appendFileSync(logFile, payload);
+    _logSizeCache += payload.length;
   } catch (_) {}
+}
+
+function fetchBootProbe(host = currentBackendHost, port = currentBackendPort, timeoutMs = 6000) {
+  // Operator 2026-06-25: splash-time health pipeline. Calls the
+  // public /api/boot-probe endpoint and resolves to the parsed JSON
+  // {ok, devices, databases, cloud, failures} or null on fetch error.
+  return new Promise((resolve) => {
+    const req = http.get(
+      { host, port, path: "/api/boot-probe", timeout: timeoutMs },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => { body += chunk; });
+        res.on("end", () => {
+          try {
+            const parsed = JSON.parse(body);
+            resolve(parsed && typeof parsed === "object" ? parsed : null);
+          } catch (_) { resolve(null); }
+        });
+      },
+    );
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.on("error", () => resolve(null));
+  });
 }
 
 function checkBackendHealth(host = currentBackendHost, port = currentBackendPort, timeoutMs = 1500) {
@@ -539,6 +606,53 @@ function killBackendImageNamesWindows() {
   }
 }
 
+// Operator 2026-06-23 (Item 3): supervisor-level auto-restart state.
+// Tracks recent crash times so a backend that crashes in a tight loop
+// gets exponentially longer waits before each next spawn attempt.
+// `quitting` is set to true on before-quit so the respawn helper
+// doesn't fight a deliberate shutdown. The flag was referenced at
+// three places earlier in the file without ever being declared —
+// `if (quitting)` was always falsy. This is the real declaration.
+let quitting = false;
+const recentCrashTimes = [];
+const CRASH_BURST_WINDOW_MS = 60_000;
+const CRASH_BURST_THRESHOLD = 5;
+
+async function respawnBackendWithBackoff(lastExitCode) {
+  if (quitting) return;
+  const now = Date.now();
+  recentCrashTimes.push(now);
+  while (recentCrashTimes.length && (now - recentCrashTimes[0]) > CRASH_BURST_WINDOW_MS) {
+    recentCrashTimes.shift();
+  }
+  const crashesInWindow = recentCrashTimes.length;
+  // 2s for the first, 4s, 8s, 16s, then 30s cap.
+  let delayMs;
+  if (crashesInWindow >= CRASH_BURST_THRESHOLD) {
+    delayMs = 30_000;
+    logBackend(
+      `BACKEND CRASH-LOOP: ${crashesInWindow} crashes in ${CRASH_BURST_WINDOW_MS / 1000}s; ` +
+      `waiting ${delayMs / 1000}s before next respawn attempt (lastExitCode=${lastExitCode}).`
+    );
+  } else {
+    delayMs = Math.min(2000 * Math.pow(2, crashesInWindow - 1), 30_000);
+    logBackend(
+      `BACKEND CRASHED (exit=${lastExitCode}). Respawning in ${delayMs / 1000}s ` +
+      `(attempt ${crashesInWindow} this minute).`
+    );
+  }
+  await new Promise((r) => setTimeout(r, delayMs));
+  if (quitting) return;
+  try {
+    await startBackend();
+    logBackend("Backend respawned by supervisor.");
+  } catch (err) {
+    logBackend(`Backend respawn FAILED: ${String(err)}`);
+    // Try again on next failed exit; the spawn helper itself will
+    // re-trigger the on("exit") handler if it dies again.
+  }
+}
+
 async function startBackend() {
   if (backendProc) return;
 
@@ -708,17 +822,30 @@ async function startBackend() {
     logBackend(`Backend exited with code ${code ?? "null"}`);
     backendProc = null;
     if (code && code !== 0) {
-      // Some packaged backends are singleton-style and exit non-zero when another
-      // compatible instance already owns the local API port. Attach instead of fail.
+      // Operator 2026-06-23 (Item 3): auto-respawn on non-zero exit
+      // with exponential backoff. Previously this only tried to
+      // *attach* to an already-running compatible backend — useful
+      // when the EXE detected a port conflict, but useless after a
+      // genuine crash (segfault, OOM, uncaught exception) where no
+      // sibling exists. Now we first probe for a sibling (same as
+      // before, preserving the singleton-attach behavior); if none
+      // is found, we respawn the backend. Restarts are capped via
+      // recentCrashTimes — a burst (e.g. 5 crashes in 60s) means
+      // something is fundamentally broken and respawning will keep
+      // restarting forever; back off harder.
       setTimeout(async () => {
+        if (quitting) return;
         const running = await findCompatibleRunningBackend();
-        if (!running) return;
-        currentBackendHost = running.host;
-        currentBackendPort = running.port;
-        backendExited = false;
-        backendExitCode = null;
-        ownsBackendProcess = false;
-        logBackend(`Attached to compatible running backend at http://${currentBackendHost}:${currentBackendPort} after local exit.`);
+        if (running) {
+          currentBackendHost = running.host;
+          currentBackendPort = running.port;
+          backendExited = false;
+          backendExitCode = null;
+          ownsBackendProcess = false;
+          logBackend(`Attached to compatible running backend at http://${currentBackendHost}:${currentBackendPort} after local exit.`);
+          return;
+        }
+        await respawnBackendWithBackoff(code);
       }, 350);
     }
   });
@@ -752,6 +879,13 @@ function stopBackend() {
   backendProc = null;
   ownsBackendProcess = false;
 }
+
+// Operator 2026-06-24 (cleanup pass): removed the external watchdog
+// sidecar. The in-process worker watchdog (with the dispose-in-
+// to_thread fix) handles real stalls. The sidecar layer added
+// startup latency, false-killed an idle backend on its
+// heartbeat-staleness rule, and introduced a circular-import bug
+// in the heartbeat hook. Net: more complexity than reliability.
 
 function getUiSourceConfig() {
   const userConfigPath = path.join(app.getPath("userData"), UI_SOURCE_FILE);
@@ -862,47 +996,98 @@ function buildSplashHtml() {
     background: linear-gradient(160deg, #f6f8fb 0%, #ffffff 60%, #e9f1f0 100%);
     overflow: hidden; }
   .stage { display: flex; flex-direction: column; align-items: center;
-    justify-content: center; height: 100%; padding: 24px 32px; gap: 18px;
+    justify-content: center; height: 100%; padding: 18px 24px; gap: 14px;
     -webkit-app-region: drag; position: relative; }
-  .logo { width: 240px; height: 140px; display: flex;
+  .logo { width: 220px; height: 110px; display: flex;
     align-items: center; justify-content: center; }
   .logo img { max-width: 100%; max-height: 100%; object-fit: contain; }
-  .logo svg { width: 120px; height: 120px; }
+  .logo svg { width: 96px; height: 96px; }
   .status { font-size: 12px; color: #475569; margin-top: 2px;
-    min-height: 16px; text-align: center; max-width: 360px; }
+    min-height: 16px; text-align: center; max-width: 380px; }
   .bar { width: 220px; height: 3px; border-radius: 999px;
     background: rgba(15,23,42,0.08); overflow: hidden; position: relative; }
+  .bar.hidden { display: none; }
   .bar::after { content: ""; position: absolute; left: -40%; top: 0;
     width: 40%; height: 100%; border-radius: 999px;
     background: linear-gradient(90deg, transparent, #14a89a, transparent);
     animation: slide 1.4s ease-in-out infinite; }
   @keyframes slide { 0% { left: -40%; } 100% { left: 100%; } }
-  .footer { position: absolute; bottom: 12px; left: 0; right: 0;
+  .fail-box { display: none; max-width: 420px; max-height: 140px;
+    overflow-y: auto; padding: 8px 12px; background: rgba(220,38,38,0.06);
+    border: 1px solid rgba(220,38,38,0.25); border-radius: 6px;
+    font-size: 11px; color: #b91c1c; text-align: left;
+    -webkit-app-region: no-drag; }
+  .fail-box.visible { display: block; }
+  .fail-row { margin: 2px 0; }
+  .actions { display: none; gap: 12px; margin-top: 4px;
+    -webkit-app-region: no-drag; }
+  .actions.visible { display: flex; }
+  .btn { padding: 6px 16px; border-radius: 5px; border: 1px solid transparent;
+    font-size: 12px; font-weight: 500; cursor: pointer;
+    transition: background 0.15s; }
+  .btn-primary { background: #14a89a; color: #fff; }
+  .btn-primary:hover { background: #0f8c80; }
+  .btn-secondary { background: rgba(15,23,42,0.06); color: #0f172a;
+    border-color: rgba(15,23,42,0.12); }
+  .btn-secondary:hover { background: rgba(15,23,42,0.10); }
+  .footer { position: absolute; bottom: 10px; left: 0; right: 0;
     text-align: center; font-size: 10px; color: #94a3b8;
     letter-spacing: 0.08em; }
 </style>
 </head><body>
   <div class="stage">
     <div class="logo">${brandMark}</div>
-    <div class="bar"></div>
+    <div class="bar" id="bar"></div>
     <div class="status" id="status">Starting up…</div>
+    <div class="fail-box" id="failbox"></div>
+    <div class="actions" id="actions">
+      <button class="btn btn-primary" id="btnRetry">Retry</button>
+      <button class="btn btn-secondary" id="btnSkip">Skip</button>
+    </div>
     <div class="footer">v${version}</div>
   </div>
   <script>
-    // Plain ipcRenderer would be unavailable under contextIsolation,
-    // so the preload exposes window.electronAPI.onSplashStatus.
     function bind() {
       if (window.electronAPI && window.electronAPI.onSplashStatus) {
         window.electronAPI.onSplashStatus(function(msg) {
           var el = document.getElementById('status');
           if (el && typeof msg === 'string') el.textContent = msg;
         });
-      } else {
-        // contextIsolation may resolve a tick later — retry briefly.
-        setTimeout(bind, 50);
       }
+      if (window.electronAPI && window.electronAPI.onSplashFailures) {
+        window.electronAPI.onSplashFailures(function(payload) {
+          var box = document.getElementById('failbox');
+          var act = document.getElementById('actions');
+          var bar = document.getElementById('bar');
+          if (!box || !act) return;
+          var failures = (payload && payload.failures) || [];
+          if (failures.length === 0) {
+            box.classList.remove('visible');
+            act.classList.remove('visible');
+            bar.classList.remove('hidden');
+            return;
+          }
+          box.innerHTML = '';
+          for (var i = 0; i < failures.length; i++) {
+            var d = document.createElement('div');
+            d.className = 'fail-row';
+            d.textContent = '• ' + String(failures[i]);
+            box.appendChild(d);
+          }
+          box.classList.add('visible');
+          act.classList.add('visible');
+          bar.classList.add('hidden');
+        });
+      }
+      if (!window.electronAPI) { setTimeout(bind, 50); }
     }
     bind();
+    document.getElementById('btnRetry').addEventListener('click', function() {
+      if (window.electronAPI && window.electronAPI.splashRetry) window.electronAPI.splashRetry();
+    });
+    document.getElementById('btnSkip').addEventListener('click', function() {
+      if (window.electronAPI && window.electronAPI.splashSkip) window.electronAPI.splashSkip();
+    });
   </script>
 </body></html>`;
 }
@@ -1629,26 +1814,80 @@ app.whenReady().then(async () => {
   await startBackend();
   updateSplashStatus("Service started. Waiting for health…");
   startBackendSupervisor();
-  // Poll the backend health endpoint once so the splash transitions
-  // to "Loading UI…" only after the backend is actually responsive.
-  // Ceiling raised to 12 s (from 8 s) to cover AV-heavy machines;
-  // monitorBackendStartup keeps polling once the main window is up.
-  // Per-attempt timeout cut to 500 ms (loopback ECONNREFUSED arrives
-  // in <1 ms, so 1500 ms was pure wasted wall-clock). Inter-poll sleep
-  // cut to 100 ms so a backend that starts in ~3 s is detected within
-  // ~3.6 s instead of up to ~5.9 s with the old 400 ms cadence.
-  const splashHealthDeadline = Date.now() + 12000;
-  while (Date.now() < splashHealthDeadline) {
+
+  // Operator 2026-06-25 (simplification): the splash has ONE job —
+  // wait until the backend is alive (i.e. /api/health returns 200).
+  // No contract gates, no boot_error.json, no route-registry
+  // assertions. If the backend is dead the user gets a single
+  // honest failure message + Retry + Skip. That's it.
+  let splashResolver = null;
+  ipcMain.on("splash:retry", () => { if (splashResolver) { const r = splashResolver; splashResolver = null; r("retry"); } });
+  ipcMain.on("splash:skip",  () => { if (splashResolver) { const r = splashResolver; splashResolver = null; r("skip"); } });
+
+  const waitForHealth = async (deadlineMs) => {
+    while (Date.now() < deadlineMs) {
+      try {
+        if (await checkBackendHealth(currentBackendHost, currentBackendPort, 500)) return true;
+      } catch (_) { /* keep polling */ }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return false;
+  };
+
+  let backendAlive = await waitForHealth(Date.now() + 30000);
+  while (!backendAlive) {
+    updateSplashStatus("Backend service did not respond");
     try {
-      const alive = await checkBackendHealth(
-        currentBackendHost,
-        currentBackendPort,
-        500,
-      );
-      if (alive) break;
-    } catch (_) { /* keep polling */ }
-    await new Promise((r) => setTimeout(r, 100));
+      splashWindow && splashWindow.webContents && splashWindow.webContents.send("splash:failures", {
+        failures: ["Backend service did not respond within 30 seconds. The service may have failed to start."],
+      });
+    } catch (_) {}
+    const action = await new Promise((res) => { splashResolver = res; });
+    if (action === "skip") break;
+    updateSplashStatus("Restarting backend service…");
+    try { stopBackend(); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 1000));
+    try { await startBackend(); } catch (_) {}
+    updateSplashStatus("Waiting for backend…");
+    backendAlive = await waitForHealth(Date.now() + 30000);
   }
+
+  // Boot probe: check every configured device + DB reaches its
+  // endpoint. ONE call to /api/boot-probe. Three outcomes only:
+  //   - probe returned and probe.ok === true → proceed.
+  //   - probe returned and probe.ok === false → show the failure
+  //     list + Retry/Skip.
+  //   - probe couldn't run (404, network, etc.) → proceed silently
+  //     (don't trap the user behind an endpoint issue; the
+  //     React-side card poller will surface device status).
+  if (backendAlive) {
+    updateSplashStatus("Checking device & database connections…");
+    let probeDone = false;
+    while (!probeDone) {
+      const probe = await fetchBootProbe(currentBackendHost, currentBackendPort, 8000);
+      if (!probe) {
+        // Endpoint unreachable — proceed; UI will surface real status.
+        probeDone = true;
+        break;
+      }
+      if (probe.ok) {
+        probeDone = true;
+        break;
+      }
+      // probe.ok === false with a real failure list.
+      const fails = Array.isArray(probe.failures) && probe.failures.length
+        ? probe.failures.map(String)
+        : ["One or more connections are not reachable."];
+      try {
+        splashWindow && splashWindow.webContents && splashWindow.webContents.send("splash:failures", { failures: fails });
+      } catch (_) {}
+      updateSplashStatus(`${fails.length} connection${fails.length === 1 ? "" : "s"} not reachable`);
+      const action = await new Promise((res) => { splashResolver = res; });
+      if (action === "skip") break;
+      updateSplashStatus("Re-checking connections…");
+    }
+  }
+
   updateSplashStatus("Loading interface…");
   createWindow();
   monitorBackendStartup();
@@ -1664,6 +1903,7 @@ app.on("second-instance", () => {
 
 app.on("before-quit", () => {
   app.isQuiting = true;
+  quitting = true;  // Item 3: tells respawnBackendWithBackoff to give up.
   // Ensure no gateway loop keeps writing if backend survives app close.
   try {
     postStopAllGateways();
