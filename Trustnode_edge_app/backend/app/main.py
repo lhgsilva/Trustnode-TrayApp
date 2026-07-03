@@ -32,7 +32,8 @@ if not logging.getLogger().handlers:
     logging.getLogger().setLevel(logging.WARNING)
 # Promote only the trustnode operational loggers we explicitly added
 # in this round of hardening. Anything else stays at WARNING.
-for _name in ("trustnode.gateway", "trustnode.watchdog"):
+for _name in ("trustnode.gateway", "trustnode.watchdog",
+              "trustnode.intelligence.service", "trustnode.intelligence.ai"):
     try:
         logging.getLogger(_name).setLevel(logging.INFO)
     except Exception:
@@ -216,6 +217,41 @@ def _init_sentry() -> None:
 _init_sentry()
 
 app = FastAPI(title="Trustnode Edge API", version="0.1.0")
+
+
+# Operator 2026-06-30: TrustNode Intelligence module — opt-in bolt-on
+# under <repo>/trustnode_intelligence/. License-gated (routes 404 when
+# the customer's license doesn't list `trustnode_intelligence`).
+#
+# Disabled by default to keep the working baseline untouched. Set the
+# env var TRUSTNODE_INTELLIGENCE=on (or 1/true/yes) to load it. If the
+# import or include_router fails for ANY reason, the failure is logged
+# and the rest of the app continues normally — Intelligence has zero
+# hooks into PLC, historian, sync loops, or any other working flow.
+if str(os.environ.get("TRUSTNODE_INTELLIGENCE", "")).strip().lower() in {"on", "1", "true", "yes"}:
+    try:
+        import sys as _sys
+        _tn_intel_root = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "trustnode_intelligence",
+        )
+        # Make `trustnode_intelligence` importable both in dev (repo
+        # layout) and packaged (PyInstaller _MEIPASS). Insert the parent
+        # so `import trustnode_intelligence.backend.router` resolves.
+        _tn_intel_repo_root = os.path.dirname(_tn_intel_root)
+        if _tn_intel_repo_root not in _sys.path:
+            _sys.path.insert(0, _tn_intel_repo_root)
+        from trustnode_intelligence.backend.router import router as _intelligence_router
+        app.include_router(_intelligence_router)
+        print("[trustnode][boot] TrustNode Intelligence module loaded", flush=True)
+    except Exception as _intel_exc:
+        print(
+            f"[trustnode][boot] Intelligence module not loaded "
+            f"({type(_intel_exc).__name__}: {_intel_exc}) — continuing without it.",
+            flush=True,
+        )
+else:
+    print("[trustnode][boot] TrustNode Intelligence module DISABLED (set TRUSTNODE_INTELLIGENCE=on to enable)", flush=True)
 
 
 class CloudLiveAuthMiddleware:
@@ -895,6 +931,11 @@ async def startup_event() -> None:
 PUBLIC_PATHS = {
     "/api/health",
     "/api/boot-probe",
+    # Intelligence status probe — must be public so the sidebar menu
+    # component can decide whether to render. Endpoint still returns
+    # 404 when the license doesn't list the module (license_inspect
+    # gating in trustnode_intelligence/backend/license.py).
+    "/api/intelligence/status",
     "/api/auth/login",
     "/api/auth/me",
     "/api/auth/forgot-password",
@@ -904,6 +945,10 @@ PUBLIC_PATHS = {
     "/api/control-plane/edge-link/bootstrap",
     "/api/control-plane/edge-link/register",
     "/api/control-plane/edge-link/local-finalize",
+    # Operator 2026-07-01: public so the Edge process can pull the
+    # portal-admin's AI Endpoint config without holding a Supabase JWT.
+    # Gated inside the handler by the edge_id's active license.
+    "/api/control-plane/edge-link/ai-endpoint",
     "/api/control-plane/password-reset/public/issue",
     "/api/control-plane/password-reset/public/apply",
     "/api/v1/healthz",

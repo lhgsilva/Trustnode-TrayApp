@@ -78,7 +78,9 @@ class BatchService:
                 SELECT id, name, description, parent_type_id, start_method, end_method,
                        start_config_json, end_config_json, collection_profile,
                        report_template_id, identifier_method, identifier_prefix,
-                       summary_tags_json, enabled, created_utc, updated_utc
+                       summary_tags_json, enabled, created_utc, updated_utc,
+                       email_on_close, email_recipients,
+                       trigger_start_json, trigger_stop_json
                 FROM batch_types
                 WHERE tenant_id = ?
                 ORDER BY name COLLATE NOCASE
@@ -95,7 +97,9 @@ class BatchService:
                 SELECT id, name, description, parent_type_id, start_method, end_method,
                        start_config_json, end_config_json, collection_profile,
                        report_template_id, identifier_method, identifier_prefix,
-                       summary_tags_json, enabled, created_utc, updated_utc
+                       summary_tags_json, enabled, created_utc, updated_utc,
+                       email_on_close, email_recipients,
+                       trigger_start_json, trigger_stop_json
                 FROM batch_types
                 WHERE tenant_id = ? AND id = ?
                 """,
@@ -125,6 +129,11 @@ class BatchService:
             _json_or_none(payload.get("summary_tags")),
             1 if payload.get("enabled", True) else 0,
             now, now,
+            # Operator 2026-06-30: new email + trigger columns.
+            1 if payload.get("email_on_close") else 0,
+            (payload.get("email_recipients") or None),
+            _json_or_none(payload.get("trigger_start")),
+            _json_or_none(payload.get("trigger_stop")),
         )
         with self._connect() as c:
             if is_new:
@@ -134,8 +143,10 @@ class BatchService:
                     (id, tenant_id, name, description, parent_type_id, start_method, end_method,
                      start_config_json, end_config_json, collection_profile, report_template_id,
                      identifier_method, identifier_prefix, summary_tags_json, enabled,
-                     created_utc, updated_utc)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_utc, updated_utc,
+                     email_on_close, email_recipients,
+                     trigger_start_json, trigger_stop_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     record,
                 )
@@ -155,13 +166,17 @@ class BatchService:
                         end_method = ?, start_config_json = ?, end_config_json = ?,
                         collection_profile = ?, report_template_id = ?, identifier_method = ?,
                         identifier_prefix = ?, summary_tags_json = ?, enabled = ?,
-                        updated_utc = ?
+                        updated_utc = ?,
+                        email_on_close = ?, email_recipients = ?,
+                        trigger_start_json = ?, trigger_stop_json = ?
                     WHERE tenant_id = ? AND id = ?
                     """,
                     (
                         record[2], record[3], record[4], record[5], record[6], record[7],
                         record[8], record[9], record[10], record[11], record[12], record[13],
-                        record[14], now, tid, bt_id,
+                        record[14], now,
+                        record[17], record[18], record[19], record[20],
+                        tid, bt_id,
                     ),
                 )
                 self._audit(c, tid=tid, actor=actor, batch_type_id=bt_id,
@@ -364,7 +379,101 @@ class BatchService:
             self.compute_summaries(batch_id)
         except Exception:
             pass
+        # Operator 2026-06-30: fire email-on-close if the batch_type asked for it.
+        # Best-effort; failure does not block the batch state transition.
+        try:
+            self._maybe_send_close_email(batch_id)
+        except Exception as _email_exc:
+            try:
+                with self._connect() as c:
+                    self._event(c, batch_id=batch_id, kind="batch.email_failed",
+                                severity="warning",
+                                message=f"Close-email failed: {type(_email_exc).__name__}: {_email_exc}")
+                    c.commit()
+            except Exception:
+                pass
         return self.get_batch(batch_id)  # type: ignore[return-value]
+
+    def _maybe_send_close_email(self, batch_id: str) -> None:
+        """If the batch's type has email_on_close=True and has recipients,
+        send the PDF report. Reuses the global SMTP/PHP transport config
+        from app_settings → email_notifications.settings."""
+        batch = self.get_batch(batch_id)
+        if not batch:
+            return
+        bt = self.get_batch_type(batch.get("batch_type_id") or "") if batch.get("batch_type_id") else None
+        if not bt or not bt.get("email_on_close"):
+            return
+        recipients = [s.strip() for s in str(bt.get("email_recipients") or "").replace(";", ",").split(",") if s.strip()]
+        if not recipients:
+            return
+        # Pull current email settings from app_settings.
+        try:
+            bs = self._app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+            email_block = bs.get("email_notifications") or {}
+            email_settings = email_block.get("settings") or email_block or {}
+        except Exception:
+            email_settings = {}
+        # Build PDF in-memory.
+        try:
+            from .reports import render_single_batch_pdf
+            events = self.list_events(batch_id, limit=2000)
+            summaries = self.list_summaries(batch_id)
+            pdf_bytes = render_single_batch_pdf(batch, bt, events, summaries)
+        except Exception as exc:
+            with self._connect() as c:
+                self._event(c, batch_id=batch_id, kind="batch.email_failed",
+                            severity="warning",
+                            message=f"PDF build failed: {exc}")
+                c.commit()
+            return
+        # Send via shared notifications helper.
+        try:
+            import base64 as _b64
+            from app.routers.notifications import (
+                EmailRequest, SMTPConfig, PHPMailConfig, EmailAttachment, send_email_request,
+            )
+        except Exception as exc:
+            return
+        transport = str(email_settings.get("transport") or "smtp").strip().lower()
+        smtp = email_settings.get("smtp") or {}
+        php = email_settings.get("php_mail")
+        subject = f"Batch {batch.get('identifier') or batch.get('id')} — {batch.get('status') or 'closed'}"
+        body = (
+            f"<p>Batch <b>{batch.get('identifier') or batch.get('id')}</b> closed with status "
+            f"<b>{batch.get('status')}</b>.</p>"
+            f"<p>Product: {batch.get('product') or '—'} · Recipe: {batch.get('recipe') or '—'}</p>"
+            f"<p>Started: {batch.get('started_utc') or '—'} → Ended: {batch.get('ended_utc') or '—'} (UTC)</p>"
+            f"<p>PDF attached.</p>"
+        )
+        try:
+            attach = EmailAttachment(
+                filename=f"batch_{batch.get('identifier') or batch.get('id')}.pdf",
+                content_b64=_b64.b64encode(pdf_bytes).decode("ascii"),
+                content_type="application/pdf",
+            )
+        except Exception:
+            return
+        req = EmailRequest(
+            transport="php_http" if transport == "php_http" else "smtp",
+            smtp=SMTPConfig(**(smtp if isinstance(smtp, dict) else {})),
+            php_mail=PHPMailConfig(**(php if isinstance(php, dict) else {})) if isinstance(php, dict) else None,
+            to=recipients,
+            cc=[], bcc=[],
+            subject=subject,
+            html_body=body,
+            text_body=f"Batch {batch.get('identifier') or batch.get('id')} closed",
+            attachments=[attach],
+        )
+        outcome = send_email_request(req)
+        ok = bool(getattr(outcome, "ok", False))
+        with self._connect() as c:
+            self._event(c, batch_id=batch_id,
+                        kind="batch.email_sent" if ok else "batch.email_failed",
+                        severity="info" if ok else "warning",
+                        message=(f"Close-email sent to {', '.join(recipients)}" if ok
+                                 else f"Email failed: {getattr(outcome, 'message', '?')}"))
+            c.commit()
 
     def delete_batch(self, batch_id: str, *, actor: Optional[str] = None) -> bool:
         tid = self._tenant()
@@ -560,6 +669,92 @@ class BatchService:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # -- parent / child rollup ----------------------------------------
+    def list_child_batches(self, parent_batch_id: str) -> list[dict[str, Any]]:
+        """All batches that name this batch as their parent (newest first)."""
+        tid = self._tenant()
+        with self._connect_readonly() as c:
+            rows = c.execute(
+                """
+                SELECT * FROM batches
+                WHERE tenant_id = ? AND parent_batch_id = ?
+                ORDER BY COALESCE(started_utc, created_utc) DESC
+                """,
+                (tid, parent_batch_id),
+            ).fetchall()
+        return [self._row_to_batch(r) for r in rows]
+
+    def rollup_children(self, parent_batch_id: str) -> dict[str, Any]:
+        """Aggregate per-tag statistics across every child batch of a parent.
+
+        Returns:
+            {
+              parent: <batch dict>,
+              children: [<batch dict>, ...],   # newest first
+              tags: [
+                {tag_name, gateway_id, sample_count, min_value, max_value,
+                 avg_value, contributing_children},
+                ...
+              ],
+              totals: {child_count, completed, failed, cancelled, running}
+            }
+
+        Aggregation: weighted average by per-child sample_count. min/max
+        are global. Used by the Insights / UI rollup view and a future
+        parent-batch PDF (single export covering an entire shift/day).
+        """
+        parent = self.get_batch(parent_batch_id)
+        if not parent:
+            raise KeyError(parent_batch_id)
+        children = self.list_child_batches(parent_batch_id)
+        # Collect per-child summaries.
+        agg: dict[tuple[str, str | None], dict[str, Any]] = {}
+        for ch in children:
+            for s in self.list_summaries(ch["id"]):
+                key = (str(s.get("tag_name") or ""), s.get("gateway_id"))
+                cnt = int(s.get("sample_count") or 0)
+                if cnt <= 0:
+                    continue
+                bucket = agg.setdefault(key, {
+                    "tag_name": key[0], "gateway_id": key[1],
+                    "sample_count": 0, "min_value": None, "max_value": None,
+                    "_weighted_sum": 0.0, "contributing_children": 0,
+                })
+                bucket["sample_count"] += cnt
+                bucket["contributing_children"] += 1
+                # Weighted avg accumulator
+                try:
+                    avg = float(s.get("avg_value") or 0.0)
+                    bucket["_weighted_sum"] += avg * cnt
+                except Exception:
+                    pass
+                # min / max global
+                try:
+                    mn = float(s.get("min_value"))
+                    bucket["min_value"] = mn if bucket["min_value"] is None else min(bucket["min_value"], mn)
+                except Exception:
+                    pass
+                try:
+                    mx = float(s.get("max_value"))
+                    bucket["max_value"] = mx if bucket["max_value"] is None else max(bucket["max_value"], mx)
+                except Exception:
+                    pass
+        tags = []
+        for b in agg.values():
+            n = b["sample_count"] or 1
+            b["avg_value"] = (b.pop("_weighted_sum") / n) if n else None
+            tags.append(b)
+        tags.sort(key=lambda x: (x.get("tag_name") or "").lower())
+        # Status totals
+        totals = {"child_count": len(children),
+                  "completed": 0, "failed": 0, "cancelled": 0, "running": 0,
+                  "validated": 0, "created": 0}
+        for ch in children:
+            st = str(ch.get("status") or "")
+            if st in totals:
+                totals[st] += 1
+        return {"parent": parent, "children": children, "tags": tags, "totals": totals}
+
     # -- audit ---------------------------------------------------------
     def list_audit(self, *, limit: int = 200, batch_id: Optional[str] = None) -> list[dict[str, Any]]:
         tid = self._tenant()
@@ -692,6 +887,10 @@ class BatchService:
             "identifier_prefix": d.get("identifier_prefix"),
             "summary_tags": _json_load(d.get("summary_tags_json")) or [],
             "enabled": bool(d.get("enabled", 1)),
+            "email_on_close": bool(d.get("email_on_close", 0)),
+            "email_recipients": d.get("email_recipients"),
+            "trigger_start": _json_load(d.get("trigger_start_json")),
+            "trigger_stop": _json_load(d.get("trigger_stop_json")),
             "created_utc": d["created_utc"],
             "updated_utc": d["updated_utc"],
         }
@@ -731,5 +930,7 @@ def record_to_dict(record: tuple) -> dict[str, Any]:
         "end_method", "start_config_json", "end_config_json", "collection_profile",
         "report_template_id", "identifier_method", "identifier_prefix",
         "summary_tags_json", "enabled", "created_utc", "updated_utc",
+        "email_on_close", "email_recipients",
+        "trigger_start_json", "trigger_stop_json",
     )
     return {k: v for k, v in zip(keys, record)}

@@ -2111,6 +2111,25 @@ export async function setControlPlaneLicenseModules(licenseId, payload) {
   return res.json();
 }
 
+// AI Endpoint config (TrustNode Intelligence). Read by every authed
+// portal user (so the card can render its current values); write is
+// gated to global admin on the backend.
+export async function getAIEndpointConfig() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/ai-endpoint`);
+  await ensureOk(res, "AI endpoint config fetch failed");
+  return res.json();
+}
+
+export async function setAIEndpointConfig(cfg) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/ai-endpoint`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(cfg || {}),
+  });
+  await ensureOk(res, "AI endpoint config save failed");
+  return res.json();
+}
+
 export async function getControlPlaneUsers(tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));

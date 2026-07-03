@@ -112,3 +112,154 @@ def render_single_batch_pdf(batch: dict[str, Any],
 
     doc.build(story)
     return buf.getvalue()
+
+
+def render_parent_rollup_pdf(parent: dict[str, Any],
+                             parent_type: dict[str, Any] | None,
+                             rollup: dict[str, Any],
+                             children: list[dict[str, Any]],
+                             service: Any) -> bytes:
+    """Multi-section PDF for a parent batch:
+      Page 1: cover with status totals + per-tag aggregated stats
+      Page N: one section per child batch (reuses single-batch shape)
+
+    Operator 2026-06-30: lets a supervisor email/print one document for an
+    entire shift or production run instead of N separate child PDFs.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+    )
+    import io as _io
+
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, title=f"Parent batch {parent.get('identifier') or parent.get('id')}")
+    styles = getSampleStyleSheet()
+    story: list[Any] = []
+
+    # ----- cover ------------------------------------------------------
+    story.append(Paragraph(f"<b>Parent Batch Report</b> — {parent.get('identifier') or parent.get('id')}", styles["Title"]))
+    story.append(Spacer(1, 8))
+    head_rows = [
+        ["Type",       (parent_type or {}).get("name") or "—"],
+        ["Status",     parent.get("status") or "—"],
+        ["Product",    parent.get("product") or "—"],
+        ["Recipe",     parent.get("recipe") or "—"],
+        ["Operator",   parent.get("operator") or "—"],
+        ["Started",    parent.get("started_utc") or "—"],
+        ["Ended",      parent.get("ended_utc") or "—"],
+    ]
+    ht = Table(head_rows, colWidths=[100, 380])
+    ht.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#0e7a78")),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#999")),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    story.append(ht)
+    story.append(Spacer(1, 14))
+
+    totals = rollup.get("totals") or {}
+    story.append(Paragraph(
+        f"<b>Children:</b> {totals.get('child_count', 0)} total · "
+        f"{totals.get('completed', 0)} completed · "
+        f"{totals.get('validated', 0)} validated · "
+        f"{totals.get('failed', 0)} failed · "
+        f"{totals.get('cancelled', 0)} cancelled · "
+        f"{totals.get('running', 0)} running",
+        styles["Normal"]))
+    story.append(Spacer(1, 10))
+
+    # Aggregated stats table
+    story.append(Paragraph("<b>Aggregated tag statistics</b> (weighted avg across children)", styles["Heading3"]))
+    tag_rows: list[list[Any]] = [["Tag", "Gateway", "Children", "Samples", "Min", "Max", "Avg"]]
+    for t in (rollup.get("tags") or []):
+        def _f(v):
+            try: return f"{float(v):.2f}"
+            except Exception: return "—"
+        tag_rows.append([
+            t.get("tag_name") or "—",
+            t.get("gateway_id") or "—",
+            t.get("contributing_children") or 0,
+            t.get("sample_count") or 0,
+            _f(t.get("min_value")),
+            _f(t.get("max_value")),
+            _f(t.get("avg_value")),
+        ])
+    if len(tag_rows) == 1:
+        tag_rows.append(["(no aggregated tag data)"] + [""] * 6)
+    tt = Table(tag_rows, repeatRows=1, colWidths=[110, 90, 55, 60, 60, 60, 60])
+    tt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0e7a78")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#999")),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(tt)
+    story.append(Spacer(1, 12))
+
+    # Children list
+    story.append(Paragraph("<b>Child batches</b>", styles["Heading3"]))
+    ch_rows: list[list[Any]] = [["Identifier", "Status", "Started", "Ended", "Operator"]]
+    for ch in children:
+        ch_rows.append([
+            ch.get("identifier") or ch.get("id") or "—",
+            ch.get("status") or "—",
+            ch.get("started_utc") or "—",
+            ch.get("ended_utc") or "—",
+            ch.get("operator") or "—",
+        ])
+    if len(ch_rows) == 1:
+        ch_rows.append(["(no child batches)"] + [""] * 4)
+    ct = Table(ch_rows, repeatRows=1, colWidths=[140, 70, 110, 110, 90])
+    ct.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0e7a78")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#999")),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(ct)
+
+    # ----- per-child sections ---------------------------------------
+    if children:
+        story.append(PageBreak())
+        for ch in children:
+            ch_type = service.get_batch_type(ch.get("batch_type_id") or "") if ch.get("batch_type_id") else None
+            ch_events = service.list_events(ch["id"], limit=200)
+            ch_summaries = service.list_summaries(ch["id"])
+            story.append(Paragraph(
+                f"<b>Child:</b> {ch.get('identifier') or ch.get('id')} "
+                f"<font color='#666'>({ch.get('status') or '—'})</font>",
+                styles["Heading2"]))
+            story.append(Spacer(1, 6))
+            # Reuse single-batch sections inline (light copy: just the
+            # summaries table) to keep the file size bounded.
+            if ch_summaries:
+                rows = [["Tag", "Samples", "Min", "Max", "Avg", "Stdev"]]
+                for s in ch_summaries:
+                    def _f(v):
+                        try: return f"{float(v):.2f}"
+                        except Exception: return "—"
+                    rows.append([
+                        s.get("tag_name") or "—",
+                        s.get("sample_count") or 0,
+                        _f(s.get("min_value")), _f(s.get("max_value")),
+                        _f(s.get("avg_value")), _f(s.get("stdev_value")),
+                    ])
+                st = Table(rows, repeatRows=1, colWidths=[150, 60, 60, 60, 60, 60])
+                st.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0e7a78")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#999")),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ]))
+                story.append(st)
+            else:
+                story.append(Paragraph("(no tag summaries)", styles["Normal"]))
+            story.append(Spacer(1, 14))
+
+    doc.build(story)
+    return buf.getvalue()

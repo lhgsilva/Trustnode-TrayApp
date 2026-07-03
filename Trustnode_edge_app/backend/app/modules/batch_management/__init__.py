@@ -12,3 +12,13 @@ License-gated feature. Files:
 """
 
 from .router import router as batch_router  # noqa: F401
+
+# Operator 2026-06-30: kick the PLC-driven auto-trigger watcher on
+# import. Idempotent + daemon thread, so safe to call multiple times.
+# Wrapped in try/except so a watcher failure never blocks the rest of
+# the module from loading.
+try:
+    from .triggers import start_trigger_watcher as _start_trigger_watcher
+    _start_trigger_watcher()
+except Exception:
+    pass

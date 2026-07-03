@@ -129,6 +129,8 @@ import {
   deleteControlPlaneLicense,
   getControlPlaneLicenseModules,
   setControlPlaneLicenseModules,
+  getAIEndpointConfig,
+  setAIEndpointConfig,
   getControlPlaneUsers,
   upsertControlPlaneUser,
   deleteControlPlaneUser,
@@ -165,6 +167,13 @@ import {
   importWorkspace,
 } from "./api";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, ComposedChart, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+// Operator 2026-06-30: TrustNode Intelligence module — sidebar menu +
+// page components. All three self-hide if the license check fails or
+// the backend returns 404 (module not loaded / not licensed). Mounting
+// them unconditionally is safe; the menu itself decides whether to render.
+import IntelligenceMenu from "../../trustnode_intelligence/frontend/IntelligenceMenu.jsx";
+import IntelligenceChatPage from "../../trustnode_intelligence/frontend/IntelligenceChatPage.jsx";
+import IntelligenceInsightsPage from "../../trustnode_intelligence/frontend/IntelligenceInsightsPage.jsx";
 
 function getUiStorageScope() {
   try {
@@ -3587,6 +3596,23 @@ function AppShell() {
   const [gatewaySelectedTags, setGatewaySelectedTags] = useState([]);
   const [gatewayBrowseSearch, setGatewayBrowseSearch] = useState("");
   const [gatewayManualTagInput, setGatewayManualTagInput] = useState("");
+  // Operator 2026-07-01: user-toggled column count for the tag picker
+  // grids (Selected + Discovered). Cycles 1→2→3→4→1 via a small button
+  // in the toolbar. Persisted per-user so a wide-monitor operator
+  // doesn't have to re-set it every time the modal opens.
+  const [gatewayTagCols, setGatewayTagColsState] = useState(() => {
+    try {
+      const raw = parseInt(localStorage.getItem("trustnode_gateway_tag_cols") || "", 10);
+      if (raw >= 1 && raw <= 4) return raw;
+    } catch { /* ignore */ }
+    return 2;
+  });
+  const setGatewayTagCols = (n) => {
+    const v = Math.max(1, Math.min(4, Number(n) || 1));
+    setGatewayTagColsState(v);
+    try { localStorage.setItem("trustnode_gateway_tag_cols", String(v)); } catch { /* ignore */ }
+  };
+  const cycleGatewayTagCols = () => setGatewayTagCols((gatewayTagCols % 4) + 1);
   const [gatewayOpcNodeSummary, setGatewayOpcNodeSummary] = useState({ total: 0, objects: 0, variables: 0, methods: 0 });
   const [gatewayForm, setGatewayForm] = useState({
     name: "",
@@ -4310,6 +4336,19 @@ function AppShell() {
   const [cpDashboardProfilesFilter, setCpDashboardProfilesFilter] = useState("");
   const [cpActivationCodes, setCpActivationCodes] = useState([]);
   const [cpModuleCatalog, setCpModuleCatalog] = useState([]);
+  // AI Endpoint config (TrustNode Intelligence) — global, lives in
+  // app_settings.ai_endpoint_config. Pushed into module_configs of any
+  // license that has the module enabled.
+  const [cpAiEndpoint, setCpAiEndpoint] = useState({
+    endpoint_url: "",
+    model: "qwen2.5:7b-instruct",
+    auth_token: "",
+    rate_limits: { queries_per_day: 500, max_tokens_per_query: 2048 },
+    features: { insights: true, email_schedule: true },
+    allowed_tools: ["read_only"],
+  });
+  const [cpAiEndpointBusy, setCpAiEndpointBusy] = useState(false);
+  const [cpAiEndpointStatus, setCpAiEndpointStatus] = useState("");
   const [cpTenantForm, setCpTenantForm] = useState({
     tenant_id: "",
     name: "",
@@ -4428,6 +4467,7 @@ function AppShell() {
     users: false,
     activation: false,
     trials: false,
+    ai_endpoint: true,
   });
   // Emergency-trial history for the portal admin. Populated by
   // refreshCpTrialHistory (called when the Edges workspace mounts and
@@ -4578,6 +4618,15 @@ function AppShell() {
   const cloudNewestLiveTsMsRef = useRef(0);
   const cloudLastApplyMsRef = useRef(0);
   const gatewayDownPollCountersRef = useRef({});
+  // Operator 2026-06-29 (Bug A): data-loss guard. Flips to true ONLY
+  // when applyAppStorePayload runs with a real backend payload (or when
+  // the user explicitly mutates a domain via handlers). Each auto-save
+  // effect refuses to PUT an empty list while this is still false —
+  // otherwise a wedged backend (bootstrap throws → appStoreHydrated
+  // flips true with no payload) silently overwrites the customer's
+  // saved configs (database_configurations, gateway_configurations,
+  // triggers_limits, alarms_setup, ...) with React's initial [].
+  const appStorePayloadEverHydratedRef = useRef(false);
   // Wall-clock ms when the user (or this client) intentionally stopped a
   // gateway. While this is recent the debounce in refreshGatewayRuntimes is
   // bypassed so the UI doesn't keep showing RUNNING for ~20 s because the
@@ -4762,6 +4811,10 @@ function AppShell() {
 
   const applyAppStorePayload = (data) => {
     if (!data || typeof data !== "object") return;
+    // Bug A guard: backend returned a real payload. Mark hydrated so
+    // the per-domain save effects know an empty list is now a real
+    // empty (not React's initial state).
+    appStorePayloadEverHydratedRef.current = true;
     const appSettings = data.app_settings || {};
     const usersAccess = data.users_access || {};
     const triggers = data.triggers_limits || {};
@@ -6538,6 +6591,10 @@ function AppShell() {
       // blank for hours on installs whose only change was upgrading the
       // EXE. The backend save path is already idempotent: a no-op write
       // returns {unchanged: true} and skips the cloud mirror.
+      // Bug A guard: refuse to PUT an empty widgets list if backend
+      // hydration has never confirmed (wedged-backend → React initial []
+      // would otherwise clobber the customer's saved widgets).
+      if ((!Array.isArray(payload.widgets) || payload.widgets.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === dashboardDomainLastPersistSignatureRef.current) return;
       dashboardDomainPersistInFlightRef.current = true;
       try {
@@ -6575,6 +6632,8 @@ function AppShell() {
       const payload = { alarms: Array.isArray(alarms) ? alarms : [] };
       const signature = JSON.stringify(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
+      // Bug A guard: see dashboard_configurations note above.
+      if ((!Array.isArray(payload.alarms) || payload.alarms.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === alarmsDomainLastPersistSignatureRef.current) return;
       alarmsDomainPersistInFlightRef.current = true;
       try {
@@ -6613,6 +6672,13 @@ function AppShell() {
       };
       const signature = JSON.stringify(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
+      // Bug A guard: triggers + rules empty BEFORE hydration would
+      // erase the customer's configured triggers/rules. Refuse PUT.
+      if (
+        (!Array.isArray(payload.collection_triggers) || payload.collection_triggers.length === 0) &&
+        (!Array.isArray(payload.trigger_rules) || payload.trigger_rules.length === 0) &&
+        !appStorePayloadEverHydratedRef.current
+      ) return;
       if (signature === triggersDomainLastPersistSignatureRef.current) return;
       triggersDomainPersistInFlightRef.current = true;
       try {
@@ -6667,6 +6733,9 @@ function AppShell() {
       // worst case is one redundant PUT right after bootstrap (the
       // backend skips no-op upserts anyway, so the cost is one round
       // trip — preferable to silently losing user edits).
+      // Bug A guard: refuse to PUT an empty gateway list if backend
+      // hydration has never confirmed.
+      if ((!Array.isArray(payload) || payload.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === gatewayConfigsLastPersistSignatureRef.current) return;
       gatewayConfigsPersistInFlightRef.current = true;
       try {
@@ -6692,6 +6761,9 @@ function AppShell() {
       const payload = Array.isArray(devices) ? devices : [];
       const signature = JSON.stringify(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
+      // Bug A guard: refuse to PUT an empty devices list if backend
+      // hydration has never confirmed.
+      if ((!Array.isArray(payload) || payload.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === devicesLastPersistSignatureRef.current) return;
       devicesPersistInFlightRef.current = true;
       try {
@@ -6717,6 +6789,11 @@ function AppShell() {
       const payload = Array.isArray(dbConnections) ? dbConnections : [];
       const signature = JSON.stringify(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
+      // Bug A guard: this is THE bug that erased mari's cloud DB on
+      // edge reactivation — empty React state PUT before bootstrap
+      // returned, then cloud_pull picked up the empty mirror later.
+      // Refuse PUT until applyAppStorePayload has run at least once.
+      if ((!Array.isArray(payload) || payload.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === dbConnectionsLastPersistSignatureRef.current) return;
       dbConnectionsPersistInFlightRef.current = true;
       try {
@@ -6742,6 +6819,8 @@ function AppShell() {
       const payload = powerConfig && typeof powerConfig === "object" ? powerConfig : {};
       const signature = JSON.stringify(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
+      // Bug A guard: empty object before hydration is React initial state.
+      if (signature === "{}" && !appStorePayloadEverHydratedRef.current) return;
       if (signature === powerConfigLastPersistSignatureRef.current) return;
       powerConfigPersistInFlightRef.current = true;
       try {
@@ -10264,6 +10343,26 @@ function AppShell() {
     () => normalizeLicenseModuleKeys(edgeLicenseSnapshot?.license?.modules),
     [edgeLicenseSnapshot?.license?.modules]
   );
+  // Operator 2026-07-01: expose to window for on-machine diagnostics.
+  // In dev console: window.__tnLicenseDebug() prints the raw snapshot,
+  // normalized keys, and answers hasLicenseModule() for common modules.
+  // No effect on runtime; only writes to window when it changes.
+  useEffect(() => {
+    try {
+      const snap = edgeLicenseSnapshot;
+      window.__tnLicenseDebug = () => {
+        const keys = licensedModuleKeys;
+        console.log("[trustnode.license] snapshot.ok =", snap?.ok);
+        console.log("[trustnode.license] snapshot.license.modules =", snap?.license?.modules);
+        console.log("[trustnode.license] normalized keys =", keys);
+        console.log("[trustnode.license] has batch_management =", keys.includes("batch_management"));
+        console.log("[trustnode.license] has trustnode_intelligence =", keys.includes("trustnode_intelligence"));
+        console.log("[trustnode.license] cached in localStorage:",
+          (() => { try { return JSON.parse(localStorage.getItem("trustnode_edge_license_snapshot_v1") || "null"); } catch { return "PARSE_ERROR"; } })());
+        return keys;
+      };
+    } catch (_) {}
+  }, [edgeLicenseSnapshot, licensedModuleKeys]);
   // Operator 2026-06-18: grandfathered modules — features the customer
   // was already running BEFORE the new license-module check rolled out.
   // Set on first boot by the backend; clients receive it via the
@@ -10840,6 +10939,40 @@ function AppShell() {
               setLicenseGuardBlocked(false);
               setLicenseGuardMessage("License active (cached)");
               setLicenseGuardLastCheckedUtc(tsNow());
+              // Operator 2026-07-01: cache hit lets the user in immediately,
+              // but silently poll the cloud in the background so newly-
+              // enabled modules (e.g. Batch Management just ticked in the
+              // portal) show up on this boot instead of waiting 30 days.
+              // We only *replace* the snapshot when cloud responds with
+              // ok=true and a different module set — otherwise we stay on
+              // the cached copy so offline boots still work.
+              (async () => {
+                try {
+                  const edgeIdBg = String(edgeProfile?.edge_id || cachedSnap?.edge?.edge_id || "").trim();
+                  if (!edgeIdBg) return;
+                  const fresh = await checkControlPlaneEdgeLicense(edgeIdBg, currentTenantId || "default");
+                  if (!fresh?.ok) return;
+                  const oldKeys = JSON.stringify(
+                    (Array.isArray(cachedSnap?.license?.modules) ? cachedSnap.license.modules : [])
+                      .map(m => String(m?.module_key || m?.key || "").trim()).filter(Boolean).sort()
+                  );
+                  const newKeys = JSON.stringify(
+                    (Array.isArray(fresh?.license?.modules) ? fresh.license.modules : [])
+                      .map(m => String(m?.module_key || m?.key || "").trim()).filter(Boolean).sort()
+                  );
+                  if (oldKeys !== newKeys) {
+                    setEdgeLicenseSnapshot(fresh);
+                    try {
+                      localStorage.setItem(
+                        LICENSE_SNAPSHOT_STORAGE_KEY,
+                        JSON.stringify({ snapshot: fresh, cached_at_ms: Date.now() })
+                      );
+                    } catch (_) {}
+                  }
+                } catch (_) {
+                  // Offline / cloud unreachable — keep cached snapshot.
+                }
+              })();
               return;
             }
             // Cached snapshot says the license ended — fall through
@@ -17593,8 +17726,12 @@ const getGatewayHealth = (gateway) => {
         getControlPlaneModuleCatalog(),
         getControlPlaneActivationCodes(scopedTenantId, cpCustomerFilter !== "__all__" ? cpCustomerFilter : ""),
         getControlPlaneUsers(scopedTenantId),
+        getAIEndpointConfig(),
       ]);
-      const [summaryRes, tenantsRes, customersRes, edgesRes, licensesRes, modulesRes, activationRes, usersRes] = results;
+      const [summaryRes, tenantsRes, customersRes, edgesRes, licensesRes, modulesRes, activationRes, usersRes, aiEndpointRes] = results;
+      if (aiEndpointRes?.status === "fulfilled" && aiEndpointRes.value?.config) {
+        setCpAiEndpoint((prev) => ({ ...prev, ...aiEndpointRes.value.config }));
+      }
       setCpSummary(summaryRes?.status === "fulfilled" ? (summaryRes.value || null) : null);
       setCpTenants(tenantsRes?.status === "fulfilled" && Array.isArray(tenantsRes.value?.rows) ? tenantsRes.value.rows : []);
       setCpCustomers(customersRes?.status === "fulfilled" && Array.isArray(customersRes.value?.rows) ? customersRes.value.rows : []);
@@ -18200,6 +18337,21 @@ const getGatewayHealth = (gateway) => {
       setCpResult(`Save license modules failed: ${String(err?.message || err)}`);
     } finally {
       setCpBusy(false);
+    }
+  };
+
+  const saveAiEndpointConfig = async () => {
+    if (!canEditPage("control_plane")) return;
+    setCpAiEndpointBusy(true);
+    setCpAiEndpointStatus("");
+    try {
+      const res = await setAIEndpointConfig(cpAiEndpoint);
+      if (res?.config) setCpAiEndpoint((prev) => ({ ...prev, ...res.config }));
+      setCpAiEndpointStatus("Saved.");
+    } catch (err) {
+      setCpAiEndpointStatus(`Save failed: ${String(err?.message || err)}`);
+    } finally {
+      setCpAiEndpointBusy(false);
     }
   };
 
@@ -19702,6 +19854,11 @@ const getGatewayHealth = (gateway) => {
             })}
           </div>
 
+          {/* Intelligence menu: self-hides when /api/intelligence/status
+              returns 404 (module not loaded or license missing). Sits
+              above the user/login footer. Independent of other menus. */}
+          <IntelligenceMenu activePage={activePage} onNavigate={setActivePage} sidebarCollapsed={sidebarCollapsed} />
+
           <div className="sidebar-footer">
             <div className="user-menu-wrap" ref={userMenuRef}>
               <button
@@ -19871,6 +20028,13 @@ const getGatewayHealth = (gateway) => {
                 {pageTitle(activePage)} {renderLock(activePage)}
               </h1>
             </section>
+          ) : null}
+
+          {activePage === "intelligence_chat" ? (
+            <IntelligenceChatPage />
+          ) : null}
+          {activePage === "intelligence_insights" ? (
+            <IntelligenceInsightsPage />
           ) : null}
 
           {activePage === "dashboard" ? (
@@ -24813,6 +24977,88 @@ const getGatewayHealth = (gateway) => {
                       </section>
                       <section className="card control-plane-workspace-card">
                         <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                          <h4 style={{ margin: 0 }}>AI Endpoint (TrustNode Intelligence)</h4>
+                          <div className="row">
+                            <button className="icon-btn portal-card-btn" onClick={() => toggleCpWorkspaceCard("ai_endpoint")} aria-label={cpWorkspaceCollapsed.ai_endpoint ? "Expand" : "Collapse"} title={cpWorkspaceCollapsed.ai_endpoint ? "Expand" : "Collapse"}>{cpWorkspaceCollapsed.ai_endpoint ? <ExpandIcon /> : <CollapseIcon />}</button>
+                          </div>
+                        </div>
+                        {!cpWorkspaceCollapsed.ai_endpoint ? (
+                        <div style={{ marginTop: 10 }}>
+                          <small className="hint" style={{ display: "block", marginBottom: 8, color: "var(--ink-soft, #8a98ab)" }}>
+                            One global config. Pushed (signed) into every license bundle whose holder has <code>trustnode_intelligence</code> enabled. Changes apply on the edge on next license refresh.
+                          </small>
+                          <div className="trigger-form-grid">
+                            <label>
+                              Endpoint URL
+                              <input
+                                value={cpAiEndpoint.endpoint_url || ""}
+                                onChange={(e) => setCpAiEndpoint((p) => ({ ...p, endpoint_url: e.target.value }))}
+                                placeholder="https://ai.trustnode.lsapps.app"
+                              />
+                            </label>
+                            <label>
+                              Model
+                              <input
+                                value={cpAiEndpoint.model || ""}
+                                onChange={(e) => setCpAiEndpoint((p) => ({ ...p, model: e.target.value }))}
+                                placeholder="qwen2.5:7b-instruct"
+                              />
+                            </label>
+                            <label>
+                              Auth Token
+                              <input
+                                type="password"
+                                value={cpAiEndpoint.auth_token || ""}
+                                onChange={(e) => setCpAiEndpoint((p) => ({ ...p, auth_token: e.target.value }))}
+                                placeholder="bearer token (optional)"
+                              />
+                            </label>
+                            <label>
+                              Queries / day
+                              <input
+                                type="number"
+                                min="0"
+                                value={Number(cpAiEndpoint?.rate_limits?.queries_per_day ?? 500)}
+                                onChange={(e) => setCpAiEndpoint((p) => ({ ...p, rate_limits: { ...(p.rate_limits || {}), queries_per_day: Number(e.target.value || 0) } }))}
+                              />
+                            </label>
+                            <label>
+                              Max tokens / query
+                              <input
+                                type="number"
+                                min="0"
+                                value={Number(cpAiEndpoint?.rate_limits?.max_tokens_per_query ?? 2048)}
+                                onChange={(e) => setCpAiEndpoint((p) => ({ ...p, rate_limits: { ...(p.rate_limits || {}), max_tokens_per_query: Number(e.target.value || 0) } }))}
+                              />
+                            </label>
+                          </div>
+                          <div className="form-grid" style={{ marginTop: 8 }}>
+                            <label className="remember-row">
+                              <input
+                                type="checkbox"
+                                checked={Boolean(cpAiEndpoint?.features?.insights)}
+                                onChange={(e) => setCpAiEndpoint((p) => ({ ...p, features: { ...(p.features || {}), insights: e.target.checked } }))}
+                              />
+                              <span className="remember-label">Insights (saved + scheduled prompts)</span>
+                            </label>
+                            <label className="remember-row">
+                              <input
+                                type="checkbox"
+                                checked={Boolean(cpAiEndpoint?.features?.email_schedule)}
+                                onChange={(e) => setCpAiEndpoint((p) => ({ ...p, features: { ...(p.features || {}), email_schedule: e.target.checked } }))}
+                              />
+                              <span className="remember-label">Email-on-schedule for insights</span>
+                            </label>
+                          </div>
+                          <div className="row" style={{ marginTop: 10, alignItems: "center", gap: 10 }}>
+                            <button className="btn btn-primary" onClick={saveAiEndpointConfig} disabled={cpAiEndpointBusy || !canEditPage("control_plane")}>Save</button>
+                            {cpAiEndpointStatus ? <span className="hint" style={{ color: cpAiEndpointStatus.startsWith("Save failed") ? "var(--danger, #ff6b6b)" : "var(--ink-soft, #8a98ab)" }}>{cpAiEndpointStatus}</span> : null}
+                          </div>
+                        </div>
+                        ) : null}
+                      </section>
+                      <section className="card control-plane-workspace-card">
+                        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12 }}>
                           <h4 style={{ margin: 0 }}>Edge Apps</h4>
                           <div className="row">
                             <button className="icon-btn portal-card-btn" onClick={openCpEdgeCreate} disabled={cpBusy || !canEditPage("control_plane")} aria-label="Add edge" title="Add edge"><AddIcon /></button>
@@ -27227,6 +27473,14 @@ const getGatewayHealth = (gateway) => {
                       <strong>Selected Tags ({tagList.length})</strong>
                       <button
                         type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={cycleGatewayTagCols}
+                        title="Cycle grid columns (1 → 2 → 3 → 4)"
+                      >
+                        {gatewayTagCols} col{gatewayTagCols === 1 ? "" : "s"}
+                      </button>
+                      <button
+                        type="button"
                         className="btn btn-danger btn-sm"
                         onClick={() => setGatewayForm({ ...gatewayForm, tags_text: "" })}
                         disabled={!canEditPage("gateway_configuration")}
@@ -27237,13 +27491,18 @@ const getGatewayHealth = (gateway) => {
                     <div className="discovered-tags-list" style={{ maxHeight: 220 }}>
                       <div style={{
                         display: "grid",
-                        gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                        gridTemplateColumns: `repeat(${gatewayTagCols}, minmax(0, 1fr))`,
                         gap: "4px 12px",
                         padding: "4px 8px",
                         width: "100%",
                       }}>
                         {tagList.map((tag) => (
-                          <label key={`saved-${tag}`} className="discovered-tag-item" style={{ minWidth: 0 }}>
+                          <label
+                            key={`saved-${tag}`}
+                            className="discovered-tag-item"
+                            style={{ minWidth: 0 }}
+                            title={tag}
+                          >
                             <input
                               type="checkbox"
                               checked
@@ -27386,6 +27645,14 @@ const getGatewayHealth = (gateway) => {
                       onChange={(e) => setGatewayBrowseSearch(e.target.value)}
                     />
                     <div className="row">
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        onClick={cycleGatewayTagCols}
+                        title="Cycle grid columns (1 → 2 → 3 → 4)"
+                      >
+                        {gatewayTagCols} col{gatewayTagCols === 1 ? "" : "s"}
+                      </button>
                       <button type="button" className="btn btn-primary btn-sm" onClick={selectAllDiscoveredTags}>
                         Select All
                       </button>
@@ -27464,13 +27731,18 @@ const getGatewayHealth = (gateway) => {
                           return (
                             <div className="discovered-tags-grid" style={{
                               display: "grid",
-                              gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                              gridTemplateColumns: `repeat(${gatewayTagCols}, minmax(0, 1fr))`,
                               gap: "4px 12px",
                               padding: "4px 8px",
                               width: "100%",
                             }}>
                               {filtered.map((tag) => (
-                                <label key={tag} className="discovered-tag-item" style={{ minWidth: 0 }}>
+                                <label
+                                  key={tag}
+                                  className="discovered-tag-item"
+                                  style={{ minWidth: 0 }}
+                                  title={tag}
+                                >
                                   <input
                                     type="checkbox"
                                     checked={gatewaySelectedTags.includes(tag)}

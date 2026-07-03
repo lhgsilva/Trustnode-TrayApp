@@ -25,6 +25,11 @@ class BatchTypeIn(BaseModel):
     identifier_prefix: Optional[str] = None
     summary_tags: Optional[list[str]] = None
     enabled: bool = True
+    # Operator 2026-06-30: per-type email-on-close + PLC trigger config.
+    email_on_close: bool = False
+    email_recipients: Optional[str] = None   # comma-separated addresses
+    trigger_start: Optional[dict[str, Any]] = None  # {operator: "AND"|"OR", rules: [...]}
+    trigger_stop: Optional[dict[str, Any]] = None
 
 
 class BatchTypeOut(BatchTypeIn):

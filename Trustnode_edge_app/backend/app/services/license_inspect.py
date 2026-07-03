@@ -40,13 +40,73 @@ def _normalize_module_key(value: Any) -> str:
 
 
 def _read_snapshot() -> dict[str, Any]:
+    """Return the app_settings dict the license check evaluates against.
+
+    Read order:
+      1. Unscoped `config_documents.app_settings` — historical truth.
+      2. If that dict has no usable `license` block, scan
+         `config_documents_scoped` for the most-recent `app_settings`
+         row whose `license` is populated AND has a `modules` list,
+         then overlay the `license` field. This rescues edges where
+         the UI saved the license bundle into a scoped row (per-user
+         or per-edge scope) but never mirrored it back to the
+         unscoped doc. Other fields are left untouched.
+
+    Safety:
+      * Unscoped data ALWAYS wins when it carries a non-empty license.
+        Only the empty/missing case falls back.
+      * No new tables, no schema migration.
+      * Pure read; cached upstream by `_refresh_if_stale()` so the
+        scoped scan happens at most every 30 s.
+    """
     try:
         from app.state import app_store
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
     except Exception:
         return {}
     s = bootstrap.get("app_settings")
-    return s if isinstance(s, dict) else {}
+    if not isinstance(s, dict):
+        s = {}
+
+    # Fast path: unscoped doc already carries a usable license.
+    lic_unscoped = s.get("license") if isinstance(s.get("license"), dict) else None
+    if isinstance(lic_unscoped, dict) and lic_unscoped.get("modules"):
+        return s
+
+    # Fallback: walk scoped app_settings rows and overlay the first
+    # `license` block we find that has a non-empty modules list. We
+    # also overlay `grandfathered_modules` if the scoped doc has one
+    # and the unscoped doesn't, so legacy installs continue to work.
+    try:
+        import sqlite3 as _sqlite
+        import json as _json
+        with _sqlite.connect(getattr(app_store, "_db_path", ""), timeout=5.0) as _con:
+            _con.row_factory = _sqlite.Row
+            rows = _con.execute(
+                "SELECT payload_json FROM config_documents_scoped "
+                "WHERE domain='app_settings' ORDER BY updated_utc DESC"
+            ).fetchall()
+        for r in rows:
+            try:
+                payload = _json.loads(str(r["payload_json"] or "null"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            scoped_lic = payload.get("license") if isinstance(payload.get("license"), dict) else None
+            if isinstance(scoped_lic, dict) and scoped_lic.get("modules"):
+                # Overlay only the license-related fields. Do NOT replace
+                # the whole dict — other fields (endpoint_mode, cloud_url,
+                # etc.) on the unscoped row are authoritative.
+                merged = dict(s)
+                merged["license"] = scoped_lic
+                if not s.get("grandfathered_modules") and payload.get("grandfathered_modules"):
+                    merged["grandfathered_modules"] = payload["grandfathered_modules"]
+                return merged
+    except Exception:
+        # Best-effort fallback — never raise from a license probe.
+        pass
+    return s
 
 
 def _evaluate() -> dict[str, Any]:
@@ -96,11 +156,24 @@ def _evaluate() -> dict[str, Any]:
 
     pkg = _normalize_module_key(license_obj.get("package_key"))
 
+    # Operator 2026-06-30: surface per-module config blobs to bolt-on
+    # modules (e.g. trustnode_intelligence reading its AI endpoint URL /
+    # model / token). The portal pushes these inside the signed license
+    # bundle under `license.module_configs[<module_key>]`; we copy them
+    # straight through. Empty dict when absent.
+    raw_mc = license_obj.get("module_configs")
+    module_configs: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_mc, dict):
+        for k, v in raw_mc.items():
+            if isinstance(v, dict):
+                module_configs[_normalize_module_key(k)] = dict(v)
+
     return {
         "modules": enabled_modules,
         "limits": limits,
         "package_key": pkg or "edge",  # legacy installs report as "edge" for the banner
         "grandfathered": grandfathered,
+        "module_configs": module_configs,
     }
 
 
@@ -234,6 +307,7 @@ def get_license_summary() -> dict[str, Any]:
         "modules": sorted(c.get("modules", set())),
         "grandfathered": sorted(c.get("grandfathered", set())),
         "limits": dict(c.get("limits") or {}),
+        "module_configs": dict(c.get("module_configs") or {}),
         "usage": {
             "tags": count_configured_tags(),
             "gateways": count_configured_gateways(),

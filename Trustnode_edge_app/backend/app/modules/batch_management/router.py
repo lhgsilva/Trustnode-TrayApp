@@ -188,6 +188,40 @@ def delete_batch(batch_id: str, request: Request) -> dict:
     return {"ok": True}
 
 
+# ---- parent / child rollup -------------------------------------------
+@router.get("/batches/{batch_id}/rollup", dependencies=[Depends(require_batch_management_license)])
+def batch_rollup(batch_id: str) -> dict:
+    """Aggregate all child batches under this parent: per-tag stats
+    (weighted-avg + global min/max), child list, status totals.
+    Used by the UI parent-batch detail view + parent PDF export."""
+    try:
+        return {"ok": True, **_service().rollup_children(batch_id)}
+    except KeyError:
+        raise HTTPException(status_code=404, detail="parent batch not found")
+
+
+@router.get("/batches/{batch_id}/rollup-report.pdf", dependencies=[Depends(require_batch_management_license)])
+def batch_rollup_pdf(batch_id: str) -> Response:
+    """Single PDF that covers a parent batch + every child: cover page
+    with aggregated stats, then one section per child."""
+    svc = _service()
+    parent = svc.get_batch(batch_id)
+    if not parent:
+        raise HTTPException(status_code=404, detail="parent batch not found")
+    rollup = svc.rollup_children(batch_id)
+    children = rollup.get("children") or []
+    # Build per-child sections by calling the existing per-batch renderer
+    # for each, then concatenate. Keeps render code in one place.
+    from .reports import render_single_batch_pdf, render_parent_rollup_pdf
+    pdf = render_parent_rollup_pdf(parent, svc.get_batch_type(parent.get("batch_type_id") or ""), rollup, children, svc)
+    filename = f"batch-rollup-{parent.get('identifier') or batch_id}.pdf".replace("/", "-")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
 # ---- reports ---------------------------------------------------------
 @router.get("/batches/{batch_id}/report.pdf", dependencies=[Depends(require_batch_management_license)])
 def batch_report_pdf(batch_id: str) -> Response:

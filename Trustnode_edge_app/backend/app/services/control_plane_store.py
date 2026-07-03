@@ -50,6 +50,12 @@ class ControlPlaneStore:
         {"key": "local_web_app", "label": "Local Web App (LAN browser access)", "default_enabled": False, "group": "Cloud / Web"},
         {"key": "cloud_lite_access", "label": "Cloud Lite (web read-only)", "default_enabled": False, "group": "Cloud / Web"},
         {"key": "cloud_client_view", "label": "Cloud Client View (web)", "default_enabled": False, "group": "Cloud / Web"},
+        # --- Operator 2026-06-30: bolt-on application modules ------------
+        # Both default_enabled=False so existing licenses are untouched
+        # when MODULE_CATALOG is re-seeded; admins opt-in per-license via
+        # the portal License Editor checkbox.
+        {"key": "batch_management", "label": "Batch Management & Traceability", "default_enabled": False, "group": "Applications"},
+        {"key": "trustnode_intelligence", "label": "TrustNode Intelligence (AI assistant)", "default_enabled": False, "group": "AI"},
     ]
 
     def __init__(self) -> None:
@@ -1944,17 +1950,27 @@ class ControlPlaneStore:
             return []
         with self._lock:
             with self._connect() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT id, tenant_id, customer_id, license_id, edge_id,
-                           trial_kind, granted_utc, expires_utc, granted_by,
-                           source, metadata_json
-                    FROM cp_trial_grants
-                    WHERE license_id=? AND edge_id=?
-                    ORDER BY granted_utc DESC, id DESC
-                    """,
-                    (lid, eid),
-                ).fetchall()
+                try:
+                    rows = conn.execute(
+                        """
+                        SELECT id, tenant_id, customer_id, license_id, edge_id,
+                               trial_kind, granted_utc, expires_utc, granted_by,
+                               source, metadata_json
+                        FROM cp_trial_grants
+                        WHERE license_id=? AND edge_id=?
+                        ORDER BY granted_utc DESC, id DESC
+                        """,
+                        (lid, eid),
+                    ).fetchall()
+                except Exception:
+                    # Operator 2026-07-01: cp_trial_grants is optional. Cloud
+                    # backends (Supabase) may not have provisioned this table
+                    # yet — treat that as "no grants issued" instead of
+                    # crashing the whole license-check pipeline, which used
+                    # to leave every Edge stuck on its stale cached snapshot
+                    # (customer symptoms: AI shows 'endpoint not configured',
+                    # newly-licensed modules never appear in the menu).
+                    return []
                 out = [dict(r) for r in rows]
                 for o in out:
                     try:

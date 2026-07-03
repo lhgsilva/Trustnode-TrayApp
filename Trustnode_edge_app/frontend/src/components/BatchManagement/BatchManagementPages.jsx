@@ -10,6 +10,48 @@
    look matches the rest of the app exactly. No new stylesheets.
 */
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
+
+/**
+ * Render a modal via React Portal to document.body so it escapes any
+ * ancestor with overflow:hidden / transform / contain (the batch detail
+ * page card sets those and used to clip the editor). Also enforces the
+ * host's modal class pair (.modal-backdrop + .modal-card) so dark/light
+ * theme rules apply consistently with the rest of the app's modals.
+ *
+ * Usage:
+ *   <Modal onClose={() => setEditing(null)}>
+ *     <h3>…</h3>
+ *     <button onClick={save}>Save</button>
+ *   </Modal>
+ */
+function Modal({ onClose, children, width }) {
+  const node = (
+    <div
+      className="modal-backdrop"
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 10000,
+        display: "flex", alignItems: "center", justifyContent: "center", padding: 16,
+      }}
+    >
+      <div
+        className="modal-card"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "var(--card)", color: "var(--text)",
+          border: "1px solid var(--stroke)", borderRadius: 10,
+          width: "100%", maxWidth: width || 720, maxHeight: "90vh",
+          overflow: "auto", padding: 20,
+          boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+  return typeof document === "undefined" ? node : createPortal(node, document.body);
+}
 import {
   getBatchManagementStatus,
   listBatchTypes,
@@ -72,6 +114,7 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
   const [createForm, setCreateForm] = useState({
     batch_type_id: "", identifier: "", product: "", recipe: "",
     operator: currentUser?.username || "", gateway_id: "", notes: "",
+    parent_batch_id: "",
   });
   const [selectedId, setSelectedId] = useState(null);
   const [error, setError] = useToastError();
@@ -107,6 +150,7 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
       setCreateForm({
         batch_type_id: "", identifier: "", product: "", recipe: "",
         operator: currentUser?.username || "", gateway_id: "", notes: "",
+        parent_batch_id: "",
       });
       await refresh();
     } catch (e) { setError(e); }
@@ -214,8 +258,7 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
       </section>
 
       {showCreate ? (
-        <div className="modal-backdrop" onClick={() => setShowCreate(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <Modal onClose={() => setShowCreate(false)} width={640}>
             <h3 style={{ marginTop: 0 }}>New Batch</h3>
             <div className="form-grid">
               <label>
@@ -262,6 +305,23 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
                   ))}
                 </select>
               </label>
+              <label>
+                Parent batch (optional)
+                <select
+                  value={createForm.parent_batch_id || ""}
+                  onChange={(e) => setCreateForm({ ...createForm, parent_batch_id: e.target.value })}
+                >
+                  <option value="">(none)</option>
+                  {rows.filter((b) => b.status === "running" || b.status === "created").map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.identifier || b.id} {b.product ? `· ${b.product}` : ""}
+                    </option>
+                  ))}
+                </select>
+                <small style={{ color: "var(--muted)", fontSize: 11 }}>
+                  Group this batch under a parent so a single rollup PDF can cover the shift/run.
+                </small>
+              </label>
               <label style={{ gridColumn: "1 / -1" }}>
                 Notes
                 <textarea
@@ -275,8 +335,7 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
               <button className="btn btn-secondary" onClick={() => setShowCreate(false)}>Cancel</button>
               <button className="btn btn-primary" onClick={handleCreate}>Create</button>
             </div>
-          </div>
-        </div>
+        </Modal>
       ) : null}
     </div>
   );
@@ -359,6 +418,17 @@ function BatchDetailPage({ batchId, onBack, currentUser, batchTypes }) {
               rel="noreferrer"
               style={{ marginRight: 8 }}
             >Download PDF</a>
+            {/* Parent-rollup PDF: only meaningful for a batch that has children
+                under it. Always linked — the endpoint returns an empty
+                "no children" page if there are none. */}
+            <a
+              className="btn btn-secondary btn-sm"
+              href={`/api/batch-management/batches/${encodeURIComponent(batchId)}/rollup-report.pdf`}
+              target="_blank"
+              rel="noreferrer"
+              style={{ marginRight: 8 }}
+              title="If this batch has child batches, download a single PDF covering the parent + every child."
+            >Rollup PDF</a>
             {batch.status === "completed" ? (
               <>
                 <input
@@ -530,8 +600,7 @@ export function BatchTypesPage() {
       </section>
 
       {editing ? (
-        <div className="modal-backdrop" onClick={() => setEditing(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <Modal onClose={() => setEditing(null)} width={760}>
             <h3 style={{ marginTop: 0 }}>{editing.id ? "Edit Batch Type" : "New Batch Type"}</h3>
             <div className="form-grid">
               <label>
@@ -589,12 +658,89 @@ export function BatchTypesPage() {
                 {" "}Enabled
               </label>
             </div>
+
+            {/* Operator 2026-06-30: email-on-close config */}
+            <div className="card" style={{ marginTop: 14, padding: 12, background: "var(--surface-elev, var(--card))" }}>
+              <h4 style={{ margin: "0 0 8px 0", fontSize: 13 }}>Email on close</h4>
+              <div className="form-grid">
+                <label>
+                  <input type="checkbox" checked={!!editing.email_on_close}
+                         onChange={(e) => setEditing({ ...editing, email_on_close: e.target.checked })} />
+                  {" "}Send PDF report when batch closes
+                </label>
+                <label style={{ gridColumn: "1 / -1" }}>
+                  Recipients (comma-separated)
+                  <input value={editing.email_recipients || ""}
+                         placeholder="qa@example.com, operator@example.com"
+                         onChange={(e) => setEditing({ ...editing, email_recipients: e.target.value })} />
+                  <small style={{ color: "var(--muted)", fontSize: 11 }}>
+                    Uses the global SMTP settings from Settings → Notifications.
+                  </small>
+                </label>
+              </div>
+            </div>
+
+            {/* Operator 2026-06-30: PLC auto-trigger config (start + stop) */}
+            <div className="card" style={{ marginTop: 12, padding: 12, background: "var(--surface-elev, var(--card))" }}>
+              <h4 style={{ margin: "0 0 8px 0", fontSize: 13 }}>PLC auto-trigger conditions</h4>
+              <small style={{ color: "var(--muted)", fontSize: 11, display: "block", marginBottom: 8 }}>
+                JSON: <code>{`{"operator": "AND" | "OR", "rules": [{"tag": "PLC1.RUN", "kind": "rising_edge"}, ...]}`}</code>
+                <br />
+                Rule kinds: <code>rising_edge</code>, <code>falling_edge</code>,{" "}
+                <code>{`threshold (+op: > | >= | < | <=, value, hysteresis)`}</code>, <code>{`equals (+value)`}</code>.
+                Watcher polls every ~2s with 5s debounce per type.
+              </small>
+              <label style={{ display: "block", marginBottom: 8 }}>
+                Start condition
+                <textarea
+                  rows={4}
+                  style={{ fontFamily: "monospace", fontSize: 12 }}
+                  value={editing._trigger_start_text != null
+                    ? editing._trigger_start_text
+                    : (editing.trigger_start ? JSON.stringify(editing.trigger_start, null, 2) : "")}
+                  placeholder={`{"operator":"AND","rules":[{"tag":"PLC1.RUN","kind":"rising_edge"}]}`}
+                  onChange={(e) => {
+                    let parsed = null;
+                    try { parsed = e.target.value.trim() ? JSON.parse(e.target.value) : null; } catch { parsed = undefined; }
+                    setEditing({
+                      ...editing,
+                      _trigger_start_text: e.target.value,
+                      trigger_start: parsed === undefined ? editing.trigger_start : parsed,
+                      _trigger_start_invalid: parsed === undefined && !!e.target.value.trim(),
+                    });
+                  }}
+                />
+                {editing._trigger_start_invalid ? <small style={{ color: "#dc2626" }}>Invalid JSON — fix before saving.</small> : null}
+              </label>
+              <label style={{ display: "block" }}>
+                Stop condition
+                <textarea
+                  rows={4}
+                  style={{ fontFamily: "monospace", fontSize: 12 }}
+                  value={editing._trigger_stop_text != null
+                    ? editing._trigger_stop_text
+                    : (editing.trigger_stop ? JSON.stringify(editing.trigger_stop, null, 2) : "")}
+                  placeholder={`{"operator":"AND","rules":[{"tag":"PLC1.RUN","kind":"falling_edge"}]}`}
+                  onChange={(e) => {
+                    let parsed = null;
+                    try { parsed = e.target.value.trim() ? JSON.parse(e.target.value) : null; } catch { parsed = undefined; }
+                    setEditing({
+                      ...editing,
+                      _trigger_stop_text: e.target.value,
+                      trigger_stop: parsed === undefined ? editing.trigger_stop : parsed,
+                      _trigger_stop_invalid: parsed === undefined && !!e.target.value.trim(),
+                    });
+                  }}
+                />
+                {editing._trigger_stop_invalid ? <small style={{ color: "#dc2626" }}>Invalid JSON — fix before saving.</small> : null}
+              </label>
+            </div>
+
             <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", gap: 8 }}>
               <button className="btn btn-secondary" onClick={() => setEditing(null)}>Cancel</button>
-              <button className="btn btn-primary" onClick={save}>Save</button>
+              <button className="btn btn-primary" disabled={!!(editing._trigger_start_invalid || editing._trigger_stop_invalid)} onClick={save}>Save</button>
             </div>
-          </div>
-        </div>
+        </Modal>
       ) : null}
     </div>
   );

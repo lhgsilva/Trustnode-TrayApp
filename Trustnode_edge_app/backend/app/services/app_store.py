@@ -36,6 +36,15 @@ class AppStore:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        # Historian telemetry (PLC writes + cloud-outbox reads + the live
+        # latest-value cache) runs on a SEPARATE lock from config/scope/DB
+        # state. The PLC writes ~5 rows/sec and the outbox flush fires every
+        # ~0.08s; if those held self._lock, /api/health and every config read
+        # would queue behind telemetry I/O (the 1.2s health stall + wedge
+        # pattern). historian_readings/app_logs touch a disjoint set of rows
+        # from config_documents, so they need no coordination with config —
+        # only SQLite's own WAL write serialization, which this preserves.
+        self._hist_lock = threading.Lock()
         self._cloud_schema_lock = threading.Lock()
         self._cloud_engine_lock = threading.Lock()
         self._cloud_schema_ready_keys: set[str] = set()
@@ -891,7 +900,7 @@ class AppStore:
                     try:
                         import shutil
                         shutil.copy2(legacy, new)
-                        print(f"[trustnode] migrated app store from {legacy} → {new}", flush=True)
+                        print(f"[trustnode] migrated app store from {legacy} -> {new}", flush=True)
                     except Exception as exc:
                         print(f"[trustnode] WARN: app store migration failed: {exc}", flush=True)
             base = os.path.join(data_dir, "trustnode_app_store.db")
@@ -1722,10 +1731,51 @@ class AppStore:
                     return dict(cached)
                 # Negative result was cached — return None without re-hitting DB.
                 return None
-        # Walk both the unscoped doc and every scoped doc — the sync worker
-        # has no request context to pick a scope key, so it must consider all
-        # writers. The UI always saves under the active scope, so the unscoped
-        # doc is often empty/stale.
+        # Operator 2026-06-29 (bug B fix): the sync worker has no request
+        # context, so it must read scope-by-itself. Previously this walked
+        # EVERY scope_key — which meant a stale legacy scope from a
+        # previous edge_id could keep providing a cloud target after the
+        # current scope had been emptied (e.g. mari's edge reactivation
+        # left edge-01 holding the Supabase row, the new edge-74... scope
+        # held [], the worker kept syncing against the legacy row anyway).
+        # New behaviour: only consider scope_keys that match this edge's
+        # own (tenant_id, customer_id). Cross-tenant or cross-customer
+        # rows are ignored — they belong to a different deployment and
+        # must never be picked up here.
+        try:
+            settings = self._get_app_settings()
+        except Exception:
+            settings = {}
+        active_tenant = str(settings.get("tenant_id") or "").strip()
+        active_customer = str(settings.get("customer_id") or "").strip()
+
+        def _scope_matches_active(sk: str) -> bool:
+            # Accept the unscoped sentinel and the cross-tenant fallback
+            # scopes used elsewhere in this file:
+            #   tenant|customer|edge|[user]
+            #   tenant|-|edge|[user]               (legacy 2-segment fallback)
+            #   default|customer|edge|[user]       (cross-tenant fallback)
+            # Anything else (different tenant AND different customer) is
+            # treated as foreign and skipped.
+            if not sk:
+                return False
+            parts = sk.split("|")
+            if len(parts) < 3:
+                return False
+            sk_tenant = parts[0]
+            sk_customer = parts[1]
+            tenant_ok = (
+                not active_tenant
+                or sk_tenant == active_tenant
+                or sk_tenant == "default"
+            )
+            customer_ok = (
+                not active_customer
+                or sk_customer == active_customer
+                or sk_customer == "-"
+            )
+            return tenant_ok and customer_ok
+
         payloads: list[list] = []
         with self._lock:
             with self._connect() as conn:
@@ -1742,12 +1792,15 @@ class AppStore:
                         pass
                 try:
                     scoped_rows = conn.execute(
-                        "SELECT payload_json, updated_utc FROM config_documents_scoped WHERE domain = ? ORDER BY updated_utc DESC",
+                        "SELECT scope_key, payload_json, updated_utc FROM config_documents_scoped WHERE domain = ? ORDER BY updated_utc DESC",
                         ("database_configurations",),
                     ).fetchall()
                 except Exception:
                     scoped_rows = []
                 for srow in scoped_rows:
+                    sk = str(srow["scope_key"] or "")
+                    if not _scope_matches_active(sk):
+                        continue
                     try:
                         p = json.loads(str(srow["payload_json"] or "[]"))
                         if isinstance(p, list):
@@ -2441,6 +2494,38 @@ class AppStore:
                     )
                     if not should_apply:
                         continue
+                    # Operator 2026-06-30: app_settings has a `license`
+                    # field that is the authoritative output of the
+                    # edge-link/license-check flow (modules + module_configs
+                    # for bolt-on features like trustnode_intelligence's AI
+                    # endpoint). The cloud `config_documents` mirror is a
+                    # stale duplicate written by the Lite reconcile path
+                    # and lacks module_configs entirely. Preserve the
+                    # local `license` block when overwriting app_settings
+                    # so cloud-pull doesn't blow away the freshly-fetched
+                    # license bundle. Same protection for grandfathered_modules.
+                    final_payload_text = payload_text
+                    if domain == "app_settings":
+                        try:
+                            local_obj = json.loads(local_payload_text) if local_payload_text and local_payload_text != "null" else {}
+                            remote_obj = json.loads(payload_text) if payload_text and payload_text != "null" else {}
+                            local_license = local_obj.get("license") if isinstance(local_obj, dict) else None
+                            local_grand = local_obj.get("grandfathered_modules") if isinstance(local_obj, dict) else None
+                            local_sig_status = local_obj.get("license_signature_status") if isinstance(local_obj, dict) else None
+                            if isinstance(remote_obj, dict):
+                                # Preserve license bundle if local has one
+                                # that looks populated (has modules).
+                                if isinstance(local_license, dict) and local_license.get("modules"):
+                                    remote_obj["license"] = local_license
+                                if local_grand is not None:
+                                    remote_obj["grandfathered_modules"] = local_grand
+                                if local_sig_status is not None:
+                                    remote_obj["license_signature_status"] = local_sig_status
+                                final_payload_text = json.dumps(remote_obj)
+                        except Exception:
+                            # On any parse error, fall back to the
+                            # original behavior (use remote payload as-is).
+                            pass
                     conn.execute(
                         """
                         INSERT INTO config_documents(domain, payload_json, version, updated_utc)
@@ -2450,7 +2535,7 @@ class AppStore:
                           version = excluded.version,
                           updated_utc = excluded.updated_utc
                         """,
-                        (domain, payload_text, remote_version, remote_updated),
+                        (domain, final_payload_text, remote_version, remote_updated),
                     )
                     conn.execute(
                         """
@@ -3720,7 +3805,7 @@ class AppStore:
         sync_logs_this_tick = (self._data_sync_tick % int(self._data_sync_log_every_n)) == 0
 
         try:
-            with self._lock:
+            with self._hist_lock:
                 with self._connect() as conn:
                     hist_rows = conn.execute(
                         """
@@ -4423,6 +4508,18 @@ class AppStore:
                     CREATE INDEX IF NOT EXISTS idx_batch_audit_batch ON batch_audit_log(batch_id);
                     """
                 )
+                # Operator 2026-06-30: batch_types gained per-type email
+                # delivery + PLC auto-trigger config. Additive ALTERs so
+                # existing rows survive.
+                bt_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(batch_types)").fetchall()}
+                if "email_on_close" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN email_on_close INTEGER NOT NULL DEFAULT 0")
+                if "email_recipients" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN email_recipients TEXT NULL")
+                if "trigger_start_json" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN trigger_start_json TEXT NULL")
+                if "trigger_stop_json" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN trigger_stop_json TEXT NULL")
                 hist_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(historian_readings)").fetchall()}
                 if "tenant_id" not in hist_cols:
                     conn.execute('ALTER TABLE historian_readings ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "default"')
@@ -5221,6 +5318,35 @@ class AppStore:
                 if k not in seen:
                     candidates.append(k)
                     seen.add(k)
+            # 4. NEVER-LOSE-SCOPE (operator 2026-07-03): also match by the
+            #    EDGE id alone (any tenant, any customer) and by the TENANT
+            #    alone. This rescues configs saved under a DIFFERENT customer
+            #    segment than the running app resolves — e.g. a Supabase DB
+            #    saved under `tenant|-|edge-01` while the app is now
+            #    `tenant|customer|edge-B`. Without this, the customer's online
+            #    database / gateways / license would silently vanish from the
+            #    UI after a re-link even though the data is safe on disk.
+            #    Read-only; richest scopes ranked first; current scope still
+            #    overlays last so it wins when populated.
+            extra_scores: list[tuple[float, str]] = []
+            for like in (f"%|%|{edge}", f"{tenant}|%|%"):
+                for r in conn.execute(
+                    "SELECT scope_key, domain, length(payload_json) AS L "
+                    "FROM config_documents_scoped WHERE scope_key LIKE ?",
+                    (like,),
+                ).fetchall():
+                    k = str(r["scope_key"] or "")
+                    if k.count("|") != 2 or k in seen:
+                        continue
+                    weight = self._SCOPE_DOMAIN_WEIGHTS.get(str(r["domain"] or ""), 0.0)
+                    if weight <= 0 or int(r["L"] or 0) <= 4:
+                        continue
+                    extra_scores.append((int(r["L"]) * weight, k))
+            extra_scores.sort(reverse=True)
+            for _score, k in extra_scores:
+                if k not in seen:
+                    candidates.append(k)
+                    seen.add(k)
         except Exception:
             pass
         # Always probe the requested scope LAST so its rows overlay the
@@ -5260,6 +5386,28 @@ class AppStore:
             cross_tenant_skey = "|".join(["default", *parts[1:]])
             if cross_tenant_skey != skey and cross_tenant_skey not in candidate_keys:
                 candidate_keys.insert(0, cross_tenant_skey)
+        # Operator 2026-07-03 (NEVER-LOSE-SCOPE): also fold in the widened
+        # fallback (match by edge_id OR tenant). This rescues configs saved
+        # under a DIFFERENT customer segment than the running app resolves —
+        # e.g. a Supabase DB stored at `tenant|-|edge-01` while the app is now
+        # `tenant|customer|edge-B`. Inserted BEFORE skey so the current scope
+        # still overlays (wins) when it has its own value. Read-only; never
+        # moves data. The requested scope is appended last inside the helper.
+        try:
+            with self._lock:
+                with self._connect() as _c:
+                    widened = self._build_read_fallback_scope_keys(_c, skey)
+            # `candidate_keys` is read in order; the LAST occurrence of skey
+            # overlays (wins). Rebuild as: [all fallbacks..., skey] with skey
+            # only at the end. widened already ends with skey.
+            merged = []
+            for k in (candidate_keys[:-1] + widened):
+                if k != skey and k not in merged:
+                    merged.append(k)
+            merged.append(skey)
+            candidate_keys = merged
+        except Exception:
+            pass
         with self._lock:
             with self._connect() as conn:
                 for k in candidate_keys:
@@ -5273,9 +5421,23 @@ class AppStore:
                             continue
                         payload_text = str(row["payload_json"] or "null")
                         try:
-                            out[domain] = json.loads(payload_text)
+                            parsed = json.loads(payload_text)
                         except Exception:
-                            out[domain] = None
+                            parsed = None
+                        # Operator 2026-07-03 (NEVER-LOSE-SCOPE): a later scope
+                        # normally overlays an earlier one. But an EMPTY value
+                        # (e.g. the current scope has database_configurations=[]
+                        # while a fallback scope holds the real Supabase config)
+                        # must NOT wipe a populated fallback. Only overwrite
+                        # when the new value is non-empty, OR nothing is set yet.
+                        prev = out.get(domain)
+                        def _empty(v):
+                            return v is None or v == [] or v == {} or v == ""
+                        if domain not in out or not _empty(parsed) or _empty(prev):
+                            if _empty(parsed) and not _empty(prev):
+                                # keep the populated fallback; skip the empty.
+                                continue
+                            out[domain] = parsed
         if isinstance(out.get("metadata"), dict):
             out["metadata"]["scope_key"] = skey
         return out
@@ -6312,6 +6474,146 @@ class AppStore:
             pass
         return {"domain": domain, "tenant_id": self._current_tenant_id(), "version": new_version, "updated_utc": now}
 
+    def carry_forward_scope_configs(
+        self,
+        *,
+        tenant_id: str,
+        customer_id: str,
+        new_edge_id: str,
+        actor: str = "system:edge_reactivation_carry_forward",
+    ) -> Dict[str, Any]:
+        """When an edge re-activates with a new edge_id under the SAME
+        (tenant, customer), copy any per-domain scoped configs from the
+        previous edge_id(s) into the new scope.
+
+        Strict safety rules (per operator 2026-06-29):
+          * Only copy across scope_keys whose tenant AND customer match
+            EXACTLY the new edge's identity. Cross-tenant or
+            cross-customer rows are NEVER touched (other customer's
+            config must never leak into this edge).
+          * Skip any domain that the new scope ALREADY has with
+            non-empty data (operator may have configured it intentionally).
+          * Copy the MOST RECENTLY updated peer row when more than one
+            old edge_id has data for the same domain.
+          * Idempotent. Re-running is a no-op once the new scope is
+            populated.
+          * Best-effort. Failures never block activation.
+
+        Returns a summary dict {ok, copied: [domain, ...], skipped: [...],
+        peers_considered: int} for audit/logging.
+        """
+        out: Dict[str, Any] = {"ok": True, "copied": [], "skipped": [], "peers_considered": 0}
+        tid = str(tenant_id or "").strip()
+        cid = str(customer_id or "").strip()
+        eid_new = str(new_edge_id or "").strip()
+        if not tid or not cid or not eid_new:
+            out["ok"] = False
+            out["reason"] = "missing_identity"
+            return out
+        new_scope_prefix = f"{tid}|{cid}|{eid_new}"
+        now = self._utc_now()
+        try:
+            with self._lock:
+                with self._connect() as conn:
+                    # Find every scoped row for THIS (tenant, customer).
+                    # We accept both 3-segment (tenant|customer|edge) and
+                    # 4-segment (tenant|customer|edge|user) shapes. The
+                    # legacy `tenant|-|edge*` shape is also accepted only
+                    # when the customer matches the active customer's
+                    # cross-tenant fallback identity ('-' wildcard).
+                    rows = conn.execute(
+                        """
+                        SELECT scope_key, domain, payload_json, version, updated_utc
+                        FROM config_documents_scoped
+                        WHERE domain != 'metadata'
+                          AND (scope_key LIKE ? OR scope_key LIKE ?)
+                        ORDER BY updated_utc DESC
+                        """,
+                        (f"{tid}|{cid}|%", f"{tid}|-|%"),
+                    ).fetchall()
+                    # Group by (domain, edge_part). Skip rows that belong
+                    # to the new_edge_id itself — they are the destination,
+                    # not a source.
+                    peers_by_domain: Dict[str, list] = {}
+                    new_scope_state: Dict[str, Any] = {}
+                    for r in rows:
+                        sk = str(r["scope_key"] or "")
+                        dom = str(r["domain"] or "")
+                        parts = sk.split("|")
+                        if len(parts) < 3:
+                            continue
+                        sk_edge = parts[2]
+                        try:
+                            payload_obj = json.loads(str(r["payload_json"] or "null"))
+                        except Exception:
+                            payload_obj = None
+                        if sk_edge == eid_new:
+                            # Track the new scope's current state per domain
+                            # to decide whether copy is needed.
+                            if dom not in new_scope_state or new_scope_state[dom] in (None, [], {}):
+                                new_scope_state[dom] = payload_obj
+                            continue
+                        peers_by_domain.setdefault(dom, []).append({
+                            "scope_key": sk,
+                            "payload_json": str(r["payload_json"] or "null"),
+                            "payload_obj": payload_obj,
+                            "updated_utc": str(r["updated_utc"] or ""),
+                        })
+                    out["peers_considered"] = sum(len(v) for v in peers_by_domain.values())
+                    if not peers_by_domain:
+                        return out
+                    # For each domain present on a peer scope but missing
+                    # or empty on the new scope, copy the most-recent peer
+                    # payload forward.
+                    for dom, peers in peers_by_domain.items():
+                        new_val = new_scope_state.get(dom)
+                        new_is_empty = (
+                            new_val is None
+                            or new_val == []
+                            or new_val == {}
+                        )
+                        if not new_is_empty:
+                            out["skipped"].append(dom)
+                            continue
+                        # peers already sorted DESC by updated_utc.
+                        source = peers[0]
+                        # Get current version on the new scope (if any) so
+                        # the audit log + version bump are correct.
+                        cur_row = conn.execute(
+                            "SELECT version FROM config_documents_scoped WHERE scope_key=? AND domain=?",
+                            (new_scope_prefix, dom),
+                        ).fetchone()
+                        prev_v = int(cur_row["version"]) if cur_row else 0
+                        new_v = prev_v + 1
+                        try:
+                            conn.execute(
+                                """
+                                INSERT INTO config_documents_scoped
+                                    (scope_key, domain, payload_json, version, updated_utc)
+                                VALUES(?, ?, ?, ?, ?)
+                                ON CONFLICT(scope_key, domain) DO UPDATE SET
+                                    payload_json = excluded.payload_json,
+                                    version      = excluded.version,
+                                    updated_utc  = excluded.updated_utc
+                                """,
+                                (new_scope_prefix, dom, source["payload_json"], new_v, now),
+                            )
+                            try:
+                                conn.execute(
+                                    "INSERT INTO config_audit(domain, actor, old_version, new_version, changed_utc) VALUES(?, ?, ?, ?, ?)",
+                                    (dom, f"{actor}:from={source['scope_key']}", prev_v, new_v, now),
+                                )
+                            except Exception:
+                                pass
+                            out["copied"].append(dom)
+                        except Exception as exc:
+                            out["skipped"].append(f"{dom} (write failed: {type(exc).__name__})")
+                    conn.commit()
+        except Exception as exc:
+            out["ok"] = False
+            out["reason"] = f"{type(exc).__name__}: {exc}"
+        return out
+
     def upsert_domain_scoped(self, scope_key: str, domain: str, payload: Any, actor: str = "system") -> Dict[str, Any]:
         skey = str(scope_key or "").strip()
         if not skey:
@@ -6567,7 +6869,7 @@ class AppStore:
         if not safe_rows:
             return 0
         max_local_id = 0
-        with self._lock:
+        with self._hist_lock:
             with self._connect() as conn:
                 conn.executemany(
                     """
@@ -6584,7 +6886,9 @@ class AppStore:
                     max_local_id = 0
         if pending_live_rows:
             # Keep a fast local latest cache for UI/live endpoints.
-            with self._lock:
+            # Same _hist_lock as the readers at get_live_latest_rows so the
+            # cache is consistently guarded, but off the config lock.
+            with self._hist_lock:
                 for row in pending_live_rows:
                     key = (
                         normalize_tenant_id(str(row.get("tenant_id") or tenant_id)),
@@ -8098,7 +8402,9 @@ class AppStore:
                     return self._filter_rows_by_tenant(self._filter_rows_by_edge(hist_live, edge_filter), tenant_id)[:lim]
 
         # Local fast path: serve latest-per-tag rows from in-memory cache first.
-        with self._lock:
+        # _hist_lock (not self._lock) — matches the writer in append_historian_rows
+        # so this hot read never queues behind config/scope writes.
+        with self._hist_lock:
             cache_rows = [
                 {
                     "ts": str(v.get("ts_utc") or ""),

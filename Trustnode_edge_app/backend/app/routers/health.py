@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import APIRouter, Request, HTTPException
 
 from app.state import app_store
@@ -5,8 +7,33 @@ from app.state import app_store
 router = APIRouter(prefix="/api", tags=["health"])
 
 
+def _collect_routing() -> dict:
+    try:
+        return app_store.get_historian_read_routing_status() or {}
+    except Exception:
+        return {}
+
+
+def _collect_license_summary() -> dict:
+    try:
+        from app.services import license_inspect
+        return license_inspect.get_license_summary() or {}
+    except Exception:
+        return {}
+
+
 @router.get("/health")
-def health() -> dict:
+async def health() -> dict:
+    # Operator 2026-07-02: `health` is now `async` and the two calls that
+    # acquire the global app_store lock (routing status + license summary)
+    # run via asyncio.to_thread. Previously this was a plain `def` handler
+    # that ran on the SHARED anyio threadpool; when those lock-acquiring
+    # calls blocked (historian flush / cloud-sync holding the lock), the
+    # health thread sat there occupying a pool slot. Enough concurrent
+    # blocked slots drained the pool and froze EVERY sync route. Moving the
+    # blocking work to to_thread keeps the anyio pool free for other
+    # requests while this coroutine awaits. Output JSON is unchanged.
+
     # Operator 2026-06-19 (L5): surface the boot-time SQLite
     # quick_check result so the desktop supervisor / support staff
     # can spot a corrupted store before the operator does.
@@ -15,24 +42,10 @@ def health() -> dict:
         integrity = dict(getattr(app_store, "_last_integrity_results", {}) or {})
     except Exception:
         integrity = {}
-    # Operator 2026-06-23: surface the historian read-routing decision
-    # so the Database Overview UI can show "Reads: customer_db (LAN
-    # Postgres)" or "Reads: sqlite (backfill pending)" without needing
-    # a second endpoint.
-    routing = {}
-    try:
-        routing = app_store.get_historian_read_routing_status() or {}
-    except Exception:
-        routing = {}
-    # Operator 2026-06-23: license modules + limits + usage. The
-    # frontend reads this to draw the package banner ("Operations
-    # · Tags 47/100"). Fails OPEN (empty dict) on any internal error.
-    license_summary = {}
-    try:
-        from app.services import license_inspect
-        license_summary = license_inspect.get_license_summary()
-    except Exception:
-        license_summary = {}
+    # Operator 2026-06-23: historian read-routing + license summary. Both
+    # acquire the app_store lock, so run them off the anyio pool.
+    routing = await asyncio.to_thread(_collect_routing)
+    license_summary = await asyncio.to_thread(_collect_license_summary)
     return {
         "status": "ok",
         "api_build": "edge-2026-06-23-canonical-db-1",

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import logging
 import os
 from typing import Any
 
@@ -8,6 +9,13 @@ import requests
 
 from app.state import app_store, control_plane_store, telemetry_service
 from app.tenant import get_current_tenant, normalize_tenant_id
+
+# Operator 2026-06-30: file uses `logger.warning(...)` in several places
+# (license_signature, carry_forward_scope_configs, module_configs
+# enrichment, license bundle persist). Previously these only ran on
+# error paths so the missing import didn't fire, but the new always-on
+# enrichment path tripped NameError → 500 on the license-check route.
+logger = logging.getLogger("trustnode.control_plane")
 
 router = APIRouter(prefix="/api/control-plane", tags=["control-plane"])
 
@@ -259,6 +267,115 @@ def _audit(
 def list_module_catalog(request: Request) -> dict[str, Any]:
     _require_auth_payload(request)
     return {"ok": True, "modules": control_plane_store.module_catalog()}
+
+
+# --- AI Endpoint (TrustNode Intelligence module config) -----------------
+# Global config the portal pushes into every license bundle whose holder
+# has `trustnode_intelligence` enabled. Stored in app_settings (existing
+# storage; no new schema). Read-only for any authenticated portal user;
+# write requires global admin (same gate as /modules edits).
+_AI_ENDPOINT_KEY = "ai_endpoint_config"
+_AI_ENDPOINT_DEFAULTS: dict[str, Any] = {
+    "endpoint_url": "",
+    "model": "qwen2.5:7b-instruct",
+    "auth_token": "",
+    "rate_limits": {"queries_per_day": 500, "max_tokens_per_query": 2048},
+    "features": {"insights": True, "email_schedule": True},
+    "allowed_tools": ["read_only"],
+}
+
+
+def _load_ai_endpoint_config() -> dict[str, Any]:
+    try:
+        bs = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        s = bs.get("app_settings") if isinstance(bs.get("app_settings"), dict) else {}
+        cfg = s.get(_AI_ENDPOINT_KEY) if isinstance(s, dict) else None
+        if isinstance(cfg, dict) and cfg:
+            out = dict(_AI_ENDPOINT_DEFAULTS)
+            # Shallow-merge so missing keys fall back to defaults but
+            # nested dicts (rate_limits, features) replace cleanly.
+            out.update(cfg)
+            return out
+    except Exception:
+        pass
+    return dict(_AI_ENDPOINT_DEFAULTS)
+
+
+class AIEndpointConfigRequest(BaseModel):
+    endpoint_url: str = ""
+    model: str = "qwen2.5:7b-instruct"
+    auth_token: str = ""
+    rate_limits: dict[str, int] = Field(default_factory=lambda: {"queries_per_day": 500, "max_tokens_per_query": 2048})
+    features: dict[str, bool] = Field(default_factory=lambda: {"insights": True, "email_schedule": True})
+    allowed_tools: list[str] = Field(default_factory=lambda: ["read_only"])
+
+
+@router.get("/ai-endpoint")
+def get_ai_endpoint_config(request: Request) -> dict[str, Any]:
+    _require_auth_payload(request)
+    return {"ok": True, "config": _load_ai_endpoint_config()}
+
+
+@router.get("/edge-link/ai-endpoint")
+def get_ai_endpoint_for_edge(request: Request, edge_id: str = "") -> dict[str, Any]:
+    """Public: return the AI Endpoint config for an edge that has the
+    trustnode_intelligence module enabled on its license.
+
+    Why public: the customer's Edge process doesn't have a Supabase JWT
+    (it authenticates users against its own local AuthStore, whose tokens
+    are signed with a different key than the VPS uses). Making this
+    endpoint public — but strictly gated on "this edge_id has an active
+    license with trustnode_intelligence enabled" — lets the Edge pull the
+    AI config the portal-admin saved centrally, without forcing every
+    Edge to embed a VPS credential.
+
+    Safety: (1) no data can be READ or MUTATED — only the AI config the
+    admin explicitly configured in the portal is returned. (2) The response
+    is empty when the edge is unknown or the module isn't licensed. (3) The
+    auth_token is a customer-provided OpenAI key the admin wants pushed
+    to their own edges anyway; this route only exposes it to edges the
+    admin already licensed.
+    """
+    eid = str(edge_id or "").strip()
+    if not eid:
+        return {"ok": False, "reason": "edge_id_required"}
+    try:
+        check = control_plane_store.check_edge_license(tenant_id="", edge_id=eid)
+    except Exception:
+        return {"ok": False, "reason": "check_failed"}
+    if not bool(check.get("ok")):
+        return {"ok": False, "reason": str(check.get("reason") or "not_ok")}
+    lic = check.get("license") or {}
+    modules = lic.get("modules") or []
+    enabled_keys = {
+        str(m.get("module_key") or "").strip().lower()
+        for m in modules if isinstance(m, dict) and m.get("enabled") is not False
+    }
+    if "trustnode_intelligence" not in enabled_keys:
+        return {"ok": False, "reason": "module_not_licensed"}
+    return {"ok": True, "config": _load_ai_endpoint_config()}
+
+
+@router.put("/ai-endpoint")
+def put_ai_endpoint_config(payload: AIEndpointConfigRequest, request: Request) -> dict[str, Any]:
+    user_payload = _require_auth_payload(request)
+    if not _is_global_admin(user_payload):
+        raise HTTPException(status_code=403, detail="Global admin required")
+    try:
+        bs = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+        s = dict(bs.get("app_settings") or {})
+        s[_AI_ENDPOINT_KEY] = payload.model_dump()
+        app_store.upsert_domain("app_settings", s, actor="ai_endpoint_config")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"save_failed: {type(exc).__name__}: {exc}")
+    _audit(
+        request,
+        tenant_id="default",
+        action="ai_endpoint.set",
+        outcome="ok",
+        details={"model": payload.model, "url_set": bool(payload.endpoint_url)},
+    )
+    return {"ok": True, "config": _load_ai_endpoint_config()}
 
 
 @router.get("/tenants")
@@ -1826,6 +1943,29 @@ def edge_link_register(payload: EdgeRegisterRequest, request: Request) -> dict[s
                 actor=f"edge_register:{admin_username}",
             )
             telemetry_service.configure_from_bootstrap({"data": app_store.get_bootstrap(prefer_cloud_reads=False)})
+            # Operator 2026-06-29 (Bug C): when an edge re-activates with
+            # a new edge_id under the SAME (tenant, customer), copy any
+            # per-domain scoped configs (database_configurations,
+            # gateway_configurations, dashboard_configurations, alarms_setup,
+            # triggers_limits, ...) from the previous edge_id forward so
+            # the operator doesn't have to re-enter them. Strict guard:
+            # only copy across scopes where tenant AND customer match
+            # exactly — never cross customer/tenant boundaries.
+            try:
+                _carry = app_store.carry_forward_scope_configs(
+                    tenant_id=tenant_id,
+                    customer_id=resolved_customer_id,
+                    new_edge_id=str(row.get("edge_id") or payload.edge_id),
+                )
+                if _carry.get("copied"):
+                    logger.info(
+                        "edge_reactivation_carry_forward: tenant=%s customer=%s edge=%s copied=%s skipped=%s",
+                        tenant_id, resolved_customer_id,
+                        str(row.get("edge_id") or payload.edge_id),
+                        _carry.get("copied"), _carry.get("skipped"),
+                    )
+            except Exception as _carry_exc:
+                logger.warning("carry_forward_scope_configs failed: %s", _carry_exc)
         except Exception:
             # Cloud-side registration should not fail due to optional local bootstrap materialization.
             pass
@@ -2393,12 +2533,25 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
         local_license = dict(out.get("license") or {}) if isinstance(out.get("license"), dict) else {}
         local_modules = local_license.get("modules") if isinstance(local_license, dict) else []
         local_license_id = str(local_license.get("license_id") or linked_license_id or "").strip()
+        # Operator 2026-07-01: if the local mirror is missing modules that
+        # exist in the catalog (e.g. batch_management, trustnode_intelligence
+        # were added to the portal AFTER this edge cached its license), the
+        # count is > 0 but incomplete. Treat that as stale so we hit the
+        # cloud and refresh the mirror. Detected by comparing local module
+        # count against the catalog count — anything smaller is stale.
+        try:
+            catalog_size = len(control_plane_store.module_catalog() or [])
+        except Exception:
+            catalog_size = 0
+        local_count = len(local_modules) if isinstance(local_modules, list) else 0
+        local_modules_stale = catalog_size > 0 and local_count < catalog_size
         local_missing_details = (
             (not bool(out.get("ok")))
             or (not str(local_license.get("start_utc") or "").strip())
             or (not str(local_license.get("end_utc") or "").strip())
             or (not isinstance(local_modules, list))
             or (isinstance(local_modules, list) and len(local_modules) == 0)
+            or local_modules_stale
         )
         if should_try_cloud and local_missing_details:
             fwd_headers: dict[str, str] = {}
@@ -2507,6 +2660,20 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
                             )
                         out = control_plane_store.check_edge_license(tenant_id=c_tenant, edge_id=c_edge_id or check_edge_id)
                         resolved_tenant = str(out.get("resolved_tenant_id") or c_tenant)
+                        # Operator 2026-06-30: the cloud response carries
+                        # module_configs (per-module settings injected by
+                        # the VPS portal enrichment block, e.g. the AI
+                        # Endpoint config). The local check_edge_license
+                        # above doesn't store module_configs (cp_license_modules
+                        # has no column for per-module JSON), so without
+                        # this step the AI endpoint URL/model/token never
+                        # reach the Edge. Copy them onto the local `out`.
+                        try:
+                            cloud_mc = cloud_license.get("module_configs") if isinstance(cloud_license, dict) else None
+                            if isinstance(cloud_mc, dict) and cloud_mc and isinstance(out.get("license"), dict):
+                                out["license"]["module_configs"] = dict(cloud_mc)
+                        except Exception:
+                            pass
 
             # Last-mile recovery for legacy scopes: if still missing details, hydrate directly
             # from cloud license endpoints using known license_id from local state.
@@ -2761,6 +2928,44 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
                     grandfathered = derived
     except Exception:
         pass
+    # Operator 2026-06-30: enrich the license payload with module_configs
+    # BEFORE signing, so the config travels whether the signing key is
+    # present or not. This must run independently of the signing block
+    # because some VPS deployments don't have the signing key configured
+    # — without it, the previous version only attached module_configs
+    # inside the signing branch, leaving plain (unsigned) license bundles
+    # with empty module_configs.
+    if isinstance(out.get("license"), dict):
+        try:
+            lic_pre = out["license"]
+            enabled_keys = {
+                str(m.get("module_key") or "").strip().lower()
+                for m in (lic_pre.get("modules") or [])
+                if isinstance(m, dict)
+            }
+            if "trustnode_intelligence" in enabled_keys:
+                mc = dict(lic_pre.get("module_configs") or {})
+                # Operator 2026-06-30 (bug fix): only inject local AI
+                # Endpoint config when the upstream payload didn't
+                # already carry one. This runs on BOTH the VPS portal
+                # (where _load_ai_endpoint_config has the real OpenAI
+                # config) AND on the customer's Edge (where the local
+                # app_settings doesn't have ai_endpoint_config — only
+                # the VPS does). Without this guard, the Edge would
+                # overwrite the VPS-injected real config with its own
+                # empty defaults during the relay.
+                local_ai = _load_ai_endpoint_config()
+                upstream_ti = mc.get("trustnode_intelligence") if isinstance(mc.get("trustnode_intelligence"), dict) else None
+                upstream_has_real = bool(upstream_ti and str(upstream_ti.get("endpoint_url") or "").strip())
+                local_has_real = bool(str(local_ai.get("endpoint_url") or "").strip())
+                if local_has_real or not upstream_has_real:
+                    # We are the authoritative source OR upstream had nothing.
+                    mc["trustnode_intelligence"] = local_ai if local_has_real else (upstream_ti or local_ai)
+                # else: upstream had a real config + we don't — preserve upstream.
+                lic_pre["module_configs"] = mc
+        except Exception as _mc_exc:
+            logger.warning("module_configs enrichment failed: %s", _mc_exc)
+
     # Operator 2026-06-18: SIGN the license payload server-side IF this
     # backend is running on the dev portal VPS (TRUSTNODE_LICENSE_SIGNING_PRIVATE_PEM
     # env var present). The customer's tray then verifies the signature
@@ -2788,6 +2993,30 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
             out["license"] = sign_license_payload(lic, private_pem_str.encode("utf-8"))
     except Exception as _exc:
         logger.warning("license_signature: server-side signing failed: %s", _exc)
+
+    # Operator 2026-06-30: persist the FRESH license bundle (modules +
+    # module_configs) into the unscoped app_settings.license so
+    # license_inspect and any bolt-on module's config reader (e.g.
+    # trustnode_intelligence reading endpoint_url/model/auth_token) can
+    # see the latest values without needing the scoped-doc overlay.
+    # Runs regardless of signing status — module_configs travel with
+    # or without a signature key on the VPS.
+    try:
+        _cloud_ok = bool(out.get("ok"))
+        _lic_payload = out.get("license") if isinstance(out.get("license"), dict) else None
+        if _cloud_ok and _lic_payload:
+            _bs = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+            _s_persist = dict(_bs.get("app_settings") or {})
+            _s_persist["license"] = dict(_lic_payload)
+            app_store.upsert_domain("app_settings", _s_persist, actor="license_check_persist")
+            # Invalidate the 30s cache so license_inspect re-reads now.
+            try:
+                from app.services import license_inspect as _li
+                _li.invalidate_cache()
+            except Exception:
+                pass
+    except Exception as _pexc:
+        logger.warning("license bundle persist failed: %s", _pexc)
 
     # Now verify on the response — the tray does the same check on its
     # end with the bundled public key. Verifying here too gives the dev

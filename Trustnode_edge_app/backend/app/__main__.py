@@ -41,11 +41,25 @@ def main() -> None:
     # loaded) and /api/boot-probe (proves devices/DBs reachable).
     # Those are the only two signals that matter — anything else
     # adds false-negative risk we proved we don't want.
+    # Operator 2026-07-03: tune HTTP keep-alive to stop connection churn.
+    # The Electron renderer opens short-lived fetch connections; with the
+    # default 5s keep-alive and rapid UI requests, thousands of sockets piled
+    # up in TIME_WAIT and, during a burst, exhausted the browser's ~6-conn/
+    # host limit → "Failed to fetch". A longer keep-alive lets the browser
+    # REUSE one connection for many requests instead of opening a new socket
+    # each time.
+    #
+    # We DO NOT set limit_concurrency — uvicorn returns HTTP 503 when that
+    # cap is exceeded, which surfaced as "Service Unavailable" on delete
+    # during bursts. A large accept backlog absorbs bursts instead of
+    # refusing them; requests queue briefly rather than 503.
     uvicorn.run(
         "app.main:app",
         host=settings.trustnode_host,
         port=settings.trustnode_port,
         reload=False,
+        timeout_keep_alive=75,   # keep idle conns open 75s → browser reuses them
+        backlog=2048,            # absorb connection bursts without refusing
     )
 
 

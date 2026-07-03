@@ -20,7 +20,14 @@ class Settings(BaseSettings):
     trustnode_env: str = "dev"
     trustnode_host: str = "127.0.0.1"
     trustnode_port: int = 8000
-    trustnode_cors_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
+    # Operator 2026-07-02: include `null` and `file://` so the packaged
+    # Electron app (which loads the SPA from file:// and therefore sends
+    # `Origin: null` on cross-origin fetches to the loopback backend) passes
+    # CORS preflight for POST/DELETE. Without this, POST/DELETE from the
+    # desktop app failed preflight with 400 and fetch() rejected as
+    # "Failed to fetch" (create chat / delete chat / send message). The
+    # backend binds 127.0.0.1 only, so allowing the local app origin is safe.
+    trustnode_cors_origins: str = "http://127.0.0.1:5173,http://localhost:5173,null,file://"
 
     @property
     def cors_origins(self) -> List[str]:
