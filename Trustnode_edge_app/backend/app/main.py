@@ -833,6 +833,23 @@ async def _deferred_startup() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    # Operator 2026-07-03 (COLLECTION-STARVATION FIX): raise the anyio
+    # default thread limiter from 40 to 200. FastAPI runs every sync route
+    # AND every `asyncio.to_thread` on this ONE shared pool. The PLC worker
+    # does read + persist via to_thread each cycle; with 2 gateways at ~1Hz
+    # plus cloud-sync + UI polling, 40 tokens is too tight — collection
+    # to_thread calls QUEUED behind request handling, producing the historian
+    # gaps the operator reported. Raising the ceiling is purely additive
+    # (more concurrency, never less) and lets collection + the UI coexist.
+    try:
+        import anyio
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        if limiter.total_tokens < 200:
+            limiter.total_tokens = 200
+            print(f"[trustnode][boot] anyio thread limiter raised to {limiter.total_tokens}", flush=True)
+    except Exception as _exc:
+        print(f"[trustnode][boot] could not raise thread limiter: {_exc!r}", flush=True)
+
     # Phase 4a-2: kick the deferred boot work onto the event loop so the
     # startup handler returns immediately and uvicorn starts answering
     # /api/health. The 2026-06-17 in-process LAN socket + OPC UA/MQTT

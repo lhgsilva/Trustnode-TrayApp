@@ -1,4 +1,5 @@
-import asyncio
+import time as _time
+import threading as _threading
 
 from fastapi import APIRouter, Request, HTTPException
 
@@ -22,30 +23,47 @@ def _collect_license_summary() -> dict:
         return {}
 
 
-@router.get("/health")
-async def health() -> dict:
-    # Operator 2026-07-02: `health` is now `async` and the two calls that
-    # acquire the global app_store lock (routing status + license summary)
-    # run via asyncio.to_thread. Previously this was a plain `def` handler
-    # that ran on the SHARED anyio threadpool; when those lock-acquiring
-    # calls blocked (historian flush / cloud-sync holding the lock), the
-    # health thread sat there occupying a pool slot. Enough concurrent
-    # blocked slots drained the pool and froze EVERY sync route. Moving the
-    # blocking work to to_thread keeps the anyio pool free for other
-    # requests while this coroutine awaits. Output JSON is unchanged.
+# Operator 2026-07-03 (REGRESSION FIX): the UI polls /api/health frequently.
+# A short in-process cache means the routing + license reads happen at most
+# once per _HEALTH_TTL, NOT on every poll — so health stays cheap even under
+# heavy collection and never competes with the PLC write path.
+_HEALTH_CACHE = {"at": 0.0, "routing": {}, "license": {}}
+_HEALTH_TTL = 5.0
+_HEALTH_LOCK = _threading.Lock()
 
-    # Operator 2026-06-19 (L5): surface the boot-time SQLite
-    # quick_check result so the desktop supervisor / support staff
-    # can spot a corrupted store before the operator does.
+
+@router.get("/health")
+def health() -> dict:
+    # Operator 2026-07-03 (REGRESSION FIX): reverted from `async def` +
+    # asyncio.to_thread back to a PLAIN `def`. The async+to_thread variant
+    # (added 2026-07-02) borrowed from the shared anyio threadpool on EVERY
+    # health poll. Under active collection the PLC worker's per-cycle
+    # to_thread(read_from_gateway) calls saturate that pool, so health's
+    # to_thread work QUEUED for ~1.25s AND stole threads from collection —
+    # causing the historian/chart GAPS the operator reported. A plain `def`
+    # runs inline in FastAPI's own worker slot (never spawns competing
+    # to_thread tasks), and the 5s cache below makes the reads near-free.
+    # This restores the fast, contention-free behavior of the working build.
+
+    # Operator 2026-06-19 (L5): surface the boot-time SQLite quick_check.
     integrity = {}
     try:
         integrity = dict(getattr(app_store, "_last_integrity_results", {}) or {})
     except Exception:
         integrity = {}
-    # Operator 2026-06-23: historian read-routing + license summary. Both
-    # acquire the app_store lock, so run them off the anyio pool.
-    routing = await asyncio.to_thread(_collect_routing)
-    license_summary = await asyncio.to_thread(_collect_license_summary)
+
+    now = _time.monotonic()
+    with _HEALTH_LOCK:
+        fresh = (now - _HEALTH_CACHE["at"]) < _HEALTH_TTL and _HEALTH_CACHE["at"] > 0
+        if fresh:
+            routing = _HEALTH_CACHE["routing"]
+            license_summary = _HEALTH_CACHE["license"]
+        else:
+            routing = _collect_routing()
+            license_summary = _collect_license_summary()
+            _HEALTH_CACHE["at"] = now
+            _HEALTH_CACHE["routing"] = routing
+            _HEALTH_CACHE["license"] = license_summary
     return {
         "status": "ok",
         "api_build": "edge-2026-06-23-canonical-db-1",
