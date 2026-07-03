@@ -24,6 +24,11 @@ from .tools import run_tool
 
 _LAST_RE = re.compile(r"\b(last|latest|current|most recent)\b.*\b(reading|value|reads?)\b", re.I)
 _AVG_RE = re.compile(r"\b(average|avg|mean|min|max|minimum|maximum|stddev|std|summary|stats?)\b", re.I)
+# Bare current-value ask: "value of X", "what is X", "reading of X",
+# "how much is X", "show me X". Very common; must be instant (maps to the
+# tag summary, which returns latest value + basic stats). Deliberately does
+# NOT require a last/latest qualifier — that gap sent these to the slow loop.
+_VALUE_RE = re.compile(r"\b(value|reading|worth)\b|\b(what|whats|how much|show( me)?|give me)\b", re.I)
 _CHART_RE = re.compile(r"\b(chart|plot|graph|trend|visuali[sz]e|show me.*(over time|readings?)|line chart)\b", re.I)
 _BUCKET_RE = re.compile(r"\b(every|per)\s+(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|h|hour|hours)\b", re.I)
 
@@ -152,7 +157,7 @@ def classify(user_message: str) -> Optional[Dict[str, Any]]:
                          "max_points": 200},
                 "is_chart": True}
 
-    if _LAST_RE.search(text) or _AVG_RE.search(text):
+    if _LAST_RE.search(text) or _AVG_RE.search(text) or _VALUE_RE.search(text):
         return {"kind": "summary", "tool": "get_tag_summary",
                 "args": {"tag": tag, "from_": frm, "to": "now"},
                 "is_chart": False}

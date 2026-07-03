@@ -323,12 +323,15 @@ def run_chat_turn(chat_id: str, user_message: str, data_source: str = "local",
     if mode not in ("instant", "high"):
         # tolerate legacy names
         mode = "instant" if mode == "turbo" else "high"
+    # Operator 2026-07-03 (INSTANT-WORKS-WITHOUT-AI): do NOT bail here when the
+    # AI endpoint is unconfigured. Pure-data queries (list tags/gateways/alarms,
+    # tag value, trend, chart) are answered by the deterministic fast-path with
+    # NO AI call at all — they must work even with no endpoint. We resolve the
+    # AI client LAZILY and only require it on the branches that truly need AI
+    # (narration, interpretation, the full tool loop). Previously this returned
+    # "AI endpoint not configured" up front, which broke EVERY message —
+    # including Instant data lookups that need no model.
     client, err = _client()
-    if not client:
-        # Still persist the user message so the chat history is intact.
-        store.append_message(chat_id, "user", user_message)
-        store.append_message(chat_id, "assistant", err)
-        return {"ok": False, "error": err, "content": err, "tool_log": []}
 
     # Operator 2026-07-02 (FAST-PATH): for common, clearly-shaped single-tag
     # questions (last reading / average / chart / bucketed) we skip the
@@ -390,6 +393,25 @@ def run_chat_turn(chat_id: str, user_message: str, data_source: str = "local",
                             "path": "local"}
                 except Exception:
                     pass  # fall through to AI narration
+            # AI narration needs a client. If the endpoint isn't configured,
+            # don't error out on a query we CAN answer — render the data
+            # locally (it's a real answer) and advise enabling High Effort/AI
+            # for the interpretation. Only truly AI-only asks surface the error.
+            if not client:
+                try:
+                    from . import fastpath as _fp3
+                    content = _fp3.render_local(fp["tool_name"], tool_result, fp.get("is_chart"))
+                    content += ("\n\n_Showing the data directly. In-depth AI analysis "
+                                "is unavailable until the assistant endpoint is configured._")
+                    store.append_message(chat_id, "assistant", content,
+                                         tool_calls=None, tool_results=tlog)
+                    _log.info("fast-path LOCAL fallback (no AI client) (%s) in %.2fs",
+                              fp["tool_name"], _time.monotonic() - _t0)
+                    return {"ok": True, "content": content, "tool_log": tlog,
+                            "path": "local_no_ai"}
+                except Exception:
+                    store.append_message(chat_id, "assistant", err)
+                    return {"ok": False, "error": err, "content": err, "tool_log": []}
             try:
                 content = _narrate_result(client, user_message, tool_result, fp.get("is_chart"))
                 if content:
@@ -423,6 +445,16 @@ def run_chat_turn(chat_id: str, user_message: str, data_source: str = "local",
         store.append_message(chat_id, "assistant", advice)
         _log.info("instant-mode advisory (needs High Effort)")
         return {"ok": True, "content": advice, "tool_log": [], "path": "instant_advise"}
+
+    # From here on we run the full AI tool-loop (High Effort, interpretive
+    # question that the fast-path couldn't answer). This genuinely needs the
+    # model — if the endpoint isn't configured, surface the friendly error now
+    # (the user message was persisted above when _fastpath_user_persisted).
+    if not client:
+        if not _fastpath_user_persisted:
+            store.append_message(chat_id, "user", user_message)
+        store.append_message(chat_id, "assistant", err)
+        return {"ok": False, "error": err, "content": err, "tool_log": []}
 
     # Build conversation history.
     # Operator 2026-07-02: cap to the last N messages and STRIP embedded
