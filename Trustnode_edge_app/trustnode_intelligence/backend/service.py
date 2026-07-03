@@ -101,10 +101,37 @@ SYSTEM_PROMPT = (
     "  Use for limit/SLA/spec questions ('how long was X above 150?').\n"
     "- `detect_anomalies` — SPC control limits (mean +/- k-sigma) and out-of-control point count.\n"
     "  Use for 'any anomalies/outliers?', 'is the process in control?'. Default sigma=3.\n"
+    "- `get_multi_tag_timeseries` — overlay MULTIPLE tags on ONE chart (no analysis). Use for a\n"
+    "  plain 'trend/plot A, B, C together' when the user just wants to SEE them overlaid.\n"
+    "- `compare_tags` — COMPARE/CORRELATE multiple tags over a range at a chosen time bucket.\n"
+    "  Returns a multi-series chart + a pairwise Pearson correlation matrix + insights. USE THIS\n"
+    "  (not get_multi_tag_timeseries) whenever the user says compare / correlate / relationship /\n"
+    "  'move together' / 'which drives which', OR gives a bucket size. Args: tags[], from_/to,\n"
+    "  bucket (1s..1d or 'auto'). Embed its `series` in a ```trustnode-chart block and present\n"
+    "  the correlation table + insights.\n"
     "- Filters: get_bucketed_series accepts value_gt / value_lt / quality to constrain readings.\n"
     "As a quality engineer, prefer the analytics tool that answers the UNDERLYING question,\n"
     "not just the literal words — e.g. 'is my level stable?' → detect_anomalies + analyze_trend,\n"
     "then interpret (in control? drifting? capable?).\n"
+    "\n"
+    "# RESOLVING NATURAL TIME RANGES (do this BEFORE the data tool)\n"
+    "The user often describes a range by an EVENT, not a clock time. Resolve it to explicit\n"
+    "from/to first, then pass those to the data/compare tool:\n"
+    "- 'the last batch' / 'last test' / 'last run' / 'this batch': call `list_recent_batches`\n"
+    "  (limit 1, or the N they named), take the batch's started_utc → ended_utc (use\n"
+    "  `get_batch_summary` for exact times), then query/compare tags over THAT window. If a\n"
+    "  batch is still running, use started_utc → now.\n"
+    "- 'the last N batches' / 'recent batches': list them, then either compare per-batch stats\n"
+    "  or use the span from the oldest batch's start to the newest batch's end.\n"
+    "- 'since the process started' / 'since collection began' / 'all data': use a wide window\n"
+    "  ('-30d' or the earliest reading) — state that you used the full available history.\n"
+    "- 'since <tag> went to <value>' / 'since it crossed X' / 'after it hit X': use\n"
+    "  `detect_threshold` (upper_limit/lower_limit = the value) over a recent window to find the\n"
+    "  FIRST crossing time, then use that timestamp as the `from_` for the real query.\n"
+    "- 'since the last alarm' / 'since the fault': use `list_recent_alarms` to get the most recent\n"
+    "  alarm time and query from there.\n"
+    "ALWAYS state the concrete window you resolved to ('last batch: 30 Jun 14:02 → 14:37 (local)')\n"
+    "so the operator can trust the range.\n"
     "\n"
     "# NAMING RULES (important — affects how the user reads the answer)\n"
     "- When referring to a gateway in the human reply, ALWAYS use its `name`\n"
@@ -581,6 +608,32 @@ def run_insight(prompt: str, tool_plan: List[Dict[str, Any]],
         args = step.get("args") or {}
         result = run_tool(name, args, {"data_source": data_source})
         tool_results.append({"name": name, "args": args, "result": result})
+
+    # Operator 2026-07-03 (TABLE/CHART PARITY): if the saved insight is a single
+    # DETERMINISTIC data tool that the chat renders as a TABLE or CHART
+    # (list_tags/list_gateways/list_recent_alarms/get_tag_timeseries/
+    # get_multi_tag_timeseries/get_tag_summary/get_bucketed_series), render it
+    # the SAME way here — so a scheduled run produces the exact table/chart the
+    # user saw in chat, not an AI prose paraphrase. Needs no AI client, so this
+    # also works when the endpoint isn't configured.
+    _RENDERABLE = {
+        "list_tags", "list_gateways", "list_recent_alarms",
+        "get_tag_timeseries", "get_multi_tag_timeseries",
+        "get_tag_summary", "get_bucketed_series",
+    }
+    if len(tool_results) == 1 and str(tool_results[0].get("name")) in _RENDERABLE:
+        tr = tool_results[0]
+        res0 = tr.get("result")
+        if isinstance(res0, dict) and not res0.get("error"):
+            try:
+                from . import fastpath as _fp
+                is_chart = ("timeseries" in tr["name"]) or bool(res0.get("series")) and tr["name"] != "get_tag_summary"
+                content = _fp.render_local(tr["name"], res0, bool(is_chart))
+                if content:
+                    return {"ok": True, "content": content, "tool_results": tool_results,
+                            "path": "insight_local"}
+            except Exception:
+                pass  # fall through to AI narration
 
     if not client:
         # Return raw results with the error message — caller (scheduler /

@@ -70,6 +70,17 @@ CREATE TABLE IF NOT EXISTS ai_insight_runs (
     FOREIGN KEY (insight_id) REFERENCES ai_insights(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS ix_ai_insight_runs_insight ON ai_insight_runs(insight_id, started_utc DESC);
+
+-- Operator 2026-07-03: customer-editable predefined queries (the starter-query
+-- palette). One row per tenant holding the full palette JSON. IF NOT EXISTS +
+-- per-tenant means: FRESH install has no row (→ serve built-in defaults), an
+-- UPGRADE just adds the table without touching data, and once the customer
+-- customizes their palette it persists here and survives future upgrades.
+CREATE TABLE IF NOT EXISTS ai_presets (
+    tenant_id     TEXT PRIMARY KEY,
+    palette_json  TEXT NOT NULL,
+    updated_utc   TEXT NOT NULL
+);
 """
 
 # Per-insight cap on the runs table (FIFO trim on insert). Keeps the
@@ -487,4 +498,46 @@ def delete_insight(insight_id: str) -> None:
     ensure_schema()
     with _connect() as con:
         con.execute("DELETE FROM ai_insights WHERE id=?", (insight_id,))
+        con.commit()
+
+
+# --- presets (customer-editable starter-query palette) --------------------
+
+def get_presets(tenant_id: str) -> Optional[Dict[str, Any]]:
+    """Return the customer's SAVED palette JSON for this tenant, or None if
+    they haven't customized it yet (caller then serves the built-in defaults).
+    """
+    ensure_schema()
+    with _connect() as con:
+        row = con.execute(
+            "SELECT palette_json FROM ai_presets WHERE tenant_id=?",
+            (tenant_id or "default",),
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
+
+
+def save_presets(tenant_id: str, palette: Dict[str, Any]) -> None:
+    """Persist the customer's edited palette for this tenant (upsert)."""
+    ensure_schema()
+    payload = json.dumps(palette, default=str)
+    with _connect() as con:
+        con.execute(
+            "INSERT INTO ai_presets (tenant_id, palette_json, updated_utc) VALUES (?,?,?) "
+            "ON CONFLICT(tenant_id) DO UPDATE SET palette_json=excluded.palette_json, "
+            "updated_utc=excluded.updated_utc",
+            (tenant_id or "default", payload, _now_utc()),
+        )
+        con.commit()
+
+
+def reset_presets(tenant_id: str) -> None:
+    """Delete the customer's custom palette so defaults are served again."""
+    ensure_schema()
+    with _connect() as con:
+        con.execute("DELETE FROM ai_presets WHERE tenant_id=?", (tenant_id or "default",))
         con.commit()

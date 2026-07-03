@@ -96,6 +96,29 @@ def _extract_tag(text: str) -> Optional[str]:
     return None
 
 
+def _extract_tags(text: str, limit: int = 6) -> list:
+    """Pull MULTIPLE candidate tag tokens, in order, de-duplicated. Used for
+    multi-series charts ('trend BT_PVA_Level, BT_PVB_Level, BT_PVC_Level').
+    Only collects strongly tag-shaped tokens (bracket / underscore / embedded
+    digit) so plain English words don't get mistaken for tags — for a single
+    plain word we still fall back to _extract_tag. Returns [] if none."""
+    out = []
+    seen = set()
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9_]*(?:\[\d+\])?", text):
+        tok = m.group(0)
+        if tok.lower() in _STOP:
+            continue
+        # Strongly tag-shaped only (avoid grabbing 'chart', 'readings', etc.).
+        if "[" in tok or "_" in tok or any(c.isdigit() for c in tok):
+            key = re.sub(r"[^a-z0-9]", "", tok.lower())
+            if key not in seen:
+                seen.add(key)
+                out.append(tok)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _window_from(text: str) -> str:
     m = _WINDOW_RE.search(text)
     if m:
@@ -114,9 +137,49 @@ def _window_from(text: str) -> str:
     return "-1h"
 
 
-_LIST_TAGS_RE = re.compile(r"\b(list|show|what|which)\b.*\btags?\b", re.I)
-_LIST_GW_RE = re.compile(r"\b(list|show|what|which)\b.*\b(gateway|gateways|plc)s?\b", re.I)
-_LIST_ALARMS_RE = re.compile(r"\b(list|show|any|recent)\b.*\b(alarm|alarms|alert|alerts|events?)\b", re.I)
+# Operator 2026-07-03: broadened these so natural phrasings route to the
+# instant catalog tools instead of being misread as a tag lookup. Previously
+# "give me detailed information about the current gateway" started with
+# "give me" (not in the old list|show|what|which set), so it fell through,
+# grabbed "detailed" as a tag, found nothing, and punted to High Effort. Now
+# ANY request-ish verb OR a bare mention of the entity triggers the listing —
+# gateways/tags/alarms are pure data and must ALWAYS be instant, no AI.
+# "Live intent" — the user wants what is ACTIVE NOW, not the whole catalog.
+_LIVE_RE = re.compile(r"\b(live|running|active|now|currently|being collected|collecting|online|real[\- ]?time)\b", re.I)
+# "Compare intent" — wants correlation/comparison analysis, not just an overlay.
+_COMPARE_RE = re.compile(r"\b(compare|comparison|correlat|relationship|relate|versus|vs\.?|against|side by side|analyz?e|analys)\b", re.I)
+_UNIT = r"(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)"
+# EXPLICIT bucket phrase — a grouping keyword immediately before the number.
+# This must win over a bare time that belongs to the RANGE ("last 30 minutes").
+_BUCKET_EXPLICIT_RE = re.compile(
+    rf"\b(?:group(?:ed)?\s+(?:by|in|into)|every|per|each|bucket(?:ed|s)?(?:\s+of)?|interval(?:\s+of)?|resolution(?:\s+of)?)\s+(\d+)\s*{_UNIT}\b",
+    re.I)
+# A number+unit that appears right before/after the word 'bucket' (e.g. "10s buckets").
+_BUCKET_TRAILING_RE = re.compile(rf"\b(\d+)\s*{_UNIT}\s+buckets?\b", re.I)
+_BUCKET_NAMED = {
+    "secondly": "1s", "minutely": "1m", "hourly": "1h", "daily": "1d",
+}
+
+
+def _bucket_label_from(text: str):
+    """Extract the time-BUCKET the user asked for ('5s','1m','1h'...), or None.
+    Prefers an explicit grouping phrase ('group by 1 minute', 'every 5s',
+    '10s buckets') so a range like 'last 30 minutes' is NOT mistaken for it."""
+    for rx in (_BUCKET_EXPLICIT_RE, _BUCKET_TRAILING_RE):
+        m = rx.search(text)
+        if m:
+            n, u = m.group(1), m.group(2).lower()
+            ub = "s" if u.startswith("s") else ("m" if u.startswith("m") else ("h" if u.startswith("h") else "d"))
+            return f"{n}{ub}"
+    for word, lab in _BUCKET_NAMED.items():
+        if re.search(rf"\b{word}\b", text, re.I):
+            return lab
+    return None
+
+_REQ = r"(list|show|what|which|give|tell|display|info|information|details?|describe|current|running|status|all|my)"
+_LIST_TAGS_RE = re.compile(rf"\b{_REQ}\b.*\btags?\b", re.I)
+_LIST_GW_RE = re.compile(rf"\b{_REQ}\b.*\b(gateway|gateways|plc|plcs|device|devices)\b", re.I)
+_LIST_ALARMS_RE = re.compile(rf"\b{_REQ}\b.*\b(alarm|alarms|alert|alerts|events?)\b", re.I)
 
 
 def classify(user_message: str) -> Optional[Dict[str, Any]]:
@@ -125,12 +188,19 @@ def classify(user_message: str) -> Optional[Dict[str, Any]]:
     if len(text) > 200:
         return None  # long/complex → full loop
 
+    # Operator 2026-07-03 (LIVE INTENT): if the question is about what is LIVE /
+    # RUNNING / ACTIVE / being collected right NOW, pass live_only so the tool
+    # proves recency from the historian instead of dumping the whole configured
+    # catalog. "list all tags" (no live word) still returns the full catalog.
+    live_only = bool(_LIVE_RE.search(text))
+    _largs = {"live_only": True} if live_only else {}
+
     # Catalog listings — pure data, no tag needed. These are common and should
     # be instant (the old full-loop made 'list tags' take several seconds).
     if _LIST_GW_RE.search(text) and not _LIST_TAGS_RE.search(text):
-        return {"kind": "list", "tool": "list_gateways", "args": {}, "is_chart": False}
+        return {"kind": "list", "tool": "list_gateways", "args": dict(_largs), "is_chart": False}
     if _LIST_TAGS_RE.search(text):
-        return {"kind": "list", "tool": "list_tags", "args": {}, "is_chart": False}
+        return {"kind": "list", "tool": "list_tags", "args": dict(_largs), "is_chart": False}
     if _LIST_ALARMS_RE.search(text):
         return {"kind": "list", "tool": "list_recent_alarms", "args": {}, "is_chart": False}
 
@@ -140,6 +210,33 @@ def classify(user_message: str) -> Optional[Dict[str, Any]]:
 
     is_chart = bool(_CHART_RE.search(text))
     frm = _window_from(text)
+
+    # Operator 2026-07-03 (MULTI-SERIES CHART): if the user named MORE THAN ONE
+    # tag and wants a chart ("trend BT_PVA_Level, BT_PVB_Level, BT_PVC_Level in
+    # the same chart"), route to the multi-tag tool so all series overlay on one
+    # chart. The renderer already accepts the multi-series shape natively and
+    # auto-splits axes when ranges differ. Previously only the FIRST tag was
+    # extracted, so only one series was plotted.
+    multi_tags = _extract_tags(text)
+    if len(multi_tags) >= 2:
+        # Operator 2026-07-03 (COMPARE + CORRELATE): if the user wants to
+        # COMPARE / CORRELATE the tags, or specifies a time BUCKET, route to
+        # compare_tags (same-grid bucketing + Pearson correlation + insights).
+        # This produces its OWN chart, so it doesn't require a 'chart'/'trend'
+        # word. A plain overlay (chart word, no compare intent) still uses the
+        # lightweight multi-tag timeseries.
+        wants_compare = bool(_COMPARE_RE.search(text))
+        bucket = _bucket_label_from(text)
+        if wants_compare or bucket:
+            return {"kind": "comparison", "tool": "compare_tags",
+                    "args": {"tags": multi_tags, "from_": frm, "to": "now",
+                             "bucket": bucket or "auto"},
+                    "is_chart": True}
+        if is_chart:
+            return {"kind": "multichart", "tool": "get_multi_tag_timeseries",
+                    "args": {"tags": multi_tags, "from_": frm, "to": "now",
+                             "max_points": 200},
+                    "is_chart": True}
 
     # Bucketed ("average every 5 minutes")
     bm = _BUCKET_RE.search(text)
@@ -214,20 +311,31 @@ def render_local(tool_name: str, result: dict, is_chart: bool) -> str:
     import json as _json
 
     # ---- Catalog listings (tags / gateways / alarms) ----
+    live = bool(result.get("live_only"))
+    since = result.get("since")
     if tool_name == "list_tags":
         tags = result.get("tags") or []
         if not tags:
+            if live:
+                return (f"No tags have reported since {since} — nothing is actively "
+                        f"collecting right now.")
             return "No tags are currently being collected."
-        rows = ["**Collected tags** — {} total".format(len(tags)), "",
-                "| Tag | Gateway |", "|---|---|"]
+        title = (f"**Live tags** — {len(tags)} collecting now" + (f" (since {since} UTC)" if since else "")) if live \
+                else "**Collected tags** — {} total".format(len(tags))
+        rows = [title, "", "| Tag | Gateway |", "|---|---|"]
         for t in tags:
             rows.append(f"| {t.get('tag','')} | {t.get('gateway_name') or t.get('gateway_id','')} |")
         return "\n".join(rows)
     if tool_name == "list_gateways":
         gws = result.get("gateways") or []
         if not gws:
+            if live:
+                return (f"No gateway has written data since {since} — none are actively "
+                        f"running right now.")
             return "No gateways are configured."
-        rows = ["**Gateways** — {} total".format(len(gws)), "",
+        title = (f"**Live gateways** — {len(gws)} running now" + (f" (since {since} UTC)" if since else "")) if live \
+                else "**Gateways** — {} total".format(len(gws))
+        rows = [title, "",
                 "| Name | Type | IP | Interval (ms) | Running |", "|---|---|---|---|---|"]
         for g in gws:
             rows.append(f"| {g.get('name') or g.get('id','')} | {g.get('type','')} | "
@@ -243,6 +351,64 @@ def render_local(tool_name: str, result: dict, is_chart: bool) -> str:
             rows.append(f"| {a.get('ts_utc','')} | {a.get('level','')} | "
                         f"{a.get('gateway_name') or a.get('category','')} | {str(a.get('message','')).replace('|','/')} |")
         return "\n".join(rows)
+
+    # ---- Comparison (compare_tags): chart + correlation matrix + insights ----
+    if result.get("kind") == "comparison":
+        import json as _jc
+        frm2, to2 = result.get("from"), result.get("to")
+        bkt = result.get("bucket")
+        good = [s for s in (result.get("series") or []) if isinstance(s, dict) and (s.get("series") or [])]
+        out = []
+        tags_lbl = ", ".join(f"**{s.get('tag')}**" for s in good) or "the selected tags"
+        out.append(f"**Comparison** — {tags_lbl}")
+        out.append(f"_Window {frm2} → {to2}  ·  bucket {bkt}  ·  {result.get('buckets',0)} points per tag_")
+        # Chart (multi-series overlay).
+        if good:
+            out.append("")
+            out.append("```trustnode-chart\n" + _jc.dumps({"from": frm2, "to": to2, "series": good}, default=str) + "\n```")
+        # Correlation matrix table.
+        cors = result.get("correlations") or []
+        if cors:
+            out.append("")
+            out.append("**Correlation (Pearson r)**")
+            out.append("")
+            out.append("| Tag A | Tag B | r | Strength | Direction | Buckets |")
+            out.append("|---|---|---|---|---|---|")
+            for c in cors:
+                rr = c.get("r")
+                out.append(f"| {c.get('tag_a')} | {c.get('tag_b')} | "
+                           f"{('%.3f' % rr) if isinstance(rr,(int,float)) else '—'} | "
+                           f"{c.get('strength','')} | {c.get('direction') or '—'} | {c.get('n',0)} |")
+        # Plain-language insights.
+        ins = result.get("insights") or []
+        if ins:
+            out.append("")
+            out.append("**Insights**")
+            for line in ins:
+                out.append(f"- {line}")
+        return "\n".join(out)
+
+    # ---- Multi-series chart (multiple tags overlaid on one chart) ----
+    # The multi-tag tool returns {from, to, series:[{tag, gateway_name,
+    # series:[{ts,value}]}, ...]}. Detect it by series[0] being a dict that
+    # itself carries a nested 'series' list, and emit the multi-shape the
+    # chart component renders natively (one line per tag, auto dual-axis).
+    _ms = result.get("series")
+    if is_chart and isinstance(_ms, list) and _ms and isinstance(_ms[0], dict) and "series" in _ms[0]:
+        import json as _json2
+        frm2, to2 = result.get("from"), result.get("to")
+        # Keep only series that actually have points; note any empties.
+        good = [s for s in _ms if isinstance(s, dict) and (s.get("series") or [])]
+        empty = [str(s.get("tag") or "?") for s in _ms if not (isinstance(s, dict) and (s.get("series") or []))]
+        if not good:
+            names = ", ".join(str(s.get("tag") or "?") for s in _ms)
+            return (f"**{names}** — no readings in {frm2} → {to2}.\n\n"
+                    f"The gateway may not have been collecting these tags in that window.")
+        chart_json = _json2.dumps({"from": frm2, "to": to2, "series": good}, default=str)
+        tags_lbl = ", ".join(f"**{s.get('tag')}**" for s in good)
+        note = f"  ·  (no data: {', '.join(empty)})" if empty else ""
+        head = f"{tags_lbl} — {len(good)} series{note}"
+        return f"{head}\n\n```trustnode-chart\n{chart_json}\n```"
 
     tag = result.get("tag") or "tag"
     gw = result.get("gateway_name")

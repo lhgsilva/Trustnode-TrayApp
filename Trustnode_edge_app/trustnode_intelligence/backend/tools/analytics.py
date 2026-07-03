@@ -511,3 +511,184 @@ def _estimate_interval_seconds(gateway_id: str) -> Optional[float]:
         return 1.0
     except Exception:
         return 1.0
+
+
+# --------------------------------------------------------------------------
+# 5. Multi-tag comparison: same-grid bucketing + Pearson correlation + insights
+#    (operator 2026-07-03)
+# --------------------------------------------------------------------------
+
+def _tag_span(bmap: Dict[int, float]) -> Optional[float]:
+    vs = list(bmap.values())
+    return (max(vs) - min(vs)) if vs else None
+
+
+def _bucketed_avg_for_tag(tag: str, frm: datetime, to: datetime, bucket_s: int,
+                          gateway_id: str = "") -> Dict[int, float]:
+    """Return {bucket_epoch_s: avg_value} for ONE tag over [frm,to), aggregated
+    into fixed bucket_s buckets. Same SQL bucketing as get_bucketed_series so
+    every tag in a comparison lands on one aligned time grid."""
+    out: Dict[int, Tuple[float, int]] = {}
+    for db_path in all_db_paths():
+        tenants = _historian_tenants(db_path)
+        if not tenants:
+            continue
+        try:
+            con = _connect(db_path)
+        except Exception:
+            continue
+        try:
+            for tid in tenants:
+                wsql, params = _where_and_params(tid, frm, to, tag, gateway_id, None, None, "")
+                sql = (
+                    f"SELECT (CAST(strftime('%s', ts_utc) AS INTEGER) / {bucket_s}) * {bucket_s} AS bkt, "
+                    f"AVG(CAST(value AS REAL)) AS a, COUNT(*) AS c "
+                    f"FROM historian_readings WHERE {wsql} "
+                    f"GROUP BY bkt ORDER BY bkt ASC LIMIT 5000"
+                )
+                try:
+                    for r in con.execute(sql, params):
+                        bkt = int(r[0]); a = r[1]; c = int(r[2] or 0)
+                        if a is None:
+                            continue
+                        prev = out.get(bkt)
+                        if prev is None:
+                            out[bkt] = (float(a), c)
+                        else:
+                            pv, pc = prev
+                            tc = pc + c
+                            out[bkt] = (((pv * pc) + (float(a) * c)) / tc if tc else pv, tc)
+                except Exception:
+                    continue
+        finally:
+            try: con.close()
+            except Exception: pass
+    return {k: v[0] for k, v in out.items()}
+
+
+def _pearson(xs: List[float], ys: List[float]) -> Optional[float]:
+    """Pearson r over paired samples. None if <3 pairs or zero variance."""
+    n = len(xs)
+    if n < 3:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return sxy / math.sqrt(sxx * syy)
+
+
+def _corr_strength(r: float) -> str:
+    a = abs(r)
+    if a >= 0.9: return "very strong"
+    if a >= 0.7: return "strong"
+    if a >= 0.4: return "moderate"
+    if a >= 0.2: return "weak"
+    return "negligible"
+
+
+def run_compare_tags(args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    """Compare MULTIPLE tags over an explicit time range at a chosen time
+    bucket, returning a multi-series chart shape + a pairwise Pearson
+    correlation matrix + plain-language insights.
+
+    Args:
+      tags:    list (or comma-separated string) of 2..6 tag names.
+      from_/from, to: explicit range ('-1h'/'now', ISO, or epoch).
+      bucket:  one of 1s/5s/10s/30s/1m/5m/15m/1h/1d, or 'auto'.
+    """
+    tags_arg = args.get("tags") or []
+    if isinstance(tags_arg, str):
+        tags_list = [t.strip() for t in tags_arg.split(",") if t.strip()]
+    else:
+        tags_list = [str(t).strip() for t in tags_arg if str(t).strip()]
+
+    from .tag_summary import _auto_resolve
+    resolved: List[str] = []
+    for t in tags_list[:6]:
+        r = _auto_resolve(t)
+        if r.get("needs_choice"):
+            return {"disambiguation_needed": True, "query": t, "suggestions": r["needs_choice"],
+                    "instruction": "Ask the user to pick one of these tags, then call again."}
+        if r.get("not_found"):
+            continue
+        resolved.append(r["tag"])
+    seen = set(); tags = []
+    for t in resolved:
+        if t not in seen:
+            seen.add(t); tags.append(t)
+    if len(tags) < 2:
+        return {"error": "Need at least 2 valid tags to compare."}
+
+    frm = _parse_time(args.get("from_") or args.get("from") or "-1h")
+    to = _parse_time(args.get("to") or "now")
+    bucket_s, bucket_label = _resolve_bucket_seconds(args.get("bucket") or "auto", frm, to)
+    gateway_id = str(args.get("gateway_id") or "").strip()
+
+    per_tag: Dict[str, Dict[int, float]] = {t: _bucketed_avg_for_tag(t, frm, to, bucket_s, gateway_id) for t in tags}
+
+    series_out: List[Dict[str, Any]] = []
+    for t in tags:
+        pts = [{"ts": bkt * 1000, "value": v} for bkt, v in sorted(per_tag[t].items())]
+        vs = [p["value"] for p in pts]
+        series_out.append({
+            "tag": t, "gateway_name": gateway_name_for_tag(t), "series": pts,
+            "min": (min(vs) if vs else None), "max": (max(vs) if vs else None),
+            "avg": (sum(vs) / len(vs) if vs else None),
+        })
+
+    correlations: List[Dict[str, Any]] = []
+    best = None
+    for i in range(len(tags)):
+        for j in range(i + 1, len(tags)):
+            a, b = tags[i], tags[j]
+            common = sorted(set(per_tag[a].keys()) & set(per_tag[b].keys()))
+            xs = [per_tag[a][k] for k in common]
+            ys = [per_tag[b][k] for k in common]
+            r = _pearson(xs, ys)
+            entry = {
+                "tag_a": a, "tag_b": b,
+                "r": (round(r, 3) if r is not None else None),
+                "n": len(common),
+                "strength": (_corr_strength(r) if r is not None else "insufficient data"),
+                "direction": (("positive" if r > 0 else "negative") if r is not None else None),
+            }
+            correlations.append(entry)
+            if r is not None and (best is None or abs(r) > best[0]):
+                best = (abs(r), entry)
+
+    insights: List[str] = []
+    n_buckets = max((len(per_tag[t]) for t in tags), default=0)
+    if n_buckets == 0:
+        insights.append("No data in the selected window for these tags — widen the range or check the gateway.")
+    else:
+        if best is not None and best[1]["r"] is not None and abs(best[1]["r"]) >= 0.4:
+            e = best[1]
+            rel = "driven by the same condition" if e["direction"] == "positive" else "inversely related"
+            insights.append(
+                f"{e['tag_a']} and {e['tag_b']} move {e['direction']}ly together "
+                f"({e['strength']}, r={e['r']}, {e['n']} buckets) — likely {rel}."
+            )
+        else:
+            insights.append("No strong correlation between the compared tags in this window — they look largely independent.")
+        spans = {t: _tag_span(per_tag[t]) for t in tags}
+        real = {t: s for t, s in spans.items() if s}
+        if len(real) > 1:
+            widest = max(real, key=lambda k: real[k])
+            insights.append(f"{widest} has the widest variation over the window (range {real[widest]:.3g}).")
+
+    return {
+        "kind": "comparison",
+        "tags": tags,
+        "from": _to_sqlite_text(frm) + "Z",
+        "to": _to_sqlite_text(to) + "Z",
+        "bucket": bucket_label,
+        "bucket_seconds": bucket_s,
+        "buckets": n_buckets,
+        "series": series_out,          # multi-series chart shape (renders natively)
+        "correlations": correlations,  # pairwise Pearson matrix
+        "insights": insights,          # plain-language findings
+    }

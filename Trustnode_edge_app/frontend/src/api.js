@@ -138,10 +138,24 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
     if (token && !headers.Authorization) {
       headers.Authorization = `Bearer ${token}`;
     }
+    // Operator 2026-07-03 (CONNECTION-REUSE FIX): do NOT force `cache:"no-store"`.
+    // On the Electron file:// (null) origin, `no-store` makes Chromium open a
+    // BRAND-NEW TCP socket for EVERY request (no keep-alive reuse). With 22
+    // setInterval pollers here (several at 2-3s) each opening a fresh socket,
+    // Chromium's ~6-conn/host limit is saturated continuously — so an on-demand
+    // request (e.g. the Intelligence create-chat / switch-chat) QUEUES 20-40s
+    // waiting for a free connection slot.
+    //
+    // Dropping the client `no-store` is SAFE for freshness: the backend already
+    // sends `Cache-Control: no-store, no-cache, must-revalidate` on every
+    // response (verified), so the browser never serves a cached API response
+    // regardless. Removing the client flag just lets connections REUSE via
+    // keep-alive, freeing the pool. An explicit per-call `cache` option still
+    // wins if a caller sets one.
     const hasCacheOption = Object.prototype.hasOwnProperty.call(options || {}, "cache");
     const finalOptions = hasCacheOption
       ? { ...options, headers, signal: controller.signal }
-      : { ...options, headers, signal: controller.signal, cache: "no-store" };
+      : { ...options, headers, signal: controller.signal };
     return await fetch(url, finalOptions);
   } finally {
     clearTimeout(timeout);

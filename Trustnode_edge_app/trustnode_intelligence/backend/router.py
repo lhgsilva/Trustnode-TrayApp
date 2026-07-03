@@ -97,6 +97,70 @@ class CreateInsightRequest(BaseModel):
     email_to: str = ""
 
 
+class PresetsRequest(BaseModel):
+    # Full palette: [{key, label, hint, queries:[str,...]}, ...]. Query strings
+    # may use {t1}/{t2}/{t3}/{multi} placeholders — the UI fills them with the
+    # customer's real tags. The customer edits/reorders these in the UI.
+    categories: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+# Built-in DEFAULT palette — shipped with every install. Served when the
+# customer hasn't customized their palette (fresh install). Query strings use
+# {t1}/{t2}/{t3}/{multi} placeholders filled with the customer's real tags in
+# the UI. The customer can edit/add/remove/reorder these; their version is
+# then persisted per-tenant and survives upgrades.
+DEFAULT_PRESETS: List[Dict[str, Any]] = [
+    {
+        "key": "data", "label": "Data & Live Status",
+        "hint": "Instant · values, tables, what's running",
+        "queries": [
+            "What tags are live right now?",
+            "Which gateways are running now?",
+            "What is the current value of {t1}?",
+            "Show me the latest reading for every live tag",
+            "List all tags being collected",
+            "Trend {t1} over the last 20 readings",
+            "Give me detailed information about the current gateway running",
+            "Are there any alarms in the last 24 hours?",
+            "What is the min, max and average of {t1} in the last hour?",
+            "How many readings has the active gateway written today?",
+        ],
+    },
+    {
+        "key": "analytics", "label": "Process Analytics",
+        "hint": "High Effort · stability, drift, capability",
+        "queries": [
+            "Is {t1} stable and in control over the last hour?",
+            "Are there any anomalies or spikes in {t1} today?",
+            "Is the process drifting? Analyze {t2} over the last 4 hours.",
+            "Give me a process-capability assessment for {t1}.",
+            "Summarize the health of the process across all live tags.",
+            "Why did {t1} change over the last hour?",
+            "Detect any out-of-range excursions across the live tags today.",
+            "What is the standard deviation of {t3} and is it acceptable?",
+            "Assess whether the gateway is collecting reliably or has gaps.",
+            "Identify the noisiest tag and explain its variability.",
+        ],
+    },
+    {
+        "key": "compare", "label": "Compare · Multi-series · Batches",
+        "hint": "Overlays, correlation, period-over-period, batches",
+        "queries": [
+            "Compare {multi} grouped by 1 minute over the last hour and show correlation",
+            "Correlate {t1} and {t2} every 5 seconds over the last 30 minutes",
+            "Trend {multi} in the same chart",
+            "Compare {t1} this hour to the same hour yesterday",
+            "Trend {multi} for the last batch",
+            "Show the last 5 batches and their durations",
+            "Compare {t1} across the last 3 batches",
+            "Trend {t1} since the process started",
+            "Trend {t1} since it last crossed a high value",
+            "Which of {multi} move together? Analyze the correlation over the last hour.",
+        ],
+    },
+]
+
+
 # --- Helpers --------------------------------------------------------------
 
 def _user_ctx(request: Request) -> Dict[str, str]:
@@ -318,3 +382,73 @@ async def delete_insight(insight_id: str) -> Dict[str, Any]:
 def list_tools() -> Dict[str, Any]:
     from .tools import openai_tool_schemas
     return {"ok": True, "tools": openai_tool_schemas(allowed_only=True)}
+
+
+@router.get("/catalog")
+async def get_catalog() -> Dict[str, Any]:
+    """Lightweight catalog for the UI to build REAL, customer-specific starter
+    queries (predefined-query palette). Returns the tags actually being
+    collected + configured gateways for THIS edge — so the suggestions use the
+    customer's own tag names, never hardcoded demo tags. Runs on the DB pool.
+    """
+    def _build() -> Dict[str, Any]:
+        from .tools.gateways import run_list_tags, run_list_gateways, _recently_active
+        ctx = {"data_source": "local"}
+        try:
+            live_tags, live_gws, _ = _recently_active(600)  # last 10 min = "live"
+        except Exception:
+            live_tags, live_gws = set(), set()
+        try:
+            all_tags = [t.get("tag") for t in (run_list_tags({}, ctx).get("tags") or []) if t.get("tag")]
+        except Exception:
+            all_tags = []
+        try:
+            gws = run_list_gateways({}, ctx).get("gateways") or []
+        except Exception:
+            gws = []
+        # De-dup, preserve order; prefer live tags first so starter queries use
+        # tags the customer is actively collecting.
+        seen = set()
+        ordered = []
+        for t in list(live_tags) + all_tags:
+            if t and t not in seen:
+                seen.add(t)
+                ordered.append(t)
+        return {
+            "ok": True,
+            "tags": ordered[:60],
+            "live_tags": sorted(live_tags)[:60],
+            "gateways": [{"name": g.get("name"), "id": g.get("id"), "running": g.get("running")} for g in gws][:20],
+        }
+    return await _run_db(_build)
+
+
+# --- Presets (customer-editable starter-query palette) --------------------
+
+@router.get("/presets")
+async def get_presets(request: Request) -> Dict[str, Any]:
+    """Return the customer's palette (their saved edits) or the shipped
+    DEFAULT_PRESETS if they haven't customized it. `is_default` tells the UI
+    whether these are the built-ins."""
+    ctx = _user_ctx(request)
+    saved = await _run_db(store.get_presets, ctx["tenant_id"])
+    if saved and isinstance(saved.get("categories"), list) and saved["categories"]:
+        return {"ok": True, "categories": saved["categories"], "is_default": False}
+    return {"ok": True, "categories": DEFAULT_PRESETS, "is_default": True}
+
+
+@router.put("/presets")
+async def put_presets(payload: PresetsRequest, request: Request) -> Dict[str, Any]:
+    """Save the customer's edited palette (per tenant)."""
+    ctx = _user_ctx(request)
+    cats = payload.categories or []
+    await _run_db(store.save_presets, ctx["tenant_id"], {"categories": cats})
+    return {"ok": True, "categories": cats, "is_default": False}
+
+
+@router.delete("/presets")
+async def delete_presets(request: Request) -> Dict[str, Any]:
+    """Reset the palette to the shipped defaults."""
+    ctx = _user_ctx(request)
+    await _run_db(store.reset_presets, ctx["tenant_id"])
+    return {"ok": True, "categories": DEFAULT_PRESETS, "is_default": True}

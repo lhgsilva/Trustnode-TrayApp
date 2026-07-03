@@ -41,10 +41,15 @@ const _inflight = new Map();
 
 // Per-request timeout so a slow/hung call NEVER holds a connection slot
 // forever. AI sends get a long budget; everything else is snappy.
+// Operator 2026-07-03: raised the CRUD timeout 15s -> 30s. Under momentary
+// connection-pool pressure a create/list/get can spend a few seconds just
+// waiting for a socket; a 15s abort was firing DURING that wait and surfacing
+// as "signal is aborted / Failed to fetch". 30s + the retry wrapper below
+// gives the connection time to establish, then the request itself is <100ms.
 function _timeoutFor(method, path) {
   if (method === "POST" && path.includes("/messages")) return 90000; // AI turn
   if (path.includes("/insights/") && path.includes("/run")) return 90000;
-  return 15000;
+  return 30000;
 }
 
 async function request(method, path, body) {
@@ -57,21 +62,36 @@ async function request(method, path, body) {
   const url = `${_apiBase()}${PATH_BASE}${path}`;
   const key = method === "GET" && body === undefined ? `${method} ${url}` : null;
 
+  // Operator 2026-07-03 (UI-TIMING INSTRUMENTATION): the operator reports
+  // create-chat ~20s and chat-switch ~40s in the UI though the backend +
+  // network are <15ms. Log the real per-request lifecycle to the console so
+  // we can see EXACTLY where the time goes: queued (waiting for a connection
+  // slot / event loop), fetch (network+server), parse (reading the body).
+  const _t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
+  const _tlog = (phase, extra) => {
+    try {
+      const dt = ((typeof performance !== "undefined" ? performance.now() : Date.now()) - _t0);
+      // eslint-disable-next-line no-console
+      console.log(`[tn-intel-timing] ${method} ${path} ${phase} +${dt.toFixed(0)}ms${extra ? " " + extra : ""}`);
+    } catch {}
+  };
+
   // Fetch + fully parse into a resolved value {ok, data} so shared callers
   // don't fight over a single Response body (which can only be read once).
   const doFetchAndParse = async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), _timeoutFor(method, path));
-    // CRITICAL latency fix: only force `cache: "no-store"` on GETs. On the
-    // Electron file:// (null) origin, `no-store` makes Chromium open a BRAND
-    // NEW TCP socket for every request (no connection reuse). With ~6 conns/
-    // host, the AI POST would queue for 12-40s behind the mount GETs
-    // (status/chats/messages) instead of reusing an open keep-alive socket.
-    // GETs still bypass the HTTP cache so live data is never stale; POSTs are
-    // never cached by the browser anyway, so dropping the flag is pure win —
-    // the reply now returns in <1s (the request was the queue wait, not AI).
+    _tlog("fetch-start");
+    // CRITICAL latency fix (2026-07-03 update): do NOT force `cache:"no-store"`
+    // at all — not even on GETs. On the Electron file:// (null) origin,
+    // `no-store` makes Chromium open a BRAND-NEW TCP socket per request (no
+    // keep-alive reuse), so requests queue on the ~6-conn/host limit behind the
+    // host app's many pollers. The backend already sends `Cache-Control:
+    // no-store, no-cache, must-revalidate` on every response (verified), so
+    // freshness is guaranteed server-side regardless. Omitting the client flag
+    // lets ALL intelligence requests (create/switch/send) reuse keep-alive
+    // connections instead of competing for new sockets.
     const opts = { method, headers, signal: controller.signal };
-    if (method === "GET") opts.cache = "no-store";
     if (body !== undefined) opts.body = JSON.stringify(body);
     let res;
     try {
@@ -79,6 +99,7 @@ async function request(method, path, body) {
     } finally {
       clearTimeout(timer);
     }
+    _tlog("fetch-done", `status=${res.status}`);
     if (!res.ok) {
       if (res.status === 404) throw new Error("intelligence_not_licensed");
       let detail = res.statusText;
@@ -88,23 +109,62 @@ async function request(method, path, body) {
       } catch {}
       throw new Error(`intelligence_api_${res.status}: ${detail}`);
     }
-    return res.json();
+    const parsed = await res.json();
+    _tlog("parse-done");
+    return parsed;
+  };
+
+  // Operator 2026-07-03 (RESILIENCE): retry on transient CONNECTION failures.
+  // Under host-app socket churn the ephemeral-port pool can be momentarily
+  // exhausted, so fetch() fails with "Failed to fetch" / "signal is aborted"
+  // (the connection never established). These are NOT server errors — a short
+  // wait lets a TIME_WAIT port free, and the retry usually succeeds instantly.
+  // We do NOT retry HTTP errors (4xx/5xx come back as a real response) — only
+  // connection-level failures. Bounded so a genuinely-down backend still fails.
+  const _isTransientConnErr = (e) => {
+    const m = String(e?.message || e || "").toLowerCase();
+    return m.includes("failed to fetch")
+      || m.includes("aborted")
+      || m.includes("network")
+      || m.includes("load failed")
+      || m.includes("err_")               // ERR_INSUFFICIENT_RESOURCES, etc.
+      || m.includes("insufficient");
+  };
+  const _withRetry = async () => {
+    const MAX = 3;
+    for (let attempt = 1; attempt <= MAX; attempt++) {
+      try {
+        return await doFetchAndParse();
+      } catch (e) {
+        if (attempt < MAX && _isTransientConnErr(e)) {
+          _tlog(`retry ${attempt}/${MAX - 1}`, String(e?.message || e).slice(0, 40));
+          // Short, escalating wait so a churned port pool can recover.
+          await new Promise((r) => setTimeout(r, 250 * attempt));
+          continue;
+        }
+        throw e;
+      }
+    }
   };
 
   if (key) {
     let shared = _inflight.get(key);
     if (!shared) {
-      shared = doFetchAndParse().finally(() => _inflight.delete(key));
+      shared = _withRetry().finally(() => _inflight.delete(key));
       _inflight.set(key, shared);
     }
     return shared;
   }
-  return doFetchAndParse();
+  return _withRetry();
 }
 
 export const intelligenceApi = {
   getStatus: () => request("GET", "/status"),
   listTools: () => request("GET", "/tools"),
+  getCatalog: () => request("GET", "/catalog"),
+  getPresets: () => request("GET", "/presets"),
+  savePresets: (categories) => request("PUT", "/presets", { categories }),
+  resetPresets: () => request("DELETE", "/presets"),
 
   // Chats
   createChat: ({ title, data_source } = {}) =>

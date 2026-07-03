@@ -88,14 +88,20 @@ export default function IntelligenceInsightsPage() {
 
   const selected = insights.find((i) => i.id === selectedId) || null;
 
+  // Operator 2026-07-03: panel cards are FIXED to the viewport height and
+  // scroll their content INTERNALLY. Previously the cards grew with their
+  // content and pushed the whole page taller than the screen (so the user had
+  // to scroll the page). Now the card is a flex column: a fixed header + a
+  // flex:1 body that scrolls on overflow — the page itself never scrolls.
   const cardStyle = {
     padding: "16px 20px",
     background: "var(--card)", color: "var(--text)",
     border: "1px solid var(--stroke)", borderRadius: "var(--radius-lg, 12px)",
+    display: "flex", flexDirection: "column", minHeight: 0, overflow: "hidden",
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 12, minHeight: "calc(100vh - 120px)" }}>
+    <div style={{ display: "flex", flexDirection: "column", gap: 12, height: "calc(100vh - 120px)", overflow: "hidden" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ fontSize: 16, fontWeight: 600, color: "var(--text)" }}>TrustNode Intelligence — Insights</div>
         <button
@@ -119,7 +125,7 @@ export default function IntelligenceInsightsPage() {
       }}>
         {/* ============ LEFT CARD: Configured insights ============ */}
         <div className="card" style={cardStyle}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 12 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 12, flexShrink: 0 }}>
             Configured insights
           </div>
           {insights.length === 0 ? (
@@ -128,7 +134,7 @@ export default function IntelligenceInsightsPage() {
               or click "New insight" above to define a scheduled analysis directly.
             </div>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, flex: 1, minHeight: 0, overflowY: "auto", paddingRight: 4 }}>
               {insights.map((ins) => {
                 const active = ins.id === selectedId;
                 return (
@@ -179,7 +185,7 @@ export default function IntelligenceInsightsPage() {
 
         {/* ============ RIGHT CARD: Generated insights (history of runs) ============ */}
         <div className="card" style={cardStyle}>
-          <div style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 12 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 12, flexShrink: 0 }}>
             Generated insights {selected ? <span style={{ color: "var(--text)", textTransform: "none", letterSpacing: 0, fontWeight: 600, marginLeft: 6 }}>· {selected.title}</span> : null}
           </div>
 
@@ -195,7 +201,7 @@ export default function IntelligenceInsightsPage() {
               or set a schedule.
             </div>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 540, overflowY: "auto", paddingRight: 4 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, flex: 1, minHeight: 0, overflowY: "auto", paddingRight: 4 }}>
               {runs.map((run) => (
                 <div
                   key={run.id}

@@ -134,8 +134,15 @@ function _assignAxes(seriesList) {
   return result;
 }
 
-function TrustnodeChart({ data }) {
-  const W = 640, H = 220, pad = { l: 50, r: 50, t: 18, b: 28 };
+function TrustnodeChart({ data, big = false }) {
+  // Operator 2026-07-03: `big` renders a larger canvas for the expand modal.
+  // The small inline chart stays 640x220; the modal uses a much taller/wider
+  // viewBox so operators can read the trend for analysis. Everything else
+  // (scales, axes, series paths) is identical — only the dimensions change.
+  const W = big ? 1100 : 640;
+  const H = big ? 460 : 220;
+  const pad = { l: big ? 64 : 50, r: big ? 64 : 50, t: big ? 24 : 18, b: big ? 38 : 28 };
+  const [expanded, setExpanded] = React.useState(false);
   const norm = useMemo(() => _toMultiShape(data), [data]);
   const series = useMemo(() => (norm ? _assignAxes(norm.series) : []), [norm]);
 
@@ -199,16 +206,16 @@ function TrustnodeChart({ data }) {
 
   return (
     <div style={{
-      margin: "8px 0", padding: 10,
-      border: "1px solid var(--stroke)", borderRadius: 8,
-      background: "var(--bg)",
+      margin: "8px 0", padding: big ? 4 : 10,
+      border: big ? "none" : "1px solid var(--stroke)", borderRadius: 8,
+      background: big ? "transparent" : "var(--bg)",
     }}>
       <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 12 }}>
         <span>
           {(norm.from && norm.to) ? <>{fmtWindowSide(norm.from)} → {fmtWindowSide(norm.to)}</> : null}
         </span>
         {series.map((s, i) => (
-          <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 11 }}>
+          <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: big ? 13 : 11 }}>
             <span style={{
               width: 10, height: 2, background: s.color, display: "inline-block", borderRadius: 1,
             }} />
@@ -217,6 +224,23 @@ function TrustnodeChart({ data }) {
             {rightAxis && s.axis === "right" ? <span style={{ opacity: 0.6 }}>(R)</span> : null}
           </span>
         ))}
+        {/* Expand-to-modal button (inline chart only). */}
+        {!big ? (
+          <button
+            type="button"
+            onClick={() => setExpanded(true)}
+            title="Open chart in a larger view for analysis"
+            style={{
+              marginLeft: "auto", border: "1px solid var(--stroke)",
+              background: "color-mix(in srgb, var(--teal, #14a89a) 12%, transparent)",
+              color: "var(--text)", cursor: "pointer", fontSize: 11,
+              padding: "2px 8px", borderRadius: 5, display: "inline-flex",
+              alignItems: "center", gap: 5,
+            }}
+          >
+            <span style={{ fontSize: 13, lineHeight: 1 }}>⤢</span> Expand
+          </button>
+        ) : null}
       </div>
       <svg width="100%" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ display: "block" }}>
         {/* Left axis grid + labels */}
@@ -267,6 +291,66 @@ function TrustnodeChart({ data }) {
             </span>
           );
         })}
+      </div>
+
+      {/* Expand modal: a large, centered popup of the SAME chart for analysis.
+          Click the backdrop or the × (or press Esc) to close. Rendered only
+          for the inline chart (big=false) so the modal's own chart doesn't
+          recurse another modal. */}
+      {expanded && !big ? (
+        <ChartModal onClose={() => setExpanded(false)}>
+          <TrustnodeChart data={data} big />
+        </ChartModal>
+      ) : null}
+    </div>
+  );
+}
+
+// Full-screen centered modal for the expanded chart. Closes on backdrop click,
+// the × button, or the Escape key. No external dependency.
+function ChartModal({ children, onClose }) {
+  React.useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    // Prevent background scroll while open.
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [onClose]);
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, zIndex: 9999,
+        background: "rgba(0,0,0,0.6)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        padding: 24,
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          position: "relative", width: "min(1200px, 96vw)", maxHeight: "92vh",
+          overflow: "auto", background: "var(--card)",
+          border: "1px solid var(--stroke)", borderRadius: 12,
+          padding: 18, boxShadow: "0 12px 48px rgba(0,0,0,0.5)",
+        }}
+      >
+        <button
+          type="button"
+          onClick={onClose}
+          title="Close (Esc)"
+          style={{
+            position: "absolute", top: 10, right: 12, zIndex: 1,
+            border: "1px solid var(--stroke)", background: "var(--bg)",
+            color: "var(--text)", cursor: "pointer", fontSize: 16,
+            width: 30, height: 30, borderRadius: 6, lineHeight: 1,
+          }}
+        >×</button>
+        {children}
       </div>
     </div>
   );

@@ -6,6 +6,7 @@ import { DataSourceToggle } from "./components/DataSourceToggle.jsx";
 import { EffortSlider } from "./components/EffortSlider.jsx";
 import { InsightEditor } from "./components/InsightEditor.jsx";
 import { InsightPreviewModal } from "./components/InsightPreviewModal.jsx";
+import { PredefinedQueries } from "./components/PredefinedQueries.jsx";
 
 /**
  * TrustNode Intelligence — Chat page.
@@ -34,6 +35,7 @@ const _CACHE = {
   activeId: null,
   messagesByChat: {},   // chatId -> messages[]
   dataSource: "local",
+  catalogTags: null,    // customer's real tag names for the query palette
 };
 const _ACTIVE_ID_KEY = "trustnode_intelligence_active_chat_v1";
 
@@ -73,6 +75,9 @@ export default function IntelligenceChatPage() {
   };
   const [error, setError] = useState("");
   const [authError, setAuthError] = useState(false);   // sticky 401 flag
+  // Real tags from THIS customer's DB — used to build the predefined-query
+  // palette with the customer's own tag names (never hardcoded demo tags).
+  const [liveTags, setLiveTags] = useState(_CACHE.catalogTags || []);
   const [previewDraft, setPreviewDraft] = useState(null);
   const [insightDraft, setInsightDraft] = useState(null);
   const [saveStatus, setSaveStatus] = useState("");
@@ -126,6 +131,18 @@ export default function IntelligenceChatPage() {
     // refresh on window focus + right before every Send, which are the
     // moments the user actually needs a fresh answer.
     refreshStatus();
+    // Fetch the customer's real tags ONCE so the predefined-query palette uses
+    // their own tag names. Cached across remounts; silent on failure (the
+    // palette just falls back to generic phrasings).
+    if (!_CACHE.catalogTags) {
+      intelligenceApi.getCatalog()
+        .then((c) => {
+          const tags = c?.tags || [];
+          _CACHE.catalogTags = tags;
+          setLiveTags(tags);
+        })
+        .catch(() => {});
+    }
     const onFocus = () => refreshStatus();
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
@@ -167,17 +184,23 @@ export default function IntelligenceChatPage() {
 
   const selectChat = useCallback(async (id, opts = {}) => {
     if (busyRef.current) return;  // don't switch/refetch mid-send
+    const _ts = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    const _tl = (p) => { try { console.log(`[tn-intel-ui] selectChat(${id}) ${p} +${((typeof performance!=="undefined"?performance.now():Date.now())-_ts).toFixed(0)}ms`); } catch {} };
+    _tl("start");
     setActiveId(id);
     setError("");
     // Show cached messages immediately (instant), then refresh from server.
     const cached = _CACHE.messagesByChat[id];
     if (cached) setMessages(cached);
+    _tl(`cached-shown(${cached ? cached.length : 0} msgs)`);
     try {
       const r = await intelligenceApi.getChat(id);
+      _tl(`getChat-returned(${(r?.chat?.messages || []).length} msgs)`);
       // Only apply if the user is still on this chat AND not mid-send.
       if (activeIdRef.current === id && !busyRef.current) {
         setMessages(r?.chat?.messages || []);
         setDataSource(r?.chat?.data_source || "local");
+        _tl("setMessages-called");
       }
     } catch (e) {
       if (!opts.silent) surfaceError(e);
@@ -195,14 +218,19 @@ export default function IntelligenceChatPage() {
 
   const newChat = async () => {
     setError("");
+    const _ts = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    const _tl = (p) => { try { console.log(`[tn-intel-ui] newChat ${p} +${((typeof performance!=="undefined"?performance.now():Date.now())-_ts).toFixed(0)}ms`); } catch {} };
+    _tl("start");
     try {
       const r = await intelligenceApi.createChat({ title: "New chat", data_source: dataSource });
+      _tl("createChat-returned");
       // Optimistic: add to the sidebar + open it with an empty message list —
       // no round-trips, instant UI.
       setActiveId(r.id);
       setMessages([]);
       setChats((prev) => (prev.some((c) => c.id === r.id) ? prev
         : [{ id: r.id, title: "New chat", data_source: dataSource }, ...prev]));
+      _tl("state-updated (UI should be done)");
     } catch (e) {
       surfaceError(e, "Could not create chat");
     }
@@ -268,8 +296,9 @@ export default function IntelligenceChatPage() {
     }
   };
 
-  const send = async () => {
-    const text = draft.trim();
+  const send = async (presetText) => {
+    // presetText lets a predefined-query chip send directly without typing.
+    const text = (typeof presetText === "string" ? presetText : draft).trim();
     if (!text || busy) return;
     setDraft("");
     // Operator 2026-07-02: do NOT fire refreshStatus() here. The Electron
@@ -375,22 +404,7 @@ export default function IntelligenceChatPage() {
           flex: 1, overflowY: "auto", padding: "16px 24px", background: "var(--bg)",
         }}>
           {messages.length === 0 && !busy ? (
-            <div style={{
-              color: "var(--muted)", fontSize: 13, textAlign: "center",
-              marginTop: 60, maxWidth: 560, marginLeft: "auto", marginRight: "auto",
-            }}>
-              <div style={{ marginBottom: 12 }}>
-                Ask about tags, batches, alarms, gateway status, or trends over time.
-              </div>
-              <div style={{ fontSize: 12, lineHeight: 1.8, opacity: 0.85 }}>
-                Try:
-                <div>· "Show me the trend of the last hour for my main tag"</div>
-                <div>· "What's the average of my process tag over the last 8 hours?"</div>
-                <div>· "Are there any alarms in the last 24 hours?"</div>
-                <div>· "List my running gateways"</div>
-                <div>· "Compare this hour to yesterday at the same time"</div>
-              </div>
-            </div>
+            <PredefinedQueries onPick={(q) => send(q)} tags={liveTags} />
           ) : null}
           {messages.map((m, i) => {
             const handleSave = m.role === "assistant" ? () => {

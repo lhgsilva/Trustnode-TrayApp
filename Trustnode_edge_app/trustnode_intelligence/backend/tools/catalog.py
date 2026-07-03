@@ -128,6 +128,28 @@ TOOL_CATALOG: Dict[str, Tool] = {
         },
         runner=tag_summary.run_get_multi_tag_timeseries,
     ),
+    "compare_tags": Tool(
+        name="compare_tags",
+        category="read_only",
+        description="Compare MULTIPLE tags over an explicit time range at a chosen time bucket "
+                    "(1s/5s/10s/30s/1m/5m/15m/1h/1d, or 'auto'). USE THIS when the user wants to "
+                    "compare/correlate several tags along time, or asks about relationships/correlation "
+                    "between tags. Returns a multi-series chart shape PLUS a pairwise Pearson correlation "
+                    "matrix PLUS plain-language insights. Prefer this over get_multi_tag_timeseries when "
+                    "the user wants analysis/correlation (not just an overlay), or specifies a bucket size.",
+        schema={
+            "type": "object",
+            "properties": {
+                "tags":   {"type": "array", "items": {"type": "string"}, "description": "2-6 tag names to compare."},
+                "from_":  {"type": "string", "description": "Start time. ISO-8601 or relative ('-1h','-24h','-7d'). Default '-1h'."},
+                "to":     {"type": "string", "description": "End time. Same format or 'now'. Default 'now'."},
+                "bucket": {"type": "string", "description": "Time grouping: 1s/5s/10s/30s/1m/5m/15m/1h/1d, or 'auto'.", "default": "auto"},
+                "gateway_id": {"type": "string", "description": "Optional gateway scope.", "default": ""},
+            },
+            "required": ["tags"],
+        },
+        runner=analytics.run_compare_tags,
+    ),
     "compare_periods": Tool(
         name="compare_periods",
         category="read_only",

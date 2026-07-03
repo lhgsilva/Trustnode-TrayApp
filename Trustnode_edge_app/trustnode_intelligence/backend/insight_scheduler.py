@@ -138,6 +138,14 @@ def _run_due_insights() -> None:
 def _loop() -> None:
     # Sleep until next minute boundary, then tick every 60s. Cron has
     # minute resolution so this is plenty.
+    #
+    # Operator 2026-07-03 (KEEP-IT-SIMPLE): when there are NO scheduled
+    # insights, the per-minute wake is a no-op — we still tick (cheap) but
+    # `_run_due_insights` returns immediately after one tiny indexed query.
+    # The heavy work only runs when a schedule is actually due. This keeps
+    # the module quiet: it does NOT poll data or hit the AI on a timer;
+    # background activity is one small DB read per minute, and only when the
+    # user has created a scheduled insight does it do more.
     while True:
         try:
             now = datetime.now(timezone.utc)
