@@ -16,6 +16,52 @@ import intelligenceApi from "../api.js";
 const CAT_COLORS = { data: "#14b8a6", analytics: "#f59e0b", compare: "#a855f7" };
 const catColor = (key, i) => CAT_COLORS[key] || ["#14b8a6", "#f59e0b", "#a855f7", "#3b82f6"][i % 4];
 
+// Bundled DEFAULT palette — mirrors the backend DEFAULT_PRESETS. We render this
+// INSTANTLY so the palette never sits in a "Loading" limbo (and never flickers
+// if the /presets fetch is slow or unauthorized). The backend fetch then
+// OVERRIDES this only if the customer saved a custom palette.
+const BUNDLED_DEFAULTS = [
+  { key: "data", label: "Data & Live Status", hint: "Instant · values, tables, what's running", queries: [
+    "What tags are live right now?",
+    "Which gateways are running now?",
+    "What is the current value of {t1}?",
+    "Show me the latest reading for every live tag",
+    "List all tags being collected",
+    "Trend {t1} over the last 20 readings",
+    "Give me detailed information about the current gateway running",
+    "Are there any alarms in the last 24 hours?",
+    "What is the min, max and average of {t1} in the last hour?",
+    "How many readings has the active gateway written today?",
+  ]},
+  { key: "analytics", label: "Process Analytics", hint: "High Effort · stability, drift, capability", queries: [
+    "Is {t1} stable and in control over the last hour?",
+    "Are there any anomalies or spikes in {t1} today?",
+    "Is the process drifting? Analyze {t2} over the last 4 hours.",
+    "Give me a process-capability assessment for {t1}.",
+    "Summarize the health of the process across all live tags.",
+    "Why did {t1} change over the last hour?",
+    "Detect any out-of-range excursions across the live tags today.",
+    "What is the standard deviation of {t3} and is it acceptable?",
+    "Assess whether the gateway is collecting reliably or has gaps.",
+    "Identify the noisiest tag and explain its variability.",
+  ]},
+  { key: "compare", label: "Compare · Multi-series · Batches", hint: "Overlays, correlation, period-over-period, batches", queries: [
+    "Compare {multi} grouped by 1 minute over the last hour and show correlation",
+    "Correlate {t1} and {t2} every 5 seconds over the last 30 minutes",
+    "Trend {multi} in the same chart",
+    "Compare {t1} this hour to the same hour yesterday",
+    "Trend {multi} for the last batch",
+    "Show the last 5 batches and their durations",
+    "Compare {t1} across the last 3 batches",
+    "Trend {t1} since the process started",
+    "Trend {t1} since it last crossed a high value",
+    "Which of {multi} move together? Analyze the correlation over the last hour.",
+  ]},
+];
+
+// Module-level cache so remounts (screen switches) don't re-fetch or flicker.
+const _PRESET_CACHE = { categories: null, isDefault: true };
+
 // Fill {t1}/{t2}/{t3}/{multi} placeholders with the customer's real tags.
 function fillTemplate(q, tags) {
   const has = Array.isArray(tags) && tags.length > 0;
@@ -28,23 +74,30 @@ function fillTemplate(q, tags) {
 }
 
 export function PredefinedQueries({ onPick, tags }) {
-  const [cats, setCats] = useState(null);        // [{key,label,hint,queries}]
-  const [isDefault, setIsDefault] = useState(true);
-  const [active, setActive] = useState(null);
+  // Seed from cache if present, else the bundled defaults — so we ALWAYS have a
+  // palette to show immediately (never a "Loading" limbo, never a flicker).
+  const [cats, setCats] = useState(_PRESET_CACHE.categories || BUNDLED_DEFAULTS);
+  const [isDefault, setIsDefault] = useState(_PRESET_CACHE.isDefault);
+  const [active, setActive] = useState((_PRESET_CACHE.categories || BUNDLED_DEFAULTS)[0]?.key || "data");
   const [editing, setEditing] = useState(false);
 
-  // Load the palette (customer's saved edits or shipped defaults).
+  // Fetch the customer's saved palette ONCE (if not already cached). This only
+  // OVERRIDES the bundled defaults when the customer has actually customized —
+  // and it's best-effort: any failure (401 mid-login, network) leaves the
+  // bundled defaults in place. Runs at most once per session (module cache).
   useEffect(() => {
+    if (_PRESET_CACHE.categories) return;  // already loaded — no re-fetch, no flicker
     let cancelled = false;
     intelligenceApi.getPresets()
       .then((r) => {
-        if (cancelled) return;
-        const list = (r && Array.isArray(r.categories) && r.categories.length) ? r.categories : [];
+        if (cancelled || !r) return;
+        const list = (Array.isArray(r.categories) && r.categories.length) ? r.categories : BUNDLED_DEFAULTS;
+        _PRESET_CACHE.categories = list;
+        _PRESET_CACHE.isDefault = !!r.is_default;
         setCats(list);
-        setIsDefault(!!(r && r.is_default));
-        setActive((prev) => prev || (list[0] && list[0].key) || null);
+        setIsDefault(!!r.is_default);
       })
-      .catch(() => { if (!cancelled) setCats([]); });
+      .catch(() => { /* keep the bundled defaults already shown */ });
     return () => { cancelled = true; };
   }, []);
 
@@ -52,23 +105,22 @@ export function PredefinedQueries({ onPick, tags }) {
 
   const saveEdits = async (next) => {
     setCats(next);
-    try {
-      const r = await intelligenceApi.savePresets(next);
-      setIsDefault(!!(r && r.is_default));
-    } catch { /* keep local edits; will retry on next save */ }
+    _PRESET_CACHE.categories = next; _PRESET_CACHE.isDefault = false;
+    setIsDefault(false);
+    try { await intelligenceApi.savePresets(next); }
+    catch { /* keep local edits; will retry on next save */ }
   };
   const resetDefaults = async () => {
+    // Optimistic: show bundled defaults immediately.
+    setCats(BUNDLED_DEFAULTS); setIsDefault(true);
+    setActive(BUNDLED_DEFAULTS[0]?.key || "data");
+    _PRESET_CACHE.categories = null; _PRESET_CACHE.isDefault = true;
     try {
       const r = await intelligenceApi.resetPresets();
-      const list = (r && r.categories) || [];
-      setCats(list); setIsDefault(true);
-      setActive((list[0] && list[0].key) || null);
-    } catch {}
+      const list = (r && Array.isArray(r.categories) && r.categories.length) ? r.categories : BUNDLED_DEFAULTS;
+      setCats(list);
+    } catch { /* bundled defaults already shown */ }
   };
-
-  if (cats === null) {
-    return <div style={{ textAlign: "center", color: "var(--muted)", fontSize: 13, marginTop: 60 }}>Loading starter queries…</div>;
-  }
 
   return (
     <div style={{ maxWidth: 780, margin: "40px auto 0", color: "var(--text)" }}>
