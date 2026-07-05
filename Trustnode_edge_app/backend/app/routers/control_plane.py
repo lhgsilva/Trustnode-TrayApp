@@ -2458,7 +2458,19 @@ def edge_link_unlink(request: Request) -> dict[str, Any]:
 
 @router.get("/edge-link/license-check")
 def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str | None = None) -> dict[str, Any]:
-    tid = _scoped_tenant(request, tenant_id)
+    # Operator 2026-07-05: tenant resolution is AUTH-OPTIONAL. Authenticated
+    # callers (portal admins, the local UI carrying a valid token) keep the
+    # exact scoped behavior via _scoped_tenant. But this route is also called
+    # PUBLICLY by the Edge process (which has no cloud JWT) so it can pull its
+    # renewed license on "Re-check now" — for that path we must NOT 401 on the
+    # missing token. Fall back to the requested tenant_id (or default) and let
+    # check_edge_license gate on the edge_id having an active license, exactly
+    # like the ai-endpoint route. Without this, _scoped_tenant threw 401, the
+    # cloud hydrate failed, and a renewed license never reached the edge.
+    try:
+        tid = _scoped_tenant(request, tenant_id)
+    except HTTPException:
+        tid = normalize_tenant_id(tenant_id or "default")
     check_edge_id = str(edge_id or "").strip()
     if not check_edge_id:
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}

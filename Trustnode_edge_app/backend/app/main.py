@@ -966,6 +966,17 @@ PUBLIC_PATHS = {
     # portal-admin's AI Endpoint config without holding a Supabase JWT.
     # Gated inside the handler by the edge_id's active license.
     "/api/control-plane/edge-link/ai-endpoint",
+    # Operator 2026-07-05: public for the SAME reason as ai-endpoint — the
+    # Edge process authenticates users against its LOCAL AuthStore (tokens
+    # signed with a different key than the cloud), so it cannot present a
+    # valid cloud JWT. When a license is renewed in the portal, "Re-check
+    # now" calls the cloud's license-check to pull the new end_utc; if that
+    # route requires cloud auth the forwarded local token gets 401, the
+    # hydrate fails, and the renewed license never reaches the edge (the
+    # trial banner never clears). Exposes only license status/modules/expiry
+    # for an edge_id that has an active license — strictly less sensitive
+    # than ai-endpoint (which already returns the customer's API key).
+    "/api/control-plane/edge-link/license-check",
     "/api/control-plane/password-reset/public/issue",
     "/api/control-plane/password-reset/public/apply",
     "/api/v1/healthz",
