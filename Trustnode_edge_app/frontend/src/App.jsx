@@ -10451,7 +10451,15 @@ function AppShell() {
     [currentUser, isPageLicensed]
   );
 
-  const canEditPage = (page) => {
+  // Operator 2026-07-05 (FLICKER FIX): canEditPage / canOpenPage are memoized
+  // with useCallback so their function IDENTITY is stable across renders.
+  // They are used in the dependency arrays of the page-guard effects
+  // (setActivePage). As plain functions they were recreated every render, so
+  // those effects re-ran every render — and when the license entered a
+  // flip-flopping state (e.g. expired → emergency-trial), the guard kept
+  // re-routing, causing an infinite re-render loop that showed as the whole
+  // app flickering. Stable identities break that loop; behavior is unchanged.
+  const canEditPage = useCallback((page) => {
     if (isReadonlyCloudMode) return false;
     if (!currentUser) return false;
     if (currentUser.role === "admin") return true;
@@ -10488,9 +10496,9 @@ function AppShell() {
       return Boolean(currentUser.permissions?.historian ?? currentUser.permissions?.data_log);
     }
     return Boolean(currentUser.permissions?.[mapped]);
-  };
+  }, [isReadonlyCloudMode, currentUser]);
 
-  const canOpenPage = (page) => {
+  const canOpenPage = useCallback((page) => {
     if (page === "control_plane") return Boolean(isPortalOnly);
     // Admins are never gated by the license check. Operator regression
     // 2026-06-12: a transient license snapshot miss (edge offline, slow
@@ -10586,7 +10594,7 @@ function AppShell() {
       if (anyStudioKeyPresent && !hasLicenseModule(studioKey)) return false;
     }
     return canEditPage(page);
-  };
+  }, [currentUser, isPortalOnly, isClientView, isPageLicensed, canEditPage, hasLicenseModule, licensedModuleKeys]);
 
   const visibleClientModuleLabels = useCallback(
     (user) => {
