@@ -22,6 +22,20 @@ from .tools import run_tool
 # Intent patterns. Each maps a user phrasing to (tool_name, arg_builder).
 # We keep these deliberately conservative — only fire on clearly-shaped asks.
 
+# Chart-TYPE intent. The user can ask for a specific visualization; default is
+# a line trend. 'bar'/'column'/'histogram' -> bar; 'pie'/'donut'/'doughnut' ->
+# donut. We only switch the type — the data query is chosen by the question.
+_BAR_RE = re.compile(r"\b(bar|column|histogram)\s*(chart|graph|plot)?\b|\bas\s+bars?\b", re.I)
+_DONUT_RE = re.compile(r"\b(pie|donut|doughnut)\s*(chart|graph)?\b", re.I)
+# Category / breakdown intent (the natural source for a donut, but also usable
+# as a bar). We detect WHAT to break down by.
+_SHARE_RE = re.compile(r"\b(share|breakdown|proportion|percentage|percent|distribution|split|how much of|what (?:part|fraction)|makeup|composition)\b", re.I)
+_PER_TAG_RE = re.compile(r"\b(per|by|each|for every|across)\s+tags?\b|\btags?\b.*\b(share|breakdown|proportion|distribution)\b|\breadings?\s+per\s+tag\b", re.I)
+_PER_GW_RE = re.compile(r"\b(per|by|each|for every|across)\s+(gateway|gateways|plc|plcs|device|devices)\b|\b(gateway|gateways|plc|device)\b.*\b(share|breakdown|proportion|distribution|volume)\b", re.I)
+_QUALITY_RE = re.compile(r"\b(quality|good|bad|uncertain)\b.*\b(share|breakdown|proportion|distribution|split|percentage|percent|donut|pie|how much)\b|\b(share|breakdown|proportion|distribution|how much)\b.*\bquality\b|\bgood\s*/\s*bad\b|\bquality\s+(breakdown|distribution|split)\b", re.I)
+# value-band intent: "how often was X above 100", "time in band", "between A and B"
+_BAND_RE = re.compile(r"\b(how (?:often|much|long)|time (?:in|spent)|percentage of (?:time|readings)|distribution of values?)\b", re.I)
+
 _LAST_RE = re.compile(r"\b(last|latest|current|most recent)\b.*\b(reading|value|reads?)\b", re.I)
 _AVG_RE = re.compile(r"\b(average|avg|mean|min|max|minimum|maximum|stddev|std|summary|stats?)\b", re.I)
 # Bare current-value ask: "value of X", "what is X", "reading of X",
@@ -215,6 +229,22 @@ def _window_from(text: str) -> str:
     return "-1h"
 
 
+def _window_from_or(text: str, default: str) -> str:
+    """Like _window_from but use `default` when no explicit window is present
+    (breakdowns default to a wider window than trends)."""
+    # Reuse _window_from, but only override its "-1h" fallback.
+    has_explicit = bool(
+        _WINDOW_RE.search(text)
+        or _last_n_readings(text) is not None
+        or re.search(r"\b(?:last|past|previous|this)\s+(minute|hour|day|week|month)\b", text, re.I)
+        or re.search(r"\b(today|yesterday)\b", text, re.I)
+    )
+    w = _window_from(text)
+    if not has_explicit and w == "-1h":
+        return default
+    return w
+
+
 # Operator 2026-07-03: broadened these so natural phrasings route to the
 # instant catalog tools instead of being misread as a tag lookup. Previously
 # "give me detailed information about the current gateway" started with
@@ -235,6 +265,23 @@ _CONDITION_RE = re.compile(
     r"\b(above|below|over|under|exceed|greater than|less than|between)\b.*\b\d|"
     r"\bwas\s+(above|below|over|under|at|equal)\b",
     re.I)
+# Time-window phrases that use 'over'/'under' innocently ("over the last 6
+# hours", "over time", "under 5 minutes ago"). We strip these BEFORE the
+# condition test so a plain trend with a window isn't mistaken for a threshold
+# condition (which would wrongly defer it to the AI).
+_TIMEWORD = r"(?:second|seconds|sec|secs|minute|minutes|min|mins|hour|hours|hr|hrs|day|days|week|weeks|month|months)"
+_TIME_PHRASE_RE = re.compile(
+    rf"\bover\s+time\b"
+    rf"|\b(?:over|under|above|below|within|in|for)\s+the\s+(?:last|past|previous|next)\s+\d+\s*{_TIMEWORD}\b"
+    rf"|\b(?:over|for|within|in)\s+(?:the\s+)?(?:last|past|previous|next)?\s*\d+\s*{_TIMEWORD}\b",
+    re.I)
+
+
+def _has_condition(text: str) -> bool:
+    """True if the text carries a real threshold/condition filter — after
+    removing innocent time-window phrases ('over the last 6 hours')."""
+    cleaned = _TIME_PHRASE_RE.sub(" ", text)
+    return bool(_CONDITION_RE.search(cleaned))
 # "Compare intent" — wants correlation/comparison analysis, not just an overlay.
 _COMPARE_RE = re.compile(r"\b(compare|comparison|correlat|relationship|relate|versus|vs\.?|against|side by side|analyz?e|analys)\b", re.I)
 _UNIT = r"(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)"
@@ -275,8 +322,31 @@ def _agg_from(text: str) -> str:
     t = text.lower()
     if re.search(r"\bmax(imum)?\b", t): return "max"
     if re.search(r"\bmin(imum)?\b", t): return "min"
-    if re.search(r"\bcount\b|how many\b", t): return "count"
+    if re.search(r"\bsum|total\b", t): return "sum"
+    if re.search(r"\bcount\b|how many\b|number of\b", t): return "count"
     return "avg"
+
+
+def _chart_type_from(text: str) -> str:
+    """Explicit chart type the user asked for: 'bar' | 'donut' | 'line' (default)."""
+    if _DONUT_RE.search(text):
+        return "donut"
+    if _BAR_RE.search(text):
+        return "bar"
+    return "line"
+
+
+def _bands_from(text: str):
+    """Extract numeric band edges from phrases like 'above 100', 'between 100
+    and 150', 'over 50 under 80', '100, 150'. Returns a sorted list or None."""
+    nums = []
+    for m in re.finditer(r"(?:above|over|below|under|between|and|greater than|less than|>=?|<=?|,)\s*(-?\d+(?:\.\d+)?)", text, re.I):
+        try:
+            nums.append(float(m.group(1)))
+        except Exception:
+            pass
+    edges = sorted(set(nums))
+    return edges or None
 
 
 def _bucket_label_from(text: str):
@@ -320,8 +390,10 @@ def classify(user_message: str) -> Optional[Dict[str, Any]]:
     text = user_message.strip()
     if len(text) > 200:
         return None  # long/complex → full loop
-    # Conditional / filtered data question → let the AI reason about it.
-    if _CONDITION_RE.search(text):
+    # Conditional / filtered data question → let the AI reason about it. Uses
+    # _has_condition so an innocent time window ("over the last 6 hours") is NOT
+    # mistaken for a threshold condition.
+    if _has_condition(text):
         return None
 
     # Operator 2026-07-03 (LIVE INTENT): if the question is about what is LIVE /
@@ -337,6 +409,48 @@ def classify(user_message: str) -> Optional[Dict[str, Any]]:
     # query contains 'tags'). get_live_values returns value+timestamp per tag.
     if _LIVE_VALUES_RE.search(text):
         return {"kind": "live_values", "tool": "get_live_values", "args": {}, "is_chart": False}
+
+    # Operator 2026-07-06 (DONUT / CATEGORY BREAKDOWN): a pie/donut request, or a
+    # "share/breakdown/distribution … by tag/gateway/quality" question, maps to
+    # get_category_breakdown (categorical slices), NOT a time-series. Must run
+    # BEFORE list_tags/list_gateways (those phrasings also contain 'tags'/
+    # 'gateways'). We infer the `by` dimension from the wording.
+    _wants_donut = bool(_DONUT_RE.search(text))
+    _multi = _extract_tags(text)
+    if _wants_donut or _QUALITY_RE.search(text) or (_SHARE_RE.search(text) and (_PER_TAG_RE.search(text) or _PER_GW_RE.search(text))):
+        frm = _window_from_or(text, "-24h")
+        # quality breakdown
+        if _QUALITY_RE.search(text) or re.search(r"\bquality\b", text, re.I):
+            _t = _extract_tag(text)
+            args = {"by": "quality", "from_": frm, "to": "now"}
+            if _t:
+                args["tag"] = _t
+            return {"kind": "breakdown", "tool": "get_category_breakdown", "args": args, "is_chart": True}
+        # value bands ("how often was X above/between …") for a single tag
+        _bands = _bands_from(text)
+        if _bands and _extract_tag(text) and (_BAND_RE.search(text) or _wants_donut):
+            return {"kind": "breakdown", "tool": "get_category_breakdown",
+                    "args": {"by": "value_bands", "tag": _extract_tag(text), "bands": _bands,
+                             "from_": frm, "to": "now"}, "is_chart": True}
+        # by gateway
+        if _PER_GW_RE.search(text):
+            return {"kind": "breakdown", "tool": "get_category_breakdown",
+                    "args": {"by": "by_gateway", "from_": frm, "to": "now"}, "is_chart": True}
+        # by tag (default donut dimension) — optionally limited to named tags
+        args = {"by": "by_tag", "from_": frm, "to": "now"}
+        if re.search(r"\bby value|sum|total value|amount\b", text, re.I):
+            args["measure"] = "value"
+        if len(_multi) >= 2:
+            args["tags"] = _multi
+        return {"kind": "breakdown", "tool": "get_category_breakdown", "args": args, "is_chart": True}
+
+    # Operator 2026-07-06 (BAR COMPARE): "bar chart of the avg/min/max of A, B, C"
+    # — one bar per tag. Needs >=2 tags AND an explicit bar request (else a
+    # multi-tag ask is a line overlay, handled below).
+    if _BAR_RE.search(text) and len(_multi) >= 2 and not _bucket_label_from(text):
+        return {"kind": "aggregate", "tool": "aggregate_tags",
+                "args": {"tags": _multi, "from_": _window_from(text), "to": "now",
+                         "agg": _agg_from(text)}, "is_chart": True}
 
     # Catalog listings — pure data, no tag needed. These are common and should
     # be instant (the old full-loop made 'list tags' take several seconds).
@@ -396,20 +510,24 @@ def classify(user_message: str) -> Optional[Dict[str, Any]]:
         n, unit = bm.group(2), bm.group(3).lower()
         ubase = "s" if unit.startswith("s") else ("m" if unit.startswith("m") else "h")
         bucket = f"{n}{ubase}"
+    # The user may want this drawn as BARS ('bar chart of hourly average').
+    _ctype = _chart_type_from(text)
     # If an explicit bucket/grain was requested, that IS a bucketed request —
     # fire it regardless of whether the word 'average' or 'chart' appears
     # ("show X grouped by 1 hour" is bucketed even without those words).
-    if bucket:
-        snapped = _snap_bucket(bucket)
+    # A bar request over a single tag ALSO implies bucketing (bars need discrete
+    # buckets, not ~200 raw points) — default to 'auto' when bars asked w/o grain.
+    if bucket or _ctype == "bar":
+        snapped = _snap_bucket(bucket) if bucket else "auto"
         return {"kind": "bucketed", "tool": "get_bucketed_series",
                 "args": {"tag": tag, "from_": frm, "to": "now", "bucket": snapped, "agg": _agg_from(text)},
-                "is_chart": True}
+                "is_chart": True, "chart_type": ("bar" if _ctype == "bar" else "line")}
 
     if is_chart:
         return {"kind": "chart", "tool": "get_tag_timeseries",
                 "args": {"tag": tag, "from_": frm, "to": "now",
                          "max_points": _max_pts},
-                "is_chart": True}
+                "is_chart": True, "chart_type": _ctype}
 
     if _LAST_RE.search(text) or _AVG_RE.search(text) or _VALUE_RE.search(text):
         return {"kind": "summary", "tool": "get_tag_summary",
@@ -498,13 +616,20 @@ def run_fastpath(user_message: str, data_source: str) -> Optional[Dict[str, Any]
                     result = wresult
                     break
 
+    # Stamp the requested chart_type onto the result so render_local (and the
+    # AI narrator) can emit the right shape. Tools that already set chart_type
+    # (breakdown='donut', aggregate='bar') keep theirs; time-series get the
+    # type the classifier picked ('line' default, or 'bar' when asked).
+    if isinstance(result, dict) and not result.get("chart_type"):
+        result["chart_type"] = plan.get("chart_type", "line")
+
     # DECISION: does this question need AI interpretation, or just the data?
     # If the user asked a plain data question (no 'why/stable/anomaly/trend'
     # words), we can render a deterministic answer in CODE — instant, no AI.
     wants_ai = bool(_INTERPRET_RE.search(user_message))
     return {"tool_result": result, "tool_name": plan["tool"],
             "is_chart": plan.get("is_chart", False), "disambiguation": None,
-            "wants_ai": wants_ai}
+            "wants_ai": wants_ai, "chart_type": plan.get("chart_type", "line")}
 
 
 # --------------------------------------------------------------------------
@@ -527,6 +652,50 @@ def render_local(tool_name: str, result: dict, is_chart: bool) -> str:
     """Build a Markdown answer directly from the tool result — no LLM.
     Sub-second, deterministic, always-correct numbers."""
     import json as _json
+
+    # ---- Category breakdown → DONUT/PIE (slices) ----
+    if tool_name == "get_category_breakdown" or result.get("kind") == "breakdown":
+        slices = [s for s in (result.get("slices") or []) if s.get("value")]
+        by = result.get("by")
+        total = result.get("total")
+        frm, to = result.get("from"), result.get("to")
+        _by_lbl = {"tag": "by tag", "gateway": "by gateway", "quality": "quality",
+                   "value_bands": "value bands"}.get(by, by or "")
+        title_tag = f" — {result.get('tag')}" if result.get("tag") and by in ("quality", "value_bands") else ""
+        if not slices:
+            return (f"**Breakdown {_by_lbl}{title_tag}** — no data in {frm} → {to}.\n\n"
+                    f"Nothing was collected in that window to break down.")
+        chart_obj = {"chart_type": "donut", "by": by, "from": frm, "to": to,
+                     "total": total,
+                     "slices": [{"label": s.get("label"), "value": s.get("value"),
+                                 "pct": s.get("pct")} for s in slices]}
+        head = f"**Breakdown {_by_lbl}{title_tag}** — {len(slices)} categor{'y' if len(slices)==1 else 'ies'}"
+        if total:
+            head += f"  ·  {_fmt_num(total)} readings total"
+        lines = [head, "", "```trustnode-chart", _json.dumps(chart_obj, default=str), "```", "",
+                 "| Category | Value | Share |", "|---|---|---|"]
+        for s in slices:
+            pct = s.get("pct")
+            lines.append(f"| {s.get('label','')} | {_fmt_num(s.get('value'))} | "
+                         f"{(str(pct)+'%') if pct is not None else '—'} |")
+        return "\n".join(lines)
+
+    # ---- Per-tag aggregate → BAR (one bar per tag) ----
+    if tool_name == "aggregate_tags" or result.get("kind") == "aggregate":
+        slices = [s for s in (result.get("slices") or []) if s.get("value") is not None]
+        agg = result.get("agg") or "avg"
+        frm, to = result.get("from"), result.get("to")
+        if not slices:
+            return (f"**{agg} per tag** — no data in {frm} → {to}.\n\n"
+                    f"None of the requested tags had readings in that window.")
+        chart_obj = {"chart_type": "bar", "agg": agg, "from": frm, "to": to,
+                     "slices": [{"label": s.get("label"), "value": s.get("value")} for s in slices]}
+        head = f"**{agg.capitalize()} per tag** — {len(slices)} tag{'s' if len(slices)!=1 else ''}"
+        lines = [head, "", "```trustnode-chart", _json.dumps(chart_obj, default=str), "```", "",
+                 f"| Tag | {agg.capitalize()} | Samples |", "|---|---|---|"]
+        for s in slices:
+            lines.append(f"| {s.get('label','')} | {_fmt_num(s.get('value'))} | {_fmt_num(s.get('count'))} |")
+        return "\n".join(lines)
 
     # ---- Latest value per tag ----
     if tool_name == "get_live_values":
@@ -663,10 +832,13 @@ def render_local(tool_name: str, result: dict, is_chart: bool) -> str:
 
     if is_chart and result.get("series"):
         pts = result.get("series") or []
-        chart_json = _json.dumps({
-            "tag": tag, "gateway_name": gw, "from": frm, "to": to, "series": pts,
-        }, default=str)
-        head = f"{_widen_note}**{tag}**{f' @ {gw}' if gw else ''} — {len(pts)} points"
+        _ct = result.get("chart_type") or "line"
+        _chart_payload = {"tag": tag, "gateway_name": gw, "from": frm, "to": to, "series": pts}
+        if _ct and _ct != "line":
+            _chart_payload["chart_type"] = _ct   # 'bar' → renderer draws bars
+        chart_json = _json.dumps(_chart_payload, default=str)
+        _kindword = "bars" if _ct == "bar" else "points"
+        head = f"{_widen_note}**{tag}**{f' @ {gw}' if gw else ''} — {len(pts)} {_kindword}"
         stats = []
         for k, lbl in (("min", "Min"), ("max", "Max"), ("avg", "Mean")):
             if result.get(k) is not None:

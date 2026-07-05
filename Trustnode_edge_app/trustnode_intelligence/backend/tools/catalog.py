@@ -319,6 +319,60 @@ TOOL_CATALOG: Dict[str, Tool] = {
         },
         runner=analytics.run_detect_anomalies,
     ),
+    # ---- Bar / Donut chart data (operator 2026-07-06) -------------------
+    "aggregate_tags": Tool(
+        name="aggregate_tags",
+        category="read_only",
+        description="Compute ONE aggregate value per tag over a window (avg/min/max/count/sum/stddev) — the data for a "
+                    "BAR CHART that COMPARES several tags side by side. USE THIS for 'bar chart of the average of A, B, C', "
+                    "'compare the max of these tags as bars', 'total count per tag'. Returns {chart_type:'bar', "
+                    "slices:[{label,value}]}. Embed the WHOLE result JSON in a ```trustnode-chart fenced block — the "
+                    "renderer draws bars because chart_type is 'bar'. (For a bar chart of ONE tag OVER TIME, i.e. hourly "
+                    "bars, use get_bucketed_series and set chart_type:'bar' on its chart JSON instead.)",
+        schema={
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "1-12 tag names to aggregate (one bar each)."},
+                "from_": {"type": "string", "description": "Start time. ISO-8601 or relative ('-1h','-24h','-7d'). Default '-1h'."},
+                "to": {"type": "string", "description": "End time or 'now'. Default 'now'."},
+                "agg": {"type": "string", "enum": ["avg", "min", "max", "count", "sum", "stddev"],
+                        "description": "Aggregation per tag. Default 'avg'.", "default": "avg"},
+                "gateway_id": {"type": "string", "default": ""},
+            },
+            "required": ["tags"],
+        },
+        runner=analytics.run_aggregate_tags,
+    ),
+    "get_category_breakdown": Tool(
+        name="get_category_breakdown",
+        category="read_only",
+        description="Return categorical SLICES for a DONUT / PIE chart. Pick the dimension with `by`:\n"
+                    "  • 'by_tag'      — each tag's share of total readings (or summed value if measure='value'); "
+                    "optionally limit with `tags`. For 'pie/donut of readings per tag', 'which tag has the most data'.\n"
+                    "  • 'by_gateway'  — each gateway's share of readings collected. For 'donut of data volume per gateway'.\n"
+                    "  • 'quality'     — GOOD/BAD/UNCERTAIN share for `tag` (or all). For 'quality breakdown', 'how much is GOOD'.\n"
+                    "  • 'value_bands' — for one `tag`, % of readings in each range defined by numeric `bands` edges "
+                    "(e.g. bands=[100,150] → '<100','100–150','≥150'). For 'how often was X above/below/between …', "
+                    "'time-in-band distribution'.\n"
+                    "Returns {chart_type:'donut', slices:[{label,value,pct}], total}. Embed the WHOLE result JSON in a "
+                    "```trustnode-chart fenced block — the renderer draws a donut because chart_type is 'donut'.",
+        schema={
+            "type": "object",
+            "properties": {
+                "by": {"type": "string", "enum": ["by_tag", "by_gateway", "quality", "value_bands"],
+                       "description": "Which dimension to break down by."},
+                "tag": {"type": "string", "description": "Required for 'quality' (single tag) and 'value_bands'. Ignored for by_tag/by_gateway."},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional: limit 'by_tag' to these tags."},
+                "bands": {"type": "array", "items": {"type": "number"}, "description": "Numeric edges for 'value_bands', e.g. [100,150]. Required for value_bands."},
+                "measure": {"type": "string", "enum": ["count", "value"], "description": "For by_tag: share by reading COUNT (default) or by summed VALUE.", "default": "count"},
+                "from_": {"type": "string", "description": "Start time. ISO-8601 or relative. Default '-24h'."},
+                "to": {"type": "string", "description": "End time or 'now'. Default 'now'."},
+                "gateway_id": {"type": "string", "default": ""},
+            },
+            "required": [],
+        },
+        runner=analytics.run_get_category_breakdown,
+    ),
 }
 
 

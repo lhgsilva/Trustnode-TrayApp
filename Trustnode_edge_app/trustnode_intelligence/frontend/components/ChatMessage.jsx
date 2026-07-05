@@ -134,6 +134,190 @@ function _assignAxes(seriesList) {
   return result;
 }
 
+// Compact numeric formatter shared by bar/donut labels.
+function _fmtVal(v) {
+  const n = Number(v);
+  if (!isFinite(n)) return String(v ?? "");
+  if (Math.abs(n) >= 1000) return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (Math.abs(n) >= 10) return n.toFixed(1);
+  return n.toFixed(2);
+}
+
+// ---- BAR chart (categorical or time-bucketed) --------------------------
+// Accepts:
+//   slices form: {chart_type:'bar', slices:[{label,value}], agg?}
+//   series form: {chart_type:'bar', tag, series:[{ts,value}]}  (bucketed bars)
+function BarChart({ data, big = false }) {
+  const W = big ? 1100 : 640;
+  const H = big ? 460 : 260;
+  const pad = { l: big ? 64 : 52, r: big ? 24 : 16, t: big ? 24 : 18, b: big ? 96 : 74 };
+
+  // Normalize to [{label, value, color}].
+  let bars = [];
+  if (Array.isArray(data.slices) && data.slices.length) {
+    bars = data.slices
+      .map((s, i) => ({ label: String(s.label ?? `#${i + 1}`), value: Number(s.value), color: CHART_PALETTE[i % CHART_PALETTE.length] }))
+      .filter((b) => isFinite(b.value));
+  } else if (Array.isArray(data.series) && data.series.length) {
+    // Bucketed time series → bars per bucket. Label each by local time.
+    const spanH = data.series.length > 1
+      ? (Number(data.series[data.series.length - 1].ts) - Number(data.series[0].ts)) / 3600000 : 0;
+    bars = data.series
+      .map((p, i) => {
+        let lab = "";
+        try {
+          const d = new Date(Number(p.ts));
+          lab = d.toLocaleString(undefined, spanH > 24
+            ? { month: "short", day: "2-digit", hour: "2-digit" }
+            : { hour: "2-digit", minute: "2-digit" });
+        } catch { lab = String(i + 1); }
+        return { label: lab, value: Number(p.value), color: CHART_PALETTE[0] };
+      })
+      .filter((b) => isFinite(b.value));
+  }
+
+  if (!bars.length) {
+    return (
+      <div style={{ border: "1px solid var(--stroke)", borderRadius: 8, padding: 16, color: "var(--muted)", fontSize: 12 }}>
+        Bar chart: no data to plot.
+      </div>
+    );
+  }
+
+  const innerW = W - pad.l - pad.r;
+  const innerH = H - pad.t - pad.b;
+  const vals = bars.map((b) => b.value);
+  let vMax = Math.max(...vals, 0);
+  let vMin = Math.min(...vals, 0);
+  if (vMax === vMin) { vMax += 1; }
+  const yOf = (v) => pad.t + innerH - ((v - vMin) / (vMax - vMin)) * innerH;
+  const zeroY = yOf(0);
+  const n = bars.length;
+  const slot = innerW / n;
+  const bw = Math.max(4, Math.min(slot * 0.7, big ? 90 : 60));
+  const ticks = [vMax, (vMax + vMin) / 2, vMin];
+  // Show every k-th label if crowded.
+  const labStep = Math.ceil(n / (big ? 24 : 14));
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ display: "block" }}>
+      {/* Y grid + labels */}
+      {ticks.map((t, i) => {
+        const y = yOf(t);
+        return (
+          <g key={`g${i}`}>
+            <line x1={pad.l} y1={y} x2={W - pad.r} y2={y} stroke="var(--stroke)" strokeWidth="1" strokeDasharray="2,3" opacity="0.6" />
+            <text x={pad.l - 6} y={y + 3} fill="var(--muted)" fontSize="10" textAnchor="end" fontFamily="sans-serif">{_fmtVal(t)}</text>
+          </g>
+        );
+      })}
+      {/* zero baseline (if data spans negatives) */}
+      {vMin < 0 ? <line x1={pad.l} y1={zeroY} x2={W - pad.r} y2={zeroY} stroke="var(--muted)" strokeWidth="1" opacity="0.8" /> : null}
+      {bars.map((b, i) => {
+        const x = pad.l + i * slot + (slot - bw) / 2;
+        const top = yOf(Math.max(b.value, 0));
+        const bot = yOf(Math.min(b.value, 0));
+        const h = Math.max(1, bot - top);
+        const showLab = (i % labStep) === 0;
+        return (
+          <g key={`b${i}`}>
+            <rect x={x} y={top} width={bw} height={h} fill={b.color} rx="2">
+              <title>{b.label}: {_fmtVal(b.value)}</title>
+            </rect>
+            {/* value on top of bar */}
+            <text x={x + bw / 2} y={top - 4} fill="var(--text)" fontSize={big ? 11 : 9} textAnchor="middle" fontFamily="sans-serif">{_fmtVal(b.value)}</text>
+            {/* category label (rotated when many) */}
+            {showLab ? (
+              <text
+                x={x + bw / 2} y={H - pad.b + 14}
+                fill="var(--muted)" fontSize={big ? 11 : 9.5}
+                textAnchor="end" fontFamily="sans-serif"
+                transform={`rotate(-40 ${x + bw / 2} ${H - pad.b + 14})`}
+              >{b.label.length > 22 ? b.label.slice(0, 21) + "…" : b.label}</text>
+            ) : null}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// ---- DONUT / PIE chart -------------------------------------------------
+// Accepts {chart_type:'donut', slices:[{label,value,pct?}], total?}.
+function DonutChart({ data, big = false }) {
+  const size = big ? 320 : 200;
+  const cx = size / 2, cy = size / 2;
+  const rOuter = size / 2 - 6;
+  const rInner = rOuter * 0.58; // donut hole (0 would be a full pie)
+  const raw = (data.slices || [])
+    .map((s, i) => ({ label: String(s.label ?? `#${i + 1}`), value: Math.max(0, Number(s.value) || 0),
+                      pct: (typeof s.pct === "number" ? s.pct : null), color: CHART_PALETTE[i % CHART_PALETTE.length] }))
+    .filter((s) => s.value > 0);
+  const total = raw.reduce((a, b) => a + b.value, 0);
+
+  if (!raw.length || total <= 0) {
+    return (
+      <div style={{ border: "1px solid var(--stroke)", borderRadius: 8, padding: 16, color: "var(--muted)", fontSize: 12 }}>
+        Donut: no data to plot.
+      </div>
+    );
+  }
+
+  // Build arc paths.
+  const arc = (startFrac, endFrac) => {
+    const a0 = startFrac * 2 * Math.PI - Math.PI / 2;
+    const a1 = endFrac * 2 * Math.PI - Math.PI / 2;
+    const large = (endFrac - startFrac) > 0.5 ? 1 : 0;
+    const x0 = cx + rOuter * Math.cos(a0), y0 = cy + rOuter * Math.sin(a0);
+    const x1 = cx + rOuter * Math.cos(a1), y1 = cy + rOuter * Math.sin(a1);
+    const xi1 = cx + rInner * Math.cos(a1), yi1 = cy + rInner * Math.sin(a1);
+    const xi0 = cx + rInner * Math.cos(a0), yi0 = cy + rInner * Math.sin(a0);
+    return `M ${x0} ${y0} A ${rOuter} ${rOuter} 0 ${large} 1 ${x1} ${y1} `
+         + `L ${xi1} ${yi1} A ${rInner} ${rInner} 0 ${large} 0 ${xi0} ${yi0} Z`;
+  };
+  let acc = 0;
+  const segs = raw.map((s) => {
+    const start = acc / total;
+    acc += s.value;
+    const end = acc / total;
+    // A single 100% slice can't draw as an arc (start==end after wrap) — draw a ring instead.
+    const isFull = raw.length === 1 || (end - start) >= 0.9999;
+    return { ...s, start, end, isFull, pctCalc: (s.pct != null ? s.pct : (s.value / total) * 100) };
+  });
+
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: big ? 28 : 16, justifyContent: "center" }}>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} style={{ flex: "0 0 auto" }}>
+        {segs.map((s, i) => (
+          s.isFull ? (
+            <g key={`f${i}`}>
+              <circle cx={cx} cy={cy} r={rOuter} fill={s.color} />
+              <circle cx={cx} cy={cy} r={rInner} fill="var(--card)" />
+            </g>
+          ) : (
+            <path key={`s${i}`} d={arc(s.start, s.end)} fill={s.color} stroke="var(--card)" strokeWidth="1.5">
+              <title>{s.label}: {_fmtVal(s.value)} ({s.pctCalc.toFixed(1)}%)</title>
+            </path>
+          )
+        ))}
+        {/* center total */}
+        <text x={cx} y={cy - 2} fill="var(--text)" fontSize={big ? 16 : 12} fontWeight="700" textAnchor="middle" fontFamily="sans-serif">{_fmtVal(total)}</text>
+        <text x={cx} y={cy + (big ? 16 : 13)} fill="var(--muted)" fontSize={big ? 11 : 9} textAnchor="middle" fontFamily="sans-serif">total</text>
+      </svg>
+      {/* legend */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 140 }}>
+        {segs.map((s, i) => (
+          <div key={`l${i}`} style={{ display: "flex", alignItems: "center", gap: 7, fontSize: big ? 13 : 11.5 }}>
+            <span style={{ width: 11, height: 11, borderRadius: 2, background: s.color, flex: "0 0 auto" }} />
+            <span style={{ color: "var(--text)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.label}</span>
+            <span style={{ color: "var(--muted)", fontVariantNumeric: "tabular-nums" }}>{s.pctCalc.toFixed(1)}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function TrustnodeChart({ data, big = false }) {
   // Operator 2026-07-03: `big` renders a larger canvas for the expand modal.
   // The small inline chart stays 640x220; the modal uses a much taller/wider
@@ -143,8 +327,59 @@ function TrustnodeChart({ data, big = false }) {
   const H = big ? 460 : 220;
   const pad = { l: big ? 64 : 50, r: big ? 64 : 50, t: big ? 24 : 18, b: big ? 38 : 28 };
   const [expanded, setExpanded] = React.useState(false);
+  // Hooks must run unconditionally (before any early return) — compute the
+  // line-shape memos here even if we end up rendering a bar/donut instead.
   const norm = useMemo(() => _toMultiShape(data), [data]);
   const series = useMemo(() => (norm ? _assignAxes(norm.series) : []), [norm]);
+
+  // DISPATCH on chart_type. Absent/'line' → the SVG line chart below (unchanged).
+  // 'bar' / 'donut' render their own components, wrapped in the same card chrome
+  // + expand-to-modal button so the UX is consistent across chart types.
+  const ctype = String(data?.chart_type || "line").toLowerCase();
+  if (ctype === "bar" || ctype === "donut") {
+    const title = (() => {
+      if (ctype === "donut") {
+        const by = data.by ? ` by ${data.by === "value_bands" ? "value band" : data.by}` : "";
+        return `Breakdown${by}${data.tag ? ` — ${data.tag}` : ""}`;
+      }
+      const agg = data.agg ? `${String(data.agg).charAt(0).toUpperCase()}${String(data.agg).slice(1)} ` : "";
+      return data.tag ? `${data.tag} — ${agg}bars` : `${agg}by tag`;
+    })();
+    const inner = ctype === "donut"
+      ? <DonutChart data={data} big={big} />
+      : <BarChart data={data} big={big} />;
+    return (
+      <div style={{
+        margin: "8px 0", padding: big ? 4 : 10,
+        border: big ? "none" : "1px solid var(--stroke)", borderRadius: 8,
+        background: big ? "transparent" : "var(--bg)",
+      }}>
+        <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6, display: "flex", alignItems: "center", gap: 12 }}>
+          <strong style={{ color: "var(--text)" }}>{title}</strong>
+          {(data.from && data.to) ? <span>{fmtWindowSide(data.from)} → {fmtWindowSide(data.to)}</span> : null}
+          {!big ? (
+            <button
+              type="button"
+              onClick={() => setExpanded(true)}
+              title="Open chart in a larger view"
+              style={{
+                marginLeft: "auto", border: "1px solid var(--stroke)",
+                background: "color-mix(in srgb, var(--teal, #14a89a) 12%, transparent)",
+                color: "var(--text)", cursor: "pointer", fontSize: 11,
+                padding: "2px 8px", borderRadius: 5, display: "inline-flex", alignItems: "center", gap: 5,
+              }}
+            ><span style={{ fontSize: 13, lineHeight: 1 }}>⤢</span> Expand</button>
+          ) : null}
+        </div>
+        {inner}
+        {expanded && !big ? (
+          <ChartModal onClose={() => setExpanded(false)}>
+            <TrustnodeChart data={data} big />
+          </ChartModal>
+        ) : null}
+      </div>
+    );
+  }
 
   if (!norm || !series.length || series.every((s) => !s.points.length)) {
     return (
@@ -449,8 +684,11 @@ function renderMarkdown(src) {
       //   3. Multiple concatenated objects in one block (LLM sometimes emits
       //      one tag-object per chart back-to-back). We extract each {...} run
       //      and render one chart per valid chart-shaped object.
+      // A chart payload has either a time-series (`series`) OR categorical
+      // slices (`slices`, used by donut + per-tag bar). Both render as charts.
       const isChartShape = (o) => o && typeof o === "object"
-        && Array.isArray(o.series) && o.series.length > 0;
+        && ((Array.isArray(o.series) && o.series.length > 0)
+            || (Array.isArray(o.slices) && o.slices.length > 0));
 
       let chartObjects = [];
       let parsedWhole = null;

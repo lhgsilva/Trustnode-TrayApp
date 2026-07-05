@@ -201,9 +201,43 @@ SYSTEM_PROMPT = (
     "]}\n"
     "```\n"
     "\n"
+    "## Bar chart (compare tags, or one tag as time-bucketed bars)\n"
+    "  - COMPARE several tags by a single aggregate ('bar chart of the average of\n"
+    "    A, B, C', 'which tag has the highest max'): call `aggregate_tags`\n"
+    "    (tags, agg=avg|min|max|count|sum|stddev). Embed its result JSON VERBATIM\n"
+    "    in a ```trustnode-chart block — it carries chart_type:'bar' + slices[].\n"
+    "  - ONE tag as bars OVER TIME (hourly/daily bars): call `get_bucketed_series`\n"
+    "    with the right bucket, then in the chart JSON add \"chart_type\":\"bar\"\n"
+    "    alongside tag/from/to/series. Shape:\n"
+    "```trustnode-chart\n"
+    "{\"chart_type\":\"bar\",\"tag\":\"<tag>\",\"from\":\"<iso>\",\"to\":\"<iso>\","
+    "\"series\":[{\"ts\":<ms>,\"value\":<v>},...]}\n"
+    "```\n"
+    "\n"
+    "## Donut / pie chart (categorical share — NOT a time series)\n"
+    "For 'pie'/'donut' or 'share/breakdown/distribution' questions call\n"
+    "`get_category_breakdown` and embed its result JSON VERBATIM (it carries\n"
+    "chart_type:'donut' + slices:[{label,value,pct}]). Pick `by`:\n"
+    "  - by_tag     → readings (or value) per tag ('pie of readings per tag')\n"
+    "  - by_gateway → data volume per gateway\n"
+    "  - quality    → GOOD/BAD/UNCERTAIN share for a tag ('quality breakdown')\n"
+    "  - value_bands→ % of a tag's readings in ranges (bands=[100,150] → '<100',\n"
+    "    '100–150','≥150'); for 'how often was X above/below/between …'.\n"
+    "```trustnode-chart\n"
+    "{\"chart_type\":\"donut\",\"by\":\"tag\",\"total\":<n>,"
+    "\"slices\":[{\"label\":\"<cat>\",\"value\":<v>,\"pct\":<p>},...]}\n"
+    "```\n"
+    "\n"
+    "## Choosing the chart type\n"
+    "  - TREND over time, or comparing shapes → LINE (default).\n"
+    "  - COMPARE a few discrete categories/tags by one number → BAR.\n"
+    "  - COMPOSITION / share of a whole (parts add to 100%) → DONUT.\n"
+    "  Honor an explicit request ('as a bar chart', 'pie'); otherwise pick the one\n"
+    "  that best fits the question. Never invent slices/series — use tool output.\n"
+    "\n"
     "## After the chart block\n"
     "Write 1-2 short sentences: state the window in local-friendly format and\n"
-    "one observation (range, drift, anomaly). DO NOT duplicate the JSON in prose.\n"
+    "one observation (range, drift, anomaly, biggest slice). DO NOT duplicate the JSON in prose.\n"
     "\n"
     "## Hard rules — failures here mean the user sees raw JSON instead of a chart\n"
     "  - The LANGUAGE TAG MUST be exactly `trustnode-chart`. A plain ``` block,\n"
@@ -289,6 +323,25 @@ def _narrate_result(client, user_message, tool_result, is_chart):
     keeps chart replies fast (small output) and guarantees a valid chart.
     """
     import json as _json
+    # BAR / DONUT results carry chart_type + slices (or a bucketed series flagged
+    # as bar). The line-rebuild below would drop that shape, so for these we build
+    # the chart block from render_local (deterministic, correct) and only ask the
+    # model for a short prose lead-in around it.
+    _ct = str((tool_result or {}).get("chart_type") or "").lower() if isinstance(tool_result, dict) else ""
+    _has_slices = isinstance(tool_result, dict) and isinstance(tool_result.get("slices"), list)
+    if is_chart and isinstance(tool_result, dict) and (_ct in ("bar", "donut") or _has_slices):
+        try:
+            from . import fastpath as _fp
+            # render_local already emits the correct ```trustnode-chart``` block
+            # (with chart_type + slices) plus a table — return it directly. This
+            # keeps bar/donut fast and always-valid, same as the line fast-path.
+            # It keys off result['kind'] ('breakdown'/'aggregate') so an empty
+            # tool name is fine here.
+            body = _fp.render_local("", tool_result, True)
+            if body:
+                return body
+        except Exception:
+            pass  # fall through to generic handling
     if is_chart and isinstance(tool_result, dict) and tool_result.get("series"):
         # Give the model only the compact stats (not the full point array).
         summary_view = {k: v for k, v in tool_result.items() if k != "series"}
@@ -620,6 +673,7 @@ def run_insight(prompt: str, tool_plan: List[Dict[str, Any]],
         "list_tags", "list_gateways", "list_recent_alarms",
         "get_tag_timeseries", "get_multi_tag_timeseries",
         "get_tag_summary", "get_bucketed_series",
+        "aggregate_tags", "get_category_breakdown",
     }
     if len(tool_results) == 1 and str(tool_results[0].get("name")) in _RENDERABLE:
         tr = tool_results[0]
@@ -627,7 +681,8 @@ def run_insight(prompt: str, tool_plan: List[Dict[str, Any]],
         if isinstance(res0, dict) and not res0.get("error"):
             try:
                 from . import fastpath as _fp
-                is_chart = ("timeseries" in tr["name"]) or bool(res0.get("series")) and tr["name"] != "get_tag_summary"
+                is_chart = ("timeseries" in tr["name"]) or ("slices" in res0) \
+                    or (bool(res0.get("series")) and tr["name"] != "get_tag_summary")
                 content = _fp.render_local(tr["name"], res0, bool(is_chart))
                 if content:
                     return {"ok": True, "content": content, "tool_results": tool_results,
