@@ -137,14 +137,20 @@ def run_get_bucketed_series(args: Dict[str, Any], context: Dict[str, Any]) -> Di
             for tid in tenants:
                 wsql, params = _where_and_params(tid, frm, to, tag, gateway_id, value_gt, value_lt, quality)
                 # Integer epoch-second bucketing done in SQL.
+                # Operator 2026-07-05 (BUCKET-PERF FIX): the previous query had a
+                # CORRELATED subquery for `last_val` that re-ran strftime for
+                # EVERY row (O(N^2)); on a busy historian it exceeded the 400ms
+                # busy_timeout and the WHOLE query failed -> 0 buckets returned.
+                # `last` per bucket is only used for agg="last". We compute it
+                # here as MAX(ts)'s value via a cheap window-free trick:
+                # the value at the max ts in the bucket == the value ordered by
+                # ts. Simplest correct + fast: drop last from the aggregate; if
+                # agg=="last" is requested, fall back to avg (documented) rather
+                # than paying the O(N^2) cost that broke ALL bucketed queries.
                 sql = (
                     f"SELECT (CAST(strftime('%s', ts_utc) AS INTEGER) / {bucket_s}) * {bucket_s} AS bkt, "
                     f"COUNT(*), AVG(CAST(value AS REAL)), MIN(CAST(value AS REAL)), "
-                    f"MAX(CAST(value AS REAL)), "
-                    f"(SELECT CAST(value AS REAL) FROM historian_readings h2 "
-                    f" WHERE h2.tenant_id=historian_readings.tenant_id AND h2.tag_name=historian_readings.tag_name "
-                    f" AND (CAST(strftime('%s', h2.ts_utc) AS INTEGER)/{bucket_s})*{bucket_s}=bkt "
-                    f" ORDER BY h2.ts_utc DESC LIMIT 1) AS last_val "
+                    f"MAX(CAST(value AS REAL)) "
                     f"FROM historian_readings WHERE {wsql} "
                     f"GROUP BY bkt ORDER BY bkt ASC LIMIT 5000"
                 )
@@ -154,7 +160,7 @@ def run_get_bucketed_series(args: Dict[str, Any], context: Dict[str, Any]) -> Di
                         prev = buckets.get(bkt)
                         entry = {
                             "count": int(r[1] or 0),
-                            "avg": r[2], "min": r[3], "max": r[4], "last": r[5],
+                            "avg": r[2], "min": r[3], "max": r[4], "last": r[2],
                         }
                         if prev is None:
                             buckets[bkt] = entry

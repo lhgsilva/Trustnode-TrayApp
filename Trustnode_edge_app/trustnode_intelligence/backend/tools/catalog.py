@@ -50,6 +50,24 @@ TOOL_CATALOG: Dict[str, Tool] = {
         },
         runner=gateways.run_list_gateways,
     ),
+    "get_live_values": Tool(
+        name="get_live_values",
+        category="read_only",
+        description="Return the LATEST value + timestamp for each tag currently collecting. "
+                    "USE THIS for 'show me the latest reading for every live tag', 'current values', "
+                    "'what is everything reading right now', 'latest value of all tags'. Returns one row "
+                    "per (tag, gateway) with its most-recent value and time — NOT just tag names. "
+                    "Optionally pass `tags` to limit to specific tags.",
+        schema={
+            "type": "object",
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional: limit to these tag names. Omit for ALL live tags."},
+                "window_s": {"type": "integer", "description": "Recency window in seconds; a tag with no reading inside it is omitted. Default 600.", "default": 600},
+            },
+            "required": [],
+        },
+        runner=gateways.run_get_live_values,
+    ),
     "find_tags": Tool(
         name="find_tags",
         category="read_only",

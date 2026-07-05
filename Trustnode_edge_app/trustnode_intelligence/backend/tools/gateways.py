@@ -144,3 +144,87 @@ def run_list_tags(args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, An
         result["live_only"] = True
         result["since"] = cutoff_txt
     return result
+
+
+def run_get_live_values(args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the LATEST value + timestamp for each tag currently collecting
+    (or a specific set of tags). This is the tool for "show me the latest
+    reading for every live tag", "current values", "what are all the tags
+    reading now". Reads the most-recent historian row per (tag, gateway).
+
+    Args:
+      tags: optional list of tag names to limit to (else all recently-active).
+      window_s: recency window in seconds (default 600). A tag with no reading
+                inside the window is considered not live and omitted.
+    """
+    from .tag_summary import hist_connect, _historian_tenants
+    from ._scope import all_db_paths, gateway_name_for
+    import datetime as _dt
+
+    try:
+        window_s = max(30, int(args.get("window_s") or 600))
+    except Exception:
+        window_s = 600
+    want = args.get("tags") or []
+    if isinstance(want, str):
+        want = [t.strip() for t in want.split(",") if t.strip()]
+    want_set = {str(t).strip() for t in want if str(t).strip()}
+
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=window_s)
+    cutoff_txt = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    # latest row per (tag, gateway): {(tag,gid): {value, ts, gid}}
+    latest: Dict[tuple, Dict[str, Any]] = {}
+    for db_path in all_db_paths():
+        tenants = _historian_tenants(db_path)
+        if not tenants:
+            continue
+        try:
+            con = hist_connect(db_path)
+        except Exception:
+            continue
+        try:
+            for tid in tenants:
+                # Most-recent reading per (tag_name, gateway_id) within the window.
+                sql = (
+                    "SELECT tag_name, gateway_id, value, value_text, MAX(ts_utc) AS ts, quality_label "
+                    "FROM historian_readings WHERE tenant_id = ? AND ts_utc >= ? "
+                    "GROUP BY tag_name, gateway_id"
+                )
+                try:
+                    for r in con.execute(sql, (tid, cutoff_txt)):
+                        tag = str(r[0] or "")
+                        gid = str(r[1] or "")
+                        if not tag:
+                            continue
+                        if want_set and tag not in want_set:
+                            continue
+                        ts = str(r[4] or "")
+                        key = (tag, gid)
+                        prev = latest.get(key)
+                        if prev is None or ts > prev.get("ts", ""):
+                            val = r[2]
+                            vt = r[3]
+                            latest[key] = {
+                                "tag": tag, "gateway_id": gid,
+                                "value": (val if val is not None else vt),
+                                "ts": ts,
+                                "quality": str(r[5] or ""),
+                            }
+                except Exception:
+                    continue
+        finally:
+            try: con.close()
+            except Exception: pass
+
+    rows = []
+    for (tag, gid), v in latest.items():
+        rows.append({
+            "tag": tag,
+            "gateway_id": gid,
+            "gateway_name": gateway_name_for(gid) if gid else "",
+            "value": v.get("value"),
+            "ts_utc": v.get("ts"),
+            "quality": v.get("quality"),
+        })
+    rows.sort(key=lambda x: (x["gateway_name"], x["tag"]))
+    return {"count": len(rows), "since": cutoff_txt, "values": rows}

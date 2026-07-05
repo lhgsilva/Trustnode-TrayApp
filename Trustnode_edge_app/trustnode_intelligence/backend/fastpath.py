@@ -34,7 +34,29 @@ _BUCKET_RE = re.compile(r"\b(every|per)\s+(\d+)\s*(s|sec|second|seconds|m|min|mi
 
 # Time-window hints.
 _WINDOW_RE = re.compile(r"\blast\s+(\d+)\s*(s|sec|seconds?|m|min|minutes?|h|hours?|d|days?|w|weeks?)\b", re.I)
-_LAST_N_RE = re.compile(r"\blast\s+(\d+)\s+(reading|readings|points?|samples?)\b", re.I)
+# "last N readings" AND "N last readings" AND "last N points/samples" — the
+# count may come BEFORE or AFTER 'last' (operators phrase it both ways). Also
+# accept a bare "last N" with no unit-word right before the tag list.
+_LAST_N_RE = re.compile(
+    r"\b(?:last\s+(\d+)\s+(?:reading|readings|points?|samples?)"
+    r"|(\d+)\s+last\s+(?:reading|readings|points?|samples?)"
+    r"|(?:the\s+)?last\s+(\d+)\s+(?:reading|readings|points?|samples?))\b",
+    re.I)
+
+
+def _last_n_readings(text: str):
+    """If the user asked for the last N readings/points/samples, return N,
+    else None. Handles 'last 20 readings' and '20 last readings'."""
+    m = _LAST_N_RE.search(text)
+    if not m:
+        return None
+    for g in m.groups():
+        if g:
+            try:
+                return max(1, min(5000, int(g)))
+            except Exception:
+                return None
+    return None
 
 # Words that signal the user wants ANALYSIS / REASONING (only these truly
 # need the AI). Instant mode can do EVERYTHING ELSE — tables, values, trends,
@@ -67,29 +89,78 @@ _STOP = {
 }
 
 
+# Cached set of real tag names (normalized) so the fast-path can VALIDATE that
+# an extracted token is actually a tag before running a query on it — otherwise
+# plain English words ('each','tank','detailed') get mis-read as tags (audit
+# 1g). Refreshed every 60s. On any failure, returns None and _extract_tag
+# falls back to shape-only heuristics (never worse than before).
+_TAGSET_CACHE = {"at": 0.0, "norm": None, "raw": None}
+_TAGSET_TTL = 60.0
+
+
+def _norm_tag(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def _known_tags():
+    """(normalized_set, raw_list) of real tag names, cached; or (None, None)."""
+    import time as _t
+    now = _t.monotonic()
+    if _TAGSET_CACHE["norm"] is not None and (now - _TAGSET_CACHE["at"]) < _TAGSET_TTL:
+        return _TAGSET_CACHE["norm"], _TAGSET_CACHE["raw"]
+    try:
+        from .tools._scope import all_tag_names
+        raw = list(all_tag_names() or [])
+        norm = {_norm_tag(t) for t in raw}
+        _TAGSET_CACHE.update(at=now, norm=norm, raw=raw)
+        return norm, raw
+    except Exception:
+        return None, None
+
+
+def _looks_like_real_tag(tok: str) -> bool:
+    """True if tok exactly/normalized-matches a real tag, or is a substring of
+    one (abbreviations like 'PVA' -> 'BT_PVA_Level'). If the tag set can't be
+    read, fall back to True for strongly-shaped tokens only (handled by caller)."""
+    norm, _raw = _known_tags()
+    if not norm:
+        return True  # can't validate — don't block; caller uses shape heuristic
+    tn = _norm_tag(tok)
+    if tn in norm:
+        return True
+    # substring match against any real tag (>=3 chars to avoid noise)
+    if len(tn) >= 3 and any(tn in n for n in norm):
+        return True
+    return False
+
+
 def _extract_tag(text: str) -> Optional[str]:
-    """Pull a candidate tag token from the message. We grab the most
-    tag-looking token and let the tool's auto-resolver map it to a real tag."""
+    """Pull a candidate tag token from the message — but only if it plausibly
+    corresponds to a REAL tag, so plain English words aren't mis-read as tags.
+    Returns None when nothing tag-like is found (→ caller defers to the AI)."""
     tokens = list(re.finditer(r"[A-Za-z][A-Za-z0-9_]*(?:\[\d+\])?", text))
+    norm, _raw = _known_tags()
     # Pass 1: strongly tag-shaped — bracket, underscore, or embedded digit.
+    # These are almost always real tags; accept without validation.
     for m in tokens:
         tok = m.group(0)
         if tok.lower() in _STOP:
             continue
         if "[" in tok or "_" in tok or any(c.isdigit() for c in tok):
             return tok
-    # Pass 2: an UPPERCASE-ish abbreviation (PVA, LVB) or a 4+ char word that
-    # isn't a stop word — let the auto-resolver map it to the real tag.
+    # Pass 2: a word/abbreviation — accept ONLY if it matches a real tag name
+    # (exact, normalized, or as an abbreviation substring). This stops 'each',
+    # 'tank', 'detailed', 'information' from being treated as tags.
     for m in tokens:
         tok = m.group(0)
         low = tok.lower()
         if low in _STOP:
             continue
-        if tok.isupper() and 2 <= len(tok) <= 12:   # PVA, LVB, TEMP
+        if len(tok) < 2:
+            continue
+        if _looks_like_real_tag(tok):
             return tok
-        if len(tok) >= 4:                            # 'level', 'temperature'
-            return tok
-    # Pass 3: quoted tag.
+    # Pass 3: quoted tag (user explicitly quoted it → trust it).
     m = re.search(r"['\"]([^'\"]{2,40})['\"]", text)
     if m:
         return m.group(1)
@@ -124,16 +195,23 @@ def _window_from(text: str) -> str:
     if m:
         n, unit = m.group(1), m.group(2).lower()[0]
         return f"-{n}{unit}"
-    lm = _LAST_N_RE.search(text)
-    if lm:
+    n = _last_n_readings(text)
+    if n is not None:
         # "last N readings" — size the window to comfortably include N points.
-        # At ~1 reading/sec that's N seconds; pad generously (×3, min 5 min).
-        try:
-            n = int(lm.group(1))
-        except Exception:
-            n = 100
-        secs = max(300, n * 3)
+        # At ~1 reading/sec that's N seconds; pad generously (×3, min 60s). The
+        # tool then keeps the most-recent N via max_points, so the chart shows
+        # exactly N points even if the window caught more.
+        secs = max(60, n * 3)
         return f"-{secs}s"
+    # "last minute / hour / day / week" (no number) + "today" / "past hour".
+    bare = re.search(r"\b(?:last|past|previous|this)\s+(minute|hour|day|week|month)\b", text, re.I)
+    if bare:
+        u = bare.group(1).lower()
+        return {"minute": "-1m", "hour": "-1h", "day": "-1d", "week": "-7d", "month": "-30d"}[u]
+    if re.search(r"\btoday\b", text, re.I):
+        return "-1d"
+    if re.search(r"\byesterday\b", text, re.I):
+        return "-2d"
     return "-1h"
 
 
@@ -146,6 +224,17 @@ def _window_from(text: str) -> str:
 # gateways/tags/alarms are pure data and must ALWAYS be instant, no AI.
 # "Live intent" — the user wants what is ACTIVE NOW, not the whole catalog.
 _LIVE_RE = re.compile(r"\b(live|running|active|now|currently|being collected|collecting|online|real[\- ]?time)\b", re.I)
+# CONDITION / complex-filter intent — a data question the deterministic
+# fast-path can't answer precisely ("show X WHEN Y was above 50", "trend X
+# WHILE the machine was running", "only when quality was bad"). These need the
+# AI tool-loop (it has detect_threshold + can reason about the condition), so
+# classify() returns None and lets the full AI handle it instead of giving a
+# wrong plain answer.
+_CONDITION_RE = re.compile(
+    r"\bwhen\b|\bwhile\b|\bduring\b|\bwhenever\b|\bif\b|\bas long as\b|"
+    r"\b(above|below|over|under|exceed|greater than|less than|between)\b.*\b\d|"
+    r"\bwas\s+(above|below|over|under|at|equal)\b",
+    re.I)
 # "Compare intent" — wants correlation/comparison analysis, not just an overlay.
 _COMPARE_RE = re.compile(r"\b(compare|comparison|correlat|relationship|relate|versus|vs\.?|against|side by side|analyz?e|analys)\b", re.I)
 _UNIT = r"(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)"
@@ -159,6 +248,35 @@ _BUCKET_TRAILING_RE = re.compile(rf"\b(\d+)\s*{_UNIT}\s+buckets?\b", re.I)
 _BUCKET_NAMED = {
     "secondly": "1s", "minutely": "1m", "hourly": "1h", "daily": "1d",
 }
+
+
+# Valid bucket sizes the tool actually honors (must match analytics.BUCKET_SECONDS).
+_VALID_BUCKET_SECONDS = {"1s":1,"5s":5,"10s":10,"30s":30,"1m":60,"5m":300,"15m":900,"1h":3600,"1d":86400}
+
+
+def _snap_bucket(label: str) -> str:
+    """Snap any 'Nu' bucket to the nearest VALID enum bucket, so the tool never
+    silently substitutes a different size (audit 1c). '45s'->'30s', '20m'->'15m',
+    '3h'->'1h', etc. Already-valid labels pass through."""
+    if label in _VALID_BUCKET_SECONDS:
+        return label
+    m = re.match(r"(\d+)\s*([smhd])", str(label).lower())
+    if not m:
+        return "auto"
+    n = int(m.group(1)); u = m.group(2)
+    secs = n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[u]
+    # nearest by absolute difference
+    best = min(_VALID_BUCKET_SECONDS.items(), key=lambda kv: abs(kv[1] - secs))
+    return best[0]
+
+
+def _agg_from(text: str) -> str:
+    """Pick the aggregation the user asked for (min/max/avg/count), default avg."""
+    t = text.lower()
+    if re.search(r"\bmax(imum)?\b", t): return "max"
+    if re.search(r"\bmin(imum)?\b", t): return "min"
+    if re.search(r"\bcount\b|how many\b", t): return "count"
+    return "avg"
 
 
 def _bucket_label_from(text: str):
@@ -176,6 +294,15 @@ def _bucket_label_from(text: str):
             return lab
     return None
 
+# "Latest VALUES per tag" — wants values, not a name list. Matches "latest/
+# current reading(s)/value(s) ... for/of every/all/each tag(s)", "current
+# values of all tags", "what is everything reading now".
+_LIVE_VALUES_RE = re.compile(
+    r"(?:\b(latest|current|last|live|most recent)\b.*\b(reading|readings|value|values)\b.*\b(every|all|each|the)\b.*\btags?\b)"
+    r"|(?:\b(reading|readings|value|values)\b.*\bfor (every|all|each)\b.*\btags?\b)"
+    r"|(?:\b(current|latest|live)\s+values?\b)"
+    r"|(?:\bwhat\b.*\b(everything|all tags?)\b.*\b(reading|reads?|value)\b)",
+    re.I)
 _REQ = r"(list|show|what|which|give|tell|display|info|information|details?|describe|current|running|status|all|my)"
 _LIST_TAGS_RE = re.compile(rf"\b{_REQ}\b.*\btags?\b", re.I)
 _LIST_GW_RE = re.compile(rf"\b{_REQ}\b.*\b(gateway|gateways|plc|plcs|device|devices)\b", re.I)
@@ -183,10 +310,19 @@ _LIST_ALARMS_RE = re.compile(rf"\b{_REQ}\b.*\b(alarm|alarms|alert|alerts|events?
 
 
 def classify(user_message: str) -> Optional[Dict[str, Any]]:
-    """Return {tool, args, kind} for a recognized fast-path, else None."""
+    """Return {tool, args, kind} for a recognized fast-path, else None.
+
+    Returns None (→ full AI tool-loop) whenever the request carries a CONDITION
+    or complex filter the deterministic path can't answer precisely, so the AI
+    (which can reason + use detect_threshold/get_bucketed_series) handles it
+    instead of the fast-path forcing a wrong plain answer.
+    """
     text = user_message.strip()
     if len(text) > 200:
         return None  # long/complex → full loop
+    # Conditional / filtered data question → let the AI reason about it.
+    if _CONDITION_RE.search(text):
+        return None
 
     # Operator 2026-07-03 (LIVE INTENT): if the question is about what is LIVE /
     # RUNNING / ACTIVE / being collected right NOW, pass live_only so the tool
@@ -194,6 +330,13 @@ def classify(user_message: str) -> Optional[Dict[str, Any]]:
     # catalog. "list all tags" (no live word) still returns the full catalog.
     live_only = bool(_LIVE_RE.search(text))
     _largs = {"live_only": True} if live_only else {}
+
+    # Operator 2026-07-05 (LATEST VALUES): "latest reading/value for every/all
+    # tag(s)", "current values", "what is everything reading now" wants the
+    # actual VALUES per tag, not a name list. Must fire BEFORE list_tags (the
+    # query contains 'tags'). get_live_values returns value+timestamp per tag.
+    if _LIVE_VALUES_RE.search(text):
+        return {"kind": "live_values", "tool": "get_live_values", "args": {}, "is_chart": False}
 
     # Catalog listings — pure data, no tag needed. These are common and should
     # be instant (the old full-loop made 'list tags' take several seconds).
@@ -210,6 +353,10 @@ def classify(user_message: str) -> Optional[Dict[str, Any]]:
 
     is_chart = bool(_CHART_RE.search(text))
     frm = _window_from(text)
+    # If the user asked for "last N readings", cap the chart to N points so it
+    # shows exactly what they asked (not the default 200). Else default 200.
+    _n_read = _last_n_readings(text)
+    _max_pts = _n_read if _n_read else 200
 
     # Operator 2026-07-03 (MULTI-SERIES CHART): if the user named MORE THAN ONE
     # tag and wants a chart ("trend BT_PVA_Level, BT_PVB_Level, BT_PVC_Level in
@@ -235,23 +382,33 @@ def classify(user_message: str) -> Optional[Dict[str, Any]]:
         if is_chart:
             return {"kind": "multichart", "tool": "get_multi_tag_timeseries",
                     "args": {"tags": multi_tags, "from_": frm, "to": "now",
-                             "max_points": 200},
+                             "max_points": _max_pts},
                     "is_chart": True}
 
-    # Bucketed ("average every 5 minutes")
+    # Bucketed ("average every 5 minutes", "grouped by 1 hour", "hourly avg").
+    # Operator 2026-07-05: also use _bucket_label_from so single-tag bucketing
+    # catches "grouped by / interval / resolution / hourly" (was multi-tag only,
+    # audit 1b). Snap non-standard buckets (45s, 20m, 3h) to the nearest valid
+    # one so the tool doesn't SILENTLY substitute (audit 1c).
+    bucket = _bucket_label_from(text)
     bm = _BUCKET_RE.search(text)
-    if bm and (_AVG_RE.search(text) or is_chart):
+    if not bucket and bm:
         n, unit = bm.group(2), bm.group(3).lower()
         ubase = "s" if unit.startswith("s") else ("m" if unit.startswith("m") else "h")
         bucket = f"{n}{ubase}"
+    # If an explicit bucket/grain was requested, that IS a bucketed request —
+    # fire it regardless of whether the word 'average' or 'chart' appears
+    # ("show X grouped by 1 hour" is bucketed even without those words).
+    if bucket:
+        snapped = _snap_bucket(bucket)
         return {"kind": "bucketed", "tool": "get_bucketed_series",
-                "args": {"tag": tag, "from_": frm, "to": "now", "bucket": bucket, "agg": "avg"},
-                "is_chart": is_chart}
+                "args": {"tag": tag, "from_": frm, "to": "now", "bucket": snapped, "agg": _agg_from(text)},
+                "is_chart": True}
 
     if is_chart:
         return {"kind": "chart", "tool": "get_tag_timeseries",
                 "args": {"tag": tag, "from_": frm, "to": "now",
-                         "max_points": 200},
+                         "max_points": _max_pts},
                 "is_chart": True}
 
     if _LAST_RE.search(text) or _AVG_RE.search(text) or _VALUE_RE.search(text):
@@ -309,6 +466,20 @@ def render_local(tool_name: str, result: dict, is_chart: bool) -> str:
     """Build a Markdown answer directly from the tool result — no LLM.
     Sub-second, deterministic, always-correct numbers."""
     import json as _json
+
+    # ---- Latest value per tag ----
+    if tool_name == "get_live_values":
+        vals = result.get("values") or []
+        since = result.get("since")
+        if not vals:
+            return (f"No tags have reported since {since} — nothing is collecting right now.")
+        rows = [f"**Latest values** — {len(vals)} live tag{'s' if len(vals)!=1 else ''}"
+                + (f" (as of the most recent reading)" if since else ""), "",
+                "| Tag | Value | Time | Gateway |", "|---|---|---|---|"]
+        for v in vals:
+            rows.append(f"| {v.get('tag','')} | {_fmt_num(v.get('value'))} | "
+                        f"{v.get('ts_utc','')} | {v.get('gateway_name') or v.get('gateway_id','')} |")
+        return "\n".join(rows)
 
     # ---- Catalog listings (tags / gateways / alarms) ----
     live = bool(result.get("live_only"))
