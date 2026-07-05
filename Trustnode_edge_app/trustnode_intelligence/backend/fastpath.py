@@ -419,6 +419,32 @@ def classify(user_message: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# Windows we treat as "narrow" for auto-widen (seconds). If the user asked for
+# a short recent window and it's empty, collection may have paused moments ago —
+# a smart assistant widens to find the freshest data instead of dead-ending.
+_NARROW_WINDOW_S = 15 * 60  # 15 minutes
+
+
+def _window_seconds(frm: str) -> Optional[int]:
+    """Parse a '-Nu' relative window into seconds, else None (absolute/ISO)."""
+    m = re.match(r"-\s*(\d+)\s*([smhdw])\s*$", str(frm or "").strip(), re.I)
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2).lower()]
+
+
+def _result_is_empty(result: dict, is_chart: bool) -> bool:
+    """True when a tag query came back with no data for the window."""
+    if not isinstance(result, dict):
+        return True
+    if result.get("count") == 0:
+        return True
+    if is_chart and not (result.get("series")):
+        return True
+    return False
+
+
 def run_fastpath(user_message: str, data_source: str) -> Optional[Dict[str, Any]]:
     """Execute the fast-path if the message matches. Returns:
       {"tool_result": <dict>, "tool_name": str, "is_chart": bool,
@@ -437,6 +463,41 @@ def run_fastpath(user_message: str, data_source: str) -> Optional[Dict[str, Any]
                 "query": result.get("query") or plan["args"].get("tag"),
                 "tool_name": plan["tool"], "is_chart": plan.get("is_chart", False),
                 "tool_result": None}
+
+    # SMART AUTO-WIDEN (understand intent): the user asked for a SHORT recent
+    # window ("last minute", "last 20 readings") but it came back empty — usually
+    # because collection paused/stopped minutes ago, so the newest reading sits
+    # just outside their window. A person wouldn't say "no data" and stop; they'd
+    # show the most recent data and note it's a bit stale. We retry ONCE at a
+    # wider window (1h → 1d), and if that has data, return it flagged with
+    # `widened_from`/`widened_to` so render_local tells the user we widened.
+    # Only applies to single-tag data tools with a narrow relative window; never
+    # touches a query that already returned data, and never widens explicit long
+    # windows (if you ask for "last minute" and mean it, an empty 1-min result is
+    # only widened when the tag genuinely has NO recent data at that grain).
+    if (not result.get("error")
+            and plan["tool"] in ("get_tag_timeseries", "get_tag_summary", "get_bucketed_series")
+            and "tag" in (plan.get("args") or {})
+            and _result_is_empty(result, plan.get("is_chart", False))):
+        orig_frm = plan["args"].get("from_")
+        win_s = _window_seconds(orig_frm)
+        if win_s is not None and win_s <= _NARROW_WINDOW_S:
+            for wider in ("-1h", "-1d", "-7d"):
+                if (_window_seconds(wider) or 0) <= win_s:
+                    continue
+                wargs = dict(plan["args"])
+                wargs["from_"] = wider
+                # For bucketed queries, a 1-min bucket over 1d is absurd — let the
+                # tool pick a sensible grain by switching to 'auto' when widening.
+                if plan["tool"] == "get_bucketed_series":
+                    wargs["bucket"] = "auto"
+                wresult = run_tool(plan["tool"], wargs, {"data_source": data_source})
+                if isinstance(wresult, dict) and not _result_is_empty(wresult, plan.get("is_chart", False)):
+                    wresult["widened_from"] = orig_frm
+                    wresult["widened_to"] = wider
+                    result = wresult
+                    break
+
     # DECISION: does this question need AI interpretation, or just the data?
     # If the user asked a plain data question (no 'why/stable/anomaly/trend'
     # words), we can render a deterministic answer in CODE — instant, no AI.
@@ -592,12 +653,20 @@ def render_local(tool_name: str, result: dict, is_chart: bool) -> str:
                 f"The gateway may not have been collecting this tag in that "
                 f"window. Try a wider window, or check that the gateway is running.")
 
+    # If we auto-widened because the requested short window was empty, prepend a
+    # one-line note so the user knows we adjusted the window for them.
+    _widen_note = ""
+    if result.get("widened_to"):
+        _widen_note = (f"_No data in the requested window ({result.get('widened_from')}); "
+                       f"showing {result.get('widened_to')} instead — the most recent "
+                       f"readings._\n\n")
+
     if is_chart and result.get("series"):
         pts = result.get("series") or []
         chart_json = _json.dumps({
             "tag": tag, "gateway_name": gw, "from": frm, "to": to, "series": pts,
         }, default=str)
-        head = f"**{tag}**{f' @ {gw}' if gw else ''} — {len(pts)} points"
+        head = f"{_widen_note}**{tag}**{f' @ {gw}' if gw else ''} — {len(pts)} points"
         stats = []
         for k, lbl in (("min", "Min"), ("max", "Max"), ("avg", "Mean")):
             if result.get(k) is not None:
@@ -606,7 +675,11 @@ def render_local(tool_name: str, result: dict, is_chart: bool) -> str:
         return f"{head}{substat}\n\n```trustnode-chart\n{chart_json}\n```"
 
     # Summary / bucketed table.
-    lines = [f"**{tag}**{f' @ {gw}' if gw else ''}", "", "| Metric | Value | Unit |", "|---|---|---|"]
+    lines = []
+    if _widen_note:
+        lines.append(_widen_note.rstrip())
+        lines.append("")
+    lines += [f"**{tag}**{f' @ {gw}' if gw else ''}", "", "| Metric | Value | Unit |", "|---|---|---|"]
     if frm and to:
         lines.append(f"| Period | {frm} → {to} |  |")
     if result.get("count") is not None:
