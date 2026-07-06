@@ -740,6 +740,20 @@ class ControlPlaneStore:
             "license_modules": [],
             "activation_codes": [],
         }
+        # Operator 2026-07-06: stamp WHICH edge belongs to THIS machine, so a
+        # reinstall restores the correct identity instead of latching onto a
+        # stale/empty edge (e.g. a leftover 'edge-01') that also lives in the
+        # receipt. Read the machine's current edge_id from app_settings.
+        try:
+            from app.state import app_store as _as
+            _bs = _as.get_bootstrap(prefer_cloud_reads=False) or {}
+            _s = _bs.get("app_settings") if isinstance(_bs.get("app_settings"), dict) else {}
+            _ep = _s.get("edge_profile") if isinstance(_s.get("edge_profile"), dict) else {}
+            _pe = str(_ep.get("edge_id") or _s.get("edge_id") or "").strip()
+            if _pe:
+                out["primary_edge_id"] = _pe
+        except Exception:
+            pass
         with self._lock:
             with self._connect() as conn:
                 for row in conn.execute("SELECT * FROM cp_edges").fetchall():
@@ -805,9 +819,79 @@ class ControlPlaneStore:
                     (result.get("applied") or {}).get("edges"),
                     (result.get("applied") or {}).get("licenses"),
                 )
-            return {"restored": bool(result.get("ok")), "applied": result.get("applied")}
+                # Operator 2026-07-06: ADOPT the machine's own edge identity from
+                # the receipt so the reinstall comes back as ITS edge (e.g.
+                # 'edge-9b329d5a31' / LUCAS-A), not a stale 'edge-01' that also
+                # lives in the receipt. Only set it when app_settings has no real
+                # edge yet OR is on the default 'edge-01' fallback — never clobber
+                # a legitimately-set identity.
+                try:
+                    primary = str(payload.get("primary_edge_id") or "").strip()
+                    if primary:
+                        self._adopt_restored_edge_identity(primary)
+                except Exception as _adopt_exc:
+                    logger.debug("adopt restored edge identity failed: %s", _adopt_exc)
+            return {"restored": bool(result.get("ok")), "applied": result.get("applied"),
+                    "primary_edge_id": payload.get("primary_edge_id")}
         except Exception as exc:
             return {"restored": False, "reason": f"restore failed: {exc}"}
+
+    def _adopt_restored_edge_identity(self, primary_edge_id: str) -> None:
+        """After a registry restore, point app_settings at the machine's OWN
+        edge (primary_edge_id) so it comes up as that edge — not a stale
+        'edge-01'. Pulls the edge's customer + its license from the just-restored
+        cp_edges/cp_licenses so the scope + license gate resolve correctly.
+        Only writes when the local edge_id is empty or the default 'edge-01'."""
+        primary_edge_id = str(primary_edge_id or "").strip()
+        if not primary_edge_id:
+            return
+        # Look up the restored edge + its license.
+        edge_row = None
+        lic_id = ""
+        cust_id = ""
+        tenant_id = ""
+        with self._lock:
+            with self._connect() as conn:
+                er = conn.execute("SELECT * FROM cp_edges WHERE edge_id = ? LIMIT 1", (primary_edge_id,)).fetchone()
+                if er:
+                    edge_row = {k: er[k] for k in er.keys()}
+                    cust_id = str(edge_row.get("customer_id") or "").strip()
+                    tenant_id = str(edge_row.get("tenant_id") or "").strip()
+                    # license linked to this edge's customer
+                    lr = conn.execute(
+                        "SELECT license_id FROM cp_licenses WHERE customer_id = ? ORDER BY end_utc DESC LIMIT 1",
+                        (cust_id,),
+                    ).fetchone() if cust_id else None
+                    if lr:
+                        lic_id = str(lr["license_id"] or "").strip()
+        if not edge_row:
+            return
+        try:
+            from app.state import app_store as _as
+            bs = _as.get_bootstrap(prefer_cloud_reads=False) or {}
+            s = dict(bs.get("app_settings") or {})
+            ep = dict(s.get("edge_profile") or {}) if isinstance(s.get("edge_profile"), dict) else {}
+            cur = str(ep.get("edge_id") or "").strip().lower()
+            # Only adopt when unset or on the default fallback identity.
+            if cur and cur not in ("", "edge-01", "local", "edge-local"):
+                return
+            ep["edge_id"] = primary_edge_id
+            ep["edge_name"] = str(edge_row.get("edge_name") or ep.get("edge_name") or primary_edge_id)
+            if cust_id:
+                ep["linked_customer_id"] = cust_id
+                s["customer_id"] = cust_id
+            if lic_id:
+                ep["linked_license_id"] = lic_id
+                s["license_id"] = lic_id
+            if tenant_id:
+                s["tenant_id"] = tenant_id
+            s["edge_profile"] = ep
+            s["edge_linked"] = True
+            _as.upsert_domain("app_settings", s, actor="activation_registry_restore")
+            logger.info("activation_registry: adopted restored edge identity edge_id=%s customer=%s license=%s",
+                        primary_edge_id, cust_id or "-", lic_id or "-")
+        except Exception as exc:
+            logger.debug("adopt restored identity write failed: %s", exc)
 
     def import_activation_state(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Restore the activation rows from a workspace export.

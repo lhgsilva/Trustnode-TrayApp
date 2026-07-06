@@ -23089,10 +23089,21 @@ const getGatewayHealth = (gateway) => {
                 <div className="form-grid">
                   <label>
                     Edge ID
+                    {/* Operator 2026-07-06: on a NEW PC / fresh reinstall the edge
+                        falls back to 'edge-01' and can't auto-restore its real
+                        identity (the registry receipt lives on the original
+                        machine). Make Edge ID EDITABLE while the edge is unlinked
+                        (or on the default 'edge-01') so the operator can enter the
+                        real edge id from the portal, then Activate to re-link. A
+                        genuinely-linked edge keeps this read-only. */}
                     <input
                       value={edgeProfile.edge_id}
                       placeholder="edge-01"
-                      disabled
+                      onChange={(e) => setEdgeProfile((p) => ({ ...p, edge_id: e.target.value.trim() }))}
+                      disabled={
+                        !canEditPage("edge")
+                        || (edgeLinked && String(edgeProfile.edge_id || "").trim().toLowerCase() !== "edge-01")
+                      }
                     />
                   </label>
                   <label>
@@ -23175,6 +23186,20 @@ const getGatewayHealth = (gateway) => {
                     {edgeLicenseBusy ? "Refreshing..." : "Refresh"}
                   </button>
                 </div>
+                {/* Operator 2026-07-06: guide the operator when the edge isn't
+                    linked / is on the default 'edge-01' (typical after a fresh
+                    install on a NEW PC). Tell them to set the real Edge ID above
+                    and paste an activation code from the portal to re-link. */}
+                {(!edgeLinked || String(edgeProfile.edge_id || "").trim().toLowerCase() === "edge-01") ? (
+                  <div className="info-note" style={{ marginBottom: 10 }}>
+                    This edge isn’t linked to your portal license yet. To activate this computer:
+                    <ol style={{ margin: "6px 0 0 18px", padding: 0 }}>
+                      <li>Set <strong>Edge ID</strong> above to your edge’s id from the portal (e.g. <code>edge-9b329d5a31</code>), then <strong>Save Edge Information</strong>.</li>
+                      <li>In the portal, issue an <strong>activation code</strong> for that edge (on a license that is not expired).</li>
+                      <li>Paste it below and click <strong>Activate License</strong>.</li>
+                    </ol>
+                  </div>
+                ) : null}
                 <div className="form-grid">
                   <label className="form-span-2">
                     Activation Code
