@@ -10907,13 +10907,35 @@ function AppShell() {
   const LICENSE_CHECK_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000;
   const LICENSE_SNAPSHOT_STORAGE_KEY = "trustnode_edge_license_snapshot_v1";
   const LICENSE_SNAPSHOT_GRACE_MS = 7 * 24 * 60 * 60 * 1000; // 7d grace after 30d
-  const formatLicenseGuardReason = useCallback((reason) => {
+  // Operator 2026-07-06: set true when the last license check couldn't reach
+  // the license server, so the startup burst retries quickly (cold-start heal).
+  // Declared before runLicenseComplianceCheck so the callback closes over it.
+  const licenseSyncUnreachableRef = useRef(false);
+  const formatLicenseGuardReason = useCallback((reason, opts = {}) => {
     const r = String(reason || "").trim();
+    // Operator 2026-07-06: when the edge couldn't REACH the license server, say
+    // so plainly (it's a connectivity issue, not an expired license) and tell
+    // the operator it will keep retrying / to click Re-check. This is the case
+    // that used to look like "the button does nothing".
+    if (opts.cloudUnreachable) {
+      return "Couldn't reach the license server (connection timed out). "
+        + "The app will keep retrying — check this PC's internet connection, "
+        + "or click “Re-check now” again.";
+    }
     if (r === "edge_not_found") return "Edge not found in control-plane. Verify edge identity and activation code.";
     if (r === "edge_customer_missing") return "Edge is linked but customer scope is missing.";
     if (r === "license_not_found") return "No active license found for this edge customer.";
     if (r === "license_inactive") return "License is inactive.";
-    if (r === "license_expired") return "License is expired.";
+    if (r === "license_expired") {
+      // Include the actual expiry date + the fix (renew in portal, then re-check).
+      const end = String(opts.endUtc || "").trim();
+      let when = "";
+      if (end) {
+        const d = new Date(end);
+        if (!isNaN(d.getTime())) when = ` on ${d.toLocaleDateString()}`;
+      }
+      return `License expired${when}. Renew it in the portal, then click “Re-check now”.`;
+    }
     if (!r) return "License validation failed.";
     return r.replaceAll("_", " ");
   }, []);
@@ -11159,23 +11181,42 @@ function AppShell() {
           "license_not_found",
           "edge_not_found",
         ]);
-        if (hardReasons.has(reason)) {
+        // Operator 2026-07-06: did the edge fail to REACH the license server?
+        // That's a soft/connectivity failure — never trap the operator on it;
+        // keep the app usable from the local snapshot if we have one, and show
+        // a clear "couldn't reach server, retrying" message so Re-check isn't a
+        // silent no-op.
+        const cloudUnreachable = Boolean(out?.sync_status?.cloud_unreachable);
+        const endUtc = String(out?.license?.end_utc || "").trim();
+        licenseSyncUnreachableRef.current = cloudUnreachable;
+        if (cloudUnreachable) {
+          if (localLicenseLooksActive) {
+            setLicenseGuardBlocked(false);
+          } else {
+            setLicenseGuardBlocked(true);
+          }
+          setLicenseGuardMessage(formatLicenseGuardReason(reason, { cloudUnreachable: true }));
+        } else if (hardReasons.has(reason)) {
           setLicenseGuardBlocked(true);
-          setLicenseGuardMessage(formatLicenseGuardReason(reason));
+          setLicenseGuardMessage(formatLicenseGuardReason(reason, { endUtc }));
         } else if (localLicenseLooksActive) {
           // Keep app usable from persisted local state; cloud check will run again on schedule.
           setLicenseGuardBlocked(false);
           setLicenseGuardMessage("License active");
         } else {
           setLicenseGuardBlocked(true);
-          setLicenseGuardMessage(formatLicenseGuardReason(reason));
+          setLicenseGuardMessage(formatLicenseGuardReason(reason, { endUtc }));
         }
       } else {
+        licenseSyncUnreachableRef.current = false;  // synced OK — stop startup retries
         setLicenseGuardBlocked(false);
         setLicenseGuardMessage("License active");
       }
       setLicenseGuardLastCheckedUtc(tsNow());
     } catch {
+      // A thrown error here (fetch rejected) is itself a reachability failure —
+      // let the startup burst retry it.
+      licenseSyncUnreachableRef.current = true;
       if (localLicenseLooksActive) {
         setLicenseGuardBlocked(false);
         setLicenseGuardMessage("License active");
@@ -11198,8 +11239,19 @@ function AppShell() {
     // historian reads, and the export tab.
     const call = () => { runLicenseComplianceCheckRef.current?.(); };
     call();
+    // STARTUP SELF-HEAL: the portal's license-check can cold-start and time out
+    // on the very first hit after idle. Fire a few EXTRA forced checks in the
+    // first ~40s so a transient timeout heals itself without the operator
+    // touching anything. Bounded (3 tries) and only while still unreachable, so
+    // it never becomes a request storm. Force=true bypasses the 30-day cache.
+    const retryDelays = [6000, 15000, 30000];
+    const retryTimers = retryDelays.map((ms) => setTimeout(() => {
+      if (licenseSyncUnreachableRef.current) {
+        runLicenseComplianceCheckRef.current?.(true);
+      }
+    }, ms));
     const timer = setInterval(call, LICENSE_CHECK_INTERVAL_MS);
-    return () => { clearInterval(timer); };
+    return () => { clearInterval(timer); retryTimers.forEach(clearTimeout); };
   }, [currentUser, isHostedWebClient]);
 
   // Remember the page the user was on before the license guard forced a jump

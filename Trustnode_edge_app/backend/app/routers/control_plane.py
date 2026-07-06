@@ -2480,6 +2480,12 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
     resolved_tenant = str(out.get("resolved_tenant_id") or tid)
 
     # If local scope is stale/incomplete, hydrate from cloud control-plane authoritative source.
+    # Operator 2026-07-06: track the cloud-sync outcome so the UI can tell the
+    # operator WHY a re-check didn't unlock — "couldn't reach the license server"
+    # (retry) vs "license genuinely expired" (renew in portal). Previously the
+    # whole block was `except: pass`, so a network/timeout failure was invisible
+    # and the button looked dead.
+    _sync = {"attempted": False, "reachable": None, "error": None}
     try:
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
         app_settings = dict(bootstrap.get("app_settings") or {})
@@ -2566,6 +2572,7 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
             or local_modules_stale
         )
         if should_try_cloud and local_missing_details:
+            _sync["attempted"] = True
             fwd_headers: dict[str, str] = {}
             auth = str(request.headers.get("authorization") or "").strip()
             if auth:
@@ -2574,8 +2581,31 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
                 fwd_headers["X-Tenant-Id"] = resolved_tenant
 
             def _cloud_get(url: str, *, timeout: int = 8) -> requests.Response:
-                # Try forwarded auth first.
-                resp = requests.get(url, timeout=timeout, headers=fwd_headers or None)
+                # Operator 2026-07-06 (RE-CHECK ROBUSTNESS): the portal's
+                # license-check route can COLD-START on the first hit after idle
+                # and time out, then serve fine on retry (reproduced: HTTP 000
+                # once, then 200 in 0.6s). A single shot that fails made the edge
+                # silently keep its stale/expired license and the "Re-check"
+                # button look dead. Retry a few times on connection/timeout errors
+                # with a short backoff so a cold start self-heals.
+                last_exc: Exception | None = None
+                resp = None
+                for _attempt in range(3):
+                    try:
+                        resp = requests.get(url, timeout=timeout, headers=fwd_headers or None)
+                        break
+                    except (requests.ConnectionError, requests.Timeout) as _e:
+                        last_exc = _e
+                        try:
+                            import time as _t
+                            _t.sleep(0.6 * (_attempt + 1))
+                        except Exception:
+                            pass
+                if resp is None:
+                    # All attempts failed to connect — re-raise so the caller's
+                    # try/except records it as a reachability failure (surfaced
+                    # to the UI), rather than silently returning stale data.
+                    raise (last_exc or requests.ConnectionError(f"cloud unreachable: {url}"))
                 if resp.status_code != 401:
                     return resp
                 # Local JWT may not match cloud JWT secret; obtain cloud token and retry.
@@ -2618,6 +2648,7 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
             qs = f"?{'&'.join(params)}" if params else ""
             url = f"{cloud_url}/api/control-plane/edge-link/license-check{qs}"
             r = _cloud_get(url, timeout=8)
+            _sync["reachable"] = True  # got an HTTP response (any status)
             if r.status_code < 400:
                 cloud = r.json() if r.content else {}
                 if isinstance(cloud, dict):
@@ -2770,8 +2801,13 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
                                 pass
                         out = control_plane_store.check_edge_license(tenant_id=c_tenant, edge_id=check_edge_id)
                         resolved_tenant = str(out.get("resolved_tenant_id") or c_tenant)
-    except Exception:
-        pass
+    except (requests.ConnectionError, requests.Timeout) as _net_exc:
+        # Reachability failure — record it so the UI can say "couldn't reach the
+        # license server, retry" instead of silently showing the stale license.
+        _sync["reachable"] = False
+        _sync["error"] = f"{type(_net_exc).__name__}"
+    except Exception as _other_exc:
+        _sync["error"] = f"{type(_other_exc).__name__}"
 
     # Secondary recovery path for legacy/partial links:
     # resolve full license details by app_settings.license_id and persist locally.
@@ -3088,12 +3124,25 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
     except Exception as exc:
         sig_status = {"verified": False, "reason": f"verifier error: {type(exc).__name__}"}
 
+    # Operator 2026-07-06: tell the UI HOW the sync went so a failed re-check is
+    # never a silent no-op. Three cases the frontend can message distinctly:
+    #   - reachable False  -> "Couldn't reach the license server" (retry / offline)
+    #   - reachable True but ok False & reason license_expired -> genuinely expired
+    #   - ok True -> synced.
+    _cloud_unreachable = (_sync.get("attempted") and _sync.get("reachable") is False)
+    sync_status = {
+        "attempted": bool(_sync.get("attempted")),
+        "reachable": _sync.get("reachable"),
+        "error": _sync.get("error"),
+        "cloud_unreachable": bool(_cloud_unreachable),
+    }
     return {
         "ok": bool(out.get("ok")),
         "tenant_id": resolved_tenant,
         "edge_id": resolved_edge_id,
         "grandfathered_modules": grandfathered,
         "license_signature": sig_status,
+        "sync_status": sync_status,
         **out,
     }
 
