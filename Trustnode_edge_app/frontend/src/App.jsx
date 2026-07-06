@@ -19173,15 +19173,22 @@ const getGatewayHealth = (gateway) => {
         }
       }
       const msg =
-        raw.includes("activation_code_not_found")
-          ? "Activation code not found. Verify the exact code and confirm it was issued in the cloud portal."
-          : raw.includes("activation_code_used")
-            ? "Activation code already used. Issue a new code or reuse the same bound edge."
-            : raw.includes("activation_code_expired")
-              ? "Activation code expired. Issue a new activation code."
-              : raw.includes("activation_scope_resolution_failed")
-                ? "Activation scope could not be resolved. Check tenant/customer/license linkage in portal."
-                : raw;
+        // Operator 2026-07-06: the portal returns activation_license_expired when
+        // the LICENSE behind the code has lapsed — the most common real cause.
+        // Say so plainly instead of a generic "register failed (HTTP 400)".
+        raw.includes("activation_license_expired")
+          ? "The license for this activation code has expired. Renew the license in the portal (extend its end date), then activate again."
+          : raw.includes("activation_license_inactive")
+            ? "The license for this activation code is inactive. Re-activate the license in the portal, then try again."
+          : raw.includes("activation_code_not_found")
+            ? "Activation code not found. Verify the exact code and confirm it was issued in the cloud portal."
+            : raw.includes("activation_code_used")
+              ? "Activation code already used. Issue a new code or reuse the same bound edge."
+              : raw.includes("activation_code_expired")
+                ? "Activation code expired. Issue a new activation code."
+                : raw.includes("activation_scope_resolution_failed")
+                  ? "Activation scope could not be resolved. Check tenant/customer/license linkage in portal."
+                  : raw;
       setEdgeActivationResult(`Activation failed: ${msg}`);
     } finally {
       setEdgeActivationBusy(false);
