@@ -15,6 +15,12 @@ class BatchTypeIn(BaseModel):
     name: str
     description: Optional[str] = None
     parent_type_id: Optional[str] = None
+    # Operator 2026-07-06: the simplified Single/Multiple model.
+    #   'single'   → one continuous collection run with a clear start & stop.
+    #   'multiple' → a parent run that auto-spawns 'single' children (child_type_id)
+    #                between its own start and stop, using the same condition kinds.
+    batch_kind: Literal["single", "multiple"] = "single"
+    child_type_id: Optional[str] = None   # for 'multiple': the Single type to spawn
     start_method: Literal["manual", "plc_trigger", "scheduled", "barcode"] = "manual"
     end_method: Literal["manual", "plc_trigger", "duration", "quantity", "scheduled"] = "manual"
     start_config: Optional[dict[str, Any]] = None

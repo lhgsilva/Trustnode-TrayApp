@@ -62,6 +62,8 @@ import {
   startBatch,
   stopBatch,
   scanBatch,
+  nextChildBatch,
+  seedBatchDefaults,
   validateBatch,
   listBatchEvents,
   addBatchEvent,
@@ -432,6 +434,11 @@ function BatchDetailPage({ batchId, onBack, currentUser, batchTypes }) {
     } catch (e) { setError(e); }
   };
 
+  const handleNextChild = async () => {
+    try { await nextChildBatch(batchId); await refresh(); }
+    catch (e) { setError(e); }
+  };
+
   const handleRecompute = async () => {
     try { await recomputeBatchSummaries(batchId); await refresh(); }
     catch (e) { setError(e); }
@@ -452,6 +459,12 @@ function BatchDetailPage({ batchId, onBack, currentUser, batchTypes }) {
             <span style={{ marginLeft: 12 }}><StatusPill status={batch.status} /></span>
           </div>
           <div>
+            {/* Operator 2026-07-06: MULTIPLE parent → manual "roll to next child". */}
+            {((bt?.batch_kind === "multiple") && batch.status === "running") ? (
+              <button className="btn btn-primary btn-sm" style={{ marginRight: 8 }}
+                      title="Close the current sub-batch and start the next one."
+                      onClick={handleNextChild}>Next child ▸</button>
+            ) : null}
             <a
               className="btn btn-secondary btn-sm"
               href={bmDownloadUrl(`/batches/${encodeURIComponent(batchId)}/report.pdf`)}
@@ -657,7 +670,12 @@ export function BatchTypesPage() {
     collection_profile: "continuous", identifier_method: "auto", identifier_prefix: "",
     enabled: true, summary_tags: [],
     start_schedule: null, stop_schedule: null, report_schedule: null,
+    batch_kind: "single", child_type_id: "",
   }), []);
+  // Single types available to be the "child" of a Multiple type.
+  const singleTypes = useMemo(
+    () => rows.filter((t) => (t.batch_kind || "single") === "single" && t.id !== editing?.id),
+    [rows, editing]);
 
   const refresh = useCallback(async () => {
     setBusy(true);
@@ -685,17 +703,25 @@ export function BatchTypesPage() {
       <section className="card">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <h3 style={{ margin: 0 }}>Batch Types</h3>
-          <button className="btn btn-primary" onClick={() => setEditing({ ...blank })}>New Type</button>
+          <div style={{ display: "flex", gap: 8 }}>
+            {rows.length === 0 ? (
+              <button className="btn btn-secondary" onClick={async () => { try { await seedBatchDefaults(); await refresh(); } catch (e) { setError(e); } }}>
+                Seed starter types
+              </button>
+            ) : null}
+            <button className="btn btn-primary" onClick={() => setEditing({ ...blank })}>New Type</button>
+          </div>
         </div>
         {error ? <div className="alert alert-error" style={{ marginTop: 12 }}>{error}</div> : null}
         <div className="table" style={{ marginTop: 12 }}>
           <div className="thead">
-            <span>Name</span><span>Start</span><span>End</span>
+            <span>Name</span><span>Kind</span><span>Start</span><span>End</span>
             <span>Profile</span><span>Identifier</span><span>Enabled</span><span>Actions</span>
           </div>
           {rows.map((t) => (
             <div key={t.id} className="trow">
               <span>{t.name}</span>
+              <span>{(t.batch_kind || "single") === "multiple" ? "Multiple" : "Single"}</span>
               <span>{t.start_method}</span>
               <span>{t.end_method}</span>
               <span>{t.collection_profile}</span>
@@ -707,13 +733,41 @@ export function BatchTypesPage() {
               </span>
             </div>
           ))}
-          {rows.length === 0 ? <div className="trow"><span>{busy ? "Loading…" : "No batch types configured."}</span></div> : null}
+          {rows.length === 0 ? <div className="trow"><span>{busy ? "Loading…" : "No batch types yet — click “Seed starter types” to create Single + Multiple."}</span></div> : null}
         </div>
       </section>
 
       {editing ? (
         <Modal onClose={() => setEditing(null)} width={760}>
             <h3 style={{ marginTop: 0 }}>{editing.id ? "Edit Batch Type" : "New Batch Type"}</h3>
+            {/* Operator 2026-07-06: Single vs Multiple is the primary choice. */}
+            <div className="card" style={{ padding: 12, marginBottom: 12, background: "var(--surface-elev, var(--card))" }}>
+              <div className="form-grid">
+                <label>
+                  Batch kind
+                  <select value={editing.batch_kind || "single"}
+                          onChange={(e) => setEditing({ ...editing, batch_kind: e.target.value })}>
+                    <option value="single">Single — one continuous run</option>
+                    <option value="multiple">Multiple — auto-spawns Single children</option>
+                  </select>
+                </label>
+                {(editing.batch_kind === "multiple") ? (
+                  <label>
+                    Child type (the Single batch to spawn)
+                    <select value={editing.child_type_id || ""}
+                            onChange={(e) => setEditing({ ...editing, child_type_id: e.target.value })}>
+                      <option value="">— pick a Single type —</option>
+                      {singleTypes.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+                    </select>
+                  </label>
+                ) : null}
+              </div>
+              <small style={{ color: "var(--muted)", fontSize: 11 }}>
+                {editing.batch_kind === "multiple"
+                  ? "Multiple: starting the parent opens a child Single; each start-condition fire (or the 'Next child' button) rolls to a new one; stopping the parent closes everything."
+                  : "Single: collects continuously from start to stop. Start/stop can be manual, a barcode scan, or a tag condition (below)."}
+              </small>
+            </div>
             <div className="form-grid">
               <label>
                 Name

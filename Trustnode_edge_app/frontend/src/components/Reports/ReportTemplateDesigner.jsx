@@ -28,6 +28,8 @@ import {
   listReportTemplates,
   renderReportPreview,
   saveReportTemplate,
+  listBatches,
+  listBatchTypes,
 } from "../../api";
 
 // ---------------------------------------------------------------------------
@@ -57,7 +59,59 @@ const TIME_PRESETS = [
   { value: "7d", label: "Last 7 days" },
   { value: "30d", label: "Last 30 days" },
   { value: "custom", label: "Custom range" },
+  // Operator 2026-07-06: anchor the section to a BATCH's window — the report
+  // shows exactly the data collected during that batch (or the latest of a type).
+  { value: "batch", label: "Batch window" },
 ];
+
+// Picker shown when a section's time-range preset is "batch". Lets the user
+// bind the section to a specific batch, or to "the latest batch of a type"
+// (so a scheduled report always covers the most recent run of that type).
+function BatchWindowPicker({ timeRange, onChange }) {
+  const [types, setTypes] = React.useState([]);
+  const [batches, setBatches] = React.useState([]);
+  const [mode, setMode] = React.useState(timeRange?.batch_of_type_id ? "latest_of_type" : "specific");
+  React.useEffect(() => {
+    (async () => {
+      try { setTypes(await listBatchTypes()); } catch { /* module may be off */ }
+      try { const d = await listBatches({ limit: 100 }); setBatches(Array.isArray(d?.rows) ? d.rows : []); } catch { /* */ }
+    })();
+  }, []);
+  return (
+    <div className="tn-row tn-row-2 tn-row-tight">
+      <label>Batch source
+        <select value={mode} onChange={(e) => {
+          const m = e.target.value; setMode(m);
+          // clear the other key when switching mode
+          if (m === "specific") onChange({ batch_of_type_id: "" });
+          else onChange({ batch_id: "" });
+        }}>
+          <option value="specific">A specific batch</option>
+          <option value="latest_of_type">Latest batch of a type</option>
+        </select>
+      </label>
+      {mode === "specific" ? (
+        <label>Batch
+          <select value={timeRange?.batch_id || ""} onChange={(e) => onChange({ batch_id: e.target.value })}>
+            <option value="">— pick a batch —</option>
+            {batches.map((b) => (
+              <option key={b.id} value={b.id}>
+                {(b.identifier || b.id)}{b.status ? ` · ${b.status}` : ""}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : (
+        <label>Batch type
+          <select value={timeRange?.batch_of_type_id || ""} onChange={(e) => onChange({ batch_of_type_id: e.target.value })}>
+            <option value="">— pick a type —</option>
+            {types.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+        </label>
+      )}
+    </div>
+  );
+}
 
 const KPI_AGGREGATIONS = [
   { value: "count", label: "Count" },
@@ -1382,6 +1436,12 @@ function SectionEditor({
                     <input type="datetime-local" value={section.time_range?.to_utc || ""} onChange={(e) => onChange({ time_range: { ...(section.time_range || {}), to_utc: e.target.value } })} />
                   </label>
                 </div>
+              ) : null}
+              {section.time_range?.preset === "batch" ? (
+                <BatchWindowPicker
+                  timeRange={section.time_range}
+                  onChange={(patch) => onChange({ time_range: { ...(section.time_range || {}), preset: "batch", ...patch } })}
+                />
               ) : null}
             </div>
             {/* Section-level bucket size. "Raw samples" keeps the current

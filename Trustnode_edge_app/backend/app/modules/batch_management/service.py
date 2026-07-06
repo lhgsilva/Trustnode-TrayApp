@@ -82,7 +82,8 @@ class BatchService:
                        email_on_close, email_recipients,
                        trigger_start_json, trigger_stop_json,
                        start_schedule_json, stop_schedule_json, report_schedule_json,
-                       last_scheduled_start_utc, last_scheduled_stop_utc, last_report_utc
+                       last_scheduled_start_utc, last_scheduled_stop_utc, last_report_utc,
+                       batch_kind, child_type_id
                 FROM batch_types
                 WHERE tenant_id = ?
                 ORDER BY name COLLATE NOCASE
@@ -103,7 +104,8 @@ class BatchService:
                        email_on_close, email_recipients,
                        trigger_start_json, trigger_stop_json,
                        start_schedule_json, stop_schedule_json, report_schedule_json,
-                       last_scheduled_start_utc, last_scheduled_stop_utc, last_report_utc
+                       last_scheduled_start_utc, last_scheduled_stop_utc, last_report_utc,
+                       batch_kind, child_type_id
                 FROM batch_types
                 WHERE tenant_id = ? AND id = ?
                 """,
@@ -144,6 +146,9 @@ class BatchService:
             _json_or_none(payload.get("start_schedule")),
             _json_or_none(payload.get("stop_schedule")),
             _json_or_none(payload.get("report_schedule")),
+            # Operator 2026-07-06: single/multiple model.
+            (payload.get("batch_kind") or "single"),
+            (payload.get("child_type_id") or None),
         )
         with self._connect() as c:
             if is_new:
@@ -156,8 +161,9 @@ class BatchService:
                      created_utc, updated_utc,
                      email_on_close, email_recipients,
                      trigger_start_json, trigger_stop_json,
-                     start_schedule_json, stop_schedule_json, report_schedule_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     start_schedule_json, stop_schedule_json, report_schedule_json,
+                     batch_kind, child_type_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     record,
                 )
@@ -180,7 +186,8 @@ class BatchService:
                         updated_utc = ?,
                         email_on_close = ?, email_recipients = ?,
                         trigger_start_json = ?, trigger_stop_json = ?,
-                        start_schedule_json = ?, stop_schedule_json = ?, report_schedule_json = ?
+                        start_schedule_json = ?, stop_schedule_json = ?, report_schedule_json = ?,
+                        batch_kind = ?, child_type_id = ?
                     WHERE tenant_id = ? AND id = ?
                     """,
                     (
@@ -189,6 +196,7 @@ class BatchService:
                         record[14], now,
                         record[17], record[18], record[19], record[20],
                         record[21], record[22], record[23],
+                        record[24], record[25],
                         tid, bt_id,
                     ),
                 )
@@ -215,6 +223,49 @@ class BatchService:
                         action="batch_type.delete", before=dict(before))
             c.commit()
         return True
+
+    def seed_default_types(self) -> bool:
+        """On a tenant that has NO batch types yet, create the two starter
+        types so the module works out of the box:
+          • 'Single Batch'   — one continuous run, manual start/stop.
+          • 'Multiple Batch'  — a parent that auto-spawns 'Single Batch' children.
+        Idempotent: does nothing if any type already exists. Returns True if it
+        seeded. Operator 2026-07-06."""
+        try:
+            existing = self.list_batch_types()
+        except Exception:
+            return False
+        if existing:
+            return False
+        try:
+            single = self.save_batch_type({
+                "name": "Single Batch",
+                "description": "One continuous collection run with a clear start and stop "
+                               "(manual button, barcode, or a tag condition).",
+                "batch_kind": "single",
+                "start_method": "manual",
+                "end_method": "manual",
+                "collection_profile": "continuous",
+                "identifier_method": "auto",
+                "identifier_prefix": "SINGLE",
+                "enabled": True,
+            }, actor="system:seed")
+            self.save_batch_type({
+                "name": "Multiple Batch",
+                "description": "A parent run that automatically starts a new 'Single Batch' each "
+                               "time its start condition fires, until the parent is stopped.",
+                "batch_kind": "multiple",
+                "child_type_id": single["id"],
+                "start_method": "manual",
+                "end_method": "manual",
+                "collection_profile": "continuous",
+                "identifier_method": "auto",
+                "identifier_prefix": "MULTI",
+                "enabled": True,
+            }, actor="system:seed")
+            return True
+        except Exception:
+            return False
 
     # -- batches -------------------------------------------------------
     def list_batches(self, *, limit: int = 200, offset: int = 0,
@@ -343,6 +394,17 @@ class BatchService:
             self._audit(c, tid=tid, actor=actor, batch_id=batch_id,
                         action="batch.start", after={"started_utc": now, "source": source})
             c.commit()
+        # Operator 2026-07-06: if a MULTIPLE parent was just started (and this
+        # isn't the internal spawn of a child), open its first child so the run
+        # begins collecting immediately. source=='multiple' means we ARE the
+        # child being started — never recurse in that case.
+        if source != "multiple":
+            try:
+                bt = self.get_batch_type(row["batch_type_id"]) if row["batch_type_id"] else None
+                if bt and str(bt.get("batch_kind")) == "multiple":
+                    self.spawn_child_for_parent(batch_id, actor=actor or "system:multiple")
+            except Exception:
+                pass
         return self.get_batch(batch_id)  # type: ignore[return-value]
 
     def stop_batch(self, batch_id: str, *, result: str = "completed",
@@ -386,6 +448,13 @@ class BatchService:
                         action="batch.stop",
                         after={"ended_utc": now, "result": result, "source": source})
             c.commit()
+        # Operator 2026-07-06: if this is a MULTIPLE parent, cascade-close its
+        # currently-open child so stopping the parent finalizes the whole run.
+        try:
+            if (row["open_child_batch_id"] if "open_child_batch_id" in row.keys() else None):
+                self.close_open_child(batch_id, result=result, actor=actor)
+        except Exception:
+            pass
         # Operator 2026-07-06: reshape the membership window per the type's
         # collection_profile (snapshot / pre_post) BEFORE computing summaries so
         # the stats reflect the intended scope. No-op for continuous.
@@ -494,6 +563,76 @@ class BatchService:
                         message=(f"Close-email sent to {', '.join(recipients)}" if ok
                                  else f"Email failed: {getattr(outcome, 'message', '?')}"))
             c.commit()
+
+    # -- Single/Multiple auto-spawn (operator 2026-07-06) --------------
+    def _set_open_child(self, parent_id: str, child_id: Optional[str]) -> None:
+        tid = self._tenant()
+        with self._connect() as c:
+            c.execute(
+                "UPDATE batches SET open_child_batch_id = ?, updated_utc = ? WHERE tenant_id = ? AND id = ?",
+                (child_id, _utc_now(), tid, parent_id),
+            )
+            c.commit()
+
+    def spawn_child_for_parent(self, parent_id: str, *, actor: str = "system:multiple") -> Optional[dict[str, Any]]:
+        """Open a NEW child Single batch under a running Multiple parent, if the
+        parent has no currently-open child. The child's type is the parent
+        type's child_type_id. Returns the child batch dict (or None if not
+        applicable / a child is already open). Called when the parent's START
+        condition fires again (each fire = a new sub-batch)."""
+        parent = self.get_batch(parent_id)
+        if not parent or parent.get("status") != "running":
+            return None
+        # Already have an open child? Don't double-open.
+        open_id = parent.get("open_child_batch_id")
+        if open_id:
+            oc = self.get_batch(open_id)
+            if oc and oc.get("status") == "running":
+                return None
+        ptype = self.get_batch_type(parent.get("batch_type_id") or "") if parent.get("batch_type_id") else None
+        child_type_id = (ptype or {}).get("child_type_id")
+        child = self.create_batch({
+            "batch_type_id": child_type_id,
+            "parent_batch_id": parent_id,
+            "operator": parent.get("operator"),
+            "gateway_id": parent.get("gateway_id"),
+            "product": parent.get("product"),
+            "recipe": parent.get("recipe"),
+            "source": "multiple",
+            "metadata": {"source": "multiple", "parent": parent_id},
+        }, actor=actor)
+        self.start_batch(child["id"], gateway_id=parent.get("gateway_id"),
+                         actor=actor, source="multiple")
+        self._set_open_child(parent_id, child["id"])
+        return self.get_batch(child["id"])
+
+    def close_open_child(self, parent_id: str, *, result: str = "completed",
+                         actor: str = "system:multiple") -> Optional[dict[str, Any]]:
+        """Close the parent's currently-open child (if any) and clear the
+        pointer, so the next start-fire opens a fresh child. Called when the
+        child's STOP condition fires."""
+        parent = self.get_batch(parent_id)
+        if not parent:
+            return None
+        open_id = parent.get("open_child_batch_id")
+        if not open_id:
+            return None
+        oc = self.get_batch(open_id)
+        if oc and oc.get("status") == "running":
+            self.stop_batch(open_id, result=result, actor=actor, source="multiple")
+        self._set_open_child(parent_id, None)
+        return self.get_batch(open_id)
+
+    def running_multiple_parents(self) -> list[dict[str, Any]]:
+        """All currently-running batches whose TYPE is batch_kind='multiple'.
+        Used by the trigger daemon to know which parents to service."""
+        rows, _ = self.list_batches(limit=200, status_filter="running")
+        out = []
+        for b in rows:
+            bt = self.get_batch_type(b.get("batch_type_id") or "") if b.get("batch_type_id") else None
+            if bt and str(bt.get("batch_kind")) == "multiple":
+                out.append(b)
+        return out
 
     def delete_batch(self, batch_id: str, *, actor: Optional[str] = None) -> bool:
         tid = self._tenant()
@@ -894,6 +1033,62 @@ class BatchService:
         rows, _ = self.list_batches(limit=1, batch_type_id=batch_type_id)
         return rows[0] if rows else None
 
+    def collected_tags_in_window(self, batch_id: str) -> list[str]:
+        """Distinct tag names that have at least one historian reading inside the
+        batch's membership window(s). This is what the Reports builder offers as
+        the pick-list for a batch-sourced report. Operator 2026-07-06."""
+        tid = self._tenant()
+        tags: set[str] = set()
+        with self._connect_readonly() as c:
+            windows = c.execute(
+                "SELECT gateway_id, ts_utc_start, ts_utc_end FROM batch_membership "
+                "WHERE batch_id = ? AND tenant_id = ?", (batch_id, tid),
+            ).fetchall()
+            for w in windows:
+                gw = str(w["gateway_id"] or "")
+                start = str(w["ts_utc_start"] or "")
+                end = str(w["ts_utc_end"] or _utc_now())
+                params: list[Any] = [tid, start, end]
+                gw_clause = ""
+                if gw:
+                    gw_clause = " AND gateway_id = ?"; params.append(gw)
+                try:
+                    for r in c.execute(
+                        f"SELECT DISTINCT tag_name FROM historian_readings "
+                        f"WHERE tenant_id = ? AND ts_utc >= ? AND ts_utc <= ?{gw_clause}",
+                        params,
+                    ):
+                        if r[0]:
+                            tags.add(str(r[0]))
+                except Exception:
+                    continue
+        return sorted(tags)
+
+    def batch_report_context(self, batch_id: str) -> dict[str, Any]:
+        """One call that gives the Reports layer everything it needs for a
+        batch-sourced report: the batch, its type, resolved window, collected
+        tags, summaries, and (if a multiple parent) the child rollup."""
+        b = self.get_batch(batch_id)
+        if not b:
+            return {}
+        bt = self.get_batch_type(b.get("batch_type_id") or "") if b.get("batch_type_id") else None
+        start = str(b.get("started_utc") or "")
+        end = str(b.get("ended_utc") or "")
+        ctx = {
+            "batch": b,
+            "batch_type": bt,
+            "from_utc": start,
+            "to_utc": end or _utc_now(),
+            "collected_tags": self.collected_tags_in_window(batch_id),
+            "summaries": self.list_summaries(batch_id),
+        }
+        if bt and str(bt.get("batch_kind")) == "multiple":
+            try:
+                ctx["rollup"] = self.rollup_children(batch_id)
+            except Exception:
+                ctx["rollup"] = None
+        return ctx
+
     # -- collection-profile window adjustment (applied on stop) -------
     def _apply_collection_profile(self, batch_id: str) -> None:
         """Reshape the batch's membership window according to its TYPE's
@@ -1214,6 +1409,8 @@ class BatchService:
             "last_scheduled_start_utc": d.get("last_scheduled_start_utc"),
             "last_scheduled_stop_utc": d.get("last_scheduled_stop_utc"),
             "last_report_utc": d.get("last_report_utc"),
+            "batch_kind": d.get("batch_kind") or "single",
+            "child_type_id": d.get("child_type_id"),
             "created_utc": d["created_utc"],
             "updated_utc": d["updated_utc"],
         }
@@ -1239,6 +1436,7 @@ class BatchService:
             "recipe": d.get("recipe"),
             "notes": d.get("notes"),
             "metadata": _json_load(d.get("metadata_json")),
+            "open_child_batch_id": d.get("open_child_batch_id"),
             "created_utc": d["created_utc"],
             "updated_utc": d["updated_utc"],
         }
@@ -1256,5 +1454,6 @@ def record_to_dict(record: tuple) -> dict[str, Any]:
         "email_on_close", "email_recipients",
         "trigger_start_json", "trigger_stop_json",
         "start_schedule_json", "stop_schedule_json", "report_schedule_json",
+        "batch_kind", "child_type_id",
     )
     return {k: v for k, v in zip(keys, record)}

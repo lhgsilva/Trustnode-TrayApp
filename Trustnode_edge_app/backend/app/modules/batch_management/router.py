@@ -159,6 +159,26 @@ def scan_batch(payload: BatchScan, request: Request) -> dict:
     return {"ok": True, "row": out}
 
 
+@router.post("/batches/{batch_id}/next-child", dependencies=[Depends(require_batch_management_license)])
+def next_child(batch_id: str, request: Request) -> dict:
+    """MULTIPLE parent: close the current child (if open) and open the next one.
+    Manual 'roll to next sub-batch' button for operators."""
+    svc = _service()
+    parent = svc.get_batch(batch_id)
+    if not parent:
+        raise HTTPException(status_code=404, detail="batch not found")
+    svc.close_open_child(batch_id, actor=_actor(request) or "manual")
+    child = svc.spawn_child_for_parent(batch_id, actor=_actor(request) or "manual")
+    return {"ok": True, "child": child}
+
+
+@router.post("/seed-defaults", dependencies=[Depends(require_batch_management_license)])
+def seed_defaults() -> dict:
+    """Create the two starter types (Single + Multiple) if none exist yet."""
+    seeded = _service().seed_default_types()
+    return {"ok": True, "seeded": bool(seeded)}
+
+
 @router.post("/batches/{batch_id}/validate", dependencies=[Depends(require_batch_management_license)])
 def validate_batch(batch_id: str, payload: BatchValidationIn, request: Request) -> dict:
     try:
@@ -197,6 +217,23 @@ def recompute_summaries(batch_id: str) -> dict:
 @router.get("/batches/{batch_id}/historian", dependencies=[Depends(require_batch_management_license)])
 def historian_rows(batch_id: str, limit: int = 5000) -> dict:
     return {"rows": _service().historian_rows_for_batch(batch_id, limit=limit)}
+
+
+@router.get("/batches/{batch_id}/collected-tags", dependencies=[Depends(require_batch_management_license)])
+def collected_tags(batch_id: str) -> dict:
+    """Distinct tags with data inside the batch window — the pick-list for a
+    batch-sourced report."""
+    return {"tags": _service().collected_tags_in_window(batch_id)}
+
+
+@router.get("/batches/{batch_id}/report-context", dependencies=[Depends(require_batch_management_license)])
+def report_context(batch_id: str) -> dict:
+    """Everything the Reports layer needs for a batch-sourced report: batch,
+    type, window, collected tags, summaries, and (multiple) child rollup."""
+    ctx = _service().batch_report_context(batch_id)
+    if not ctx:
+        raise HTTPException(status_code=404, detail="batch not found")
+    return ctx
 
 
 @router.delete("/batches/{batch_id}", dependencies=[Depends(require_batch_management_license)])

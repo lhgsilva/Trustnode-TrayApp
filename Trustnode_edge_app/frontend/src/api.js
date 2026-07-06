@@ -3127,6 +3127,31 @@ export async function scanBatch(payload) {
   return (await res.json()).row;
 }
 
+// Operator 2026-07-06: MULTIPLE parent — close current child, open the next.
+export async function nextChildBatch(id) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/next-child`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  });
+  await ensureOk(res, "Next child failed");
+  return (await res.json()).child;
+}
+
+// Seed the two starter types (Single + Multiple) if none exist.
+export async function seedBatchDefaults() {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/seed-defaults`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+  });
+  await ensureOk(res, "Seed defaults failed");
+  return (await res.json());
+}
+
+// Distinct tags that had data during a batch's window (report-builder pick-list).
+export async function getBatchCollectedTags(id) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/collected-tags`, {}, 8000);
+  await ensureOk(res, "Collected tags failed");
+  return (await res.json()).tags || [];
+}
+
 export async function validateBatch(id, payload) {
   const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/validate`, {
     method: "POST",

@@ -111,6 +111,48 @@ TIME_PRESET_SECONDS = {
 }
 
 
+def _batch_service():
+    """Resolve BatchService lazily (module may be unlicensed; that's fine —
+    a batch time-range on an unlicensed install just yields an empty window)."""
+    try:
+        from app.modules.batch_management.service import BatchService
+        return BatchService(_app_store())
+    except Exception:
+        return None
+
+
+def _resolve_batch(batch_id: str = "", batch_of_type_id: str = "") -> dict[str, Any] | None:
+    """Return a batch dict for an explicit id, or the latest batch of a type."""
+    svc = _batch_service()
+    if not svc:
+        return None
+    try:
+        if batch_id:
+            return svc.get_batch(batch_id)
+        if batch_of_type_id:
+            return svc.latest_batch_for_type(batch_of_type_id)
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_batch_window(time_range: dict[str, Any]) -> tuple[str, str]:
+    """Resolve a {preset:'batch', batch_id | batch_of_type_id} time range to the
+    batch's (started_utc, ended_utc). A still-running batch uses started→now."""
+    b = _resolve_batch(str(time_range.get("batch_id") or ""),
+                        str(time_range.get("batch_of_type_id") or ""))
+    if not b:
+        return "", ""
+    start = str(b.get("started_utc") or "").strip()
+    end = str(b.get("ended_utc") or "").strip()
+    if start and not end:
+        end = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # Trim the trailing millis so it compares/filters cleanly (historian ts_utc
+    # is 'YYYY-MM-DD HH:MM:SS.fff'; the range filter uses >= start, <= end, so
+    # keeping millis is fine — but normalize whitespace).
+    return start, end
+
+
 def _resolve_time_range(time_range: Any) -> tuple[str, str]:
     """Return (from_utc, to_utc) text suitable for historian filters."""
     if not isinstance(time_range, dict):
@@ -118,6 +160,11 @@ def _resolve_time_range(time_range: Any) -> tuple[str, str]:
     preset = str(time_range.get("preset") or "none").strip().lower()
     if preset in {"none", ""}:
         return "", ""
+    # Operator 2026-07-06: a BATCH-anchored range — the section pulls exactly the
+    # window of a chosen batch (or the latest batch of a type). This is how a
+    # report shows "the tags collected during batch X".
+    if preset == "batch":
+        return _resolve_batch_window(time_range)
     if preset == "custom":
         return (
             str(time_range.get("from_utc") or "").strip(),

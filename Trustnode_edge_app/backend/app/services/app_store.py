@@ -4537,6 +4537,20 @@ class AppStore:
                     conn.execute("ALTER TABLE batch_types ADD COLUMN last_scheduled_stop_utc TEXT NULL")
                 if "last_report_utc" not in bt_cols:
                     conn.execute("ALTER TABLE batch_types ADD COLUMN last_report_utc TEXT NULL")
+                # Operator 2026-07-06: simplified Single/Multiple model.
+                #   batch_kind = 'single'  -> one continuous collection run (start->stop)
+                #   batch_kind = 'multiple'-> a parent that auto-spawns 'single' children
+                #                             (child_type_id) between its start and stop.
+                # last_child_batch_id tracks the currently-open child of a running
+                # multiple parent so the spawn loop knows when to roll to the next.
+                if "batch_kind" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN batch_kind TEXT NOT NULL DEFAULT 'single'")
+                if "child_type_id" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN child_type_id TEXT NULL")
+                # Track the open child batch per running multiple-parent batch.
+                b_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(batches)").fetchall()}
+                if "open_child_batch_id" not in b_cols:
+                    conn.execute("ALTER TABLE batches ADD COLUMN open_child_batch_id TEXT NULL")
                 hist_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(historian_readings)").fetchall()}
                 if "tenant_id" not in hist_cols:
                     conn.execute('ALTER TABLE historian_readings ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "default"')

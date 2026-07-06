@@ -212,39 +212,68 @@ def _latest_values(tags: List[str]) -> Dict[str, Any]:
     return out
 
 
-def _fire_start(svc: Any, bt: Dict[str, Any]) -> None:
-    """Create + start a batch from a batch_type via plc_trigger."""
+def _fire_start(svc: Any, bt: Dict[str, Any], source: str = "plc_trigger") -> None:
+    """React to a type's START condition firing.
+
+    - SINGLE type: create + start one new batch.
+    - MULTIPLE type: this is a 'roll to next child' signal. For each running
+      parent of this type, close its open child (if any) and open a fresh one.
+      If NO parent of this type is running yet, start the parent itself (its
+      first start), which the multiple-tick will then populate with a child.
+    """
     try:
+        kind = str(bt.get("batch_kind") or "single")
+        if kind == "multiple":
+            parents = [p for p in svc.running_multiple_parents()
+                       if str(p.get("batch_type_id")) == str(bt["id"])]
+            if not parents:
+                # First start: create+start the parent. The child opens on the
+                # next start-fire (or immediately below for convenience).
+                created = svc.create_batch({
+                    "batch_type_id": bt["id"], "operator": source,
+                    "source": source, "metadata": {"source": source},
+                }, actor=f"system:{source}")
+                svc.start_batch(created["id"], actor=f"system:{source}", source=source)
+                svc.spawn_child_for_parent(created["id"], actor=f"system:{source}")
+                _log.info("%s: started MULTIPLE parent %s (%s) + first child", source, created["id"], bt.get("name"))
+            else:
+                for p in parents:
+                    svc.close_open_child(p["id"], actor=f"system:{source}")
+                    svc.spawn_child_for_parent(p["id"], actor=f"system:{source}")
+                    _log.info("%s: rolled MULTIPLE parent %s to next child", source, p["id"])
+            return
+        # SINGLE
         payload = {
             "batch_type_id": bt["id"],
             "product": (bt.get("description") or bt.get("name") or "").split("\n")[0][:80],
             "recipe": "",
-            "operator": "plc_trigger",
-            "metadata": {"source": "plc_trigger", "auto_start": True},
+            "operator": source,
+            "metadata": {"source": source, "auto_start": True},
         }
-        created = svc.create_batch(payload, actor="system:plc_trigger")
+        created = svc.create_batch(payload, actor=f"system:{source}")
         new_id = created.get("id")
         if not new_id:
             return
-        svc.start_batch(new_id, actor="system:plc_trigger", source="plc_trigger")
-        _log.info("plc_trigger: started batch %s from type %s", new_id, bt.get("name"))
+        svc.start_batch(new_id, actor=f"system:{source}", source=source)
+        _log.info("%s: started batch %s from type %s", source, new_id, bt.get("name"))
     except Exception as exc:
-        _log.warning("plc_trigger start failed for type %s: %s", bt.get("name"), exc)
+        _log.warning("%s start failed for type %s: %s", source, bt.get("name"), exc)
 
 
-def _fire_stop(svc: Any, bt: Dict[str, Any]) -> None:
-    """Stop all currently-running batches of this type via plc_trigger."""
+def _fire_stop(svc: Any, bt: Dict[str, Any], source: str = "plc_trigger") -> None:
+    """Stop all currently-running batches of this type. For a MULTIPLE parent,
+    stop_batch cascade-closes its open child automatically."""
     try:
         result = svc.list_batches(limit=50, batch_type_id=bt["id"], status_filter="running")
         rows = result[0] if isinstance(result, tuple) else result
         for b in (rows or []):
             try:
-                svc.stop_batch(b["id"], result="completed", actor="system:plc_trigger", source="plc_trigger")
-                _log.info("plc_trigger: stopped batch %s of type %s", b["id"], bt.get("name"))
+                svc.stop_batch(b["id"], result="completed", actor=f"system:{source}", source=source)
+                _log.info("%s: stopped batch %s of type %s", source, b["id"], bt.get("name"))
             except Exception as exc:
-                _log.warning("plc_trigger stop failed for batch %s: %s", b.get("id"), exc)
+                _log.warning("%s stop failed for batch %s: %s", source, b.get("id"), exc)
     except Exception as exc:
-        _log.warning("plc_trigger stop scan failed for type %s: %s", bt.get("name"), exc)
+        _log.warning("%s stop scan failed for type %s: %s", source, bt.get("name"), exc)
 
 
 def _tick() -> None:
@@ -418,12 +447,105 @@ def _tick_schedules() -> None:
                 _log.warning("schedule report failed for %s: %s", bt.get("name"), exc)
 
 
+# --------------------------------------------------------------------------
+# MULTIPLE child-rolling (operator 2026-07-06)
+# A 'multiple' parent auto-spawns 'single' children. Each child is closed when
+# the CHILD TYPE's stop condition fires; the next parent start-fire opens a
+# fresh one. This tick services running parents by watching their child type's
+# trigger_stop.
+# --------------------------------------------------------------------------
+def _tick_multiple() -> None:
+    try:
+        from .service import BatchService
+        from app.state import app_store as _store  # type: ignore
+        svc = BatchService(_store)
+        parents = svc.running_multiple_parents()
+    except Exception as exc:
+        _log.debug("multiple tick: cannot reach service: %s", exc)
+        return
+    if not parents:
+        return
+    # Collect child-type stop conditions and current values.
+    type_cache: Dict[str, Any] = {}
+    def _ptype(bt_id):
+        if bt_id not in type_cache:
+            type_cache[bt_id] = svc.get_batch_type(bt_id) if bt_id else None
+        return type_cache[bt_id]
+
+    # tags needed for child stop conditions
+    watch: Dict[str, Any] = {}
+    for p in parents:
+        pt = _ptype(p.get("batch_type_id"))
+        ct = _ptype((pt or {}).get("child_type_id"))
+        cond = (ct or {}).get("trigger_stop")
+        if isinstance(cond, dict):
+            for r in (cond.get("rules") or []):
+                if isinstance(r, dict) and r.get("tag"):
+                    watch[str(r["tag"])] = None
+    if not watch:
+        return
+    current = _latest_values(list(watch.keys()))
+    now_mono = time.monotonic()
+    for p in parents:
+        pt = _ptype(p.get("batch_type_id"))
+        ct = _ptype((pt or {}).get("child_type_id"))
+        cond = (ct or {}).get("trigger_stop")
+        if not isinstance(cond, dict) or not cond.get("rules"):
+            continue
+        key = (f"childstop:{p['id']}", "stop")
+        with _state_lock:
+            prior = _prior.get(key, {})
+            _prior[key] = dict(current)
+        try:
+            fires = _evaluate_condition(cond, current, prior)
+        except Exception:
+            continue
+        if not fires:
+            continue
+        last = _last_fire.get(key, 0.0)
+        if (now_mono - last) < TRIGGER_DEBOUNCE_S:
+            continue
+        _last_fire[key] = now_mono
+        # Close current child and immediately open the next one.
+        try:
+            svc.close_open_child(p["id"], actor="system:multiple")
+            svc.spawn_child_for_parent(p["id"], actor="system:multiple")
+            _log.info("multiple: rolled parent %s to next child (child stop fired)", p["id"])
+        except Exception as exc:
+            _log.warning("multiple roll failed for parent %s: %s", p["id"], exc)
+
+
+_seeded = False
+
+
+def _maybe_seed() -> None:
+    global _seeded
+    if _seeded:
+        return
+    try:
+        from .service import BatchService
+        from app.state import app_store as _store  # type: ignore
+        if BatchService(_store).seed_default_types():
+            _log.info("Seeded default batch types (Single + Multiple)")
+        _seeded = True
+    except Exception:
+        pass  # retry next tick
+
+
 def _loop() -> None:
     while True:
+        try:
+            _maybe_seed()
+        except Exception:
+            pass
         try:
             _tick()
         except Exception as exc:
             _log.exception("triggers loop tick failed: %s", exc)
+        try:
+            _tick_multiple()
+        except Exception as exc:
+            _log.exception("multiple loop tick failed: %s", exc)
         try:
             _tick_schedules()
         except Exception as exc:
