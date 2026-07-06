@@ -16,6 +16,7 @@ from fastapi.responses import Response
 from .license import require_batch_management_license, is_batch_management_enabled, MODULE_KEY
 from .models import (
     BatchTypeIn, BatchIn, BatchStart, BatchStop, BatchValidationIn, BatchEventIn,
+    BatchScan,
 )
 from .reports import render_single_batch_pdf
 
@@ -140,6 +141,24 @@ def stop_batch(batch_id: str, payload: BatchStop, request: Request) -> dict:
     return {"ok": True, "row": out}
 
 
+@router.post("/batches/scan", dependencies=[Depends(require_batch_management_license)])
+def scan_batch(payload: BatchScan, request: Request) -> dict:
+    """Keyboard-wedge barcode scan → start (default) or stop a batch whose
+    identifier IS the scanned code. See BatchScan for semantics."""
+    try:
+        out = _service().scan_batch(
+            payload.code, batch_type_id=payload.batch_type_id, action=payload.action,
+            operator=payload.operator, gateway_id=payload.gateway_id,
+            product=payload.product, recipe=payload.recipe, notes=payload.notes,
+            actor=_actor(request),
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="no matching batch for that code")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "row": out}
+
+
 @router.post("/batches/{batch_id}/validate", dependencies=[Depends(require_batch_management_license)])
 def validate_batch(batch_id: str, payload: BatchValidationIn, request: Request) -> dict:
     try:
@@ -239,6 +258,51 @@ def batch_report_pdf(batch_id: str) -> Response:
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
+
+
+# ---- CSV export ------------------------------------------------------
+def _csv_response(text: str, filename: str) -> Response:
+    return Response(
+        content=text,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/batches/{batch_id}/report.csv", dependencies=[Depends(require_batch_management_license)])
+def batch_report_csv(batch_id: str) -> Response:
+    """CSV of the batch's per-tag summaries (min/max/avg/first/last/stdev/count)."""
+    svc = _service()
+    batch = svc.get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="batch not found")
+    text = svc.batch_summary_csv(batch_id)
+    fn = f"batch-{batch.get('identifier') or batch_id}-summary.csv".replace("/", "-")
+    return _csv_response(text, fn)
+
+
+@router.get("/batches/{batch_id}/historian.csv", dependencies=[Depends(require_batch_management_license)])
+def batch_historian_csv(batch_id: str, limit: int = 50000) -> Response:
+    """CSV of the raw historian readings captured inside the batch window."""
+    svc = _service()
+    batch = svc.get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="batch not found")
+    text = svc.batch_historian_csv(batch_id, limit=limit)
+    fn = f"batch-{batch.get('identifier') or batch_id}-readings.csv".replace("/", "-")
+    return _csv_response(text, fn)
+
+
+@router.get("/batches/{batch_id}/rollup.csv", dependencies=[Depends(require_batch_management_license)])
+def batch_rollup_csv(batch_id: str) -> Response:
+    """CSV of the parent rollup: aggregated per-tag stats across child batches."""
+    svc = _service()
+    batch = svc.get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="parent batch not found")
+    text = svc.rollup_csv(batch_id)
+    fn = f"batch-rollup-{batch.get('identifier') or batch_id}.csv".replace("/", "-")
+    return _csv_response(text, fn)
 
 
 # ---- audit -----------------------------------------------------------

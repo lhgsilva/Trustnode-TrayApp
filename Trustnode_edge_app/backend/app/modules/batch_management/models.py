@@ -30,6 +30,16 @@ class BatchTypeIn(BaseModel):
     email_recipients: Optional[str] = None   # comma-separated addresses
     trigger_start: Optional[dict[str, Any]] = None  # {operator: "AND"|"OR", rules: [...]}
     trigger_stop: Optional[dict[str, Any]] = None
+    # Operator 2026-07-06: time-based scheduling. Each schedule is a simple
+    # preset the operator picks in the UI:
+    #   {enabled: bool, freq: "daily"|"weekly"|"hourly"|"every_minutes",
+    #    time: "HH:MM" (local, for daily/weekly), weekday: 0-6 (Mon=0, weekly),
+    #    every_minutes: int (for every_minutes)}
+    # start_schedule auto-creates+starts a batch; stop_schedule stops running
+    # batches of this type; report_schedule emails the latest batch's PDF/CSV.
+    start_schedule: Optional[dict[str, Any]] = None
+    stop_schedule: Optional[dict[str, Any]] = None
+    report_schedule: Optional[dict[str, Any]] = None
 
 
 class BatchTypeOut(BatchTypeIn):
@@ -101,3 +111,24 @@ class BatchOut(BaseModel):
 class BatchListResponse(BaseModel):
     rows: list[BatchOut]
     total: int
+
+
+# ---- barcode scan (keyboard-wedge scanner) -------------------------------
+
+class BatchScan(BaseModel):
+    """A scanned code from a keyboard-wedge barcode scanner.
+
+    `code` is the raw scanned string (used as the batch identifier).
+    `batch_type_id` selects which barcode-enabled type to start (optional;
+    if omitted the server picks the single barcode-start type, else errors).
+    `action` = 'start' (default) creates+starts a batch tagged source='barcode';
+    'stop' stops the running batch whose identifier matches the code.
+    """
+    code: str
+    batch_type_id: Optional[str] = None
+    action: Literal["start", "stop"] = "start"
+    operator: Optional[str] = None
+    gateway_id: Optional[str] = None
+    product: Optional[str] = None
+    recipe: Optional[str] = None
+    notes: Optional[str] = None

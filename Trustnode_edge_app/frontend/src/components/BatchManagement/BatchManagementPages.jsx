@@ -61,6 +61,7 @@ import {
   createBatch,
   startBatch,
   stopBatch,
+  scanBatch,
   validateBatch,
   listBatchEvents,
   addBatchEvent,
@@ -70,6 +71,7 @@ import {
   deleteBatch,
   listBatchAudit,
   getBatch,
+  bmDownloadUrl,
 } from "../../api";
 
 
@@ -118,6 +120,11 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
   });
   const [selectedId, setSelectedId] = useState(null);
   const [error, setError] = useToastError();
+  // Operator 2026-07-06: keyboard-wedge barcode scan-to-start. The scanner
+  // types the code + Enter into this focused field.
+  const [scanCode, setScanCode] = useState("");
+  const [scanBusy, setScanBusy] = useState(false);
+  const [scanMsg, setScanMsg] = useState("");
 
   const refresh = useCallback(async () => {
     setBusy(true);
@@ -173,6 +180,22 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
     try { await deleteBatch(id); await refresh(); }
     catch (e) { setError(e); }
   };
+  // Barcode scan → start a batch whose identifier is the code. If exactly one
+  // barcode-enabled type exists, the backend picks it automatically.
+  const handleScan = async (code) => {
+    const c = String(code || "").trim();
+    if (!c) return;
+    setScanBusy(true); setScanMsg("");
+    try {
+      const b = await scanBatch({ code: c, action: "start", operator: currentUser?.username || undefined });
+      setScanMsg(`Started ${b.identifier} (${b.status}).`);
+      setScanCode("");
+      await refresh();
+    } catch (e) {
+      setError(e);
+      setScanMsg("");
+    } finally { setScanBusy(false); }
+  };
 
   if (selectedId) {
     return (
@@ -213,6 +236,24 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
             <button className="btn btn-secondary" disabled={busy} onClick={refresh}>Refresh</button>
             <button className="btn btn-primary" onClick={() => setShowCreate(true)}>New Batch</button>
           </div>
+        </div>
+        {/* Operator 2026-07-06: barcode scan-to-start. Focus this field and scan;
+            the wedge scanner types the code + Enter, which starts the batch. */}
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12, flexWrap: "wrap" }}>
+          <span aria-hidden style={{ fontSize: 16 }}>▮▮▍</span>
+          <input
+            style={{ minWidth: 260 }}
+            placeholder="Scan barcode to start a batch…"
+            value={scanCode}
+            disabled={scanBusy}
+            onChange={(e) => setScanCode(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleScan(scanCode); } }}
+          />
+          <button className="btn btn-secondary btn-sm" disabled={scanBusy || !scanCode.trim()} onClick={() => handleScan(scanCode)}>
+            {scanBusy ? "Starting…" : "Start from scan"}
+          </button>
+          {scanMsg ? <span style={{ color: "var(--muted)", fontSize: 12 }}>{scanMsg}</span> : null}
+          <span style={{ color: "var(--muted)", fontSize: 11 }}>Requires a batch type with Start method = Barcode.</span>
         </div>
         {error ? <div className="alert alert-error" style={{ marginTop: 12 }}>{error}</div> : null}
       </section>
@@ -413,7 +454,7 @@ function BatchDetailPage({ batchId, onBack, currentUser, batchTypes }) {
           <div>
             <a
               className="btn btn-secondary btn-sm"
-              href={`/api/batch-management/batches/${encodeURIComponent(batchId)}/report.pdf`}
+              href={bmDownloadUrl(`/batches/${encodeURIComponent(batchId)}/report.pdf`)}
               target="_blank"
               rel="noreferrer"
               style={{ marginRight: 8 }}
@@ -423,12 +464,25 @@ function BatchDetailPage({ batchId, onBack, currentUser, batchTypes }) {
                 "no children" page if there are none. */}
             <a
               className="btn btn-secondary btn-sm"
-              href={`/api/batch-management/batches/${encodeURIComponent(batchId)}/rollup-report.pdf`}
+              href={bmDownloadUrl(`/batches/${encodeURIComponent(batchId)}/rollup-report.pdf`)}
               target="_blank"
               rel="noreferrer"
               style={{ marginRight: 8 }}
               title="If this batch has child batches, download a single PDF covering the parent + every child."
             >Rollup PDF</a>
+            {/* Operator 2026-07-06: CSV exports — summaries and raw readings. */}
+            <a
+              className="btn btn-secondary btn-sm"
+              href={bmDownloadUrl(`/batches/${encodeURIComponent(batchId)}/report.csv`)}
+              target="_blank" rel="noreferrer" style={{ marginRight: 8 }}
+              title="Download the per-tag summary statistics as CSV."
+            >CSV (summary)</a>
+            <a
+              className="btn btn-secondary btn-sm"
+              href={bmDownloadUrl(`/batches/${encodeURIComponent(batchId)}/historian.csv`)}
+              target="_blank" rel="noreferrer" style={{ marginRight: 8 }}
+              title="Download the raw historian readings captured during the batch as CSV."
+            >CSV (readings)</a>
             {batch.status === "completed" ? (
               <>
                 <input
@@ -536,6 +590,63 @@ function BatchDetailPage({ batchId, onBack, currentUser, batchTypes }) {
 // -----------------------------------------------------------------------
 // Batch Types page — admin-only CRUD
 // -----------------------------------------------------------------------
+// Operator 2026-07-06: a small preset-based schedule editor used for the
+// per-type start / stop / report schedules. Emits the same simple dict the
+// backend daemon understands: {enabled, freq, time, weekday, every_minutes}.
+// No cron knowledge required — dropdowns + a time/number field.
+function SchedulePreset({ label, help, value, onChange }) {
+  const v = value || {};
+  const set = (patch) => onChange({ ...v, ...patch });
+  const freq = v.freq || "daily";
+  const DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+        <input type="checkbox" checked={!!v.enabled}
+               onChange={(e) => set({ enabled: e.target.checked })} />
+        <strong style={{ fontSize: 12 }}>{label}</strong>
+      </label>
+      {help ? <small style={{ color: "var(--muted)", fontSize: 11, display: "block", marginBottom: 6 }}>{help}</small> : null}
+      {v.enabled ? (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", paddingLeft: 24 }}>
+          <select value={freq} onChange={(e) => set({ freq: e.target.value })}>
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+            <option value="hourly">Hourly</option>
+            <option value="every_minutes">Every N minutes</option>
+          </select>
+          {freq === "weekly" ? (
+            <select value={String(v.weekday ?? 0)} onChange={(e) => set({ weekday: parseInt(e.target.value, 10) })}>
+              {DOW.map((d, i) => <option key={i} value={i}>{d}</option>)}
+            </select>
+          ) : null}
+          {(freq === "daily" || freq === "weekly") ? (
+            <input type="time" value={v.time || "06:00"} onChange={(e) => set({ time: e.target.value })}
+                   style={{ width: 110 }} />
+          ) : null}
+          {freq === "hourly" ? (
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+              at minute
+              <input type="number" min={0} max={59} value={v.minute ?? 0}
+                     onChange={(e) => set({ minute: Math.max(0, Math.min(59, parseInt(e.target.value || "0", 10))) })}
+                     style={{ width: 60 }} />
+            </span>
+          ) : null}
+          {freq === "every_minutes" ? (
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+              every
+              <input type="number" min={1} max={1440} value={v.every_minutes ?? 15}
+                     onChange={(e) => set({ every_minutes: Math.max(1, parseInt(e.target.value || "1", 10)) })}
+                     style={{ width: 60 }} />
+              min
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function BatchTypesPage() {
   const [rows, setRows] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -545,6 +656,7 @@ export function BatchTypesPage() {
     name: "", description: "", start_method: "manual", end_method: "manual",
     collection_profile: "continuous", identifier_method: "auto", identifier_prefix: "",
     enabled: true, summary_tags: [],
+    start_schedule: null, stop_schedule: null, report_schedule: null,
   }), []);
 
   const refresh = useCallback(async () => {
@@ -653,6 +765,23 @@ export function BatchTypesPage() {
                 Description
                 <textarea rows={3} value={editing.description || ""} onChange={(e) => setEditing({ ...editing, description: e.target.value })} />
               </label>
+              <label style={{ gridColumn: "1 / -1" }}>
+                Summary tags (comma-separated) — optional
+                <input
+                  value={editing._summary_tags_text != null
+                    ? editing._summary_tags_text
+                    : (Array.isArray(editing.summary_tags) ? editing.summary_tags.join(", ") : "")}
+                  placeholder="Leave empty to summarize ALL collected tags, e.g. BT_PVA_Level, BT_PVB_Level"
+                  onChange={(e) => setEditing({
+                    ...editing,
+                    _summary_tags_text: e.target.value,
+                    summary_tags: e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
+                  })}
+                />
+                <small style={{ color: "var(--muted)", fontSize: 11 }}>
+                  Restricts the batch report/summaries to just these tags. Empty = every tag collected during the batch.
+                </small>
+              </label>
               <label>
                 <input type="checkbox" checked={!!editing.enabled} onChange={(e) => setEditing({ ...editing, enabled: e.target.checked })} />
                 {" "}Enabled
@@ -678,6 +807,32 @@ export function BatchTypesPage() {
                   </small>
                 </label>
               </div>
+            </div>
+
+            {/* Operator 2026-07-06: time-based schedules (start / stop / report) */}
+            <div className="card" style={{ marginTop: 12, padding: 12, background: "var(--surface-elev, var(--card))" }}>
+              <h4 style={{ margin: "0 0 8px 0", fontSize: 13 }}>Time schedules</h4>
+              <small style={{ color: "var(--muted)", fontSize: 11, display: "block", marginBottom: 10 }}>
+                Times use this machine's local clock. Runs alongside (not instead of) any PLC triggers below.
+              </small>
+              <SchedulePreset
+                label="Auto-start on a schedule"
+                help="Creates and starts a new batch of this type at the chosen time."
+                value={editing.start_schedule}
+                onChange={(s) => setEditing({ ...editing, start_schedule: s })}
+              />
+              <SchedulePreset
+                label="Auto-stop on a schedule"
+                help="Stops any running batch of this type at the chosen time."
+                value={editing.stop_schedule}
+                onChange={(s) => setEditing({ ...editing, stop_schedule: s })}
+              />
+              <SchedulePreset
+                label="Email report on a schedule"
+                help="Emails the latest batch's PDF + CSV to the recipients above."
+                value={editing.report_schedule}
+                onChange={(s) => setEditing({ ...editing, report_schedule: s })}
+              />
             </div>
 
             {/* Operator 2026-06-30: PLC auto-trigger config (start + stop) */}

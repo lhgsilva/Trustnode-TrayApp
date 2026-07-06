@@ -4520,6 +4520,23 @@ class AppStore:
                     conn.execute("ALTER TABLE batch_types ADD COLUMN trigger_start_json TEXT NULL")
                 if "trigger_stop_json" not in bt_cols:
                     conn.execute("ALTER TABLE batch_types ADD COLUMN trigger_stop_json TEXT NULL")
+                # Operator 2026-07-06: time-based scheduling for start/stop and a
+                # per-type scheduled PDF/CSV report. Schedules are simple presets
+                # ({freq: daily|weekly|hourly|every_minutes, time:"HH:MM", ...}).
+                # last_*_utc columns are the daemon's dedupe cursors so a schedule
+                # fires at most once per due window even across restarts.
+                if "start_schedule_json" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN start_schedule_json TEXT NULL")
+                if "stop_schedule_json" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN stop_schedule_json TEXT NULL")
+                if "report_schedule_json" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN report_schedule_json TEXT NULL")
+                if "last_scheduled_start_utc" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN last_scheduled_start_utc TEXT NULL")
+                if "last_scheduled_stop_utc" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN last_scheduled_stop_utc TEXT NULL")
+                if "last_report_utc" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN last_report_utc TEXT NULL")
                 hist_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(historian_readings)").fetchall()}
                 if "tenant_id" not in hist_cols:
                     conn.execute('ALTER TABLE historian_readings ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "default"')

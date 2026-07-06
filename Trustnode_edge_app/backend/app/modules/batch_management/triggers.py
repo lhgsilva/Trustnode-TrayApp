@@ -295,12 +295,139 @@ def _tick() -> None:
                 _fire_stop(svc, bt)
 
 
+# --------------------------------------------------------------------------
+# Time-based SCHEDULES (operator 2026-07-06)
+# Each batch_type may carry start_schedule / stop_schedule / report_schedule,
+# a simple preset dict the operator picks in the UI:
+#   {enabled: bool, freq: "daily"|"weekly"|"hourly"|"every_minutes",
+#    time: "HH:MM" (local clock, for daily/weekly),
+#    weekday: 0-6 (Mon=0, for weekly), every_minutes: int}
+# We evaluate against LOCAL wall-clock (the edge runs on the operator's machine,
+# so "daily at 06:00" means their 06:00). Dedupe is per due-minute using the
+# batch_type's last_scheduled_*_utc cursor so a schedule fires at most once per
+# occurrence even across restarts or multiple ticks in the same minute.
+# --------------------------------------------------------------------------
+
+def _due_now(sched: Any, now_local: datetime) -> bool:
+    """True if this schedule should fire at the current local minute."""
+    if not isinstance(sched, dict) or not sched.get("enabled"):
+        return False
+    freq = str(sched.get("freq") or "").strip().lower()
+    if freq == "every_minutes":
+        try:
+            n = max(1, int(sched.get("every_minutes") or 0))
+        except Exception:
+            return False
+        # Fire when minutes-since-midnight is a multiple of n (at :00 seconds).
+        mins = now_local.hour * 60 + now_local.minute
+        return (mins % n) == 0
+    if freq == "hourly":
+        try:
+            mm = int(sched.get("minute", 0))
+        except Exception:
+            mm = 0
+        return now_local.minute == mm
+    # daily / weekly need a HH:MM
+    tstr = str(sched.get("time") or "").strip()
+    try:
+        hh, mm = tstr.split(":")
+        hh, mm = int(hh), int(mm)
+    except Exception:
+        return False
+    if now_local.hour != hh or now_local.minute != mm:
+        return False
+    if freq == "weekly":
+        try:
+            wd = int(sched.get("weekday", 0))
+        except Exception:
+            wd = 0
+        return now_local.weekday() == wd
+    if freq == "daily":
+        return True
+    return False
+
+
+def _already_fired_this_minute(last_utc: Any, now_utc: datetime) -> bool:
+    """True if the cursor is within the same wall-clock minute as now (UTC)."""
+    if not last_utc:
+        return False
+    try:
+        s = str(last_utc)[:16]  # 'YYYY-MM-DD HH:MM'
+        return s == now_utc.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return False
+
+
+def _tick_schedules() -> None:
+    """One schedule-evaluation cycle for start/stop/report schedules."""
+    try:
+        from .service import BatchService
+        from app.state import app_store as _store  # type: ignore
+        svc = BatchService(_store)
+        batch_types = svc.list_batch_types()
+    except Exception as exc:
+        _log.debug("schedule tick: cannot reach service: %s", exc)
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    now_local = datetime.now()  # machine-local wall clock
+    now_utc_txt = now_utc.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    for bt in batch_types:
+        if not bt.get("enabled"):
+            continue
+        bt_id = str(bt.get("id"))
+
+        # ---- scheduled START ----
+        ss = bt.get("start_schedule")
+        if _due_now(ss, now_local) and not _already_fired_this_minute(bt.get("last_scheduled_start_utc"), now_utc):
+            try:
+                svc.mark_schedule_ran(bt_id, "start", now_utc_txt)
+                _fire_start(svc, bt)
+                _log.info("schedule: started batch from type %s", bt.get("name"))
+            except Exception as exc:
+                _log.warning("schedule start failed for %s: %s", bt.get("name"), exc)
+
+        # ---- scheduled STOP ----
+        st = bt.get("stop_schedule")
+        if _due_now(st, now_local) and not _already_fired_this_minute(bt.get("last_scheduled_stop_utc"), now_utc):
+            try:
+                svc.mark_schedule_ran(bt_id, "stop", now_utc_txt)
+                _fire_stop(svc, bt)
+                _log.info("schedule: stopped batches of type %s", bt.get("name"))
+            except Exception as exc:
+                _log.warning("schedule stop failed for %s: %s", bt.get("name"), exc)
+
+        # ---- scheduled REPORT (email latest batch's PDF/CSV) ----
+        rs = bt.get("report_schedule")
+        if _due_now(rs, now_local) and not _already_fired_this_minute(bt.get("last_report_utc"), now_utc):
+            try:
+                svc.mark_schedule_ran(bt_id, "report", now_utc_txt)
+                recipients = [s.strip() for s in str(bt.get("email_recipients") or "").replace(";", ",").split(",") if s.strip()]
+                latest = svc.latest_batch_for_type(bt_id)
+                if recipients and latest:
+                    attach_csv = bool((rs or {}).get("attach_csv", True))
+                    attach_pdf = bool((rs or {}).get("attach_pdf", True))
+                    ok = svc.send_batch_report_email(
+                        latest["id"], recipients,
+                        attach_pdf=attach_pdf, attach_csv=attach_csv,
+                        subject=f"Scheduled batch report — {bt.get('name')}",
+                    )
+                    _log.info("schedule: report for type %s -> %s (ok=%s)", bt.get("name"), recipients, ok)
+            except Exception as exc:
+                _log.warning("schedule report failed for %s: %s", bt.get("name"), exc)
+
+
 def _loop() -> None:
     while True:
         try:
             _tick()
         except Exception as exc:
             _log.exception("triggers loop tick failed: %s", exc)
+        try:
+            _tick_schedules()
+        except Exception as exc:
+            _log.exception("schedule loop tick failed: %s", exc)
         time.sleep(TRIGGER_POLL_INTERVAL_S)
 
 

@@ -3026,6 +3026,16 @@ export async function pushSchedulerEmailSettings(emailSettings) {
 // ====================================================================
 const _BM_BASE = () => `${getControlApiBase()}/api/batch-management`;
 
+// Operator 2026-07-06: absolute URL for a batch download link (PDF/CSV). The
+// desktop shell loads the UI from file://, so a relative "/api/..." href would
+// resolve against file:// and never reach the backend — download links MUST be
+// absolute (built off the same base the fetch calls use, which honors
+// ?backendUrl=). Use this for every <a href> that hits the batch API.
+export function bmDownloadUrl(path) {
+  const p = String(path || "");
+  return `${_BM_BASE()}${p.startsWith("/") ? p : "/" + p}`;
+}
+
 export async function getBatchManagementStatus() {
   const res = await fetchWithTimeout(`${_BM_BASE()}/status`, {}, 6000);
   if (!res.ok) return { module: "batch_management", enabled: false };
@@ -3102,6 +3112,18 @@ export async function stopBatch(id, payload = {}) {
     body: JSON.stringify(payload),
   });
   await ensureOk(res, "Stop batch failed");
+  return (await res.json()).row;
+}
+
+// Operator 2026-07-06: keyboard-wedge barcode scan → start (default) or stop a
+// batch whose identifier IS the scanned code.
+export async function scanBatch(payload) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/scan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  });
+  await ensureOk(res, "Barcode scan failed");
   return (await res.json()).row;
 }
 

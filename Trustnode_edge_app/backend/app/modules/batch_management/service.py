@@ -80,7 +80,9 @@ class BatchService:
                        report_template_id, identifier_method, identifier_prefix,
                        summary_tags_json, enabled, created_utc, updated_utc,
                        email_on_close, email_recipients,
-                       trigger_start_json, trigger_stop_json
+                       trigger_start_json, trigger_stop_json,
+                       start_schedule_json, stop_schedule_json, report_schedule_json,
+                       last_scheduled_start_utc, last_scheduled_stop_utc, last_report_utc
                 FROM batch_types
                 WHERE tenant_id = ?
                 ORDER BY name COLLATE NOCASE
@@ -99,7 +101,9 @@ class BatchService:
                        report_template_id, identifier_method, identifier_prefix,
                        summary_tags_json, enabled, created_utc, updated_utc,
                        email_on_close, email_recipients,
-                       trigger_start_json, trigger_stop_json
+                       trigger_start_json, trigger_stop_json,
+                       start_schedule_json, stop_schedule_json, report_schedule_json,
+                       last_scheduled_start_utc, last_scheduled_stop_utc, last_report_utc
                 FROM batch_types
                 WHERE tenant_id = ? AND id = ?
                 """,
@@ -134,6 +138,12 @@ class BatchService:
             (payload.get("email_recipients") or None),
             _json_or_none(payload.get("trigger_start")),
             _json_or_none(payload.get("trigger_stop")),
+            # Operator 2026-07-06: schedule columns. last_*_utc are NOT set here
+            # (the daemon owns them); on create they start NULL, and on update we
+            # deliberately leave them untouched via COALESCE below.
+            _json_or_none(payload.get("start_schedule")),
+            _json_or_none(payload.get("stop_schedule")),
+            _json_or_none(payload.get("report_schedule")),
         )
         with self._connect() as c:
             if is_new:
@@ -145,8 +155,9 @@ class BatchService:
                      identifier_method, identifier_prefix, summary_tags_json, enabled,
                      created_utc, updated_utc,
                      email_on_close, email_recipients,
-                     trigger_start_json, trigger_stop_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     trigger_start_json, trigger_stop_json,
+                     start_schedule_json, stop_schedule_json, report_schedule_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     record,
                 )
@@ -168,7 +179,8 @@ class BatchService:
                         identifier_prefix = ?, summary_tags_json = ?, enabled = ?,
                         updated_utc = ?,
                         email_on_close = ?, email_recipients = ?,
-                        trigger_start_json = ?, trigger_stop_json = ?
+                        trigger_start_json = ?, trigger_stop_json = ?,
+                        start_schedule_json = ?, stop_schedule_json = ?, report_schedule_json = ?
                     WHERE tenant_id = ? AND id = ?
                     """,
                     (
@@ -176,6 +188,7 @@ class BatchService:
                         record[8], record[9], record[10], record[11], record[12], record[13],
                         record[14], now,
                         record[17], record[18], record[19], record[20],
+                        record[21], record[22], record[23],
                         tid, bt_id,
                     ),
                 )
@@ -373,6 +386,13 @@ class BatchService:
                         action="batch.stop",
                         after={"ended_utc": now, "result": result, "source": source})
             c.commit()
+        # Operator 2026-07-06: reshape the membership window per the type's
+        # collection_profile (snapshot / pre_post) BEFORE computing summaries so
+        # the stats reflect the intended scope. No-op for continuous.
+        try:
+            self._apply_collection_profile(batch_id)
+        except Exception:
+            pass
         # Best-effort summary compute. Failures are non-fatal — operator can
         # recompute manually.
         try:
@@ -575,8 +595,25 @@ class BatchService:
     def compute_summaries(self, batch_id: str) -> int:
         """Compute min/max/avg/first/last/stdev/count for every tag that
         has at least one historian sample inside the batch's membership
-        windows. Returns the number of summary rows written."""
+        windows. Returns the number of summary rows written.
+
+        Operator 2026-07-06: if the batch's TYPE defines `summary_tags`, only
+        those tags are summarized (the report focuses on the tags that matter
+        for this recipe instead of every tag the gateway happened to collect).
+        An empty/absent summary_tags list means "all tags" (unchanged behavior).
+        """
         tid = self._tenant()
+        # Resolve the type's summary-tag allow-list (normalized for matching).
+        allow: Optional[set] = None
+        try:
+            b = self.get_batch(batch_id)
+            bt = self.get_batch_type(b.get("batch_type_id") or "") if b and b.get("batch_type_id") else None
+            st = (bt or {}).get("summary_tags") or []
+            wanted = [str(t).strip() for t in st if str(t).strip()]
+            if wanted:
+                allow = {t.lower() for t in wanted}
+        except Exception:
+            allow = None
         with self._connect_readonly() as c:
             windows = c.execute(
                 """
@@ -616,6 +653,9 @@ class BatchService:
                 for r in rows:
                     key = (str(r["gateway_id"] or ""), str(r["tag_name"] or ""))
                     if not key[1]:
+                        continue
+                    # summary_tags allow-list (type-level): skip tags not wanted.
+                    if allow is not None and key[1].lower() not in allow:
                         continue
                     try:
                         v = float(r["value"])
@@ -832,6 +872,283 @@ class BatchService:
                 all_rows.extend(dict(r) for r in rows)
         return all_rows[: max(1, min(limit, 50000))]
 
+    # -- schedule cursors (daemon dedupe) -----------------------------
+    def mark_schedule_ran(self, batch_type_id: str, slot: str, ts: str) -> None:
+        """Record that a schedule slot ('start'|'stop'|'report') fired at `ts`
+        so the daemon won't re-fire within the same due minute across restarts."""
+        col = {"start": "last_scheduled_start_utc",
+               "stop": "last_scheduled_stop_utc",
+               "report": "last_report_utc"}.get(slot)
+        if not col:
+            return
+        tid = self._tenant()
+        with self._connect() as c:
+            c.execute(
+                f"UPDATE batch_types SET {col} = ? WHERE tenant_id = ? AND id = ?",
+                (ts, tid, batch_type_id),
+            )
+            c.commit()
+
+    def latest_batch_for_type(self, batch_type_id: str) -> Optional[dict[str, Any]]:
+        """Most-recent batch of a type (any status), for scheduled reports."""
+        rows, _ = self.list_batches(limit=1, batch_type_id=batch_type_id)
+        return rows[0] if rows else None
+
+    # -- collection-profile window adjustment (applied on stop) -------
+    def _apply_collection_profile(self, batch_id: str) -> None:
+        """Reshape the batch's membership window according to its TYPE's
+        collection_profile, so summaries/historian reflect the intended scope:
+
+          continuous (default) → leave the full start→stop window as-is.
+          snapshot             → collapse to a 2s window at the START instant
+                                  (captures the point-in-time values only).
+          pre_post             → pad the window by 30s before start and after
+                                  stop (captures ramp-up / settle context).
+          trigger / event      → treated as continuous here (the PLC-trigger
+                                  windows already bound them precisely).
+
+        Only touches THIS module's batch_membership rows; never the historian.
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+        b = self.get_batch(batch_id)
+        if not b:
+            return
+        bt = self.get_batch_type(b.get("batch_type_id") or "") if b.get("batch_type_id") else None
+        profile = str((bt or {}).get("collection_profile") or "continuous").lower()
+        if profile not in ("snapshot", "pre_post"):
+            return
+
+        def _parse(ts: str):
+            try:
+                return _dt.strptime(str(ts)[:23], "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=_tz.utc)
+            except Exception:
+                try:
+                    return _dt.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=_tz.utc)
+                except Exception:
+                    return None
+
+        def _fmt(d) -> str:
+            return d.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        tid = self._tenant()
+        with self._connect() as c:
+            wins = c.execute(
+                "SELECT id, ts_utc_start, ts_utc_end FROM batch_membership "
+                "WHERE batch_id = ? AND tenant_id = ?", (batch_id, tid),
+            ).fetchall()
+            for w in wins:
+                s = _parse(w["ts_utc_start"])
+                e = _parse(w["ts_utc_end"]) if w["ts_utc_end"] else None
+                if not s:
+                    continue
+                if profile == "snapshot":
+                    new_start, new_end = s, s + _td(seconds=2)
+                else:  # pre_post
+                    new_start = s - _td(seconds=30)
+                    new_end = (e or s) + _td(seconds=30)
+                c.execute(
+                    "UPDATE batch_membership SET ts_utc_start = ?, ts_utc_end = ? WHERE id = ?",
+                    (_fmt(new_start), _fmt(new_end), w["id"]),
+                )
+            c.commit()
+
+    # -- barcode scan (keyboard-wedge) --------------------------------
+    def scan_batch(self, code: str, *, batch_type_id: Optional[str] = None,
+                   action: str = "start", operator: Optional[str] = None,
+                   gateway_id: Optional[str] = None, product: Optional[str] = None,
+                   recipe: Optional[str] = None, notes: Optional[str] = None,
+                   actor: Optional[str] = None) -> dict[str, Any]:
+        """Handle a scanned barcode from a keyboard-wedge scanner.
+
+        action='start': create + start a batch whose identifier IS the scanned
+          code, tagged source='barcode'. If batch_type_id is omitted we pick the
+          single type whose start_method OR identifier_method is 'barcode'; if
+          there are several, the caller must pass one.
+        action='stop': stop the running batch whose identifier matches the code.
+        Idempotent-ish: scanning the same code twice while running returns the
+        existing running batch instead of creating a duplicate.
+        """
+        code = str(code or "").strip()
+        if not code:
+            raise ValueError("empty barcode")
+        if action == "stop":
+            rows, _ = self.list_batches(limit=5, status_filter="running", search=code)
+            match = next((b for b in rows if str(b.get("identifier") or "") == code), None)
+            if not match:
+                raise KeyError(code)
+            return self.stop_batch(match["id"], result="completed", operator=operator,
+                                   actor=actor, source="barcode")
+        # action == start
+        # Don't double-start: if a running batch already has this identifier, return it.
+        rows, _ = self.list_batches(limit=5, status_filter="running", search=code)
+        existing = next((b for b in rows if str(b.get("identifier") or "") == code), None)
+        if existing:
+            return existing
+        # Resolve batch type.
+        bt_id = batch_type_id
+        if not bt_id:
+            barcode_types = [
+                t for t in self.list_batch_types()
+                if t.get("enabled") and (t.get("start_method") == "barcode" or t.get("identifier_method") == "barcode")
+            ]
+            if len(barcode_types) == 1:
+                bt_id = barcode_types[0]["id"]
+            elif len(barcode_types) == 0:
+                raise ValueError("no barcode-enabled batch type configured")
+            else:
+                raise ValueError("multiple barcode batch types — specify batch_type_id")
+        created = self.create_batch({
+            "batch_type_id": bt_id,
+            "identifier": code,
+            "identifier_method": "barcode",
+            "operator": operator,
+            "gateway_id": gateway_id,
+            "product": product,
+            "recipe": recipe,
+            "notes": notes,
+            "source": "barcode",
+            "metadata": {"source": "barcode", "scanned_code": code},
+        }, actor=actor or "barcode")
+        return self.start_batch(created["id"], operator=operator, gateway_id=gateway_id,
+                                actor=actor or "barcode", source="barcode")
+
+    # -- CSV export ---------------------------------------------------
+    def batch_summary_csv(self, batch_id: str) -> str:
+        """CSV of the per-tag summaries for a batch (one row per tag)."""
+        import csv as _csv
+        import io as _io
+        batch = self.get_batch(batch_id)
+        summaries = self.list_summaries(batch_id)
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(["batch_id", "identifier", "status", "started_utc", "ended_utc",
+                    "tag_name", "gateway_id", "sample_count",
+                    "min_value", "max_value", "avg_value", "first_value", "last_value", "stdev_value"])
+        ident = (batch or {}).get("identifier") or batch_id
+        for s in summaries:
+            w.writerow([
+                batch_id, ident, (batch or {}).get("status"),
+                (batch or {}).get("started_utc"), (batch or {}).get("ended_utc"),
+                s.get("tag_name"), s.get("gateway_id"), s.get("sample_count"),
+                s.get("min_value"), s.get("max_value"), s.get("avg_value"),
+                s.get("first_value"), s.get("last_value"), s.get("stdev_value"),
+            ])
+        return buf.getvalue()
+
+    def batch_historian_csv(self, batch_id: str, *, limit: int = 50000) -> str:
+        """CSV of the raw historian readings inside the batch window."""
+        import csv as _csv
+        import io as _io
+        rows = self.historian_rows_for_batch(batch_id, limit=limit)
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(["ts_utc", "tag_name", "value", "value_text", "quality_label",
+                    "gateway_id", "gateway_name", "device_name"])
+        for r in rows:
+            w.writerow([
+                r.get("ts_utc"), r.get("tag_name"), r.get("value"), r.get("value_text"),
+                r.get("quality_label"), r.get("gateway_id"), r.get("gateway_name"), r.get("device_name"),
+            ])
+        return buf.getvalue()
+
+    def rollup_csv(self, parent_batch_id: str) -> str:
+        """CSV of the parent rollup: aggregated per-tag stats across children."""
+        import csv as _csv
+        import io as _io
+        rollup = self.rollup_children(parent_batch_id)
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(["parent_batch_id", "tag_name", "gateway_id", "contributing_children",
+                    "sample_count", "min_value", "max_value", "avg_value"])
+        for t in (rollup.get("tags") or []):
+            w.writerow([
+                parent_batch_id, t.get("tag_name"), t.get("gateway_id"),
+                t.get("contributing_children"), t.get("sample_count"),
+                t.get("min_value"), t.get("max_value"), t.get("avg_value"),
+            ])
+        return buf.getvalue()
+
+    # -- scheduled-report helper (used by the schedule daemon) --------
+    def send_batch_report_email(self, batch_id: str, recipients: list[str], *,
+                                attach_pdf: bool = True, attach_csv: bool = False,
+                                subject: Optional[str] = None) -> bool:
+        """Email the batch's report (PDF and/or CSV) to `recipients`, reusing the
+        global SMTP/PHP transport. Returns True on success. Used by the schedule
+        daemon's report jobs and could back a manual 'email now' button."""
+        batch = self.get_batch(batch_id)
+        if not batch or not recipients:
+            return False
+        bt = self.get_batch_type(batch.get("batch_type_id") or "") if batch.get("batch_type_id") else None
+        events = self.list_events(batch_id, limit=2000)
+        summaries = self.list_summaries(batch_id)
+        attachments_spec: list[tuple[str, bytes, str]] = []
+        if attach_pdf:
+            try:
+                from .reports import render_single_batch_pdf
+                pdf = render_single_batch_pdf(batch, bt, events, summaries)
+                attachments_spec.append((f"batch_{batch.get('identifier') or batch_id}.pdf", pdf, "application/pdf"))
+            except Exception:
+                pass
+        if attach_csv:
+            try:
+                csv_text = self.batch_summary_csv(batch_id)
+                attachments_spec.append((f"batch_{batch.get('identifier') or batch_id}.csv",
+                                         csv_text.encode("utf-8"), "text/csv"))
+            except Exception:
+                pass
+        if not attachments_spec:
+            return False
+        return self._send_email_with_attachments(
+            recipients,
+            subject or f"Batch {batch.get('identifier') or batch_id} report",
+            (f"<p>Scheduled report for batch <b>{batch.get('identifier') or batch_id}</b> "
+             f"(status <b>{batch.get('status')}</b>).</p>"),
+            attachments_spec,
+        )
+
+    def _send_email_with_attachments(self, recipients: list[str], subject: str,
+                                     html_body: str,
+                                     attachments_spec: list[tuple[str, bytes, str]]) -> bool:
+        """Shared email sender used by close-email and scheduled reports."""
+        try:
+            bs = self._app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+            email_block = bs.get("email_notifications") or {}
+            email_settings = email_block.get("settings") or email_block or {}
+        except Exception:
+            email_settings = {}
+        try:
+            import base64 as _b64
+            from app.routers.notifications import (
+                EmailRequest, SMTPConfig, PHPMailConfig, EmailAttachment, send_email_request,
+            )
+        except Exception:
+            return False
+        transport = str(email_settings.get("transport") or "smtp").strip().lower()
+        smtp = email_settings.get("smtp") or {}
+        php = email_settings.get("php_mail")
+        attachments = []
+        for (fname, data, ctype) in attachments_spec:
+            try:
+                attachments.append(EmailAttachment(
+                    filename=fname,
+                    content_b64=_b64.b64encode(data).decode("ascii"),
+                    content_type=ctype,
+                ))
+            except Exception:
+                continue
+        if not attachments:
+            return False
+        req = EmailRequest(
+            transport="php_http" if transport == "php_http" else "smtp",
+            smtp=SMTPConfig(**(smtp if isinstance(smtp, dict) else {})),
+            php_mail=PHPMailConfig(**(php if isinstance(php, dict) else {})) if isinstance(php, dict) else None,
+            to=list(recipients), cc=[], bcc=[],
+            subject=subject, html_body=html_body,
+            text_body=subject, attachments=attachments,
+        )
+        outcome = send_email_request(req)
+        return bool(getattr(outcome, "ok", False))
+
     # -- internal helpers ---------------------------------------------
     def _event(self, c: sqlite3.Connection, *, batch_id: str, kind: str,
                severity: str = "info", actor: Optional[str] = None,
@@ -891,6 +1208,12 @@ class BatchService:
             "email_recipients": d.get("email_recipients"),
             "trigger_start": _json_load(d.get("trigger_start_json")),
             "trigger_stop": _json_load(d.get("trigger_stop_json")),
+            "start_schedule": _json_load(d.get("start_schedule_json")),
+            "stop_schedule": _json_load(d.get("stop_schedule_json")),
+            "report_schedule": _json_load(d.get("report_schedule_json")),
+            "last_scheduled_start_utc": d.get("last_scheduled_start_utc"),
+            "last_scheduled_stop_utc": d.get("last_scheduled_stop_utc"),
+            "last_report_utc": d.get("last_report_utc"),
             "created_utc": d["created_utc"],
             "updated_utc": d["updated_utc"],
         }
@@ -932,5 +1255,6 @@ def record_to_dict(record: tuple) -> dict[str, Any]:
         "summary_tags_json", "enabled", "created_utc", "updated_utc",
         "email_on_close", "email_recipients",
         "trigger_start_json", "trigger_stop_json",
+        "start_schedule_json", "stop_schedule_json", "report_schedule_json",
     )
     return {k: v for k, v in zip(keys, record)}
