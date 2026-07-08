@@ -14,11 +14,19 @@ import { InsightPreviewModal } from "./components/InsightPreviewModal.jsx";
  * plus PDF + CSV export icons.
  */
 export default function IntelligenceInsightsPage() {
-  const [insights, setInsights] = useState([]);
+  // Operator 2026-07-08 (FAST + RELIABLE): paint instantly from the last-good
+  // cached list so the page is never blank while the network call is queued
+  // behind the host app's pollers on a busy edge. requestCached (in api.js)
+  // also falls back to cache if a refresh momentarily fails, so a transient
+  // pool-saturation timeout no longer surfaces as "Failed to fetch".
+  const _cachedInsights = (() => {
+    try { const c = intelligenceApi.peekInsights(); return (c && c.insights) || []; } catch { return []; }
+  })();
+  const [insights, setInsights] = useState(_cachedInsights);
   const [error, setError] = useState("");
   const [editing, setEditing] = useState(null);
 
-  const [selectedId, setSelectedId] = useState(null);
+  const [selectedId, setSelectedId] = useState(_cachedInsights[0]?.id || null);
   const [runs, setRuns] = useState([]);
   const [runsBusy, setRunsBusy] = useState(false);
 
@@ -31,15 +39,33 @@ export default function IntelligenceInsightsPage() {
     refreshRuns(selectedId);
   }, [selectedId]);
 
+  // Softer error surface: a bare "Failed to fetch" here almost always means the
+  // list GET was momentarily queued/timed out on the saturated socket pool (or
+  // the AI endpoint is still syncing on a fresh install). Show that plainly and
+  // schedule a background retry instead of a scary raw error. Falls through to
+  // the raw message for genuine (non-connection) errors.
+  function surfaceError(e) {
+    const s = String(e?.message || e || "");
+    if (/failed to fetch|networkerror|load failed|aborted|err_|insufficient/i.test(s)) {
+      setError("Loading… (the AI service is busy or syncing — retrying).");
+      // one background retry shortly after; requestCached will use cache if it
+      // still can't reach the server.
+      setTimeout(() => { refresh().catch(() => {}); }, 1500);
+      return;
+    }
+    setError(s);
+  }
+
   async function refresh() {
     try {
       const r = await intelligenceApi.listInsights();
       const list = r.insights || [];
       setInsights(list);
+      setError("");
       // Auto-select the first one so the right column has something.
       if (!selectedId && list.length) setSelectedId(list[0].id);
     } catch (e) {
-      setError(String(e.message || e));
+      surfaceError(e);
     }
   }
 
@@ -48,8 +74,9 @@ export default function IntelligenceInsightsPage() {
     try {
       const r = await intelligenceApi.listInsightRuns(insightId, 100);
       setRuns(r.runs || []);
+      setError("");
     } catch (e) {
-      setError(String(e.message || e));
+      surfaceError(e);
     } finally {
       setRunsBusy(false);
     }
@@ -61,7 +88,7 @@ export default function IntelligenceInsightsPage() {
       await refresh();
       if (selectedId === id) await refreshRuns(id);
     } catch (e) {
-      setError(String(e.message || e));
+      surfaceError(e);
     }
   }
 
@@ -72,7 +99,7 @@ export default function IntelligenceInsightsPage() {
       if (selectedId === id) setSelectedId(null);
       await refresh();
     } catch (e) {
-      setError(String(e.message || e));
+      surfaceError(e);
     }
   }
 
@@ -82,7 +109,7 @@ export default function IntelligenceInsightsPage() {
       await intelligenceApi.deleteInsightRun(selectedId, runId);
       await refreshRuns(selectedId);
     } catch (e) {
-      setError(String(e.message || e));
+      surfaceError(e);
     }
   }
 
@@ -249,7 +276,7 @@ export default function IntelligenceInsightsPage() {
               setEditing(null);
               await refresh();
             } catch (e) {
-              setError(String(e.message || e));
+              surfaceError(e);
             }
           }}
         />
