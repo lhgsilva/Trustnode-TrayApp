@@ -771,9 +771,21 @@ async function startBackend() {
     }
   }
   // Real OS env wins over .env so operators can override per-launch.
+  // Operator 2026-07-08: default the TrustNode Intelligence module ON for the
+  // desktop app so the SHIPPED build behaves like a single production build for
+  // every customer (access is still license-gated in the backend — routes 404
+  // when the license lacks the module). Only skip if the operator/.env/OS env
+  // has explicitly set TRUSTNODE_INTELLIGENCE (their value wins via the spreads
+  // above being overridden below only when unset).
+  const _intelExplicit = String(
+    process.env.TRUSTNODE_INTELLIGENCE ?? dotenvVars.TRUSTNODE_INTELLIGENCE ?? ""
+  ).trim();
   const sharedEnv = {
     ...dotenvVars,
     ...process.env,
+    // Default on; a real OS/.env value (set above) is preserved because we only
+    // fill in the default when nothing explicit was provided.
+    TRUSTNODE_INTELLIGENCE: _intelExplicit || "on",
     TRUSTNODE_HOST: currentBackendHost,
     TRUSTNODE_PORT: String(currentBackendPort),
     TRUSTNODE_DATA_DIR: dataDir

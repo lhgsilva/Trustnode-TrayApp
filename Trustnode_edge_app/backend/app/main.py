@@ -219,16 +219,27 @@ _init_sentry()
 app = FastAPI(title="Trustnode Edge API", version="0.1.0")
 
 
-# Operator 2026-06-30: TrustNode Intelligence module — opt-in bolt-on
-# under <repo>/trustnode_intelligence/. License-gated (routes 404 when
-# the customer's license doesn't list `trustnode_intelligence`).
+# Operator 2026-06-30: TrustNode Intelligence module — bolt-on under
+# <repo>/trustnode_intelligence/. LICENSE-gated: every route depends on
+# require_intelligence_license(), which 404s when the customer's license
+# doesn't list `trustnode_intelligence` (see trustnode_intelligence/backend/
+# license.py). So the ROUTES are safe to always mount — the license is the
+# real control.
 #
-# Disabled by default to keep the working baseline untouched. Set the
-# env var TRUSTNODE_INTELLIGENCE=on (or 1/true/yes) to load it. If the
-# import or include_router fails for ANY reason, the failure is logged
-# and the rest of the app continues normally — Intelligence has zero
-# hooks into PLC, historian, sync loops, or any other working flow.
-if str(os.environ.get("TRUSTNODE_INTELLIGENCE", "")).strip().lower() in {"on", "1", "true", "yes"}:
+# Operator 2026-07-08 (SINGLE-BUILD / LICENSE-DRIVEN): previously this only
+# loaded when TRUSTNODE_INTELLIGENCE=on was set in the environment. That env
+# var was set on dev machines but NOT in the shipped EXE, so the module code
+# never loaded for customers, /api/intelligence/status 404'd, and the menu
+# self-hid EVEN WHEN the license included the module. That created a
+# dev-vs-production divergence. Now the module is loaded BY DEFAULT and only
+# skipped if explicitly turned OFF (TRUSTNODE_INTELLIGENCE=off/0/false/no) —
+# so ONE production build behaves identically for every customer/computer,
+# and access is decided purely by the license gate inside the routes.
+#
+# If the import or include_router fails for ANY reason, the failure is logged
+# and the rest of the app continues normally — Intelligence has zero hooks
+# into PLC, historian, sync loops, or any other working flow.
+if str(os.environ.get("TRUSTNODE_INTELLIGENCE", "on")).strip().lower() not in {"off", "0", "false", "no"}:
     try:
         import sys as _sys
         _tn_intel_root = os.path.join(
@@ -251,7 +262,8 @@ if str(os.environ.get("TRUSTNODE_INTELLIGENCE", "")).strip().lower() in {"on", "
             flush=True,
         )
 else:
-    print("[trustnode][boot] TrustNode Intelligence module DISABLED (set TRUSTNODE_INTELLIGENCE=on to enable)", flush=True)
+    print("[trustnode][boot] TrustNode Intelligence module explicitly DISABLED via TRUSTNODE_INTELLIGENCE=off "
+          "(access is normally license-gated; set to on/unset to restore).", flush=True)
 
 
 class CloudLiveAuthMiddleware:
