@@ -2380,6 +2380,17 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
             actor=f"edge_local_finalize:{admin_username}",
         )
         telemetry_service.configure_from_bootstrap({"data": app_store.get_bootstrap(prefer_cloud_reads=False)})
+        # Operator 2026-07-08: the edge is now LINKED with a real edge_id +
+        # customer. Immediately (re)pull the Intelligence AI-endpoint config
+        # from the portal so the AI assistant works right after activation
+        # WITHOUT a restart (the boot pull may have run earlier while the edge
+        # was still edge-01/unlinked). Fire-and-forget + guarded — never blocks
+        # or breaks the finalize; no-op if the Intelligence module isn't present.
+        try:
+            from trustnode_intelligence.backend.refresh import pull_now as _intel_pull_now
+            _intel_pull_now()
+        except Exception:
+            pass
         return {
             "ok": True,
             "tenant_id": tenant_id,

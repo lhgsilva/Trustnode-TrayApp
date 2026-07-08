@@ -107,10 +107,28 @@ export default function IntelligenceChatPage() {
     if (looksLikeAuthError(e)) {
       setAuthError(true);
       setError("Your session expired. Please log out and log in again.");
-    } else {
-      setError((prefix ? prefix + ": " : "") + String(e?.message || e));
+      return;
     }
+    const s = String(e?.message || e || "");
+    // Operator 2026-07-08: a bare "Failed to fetch" is a browser network error.
+    // The most common cause here is that the AI endpoint config hasn't synced
+    // from the portal yet (fresh install / just activated) — the edge pulls it
+    // in the background with retries. Show that plainly instead of a cryptic
+    // "Failed to fetch", and trigger a fresh status check so the banner updates
+    // once the config lands.
+    if (/failed to fetch|networkerror|load failed/i.test(s)) {
+      setError(
+        "Couldn't reach the AI service yet. The AI endpoint is syncing from the "
+        + "portal in the background — this usually clears in a few seconds. "
+        + "If it persists, check this PC's internet connection, or reopen the app."
+      );
+      try { refreshStatusRef.current && refreshStatusRef.current(); } catch {}
+      return;
+    }
+    setError((prefix ? prefix + ": " : "") + s);
   }, []);
+  // Ref so surfaceError can re-check status without depending on it.
+  const refreshStatusRef = useRef(null);
 
   // ------ status ----------------------------------------------------------
 
@@ -123,6 +141,9 @@ export default function IntelligenceChatPage() {
       // Don't set an error; the next tick will retry.
     }
   }, []);
+  // Keep the ref pointed at the latest refreshStatus so surfaceError can call
+  // it (it's defined earlier and must not depend on this callback's identity).
+  refreshStatusRef.current = refreshStatus;
 
   useEffect(() => {
     // One fetch at mount. NO polling — an every-Nseconds status ping

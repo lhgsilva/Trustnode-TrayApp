@@ -163,19 +163,76 @@ DEFAULT_PRESETS: List[Dict[str, Any]] = [
 
 # --- Helpers --------------------------------------------------------------
 
+def _edge_tenant() -> str:
+    """Return THIS edge's own tenant id — the customer/tenant the edge is
+    linked to (app_settings.tenant_id / edge_profile.linked_customer_id),
+    read lock-free from the app_store db. This is the SAME scope the rest of
+    the app uses for the customer's data. Cached briefly.
+
+    Operator 2026-07-08 (SCOPING FIX): chats + insights were scoped by the
+    LOGIN USER'S jwt tenant, which for the built-in `admin` user is 'default'.
+    So every edge that logged in as a default-tenant admin shared one 'default'
+    AI workspace — a customer saw chats/insights created on ANOTHER machine.
+    Scoping by the edge's own tenant isolates each customer edge and makes a
+    fresh install start clean. Returns '' if it can't be resolved (caller
+    falls back to the user's jwt tenant, then 'default')."""
+    import time as _t
+    now = _t.monotonic()
+    cached = _EDGE_TENANT_CACHE.get("value")
+    if cached is not None and (now - _EDGE_TENANT_CACHE.get("at", 0.0)) < 30.0:
+        return cached
+    val = ""
+    try:
+        import json as _json, sqlite3 as _sqlite3
+        from app.state import app_store  # type: ignore
+        db_path = getattr(app_store, "_db_path", "") or ""
+        if db_path:
+            con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
+            try:
+                row = con.execute(
+                    "SELECT payload_json FROM config_documents WHERE domain='app_settings'"
+                ).fetchone()
+            finally:
+                con.close()
+            if row and row[0]:
+                s = _json.loads(row[0])
+                if isinstance(s, dict):
+                    # Prefer the edge's tenant; then derive from linked customer.
+                    ep = s.get("edge_profile") if isinstance(s.get("edge_profile"), dict) else {}
+                    cand = str(s.get("tenant_id") or "").strip()
+                    if not cand:
+                        cust = str(ep.get("linked_customer_id") or s.get("customer_id") or "").strip()
+                        if cust:
+                            cand = cust if cust.startswith("tenant-") else f"tenant-{cust}"
+                    # Never treat the placeholder 'default' as a real edge tenant.
+                    if cand and cand.lower() != "default":
+                        val = cand
+    except Exception:
+        val = ""
+    _EDGE_TENANT_CACHE["value"] = val
+    _EDGE_TENANT_CACHE["at"] = now
+    return val
+
+
+_EDGE_TENANT_CACHE: Dict[str, Any] = {"value": None, "at": 0.0}
+
+
 def _user_ctx(request: Request) -> Dict[str, str]:
     # Operator 2026-07-02: the auth middleware sets `request.state.user_payload`
     # (see backend/app/main.py). The previous code read `current_user`, which
-    # was NEVER set — so tenant_id always fell back to "default" and user_id
-    # was always empty. That silently scoped every chat to an empty user.
-    # Read the correct attribute; keep the old one as a fallback.
+    # was NEVER set — so user_id was always empty.
     user = getattr(request.state, "user_payload", None)
     if not isinstance(user, dict):
         user = getattr(request.state, "current_user", None) or {}
     if not isinstance(user, dict):
         user = {}
-    tenant_id = str(user.get("tenant_id") or "default")
     user_id = str(user.get("sub") or user.get("username") or user.get("id") or "")
+    # Operator 2026-07-08 (SCOPING FIX): scope AI data by the EDGE's own tenant
+    # (the customer this edge is linked to) — the same scope the rest of the app
+    # uses — so each customer edge is isolated and a fresh install starts clean.
+    # Fall back to the user's jwt tenant, then 'default', if the edge tenant
+    # can't be resolved (e.g. a not-yet-linked fresh edge).
+    tenant_id = _edge_tenant() or str(user.get("tenant_id") or "default")
     return {"tenant_id": tenant_id, "user_id": user_id}
 
 
