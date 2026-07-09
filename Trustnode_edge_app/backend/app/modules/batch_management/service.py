@@ -51,6 +51,49 @@ def _json_load(value: Any) -> Any:
         return None
 
 
+def _opt_num(value: Any) -> Optional[float]:
+    """Parse an optional numeric (limit/threshold) value; None if blank/invalid."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _percentile(sorted_vals: list[float], pct: float) -> Optional[float]:
+    """Nearest-rank percentile over an already-sorted list. pct in [0,100]."""
+    n = len(sorted_vals)
+    if n == 0:
+        return None
+    if n == 1:
+        return sorted_vals[0]
+    import math as _m
+    rank = _m.ceil((pct / 100.0) * n)
+    idx = min(max(rank - 1, 0), n - 1)
+    return sorted_vals[idx]
+
+
+def _window_seconds(start: str, end: str) -> float:
+    """Seconds between two 'YYYY-MM-DD HH:MM:SS.fff' timestamps; 0 on any error."""
+    from datetime import datetime as _dt
+    def _p(s: str):
+        s = str(s or "")[:23]
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return _dt.strptime(s[:len(fmt) + 4] if ".%f" in fmt else s[:19], fmt)
+            except Exception:
+                continue
+        return None
+    a, b = _p(start), _p(end)
+    if not a or not b:
+        return 0.0
+    try:
+        return max(0.0, (b - a).total_seconds())
+    except Exception:
+        return 0.0
+
+
 class BatchService:
     """Per-process service. Holds a reference to the AppStore so it can
     reuse the read/write SQLite connections + tenant context, but adds
@@ -83,7 +126,8 @@ class BatchService:
                        trigger_start_json, trigger_stop_json,
                        start_schedule_json, stop_schedule_json, report_schedule_json,
                        last_scheduled_start_utc, last_scheduled_stop_utc, last_report_utc,
-                       batch_kind, child_type_id
+                       batch_kind, child_type_id,
+                       pass_rule, manual_fields_json, chart_config_json
                 FROM batch_types
                 WHERE tenant_id = ?
                 ORDER BY name COLLATE NOCASE
@@ -105,7 +149,8 @@ class BatchService:
                        trigger_start_json, trigger_stop_json,
                        start_schedule_json, stop_schedule_json, report_schedule_json,
                        last_scheduled_start_utc, last_scheduled_stop_utc, last_report_utc,
-                       batch_kind, child_type_id
+                       batch_kind, child_type_id,
+                       pass_rule, manual_fields_json, chart_config_json
                 FROM batch_types
                 WHERE tenant_id = ? AND id = ?
                 """,
@@ -149,6 +194,9 @@ class BatchService:
             # Operator 2026-07-06: single/multiple model.
             (payload.get("batch_kind") or "single"),
             (payload.get("child_type_id") or None),
+            (payload.get("pass_rule") or "any_out_of_spec"),
+            _json_or_none(payload.get("manual_fields")),
+            _json_or_none(payload.get("chart_config")),
         )
         with self._connect() as c:
             if is_new:
@@ -162,8 +210,9 @@ class BatchService:
                      email_on_close, email_recipients,
                      trigger_start_json, trigger_stop_json,
                      start_schedule_json, stop_schedule_json, report_schedule_json,
-                     batch_kind, child_type_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     batch_kind, child_type_id,
+                     pass_rule, manual_fields_json, chart_config_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     record,
                 )
@@ -187,7 +236,8 @@ class BatchService:
                         email_on_close = ?, email_recipients = ?,
                         trigger_start_json = ?, trigger_stop_json = ?,
                         start_schedule_json = ?, stop_schedule_json = ?, report_schedule_json = ?,
-                        batch_kind = ?, child_type_id = ?
+                        batch_kind = ?, child_type_id = ?,
+                        pass_rule = ?, manual_fields_json = ?, chart_config_json = ?
                     WHERE tenant_id = ? AND id = ?
                     """,
                     (
@@ -197,6 +247,7 @@ class BatchService:
                         record[17], record[18], record[19], record[20],
                         record[21], record[22], record[23],
                         record[24], record[25],
+                        record[26], record[27], record[28],
                         tid, bt_id,
                     ),
                 )
@@ -266,6 +317,105 @@ class BatchService:
             return True
         except Exception:
             return False
+
+    # -- per-type spec limits (operator 2026-07-09) -------------------
+    def list_type_limits(self, batch_type_id: str) -> list[dict[str, Any]]:
+        tid = self._tenant()
+        with self._connect_readonly() as c:
+            rows = c.execute(
+                "SELECT tag_name, lower_limit, upper_limit, warn_lower, warn_upper, "
+                "in_spec_pct_min, unit, enabled FROM batch_type_limits "
+                "WHERE tenant_id = ? AND batch_type_id = ? ORDER BY tag_name COLLATE NOCASE",
+                (tid, batch_type_id),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_type_limits(self, batch_type_id: str, limits: list[dict[str, Any]],
+                        *, actor: Optional[str] = None) -> list[dict[str, Any]]:
+        """Replace the full set of spec limits for a type (one row per tag)."""
+        tid = self._tenant()
+        now = _utc_now()
+        with self._connect() as c:
+            c.execute("DELETE FROM batch_type_limits WHERE tenant_id = ? AND batch_type_id = ?",
+                      (tid, batch_type_id))
+            for lim in (limits or []):
+                tag = str(lim.get("tag_name") or "").strip()
+                if not tag:
+                    continue
+                c.execute(
+                    """
+                    INSERT INTO batch_type_limits
+                    (batch_type_id, tenant_id, tag_name, lower_limit, upper_limit,
+                     warn_lower, warn_upper, in_spec_pct_min, unit, enabled, created_utc, updated_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        batch_type_id, tid, tag,
+                        _opt_num(lim.get("lower_limit")), _opt_num(lim.get("upper_limit")),
+                        _opt_num(lim.get("warn_lower")), _opt_num(lim.get("warn_upper")),
+                        _opt_num(lim.get("in_spec_pct_min")),
+                        (str(lim.get("unit")) if lim.get("unit") else None),
+                        0 if lim.get("enabled") is False else 1, now, now,
+                    ),
+                )
+            self._audit(c, tid=tid, actor=actor, batch_type_id=batch_type_id,
+                        action="batch_type.set_limits", after={"count": len(limits or [])})
+            c.commit()
+        return self.list_type_limits(batch_type_id)
+
+    def _limits_map_for_batch(self, batch_id: str) -> dict[str, dict[str, Any]]:
+        """{tag_lower -> limit dict} for the batch's TYPE. Empty if none."""
+        b = self.get_batch(batch_id)
+        bt_id = (b or {}).get("batch_type_id")
+        if not bt_id:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for lim in self.list_type_limits(bt_id):
+            if lim.get("enabled") is False:
+                continue
+            out[str(lim.get("tag_name") or "").lower()] = lim
+        return out
+
+    # -- manual entries (operator 2026-07-09) ------------------------
+    def list_manual_entries(self, batch_id: str) -> list[dict[str, Any]]:
+        tid = self._tenant()
+        with self._connect_readonly() as c:
+            rows = c.execute(
+                "SELECT field_key, field_label, value_text, value_num, entered_by, entered_utc "
+                "FROM batch_manual_entries WHERE tenant_id = ? AND batch_id = ? "
+                "ORDER BY entered_utc ASC",
+                (tid, batch_id),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_manual_entries(self, batch_id: str, entries: list[dict[str, Any]],
+                           *, actor: Optional[str] = None) -> list[dict[str, Any]]:
+        """Replace the manual-entry set for a batch (idempotent full-set save)."""
+        tid = self._tenant()
+        now = _utc_now()
+        with self._connect() as c:
+            c.execute("DELETE FROM batch_manual_entries WHERE tenant_id = ? AND batch_id = ?",
+                      (tid, batch_id))
+            for e in (entries or []):
+                key = str(e.get("field_key") or e.get("key") or "").strip()
+                if not key:
+                    continue
+                vt = e.get("value_text")
+                vt = str(vt) if vt is not None else None
+                c.execute(
+                    """
+                    INSERT INTO batch_manual_entries
+                    (batch_id, tenant_id, field_key, field_label, value_text, value_num,
+                     entered_by, entered_utc)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (batch_id, tid, key, (str(e.get("field_label")) if e.get("field_label") else None),
+                     vt, _opt_num(e.get("value_num")), actor, now),
+                )
+            self._event(c, batch_id=batch_id, kind="batch.manual_entry", actor=actor,
+                        message=f"{len(entries or [])} manual field(s) saved")
+            c.commit()
+        return self.list_manual_entries(batch_id)
 
     # -- batches -------------------------------------------------------
     def list_batches(self, *, limit: int = 200, offset: int = 0,
@@ -508,7 +658,8 @@ class BatchService:
             from .reports import render_single_batch_pdf
             events = self.list_events(batch_id, limit=2000)
             summaries = self.list_summaries(batch_id)
-            pdf_bytes = render_single_batch_pdf(batch, bt, events, summaries)
+            manual = self.list_manual_entries(batch_id)
+            pdf_bytes = render_single_batch_pdf(batch, bt, events, summaries, manual)
         except Exception as exc:
             with self._connect() as c:
                 self._event(c, batch_id=batch_id, kind="batch.email_failed",
@@ -744,6 +895,7 @@ class BatchService:
         tid = self._tenant()
         # Resolve the type's summary-tag allow-list (normalized for matching).
         allow: Optional[set] = None
+        pass_rule = "any_out_of_spec"
         try:
             b = self.get_batch(batch_id)
             bt = self.get_batch_type(b.get("batch_type_id") or "") if b and b.get("batch_type_id") else None
@@ -751,8 +903,12 @@ class BatchService:
             wanted = [str(t).strip() for t in st if str(t).strip()]
             if wanted:
                 allow = {t.lower() for t in wanted}
+            pass_rule = str((bt or {}).get("pass_rule") or "any_out_of_spec")
         except Exception:
             allow = None
+        # Operator 2026-07-09: per-tag spec limits for this batch's type (empty
+        # if none defined → pass/fail stays 'na' and behavior is unchanged).
+        limits = self._limits_map_for_batch(batch_id)
         with self._connect_readonly() as c:
             windows = c.execute(
                 """
@@ -767,10 +923,13 @@ class BatchService:
             tag_data: dict[tuple[str, str], list[float]] = {}
             first_values: dict[tuple[str, str], float] = {}
             last_values: dict[tuple[str, str], float] = {}
+            # window duration (seconds) across all membership windows
+            _dur_s = 0.0
             for w in windows:
                 gw = str(w["gateway_id"] or "")
                 start = str(w["ts_utc_start"] or "")
                 end = str(w["ts_utc_end"] or _utc_now())
+                _dur_s += _window_seconds(start, end)
                 params: list[Any] = [tid, start, end]
                 gw_clause = ""
                 if gw:
@@ -805,6 +964,10 @@ class BatchService:
                     last_values[key] = v
         rows_written = 0
         now = _utc_now()
+        # Batch-level pass/fail roll-up accumulators (operator 2026-07-09).
+        _pass_tags = 0
+        _fail_tags = 0
+        _any_limit = False
         with self._connect() as c:
             c.execute("DELETE FROM batch_summaries WHERE batch_id = ?", (batch_id,))
             for (gw, tag), values in tag_data.items():
@@ -814,22 +977,73 @@ class BatchService:
                     stdev = statistics.pstdev(values) if len(values) > 1 else 0.0
                 except Exception:
                     stdev = 0.0
+                svals = sorted(values)
+                p95 = _percentile(svals, 95.0)
+                # --- spec-limit evaluation (only if this tag has a limit) ---
+                lim = limits.get(tag.lower())
+                lo = up = None
+                in_cnt = out_cnt = 0
+                in_pct = None
+                tag_pf = "na"
+                if lim:
+                    _any_limit = True
+                    lo = _opt_num(lim.get("lower_limit"))
+                    up = _opt_num(lim.get("upper_limit"))
+                    if lo is not None or up is not None:
+                        for v in values:
+                            ok = True
+                            if lo is not None and v < lo:
+                                ok = False
+                            if up is not None and v > up:
+                                ok = False
+                            if ok:
+                                in_cnt += 1
+                            else:
+                                out_cnt += 1
+                        total = in_cnt + out_cnt
+                        in_pct = round((in_cnt / total) * 100.0, 3) if total else None
+                        # per-tag pass/fail depends on the type's rule
+                        if pass_rule == "in_spec_pct":
+                            thr = _opt_num(lim.get("in_spec_pct_min"))
+                            thr = thr if thr is not None else 100.0
+                            tag_pf = "pass" if (in_pct is not None and in_pct >= thr) else "fail"
+                        else:  # any_out_of_spec
+                            tag_pf = "pass" if out_cnt == 0 else "fail"
+                        if tag_pf == "pass":
+                            _pass_tags += 1
+                        elif tag_pf == "fail":
+                            _fail_tags += 1
                 c.execute(
                     """
                     INSERT INTO batch_summaries
                     (batch_id, tenant_id, tag_name, gateway_id, sample_count,
                      min_value, max_value, avg_value, first_value, last_value,
-                     stdev_value, computed_utc)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     stdev_value, computed_utc,
+                     lower_limit, upper_limit, in_spec_count, out_of_spec_count,
+                     in_spec_pct, pass_fail, p95_value, duration_s)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         batch_id, tid, tag, gw or None, len(values),
                         min(values), max(values), sum(values) / len(values),
                         first_values.get((gw, tag)), last_values.get((gw, tag)),
                         stdev, now,
+                        lo, up, in_cnt, out_cnt, in_pct, tag_pf, p95, round(_dur_s, 1),
                     ),
                 )
                 rows_written += 1
+            # Roll up to the batch. If NO tag had a limit, result stays 'na'
+            # (unchanged behavior for existing batches). Otherwise pass unless
+            # any limited tag failed.
+            if _any_limit:
+                result = "fail" if _fail_tags > 0 else "pass"
+            else:
+                result = "na"
+            c.execute(
+                "UPDATE batches SET result = ?, pass_tag_count = ?, fail_tag_count = ?, "
+                "updated_utc = ? WHERE tenant_id = ? AND id = ?",
+                (result, _pass_tags, _fail_tags, now, tid, batch_id),
+            )
             c.commit()
         return rows_written
 
@@ -839,7 +1053,9 @@ class BatchService:
             rows = c.execute(
                 """
                 SELECT tag_name, gateway_id, sample_count, min_value, max_value,
-                       avg_value, first_value, last_value, stdev_value, computed_utc
+                       avg_value, first_value, last_value, stdev_value, computed_utc,
+                       lower_limit, upper_limit, in_spec_count, out_of_spec_count,
+                       in_spec_pct, pass_fail, p95_value, duration_s
                 FROM batch_summaries
                 WHERE tenant_id = ? AND batch_id = ?
                 ORDER BY tag_name COLLATE NOCASE
@@ -1033,6 +1249,41 @@ class BatchService:
         rows, _ = self.list_batches(limit=1, batch_type_id=batch_type_id)
         return rows[0] if rows else None
 
+    def resolve_gateway_for_tag(self, tag: str) -> str:
+        """Return the gateway_id that most-recently reported `tag`, or ''.
+        Used to stamp a condition-triggered batch with the gateway of its
+        trigger tag, so two batches on different machinery stay isolated
+        (each membership window filters the historian by that gateway).
+        Operator 2026-07-09. Read-only."""
+        tag = str(tag or "").strip()
+        if not tag:
+            return ""
+        tid = self._tenant()
+        try:
+            with self._connect_readonly() as c:
+                row = c.execute(
+                    "SELECT gateway_id FROM historian_readings "
+                    "WHERE tenant_id = ? AND tag_name = ? AND gateway_id IS NOT NULL "
+                    "ORDER BY ts_utc DESC LIMIT 1",
+                    (tid, tag),
+                ).fetchone()
+                return str(row[0]) if row and row[0] else ""
+        except Exception:
+            return ""
+
+    def gateway_for_type_trigger(self, batch_type: dict[str, Any]) -> str:
+        """Best-effort gateway for a type: the gateway of the FIRST tag in its
+        trigger_start (or trigger_stop) rules. '' if none resolvable."""
+        for slot in ("trigger_start", "trigger_stop"):
+            cond = batch_type.get(slot)
+            if isinstance(cond, dict):
+                for r in (cond.get("rules") or []):
+                    if isinstance(r, dict) and r.get("tag"):
+                        gw = self.resolve_gateway_for_tag(str(r["tag"]))
+                        if gw:
+                            return gw
+        return ""
+
     def collected_tags_in_window(self, batch_id: str) -> list[str]:
         """Distinct tag names that have at least one historian reading inside the
         batch's membership window(s). This is what the Reports builder offers as
@@ -1064,6 +1315,92 @@ class BatchService:
                     continue
         return sorted(tags)
 
+    def chart_series_for_batch(self, batch_id: str, tags: list[str],
+                               *, max_points: int = 400) -> dict[str, Any]:
+        """Return downsampled per-tag time-series WITHIN the batch's window(s),
+        for the in-UI trend charts. Read-only over historian_readings by
+        (tenant, gateway, ts-range) — the same window join used everywhere in
+        this module; never modifies the historian. Operator 2026-07-09.
+
+        Returns {from, to, series:[{tag, points:[{ts_ms, value}], min, max, avg,
+                 lower_limit, upper_limit}]}."""
+        tid = self._tenant()
+        want = [str(t).strip() for t in (tags or []) if str(t).strip()]
+        if not want:
+            return {"series": []}
+        want_set = {t.lower() for t in want}
+        limits = self._limits_map_for_batch(batch_id)
+        per_tag: dict[str, list[tuple[str, float]]] = {}
+        from_ts = to_ts = ""
+        with self._connect_readonly() as c:
+            windows = c.execute(
+                "SELECT gateway_id, ts_utc_start, ts_utc_end FROM batch_membership "
+                "WHERE batch_id = ? AND tenant_id = ?", (batch_id, tid),
+            ).fetchall()
+            for w in windows:
+                gw = str(w["gateway_id"] or "")
+                start = str(w["ts_utc_start"] or "")
+                end = str(w["ts_utc_end"] or _utc_now())
+                if not from_ts or start < from_ts:
+                    from_ts = start
+                if end > to_ts:
+                    to_ts = end
+                params: list[Any] = [tid, start, end]
+                gw_clause = ""
+                if gw:
+                    gw_clause = " AND gateway_id = ?"; params.append(gw)
+                ph = ",".join(["?"] * len(want))
+                params2 = list(params) + want
+                try:
+                    for r in c.execute(
+                        f"SELECT ts_utc, tag_name, value FROM historian_readings "
+                        f"WHERE tenant_id = ? AND ts_utc >= ? AND ts_utc <= ?{gw_clause} "
+                        f"AND tag_name IN ({ph}) AND value IS NOT NULL ORDER BY ts_utc ASC",
+                        params2,
+                    ):
+                        tn = str(r[1] or "")
+                        if tn.lower() not in want_set:
+                            continue
+                        try:
+                            v = float(r[2])
+                        except Exception:
+                            continue
+                        per_tag.setdefault(tn, []).append((str(r[0]), v))
+                except Exception:
+                    continue
+        # Downsample each tag to ~max_points (stride) + compute min/max/avg.
+        import datetime as _dt
+        def _ms(ts: str) -> int:
+            s = str(ts)[:23]
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    d = _dt.datetime.strptime(s if ".%f" in fmt else s[:19], fmt)
+                    return int(d.replace(tzinfo=_dt.timezone.utc).timestamp() * 1000)
+                except Exception:
+                    continue
+            return 0
+        series = []
+        for tn in want:
+            pts = per_tag.get(tn) or []
+            if not pts:
+                series.append({"tag": tn, "points": [], "min": None, "max": None, "avg": None})
+                continue
+            vals = [v for _, v in pts]
+            import math as _m
+            stride = max(1, _m.ceil(len(pts) / max(1, max_points)))
+            ds = [{"ts_ms": _ms(ts), "value": v} for i, (ts, v) in enumerate(pts) if i % stride == 0]
+            # Always include the last point so the trend reaches the window end.
+            if pts and (len(pts) - 1) % stride != 0:
+                ds.append({"ts_ms": _ms(pts[-1][0]), "value": pts[-1][1]})
+            lim = limits.get(tn.lower()) or {}
+            series.append({
+                "tag": tn, "points": ds,
+                "min": min(vals), "max": max(vals), "avg": sum(vals) / len(vals),
+                "lower_limit": _opt_num(lim.get("lower_limit")),
+                "upper_limit": _opt_num(lim.get("upper_limit")),
+            })
+        return {"from": from_ts, "to": to_ts, "series": series}
+
     def batch_report_context(self, batch_id: str) -> dict[str, Any]:
         """One call that gives the Reports layer everything it needs for a
         batch-sourced report: the batch, its type, resolved window, collected
@@ -1081,6 +1418,13 @@ class BatchService:
             "to_utc": end or _utc_now(),
             "collected_tags": self.collected_tags_in_window(batch_id),
             "summaries": self.list_summaries(batch_id),
+            # Operator 2026-07-09: limits + manual entries + roll-up result so the
+            # report and detail UI show pass/fail without extra round-trips.
+            "limits": self.list_type_limits(b.get("batch_type_id") or "") if b.get("batch_type_id") else [],
+            "manual_entries": self.list_manual_entries(batch_id),
+            "result": b.get("result"),
+            "pass_tag_count": b.get("pass_tag_count"),
+            "fail_tag_count": b.get("fail_tag_count"),
         }
         if bt and str(bt.get("batch_kind")) == "multiple":
             try:
@@ -1276,11 +1620,12 @@ class BatchService:
         bt = self.get_batch_type(batch.get("batch_type_id") or "") if batch.get("batch_type_id") else None
         events = self.list_events(batch_id, limit=2000)
         summaries = self.list_summaries(batch_id)
+        manual = self.list_manual_entries(batch_id)
         attachments_spec: list[tuple[str, bytes, str]] = []
         if attach_pdf:
             try:
                 from .reports import render_single_batch_pdf
-                pdf = render_single_batch_pdf(batch, bt, events, summaries)
+                pdf = render_single_batch_pdf(batch, bt, events, summaries, manual)
                 attachments_spec.append((f"batch_{batch.get('identifier') or batch_id}.pdf", pdf, "application/pdf"))
             except Exception:
                 pass
@@ -1411,6 +1756,9 @@ class BatchService:
             "last_report_utc": d.get("last_report_utc"),
             "batch_kind": d.get("batch_kind") or "single",
             "child_type_id": d.get("child_type_id"),
+            "pass_rule": d.get("pass_rule") or "any_out_of_spec",
+            "manual_fields": _json_load(d.get("manual_fields_json")) or [],
+            "chart_config": _json_load(d.get("chart_config_json")),
             "created_utc": d["created_utc"],
             "updated_utc": d["updated_utc"],
         }
@@ -1437,6 +1785,9 @@ class BatchService:
             "notes": d.get("notes"),
             "metadata": _json_load(d.get("metadata_json")),
             "open_child_batch_id": d.get("open_child_batch_id"),
+            "result": d.get("result"),
+            "pass_tag_count": d.get("pass_tag_count"),
+            "fail_tag_count": d.get("fail_tag_count"),
             "created_utc": d["created_utc"],
             "updated_utc": d["updated_utc"],
         }
@@ -1455,5 +1806,6 @@ def record_to_dict(record: tuple) -> dict[str, Any]:
         "trigger_start_json", "trigger_stop_json",
         "start_schedule_json", "stop_schedule_json", "report_schedule_json",
         "batch_kind", "child_type_id",
+        "pass_rule", "manual_fields_json", "chart_config_json",
     )
     return {k: v for k, v in zip(keys, record)}

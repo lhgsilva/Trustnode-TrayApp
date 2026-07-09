@@ -68,6 +68,10 @@ import {
   listBatchEvents,
   addBatchEvent,
   listBatchSummaries,
+  getBatchManualEntries,
+  saveBatchManualEntries,
+  getBatchChart,
+  getBatchCollectedTags,
   recomputeBatchSummaries,
   listBatchHistorianRows,
   deleteBatch,
@@ -204,6 +208,7 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
       <BatchDetailPage
         batchId={selectedId}
         onBack={() => { setSelectedId(null); refresh(); }}
+        onOpenBatch={(id) => setSelectedId(id)}
         currentUser={currentUser}
         batchTypes={batchTypes}
       />
@@ -388,32 +393,217 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
 // -----------------------------------------------------------------------
 // Batch Detail page — events, summaries, historian slice, validation
 // -----------------------------------------------------------------------
-function BatchDetailPage({ batchId, onBack, currentUser, batchTypes }) {
+// Operator 2026-07-09: self-contained SVG trend chart for the batch detail.
+// Multi-series with auto dual-axis + spec-limit reference lines. Deliberately
+// standalone (no dependency on the dashboard/AI chart engines) so it can never
+// affect the working dashboard charts.
+const _BATCH_CHART_COLORS = ["#14b8a6", "#f97316", "#3b82f6", "#a855f7", "#eab308", "#ef4444"];
+function BatchTrendChart({ series }) {
+  const W = 900, H = 300, pad = { l: 54, r: 54, t: 16, b: 30 };
+  const good = (series || []).filter((s) => (s.points || []).length > 0);
+  if (!good.length) {
+    return <div style={{ color: "var(--muted)", fontSize: 13, padding: 16 }}>No data in the batch window for the selected tags.</div>;
+  }
+  // x-range across all series
+  const allX = good.flatMap((s) => s.points.map((p) => p.ts_ms));
+  const xMin = Math.min(...allX), xMax = Math.max(...allX);
+  // assign axes: series whose midrange differs >5x from the first go to the right
+  const ranges = good.map((s) => { const vs = s.points.map((p) => p.value); const mn = Math.min(...vs), mx = Math.max(...vs); return { mn, mx, mid: (mn + mx) / 2 }; });
+  const baseMid = Math.abs(ranges[0].mid) + 1;
+  const axisOf = good.map((s, i) => { const r = (Math.abs(ranges[i].mid) + 1) / baseMid; return (r > 5 || r < 0.2) ? "right" : "left"; });
+  const axVals = { left: [], right: [] };
+  good.forEach((s, i) => { s.points.forEach((p) => axVals[axisOf[i]].push(p.value)); (s.lower_limit != null) && axVals[axisOf[i]].push(s.lower_limit); (s.upper_limit != null) && axVals[axisOf[i]].push(s.upper_limit); });
+  const axis = (vs) => { if (!vs.length) return null; let mn = Math.min(...vs), mx = Math.max(...vs); if (mn === mx) { mn -= 1; mx += 1; } const p = (mx - mn) * 0.08 || 1; return { min: mn - p, max: mx + p }; };
+  const L = axis(axVals.left), R = axis(axVals.right);
+  const innerW = W - pad.l - pad.r, innerH = H - pad.t - pad.b;
+  const xS = (v) => pad.l + (xMax === xMin ? 0 : ((v - xMin) / (xMax - xMin)) * innerW);
+  const yS = (side) => { const a = side === "right" ? R : L; if (!a) return () => pad.t + innerH / 2; return (v) => pad.t + innerH - ((v - a.min) / (a.max - a.min)) * innerH; };
+  const fmtY = (v) => (Math.abs(v) >= 1000 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2));
+  const fmtT = (ms) => { try { return new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }); } catch { return ""; } };
+  const ticks = (a) => a ? [a.max, (a.max + a.min) / 2, a.min] : [];
+  return (
+    <div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 6, fontSize: 12 }}>
+        {good.map((s, i) => (
+          <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <span style={{ width: 12, height: 3, background: _BATCH_CHART_COLORS[i % 6], display: "inline-block" }} />
+            <strong>{s.tag}</strong>{axisOf[i] === "right" ? <span style={{ opacity: 0.6 }}>(R)</span> : null}
+          </span>
+        ))}
+      </div>
+      <svg width="100%" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" style={{ display: "block" }}>
+        {ticks(L).map((t, i) => { const y = yS("left")(t); return (<g key={`L${i}`}><line x1={pad.l} y1={y} x2={W - pad.r} y2={y} stroke="var(--stroke)" strokeDasharray="2,3" opacity="0.5" /><text x={pad.l - 6} y={y + 3} fill="var(--muted)" fontSize="10" textAnchor="end">{fmtY(t)}</text></g>); })}
+        {ticks(R).map((t, i) => { const y = yS("right")(t); return (<text key={`R${i}`} x={W - pad.r + 6} y={y + 3} fill="var(--muted)" fontSize="10" textAnchor="start">{fmtY(t)}</text>); })}
+        <text x={pad.l} y={H - 4} fill="var(--muted)" fontSize="10">{fmtT(xMin)}</text>
+        <text x={W - pad.r} y={H - 4} fill="var(--muted)" fontSize="10" textAnchor="end">{fmtT(xMax)}</text>
+        {good.map((s, i) => {
+          const ys = yS(axisOf[i]); const col = _BATCH_CHART_COLORS[i % 6];
+          const d = s.points.map((p, j) => `${j === 0 ? "M" : "L"} ${xS(p.ts_ms).toFixed(1)} ${ys(p.value).toFixed(1)}`).join(" ");
+          const lo = s.lower_limit != null ? ys(s.lower_limit) : null;
+          const up = s.upper_limit != null ? ys(s.upper_limit) : null;
+          return (<g key={i}>
+            <path d={d} fill="none" stroke={col} strokeWidth="1.6" />
+            {lo != null ? <line x1={pad.l} y1={lo} x2={W - pad.r} y2={lo} stroke={col} strokeWidth="1" strokeDasharray="5,4" opacity="0.7" /> : null}
+            {up != null ? <line x1={pad.l} y1={up} x2={W - pad.r} y2={up} stroke={col} strokeWidth="1" strokeDasharray="5,4" opacity="0.7" /> : null}
+          </g>);
+        })}
+      </svg>
+    </div>
+  );
+}
+
+// Chart panel: pick tags (single or multi), load series for the batch window.
+function BatchChartPanel({ batchId, batchStatus }) {
+  const [availTags, setAvailTags] = React.useState([]);
+  const [picked, setPicked] = React.useState([]);
+  const [series, setSeries] = React.useState([]);
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState("");
+  React.useEffect(() => {
+    getBatchCollectedTags(batchId).then((t) => {
+      setAvailTags(t || []);
+      if ((t || []).length) setPicked([t[0]]);  // default first tag
+    }).catch(() => {});
+  }, [batchId]);
+  const load = React.useCallback(async (tags) => {
+    if (!tags.length) { setSeries([]); return; }
+    setBusy(true); setErr("");
+    try { const r = await getBatchChart(batchId, tags, 400); setSeries(r.series || []); }
+    catch (e) { setErr(String(e?.message || e)); }
+    finally { setBusy(false); }
+  }, [batchId]);
+  React.useEffect(() => { if (picked.length) load(picked); }, [picked, load]);
+  const toggle = (tag) => { setPicked((p) => p.includes(tag) ? p.filter((x) => x !== tag) : [...p, tag].slice(0, 6)); };
+  return (
+    <section className="card">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>Trend charts</h3>
+        <button className="btn btn-secondary btn-sm" onClick={() => load(picked)} disabled={busy || !picked.length}>
+          {busy ? "Loading…" : "Refresh"}
+        </button>
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, margin: "10px 0" }}>
+        {availTags.length === 0 ? <span style={{ color: "var(--muted)", fontSize: 12 }}>No tags collected in this batch window yet{batchStatus === "running" ? " (batch still running)" : ""}.</span> : null}
+        {availTags.map((t) => (
+          <button key={t} onClick={() => toggle(t)}
+                  className={`btn btn-sm ${picked.includes(t) ? "btn-primary" : "btn-secondary"}`}
+                  style={{ fontSize: 11 }}>{t}</button>
+        ))}
+        {availTags.length ? <span style={{ color: "var(--muted)", fontSize: 11, alignSelf: "center" }}>pick up to 6 · single = one tag, multi = several (auto dual-axis) · dashed lines = spec limits</span> : null}
+      </div>
+      {err ? <div className="alert alert-error">{err}</div> : null}
+      {picked.length ? <BatchTrendChart series={series} /> : <div style={{ color: "var(--muted)", fontSize: 13 }}>Select one or more tags to chart.</div>}
+    </section>
+  );
+}
+
+// Operator 2026-07-09: manual-entry card. Shows the type's declared fields
+// (label/type/unit) pre-filled with any saved values, plus lets the operator
+// add ad-hoc rows; saves the full set via saveBatchManualEntries.
+function ManualEntriesCard({ batchId, typeFields, entries, onSaved, setError }) {
+  // Build the working rows: one per declared type field (merged with saved
+  // value by key), plus any saved entries that aren't in the declared list.
+  const initial = React.useMemo(() => {
+    const byKey = {};
+    (entries || []).forEach((e) => { byKey[e.field_key] = e; });
+    const rows = (typeFields || []).map((f) => {
+      const k = f.key || (f.label || "").toLowerCase().replace(/[^a-z0-9]+/g, "_");
+      const saved = byKey[k];
+      return { field_key: k, field_label: f.label || k, type: f.type || "text", unit: f.unit || "",
+               value_text: saved ? (saved.value_text ?? "") : "", value_num: saved ? saved.value_num : null };
+    });
+    const declared = new Set(rows.map((r) => r.field_key));
+    (entries || []).forEach((e) => {
+      if (!declared.has(e.field_key)) rows.push({ field_key: e.field_key, field_label: e.field_label || e.field_key, type: "text", unit: "", value_text: e.value_text ?? "", value_num: e.value_num });
+    });
+    return rows;
+  }, [typeFields, entries]);
+  const [rows, setRows] = React.useState(initial);
+  React.useEffect(() => { setRows(initial); }, [initial]);
+  const [saving, setSaving] = React.useState(false);
+  const [saved, setSaved] = React.useState(false);
+
+  if ((typeFields || []).length === 0 && (entries || []).length === 0) return null;
+
+  const save = async () => {
+    setSaving(true); setSaved(false);
+    try {
+      const payload = rows
+        .filter((r) => r.field_key && (String(r.value_text || "").trim() !== "" || r.value_num != null))
+        .map((r) => (r.type === "number"
+          ? { field_key: r.field_key, field_label: r.field_label, value_num: r.value_text === "" ? null : Number(r.value_text) }
+          : { field_key: r.field_key, field_label: r.field_label, value_text: r.value_text }));
+      const out = await saveBatchManualEntries(batchId, payload);
+      onSaved && onSaved(out);
+      setSaved(true);
+    } catch (e) { setError(e); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <section className="card">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <h3 style={{ margin: 0 }}>Manual entries</h3>
+        <button className="btn btn-primary btn-sm" onClick={save} disabled={saving}>
+          {saving ? "Saving…" : saved ? "Saved ✓" : "Save"}
+        </button>
+      </div>
+      <div className="form-grid" style={{ marginTop: 12 }}>
+        {rows.map((r, i) => (
+          <label key={i}>
+            {r.field_label}{r.unit ? ` (${r.unit})` : ""}
+            <input
+              type={r.type === "number" ? "number" : "text"}
+              value={r.type === "number" ? (r.value_text ?? (r.value_num ?? "")) : (r.value_text ?? "")}
+              onChange={(e) => { const a = [...rows]; a[i] = { ...a[i], value_text: e.target.value }; setRows(a); setSaved(false); }}
+            />
+          </label>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function BatchDetailPage({ batchId, onBack, onOpenBatch, currentUser, batchTypes }) {
   const [batch, setBatch] = useState(null);
   const [events, setEvents] = useState([]);
   const [summaries, setSummaries] = useState([]);
   const [historian, setHistorian] = useState([]);
+  const [children, setChildren] = useState([]);  // for a MULTIPLE parent
   const [eventComment, setEventComment] = useState("");
   const [validationNotes, setValidationNotes] = useState("");
+  const [manualEntries, setManualEntries] = useState([]);  // operator-filled values
   const [error, setError] = useToastError();
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     setBusy(true);
     try {
-      const [b, ev, sm, hist] = await Promise.all([
+      const [b, ev, sm, hist, me] = await Promise.all([
         getBatch(batchId),
         listBatchEvents(batchId, 200),
         listBatchSummaries(batchId),
         listBatchHistorianRows(batchId, 1000),
+        getBatchManualEntries(batchId).catch(() => []),
       ]);
       setBatch(b);
       setEvents(ev);
       setSummaries(sm);
       setHistorian(hist);
+      setManualEntries(Array.isArray(me) ? me : []);
+      // If this is a MULTIPLE parent, load its children for navigation.
+      const bt = batchTypes.find((t) => t.id === b.batch_type_id);
+      if (bt && bt.batch_kind === "multiple") {
+        try {
+          const rc = await listBatches({ parent_batch_id: b.id, limit: 200 });
+          setChildren(Array.isArray(rc?.rows) ? rc.rows : []);
+        } catch { setChildren([]); }
+      } else {
+        setChildren([]);
+      }
     } catch (e) { setError(e); }
     finally { setBusy(false); }
-  }, [batchId, setError]);
+  }, [batchId, setError, batchTypes]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -455,8 +645,22 @@ function BatchDetailPage({ batchId, onBack, currentUser, batchTypes }) {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div>
             <button className="btn btn-secondary btn-sm" onClick={onBack}>← Back</button>
+            {/* Operator 2026-07-09: jump up to the parent batch (child view). */}
+            {batch.parent_batch_id && onOpenBatch ? (
+              <button className="btn btn-secondary btn-sm" style={{ marginLeft: 8 }}
+                      title="Open the parent batch" onClick={() => onOpenBatch(batch.parent_batch_id)}>↑ Parent</button>
+            ) : null}
             <span style={{ marginLeft: 12, fontWeight: 600 }}>{batch.identifier || batch.id}</span>
             <span style={{ marginLeft: 12 }}><StatusPill status={batch.status} /></span>
+            {/* Operator 2026-07-09: pass/fail pill from computed result. */}
+            {(batch.result === "pass" || batch.result === "fail") ? (
+              <span style={{
+                marginLeft: 10, padding: "2px 10px", borderRadius: 12, fontSize: 12, fontWeight: 700,
+                color: "#fff", background: batch.result === "pass" ? "#16a34a" : "#dc2626",
+              }} title={`Passed tags: ${batch.pass_tag_count || 0} · Failed tags: ${batch.fail_tag_count || 0}`}>
+                {batch.result === "pass" ? "PASS" : "FAIL"}
+              </span>
+            ) : null}
           </div>
           <div>
             {/* Operator 2026-07-06: MULTIPLE parent → manual "roll to next child". */}
@@ -532,25 +736,71 @@ function BatchDetailPage({ batchId, onBack, currentUser, batchTypes }) {
         <div className="table" style={{ marginTop: 12 }}>
           <div className="thead">
             <span>Tag</span><span>Min</span><span>Max</span><span>Avg</span>
-            <span>First</span><span>Last</span><span>σ</span><span>Count</span>
+            <span>σ</span><span>Count</span><span>Limits</span><span>In-spec %</span><span>Result</span>
           </div>
-          {summaries.map((s, i) => (
+          {summaries.map((s, i) => {
+            const hasLim = s.lower_limit != null || s.upper_limit != null;
+            const limTxt = hasLim ? `${s.lower_limit ?? "−∞"} … ${s.upper_limit ?? "+∞"}` : "—";
+            const pf = s.pass_fail;
+            return (
             <div key={i} className="trow">
               <span>{s.tag_name}</span>
               <span>{Number(s.min_value).toFixed(3)}</span>
               <span>{Number(s.max_value).toFixed(3)}</span>
               <span>{Number(s.avg_value).toFixed(3)}</span>
-              <span>{Number(s.first_value).toFixed(3)}</span>
-              <span>{Number(s.last_value).toFixed(3)}</span>
               <span>{Number(s.stdev_value).toFixed(3)}</span>
               <span>{s.sample_count}</span>
+              <span>{limTxt}</span>
+              <span>{s.in_spec_pct != null ? `${s.in_spec_pct}%` : "—"}</span>
+              <span>{pf === "pass" || pf === "fail" ? (
+                <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, fontWeight: 700, color: "#fff",
+                               background: pf === "pass" ? "#16a34a" : "#dc2626" }}>{pf.toUpperCase()}</span>
+              ) : "—"}</span>
             </div>
-          ))}
+            );
+          })}
           {summaries.length === 0 ? (
             <div className="trow"><span>No summary yet. Stop the batch or click Recompute.</span></div>
           ) : null}
         </div>
       </section>
+
+      {/* Operator 2026-07-09: child batches of a MULTIPLE parent — clickable. */}
+      {children.length > 0 ? (
+        <section className="card">
+          <h3 style={{ margin: 0 }}>Child batches ({children.length})</h3>
+          <div className="table" style={{ marginTop: 12 }}>
+            <div className="thead">
+              <span>Identifier</span><span>Status</span><span>Result</span>
+              <span>Started</span><span>Ended</span><span></span>
+            </div>
+            {children.map((ch) => (
+              <div key={ch.id} className="trow" style={{ cursor: "pointer" }} onClick={() => onOpenBatch && onOpenBatch(ch.id)}>
+                <span>{ch.identifier || ch.id}</span>
+                <span><StatusPill status={ch.status} /></span>
+                <span>{(ch.result === "pass" || ch.result === "fail") ? (
+                  <span style={{ padding: "1px 8px", borderRadius: 10, fontSize: 11, fontWeight: 700, color: "#fff", background: ch.result === "pass" ? "#16a34a" : "#dc2626" }}>{ch.result.toUpperCase()}</span>
+                ) : "—"}</span>
+                <span>{formatTs(ch.started_utc)}</span>
+                <span>{formatTs(ch.ended_utc)}</span>
+                <span style={{ color: "var(--teal, #14a89a)" }}>Open →</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {/* Operator 2026-07-09: in-UI trend charts scoped to the batch window. */}
+      <BatchChartPanel batchId={batchId} batchStatus={batch.status} />
+
+      {/* Operator 2026-07-09: manual entry — type-declared fields the operator fills. */}
+      <ManualEntriesCard
+        batchId={batchId}
+        typeFields={bt?.manual_fields || []}
+        entries={manualEntries}
+        onSaved={(rows) => setManualEntries(rows)}
+        setError={setError}
+      />
 
       <section className="card">
         <h3 style={{ margin: 0 }}>Events ({events.length})</h3>
@@ -671,6 +921,7 @@ export function BatchTypesPage() {
     enabled: true, summary_tags: [],
     start_schedule: null, stop_schedule: null, report_schedule: null,
     batch_kind: "single", child_type_id: "",
+    pass_rule: "any_out_of_spec", spec_limits: [], manual_fields: [],
   }), []);
   // Single types available to be the "child" of a Multiple type.
   const singleTypes = useMemo(
@@ -844,12 +1095,17 @@ export function BatchTypesPage() {
 
             {/* Operator 2026-06-30: email-on-close config */}
             <div className="card" style={{ marginTop: 14, padding: 12, background: "var(--surface-elev, var(--card))" }}>
-              <h4 style={{ margin: "0 0 8px 0", fontSize: 13 }}>Email on close</h4>
+              <h4 style={{ margin: "0 0 8px 0", fontSize: 13 }}>Report email</h4>
+              <small style={{ color: "var(--muted)", fontSize: 11, display: "block", marginBottom: 8 }}>
+                Two independent options: <strong>email each batch as it finishes</strong> (below), and/or a
+                <strong> scheduled digest</strong> of the latest batch (in “Time schedules” above). The PDF includes
+                the pass/fail result, per-tag limits &amp; in-spec %, and manual entries.
+              </small>
               <div className="form-grid">
                 <label>
                   <input type="checkbox" checked={!!editing.email_on_close}
                          onChange={(e) => setEditing({ ...editing, email_on_close: e.target.checked })} />
-                  {" "}Send PDF report when batch closes
+                  {" "}Email the report for EVERY batch when it finishes
                 </label>
                 <label style={{ gridColumn: "1 / -1" }}>
                   Recipients (comma-separated)
@@ -887,6 +1143,59 @@ export function BatchTypesPage() {
                 value={editing.report_schedule}
                 onChange={(s) => setEditing({ ...editing, report_schedule: s })}
               />
+            </div>
+
+            {/* Operator 2026-07-09: spec limits (pass/fail) + manual fields */}
+            <div className="card" style={{ marginTop: 12, padding: 12, background: "var(--surface-elev, var(--card))" }}>
+              <h4 style={{ margin: "0 0 8px 0", fontSize: 13 }}>Spec limits &amp; pass/fail</h4>
+              <label style={{ display: "block", marginBottom: 8 }}>
+                Pass/fail rule
+                <select value={editing.pass_rule || "any_out_of_spec"}
+                        onChange={(e) => setEditing({ ...editing, pass_rule: e.target.value })}>
+                  <option value="any_out_of_spec">Fail if ANY reading is out of spec</option>
+                  <option value="in_spec_pct">Fail if in-spec % is below the tag's threshold</option>
+                </select>
+              </label>
+              <small style={{ color: "var(--muted)", fontSize: 11, display: "block", marginBottom: 8 }}>
+                Per-tag limits define the pass/fail window applied to every batch of this type.
+                {editing.pass_rule === "in_spec_pct" ? " Set an In-spec% for each tag." : ""}
+              </small>
+              {(editing.spec_limits || []).map((lim, i) => (
+                <div key={i} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6, flexWrap: "wrap" }}>
+                  <input placeholder="tag_name" style={{ minWidth: 160 }} value={lim.tag_name || ""}
+                         onChange={(e) => { const a=[...editing.spec_limits]; a[i]={...a[i],tag_name:e.target.value}; setEditing({...editing,spec_limits:a}); }} />
+                  <input type="number" placeholder="lower" style={{ width: 80 }} value={lim.lower_limit ?? ""}
+                         onChange={(e) => { const a=[...editing.spec_limits]; a[i]={...a[i],lower_limit:e.target.value===""?null:Number(e.target.value)}; setEditing({...editing,spec_limits:a}); }} />
+                  <input type="number" placeholder="upper" style={{ width: 80 }} value={lim.upper_limit ?? ""}
+                         onChange={(e) => { const a=[...editing.spec_limits]; a[i]={...a[i],upper_limit:e.target.value===""?null:Number(e.target.value)}; setEditing({...editing,spec_limits:a}); }} />
+                  {editing.pass_rule === "in_spec_pct" ? (
+                    <input type="number" placeholder="in-spec%" style={{ width: 90 }} value={lim.in_spec_pct_min ?? ""}
+                           onChange={(e) => { const a=[...editing.spec_limits]; a[i]={...a[i],in_spec_pct_min:e.target.value===""?null:Number(e.target.value)}; setEditing({...editing,spec_limits:a}); }} />
+                  ) : null}
+                  <input placeholder="unit" style={{ width: 70 }} value={lim.unit || ""}
+                         onChange={(e) => { const a=[...editing.spec_limits]; a[i]={...a[i],unit:e.target.value}; setEditing({...editing,spec_limits:a}); }} />
+                  <button className="btn btn-danger btn-sm" onClick={() => { const a=editing.spec_limits.filter((_,j)=>j!==i); setEditing({...editing,spec_limits:a}); }}>×</button>
+                </div>
+              ))}
+              <button className="btn btn-secondary btn-sm" onClick={() => setEditing({ ...editing, spec_limits: [...(editing.spec_limits||[]), { tag_name: "", lower_limit: null, upper_limit: null }] })}>+ Add limit</button>
+
+              <h4 style={{ margin: "14px 0 8px 0", fontSize: 13 }}>Manual entry fields</h4>
+              <small style={{ color: "var(--muted)", fontSize: 11, display: "block", marginBottom: 8 }}>
+                Fields the operator fills in on each batch (e.g. Sample ID, Ambient temp). Shown on the batch detail page.
+              </small>
+              {(editing.manual_fields || []).map((f, i) => (
+                <div key={i} style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6, flexWrap: "wrap" }}>
+                  <input placeholder="label" style={{ minWidth: 160 }} value={f.label || ""}
+                         onChange={(e) => { const a=[...editing.manual_fields]; a[i]={...a[i],label:e.target.value,key:(a[i].key|| e.target.value.toLowerCase().replace(/[^a-z0-9]+/g,'_'))}; setEditing({...editing,manual_fields:a}); }} />
+                  <select value={f.type || "text"} onChange={(e) => { const a=[...editing.manual_fields]; a[i]={...a[i],type:e.target.value}; setEditing({...editing,manual_fields:a}); }}>
+                    <option value="text">Text</option><option value="number">Number</option>
+                  </select>
+                  <input placeholder="unit" style={{ width: 70 }} value={f.unit || ""}
+                         onChange={(e) => { const a=[...editing.manual_fields]; a[i]={...a[i],unit:e.target.value}; setEditing({...editing,manual_fields:a}); }} />
+                  <button className="btn btn-danger btn-sm" onClick={() => { const a=editing.manual_fields.filter((_,j)=>j!==i); setEditing({...editing,manual_fields:a}); }}>×</button>
+                </div>
+              ))}
+              <button className="btn btn-secondary btn-sm" onClick={() => setEditing({ ...editing, manual_fields: [...(editing.manual_fields||[]), { key: "", label: "", type: "text" }] })}>+ Add field</button>
             </div>
 
             {/* Operator 2026-06-30: PLC auto-trigger config (start + stop) */}

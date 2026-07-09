@@ -3152,6 +3152,36 @@ export async function getBatchCollectedTags(id) {
   return (await res.json()).tags || [];
 }
 
+// Operator 2026-07-09: manual operator entries + report context (limits/result).
+export async function getBatchManualEntries(id) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/manual-entries`, {}, 8000);
+  await ensureOk(res, "List manual entries failed");
+  return (await res.json()).rows || [];
+}
+
+export async function saveBatchManualEntries(id, entries) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/manual-entries`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ entries: entries || [] }),
+  });
+  await ensureOk(res, "Save manual entries failed");
+  return (await res.json()).rows || [];
+}
+
+export async function getBatchReportContext(id) {
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/report-context`, {}, 10000);
+  await ensureOk(res, "Batch report context failed");
+  return await res.json();
+}
+
+// Downsampled per-tag series within the batch window (for the in-UI charts).
+export async function getBatchChart(id, tags, maxPoints = 400) {
+  const q = encodeURIComponent((tags || []).join(","));
+  const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/chart?tags=${q}&max_points=${maxPoints}`, {}, 15000);
+  await ensureOk(res, "Batch chart failed");
+  return await res.json();
+}
+
 export async function validateBatch(id, payload) {
   const res = await fetchWithTimeout(`${_BM_BASE()}/batches/${encodeURIComponent(id)}/validate`, {
     method: "POST",

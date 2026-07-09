@@ -29,10 +29,15 @@ def _fmt(ts: Any) -> str:
 def render_single_batch_pdf(batch: dict[str, Any],
                             batch_type: dict[str, Any] | None,
                             events: list[dict[str, Any]],
-                            summaries: list[dict[str, Any]]) -> bytes:
+                            summaries: list[dict[str, Any]],
+                            manual_entries: list[dict[str, Any]] | None = None) -> bytes:
     """Build a one-page PDF for a single batch. Uses reportlab's
     PlatypusBuilder for clean tables; falls back gracefully if a row
-    is missing data."""
+    is missing data.
+
+    Operator 2026-07-09: now includes the batch PASS/FAIL result, per-tag spec
+    limits + in-spec %, and operator manual entries when present. manual_entries
+    is optional so every existing caller keeps working unchanged."""
     from reportlab.lib.pagesizes import A4  # type: ignore
     from reportlab.lib import colors  # type: ignore
     from reportlab.lib.styles import getSampleStyleSheet  # type: ignore
@@ -49,6 +54,14 @@ def render_single_batch_pdf(batch: dict[str, Any],
     story.append(Spacer(1, 6))
     story.append(Paragraph(f"<b>Identifier:</b> {batch.get('identifier') or batch.get('id')}", styles["Normal"]))
     story.append(Paragraph(f"<b>Status:</b> {batch.get('status', '')}", styles["Normal"]))
+    # Operator 2026-07-09: overall PASS/FAIL result (green/red) when limits ran.
+    _res = str(batch.get("result") or "").lower()
+    if _res in ("pass", "fail"):
+        _col = "#16a34a" if _res == "pass" else "#dc2626"
+        story.append(Paragraph(
+            f'<b>Result:</b> <font color="{_col}"><b>{_res.upper()}</b></font>'
+            f" &nbsp;({batch.get('pass_tag_count') or 0} passed · {batch.get('fail_tag_count') or 0} failed)",
+            styles["Normal"]))
     if batch_type:
         story.append(Paragraph(f"<b>Type:</b> {batch_type.get('name', '')}", styles["Normal"]))
     story.append(Paragraph(f"<b>Product:</b> {batch.get('product') or '—'}", styles["Normal"]))
@@ -61,22 +74,38 @@ def render_single_batch_pdf(batch: dict[str, Any],
         story.append(Paragraph(f"<b>Notes:</b> {batch.get('notes')}", styles["Normal"]))
     story.append(Spacer(1, 12))
 
-    # Summaries
+    # Summaries (now with limits + in-spec% + per-tag result)
     story.append(Paragraph("<b>Tag Summary</b>", styles["Heading2"]))
-    sum_data = [["Tag", "Min", "Max", "Avg", "First", "Last", "σ", "Count"]]
-    for s in summaries or []:
-        sum_data.append([
-            s.get("tag_name", ""),
-            f"{(s.get('min_value') or 0):.3f}",
-            f"{(s.get('max_value') or 0):.3f}",
-            f"{(s.get('avg_value') or 0):.3f}",
-            f"{(s.get('first_value') or 0):.3f}",
-            f"{(s.get('last_value') or 0):.3f}",
-            f"{(s.get('stdev_value') or 0):.3f}",
-            str(s.get("sample_count") or 0),
-        ])
+    _has_limits = any((s.get("lower_limit") is not None or s.get("upper_limit") is not None) for s in (summaries or []))
+    if _has_limits:
+        sum_data = [["Tag", "Min", "Max", "Avg", "σ", "Count", "Limits", "In-spec%", "Result"]]
+        for s in summaries or []:
+            lo, up = s.get("lower_limit"), s.get("upper_limit")
+            lim = f"{lo if lo is not None else '−inf'}..{up if up is not None else '+inf'}" if (lo is not None or up is not None) else "—"
+            pf = str(s.get("pass_fail") or "").upper()
+            pf = pf if pf in ("PASS", "FAIL") else "—"
+            insp = s.get("in_spec_pct")
+            sum_data.append([
+                s.get("tag_name", ""),
+                f"{(s.get('min_value') or 0):.3f}", f"{(s.get('max_value') or 0):.3f}",
+                f"{(s.get('avg_value') or 0):.3f}", f"{(s.get('stdev_value') or 0):.3f}",
+                str(s.get("sample_count") or 0), lim,
+                (f"{insp}%" if insp is not None else "—"), pf,
+            ])
+        _ncol = 9
+    else:
+        sum_data = [["Tag", "Min", "Max", "Avg", "First", "Last", "σ", "Count"]]
+        for s in summaries or []:
+            sum_data.append([
+                s.get("tag_name", ""),
+                f"{(s.get('min_value') or 0):.3f}", f"{(s.get('max_value') or 0):.3f}",
+                f"{(s.get('avg_value') or 0):.3f}", f"{(s.get('first_value') or 0):.3f}",
+                f"{(s.get('last_value') or 0):.3f}", f"{(s.get('stdev_value') or 0):.3f}",
+                str(s.get("sample_count") or 0),
+            ])
+        _ncol = 8
     if len(sum_data) == 1:
-        sum_data.append(["(no data)"] + [""] * 7)
+        sum_data.append(["(no data)"] + [""] * (_ncol - 1))
     t = Table(sum_data, repeatRows=1)
     t.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0e7a78")),
@@ -87,6 +116,25 @@ def render_single_batch_pdf(batch: dict[str, Any],
     ]))
     story.append(t)
     story.append(Spacer(1, 12))
+
+    # Operator 2026-07-09: manual operator entries (if any).
+    if manual_entries:
+        story.append(Paragraph("<b>Manual Entries</b>", styles["Heading2"]))
+        me_rows = [["Field", "Value"]]
+        for m in manual_entries:
+            val = m.get("value_text")
+            if val is None and m.get("value_num") is not None:
+                val = m.get("value_num")
+            me_rows.append([str(m.get("field_label") or m.get("field_key") or ""), str(val if val is not None else "")])
+        me_t = Table(me_rows, repeatRows=1, colWidths=[200, 260])
+        me_t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0e7a78")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#999")),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(me_t)
+        story.append(Spacer(1, 12))
 
     # Events
     story.append(Paragraph("<b>Event Log</b>", styles["Heading2"]))

@@ -46,6 +46,16 @@ class BatchTypeIn(BaseModel):
     start_schedule: Optional[dict[str, Any]] = None
     stop_schedule: Optional[dict[str, Any]] = None
     report_schedule: Optional[dict[str, Any]] = None
+    # Operator 2026-07-09: pass/fail rule + operator manual fields + default chart.
+    #   pass_rule: 'any_out_of_spec' (fail if any reading out of spec) |
+    #              'in_spec_pct' (each tag needs >= its in_spec_pct_min).
+    #   manual_fields: [{key,label,type,unit}] operator fills per batch.
+    #   spec_limits: [{tag_name,lower_limit,upper_limit,warn_lower,warn_upper,
+    #                  in_spec_pct_min,unit,enabled}] saved via set_type_limits.
+    pass_rule: Literal["any_out_of_spec", "in_spec_pct"] = "any_out_of_spec"
+    manual_fields: Optional[list[dict[str, Any]]] = None
+    chart_config: Optional[dict[str, Any]] = None
+    spec_limits: Optional[list[dict[str, Any]]] = None
 
 
 class BatchTypeOut(BatchTypeIn):

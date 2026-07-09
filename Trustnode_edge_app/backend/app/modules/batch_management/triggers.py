@@ -223,6 +223,14 @@ def _fire_start(svc: Any, bt: Dict[str, Any], source: str = "plc_trigger") -> No
     """
     try:
         kind = str(bt.get("batch_kind") or "single")
+        # Operator 2026-07-09 (CONCURRENCY GUARD): stamp the gateway of the
+        # trigger tag onto condition-started batches, so two batches on different
+        # machinery each scope the historian to THEIR gateway → separate reports.
+        gw = ""
+        try:
+            gw = svc.gateway_for_type_trigger(bt) or ""
+        except Exception:
+            gw = ""
         if kind == "multiple":
             parents = [p for p in svc.running_multiple_parents()
                        if str(p.get("batch_type_id")) == str(bt["id"])]
@@ -231,11 +239,12 @@ def _fire_start(svc: Any, bt: Dict[str, Any], source: str = "plc_trigger") -> No
                 # next start-fire (or immediately below for convenience).
                 created = svc.create_batch({
                     "batch_type_id": bt["id"], "operator": source,
-                    "source": source, "metadata": {"source": source},
+                    "source": source, "gateway_id": (gw or None),
+                    "metadata": {"source": source},
                 }, actor=f"system:{source}")
-                svc.start_batch(created["id"], actor=f"system:{source}", source=source)
+                svc.start_batch(created["id"], gateway_id=(gw or None), actor=f"system:{source}", source=source)
                 svc.spawn_child_for_parent(created["id"], actor=f"system:{source}")
-                _log.info("%s: started MULTIPLE parent %s (%s) + first child", source, created["id"], bt.get("name"))
+                _log.info("%s: started MULTIPLE parent %s (%s) gw=%s + first child", source, created["id"], bt.get("name"), gw or "-")
             else:
                 for p in parents:
                     svc.close_open_child(p["id"], actor=f"system:{source}")
@@ -248,6 +257,7 @@ def _fire_start(svc: Any, bt: Dict[str, Any], source: str = "plc_trigger") -> No
             "product": (bt.get("description") or bt.get("name") or "").split("\n")[0][:80],
             "recipe": "",
             "operator": source,
+            "gateway_id": (gw or None),
             "metadata": {"source": source, "auto_start": True},
         }
         created = svc.create_batch(payload, actor=f"system:{source}")

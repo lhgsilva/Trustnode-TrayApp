@@ -53,26 +53,49 @@ def get_status() -> dict:
 # ---- batch types -----------------------------------------------------
 @router.get("/batch-types", dependencies=[Depends(require_batch_management_license)])
 def list_batch_types() -> dict:
-    return {"rows": _service().list_batch_types()}
+    svc = _service()
+    rows = svc.list_batch_types()
+    # attach spec_limits so the Type editor can load them in one call
+    for t in rows:
+        try:
+            t["spec_limits"] = svc.list_type_limits(t["id"])
+        except Exception:
+            t["spec_limits"] = []
+    return {"rows": rows}
 
 
 @router.post("/batch-types", dependencies=[Depends(require_batch_management_license)])
 def create_batch_type(payload: BatchTypeIn, request: Request) -> dict:
-    out = _service().save_batch_type(payload.model_dump(exclude_none=True), actor=_actor(request))
+    svc = _service()
+    data = payload.model_dump(exclude_none=True)
+    out = svc.save_batch_type(data, actor=_actor(request))
+    # Operator 2026-07-09: spec_limits are stored in their own table.
+    if payload.spec_limits is not None:
+        svc.set_type_limits(out["id"], payload.spec_limits, actor=_actor(request))
+    out["spec_limits"] = svc.list_type_limits(out["id"])
     return {"ok": True, "row": out}
 
 
 @router.put("/batch-types/{batch_type_id}", dependencies=[Depends(require_batch_management_license)])
 def update_batch_type(batch_type_id: str, payload: BatchTypeIn, request: Request) -> dict:
+    svc = _service()
     try:
-        out = _service().save_batch_type(
+        out = svc.save_batch_type(
             payload.model_dump(exclude_none=True),
             actor=_actor(request),
             batch_type_id=batch_type_id,
         )
     except KeyError:
         raise HTTPException(status_code=404, detail="batch type not found")
+    if payload.spec_limits is not None:
+        svc.set_type_limits(batch_type_id, payload.spec_limits, actor=_actor(request))
+    out["spec_limits"] = svc.list_type_limits(batch_type_id)
     return {"ok": True, "row": out}
+
+
+@router.get("/batch-types/{batch_type_id}/limits", dependencies=[Depends(require_batch_management_license)])
+def get_type_limits(batch_type_id: str) -> dict:
+    return {"rows": _service().list_type_limits(batch_type_id)}
 
 
 @router.delete("/batch-types/{batch_type_id}", dependencies=[Depends(require_batch_management_license)])
@@ -208,6 +231,19 @@ def list_summaries(batch_id: str) -> dict:
     return {"rows": _service().list_summaries(batch_id)}
 
 
+# ---- manual entries (operator 2026-07-09) ----------------------------
+@router.get("/batches/{batch_id}/manual-entries", dependencies=[Depends(require_batch_management_license)])
+def list_manual_entries(batch_id: str) -> dict:
+    return {"rows": _service().list_manual_entries(batch_id)}
+
+
+@router.put("/batches/{batch_id}/manual-entries", dependencies=[Depends(require_batch_management_license)])
+def save_manual_entries(batch_id: str, payload: dict, request: Request) -> dict:
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    rows = _service().set_manual_entries(batch_id, entries or [], actor=_actor(request))
+    return {"ok": True, "rows": rows}
+
+
 @router.post("/batches/{batch_id}/recompute-summaries", dependencies=[Depends(require_batch_management_license)])
 def recompute_summaries(batch_id: str) -> dict:
     n = _service().compute_summaries(batch_id)
@@ -224,6 +260,14 @@ def collected_tags(batch_id: str) -> dict:
     """Distinct tags with data inside the batch window — the pick-list for a
     batch-sourced report."""
     return {"tags": _service().collected_tags_in_window(batch_id)}
+
+
+@router.get("/batches/{batch_id}/chart", dependencies=[Depends(require_batch_management_license)])
+def batch_chart(batch_id: str, tags: str = "", max_points: int = 400) -> dict:
+    """Downsampled per-tag series WITHIN the batch window, for the in-UI trend
+    charts. `tags` is a comma-separated list. Read-only over the historian."""
+    tag_list = [t.strip() for t in str(tags or "").split(",") if t.strip()]
+    return _service().chart_series_for_batch(batch_id, tag_list, max_points=max_points)
 
 
 @router.get("/batches/{batch_id}/report-context", dependencies=[Depends(require_batch_management_license)])
@@ -288,7 +332,8 @@ def batch_report_pdf(batch_id: str) -> Response:
     batch_type = svc.get_batch_type(batch["batch_type_id"]) if batch.get("batch_type_id") else None
     events = svc.list_events(batch_id, limit=200)
     summaries = svc.list_summaries(batch_id)
-    pdf = render_single_batch_pdf(batch, batch_type, events, summaries)
+    manual = svc.list_manual_entries(batch_id)
+    pdf = render_single_batch_pdf(batch, batch_type, events, summaries, manual)
     filename = f"batch-{batch.get('identifier') or batch_id}.pdf".replace("/", "-")
     return Response(
         content=pdf,

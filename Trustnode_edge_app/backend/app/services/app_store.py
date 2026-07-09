@@ -4551,6 +4551,78 @@ class AppStore:
                 b_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(batches)").fetchall()}
                 if "open_child_batch_id" not in b_cols:
                     conn.execute("ALTER TABLE batches ADD COLUMN open_child_batch_id TEXT NULL")
+                # Operator 2026-07-09 (LIMITS / PASS-FAIL / KPIs / MANUAL / CHARTS).
+                # All additive — never touches historian_readings or the collection
+                # path; the batch module reads the historian by time-window only.
+                #   batch_types.pass_rule: 'any_out_of_spec' | 'in_spec_pct'
+                #     (how a batch's overall PASS/FAIL is decided from its tags).
+                #   manual_fields_json: [{key,label,type,unit}] operator fields to
+                #     fill per batch of this type.
+                #   chart_config_json: default trend-chart layout for the detail page.
+                if "pass_rule" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN pass_rule TEXT NOT NULL DEFAULT 'any_out_of_spec'")
+                if "manual_fields_json" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN manual_fields_json TEXT NULL")
+                if "chart_config_json" not in bt_cols:
+                    conn.execute("ALTER TABLE batch_types ADD COLUMN chart_config_json TEXT NULL")
+                # batches: rolled-up result so lists/KPIs read one row, no re-scan.
+                if "result" not in b_cols:
+                    conn.execute("ALTER TABLE batches ADD COLUMN result TEXT NULL")  # pass|fail|na
+                if "pass_tag_count" not in b_cols:
+                    conn.execute("ALTER TABLE batches ADD COLUMN pass_tag_count INTEGER NOT NULL DEFAULT 0")
+                if "fail_tag_count" not in b_cols:
+                    conn.execute("ALTER TABLE batches ADD COLUMN fail_tag_count INTEGER NOT NULL DEFAULT 0")
+                # batch_summaries: per-tag limit results (computed in the SAME scan
+                # compute_summaries already does over the batch window).
+                bs_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(batch_summaries)").fetchall()}
+                for _col, _ddl in (
+                    ("lower_limit", "REAL NULL"), ("upper_limit", "REAL NULL"),
+                    ("in_spec_count", "INTEGER NOT NULL DEFAULT 0"),
+                    ("out_of_spec_count", "INTEGER NOT NULL DEFAULT 0"),
+                    ("in_spec_pct", "REAL NULL"), ("pass_fail", "TEXT NULL"),  # pass|fail|na
+                    ("p95_value", "REAL NULL"), ("duration_s", "REAL NULL"),
+                ):
+                    if _col not in bs_cols:
+                        conn.execute(f"ALTER TABLE batch_summaries ADD COLUMN {_col} {_ddl}")
+                # Per-type spec limits: one row per (type, tag). Defines the pass/fail
+                # window applied to every batch of that type.
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS batch_type_limits (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      batch_type_id TEXT NOT NULL,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      tag_name TEXT NOT NULL,
+                      lower_limit REAL NULL,
+                      upper_limit REAL NULL,
+                      warn_lower REAL NULL,
+                      warn_upper REAL NULL,
+                      in_spec_pct_min REAL NULL,   -- for pass_rule='in_spec_pct' (per-tag threshold)
+                      unit TEXT NULL,
+                      enabled INTEGER NOT NULL DEFAULT 1,
+                      created_utc TEXT NOT NULL,
+                      updated_utc TEXT NOT NULL
+                    );
+                    """
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_batch_type_limits_type ON batch_type_limits(batch_type_id)")
+                # Operator-entered summary fields per batch (manual entry).
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS batch_manual_entries (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      batch_id TEXT NOT NULL,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      field_key TEXT NOT NULL,
+                      field_label TEXT NULL,
+                      value_text TEXT NULL,
+                      value_num REAL NULL,
+                      entered_by TEXT NULL,
+                      entered_utc TEXT NOT NULL
+                    );
+                    """
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_batch_manual_batch ON batch_manual_entries(batch_id)")
                 hist_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(historian_readings)").fetchall()}
                 if "tenant_id" not in hist_cols:
                     conn.execute('ALTER TABLE historian_readings ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "default"')
