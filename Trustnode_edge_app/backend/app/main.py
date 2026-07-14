@@ -472,6 +472,22 @@ app.include_router(workspace_router)
 # app/modules/batch_management/* so it is easy to find and to detach.
 from app.modules.batch_management import batch_router  # noqa: E402
 app.include_router(batch_router)
+# 2026-07-14 CLEAN REBUILD: mount the v2 router (spec-named endpoints) alongside
+# the legacy one. Both share the license gate; the new UI targets v2. Seeding the
+# 4 batch report templates is idempotent + best-effort (reuses the Report module).
+try:
+    from app.modules.batch_management import batch_router_v2  # noqa: E402
+    if batch_router_v2 is not None:
+        app.include_router(batch_router_v2)
+    from app.modules.batch_management.reports_v2 import seed_report_templates as _seed_batch_tpls
+    try:
+        _n = _seed_batch_tpls()
+        if _n:
+            print(f"[trustnode][boot] batch v2: seeded {_n} report template(s)", flush=True)
+    except Exception:
+        pass
+except Exception as _e:  # pragma: no cover - keep boot resilient
+    print(f"[trustnode][boot] batch v2 router mount skipped: {_e}", flush=True)
 
 # The cloud-live SSE endpoint lives in a SEPARATE FastAPI app so it does
 # NOT inherit the main app's BaseHTTPMiddleware (which buffers responses

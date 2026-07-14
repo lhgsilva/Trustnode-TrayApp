@@ -12,13 +12,20 @@ License-gated feature. Files:
 """
 
 from .router import router as batch_router  # noqa: F401
-
-# Operator 2026-06-30: kick the PLC-driven auto-trigger watcher on
-# import. Idempotent + daemon thread, so safe to call multiple times.
-# Wrapped in try/except so a watcher failure never blocks the rest of
-# the module from loading.
+# v2 clean-rebuild router (spec-named endpoints). Mounted alongside the legacy
+# router; the legacy endpoints remain but are no longer used by the new UI.
 try:
-    from .triggers import start_trigger_watcher as _start_trigger_watcher
-    _start_trigger_watcher()
+    from .router_v2 import router as batch_router_v2  # noqa: F401
+except Exception:  # pragma: no cover - keep module importable if v2 router absent
+    batch_router_v2 = None  # type: ignore
+
+# 2026-07-14 CLEAN REBUILD: the batch module now runs a SINGLE trigger daemon —
+# the v2 watcher (triggers_v2). The LEGACY triggers.py daemon is deliberately NOT
+# started so two loops never both create batches. The legacy daemon's evaluation
+# helpers are still imported/reused by triggers_v2; only its auto-start is retired.
+# Guide: docs/BATCH_MANAGEMENT_REDESIGN_2026-07-14.md
+try:
+    from .triggers_v2 import start_trigger_watcher_v2 as _start_v2
+    _start_v2()
 except Exception:
     pass

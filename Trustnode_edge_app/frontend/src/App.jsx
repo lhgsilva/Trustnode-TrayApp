@@ -7,6 +7,9 @@ import { ScheduledReportsManager } from "./components/Reports/ScheduledReportsMa
 // Batch Management module pages. Self-contained file; license gating in
 // canOpenPage hides the menu when batch_management is not licensed.
 import { BatchesPage, BatchTypesPage, BatchAuditPage } from "./components/BatchManagement/BatchManagementPages";
+// Batch Management v2 (clean rebuild) — spec-named pages. These replace the
+// three legacy menu items. Guide: docs/BATCH_MANAGEMENT_REDESIGN_2026-07-14.md
+import { BatchOverviewV2Page, BatchDefinitionsV2Page, BatchAnalysisV2Page } from "./components/BatchManagement/BatchManagementV2";
 import {
   getHealth,
   getBootProbe,
@@ -257,7 +260,7 @@ const NAV_SECTIONS = [
   // item is license-gated through canOpenPage(); when the license
   // module is absent the items are filtered out and the whole group
   // collapses to zero items and renders nothing.
-  { id: "batch_management", title: "Batch Management", items: ["Batches", "Batch Types", "Batch Audit"] },
+  { id: "batch_management", title: "Batch Management", items: ["Batch Overview", "Batch Definitions", "Batch Analysis"] },
   {
     id: "settings",
     title: "Database and Backup",
@@ -291,10 +294,10 @@ function pageId(label) {
   if (label.toLowerCase() === "historian") return "historian";
   if (label.toLowerCase() === "logs") return "logs";
   if (label.toLowerCase() === "reports") return "reporting";
-  // Batch Management module pages
-  if (label.toLowerCase() === "batches") return "batches";
-  if (label.toLowerCase() === "batch types") return "batch_types";
-  if (label.toLowerCase() === "batch audit") return "batch_audit";
+  // Batch Management module pages (v2 clean rebuild)
+  if (label.toLowerCase() === "batch overview") return "batch_overview";
+  if (label.toLowerCase() === "batch definitions") return "batch_definitions";
+  if (label.toLowerCase() === "batch analysis") return "batch_analysis";
   return label.toLowerCase().replace(/\s+/g, "_");
 }
 
@@ -321,9 +324,9 @@ function pageTitle(page) {
   if (page === "website_and_env") return "Website and Environment";
   if (page === "email_and_notifications") return "Email and Notifications";
   // Batch Management module pages
-  if (page === "batches") return "Batches";
-  if (page === "batch_types") return "Batch Types";
-  if (page === "batch_audit") return "Batch Audit";
+  if (page === "batch_overview") return "Batch Overview";
+  if (page === "batch_definitions") return "Batch Definitions";
+  if (page === "batch_analysis") return "Batch Analysis";
   if (page === "scheduled_reports") return "Scheduled Reports";
   if (page === "reports") return "Reports";
   if (page === "power_overview") return "Power Overview";
@@ -1560,12 +1563,12 @@ function MenuIcon({ page }) {
       return <svg {...common}><rect x="3" y="11" width="18" height="10" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /><circle cx="12" cy="16" r="1.5" /></svg>;
     case "portal_interface":
       return <svg {...common}><rect x="3" y="4" width="18" height="14" rx="2" /><path d="M3 9h18" /><path d="M8 21h8" /><path d="M12 18v3" /></svg>;
-    // Batch Management module icons (2026-06-23)
-    case "batches":
+    // Batch Management module icons (v2 clean rebuild 2026-07-14)
+    case "batch_overview":
       return <svg {...common}><rect x="3" y="6" width="18" height="14" rx="2" /><path d="M8 6V4h8v2" /><path d="M8 10h8M8 14h6" /></svg>;
-    case "batch_types":
+    case "batch_definitions":
       return <svg {...common}><path d="M4 6h16M4 12h16M4 18h10" /><circle cx="20" cy="18" r="2" /></svg>;
-    case "batch_audit":
+    case "batch_analysis":
       return <svg {...common}><path d="M4 4h12l4 4v12H4z" /><path d="M16 4v4h4" /><path d="M8 14l2 2 4-4" /></svg>;
     default:
       return <svg {...common}><circle cx="12" cy="12" r="8" /></svg>;
@@ -10491,6 +10494,12 @@ function AppShell() {
                 ? "users_and_access_control"
               : page === "email_and_notifications" || page === "scheduled_reports"
                 ? "users_and_access_control"
+          // Batch Management v2: operational pages (overview/analysis) follow the
+          // operational "batches" permission. The definition builder
+          // (batch_definitions) is configuration -> falls through so only admins
+          // get edit rights (canOpenPage already gates who can see it).
+          : page === "batch_overview" || page === "batch_analysis"
+                ? "batches"
           : page;
     if (mapped === "historian") {
       return Boolean(currentUser.permissions?.historian ?? currentUser.permissions?.data_log);
@@ -10568,12 +10577,12 @@ function AppShell() {
     // Operator 2026-06-23: Batch Management module pages — license-gated
     // AND role-gated. Hide entirely when the license module isn't
     // active so the menu stays clean (we don't want an empty group).
-    if (["batches", "batch_types", "batch_audit"].includes(page)) {
+    if (["batch_overview", "batch_definitions", "batch_analysis"].includes(page)) {
       if (!hasLicenseModule("batch_management")) return false;
-      // batch_types is configuration: admins only. The other two are
-      // operational and follow the normal per-user permission check.
-      if (page === "batch_types") return isAdmin;
-      return isAdmin || canEditPage(page) || canEditPage("batches");
+      // batch_definitions is configuration (Process Engineer / admin). The other
+      // two are operational and follow the normal per-user permission check.
+      if (page === "batch_definitions") return isAdmin || canEditPage("batch_definitions");
+      return isAdmin || canEditPage("batch_overview") || canEditPage("batches");
     }
     // Operator 2026-06-23: studio.* license-module gating.
     // Fail-OPEN by design — only enforced when at least one studio.*
@@ -23307,14 +23316,14 @@ const getGatewayHealth = (gateway) => {
               gating is handled in canOpenPage; if we got here the user
               has access. Pages live in their own component file under
               components/BatchManagement/ to keep this file manageable. */}
-          {activePage === "batches" ? (
-            <BatchesPage currentUser={currentUser} allGatewayOptions={allGatewayOptions} />
+          {activePage === "batch_overview" ? (
+            <BatchOverviewV2Page canEdit={canEditPage("batch_overview") || canEditPage("batches") || currentUser?.role === "admin"} />
           ) : null}
-          {activePage === "batch_types" ? (
-            <BatchTypesPage />
+          {activePage === "batch_definitions" ? (
+            <BatchDefinitionsV2Page canEdit={canEditPage("batch_definitions") || currentUser?.role === "admin"} gatewayConfigs={gatewayConfigs} />
           ) : null}
-          {activePage === "batch_audit" ? (
-            <BatchAuditPage />
+          {activePage === "batch_analysis" ? (
+            <BatchAnalysisV2Page canEdit={canEditPage("batch_overview") || canEditPage("batches") || currentUser?.role === "admin"} />
           ) : null}
 
           {activePage === "interface" ? (

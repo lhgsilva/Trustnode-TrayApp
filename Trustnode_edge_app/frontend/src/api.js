@@ -3244,3 +3244,130 @@ export async function listBatchAudit(limit = 200, batchId = null) {
   await ensureOk(res, "List batch audit failed");
   return (await res.json()).rows || [];
 }
+
+/* ======================================================================
+ *  Batch Management v2 (clean rebuild) — spec-named API.
+ *  Base: /api/batch-management/v2. The legacy fns above remain for the
+ *  old (now-inert) pages; the redesigned UI uses these.
+ *  Guide: docs/BATCH_MANAGEMENT_REDESIGN_2026-07-14.md
+ * ==================================================================== */
+const _BMV2 = () => `${getControlApiBase()}/api/batch-management/v2`;
+
+function _qs(params = {}) {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v === undefined || v === null || v === "") continue;
+    q.set(k, String(v));
+  }
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+async function _bmGet(path) {
+  const res = await fetchWithTimeout(`${_BMV2()}${path}`);
+  await ensureOk(res, `GET ${path} failed`);
+  return res.json();
+}
+
+async function _bmSend(path, method, body) {
+  const res = await fetchWithTimeout(`${_BMV2()}${path}`, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  await ensureOk(res, `${method} ${path} failed`);
+  return res.json();
+}
+
+export function bmv2FileUrl(generatedId, inline = true) {
+  // reuse the EXISTING Report module's file endpoint for preview/download
+  return `${getControlApiBase()}/api/reports/generated/${encodeURIComponent(generatedId)}/file${inline ? "?inline=true" : ""}`;
+}
+export function bmv2PreviewDataUrl(templateId) {
+  return `${getControlApiBase()}/api/reports/templates/${encodeURIComponent(templateId)}/preview-data`;
+}
+
+export async function bmv2Status() {
+  try { return await _bmGet("/status"); }
+  catch { return { module: "batch_management", enabled: false, api: "v2" }; }
+}
+export async function bmv2SeedReportTemplates() { return _bmSend("/seed-report-templates", "POST", {}); }
+
+// ---- Definitions ----
+export async function bmv2ListDefinitions() { return (await _bmGet("/definitions")).rows || []; }
+export async function bmv2GetDefinition(id, versionId = null) {
+  return (await _bmGet(`/definitions/${encodeURIComponent(id)}${_qs({ version_id: versionId })}`)).row;
+}
+export async function bmv2SaveDefinition(payload, id = null) {
+  const r = id
+    ? await _bmSend(`/definitions/${encodeURIComponent(id)}`, "PUT", payload)
+    : await _bmSend(`/definitions`, "POST", payload);
+  return r.row;
+}
+export async function bmv2DeleteDefinition(id) { return (await _bmSend(`/definitions/${encodeURIComponent(id)}`, "DELETE", {})).ok; }
+export async function bmv2ValidateDefinition(id) { return _bmSend(`/definitions/${encodeURIComponent(id)}/validate`, "POST", {}); }
+export async function bmv2PublishDefinition(id) { return (await _bmSend(`/definitions/${encodeURIComponent(id)}/publish`, "POST", {})).row; }
+export async function bmv2ListVersions(id) { return (await _bmGet(`/definitions/${encodeURIComponent(id)}/versions`)).rows || []; }
+export async function bmv2NewVersion(id) { return (await _bmSend(`/definitions/${encodeURIComponent(id)}/versions`, "POST", {})).row; }
+
+// ---- Batches ----
+export async function bmv2ListBatches(params = {}) { return _bmGet(`/batches${_qs(params)}`); }
+export async function bmv2GetBatch(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}`)).row; }
+export async function bmv2CreateBatch(payload) { return (await _bmSend(`/batches`, "POST", payload)).row; }
+export async function bmv2BatchAction(id, action, payload = {}) {
+  return (await _bmSend(`/batches/${encodeURIComponent(id)}/${action}`, "POST", payload)).row;
+}
+export async function bmv2AddComment(id, message, actor = null) {
+  return _bmSend(`/batches/${encodeURIComponent(id)}/comments`, "POST", { message, actor });
+}
+export async function bmv2BatchEvents(id, limit = 200) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/events${_qs({ limit })}`)).rows || []; }
+export async function bmv2BatchTrends(id, tags = "", maxPoints = 400) {
+  return (await _bmGet(`/batches/${encodeURIComponent(id)}/trends${_qs({ tags, max_points: maxPoints })}`)).series || [];
+}
+export async function bmv2BatchKpis(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/kpis`)).rows || []; }
+export async function bmv2RecomputeBatch(id) { return _bmSend(`/batches/${encodeURIComponent(id)}/recompute`, "POST", {}); }
+export async function bmv2BatchExcursions(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/excursions`)).rows || []; }
+export async function bmv2BatchCollectedTags(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/collected-tags`)).tags || []; }
+export async function bmv2ListBatchReports(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/reports`)).rows || []; }
+export async function bmv2GenerateBatchReport(id, templateId = null) {
+  return _bmSend(`/batches/${encodeURIComponent(id)}/reports`, "POST", { template_id: templateId });
+}
+export async function bmv2EmailBatchReport(id, referenceId, payload) {
+  return _bmSend(`/batches/${encodeURIComponent(id)}/reports/${encodeURIComponent(referenceId)}/email`, "POST", payload || {});
+}
+
+// ---- Groups ----
+export async function bmv2ListGroups(params = {}) { return _bmGet(`/groups${_qs(params)}`); }
+export async function bmv2GetGroup(id) { return (await _bmGet(`/groups/${encodeURIComponent(id)}`)).row; }
+export async function bmv2CreateGroup(payload) { return (await _bmSend(`/groups`, "POST", payload)).row; }
+export async function bmv2CompleteGroup(id) { return (await _bmSend(`/groups/${encodeURIComponent(id)}/complete`, "POST", {})).row; }
+export async function bmv2AbortGroup(id) { return (await _bmSend(`/groups/${encodeURIComponent(id)}/abort`, "POST", {})).row; }
+export async function bmv2GroupBatches(id) { return (await _bmGet(`/groups/${encodeURIComponent(id)}/batches`)).rows || []; }
+export async function bmv2GroupKpis(id) { return (await _bmGet(`/groups/${encodeURIComponent(id)}/kpis`)).rows || []; }
+export async function bmv2ListGroupReports(id) { return (await _bmGet(`/groups/${encodeURIComponent(id)}/reports`)).rows || []; }
+export async function bmv2GenerateGroupReport(id, templateId = null) {
+  return _bmSend(`/groups/${encodeURIComponent(id)}/reports`, "POST", { template_id: templateId });
+}
+export async function bmv2EmailGroupReport(id, referenceId, payload) {
+  return _bmSend(`/groups/${encodeURIComponent(id)}/reports/${encodeURIComponent(referenceId)}/email`, "POST", payload || {});
+}
+
+// ---- Analysis ----
+export async function bmv2AnalysisExcursions(limit = 500) { return (await _bmGet(`/analysis/excursions${_qs({ limit })}`)).rows || []; }
+export async function bmv2AckExcursion(id, payload) { return (await _bmSend(`/analysis/excursions/${encodeURIComponent(id)}/ack`, "POST", payload || {})).row; }
+export async function bmv2AnalysisComparison(batchIds = [], tags = [], maxPoints = 400) {
+  return (await _bmGet(`/analysis/comparison${_qs({ batch_ids: batchIds.join(","), tags: tags.join(","), max_points: maxPoints })}`)).batches || [];
+}
+
+// Normalize already-loaded gatewayConfigs (passed from App.jsx) into
+// {id,name,tags:[{name,unit,data_type}]} for the definition builder's tag picker.
+// No network — reuses the config the app already holds.
+export function bmv2NormalizeGatewayTags(gatewayConfigs = []) {
+  return (gatewayConfigs || []).map((g) => ({
+    id: String(g.id || ""),
+    name: String(g.name || g.id || ""),
+    tags: (g.tags || []).map((t) => ({
+      name: String(t.name || ""), unit: t.unit || "", data_type: t.data_type || "",
+    })).filter((t) => t.name),
+  }));
+}

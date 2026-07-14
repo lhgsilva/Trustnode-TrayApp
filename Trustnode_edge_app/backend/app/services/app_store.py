@@ -4623,6 +4623,291 @@ class AppStore:
                     """
                 )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_batch_manual_batch ON batch_manual_entries(batch_id)")
+                # ============================================================
+                #  Batch Management v2 — CLEAN REBUILD (2026-07-14)
+                #  Spec-named tables for the redesigned module. ADDITIVE and
+                #  idempotent (CREATE IF NOT EXISTS) — the legacy batch_* tables
+                #  above are left UNTOUCHED as a data backup. The new module reads
+                #  the historian by time-window only (batch_data_window), and never
+                #  writes to or alters historian_readings / the collection path.
+                #  Every table is tenant-scoped. IDs are '{prefix}-{12hex}'.
+                #  Guide: docs/BATCH_MANAGEMENT_REDESIGN_2026-07-14.md
+                # ============================================================
+                conn.executescript(
+                    """
+                    /* -- Batch Definition (spec 'Batch Definition') ---------- */
+                    CREATE TABLE IF NOT EXISTS batch_definition (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      code TEXT NULL,
+                      name TEXT NOT NULL,
+                      description TEXT NULL,
+                      plant TEXT NULL,
+                      area TEXT NULL,
+                      equipment_id TEXT NULL,           -- gateway id (equipment ~= gateway in v1)
+                      product TEXT NULL,
+                      owner TEXT NULL,
+                      status TEXT NOT NULL DEFAULT 'draft',   -- draft|published|retired
+                      current_version_id TEXT NULL,     -- FK -> batch_definition_version.id (published)
+                      created_utc TEXT NOT NULL,
+                      created_by TEXT NULL,
+                      updated_utc TEXT NOT NULL,
+                      updated_by TEXT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bdef_tenant ON batch_definition(tenant_id, status);
+                    CREATE INDEX IF NOT EXISTS idx_bdef_equip ON batch_definition(equipment_id);
+
+                    /* -- Batch Definition Version (immutable when published) -- */
+                    CREATE TABLE IF NOT EXISTS batch_definition_version (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      batch_definition_id TEXT NOT NULL,
+                      version_number INTEGER NOT NULL DEFAULT 1,
+                      status TEXT NOT NULL DEFAULT 'draft',   -- draft|published|retired
+                      effective_from TEXT NULL,
+                      configuration_json TEXT NULL,     -- full frozen snapshot of the definition config
+                      batch_mode TEXT NOT NULL DEFAULT 'individual',  -- individual|group|both
+                      group_config_json TEXT NULL,      -- expected child count, naming, completion rule
+                      identification_json TEXT NULL,    -- reference rules (batch + group)
+                      start_config_json TEXT NULL,      -- start condition (manual|trigger ref|edge/threshold...)
+                      stop_config_json TEXT NULL,       -- stop condition
+                      report_config_json TEXT NULL,     -- included tags/trends/kpis/events/excursions/pdf/csv
+                      batch_report_template_id TEXT NULL,
+                      batch_group_report_template_id TEXT NULL,
+                      auto_generate_batch_report INTEGER NOT NULL DEFAULT 0,
+                      auto_generate_batch_group_report INTEGER NOT NULL DEFAULT 0,
+                      auto_email_batch_report INTEGER NOT NULL DEFAULT 0,
+                      auto_email_batch_group_report INTEGER NOT NULL DEFAULT 0,
+                      email_config_json TEXT NULL,      -- recipients/cc/subject/body/attach flags
+                      created_utc TEXT NOT NULL,
+                      created_by TEXT NULL,
+                      published_utc TEXT NULL,
+                      published_by TEXT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bdefver_def ON batch_definition_version(batch_definition_id, version_number DESC);
+                    CREATE INDEX IF NOT EXISTS idx_bdefver_tenant ON batch_definition_version(tenant_id, status);
+
+                    /* -- Batch Definition Tag (selected historian tags) ------- */
+                    CREATE TABLE IF NOT EXISTS batch_definition_tag (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      definition_version_id TEXT NOT NULL,
+                      gateway_id TEXT NULL,
+                      historian_tag_id TEXT NULL,       -- registry tag id if known
+                      tag_name TEXT NOT NULL,           -- historian tag name (the join key)
+                      display_name TEXT NULL,
+                      engineering_unit TEXT NULL,
+                      data_type TEXT NULL,
+                      tag_category TEXT NULL,           -- process_value|setpoint|count|energy|flow|pressure|temperature|electrical|machine_state|alarm|status|test_result
+                      required INTEGER NOT NULL DEFAULT 0,
+                      report_enabled INTEGER NOT NULL DEFAULT 1,
+                      trend_enabled INTEGER NOT NULL DEFAULT 1,
+                      chart_group TEXT NULL,
+                      expected_sample_rate_s REAL NULL,
+                      sort_order INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bdeftag_ver ON batch_definition_tag(definition_version_id, sort_order);
+
+                    /* -- Batch Trigger Reference (references existing triggers) */
+                    CREATE TABLE IF NOT EXISTS batch_trigger_reference (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      definition_version_id TEXT NOT NULL,
+                      trigger_scope TEXT NOT NULL,      -- BATCH_START|BATCH_STOP|BATCH_GROUP_START|BATCH_GROUP_STOP|HOLD|RESUME|ABORT
+                      gateway_id TEXT NULL,
+                      existing_trigger_id TEXT NULL,    -- reference to an existing trigger config, if any
+                      condition_json TEXT NULL,         -- {operator: AND|OR, rules:[{tag,kind,value,op,hysteresis}]} (reused evaluator shape)
+                      enabled INTEGER NOT NULL DEFAULT 1
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_btrig_ver ON batch_trigger_reference(definition_version_id, trigger_scope);
+
+                    /* -- Batch Limit Definition (per definition-tag limits) --- */
+                    CREATE TABLE IF NOT EXISTS batch_limit_definition (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      definition_tag_id TEXT NOT NULL,
+                      limit_type TEXT NOT NULL,         -- operating_lower|operating_upper|warning_lower|warning_upper|spec_lower|spec_upper
+                      limit_value REAL NULL,
+                      severity TEXT NOT NULL DEFAULT 'warning',   -- info|warning|error|critical
+                      persistence_seconds REAL NOT NULL DEFAULT 0,
+                      enabled INTEGER NOT NULL DEFAULT 1
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_blimit_tag ON batch_limit_definition(definition_tag_id);
+
+                    /* -- KPI Definition (per definition version) -------------- */
+                    CREATE TABLE IF NOT EXISTS kpi_definition (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      definition_version_id TEXT NOT NULL,
+                      code TEXT NOT NULL,               -- cycle_time|running_time|hold_time|min|max|avg|first|last|total|count|time_above|time_below|time_within|time_outside|excursion_count|total_energy|total_flow|production_qty
+                      name TEXT NOT NULL,
+                      scope TEXT NOT NULL DEFAULT 'batch',   -- batch|group
+                      calculation_type TEXT NULL,
+                      configuration_json TEXT NULL,     -- {tag_name, gateway_id, limit refs, ...}
+                      engineering_unit TEXT NULL,
+                      enabled INTEGER NOT NULL DEFAULT 1,
+                      sort_order INTEGER NOT NULL DEFAULT 0
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_kpidef_ver ON kpi_definition(definition_version_id, sort_order);
+
+                    /* -- Batch Group (spec 'Batch Group') --------------------- */
+                    CREATE TABLE IF NOT EXISTS batch_group (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      reference TEXT NULL,
+                      external_reference TEXT NULL,
+                      definition_id TEXT NULL,
+                      definition_version_id TEXT NULL,
+                      equipment_id TEXT NULL,
+                      status TEXT NOT NULL DEFAULT 'planned',   -- planned|active|completed|aborted
+                      expected_child_count INTEGER NULL,
+                      actual_child_count INTEGER NOT NULL DEFAULT 0,
+                      started_utc TEXT NULL,
+                      completed_utc TEXT NULL,
+                      created_utc TEXT NOT NULL,
+                      created_by TEXT NULL,
+                      updated_utc TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bgroup_tenant ON batch_group(tenant_id, status);
+                    CREATE INDEX IF NOT EXISTS idx_bgroup_ref ON batch_group(reference);
+
+                    /* -- Batch (spec 'Batch') -------------------------------- */
+                    CREATE TABLE IF NOT EXISTS batch (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      reference TEXT NULL,
+                      batch_group_id TEXT NULL,
+                      definition_id TEXT NULL,
+                      definition_version_id TEXT NULL,
+                      equipment_id TEXT NULL,           -- gateway id scoping historian reads
+                      status TEXT NOT NULL DEFAULT 'planned',   -- planned|ready|running|held|completed|aborted|invalid
+                      quality_status TEXT NOT NULL DEFAULT 'not_evaluated',   -- not_evaluated|within_specification|with_warnings|out_of_specification|data_incomplete
+                      data_quality_status TEXT NOT NULL DEFAULT 'not_evaluated', -- good|good_with_warnings|incomplete|invalid|not_evaluated
+                      sequence_number INTEGER NULL,
+                      trigger_mode TEXT NULL,           -- manual|gateway_trigger|scheduled|barcode|api
+                      started_utc TEXT NULL,
+                      ended_utc TEXT NULL,
+                      start_reason TEXT NULL,
+                      stop_reason TEXT NULL,
+                      idempotency_key TEXT NULL,        -- dup-trigger guard
+                      product TEXT NULL,
+                      notes TEXT NULL,
+                      metadata_json TEXT NULL,
+                      created_utc TEXT NOT NULL,
+                      created_by TEXT NULL,
+                      updated_utc TEXT NOT NULL,
+                      updated_by TEXT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_batch_tenant_status ON batch(tenant_id, status);
+                    CREATE INDEX IF NOT EXISTS idx_batch_group ON batch(batch_group_id);
+                    CREATE INDEX IF NOT EXISTS idx_batch_defver ON batch(definition_version_id);
+                    CREATE INDEX IF NOT EXISTS idx_batch_equip ON batch(equipment_id);
+                    CREATE INDEX IF NOT EXISTS idx_batch_started ON batch(tenant_id, started_utc DESC);
+                    CREATE INDEX IF NOT EXISTS idx_batch_ref ON batch(reference);
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_batch_idem ON batch(tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+                    /* -- Batch Data Window (historian join window) ----------- */
+                    CREATE TABLE IF NOT EXISTS batch_data_window (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      batch_id TEXT NOT NULL,
+                      historian_source_id TEXT NULL,
+                      gateway_id TEXT NULL,
+                      window_start TEXT NOT NULL,
+                      window_end TEXT NULL,             -- NULL while running
+                      pre_buffer_seconds REAL NOT NULL DEFAULT 0,
+                      post_buffer_seconds REAL NOT NULL DEFAULT 0,
+                      query_metadata_json TEXT NULL,
+                      created_utc TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bwindow_batch ON batch_data_window(batch_id);
+                    CREATE INDEX IF NOT EXISTS idx_bwindow_scope ON batch_data_window(tenant_id, gateway_id, window_start, window_end);
+
+                    /* -- Batch Event (lifecycle + timeline) ------------------ */
+                    CREATE TABLE IF NOT EXISTS batch_event (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      batch_id TEXT NULL,
+                      batch_group_id TEXT NULL,
+                      event_type TEXT NOT NULL,
+                      event_utc TEXT NOT NULL,
+                      severity TEXT NOT NULL DEFAULT 'info',   -- info|warning|error
+                      source TEXT NULL,                 -- manual|gateway|scheduler|system|api
+                      source_reference TEXT NULL,
+                      message TEXT NULL,
+                      metadata_json TEXT NULL,
+                      created_by TEXT NULL,
+                      created_utc TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bevent_batch ON batch_event(batch_id, event_utc DESC);
+                    CREATE INDEX IF NOT EXISTS idx_bevent_group ON batch_event(batch_group_id, event_utc DESC);
+
+                    /* -- Batch KPI Result ------------------------------------ */
+                    CREATE TABLE IF NOT EXISTS batch_kpi_result (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      batch_id TEXT NULL,
+                      batch_group_id TEXT NULL,
+                      kpi_definition_id TEXT NULL,
+                      kpi_code TEXT NOT NULL,
+                      label TEXT NULL,
+                      numeric_value REAL NULL,
+                      text_value TEXT NULL,
+                      unit TEXT NULL,
+                      quality_status TEXT NOT NULL DEFAULT 'valid',   -- valid|incomplete|invalid|not_applicable
+                      calculated_utc TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bkpi_batch ON batch_kpi_result(batch_id);
+                    CREATE INDEX IF NOT EXISTS idx_bkpi_group ON batch_kpi_result(batch_group_id);
+
+                    /* -- Batch Excursion ------------------------------------- */
+                    CREATE TABLE IF NOT EXISTS batch_excursion (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      batch_id TEXT NOT NULL,
+                      batch_group_id TEXT NULL,
+                      definition_tag_id TEXT NULL,
+                      tag_name TEXT NOT NULL,
+                      gateway_id TEXT NULL,
+                      limit_type TEXT NOT NULL,         -- spec_lower|spec_upper|operating_lower|... (matches batch_limit_definition)
+                      limit_value REAL NULL,
+                      actual_minimum REAL NULL,
+                      actual_maximum REAL NULL,
+                      started_utc TEXT NULL,
+                      ended_utc TEXT NULL,
+                      duration_seconds REAL NULL,
+                      severity TEXT NOT NULL DEFAULT 'warning',
+                      acknowledged INTEGER NOT NULL DEFAULT 0,
+                      acknowledged_by TEXT NULL,
+                      acknowledged_utc TEXT NULL,
+                      comment TEXT NULL,
+                      created_utc TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_bexc_batch ON batch_excursion(batch_id);
+                    CREATE INDEX IF NOT EXISTS idx_bexc_group ON batch_excursion(batch_group_id);
+
+                    /* -- Batch Report Reference (links to generated_reports) - */
+                    CREATE TABLE IF NOT EXISTS batch_report_reference (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      batch_id TEXT NULL,
+                      batch_group_id TEXT NULL,
+                      generated_report_id TEXT NULL,    -- FK -> generated_reports.id (existing Report module)
+                      report_template_id TEXT NULL,
+                      report_kind TEXT NULL,            -- batch_summary|batch_detailed|group_summary|group_detailed
+                      report_status TEXT NOT NULL DEFAULT 'pending',   -- pending|generating|generated|failed
+                      email_status TEXT NOT NULL DEFAULT 'not_configured', -- not_configured|pending|sent|failed
+                      report_error TEXT NULL,
+                      email_error TEXT NULL,
+                      generated_utc TEXT NULL,
+                      emailed_utc TEXT NULL,
+                      created_utc TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_brepref_batch ON batch_report_reference(batch_id);
+                    CREATE INDEX IF NOT EXISTS idx_brepref_group ON batch_report_reference(batch_group_id);
+                    CREATE INDEX IF NOT EXISTS idx_brepref_status ON batch_report_reference(tenant_id, report_status, email_status);
+                    """
+                )
                 hist_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(historian_readings)").fetchall()}
                 if "tenant_id" not in hist_cols:
                     conn.execute('ALTER TABLE historian_readings ADD COLUMN tenant_id TEXT NOT NULL DEFAULT "default"')
