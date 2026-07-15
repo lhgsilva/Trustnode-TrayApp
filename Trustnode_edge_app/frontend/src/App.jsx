@@ -3814,7 +3814,9 @@ function AppShell() {
   });
   const [dataContinuityDismissed, setDataContinuityDismissed] = useState(false);
   const [cloudAutoSyncEnabled, setCloudAutoSyncEnabled] = useState(true);
-  const [tenantWebClientUrl, setTenantWebClientUrl] = useState("https://trustnode.lsapps.app");
+  // No hardcoded host: populated from app_settings.tenant_web_client_url (delivered
+  // via the activation code / infrastructure endpoints). 2026-07-15.
+  const [tenantWebClientUrl, setTenantWebClientUrl] = useState("");
   const [tenantCompanyName, setTenantCompanyName] = useState("");
   const [tenantLoginRealm, setTenantLoginRealm] = useState("");
   const [linkedCustomerId, setLinkedCustomerId] = useState("");

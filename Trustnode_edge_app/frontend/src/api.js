@@ -6,8 +6,13 @@ const FORCE_CLOUD_URL =
   /(^https?:\/\/your-cloud-backend\.example\.com$)|(^https?:\/\/api\.example\.com$)/i.test(FORCE_CLOUD_URL_RAW)
     ? ""
     : FORCE_CLOUD_URL_RAW;
+// 2026-07-15: no hardcoded portal host. The control-plane URL comes from a
+// build-time env (VITE_TRUSTNODE_CONTROL_PLANE_URL) when set; otherwise the app
+// resolves same-origin (hosted portal / cloud web client) or, on a file:// edge,
+// the URL delivered by the activation code + persisted server-side. An empty
+// fallback here is handled by the `if (CONTROL_PLANE_FALLBACK_URL)` guards below.
 const CONTROL_PLANE_FALLBACK_URL = normalizeBaseUrl(
-  import.meta.env.VITE_TRUSTNODE_CONTROL_PLANE_URL || "https://trustnode.lsapps.app"
+  import.meta.env.VITE_TRUSTNODE_CONTROL_PLANE_URL || ""
 );
 const FORCE_READONLY = String(import.meta.env.VITE_TRUSTNODE_READONLY || "").toLowerCase() === "true";
 const FORCE_CLIENT_VIEW = String(import.meta.env.VITE_TRUSTNODE_CLIENT_VIEW || "").toLowerCase() === "true";
