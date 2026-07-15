@@ -30,11 +30,21 @@ import {
   bmv2GroupBatches, bmv2GroupKpis, bmv2ListGroupReports, bmv2GenerateGroupReport, bmv2EmailGroupReport,
   bmv2AnalysisExcursions, bmv2AckExcursion, bmv2AnalysisComparison,
   bmv2NormalizeGatewayTags, bmv2FileUrl, bmv2PreviewDataUrl,
+  isTransientFetchError,
 } from "../../api";
 
 /* --------------------------------------------------------------------- */
 /*  shared primitives                                                    */
 /* --------------------------------------------------------------------- */
+
+// A request aborted by fetchWithTimeout's AbortController (fast navigation, a
+// component unmount, or a timeout) surfaces as "signal is aborted without reason".
+// That's not a real error to show the operator — swallow transient/abort errors so
+// they never render as a red banner. Returns the message to display, or "" to ignore.
+function errText(e) {
+  if (isTransientFetchError(e)) return "";
+  return e?.message || String(e || "");
+}
 function Modal({ onClose, children, width }) {
   const node = (
     <div className="modal-backdrop" onClick={onClose}
@@ -296,7 +306,7 @@ export function BatchOverviewV2Page({ canEdit = false }) {
         bmv2ListGroups({ limit: 100 }),
       ]);
       setBatches(b.rows || []); setGroups(g.rows || []);
-    } catch (e) { setErr(e?.message || String(e)); }
+    } catch (e) { setErr(errText(e)); }
   }, [statusFilter, search]);
 
   useEffect(() => { if (lic) { load(); bmv2ListDefinitions().then(setDefs).catch(() => {}); } }, [lic, load]);
@@ -405,7 +415,7 @@ function CreateBatchModal({ defs, onClose, onCreated }) {
   const save = async () => {
     setBusy(true); setErr("");
     try { await bmv2CreateBatch(form); onCreated(); }
-    catch (e) { setErr(e?.message || String(e)); } finally { setBusy(false); }
+    catch (e) { setErr(errText(e)); } finally { setBusy(false); }
   };
   return (
     <Modal onClose={onClose} width={560}>
@@ -439,7 +449,7 @@ function CreateGroupModal({ defs, onClose, onCreated }) {
     try {
       await bmv2CreateGroup({ ...form, expected_child_count: form.expected_child_count ? Number(form.expected_child_count) : null });
       onCreated();
-    } catch (e) { setErr(e?.message || String(e)); } finally { setBusy(false); }
+    } catch (e) { setErr(errText(e)); } finally { setBusy(false); }
   };
   return (
     <Modal onClose={onClose} width={560}>
@@ -498,7 +508,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
       ]);
       setKpis(k); setExcursions(x); setEvents(e); setReports(r); setTags(tg);
       if (tg.length) setSeries(await bmv2BatchTrends(batchId, tg.slice(0, 4).join(","), 400));
-    } catch (ex) { setErr(ex?.message || String(ex)); }
+    } catch (ex) { setErr(errText(ex)); }
   }, [batchId]);
 
   useEffect(() => { load(); }, [load]);
@@ -510,16 +520,16 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
   const doAction = async (action) => {
     setBusy(action); setErr("");
     try { await bmv2BatchAction(batchId, action, {}); await load(); }
-    catch (ex) { setErr(ex?.message || String(ex)); } finally { setBusy(""); setConfirmAction(null); }
+    catch (ex) { setErr(errText(ex)); } finally { setBusy(""); setConfirmAction(null); }
   };
   const genReport = async () => {
     setBusy("report"); setErr("");
     try { const r = await bmv2GenerateBatchReport(batchId); await load(); if (r?.reference) setPreview(r.reference); }
-    catch (ex) { setErr(ex?.message || String(ex)); } finally { setBusy(""); }
+    catch (ex) { setErr(errText(ex)); } finally { setBusy(""); }
   };
   const addComment = async () => {
     if (!comment.trim()) return;
-    try { await bmv2AddComment(batchId, comment.trim()); setComment(""); await load(); } catch (ex) { setErr(ex?.message || String(ex)); }
+    try { await bmv2AddComment(batchId, comment.trim()); setComment(""); await load(); } catch (ex) { setErr(errText(ex)); }
   };
 
   if (!batch) return <Card><div style={{ color: "var(--muted)" }}>{err ? <Banner tone="error">{err}</Banner> : "Loading…"}</div></Card>;
@@ -667,19 +677,19 @@ function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
         bmv2GetGroup(groupId), bmv2GroupBatches(groupId), bmv2GroupKpis(groupId), bmv2ListGroupReports(groupId),
       ]);
       setGroup(g); setChildren(ch); setKpis(k); setReports(r);
-    } catch (ex) { setErr(ex?.message || String(ex)); }
+    } catch (ex) { setErr(errText(ex)); }
   }, [groupId]);
   useEffect(() => { load(); }, [load]);
 
   const act = async (which) => {
     setBusy(which); setErr("");
     try { which === "complete" ? await bmv2CompleteGroup(groupId) : await bmv2AbortGroup(groupId); await load(); }
-    catch (ex) { setErr(ex?.message || String(ex)); } finally { setBusy(""); }
+    catch (ex) { setErr(errText(ex)); } finally { setBusy(""); }
   };
   const genReport = async () => {
     setBusy("report");
     try { const r = await bmv2GenerateGroupReport(groupId); await load(); if (r?.reference) setPreview(r.reference); }
-    catch (ex) { setErr(ex?.message || String(ex)); } finally { setBusy(""); }
+    catch (ex) { setErr(errText(ex)); } finally { setBusy(""); }
   };
 
   if (!group) return <Card><div style={{ color: "var(--muted)" }}>{err ? <Banner tone="error">{err}</Banner> : "Loading…"}</div></Card>;
@@ -764,7 +774,7 @@ export function BatchDefinitionsV2Page({ canEdit = false, gatewayConfigs = [] })
   const gateways = useMemo(() => bmv2NormalizeGatewayTags(gatewayConfigs), [gatewayConfigs]);
 
   const load = useCallback(async () => {
-    try { setDefs(await bmv2ListDefinitions()); } catch (e) { setErr(e?.message || String(e)); }
+    try { setDefs(await bmv2ListDefinitions()); } catch (e) { setErr(errText(e)); }
   }, []);
   useEffect(() => { if (lic) load(); }, [lic, load]);
 
@@ -843,7 +853,7 @@ function DefinitionWizard({ definitionId, gateways, canEdit, onClose, onSaved })
         },
       });
       setLoading(false);
-    }).catch((e) => { if (m) { setErr(e?.message || String(e)); setLoading(false); } });
+    }).catch((e) => { if (m) { setErr(errText(e)); setLoading(false); } });
     return () => { m = false; };
   }, [definitionId]);
 
@@ -859,21 +869,21 @@ function DefinitionWizard({ definitionId, gateways, canEdit, onClose, onSaved })
           recipients: String(form.config.email_config.recipients || "").split(/[,;\s]+/).filter(Boolean) } } };
       const saved = await bmv2SaveDefinition(payload, definitionId || null);
       onSaved(saved);
-    } catch (e) { setErr(e?.message || String(e)); } finally { setBusy(false); }
+    } catch (e) { setErr(errText(e)); } finally { setBusy(false); }
   };
   const doValidate = async () => {
     if (!definitionId) { setErr("Save the draft first, then validate."); return; }
-    try { setValidation(await bmv2ValidateDefinition(definitionId)); } catch (e) { setErr(e?.message || String(e)); }
+    try { setValidation(await bmv2ValidateDefinition(definitionId)); } catch (e) { setErr(errText(e)); }
   };
   const doPublish = async () => {
     if (!definitionId) { setErr("Save the draft first."); return; }
     setBusy(true); setErr("");
-    try { await bmv2PublishDefinition(definitionId); onSaved(); } catch (e) { setErr(e?.message || String(e)); } finally { setBusy(false); }
+    try { await bmv2PublishDefinition(definitionId); onSaved(); } catch (e) { setErr(errText(e)); } finally { setBusy(false); }
   };
   const newVersion = async () => {
     setBusy(true);
     try { await bmv2NewVersion(definitionId); setPublished(false); const d = await bmv2GetDefinition(definitionId); setForm((f) => ({ ...f })); }
-    catch (e) { setErr(e?.message || String(e)); } finally { setBusy(false); }
+    catch (e) { setErr(errText(e)); } finally { setBusy(false); }
   };
 
   if (loading) return <Modal onClose={onClose} width={900}><div style={{ color: "var(--muted)" }}>Loading…</div></Modal>;
@@ -1203,7 +1213,7 @@ function AnalysisReports({ canEdit }) {
         }
         acc.sort((a, b) => String(b.created_utc).localeCompare(String(a.created_utc)));
         setRows(acc);
-      } catch (e) { setErr(e?.message || String(e)); }
+      } catch (e) { setErr(errText(e)); }
     })();
   }, []);
   if (err) return <Banner tone="error">{err}</Banner>;
@@ -1236,10 +1246,10 @@ function AnalysisComparison() {
   const [tags, setTags] = useState("");
   const [data, setData] = useState([]);
   const [err, setErr] = useState("");
-  useEffect(() => { bmv2ListBatches({ limit: 50, status: "completed" }).then((r) => setBatches(r.rows || [])).catch((e) => setErr(e?.message || String(e))); }, []);
+  useEffect(() => { bmv2ListBatches({ limit: 50, status: "completed" }).then((r) => setBatches(r.rows || [])).catch((e) => setErr(errText(e))); }, []);
   const run = async () => {
     try { setData(await bmv2AnalysisComparison(picked, tags.split(/[,;\s]+/).filter(Boolean))); }
-    catch (e) { setErr(e?.message || String(e)); }
+    catch (e) { setErr(errText(e)); }
   };
   const toggle = (id) => setPicked((p) => (p.includes(id) ? p.filter((x) => x !== id) : p.length < 6 ? [...p, id] : p));
   return (
@@ -1271,9 +1281,9 @@ function AnalysisComparison() {
 function AnalysisExcursions({ canEdit }) {
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState("");
-  const load = useCallback(() => { bmv2AnalysisExcursions(500).then(setRows).catch((e) => setErr(e?.message || String(e))); }, []);
+  const load = useCallback(() => { bmv2AnalysisExcursions(500).then(setRows).catch((e) => setErr(errText(e))); }, []);
   useEffect(() => { load(); }, [load]);
-  const ack = async (id) => { try { await bmv2AckExcursion(id, { acknowledged: true }); load(); } catch (e) { setErr(e?.message || String(e)); } };
+  const ack = async (id) => { try { await bmv2AckExcursion(id, { acknowledged: true }); load(); } catch (e) { setErr(errText(e)); } };
   if (err) return <Banner tone="error">{err}</Banner>;
   if (!rows.length) return <div style={{ color: "var(--muted)", fontSize: 13 }}>No excursions recorded.</div>;
   return (

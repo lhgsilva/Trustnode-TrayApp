@@ -171,7 +171,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isTransientFetchError(err) {
+export function isTransientFetchError(err) {
   const msg = String(err?.message || err || "").toLowerCase();
   return (
     msg.includes("aborterror") ||
