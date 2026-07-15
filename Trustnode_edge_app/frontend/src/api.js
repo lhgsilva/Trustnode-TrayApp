@@ -3307,11 +3307,22 @@ async function _bmSend(path, method, body) {
 }
 
 export function bmv2FileUrl(generatedId, inline = true) {
-  // reuse the EXISTING Report module's file endpoint for preview/download
-  return `${getControlApiBase()}/api/reports/generated/${encodeURIComponent(generatedId)}/file${inline ? "?inline=true" : ""}`;
+  // reuse the EXISTING Report module's file endpoint for preview/download.
+  // An iframe src / <a download> can't set an Authorization header, so the
+  // JWT rides as ?access_token= (the auth middleware accepts it for this
+  // file route only). Without it the preview iframe showed
+  // {"detail":"Authentication required"}.
+  const tok = getAuthToken();
+  const params = [];
+  if (inline) params.push("inline=true");
+  if (tok) params.push(`access_token=${encodeURIComponent(tok)}`);
+  const qs = params.length ? `?${params.join("&")}` : "";
+  return `${getControlApiBase()}/api/reports/generated/${encodeURIComponent(generatedId)}/file${qs}`;
 }
 export function bmv2PreviewDataUrl(templateId) {
-  return `${getControlApiBase()}/api/reports/templates/${encodeURIComponent(templateId)}/preview-data`;
+  const tok = getAuthToken();
+  const qs = tok ? `?access_token=${encodeURIComponent(tok)}` : "";
+  return `${getControlApiBase()}/api/reports/templates/${encodeURIComponent(templateId)}/preview-data${qs}`;
 }
 
 export async function bmv2Status() {
@@ -3325,6 +3336,9 @@ export async function bmv2Status() {
   return await _bmGet("/status");
 }
 export async function bmv2SeedReportTemplates() { return _bmSend("/seed-report-templates", "POST", {}); }
+// Report templates the definition wizard can offer, {batch:[...], group:[...]},
+// including custom customer templates from the Reports module.
+export async function bmv2ReportTemplates() { return _bmGet("/report-templates"); }
 
 // ---- Definitions ----
 export async function bmv2ListDefinitions() { return (await _bmGet("/definitions")).rows || []; }

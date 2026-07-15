@@ -57,7 +57,11 @@ def _reports_store():
 #  Template seeding (idempotent)
 # --------------------------------------------------------------------------- #
 def _batch_summary_definition() -> dict[str, Any]:
-    return {"sections": [
+    # `batch_scope` tags this template as a BATCH template so the definition
+    # wizard's "Batch report template" dropdown can list it (and any custom
+    # customer template tagged the same way). Reports the module renders keep
+    # this in definition_json harmlessly.
+    return {"batch_scope": "batch", "sections": [
         {"type": "header", "title": "Batch Report", "subtitle": "Summary", "show_generated_at": True},
         {"type": "text", "title": "Batch", "text": "Batch summary — KPIs and per-tag results for the batch window."},
         {"type": "kpi_grid", "title": "Key Results", "columns": 4, "items": []},
@@ -76,7 +80,7 @@ def _batch_detailed_definition() -> dict[str, Any]:
 
 
 def _group_summary_definition() -> dict[str, Any]:
-    return {"sections": [
+    return {"batch_scope": "group", "sections": [
         {"type": "header", "title": "Batch Group Report", "subtitle": "Summary", "show_generated_at": True},
         {"type": "text", "title": "Batch Group", "text": "Aggregated results across the group's child batches."},
         {"type": "kpi_grid", "title": "Group KPIs", "columns": 4, "items": []},
@@ -87,6 +91,39 @@ def _group_detailed_definition() -> dict[str, Any]:
     d = _group_summary_definition()
     d["sections"][1]["text"] = "Detailed batch group report — group KPIs plus a per-child summary."
     return d
+
+
+def list_batch_templates() -> dict[str, list[dict[str, Any]]]:
+    """Report templates the definition wizard can offer, split by scope. A
+    template is a BATCH template if its definition_json has batch_scope=='batch'
+    (or its id starts with tpl-batch- and isn't a group one); GROUP likewise.
+    This is what lets CUSTOM customer templates created in the Reports module
+    appear in the batch-definition dropdowns — not just the 4 seeded ones."""
+    rs = _reports_store()
+    try:
+        tpls = rs.list_templates()
+    except Exception:
+        tpls = []
+    batch, group = [], []
+    for t in tpls:
+        tid = str(t.get("id") or "")
+        defn = t.get("definition") or {}
+        scope = str((defn or {}).get("batch_scope") or "").strip().lower()
+        if not scope:
+            # infer from the stable seed ids so pre-scope installs still classify
+            if tid in (TPL_GROUP_SUMMARY, TPL_GROUP_DETAILED):
+                scope = "group"
+            elif tid in (TPL_BATCH_SUMMARY, TPL_BATCH_DETAILED):
+                scope = "batch"
+        row = {"id": tid, "name": t.get("name") or tid, "description": t.get("description") or "", "scope": scope}
+        if scope == "group":
+            group.append(row)
+        elif scope == "batch":
+            batch.append(row)
+        else:
+            # untyped custom template -> offer in BOTH lists so it's usable
+            batch.append(row); group.append(row)
+    return {"batch": batch, "group": group}
 
 
 _SEED_SPECS = [
@@ -103,20 +140,25 @@ def seed_report_templates() -> int:
     rs = _reports_store()
     created = 0
     try:
-        existing = {t.get("id") for t in rs.list_templates()}
+        existing = {t.get("id"): t for t in rs.list_templates()}
     except Exception:
-        existing = set()
+        existing = {}
     for tpl_id, name, desc, builder in _SEED_SPECS:
-        if tpl_id in existing:
-            continue
-        try:
-            rs.upsert_template({
-                "id": tpl_id, "name": name, "description": desc,
-                "definition": builder(),
-            })
-            created += 1
-        except Exception:
-            continue
+        cur = existing.get(tpl_id)
+        if cur is None:
+            try:
+                rs.upsert_template({"id": tpl_id, "name": name, "description": desc, "definition": builder()})
+                created += 1
+            except Exception:
+                continue
+        elif not str(((cur.get("definition") or {}) or {}).get("batch_scope") or "").strip():
+            # backfill the batch_scope tag onto a template seeded before scoping
+            # so it classifies in the wizard dropdown (idempotent re-upsert).
+            try:
+                rs.upsert_template({"id": tpl_id, "name": cur.get("name") or name,
+                                    "description": cur.get("description") or desc, "definition": builder()})
+            except Exception:
+                continue
     return created
 
 

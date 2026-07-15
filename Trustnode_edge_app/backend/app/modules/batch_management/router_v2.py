@@ -24,7 +24,7 @@ from .service_v2 import (
     BatchDefinitionService, BatchExecutionService, BatchGroupService, BatchStateError,
 )
 from .calc_v2 import BatchCalcService
-from .reports_v2 import ReportIntegrationService, seed_report_templates
+from .reports_v2 import ReportIntegrationService, seed_report_templates, list_batch_templates
 
 
 router = APIRouter(prefix="/api/batch-management/v2", tags=["batch-management-v2"])
@@ -87,6 +87,19 @@ def status() -> dict:
 @router.post("/seed-report-templates", dependencies=_LIC)
 def seed_templates() -> dict:
     return {"ok": True, "created": seed_report_templates()}
+
+
+@router.get("/report-templates", dependencies=_LIC)
+def report_templates() -> dict:
+    """Report templates the definition wizard can pick from, split into
+    {batch, group}. Includes CUSTOM templates created in the Reports module
+    (any template scoped batch/group, or untyped -> offered in both). Seeds the
+    defaults first so a fresh install always has the built-ins."""
+    try:
+        seed_report_templates()
+    except Exception:
+        pass
+    return list_batch_templates()
 
 
 # ---- Batch Definitions ---------------------------------------------------

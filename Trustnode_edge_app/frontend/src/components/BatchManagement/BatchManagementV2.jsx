@@ -20,7 +20,7 @@ import {
   Legend, ReferenceLine,
 } from "recharts";
 import {
-  bmv2Status, bmv2SeedReportTemplates,
+  bmv2Status, bmv2SeedReportTemplates, bmv2ReportTemplates,
   bmv2ListDefinitions, bmv2GetDefinition, bmv2SaveDefinition, bmv2DeleteDefinition,
   bmv2ValidateDefinition, bmv2PublishDefinition, bmv2ListVersions, bmv2NewVersion,
   bmv2ListBatches, bmv2GetBatch, bmv2CreateBatch, bmv2BatchAction, bmv2AddComment,
@@ -1560,18 +1560,34 @@ function StepKpis({ cfg, setCfg, readOnly }) {
 
 function StepReports({ cfg, setCfg, readOnly }) {
   const ec = cfg.email_config || {};
+  // Load report templates from the Reports module so CUSTOM customer templates
+  // appear here — not just the built-in seeds. Split into batch/group scopes.
+  const [tpls, setTpls] = useState(() => cacheGet("bm:report-templates", { batch: [], group: [] }));
+  useEffect(() => {
+    let m = true;
+    bmv2ReportTemplates()
+      .then((r) => { if (m && r) { const v = { batch: r.batch || [], group: r.group || [] }; cacheSet("bm:report-templates", v); setTpls(v); } })
+      .catch(() => {});
+    return () => { m = false; };
+  }, []);
+  // Always show the current value even if the list hasn't loaded / it's a custom id.
+  const optionsFor = (list, currentId) => {
+    const arr = (list || []).slice();
+    if (currentId && !arr.some((t) => t.id === currentId)) arr.unshift({ id: currentId, name: currentId });
+    return arr;
+  };
   return (
     <div className="form-grid" style={{ gridTemplateColumns: "repeat(2, minmax(0,1fr))" }}>
       <Lbl label="Batch report template">
         <select disabled={readOnly} value={cfg.batch_report_template_id || ""} onChange={(e) => setCfg({ batch_report_template_id: e.target.value })}>
-          <option value="tpl-batch-summary">Batch Summary</option>
-          <option value="tpl-batch-detailed">Batch Detailed</option>
+          <option value="">(default batch summary)</option>
+          {optionsFor(tpls.batch, cfg.batch_report_template_id).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
         </select>
       </Lbl>
       <Lbl label="Group report template">
         <select disabled={readOnly} value={cfg.batch_group_report_template_id || ""} onChange={(e) => setCfg({ batch_group_report_template_id: e.target.value })}>
-          <option value="tpl-batch-group-summary">Group Summary</option>
-          <option value="tpl-batch-group-detailed">Group Detailed</option>
+          <option value="">(default group summary)</option>
+          {optionsFor(tpls.group, cfg.batch_group_report_template_id).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
         </select>
       </Lbl>
       <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13 }}>

@@ -1012,6 +1012,19 @@ PUBLIC_PATHS = {
 }
 
 
+def _allows_query_token(path: str) -> bool:
+    """Routes that may take the auth token as a ?access_token= query param
+    because they're loaded by browser-native GETs (iframe/download) that can't
+    set an Authorization header. Kept to file-serving report routes only — the
+    token is still a valid JWT, just carried differently for these GETs."""
+    p = path or ""
+    return (
+        p.startswith("/api/reports/generated/") and p.endswith("/file")
+    ) or (
+        p.startswith("/api/reports/templates/") and p.endswith("/preview-data")
+    )
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     def _apply_no_cache_headers(response):
@@ -1068,6 +1081,13 @@ async def auth_middleware(request: Request, call_next):
             return _apply_no_cache_headers(await call_next(request))
     auth = request.headers.get("Authorization", "")
     token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""
+    # Browser-native GETs (iframe src, <a download>) cannot set an Authorization
+    # header, so the report-file endpoint also accepts the token as a query param
+    # (?access_token=...). Scoped to GET on the generated-report file route only,
+    # so this does not broaden auth for the rest of the API. Without this, the
+    # batch/report PREVIEW iframe rendered {"detail":"Authentication required"}.
+    if not token and method == "GET" and _allows_query_token(path):
+        token = str(request.query_params.get("access_token") or request.query_params.get("token") or "").strip()
     if not token:
         return _apply_no_cache_headers(JSONResponse(status_code=401, content={"detail": "Authentication required"}))
     try:
