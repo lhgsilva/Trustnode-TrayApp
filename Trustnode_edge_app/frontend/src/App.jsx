@@ -19840,6 +19840,9 @@ const getGatewayHealth = (gateway) => {
                     <button className={`nav-item nav-subitem ${cpPortalPage === "dashboard_profiles" ? "active" : ""}`} onClick={() => openPortalPage("dashboard_profiles")}><span className="nav-icon"><MenuIcon page="portal_dashboard_profiles" /></span><span>Dashboard Profiles</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "users" ? "active" : ""}`} onClick={() => openPortalPage("users")}><span className="nav-icon"><MenuIcon page="portal_users" /></span><span>Users</span></button>
                     <button className={`nav-item nav-subitem ${cpPortalPage === "activation" ? "active" : ""}`} onClick={() => openPortalPage("activation")}><span className="nav-icon"><MenuIcon page="portal_activation" /></span><span>Activation</span></button>
+                    {isMasterAdmin ? (
+                      <button className={`nav-item nav-subitem ${cpPortalPage === "infrastructure" ? "active" : ""}`} onClick={() => openPortalPage("infrastructure")}><span className="nav-icon"><MenuIcon page="portal_infrastructure" /></span><span>Infrastructure</span></button>
+                    ) : null}
                     <button className={`nav-item nav-subitem ${cpPortalPage === "interface" ? "active" : ""}`} onClick={() => openPortalPage("interface")}><span className="nav-icon"><MenuIcon page="portal_interface" /></span><span>Interface</span></button>
                     <div className="portal-filter-block">
                       <label style={{ fontSize: 12, color: "var(--muted)" }}>Customer</label>
@@ -24927,6 +24930,9 @@ const getGatewayHealth = (gateway) => {
                     <button className={`btn ${cpPortalPage === "dashboard_profiles" ? "btn-primary" : ""}`} onClick={() => openPortalPage("dashboard_profiles")}>Dashboard Profiles</button>
                     <button className={`btn ${cpPortalPage === "users" ? "btn-primary" : ""}`} onClick={() => openPortalPage("users")}>Users</button>
                     <button className={`btn ${cpPortalPage === "activation" ? "btn-primary" : ""}`} onClick={() => openPortalPage("activation")}>Activation</button>
+                    {isMasterAdmin ? (
+                      <button className={`btn ${cpPortalPage === "infrastructure" ? "btn-primary" : ""}`} onClick={() => openPortalPage("infrastructure")}>Infrastructure</button>
+                    ) : null}
                     <button className={`btn ${cpPortalPage === "interface" ? "btn-primary" : ""}`} onClick={() => openPortalPage("interface")}>Interface</button>
                   </div>
                   <div className="form-grid" style={{ marginTop: 12 }}>
@@ -25709,9 +25715,6 @@ const getGatewayHealth = (gateway) => {
                       </>
                       ) : null}
                     </section>
-                    {canEditPage("control_plane") ? (
-                      <InfrastructureEndpoints tenantOptions={cpTenants} defaultTenant={getControlPlaneTenantScope?.() || ""} />
-                    ) : null}
                     <section className="card portal-activation-card">
                       <div className="portal-card-head">
                         <h4>Issued Activation Codes</h4>
@@ -25877,6 +25880,10 @@ const getGatewayHealth = (gateway) => {
                       </div>
                     ) : null}
                     </div>
+                  ) : null}
+
+                  {cpPortalPage === "infrastructure" ? (
+                    <InfrastructureEndpoints tenantOptions={cpTenants} defaultTenant={getControlPlaneTenantScope?.() || ""} />
                   ) : null}
 
                   {cpPortalPage === "interface" ? (
