@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Set
 from urllib.parse import quote_plus
@@ -84,6 +85,20 @@ class GatewayWorker:
         self.last_error: str | None = None
         self.latest_readings: List[GatewayReading] = []
         self._task: asyncio.Task | None = None
+
+        # 2026-07-15 (COLLECTION ISOLATION): a DEDICATED thread pool for this
+        # gateway's blocking collection I/O (PLC reads + historian writes). These
+        # used to run on asyncio's DEFAULT threadpool, which is SHARED with every
+        # other sync route — including control-plane/Supabase calls. When those
+        # cloud calls exhausted the shared pool (observed: ~223 threads blocked,
+        # health/re-check hung), the PLC read + historian write couldn't get a
+        # worker either, so collection STALLED even while the gateway said
+        # "Running" (real symptom: historian gaps). Giving collection its own
+        # small executor guarantees it can NEVER be starved by unrelated cloud
+        # work. Created lazily; a few workers per gateway is plenty (read + write
+        # + buffer flush overlap at most).
+        self._collection_executor: ThreadPoolExecutor | None = None
+        self._collection_executor_lock = threading.Lock()
 
         self._db_engine = None
         self._db_engine_key = ""
@@ -328,6 +343,16 @@ class GatewayWorker:
                 pass
             self._task = None
         self._dispose_gateway_clients()
+        # 2026-07-15: tear down the dedicated collection executor so a stopped/
+        # restarted gateway doesn't leak its thread pool. Non-blocking: don't wait
+        # on in-flight writes (they finish on their own daemon threads).
+        try:
+            ex = self._collection_executor
+            self._collection_executor = None
+            if ex is not None:
+                ex.shutdown(wait=False, cancel_futures=False)
+        except Exception:
+            pass
 
     def is_stalled(self) -> tuple[bool, float]:
         """True iff the worker is supposed to be running but hasn't
@@ -380,6 +405,31 @@ class GatewayWorker:
             collection_block_reason=self.collection_block_reason,
         )
 
+    def _get_collection_executor(self) -> ThreadPoolExecutor:
+        """Lazily create this gateway's DEDICATED collection thread pool.
+        max_workers=3 covers the overlap of read + write + buffer-flush; kept
+        small on purpose so it isn't a resource hog per gateway."""
+        if self._collection_executor is None:
+            with self._collection_executor_lock:
+                if self._collection_executor is None:
+                    self._collection_executor = ThreadPoolExecutor(
+                        max_workers=3,
+                        thread_name_prefix=f"tn-collect-{self.gateway_id[:8]}",
+                    )
+        return self._collection_executor
+
+    async def _run_collection_io(self, fn, *args):
+        """Run a BLOCKING collection call (PLC read / historian write) on the
+        gateway's DEDICATED executor instead of asyncio's shared default pool, so
+        control-plane / cloud slowness can never starve collection. Drop-in
+        replacement for `await asyncio.to_thread(fn, *args)`."""
+        loop = asyncio.get_running_loop()
+        executor = self._get_collection_executor()
+        if args:
+            import functools
+            return await loop.run_in_executor(executor, functools.partial(fn, *args))
+        return await loop.run_in_executor(executor, fn)
+
     async def _run_loop(self, emit_event) -> None:
         # Operator 2026-06-18: reverted the per-cycle asyncio.wait_for
         # wrapper. It was intended as a zombie-defense but the customer
@@ -401,7 +451,7 @@ class GatewayWorker:
                 # at the bottom of the cycle catches any read exception and
                 # the next cycle reconnects through `_ensure_ab_pycomm3_client`
                 # / `_ensure_opc_client`, which already handle stale sessions.
-                readings = await asyncio.to_thread(self._read_from_gateway)
+                readings = await self._run_collection_io(self._read_from_gateway)
                 self.latest_readings = readings
                 # Liveness stamp — successful read = worker is alive.
                 # The supervisor watchdog reads this to decide whether
@@ -481,7 +531,7 @@ class GatewayWorker:
                 if collection_allowed:
                     # DB sink writes can be blocking (sqlite/file/remote enqueue).
                     # Execute off-loop to avoid delaying other gateways/API calls.
-                    await asyncio.to_thread(self._persist_readings, readings)
+                    await self._run_collection_io(self._persist_readings, readings)
             except Exception as exc:
                 err_text = str(exc)
                 # Suppress transient handshake errors during the post-start
@@ -3185,7 +3235,7 @@ class PLCManager:
                     # reorder writes. Then attempt the current cycle. If
                     # either fails, the unwritten rows go into the FIFO
                     # buffer for the next attempt. No bare-except drop.
-                    await asyncio.to_thread(self._flush_historian_buffer_then_write, rows)
+                    await self._run_collection_io(self._flush_historian_buffer_then_write, rows)
         except Exception as exc:
             # We must NEVER drop rows silently here. If we reached this
             # point with a non-empty rows list it means the helper above
