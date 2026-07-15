@@ -46,6 +46,41 @@ function errText(e) {
   return e?.message || String(e || "");
 }
 
+/* --------------------------------------------------------------------- */
+/*  Stale-while-revalidate cache                                         */
+/* --------------------------------------------------------------------- */
+// The three batch pages mount/unmount on navigation (App.jsx renders each only
+// when its tab is active), so without a cache every page switch starts from
+// EMPTY state and shows a blank/"No … yet" flash until a network round-trip
+// returns. This module-level store keeps the last-known data per key so a
+// returning page paints INSTANTLY from cache, then refreshes in the background
+// (stale-while-revalidate). Survives navigation for the app's lifetime; not
+// persisted to disk (a fresh app launch legitimately re-fetches once).
+const _bmCache = new Map();
+function cacheGet(key, fallback) {
+  return _bmCache.has(key) ? _bmCache.get(key) : fallback;
+}
+function cacheSet(key, value) {
+  _bmCache.set(key, value);
+  return value;
+}
+// useState initializer that seeds from cache synchronously (no blank frame).
+function useCachedState(key, fallback) {
+  const [v, setV] = useState(() => cacheGet(key, fallback));
+  const set = useCallback((next) => {
+    setV((prev) => {
+      const resolved = typeof next === "function" ? next(prev) : next;
+      cacheSet(key, resolved);
+      return resolved;
+    });
+  }, [key]);
+  return [v, set];
+}
+// Stash a list row so a detail view can render its header instantly (before its
+// own fetch returns) instead of showing "Loading…".
+function stashRow(kind, id, row) { if (id && row) _bmCache.set(`${kind}:${id}`, row); }
+function peekRow(kind, id) { return id ? _bmCache.get(`${kind}:${id}`) : null; }
+
 // One-time CSS for the batch tables: subtle row-hover highlight + row-actions that
 // only appear on hover (cleaner, less busy tables). Injected once at module load.
 if (typeof document !== "undefined" && !document.getElementById("bm-v2-style")) {
@@ -402,9 +437,9 @@ function Unlicensed() {
 /* --------------------------------------------------------------------- */
 export function BatchOverviewV2Page({ canEdit = false }) {
   const lic = useLicense();
-  const [tab, setTab] = useState("batches");
-  const [batches, setBatches] = useState([]);
-  const [groups, setGroups] = useState([]);
+  const [tab, setTab] = useCachedState("ov:tab", "batches");
+  const [batches, setBatches] = useCachedState("ov:batches", []);
+  const [groups, setGroups] = useCachedState("ov:groups", []);
   const [statusFilter, setStatusFilter] = useState("");
   const [groupStatusFilter, setGroupStatusFilter] = useState("");
   const [search, setSearch] = useState("");
@@ -412,23 +447,27 @@ export function BatchOverviewV2Page({ canEdit = false }) {
   const [openGroup, setOpenGroup] = useState(null);
   const [creating, setCreating] = useState(null);      // "batch" | "group"
   const [err, setErr] = useState("");
-  const [defs, setDefs] = useState([]);
+  const [defs, setDefs] = useCachedState("ov:defs", []);
 
   // Load ALL rows ONCE (no filter params). Filtering is done client-side below so
   // it's instant and typing in the search box never fires a network request.
   // `load` has NO filter deps, so the 8s refresh interval + effect stay stable.
+  // Cached state means a return to this page paints the last rows instantly while
+  // this refresh runs in the background — no empty flash, no waiting.
   const load = useCallback(async () => {
-    setErr("");
     try {
       const [b, g] = await Promise.all([
         bmv2ListBatches({ limit: 300 }),
         bmv2ListGroups({ limit: 100 }),
       ]);
-      setBatches(b.rows || []); setGroups(g.rows || []);
-    } catch (e) { setErr(errText(e)); }
-  }, []);
+      setBatches(b.rows || []); setGroups(g.rows || []); setErr("");
+      // stash each row so opening a batch/group detail renders instantly
+      (b.rows || []).forEach((r) => stashRow("batch", r.id, r));
+      (g.rows || []).forEach((r) => stashRow("group", r.id, r));
+    } catch (e) { const t = errText(e); if (t) setErr(t); }  // transient -> keep cached rows
+  }, [setBatches, setGroups]);
 
-  useEffect(() => { if (lic) { load(); bmv2ListDefinitions().then(setDefs).catch(() => {}); } }, [lic, load]);
+  useEffect(() => { if (lic) { load(); bmv2ListDefinitions().then(setDefs).catch(() => {}); } }, [lic, load, setDefs]);
   useEffect(() => { if (!lic) return; const t = setInterval(load, 8000); return () => clearInterval(t); }, [lic, load]);
 
   // client-side filter — instant, no refetch on keystroke
@@ -651,9 +690,11 @@ const BATCH_ACTIONS = {
 };
 
 function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
-  const [batch, setBatch] = useState(null);
-  const [kpis, setKpis] = useState([]);
-  const [excursions, setExcursions] = useState([]);
+  // Seed from the row already in the list cache -> the header (reference/status)
+  // paints INSTANTLY; the full KPIs/trends/events stream in from the fetch below.
+  const [batch, setBatch] = useState(() => peekRow("batch", batchId) || cacheGet(`batch:full:${batchId}`, null));
+  const [kpis, setKpis] = useState(() => cacheGet(`batch:kpis:${batchId}`, []));
+  const [excursions, setExcursions] = useState(() => cacheGet(`batch:exc:${batchId}`, []));
   const [events, setEvents] = useState([]);
   const [series, setSeries] = useState([]);
   const [reports, setReports] = useState([]);
@@ -665,17 +706,18 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
   const [confirmAction, setConfirmAction] = useState(null);
 
   const load = useCallback(async () => {
-    setErr("");
     try {
       const b = await bmv2GetBatch(batchId);
-      setBatch(b);
+      setBatch(b); cacheSet(`batch:full:${batchId}`, b);
       const [k, x, e, r, tg] = await Promise.all([
         bmv2BatchKpis(batchId), bmv2BatchExcursions(batchId), bmv2BatchEvents(batchId, 100),
         bmv2ListBatchReports(batchId), bmv2BatchCollectedTags(batchId),
       ]);
       setKpis(k); setExcursions(x); setEvents(e); setReports(r); setTags(tg);
+      cacheSet(`batch:kpis:${batchId}`, k); cacheSet(`batch:exc:${batchId}`, x);
+      setErr("");
       if (tg.length) setSeries(await bmv2BatchTrends(batchId, tg.slice(0, 4).join(","), 400));
-    } catch (ex) { setErr(errText(ex)); }
+    } catch (ex) { const t = errText(ex); if (t) setErr(t); }
   }, [batchId]);
 
   useEffect(() => { load(); }, [load]);
@@ -829,21 +871,23 @@ function Field({ label, children }) {
 /*  Batch Group Detail                                                   */
 /* --------------------------------------------------------------------- */
 function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
-  const [group, setGroup] = useState(null);
-  const [children, setChildren] = useState([]);
-  const [kpis, setKpis] = useState([]);
+  // Seed header from the list-cached row -> instant paint, details stream in.
+  const [group, setGroup] = useState(() => peekRow("group", groupId) || cacheGet(`group:full:${groupId}`, null));
+  const [children, setChildren] = useState(() => cacheGet(`group:children:${groupId}`, []));
+  const [kpis, setKpis] = useState(() => cacheGet(`group:kpis:${groupId}`, []));
   const [reports, setReports] = useState([]);
   const [preview, setPreview] = useState(null);
   const [busy, setBusy] = useState(""); const [err, setErr] = useState("");
 
   const load = useCallback(async () => {
-    setErr("");
     try {
       const [g, ch, k, r] = await Promise.all([
         bmv2GetGroup(groupId), bmv2GroupBatches(groupId), bmv2GroupKpis(groupId), bmv2ListGroupReports(groupId),
       ]);
-      setGroup(g); setChildren(ch); setKpis(k); setReports(r);
-    } catch (ex) { setErr(errText(ex)); }
+      setGroup(g); setChildren(ch); setKpis(k); setReports(r); setErr("");
+      cacheSet(`group:full:${groupId}`, g); cacheSet(`group:children:${groupId}`, ch); cacheSet(`group:kpis:${groupId}`, k);
+      (ch || []).forEach((c) => stashRow("batch", c.id, c));  // open a child instantly
+    } catch (ex) { const t = errText(ex); if (t) setErr(t); }
   }, [groupId]);
   useEffect(() => { load(); }, [load]);
 
@@ -933,8 +977,8 @@ const TAG_CATEGORIES = ["process_value", "setpoint", "count", "energy", "flow", 
 
 export function BatchDefinitionsV2Page({ canEdit = false, gatewayConfigs = [] }) {
   const lic = useLicense();
-  const [defs, setDefs] = useState([]);
-  const [loaded, setLoaded] = useState(false);
+  const [defs, setDefs] = useCachedState("defs:list", []);
+  const [loaded, setLoaded] = useState(() => _bmCache.has("defs:list"));
   const [editing, setEditing] = useState(null);   // definition id or "new"
   const [err, setErr] = useState("");
   const gateways = useMemo(() => bmv2NormalizeGatewayTags(gatewayConfigs), [gatewayConfigs]);
@@ -950,7 +994,7 @@ export function BatchDefinitionsV2Page({ canEdit = false, gatewayConfigs = [] })
       const t = errText(e);
       if (t) setErr(t);          // transient/abort -> errText returns "" -> ignored; keep old list
     }
-  }, []);
+  }, [setDefs]);
   useEffect(() => { if (lic) load(); }, [lic, load]);
   useEffect(() => { if (!lic) return; const t = setInterval(load, 8000); return () => clearInterval(t); }, [lic, load]);
 
@@ -1345,7 +1389,7 @@ function StepPublish({ validation, onValidate, onPublish, canEdit, published, bu
 /* --------------------------------------------------------------------- */
 export function BatchAnalysisV2Page({ canEdit = false }) {
   const lic = useLicense();
-  const [tab, setTab] = useState("reports");
+  const [tab, setTab] = useCachedState("an:tab", "reports");
   const [openBatch, setOpenBatch] = useState(null);   // drill into a batch from Analysis
   const [openGroup, setOpenGroup] = useState(null);
   if (lic === false) return <Unlicensed />;
@@ -1376,7 +1420,7 @@ export function BatchAnalysisV2Page({ canEdit = false }) {
 
 function AnalysisReports({ canEdit, onOpenBatch, onOpenGroup }) {
   // aggregate report references across recent batches + groups
-  const [rows, setRows] = useState([]);
+  const [rows, setRows] = useCachedState("an:reports", []);
   const [preview, setPreview] = useState(null);
   const [previewOwner, setPreviewOwner] = useState(null); // {kind, id}
   const [err, setErr] = useState("");
@@ -1397,7 +1441,7 @@ function AnalysisReports({ canEdit, onOpenBatch, onOpenGroup }) {
         setRows(acc); setErr("");
       } catch (e) { const t = errText(e); if (t) setErr(t); }  // keep last-good on transient
     })();
-  }, []);
+  }, [setRows]);
   const openOwner = (r) => {
     if (r.owner_kind === "group") onOpenGroup && onOpenGroup(r.owner_id);
     else onOpenBatch && onOpenBatch(r.owner_id);
@@ -1431,12 +1475,12 @@ function AnalysisReports({ canEdit, onOpenBatch, onOpenGroup }) {
 }
 
 function AnalysisComparison({ onOpenBatch }) {
-  const [batches, setBatches] = useState([]);
-  const [picked, setPicked] = useState([]);
-  const [tags, setTags] = useState("");
-  const [data, setData] = useState([]);
+  const [batches, setBatches] = useCachedState("an:cmp:batches", []);
+  const [picked, setPicked] = useCachedState("an:cmp:picked", []);
+  const [tags, setTags] = useCachedState("an:cmp:tags", "");
+  const [data, setData] = useCachedState("an:cmp:data", []);
   const [err, setErr] = useState("");
-  useEffect(() => { bmv2ListBatches({ limit: 50, status: "completed" }).then((r) => { if (r?.rows) setBatches(r.rows); }).catch((e) => { const t = errText(e); if (t) setErr(t); }); }, []);
+  useEffect(() => { bmv2ListBatches({ limit: 50, status: "completed" }).then((r) => { if (r?.rows) setBatches(r.rows); }).catch((e) => { const t = errText(e); if (t) setErr(t); }); }, [setBatches]);
   const run = async () => {
     try { setData(await bmv2AnalysisComparison(picked, tags.split(/[,;\s]+/).filter(Boolean))); }
     catch (e) { setErr(errText(e)); }
@@ -1471,9 +1515,9 @@ function AnalysisComparison({ onOpenBatch }) {
 }
 
 function AnalysisExcursions({ canEdit, onOpenBatch }) {
-  const [rows, setRows] = useState([]);
+  const [rows, setRows] = useCachedState("an:excursions", []);
   const [err, setErr] = useState("");
-  const load = useCallback(() => { bmv2AnalysisExcursions(500).then((r) => { if (Array.isArray(r)) setRows(r); }).catch((e) => setErr(errText(e))); }, []);
+  const load = useCallback(() => { bmv2AnalysisExcursions(500).then((r) => { if (Array.isArray(r)) setRows(r); }).catch((e) => { const t = errText(e); if (t) setErr(t); }); }, [setRows]);
   useEffect(() => { load(); }, [load]);
   const ack = async (id) => { try { await bmv2AckExcursion(id, { acknowledged: true }); load(); } catch (e) { setErr(errText(e)); } };
   if (err) return <Banner tone="error">{err}</Banner>;
