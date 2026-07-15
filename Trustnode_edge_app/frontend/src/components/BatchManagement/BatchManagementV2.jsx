@@ -408,12 +408,27 @@ function useLicense() {
           _bmLicCache = true; _bmLicCheckedAt = Date.now();
           try { localStorage.setItem(_BM_LIC_LS, "1"); } catch {}
         } else if (s && typeof s.enabled !== "undefined") {
-          // A definitive false — but require 2 in a row before believing a
-          // previously-good edge is now unlicensed (guards stale-snapshot blips).
+          // A backend-reported false. ALWAYS require 2 in a row before believing
+          // it — even from a cold (null) cache. The batch license snapshot can be
+          // momentarily absent right after boot / a re-check, and the very first
+          // /status of a session can race that. One soft false must never commit
+          // the "not licensed" banner; the 2nd confirmed false does.
           _bmFalseStreak += 1;
-          if (_bmFalseStreak >= 2 || _bmLicCache === null) {
+          if (_bmFalseStreak >= 2) {
             _bmLicCache = false; _bmLicCheckedAt = Date.now();
             try { localStorage.removeItem(_BM_LIC_LS); } catch {}
+          } else {
+            // first false: re-check shortly; keep showing loading, not the banner
+            setTimeout(() => { bmv2Status().then((s2) => {
+              if (s2 && s2.enabled) {
+                _bmFalseStreak = 0; _bmLicCache = true; _bmLicCheckedAt = Date.now();
+                try { localStorage.setItem(_BM_LIC_LS, "1"); } catch {}
+              } else if (s2 && typeof s2.enabled !== "undefined") {
+                _bmFalseStreak += 1;
+                if (_bmFalseStreak >= 2) { _bmLicCache = false; _bmLicCheckedAt = Date.now(); try { localStorage.removeItem(_BM_LIC_LS); } catch {} }
+              }
+              if (m) setOk(_bmLicCache);
+            }).catch(() => {}); }, 800);
           }
         }
         if (m) setOk(_bmLicCache);

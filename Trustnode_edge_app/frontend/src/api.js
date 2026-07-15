@@ -3315,8 +3315,14 @@ export function bmv2PreviewDataUrl(templateId) {
 }
 
 export async function bmv2Status() {
-  try { return await _bmGet("/status"); }
-  catch { return { module: "batch_management", enabled: false, api: "v2" }; }
+  // The /status endpoint always returns HTTP 200 with {enabled: true|false};
+  // "not licensed" is a 200 body, never an error. So any THROW here is a
+  // transient failure (network / timeout / aborted fetch on fast navigation /
+  // 5xx while the backend is still booting). We must PROPAGATE it so the
+  // caller (useLicense) keeps its last-known-good state instead of downgrading.
+  // Returning a fabricated {enabled:false} here was the bug that made the
+  // pages flash "not licensed" after a rebuild/restart or quick navigation.
+  return await _bmGet("/status");
 }
 export async function bmv2SeedReportTemplates() { return _bmSend("/seed-report-templates", "POST", {}); }
 
