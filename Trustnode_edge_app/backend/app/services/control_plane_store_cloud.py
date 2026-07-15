@@ -375,13 +375,25 @@ class ControlPlaneStoreCloud(ControlPlaneStore):
                 "prepare_threshold": None,
                 "options": "-c lock_timeout=400ms -c statement_timeout=2500ms",
             }
+            # 2026-07-15 (WEDGE FIX): the app raises the anyio threadpool limiter to
+            # 200 (main.py) so FastAPI can run up to 200 concurrent SYNC routes.
+            # But every control-plane read on the EDGE now goes through THIS pool to
+            # Supabase over the WAN, and the old pool ceiling was only 6+10=16. Under
+            # the frontend's many pollers + the license re-check (which holds a
+            # threadpool worker for its whole multi-call cloud round-trip), 200
+            # workers starved on 16 connections: workers parked waiting on
+            # pool_timeout, threads piled up (observed ~223 blocked @ ~0 CPU), and
+            # /api/health + login + re-check hung while cheap auth-rejects stayed
+            # instant. Raise the ceiling so connection supply matches the worker
+            # limit. Still env-overridable. pool_timeout kept short so a genuine
+            # outage fails fast instead of hanging the worker.
             self._engine = create_engine(
                 url,
                 pool_pre_ping=True,
-                pool_size=int(os.environ.get("TRUSTNODE_CP_DB_POOL_SIZE", "6") or "6"),
-                max_overflow=int(os.environ.get("TRUSTNODE_CP_DB_MAX_OVERFLOW", "10") or "10"),
+                pool_size=int(os.environ.get("TRUSTNODE_CP_DB_POOL_SIZE", "20") or "20"),
+                max_overflow=int(os.environ.get("TRUSTNODE_CP_DB_MAX_OVERFLOW", "40") or "40"),
                 pool_recycle=300,
-                pool_timeout=5,
+                pool_timeout=int(os.environ.get("TRUSTNODE_CP_DB_POOL_TIMEOUT", "5") or "5"),
                 connect_args=connect_args,
             )
             return self._engine
