@@ -375,6 +375,23 @@ class ControlPlaneStore:
                       UNIQUE(license_id, edge_id, trial_kind)
                     );
 
+                    -- Infrastructure endpoints (developer-admin managed, 2026-07-15).
+                    -- Single source of truth for WHERE the deployment's services live
+                    -- (control-plane API, Supabase, AI, ...), so re-hosting means
+                    -- editing ONE row rather than hunting hardcoded URLs across the
+                    -- codebase. The config flows into activation codes, and the edge
+                    -- persists it locally on link — the operator never sees or types
+                    -- any URL. tenant_id='__global__' is the deployment-wide default;
+                    -- a per-tenant row (if present) overrides it. endpoints_json is an
+                    -- open object: { cloud_api_url, supabase_url, ai_endpoint_url, ... }.
+                    CREATE TABLE IF NOT EXISTS cp_infrastructure_config (
+                      tenant_id TEXT PRIMARY KEY,
+                      endpoints_json TEXT NOT NULL DEFAULT '{}',
+                      updated_by TEXT,
+                      updated_utc TEXT NOT NULL,
+                      metadata_json TEXT NOT NULL DEFAULT '{}'
+                    );
+
                     CREATE INDEX IF NOT EXISTS ix_cp_customers_tenant ON cp_customers(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_edges_tenant ON cp_edges(tenant_id);
                     CREATE INDEX IF NOT EXISTS ix_cp_users_tenant ON cp_users(tenant_id);
@@ -1050,6 +1067,82 @@ class ControlPlaneStore:
                     "SELECT * FROM cp_edge_view_links WHERE token=?", (t,),
                 ).fetchone()
         return dict(row) if row else None
+
+    # ------------------------------------------------------------------ #
+    #  Infrastructure endpoints (developer-admin managed) — 2026-07-15
+    #  Single source of truth for deployment endpoints so re-hosting is a
+    #  one-row edit. tenant_id '__global__' is the deployment-wide default.
+    # ------------------------------------------------------------------ #
+    GLOBAL_INFRA_TENANT = "__global__"
+    # Keys the edge understands. Open-ended, but these are the ones that flow
+    # into an activation code + local app_settings. Add here as services move.
+    INFRA_KEYS = (
+        "cloud_api_url",       # control-plane / portal API base (the one re-check needs)
+        "supabase_url",        # Supabase project URL (informational / future edge-direct)
+        "ai_endpoint_url",     # TrustNode Intelligence endpoint base
+        "web_client_url",      # optional cloud web client base
+    )
+
+    def get_infrastructure_config(self, *, tenant_id: str | None = None) -> dict[str, Any]:
+        """Return the RAW config row for a tenant (or the global default when
+        tenant_id is None/'__global__'). {} if none set yet."""
+        tid = self.GLOBAL_INFRA_TENANT if not tenant_id else normalize_tenant_id(tenant_id)
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM cp_infrastructure_config WHERE tenant_id=?", (tid,),
+                ).fetchone()
+        if not row:
+            return {}
+        d = dict(row)
+        try:
+            d["endpoints"] = json.loads(d.get("endpoints_json") or "{}")
+        except Exception:
+            d["endpoints"] = {}
+        return d
+
+    def set_infrastructure_config(self, *, endpoints: dict[str, Any],
+                                  tenant_id: str | None = None,
+                                  updated_by: str = "system") -> dict[str, Any]:
+        """Upsert the endpoints config for a tenant (or the global default).
+        Only known INFRA_KEYS are persisted (blank/None values dropped) plus any
+        forward-compat extras the caller explicitly includes."""
+        tid = self.GLOBAL_INFRA_TENANT if not tenant_id else normalize_tenant_id(tenant_id)
+        clean: dict[str, Any] = {}
+        for k, v in (endpoints or {}).items():
+            sv = str(v or "").strip()
+            if sv:
+                clean[str(k)] = sv
+        payload = json.dumps(clean, separators=(",", ":"), sort_keys=True)
+        now = self._utc_now()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO cp_infrastructure_config(tenant_id, endpoints_json, updated_by, updated_utc, metadata_json)
+                    VALUES(?, ?, ?, ?, '{}')
+                    ON CONFLICT(tenant_id) DO UPDATE SET
+                      endpoints_json=excluded.endpoints_json,
+                      updated_by=excluded.updated_by,
+                      updated_utc=excluded.updated_utc
+                    """,
+                    (tid, payload, str(updated_by or "system"), now),
+                )
+                conn.commit()
+        return self.get_infrastructure_config(tenant_id=tid)
+
+    def resolve_infrastructure_endpoints(self, *, tenant_id: str | None = None) -> dict[str, Any]:
+        """The effective endpoints for a tenant: the tenant-specific row merged
+        OVER the global default (per-key). Returns just the endpoints dict.
+        This is what activation-code issue reads to embed in the code."""
+        base = (self.get_infrastructure_config(tenant_id=self.GLOBAL_INFRA_TENANT) or {}).get("endpoints") or {}
+        merged = dict(base)
+        if tenant_id and normalize_tenant_id(tenant_id) != self.GLOBAL_INFRA_TENANT:
+            over = (self.get_infrastructure_config(tenant_id=tenant_id) or {}).get("endpoints") or {}
+            for k, v in over.items():
+                if str(v or "").strip():
+                    merged[k] = v
+        return merged
 
     def revoke_edge_view_links(self, *, tenant_id: str, edge_id: str) -> int:
         """Revoke ONLY the edge-wide (legacy) view-links for the edge.

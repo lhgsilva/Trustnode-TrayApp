@@ -10,6 +10,8 @@ import { BatchesPage, BatchTypesPage, BatchAuditPage } from "./components/BatchM
 // Batch Management v2 (clean rebuild) — spec-named pages. These replace the
 // three legacy menu items. Guide: docs/BATCH_MANAGEMENT_REDESIGN_2026-07-14.md
 import { BatchOverviewV2Page, BatchDefinitionsV2Page, BatchAnalysisV2Page } from "./components/BatchManagement/BatchManagementV2";
+// Developer-admin: deployment endpoints (single source of truth for re-hosting).
+import InfrastructureEndpoints from "./components/ControlPlane/InfrastructureEndpoints";
 import {
   getHealth,
   getBootProbe,
@@ -25705,6 +25707,9 @@ const getGatewayHealth = (gateway) => {
                       </>
                       ) : null}
                     </section>
+                    {canEditPage("control_plane") ? (
+                      <InfrastructureEndpoints tenantOptions={cpTenants} defaultTenant={getControlPlaneTenantScope?.() || ""} />
+                    ) : null}
                     <section className="card portal-activation-card">
                       <div className="portal-card-head">
                         <h4>Issued Activation Codes</h4>

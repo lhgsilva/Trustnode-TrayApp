@@ -32,6 +32,20 @@ def _is_same_origin_as_request(base_url: str, request: Request) -> bool:
 
 
 def _resolve_cloud_control_plane_base(request: Request) -> str:
+    """Resolve the cloud control-plane base URL WITHOUT any hardcoded host, so
+    the deployment can be re-hosted without editing/rebuilding the app.
+
+    Priority (2026-07-15):
+      1. env TRUSTNODE_CONTROL_PLANE_URL (ops override)
+      2. local app_settings cloud_url / cloud_api_url — populated on the edge from
+         the ACTIVATION CODE (see edge_link_local_finalize), never a literal
+      3. local app_settings.infrastructure_endpoints.cloud_api_url (same source)
+      4. a NON-localhost request's own origin (this is the portal calling itself)
+
+    On a localhost request with nothing configured we return "" — the caller then
+    reports 'cloud not configured' rather than pointing at a fixed host. A fresh
+    edge learns its URL from the activation code before it ever needs this.
+    """
     explicit = str(os.getenv("TRUSTNODE_CONTROL_PLANE_URL") or "").strip().rstrip("/")
     if explicit:
         return explicit
@@ -42,11 +56,18 @@ def _resolve_cloud_control_plane_base(request: Request) -> str:
             from_settings = str(settings.get("cloud_url") or settings.get("cloud_api_url") or "").strip().rstrip("/")
             if from_settings:
                 return from_settings
+            infra = settings.get("infrastructure_endpoints")
+            if isinstance(infra, dict):
+                from_infra = str(infra.get("cloud_api_url") or "").strip().rstrip("/")
+                if from_infra:
+                    return from_infra
     except Exception:
         pass
     host = str(request.headers.get("host", "")).split(":")[0].strip().lower()
     if host in {"127.0.0.1", "localhost", "::1"}:
-        return "https://trustnode.lsapps.app"
+        # No hardcoded fallback by design — an unconfigured edge has no cloud URL
+        # until it applies an activation code that carries one.
+        return ""
     return f"{request.url.scheme}://{host}".rstrip("/")
 
 
@@ -168,6 +189,10 @@ class EdgeLocalFinalizeRequest(BaseModel):
     license_modules: list[dict[str, Any]] = Field(default_factory=list)
     cloud_api_url: str = ""
     primary_domain: str = ""
+    # 2026-07-15: deployment endpoints delivered via the activation code
+    # ({cloud_api_url, supabase_url, ai_endpoint_url, web_client_url}). The edge
+    # may forward these; finalize also resolves them from the store as a fallback.
+    infrastructure: dict[str, str] = Field(default_factory=dict)
     admin_username: str = "admin"
     admin_password: str = ""
 
@@ -310,6 +335,16 @@ class AIEndpointConfigRequest(BaseModel):
     allowed_tools: list[str] = Field(default_factory=lambda: ["read_only"])
 
 
+class InfrastructureEndpointsRequest(BaseModel):
+    # Developer-admin deployment endpoints (2026-07-15). Open object; the edge
+    # understands cloud_api_url / supabase_url / ai_endpoint_url / web_client_url.
+    # tenant_id blank/'__global__' = deployment-wide default; a real tenant_id
+    # sets a per-tenant override. These flow into activation codes so the edge
+    # self-configures without any hardcoded URL or operator input.
+    endpoints: dict[str, str] = Field(default_factory=dict)
+    tenant_id: str = ""
+
+
 @router.get("/ai-endpoint")
 def get_ai_endpoint_config(request: Request) -> dict[str, Any]:
     _require_auth_payload(request)
@@ -376,6 +411,51 @@ def put_ai_endpoint_config(payload: AIEndpointConfigRequest, request: Request) -
         details={"model": payload.model, "url_set": bool(payload.endpoint_url)},
     )
     return {"ok": True, "config": _load_ai_endpoint_config()}
+
+
+@router.get("/infrastructure-endpoints")
+def get_infrastructure_endpoints(request: Request, tenant_id: str | None = None) -> dict[str, Any]:
+    """Developer-admin: read the deployment endpoints. Returns the global
+    default row, the requested tenant row (if any), and the effective resolved
+    endpoints (tenant merged over global)."""
+    payload = _require_auth_payload(request)
+    if not _is_global_admin(payload):
+        raise HTTPException(status_code=403, detail="Global admin required")
+    tid = str(tenant_id or "").strip() or None
+    return {
+        "ok": True,
+        "keys": list(control_plane_store.INFRA_KEYS),
+        "global": (control_plane_store.get_infrastructure_config() or {}).get("endpoints") or {},
+        "tenant": ((control_plane_store.get_infrastructure_config(tenant_id=tid) or {}).get("endpoints") or {}) if tid else {},
+        "resolved": control_plane_store.resolve_infrastructure_endpoints(tenant_id=tid),
+    }
+
+
+@router.put("/infrastructure-endpoints")
+def put_infrastructure_endpoints(payload: InfrastructureEndpointsRequest, request: Request) -> dict[str, Any]:
+    """Developer-admin: set the deployment endpoints (global default, or a
+    per-tenant override when tenant_id is provided). This is the single source
+    of truth for where the deployment's services live — re-hosting is a one-row
+    edit here; the values reach edges via activation codes."""
+    user_payload = _require_auth_payload(request)
+    if not _is_global_admin(user_payload):
+        raise HTTPException(status_code=403, detail="Global admin required")
+    actor = str(user_payload.get("sub") or user_payload.get("username") or "admin")
+    tid = str(payload.tenant_id or "").strip() or None
+    try:
+        saved = control_plane_store.set_infrastructure_config(
+            endpoints=dict(payload.endpoints or {}), tenant_id=tid, updated_by=actor,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"save_failed: {exc}") from exc
+    _audit(
+        request,
+        tenant_id=tid or "__global__",
+        action="infrastructure_endpoints.set",
+        outcome="ok",
+        details={"scope": tid or "__global__", "keys": sorted((payload.endpoints or {}).keys())},
+    )
+    return {"ok": True, "config": saved, "resolved": control_plane_store.resolve_infrastructure_endpoints(tenant_id=tid)}
 
 
 @router.get("/tenants")
@@ -1196,6 +1276,19 @@ def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request,
     assigned_tenant = (
         _customer_tenant_id(payload.customer_id) if str(payload.customer_id or "").strip() else caller_tid
     )
+    # 2026-07-15: embed the deployment endpoints (resolved: per-tenant over
+    # global) INTO the activation code metadata, so the edge learns where the
+    # portal / Supabase / AI live the moment it applies the code — no hardcoded
+    # URL in the app, no operator URL input. Re-hosting = update the portal's
+    # Infrastructure Endpoints, then new codes carry the new host automatically.
+    code_metadata = dict(payload.metadata or {})
+    try:
+        infra = control_plane_store.resolve_infrastructure_endpoints(tenant_id=assigned_tenant)
+        if infra:
+            # don't clobber an explicit metadata.infrastructure the caller sent
+            code_metadata.setdefault("infrastructure", infra)
+    except Exception:
+        pass
     try:
         row = control_plane_store.issue_activation_code(
             tenant_id=assigned_tenant,
@@ -1204,7 +1297,7 @@ def issue_activation_code(payload: ActivationCodeIssueRequest, request: Request,
             license_id=payload.license_id,
             edge_name=payload.edge_name,
             ttl_minutes=payload.ttl_minutes,
-            metadata=payload.metadata,
+            metadata=code_metadata,
         )
     except Exception as exc:
         _audit(
@@ -2364,9 +2457,33 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
             "location": str(existing_edge_profile.get("location") or ""),
             "machine_group": str(existing_edge_profile.get("machine_group") or ""),
         }
-        if str(payload.cloud_api_url or "").strip():
-            app_settings["cloud_url"] = str(payload.cloud_api_url or "").strip()
-        if str(payload.primary_domain or "").strip():
+        # 2026-07-15: persist the deployment endpoints into local app_settings so
+        # the edge self-configures — no hardcoded URL, no operator input. Source
+        # priority: the activation code's infrastructure (payload.infrastructure)
+        # -> the control-plane store (resolved for this tenant) -> the legacy
+        # cloud_api_url field. This is what makes "Re-check" work later: cloud_url
+        # is populated here from the code, not from a literal in the app.
+        infra = dict(payload.infrastructure or {})
+        if not infra:
+            try:
+                infra = control_plane_store.resolve_infrastructure_endpoints(tenant_id=tenant_id) or {}
+            except Exception:
+                infra = {}
+        eff_cloud = str(infra.get("cloud_api_url") or payload.cloud_api_url or "").strip().rstrip("/")
+        if eff_cloud:
+            app_settings["cloud_url"] = eff_cloud
+            app_settings["cloud_api_url"] = eff_cloud
+        if str(infra.get("supabase_url") or "").strip():
+            app_settings["supabase_url"] = str(infra.get("supabase_url")).strip()
+        if str(infra.get("ai_endpoint_url") or "").strip():
+            app_settings["ai_endpoint_url"] = str(infra.get("ai_endpoint_url")).strip()
+        # keep the full set under one key too, for future endpoints without new fields
+        if infra:
+            app_settings["infrastructure_endpoints"] = infra
+        web_client = str(infra.get("web_client_url") or "").strip()
+        if web_client:
+            app_settings["tenant_web_client_url"] = web_client
+        elif str(payload.primary_domain or "").strip():
             app_settings["tenant_web_client_url"] = f"https://{str(payload.primary_domain or '').strip()}"
 
         app_store.save_bootstrap(
@@ -2500,7 +2617,12 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
     try:
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
         app_settings = dict(bootstrap.get("app_settings") or {})
-        cloud_url = str(app_settings.get("cloud_url") or app_settings.get("cloud_api_url") or "").strip().rstrip("/")
+        # 2026-07-15: resolve via the shared resolver (env -> app_settings ->
+        # infrastructure_endpoints; NO hardcoded host). On this edge cloud_url
+        # was populated from the activation code at link time, so re-check can
+        # reach the portal and pull a renewed license. If genuinely unconfigured,
+        # cloud_url is "" and _sync reports 'not configured' rather than looping.
+        cloud_url = _resolve_cloud_control_plane_base(request).rstrip("/")
         should_try_cloud = bool(cloud_url and not _is_same_origin_as_request(cloud_url, request))
         linked_license_id = str(app_settings.get("license_id") or "").strip()
         linked_edge_id = str(app_settings.get("edge_id") or check_edge_id or "").strip()
@@ -2834,7 +2956,9 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
             or not str((out.get("license") or {}).get("end_utc") if isinstance(out.get("license"), dict) else "").strip()
             or not isinstance(((out.get("license") or {}) if isinstance(out.get("license"), dict) else {}).get("modules"), list)
         ):
-            cloud_url = str(app_settings.get("cloud_url") or app_settings.get("cloud_api_url") or "").strip().rstrip("/")
+            # 2026-07-15: same resolver (no hardcoded host) for the secondary
+            # recovery pull; cloud_url comes from the activation-delivered config.
+            cloud_url = _resolve_cloud_control_plane_base(request).rstrip("/")
             if cloud_url and not _is_same_origin_as_request(cloud_url, request):
                 auth = str(request.headers.get("authorization") or "").strip()
                 fwd_headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -3223,7 +3347,8 @@ def edge_link_trial_start(request: Request, payload: _TrialStartPayload, tenant_
     try:
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
         app_settings = dict(bootstrap.get("app_settings") or {})
-        cloud_url = str(app_settings.get("cloud_url") or app_settings.get("cloud_api_url") or "").strip().rstrip("/")
+        # 2026-07-15: resolver (no hardcoded host) for the trial-start mirror too.
+        cloud_url = _resolve_cloud_control_plane_base(request).rstrip("/")
         if cloud_url and not _is_same_origin_as_request(cloud_url, request):
             fwd_headers = {"X-Tenant-Id": tid, "Content-Type": "application/json"}
             auth = str(request.headers.get("authorization") or "").strip()

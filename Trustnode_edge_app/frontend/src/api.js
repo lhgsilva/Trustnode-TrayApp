@@ -2074,6 +2074,28 @@ export async function getControlPlaneLicenses(tenantId = "") {
   return res.json();
 }
 
+// Infrastructure Endpoints (developer-admin) — the single source of truth for
+// where the deployment's services live. Values flow into activation codes so
+// edges self-configure without any hardcoded URL. 2026-07-15.
+export async function getInfrastructureEndpoints(tenantId = "") {
+  const params = new URLSearchParams();
+  if (tenantId) params.set("tenant_id", String(tenantId));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/infrastructure-endpoints${suffix}`);
+  await ensureOk(res, "Infrastructure endpoints fetch failed");
+  return res.json();
+}
+
+export async function saveInfrastructureEndpoints(endpoints, tenantId = "") {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/control-plane/infrastructure-endpoints`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ endpoints: endpoints || {}, tenant_id: tenantId || "" }),
+  });
+  await ensureOk(res, "Infrastructure endpoints save failed");
+  return res.json();
+}
+
 export async function upsertControlPlaneLicense(payload, tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));
