@@ -333,7 +333,92 @@ class ReportIntegrationService(_BatchV2Base):
         secs = template["definition"].setdefault("sections", [])
         insert_at = 1 if secs and secs[0].get("type") == "header" else 0
         secs.insert(insert_at, {"type": "text", "title": "Batch Results", "text": summary_text})
+        # Append the definition's CONFIGURED charts (one section per chart, its
+        # type + its tags), a per-tag summary (min/max/avg + pass/fail), and a
+        # sampled readings matrix — so the report mirrors the batch view.
+        secs.extend(self._configured_chart_sections(batch, gw))
+        secs.append({"type": "text", "title": "Tag Summary", "text": self._tag_summary_text(batch)})
+        secs.append({"type": "text", "title": "Collected Data (sampled)", "text": self._matrix_text(batch)})
         return template
+
+    _CHART_TYPE_MAP = {"line": "line_chart", "area": "area_chart", "bar": "bar_chart", "scatter": "line_chart"}
+
+    def _configured_charts(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
+        """The charts[] declared on the batch's definition version config
+        (charts live only in configuration_json, like properties)."""
+        ver = batch.get("definition_version_id")
+        if not ver:
+            return []
+        with self._connect_readonly() as c:
+            r = c.execute("SELECT configuration_json FROM batch_definition_version WHERE id = ? AND tenant_id = ?",
+                          (ver, self._tenant())).fetchone()
+        cfg = _json_load(r["configuration_json"]) if r else {}
+        charts = (cfg or {}).get("charts") or []
+        return [ch for ch in charts if isinstance(ch, dict) and ch.get("tags")]
+
+    def _configured_chart_sections(self, batch: dict[str, Any], gw) -> list[dict[str, Any]]:
+        out = []
+        for ch in self._configured_charts(batch):
+            sec_type = self._CHART_TYPE_MAP.get(str(ch.get("type") or "line"), "line_chart")
+            out.append({
+                "type": sec_type, "title": ch.get("title") or "Chart",
+                "time_range": {"preset": "batch", "batch_id": batch["id"]},
+                "series": [{"id": f"s{i}", "label": tg, "gateway_id": gw, "tag_name": tg,
+                            "axis": "left", "aggregation": "avg"}
+                           for i, tg in enumerate(ch.get("tags") or [])],
+                "show_legend": True, "readings_count": 500,
+            })
+        return out
+
+    def _tag_summary_text(self, batch: dict[str, Any]) -> str:
+        """Per-tag min/max/avg + within-limits, computed from the batch window."""
+        try:
+            mx = self._exe.tag_matrix(batch["id"], max_rows=5000)
+        except Exception:
+            return "No collected data."
+        cols = mx.get("tags") or []
+        agg = {c: [] for c in cols}
+        for row in mx.get("rows") or []:
+            for c in cols:
+                v = (row.get("values") or {}).get(c)
+                if isinstance(v, (int, float)):
+                    agg[c].append(v)
+        spec = set(mx.get("spec_tags") or [])
+        lines = []
+        for c in cols:
+            vals = agg[c]
+            if not vals:
+                lines.append(f"{c}: (no numeric samples)"); continue
+            lo, hi, av = min(vals), max(vals), sum(vals) / len(vals)
+            flag = ""
+            if c in spec:
+                out_rows = sum(1 for r in (mx.get("rows") or [])
+                               if isinstance((r.get("values") or {}).get(c), (int, float)) and r.get("in_limits") is False)
+                flag = "  [PASS]" if out_rows == 0 else f"  [FAIL: {out_rows} out-of-limit]"
+            lines.append(f"{c}: min {lo:g}, max {hi:g}, avg {av:g}{flag}")
+        return "\n".join(lines) or "No collected data."
+
+    def _matrix_text(self, batch: dict[str, Any], max_rows: int = 60) -> str:
+        """A compact sampled readings table as text (keeps PDFs a sane size)."""
+        try:
+            mx = self._exe.tag_matrix(batch["id"], max_rows=max_rows)
+        except Exception:
+            return "No collected data."
+        cols = mx.get("tags") or []
+        if not cols:
+            return "No collected data in the batch window."
+        header = "Timestamp".ljust(20) + "".join(str(c)[:12].rjust(13) for c in cols) + "   In-limits"
+        lines = [header]
+        for r in mx.get("rows") or []:
+            ts = str(r.get("ts") or "")[:19].ljust(20)
+            cells = ""
+            for c in cols:
+                v = (r.get("values") or {}).get(c)
+                cells += (f"{v:g}" if isinstance(v, (int, float)) else (str(v) if v is not None else "—"))[:12].rjust(13)
+            verdict = "—" if r.get("in_limits") is None else ("OK" if r.get("in_limits") else "OUT")
+            lines.append(ts + cells + "   " + verdict)
+        note = f"\n({mx.get('total')} total samples" + (f", showing {len(mx.get('rows') or [])} sampled)" if mx.get("sampled") else ")")
+        return "\n".join(lines) + note
 
     def _computed_kpi_text(self, batch: dict[str, Any]) -> str:
         """A plain-text block of the batch's computed KPIs + quality (values the
@@ -380,6 +465,28 @@ class ReportIntegrationService(_BatchV2Base):
                 sec.pop("items", None); sec.pop("columns", None)
             elif sec.get("type") == "header":
                 sec["subtitle"] = f"{group.get('reference') or group['id']}"
+        # Per-child mini-summary: reference / status / result / pass% / per-tag
+        # min-max-avg, so the group report shows each child's collected results.
+        try:
+            children = self._groups.child_batches(group["id"])
+        except Exception:
+            children = []
+        child_lines = []
+        for ch in children:
+            md = ch.get("metadata") or {}
+            if isinstance(md, str):
+                md = _json_load(md) or {}
+            res = str(md.get("result") or "").upper() or "—"
+            passc = md.get("pass_tag_count"); failc = md.get("fail_tag_count")
+            pct = ""
+            if isinstance(passc, int) and isinstance(failc, int) and (passc + failc) > 0:
+                pct = f"  pass {round(100 * passc / (passc + failc))}%"
+            child_lines.append(f"• {ch.get('reference') or ch['id']} — {str(ch.get('status') or '').upper()} — {res}{pct}")
+            summ = self._tag_summary_text(ch)
+            for ln in summ.splitlines():
+                child_lines.append(f"    {ln}")
+        if child_lines:
+            secs.append({"type": "text", "title": "Child Batches", "text": "\n".join(child_lines)})
         return template
 
     def _trend_tags(self, batch: dict[str, Any]) -> list[str]:

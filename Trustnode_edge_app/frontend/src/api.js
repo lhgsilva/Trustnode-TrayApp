@@ -3377,6 +3377,10 @@ export async function bmv2BatchExcursions(id) { return (await _bmGet(`/batches/$
 export async function bmv2BatchCollectedTags(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/collected-tags`)).tags || []; }
 // Custom batch properties (barcode / order # / equipment / ...).
 export async function bmv2BatchProperties(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/properties`)).rows || []; }
+// Aligned tag matrix (rows=timestamps, cols=tags, per-row in-limits), downsampled.
+export async function bmv2BatchMatrix(id, tags = "", maxRows = 200) {
+  return _bmGet(`/batches/${encodeURIComponent(id)}/matrix${_qs({ tags, max_rows: maxRows })}`);
+}
 export async function bmv2BatchDefinitionProperties(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/definition-properties`)).rows || []; }
 export async function bmv2ListBatchReports(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/reports`)).rows || []; }
 export async function bmv2GenerateBatchReport(id, templateId = null) {

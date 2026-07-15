@@ -16,8 +16,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  Legend, ReferenceLine,
+  ResponsiveContainer, ComposedChart, LineChart, Line, Area, Scatter, Bar,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine,
 } from "recharts";
 import {
   bmv2Status, bmv2SeedReportTemplates, bmv2ReportTemplates,
@@ -25,7 +25,7 @@ import {
   bmv2ValidateDefinition, bmv2PublishDefinition, bmv2ListVersions, bmv2NewVersion,
   bmv2ListBatches, bmv2GetBatch, bmv2CreateBatch, bmv2BatchAction, bmv2AddComment,
   bmv2BatchEvents, bmv2BatchTrends, bmv2BatchKpis, bmv2RecomputeBatch, bmv2BatchExcursions,
-  bmv2BatchCollectedTags, bmv2BatchProperties, bmv2ListBatchReports, bmv2GenerateBatchReport, bmv2EmailBatchReport,
+  bmv2BatchCollectedTags, bmv2BatchProperties, bmv2BatchMatrix, bmv2ListBatchReports, bmv2GenerateBatchReport, bmv2EmailBatchReport,
   bmv2ListGroups, bmv2GetGroup, bmv2CreateGroup, bmv2CompleteGroup, bmv2AbortGroup,
   bmv2GroupBatches, bmv2GroupKpis, bmv2ListGroupReports, bmv2GenerateGroupReport, bmv2EmailGroupReport,
   bmv2AnalysisExcursions, bmv2AckExcursion, bmv2AnalysisComparison,
@@ -368,6 +368,109 @@ function TrendChart({ series, xKey = "ts", height = 260, limitLines = [] }) {
           ))}
         </LineChart>
       </ResponsiveContainer>
+    </div>
+  );
+}
+
+// One configured chart card. Renders the chart's tags as series; each series
+// has a clickable chip to toggle it on/off for analysis. `series` is the batch's
+// full per-tag series ([{tag, points}]); we filter to this chart's tags.
+function ChartCard({ chart, series }) {
+  const chartTags = chart.tags || [];
+  const [hidden, setHidden] = useState(() => new Set());
+  const active = chartTags.filter((t) => !hidden.has(t));
+  const data = useMemo(() => {
+    const byX = new Map();
+    (series || []).forEach((s) => {
+      if (!chartTags.includes(s.tag)) return;
+      (s.points || []).forEach((p) => {
+        const x = p.ts ?? p.elapsed_s;
+        if (!byX.has(x)) byX.set(x, { x });
+        byX.get(x)[s.tag] = p.value;
+      });
+    });
+    return Array.from(byX.values()).sort((a, b) => (a.x > b.x ? 1 : -1));
+  }, [series, chart]);
+  const toggle = (t) => setHidden((h) => { const n = new Set(h); n.has(t) ? n.delete(t) : n.add(t); return n; });
+  const type = chart.type || "line";
+  const renderSeries = (tag, i) => {
+    const color = SERIES_COLORS[i % SERIES_COLORS.length];
+    if (type === "area") return <Area key={tag} type="monotone" dataKey={tag} stroke={color} fill={color} fillOpacity={0.18} dot={false} isAnimationActive={false} connectNulls />;
+    if (type === "scatter") return <Scatter key={tag} dataKey={tag} fill={color} isAnimationActive={false} />;
+    if (type === "bar") return <Bar key={tag} dataKey={tag} fill={color} isAnimationActive={false} />;
+    return <Line key={tag} type="monotone" dataKey={tag} stroke={color} dot={false} strokeWidth={1.6} isAnimationActive={false} connectNulls />;
+  };
+  return (
+    <div style={{ border: "1px solid var(--stroke)", borderRadius: 10, padding: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>{chart.title || "Chart"}</span>
+        <span style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase" }}>{type}</span>
+      </div>
+      {/* clickable series chips: toggle a tag on/off for analysis */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+        {chartTags.map((t, i) => (
+          <button key={t} type="button" onClick={() => toggle(t)}
+            className={`btn btn-sm ${hidden.has(t) ? "btn-ghost" : "btn-secondary"}`}
+            style={{ fontSize: 11, opacity: hidden.has(t) ? 0.5 : 1 }}>
+            <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 2, marginRight: 5,
+              background: SERIES_COLORS[i % SERIES_COLORS.length] }} />{t}
+          </button>
+        ))}
+      </div>
+      {data.length && active.length ? (
+        <div style={{ height: 220 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <ComposedChart data={data} margin={{ top: 6, right: 12, bottom: 6, left: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--stroke)" />
+              <XAxis dataKey="x" tick={{ fontSize: 10 }} tickFormatter={(v) => String(v).slice(11, 19)} minTickGap={40} />
+              <YAxis tick={{ fontSize: 10 }} width={44} />
+              <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--stroke)", color: "var(--text)", fontSize: 12 }} />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              {chartTags.map((t, i) => (hidden.has(t) ? null : renderSeries(t, i)))}
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+      ) : <div style={{ color: "var(--muted)", fontSize: 12, padding: 12 }}>{chartTags.length ? "No data / all series hidden." : "No tags in this chart."}</div>}
+    </div>
+  );
+}
+
+// Aligned tag matrix table: rows=timestamps, cols=tags, last col = in-limits.
+// Scrollable + downsampled (the endpoint caps rows); shows total + sampled note.
+function TagMatrixTable({ matrix }) {
+  if (!matrix || !(matrix.rows || []).length) return <div style={{ color: "var(--muted)", fontSize: 13 }}>No collected data in the batch window.</div>;
+  const cols = matrix.tags || [];
+  const fmtCell = (v) => (v === null || v === undefined ? "—" : (typeof v === "number" ? fmtNum(v) : String(v)));
+  return (
+    <div>
+      <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
+        {matrix.total} sample{matrix.total === 1 ? "" : "s"} in the batch window{matrix.sampled ? ` · showing ${matrix.rows.length} evenly-sampled rows` : ""}.
+        {matrix.spec_tags?.length ? ` In-limits checks tags: ${matrix.spec_tags.join(", ")}.` : ""}
+      </div>
+      <div style={{ overflowX: "auto", maxHeight: 420, overflowY: "auto", border: "1px solid var(--stroke)", borderRadius: 8 }}>
+        <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12 }}>
+          <thead>
+            <tr style={{ position: "sticky", top: 0, background: "var(--card)" }}>
+              <th style={{ textAlign: "left", padding: "6px 10px", borderBottom: "1px solid var(--stroke)", whiteSpace: "nowrap" }}>Timestamp</th>
+              {cols.map((c) => <th key={c} style={{ textAlign: "right", padding: "6px 10px", borderBottom: "1px solid var(--stroke)", whiteSpace: "nowrap" }}>{c}</th>)}
+              <th style={{ textAlign: "center", padding: "6px 10px", borderBottom: "1px solid var(--stroke)" }}>In limits</th>
+            </tr>
+          </thead>
+          <tbody>
+            {matrix.rows.map((r, i) => (
+              <tr key={i} style={{ borderBottom: "1px solid var(--stroke)" }}>
+                <td style={{ padding: "4px 10px", whiteSpace: "nowrap", color: "var(--muted)" }}>{String(r.ts).slice(0, 19)}</td>
+                {cols.map((c) => <td key={c} style={{ padding: "4px 10px", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{fmtCell(r.values?.[c])}</td>)}
+                <td style={{ padding: "4px 10px", textAlign: "center" }}>
+                  {r.in_limits === null ? <span style={{ color: "var(--muted)" }}>—</span>
+                    : r.in_limits ? <span className="status-pill status-online">OK</span>
+                    : <span className="status-pill status-offline">OUT</span>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -751,6 +854,8 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
   const [reports, setReports] = useState([]);
   const [tags, setTags] = useState([]);
   const [properties, setProperties] = useState(() => cacheGet(`batch:props:${batchId}`, []));
+  const [charts, setCharts] = useState(() => cacheGet(`batch:charts:${batchId}`, []));
+  const [matrix, setMatrix] = useState(() => cacheGet(`batch:matrix:${batchId}`, null));
   const [preview, setPreview] = useState(null);
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
@@ -761,14 +866,23 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
     try {
       const b = await bmv2GetBatch(batchId);
       setBatch(b); cacheSet(`batch:full:${batchId}`, b);
-      const [k, x, e, r, tg, pr] = await Promise.all([
+      const [k, x, e, r, tg, pr, mx] = await Promise.all([
         bmv2BatchKpis(batchId), bmv2BatchExcursions(batchId), bmv2BatchEvents(batchId, 100),
         bmv2ListBatchReports(batchId), bmv2BatchCollectedTags(batchId), bmv2BatchProperties(batchId),
+        bmv2BatchMatrix(batchId, "", 200).catch(() => null),
       ]);
       setKpis(k); setExcursions(x); setEvents(e); setReports(r); setTags(tg); setProperties(pr);
+      if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); }
       cacheSet(`batch:kpis:${batchId}`, k); cacheSet(`batch:exc:${batchId}`, x); cacheSet(`batch:props:${batchId}`, pr);
       setErr("");
-      if (tg.length) setSeries(await bmv2BatchTrends(batchId, tg.slice(0, 4).join(","), 400));
+      // charts config comes from the batch's definition (config.charts[])
+      if (b?.definition_id) {
+        bmv2GetDefinition(b.definition_id).then((d) => {
+          const ch = d?.config?.charts || [];
+          setCharts(ch); cacheSet(`batch:charts:${batchId}`, ch);
+        }).catch(() => {});
+      }
+      if (tg.length) setSeries(await bmv2BatchTrends(batchId, tg.slice(0, 8).join(","), 500));
     } catch (ex) { const t = errText(ex); if (t) setErr(t); }
   }, [batchId]);
 
@@ -854,6 +968,21 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
             ))}
           </div>
         ) : <div style={{ color: "var(--muted)", fontSize: 13 }}>No KPIs computed yet. {canEdit && <button className="btn btn-ghost btn-sm" onClick={async () => { await bmv2RecomputeBatch(batchId); load(); }}>Recompute</button>}</div>}
+      </Card>
+
+      {/* Configured charts (from the definition). One card per chart; click a
+          series chip to toggle it on the chart for analysis. */}
+      {charts.length > 0 && (
+        <Card title="Charts">
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(360px, 1fr))", gap: 12 }}>
+            {charts.map((c) => <ChartCard key={c.id} chart={c} series={series} />)}
+          </div>
+        </Card>
+      )}
+
+      {/* Detailed collected time-series (aligned tag matrix, downsampled). */}
+      <Card title="Collected data (time series)">
+        <TagMatrixTable matrix={matrix} />
       </Card>
 
       {tags.length > 0 && <Card title="Process trends"><TrendChart series={series} xKey="ts" limitLines={limitLines} /></Card>}
@@ -1004,7 +1133,11 @@ function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
       </Card>
 
       <Card title={`Child batches (${children.length})`}>
-        <BatchTable rows={children} onOpen={onOpenBatch} />
+        <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
+          Expand a child to see its collected tag values (rows = timestamps, columns = tags, last column = within-limits).
+        </div>
+        {children.map((ch) => <ChildBatchRow key={ch.id} child={ch} onOpen={onOpenBatch} />)}
+        {!children.length && <div style={{ color: "var(--muted)", fontSize: 13 }}>No child batches.</div>}
       </Card>
 
       <Card title="Reports">
@@ -1028,10 +1161,46 @@ function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
   );
 }
 
+// An expandable child-batch row inside the group view. Collapsed: a summary
+// line. Expanded: lazily loads that child's tag matrix (rows=ts, cols=tags,
+// last col=in-limits). Cached per child so re-expanding is instant.
+function ChildBatchRow({ child, onOpen }) {
+  const [open, setOpen] = useState(false);
+  const [matrix, setMatrix] = useState(() => cacheGet(`batch:matrix:${child.id}`, null));
+  const [loading, setLoading] = useState(false);
+  useEffect(() => {
+    if (!open || matrix) return;
+    setLoading(true);
+    bmv2BatchMatrix(child.id, "", 200)
+      .then((m) => { setMatrix(m); cacheSet(`batch:matrix:${child.id}`, m); })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, [open, child.id]);
+  return (
+    <div style={{ border: "1px solid var(--stroke)", borderRadius: 8, marginBottom: 6 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "auto 1.6fr 1fr 1fr 1fr auto", gap: 8, alignItems: "center", padding: "8px 10px" }}>
+        <button className="btn btn-ghost btn-sm" onClick={() => setOpen((v) => !v)} style={{ width: 28 }} title={open ? "Collapse" : "Expand"}>{open ? "▾" : "▸"}</button>
+        <span style={{ fontWeight: 600, cursor: "pointer" }} onClick={() => setOpen((v) => !v)}>{child.reference || child.id}</span>
+        <Pill value={child.status} />
+        <ResultPill batch={child} />
+        <span style={{ fontSize: 12, color: "var(--muted)" }}>{humanDur(child.started_utc, child.ended_utc)}</span>
+        {onOpen && <button className="btn btn-secondary btn-sm" onClick={() => onOpen(child.id)}>Open</button>}
+      </div>
+      {open && (
+        <div style={{ padding: "0 10px 10px", borderTop: "1px solid var(--stroke)" }}>
+          {loading && !matrix ? <div style={{ color: "var(--muted)", fontSize: 12, padding: 10 }}>Loading…</div>
+            : <TagMatrixTable matrix={matrix} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* --------------------------------------------------------------------- */
 /*  PAGE 2 — Batch Definitions (list + guided multi-step builder)        */
 /* --------------------------------------------------------------------- */
-const WIZ_STEPS = ["General", "Structure", "Identification", "Start", "Stop", "Tags & Limits", "KPIs", "Reports & Email", "Publish"];
+const WIZ_STEPS = ["General", "Structure", "Identification", "Start", "Stop", "Tags & Limits", "Charts", "KPIs", "Reports & Email", "Publish"];
+const CHART_TYPES = [["line", "Line"], ["area", "Area"], ["scatter", "Scatter"], ["bar", "Bar"]];
 const KPI_CHOICES = [
   ["cycle_time", "Cycle time"], ["running_time", "Running time"], ["hold_time", "Hold time"],
   ["avg", "Average (per tag)"], ["min", "Min (per tag)"], ["max", "Max (per tag)"],
@@ -1142,7 +1311,7 @@ function DefinitionWizard({ definitionId, gateways, canEdit, onClose, onSaved })
       start_config: { method: "manual" }, stop_config: { method: "manual" },
       report_config: {}, batch_report_template_id: "tpl-batch-detailed", batch_group_report_template_id: "tpl-batch-group-summary",
       auto_generate_batch_report: false, auto_email_batch_report: false, email_config: { recipients: "", subject: "", body: "" },
-      tags: [], triggers: [], kpis: [], properties: [],
+      tags: [], triggers: [], kpis: [], properties: [], charts: [],
     },
   });
 
@@ -1169,7 +1338,7 @@ function DefinitionWizard({ definitionId, gateways, canEdit, onClose, onSaved })
           email_config: d.config?.email_config || { recipients: "", subject: "", body: "" },
           tags: (d.config?.tags || []).map((t) => ({ ...t, limits: t.limits || [] })),
           triggers: d.config?.triggers || [], kpis: d.config?.kpis || [],
-          properties: d.config?.properties || [],
+          properties: d.config?.properties || [], charts: d.config?.charts || [],
         },
       });
       setLoading(false);
@@ -1233,9 +1402,10 @@ function DefinitionWizard({ definitionId, gateways, canEdit, onClose, onSaved })
         {step === 3 && <StepCondition which="start_config" title="Start" cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
         {step === 4 && <StepCondition which="stop_config" title="Stop" cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
         {step === 5 && <StepTags cfg={form.config} setCfg={setCfg} gateways={gateways} readOnly={readOnly} />}
-        {step === 6 && <StepKpis cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
-        {step === 7 && <StepReports cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
-        {step === 8 && <StepPublish validation={validation} onValidate={doValidate} onPublish={doPublish} canEdit={canEdit} published={published} busy={busy} />}
+        {step === 6 && <StepCharts cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
+        {step === 7 && <StepKpis cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
+        {step === 8 && <StepReports cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
+        {step === 9 && <StepPublish validation={validation} onValidate={doValidate} onPublish={doPublish} canEdit={canEdit} published={published} busy={busy} />}
       </div>
 
       <div style={{ display: "flex", gap: 8, justifyContent: "space-between", marginTop: 14, borderTop: "1px solid var(--stroke)", paddingTop: 12 }}>
@@ -1535,6 +1705,56 @@ function TagLimits({ tag, onChange, readOnly }) {
         </div>
       ))}
       {!readOnly && <button className="btn btn-ghost btn-sm" onClick={add} style={{ fontSize: 11 }}>+ limit</button>}
+    </div>
+  );
+}
+
+// Charts step: define the charts shown on the batch/group view + in reports.
+// Each chart = { id, title, type, tags:[names] }. Tags come from THIS definition's
+// tag list. Stored in config.charts[]; the batch view renders one card per chart
+// and lets the user toggle each series on/off for analysis.
+function StepCharts({ cfg, setCfg, readOnly }) {
+  const charts = cfg.charts || [];
+  const defTags = (cfg.tags || []).map((t) => t.tag_name).filter(Boolean);
+  const genId = () => `chart_${charts.length + 1}_${(charts.map((c) => c.id).join("").length)}`;
+  const addChart = () => setCfg({ charts: [...charts, { id: genId(), title: `Chart ${charts.length + 1}`, type: "line", tags: [] }] });
+  const setChart = (i, patch) => setCfg({ charts: charts.map((c, j) => (j === i ? { ...c, ...patch } : c)) });
+  const toggleTag = (i, tag) => {
+    const c = charts[i]; const has = (c.tags || []).includes(tag);
+    setChart(i, { tags: has ? c.tags.filter((t) => t !== tag) : [...(c.tags || []), tag] });
+  };
+  return (
+    <div>
+      <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
+        Define charts to show on the batch view and in reports. Each chart plots the tags you pick; on the
+        batch view you can click a series to add/remove it for analysis.
+      </div>
+      {!readOnly && <button className="btn btn-ghost btn-sm" onClick={addChart} style={{ marginBottom: 10 }} disabled={!defTags.length}>+ Add chart</button>}
+      {!defTags.length && <div style={{ color: "var(--muted)", fontSize: 12 }}>Add tags in “Tags &amp; Limits” first — charts plot those tags.</div>}
+      {!charts.length && defTags.length > 0 && <div style={{ color: "var(--muted)", fontSize: 12 }}>No charts yet. Add one to visualize tag trends.</div>}
+      {charts.map((c, i) => (
+        <div key={c.id || i} style={{ border: "1px solid var(--stroke)", borderRadius: 8, padding: 10, marginBottom: 8 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr auto", gap: 8, alignItems: "center", marginBottom: 8 }}>
+            <input disabled={readOnly} placeholder="Chart title" value={c.title || ""} onChange={(e) => setChart(i, { title: e.target.value })} />
+            <select disabled={readOnly} value={c.type || "line"} onChange={(e) => setChart(i, { type: e.target.value })}>
+              {CHART_TYPES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+            </select>
+            {!readOnly && <button className="btn btn-danger btn-sm" onClick={() => setCfg({ charts: charts.filter((_, j) => j !== i) })}>×</button>}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>Series (tags in this chart)</div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {defTags.map((tag) => {
+              const on = (c.tags || []).includes(tag);
+              return (
+                <button key={tag} type="button" disabled={readOnly} onClick={() => toggleTag(i, tag)}
+                  className={`btn btn-sm ${on ? "btn-primary" : "btn-ghost"}`} style={{ fontSize: 11 }}>
+                  {on ? "✓ " : ""}{tag}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
     </div>
   );
 }

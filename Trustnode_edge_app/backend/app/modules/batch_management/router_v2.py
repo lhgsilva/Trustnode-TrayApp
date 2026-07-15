@@ -299,6 +299,15 @@ def batch_collected_tags(batch_id: str) -> dict:
     return {"tags": _exe().collected_tags_in_window(batch_id)}
 
 
+@router.get("/batches/{batch_id}/matrix", dependencies=_LIC)
+def batch_matrix(batch_id: str, tags: str = "", max_rows: int = 200) -> dict:
+    """Aligned tag matrix (rows=timestamps, cols=tags, per-row in-limits),
+    downsampled. Powers the single-batch time-series section + group child
+    expand."""
+    taglist = [t.strip() for t in (tags or "").split(",") if t.strip()] or None
+    return _exe().tag_matrix(batch_id, tags=taglist, max_rows=max(10, min(max_rows, 2000)))
+
+
 # ---- Custom properties (barcode / order # / equipment / ...) -------------
 @router.get("/batches/{batch_id}/properties", dependencies=_LIC)
 def batch_properties(batch_id: str) -> dict:

@@ -1114,6 +1114,72 @@ class BatchExecutionService(_BatchV2Base):
                     continue
         return sorted(tags)
 
+    def tag_matrix(self, batch_id: str, *, tags: Optional[list[str]] = None, max_rows: int = 200) -> dict[str, Any]:
+        """Aligned time-series matrix for a batch: one row per timestamp, one
+        column per tag, plus a per-row in-limits verdict (OK / OUT vs the tags'
+        spec limits). Read-only over the historian window (no PLC re-poll).
+
+        Downsampled to <= max_rows evenly-spaced rows so long batches stay
+        instant in the UI; `total` reports the pre-sample row count. The report
+        renderer uses the same shape (with a larger cap) for its sampled table."""
+        # per-tag spec limits, so we can flag each row within/outside
+        from .calc_v2 import BatchCalcService, _SPEC_UPPER, _SPEC_LOWER
+        calc = BatchCalcService(self._app_store)
+        batch = self.get_batch(batch_id)
+        limits = calc._limits_for_batch(batch) if batch else {}
+        spec = {}
+        for tg, lst in (limits or {}).items():
+            lo = next((_opt_num(l.get("limit_value")) for l in lst if str(l.get("limit_type")) == _SPEC_LOWER), None)
+            hi = next((_opt_num(l.get("limit_value")) for l in lst if str(l.get("limit_type")) == _SPEC_UPPER), None)
+            if lo is not None or hi is not None:
+                spec[tg] = (lo, hi)
+
+        rows = self.historian_rows_for_batch(batch_id, limit=50000)
+        want = set(tags) if tags else None
+        # bucket by timestamp -> {tag: value}
+        by_ts: dict[str, dict[str, Any]] = {}
+        tagset: set[str] = set()
+        for r in rows:
+            tg = str(r.get("tag_name") or "")
+            if want is not None and tg not in want:
+                continue
+            v = r.get("value")
+            if v is None and r.get("value_text") is None:
+                continue
+            ts = str(r.get("ts_utc") or "")
+            tagset.add(tg)
+            cell = _opt_num(v)
+            by_ts.setdefault(ts, {})[tg] = cell if cell is not None else r.get("value_text")
+        ordered_ts = sorted(by_ts.keys())
+        total = len(ordered_ts)
+        # downsample evenly, always keep first + last
+        if total > max_rows:
+            import math
+            stride = math.ceil(total / max_rows)
+            keep = ordered_ts[::stride]
+            if keep and keep[-1] != ordered_ts[-1]:
+                keep.append(ordered_ts[-1])
+            ordered_ts = keep
+        cols = sorted(tagset)
+
+        def _row_ok(vals: dict[str, Any]) -> Optional[bool]:
+            checked = False
+            for tg, (lo, hi) in spec.items():
+                v = vals.get(tg)
+                if not isinstance(v, (int, float)):
+                    continue
+                checked = True
+                if (lo is not None and v < lo) or (hi is not None and v > hi):
+                    return False
+            return True if checked else None  # None = no spec tag on this row
+
+        out_rows = []
+        for ts in ordered_ts:
+            vals = by_ts[ts]
+            out_rows.append({"ts": ts, "values": {c: vals.get(c) for c in cols}, "in_limits": _row_ok(vals)})
+        return {"tags": cols, "rows": out_rows, "total": total, "sampled": total > len(out_rows),
+                "spec_tags": sorted(spec.keys())}
+
     # -- idempotency + helpers ----------------------------------------
     def _find_by_idem(self, idem: str) -> Optional[dict[str, Any]]:
         tid = self._tenant()
