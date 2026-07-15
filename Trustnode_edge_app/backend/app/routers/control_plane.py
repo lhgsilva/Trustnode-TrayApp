@@ -2500,17 +2500,7 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
     try:
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
         app_settings = dict(bootstrap.get("app_settings") or {})
-        # Operator 2026-07-15 (RE-CHECK SELF-HEAL): resolve the cloud base via the
-        # shared resolver instead of reading app_settings.cloud_url directly. On a
-        # customer edge whose local scope was never fully populated (blank
-        # cloud_url / tenant_id — e.g. a legacy or partial link), the direct read
-        # was empty, so should_try_cloud stayed False and NONE of the hydrate
-        # blocks fired: a genuinely-renewed license in the portal could never
-        # reach the edge no matter how many times "Re-check now" ran. The resolver
-        # falls back to env TRUSTNODE_CONTROL_PLANE_URL, then app_settings, then
-        # the compiled-in https://trustnode.lsapps.app on localhost — so re-check
-        # works for ANY edge/customer, matching every other control-plane route.
-        cloud_url = _resolve_cloud_control_plane_base(request).rstrip("/")
+        cloud_url = str(app_settings.get("cloud_url") or app_settings.get("cloud_api_url") or "").strip().rstrip("/")
         should_try_cloud = bool(cloud_url and not _is_same_origin_as_request(cloud_url, request))
         linked_license_id = str(app_settings.get("license_id") or "").strip()
         linked_edge_id = str(app_settings.get("edge_id") or check_edge_id or "").strip()
@@ -2844,9 +2834,7 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
             or not str((out.get("license") or {}).get("end_utc") if isinstance(out.get("license"), dict) else "").strip()
             or not isinstance(((out.get("license") or {}) if isinstance(out.get("license"), dict) else {}).get("modules"), list)
         ):
-            # Operator 2026-07-15: same resolver fallback as the primary block —
-            # never gate this secondary recovery on a blank local cloud_url.
-            cloud_url = _resolve_cloud_control_plane_base(request).rstrip("/")
+            cloud_url = str(app_settings.get("cloud_url") or app_settings.get("cloud_api_url") or "").strip().rstrip("/")
             if cloud_url and not _is_same_origin_as_request(cloud_url, request):
                 auth = str(request.headers.get("authorization") or "").strip()
                 fwd_headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -3235,10 +3223,7 @@ def edge_link_trial_start(request: Request, payload: _TrialStartPayload, tenant_
     try:
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
         app_settings = dict(bootstrap.get("app_settings") or {})
-        # Operator 2026-07-15: resolve the cloud base via the shared resolver so a
-        # blank local cloud_url doesn't skip the trial mirror (same class of bug as
-        # the license re-check; the "Activate or Start Trial" button shares it).
-        cloud_url = _resolve_cloud_control_plane_base(request).rstrip("/")
+        cloud_url = str(app_settings.get("cloud_url") or app_settings.get("cloud_api_url") or "").strip().rstrip("/")
         if cloud_url and not _is_same_origin_as_request(cloud_url, request):
             fwd_headers = {"X-Tenant-Id": tid, "Content-Type": "application/json"}
             auth = str(request.headers.get("authorization") or "").strip()
