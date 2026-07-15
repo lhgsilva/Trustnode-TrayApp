@@ -3150,16 +3150,25 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
             logger.warning("module_configs enrichment failed: %s", _mc_exc)
 
     # 2026-07-15 (SELF-HEALING RE-HOST): attach the deployment's infrastructure
-    # endpoints (resolved: per-tenant over global) to EVERY license-check response.
-    # The edge persists these on each re-check (see the persist block below), so
-    # if the deployment is re-hosted — the developer edits Infrastructure Endpoints
-    # in the portal — every edge picks up the new cloud/Supabase/AI URLs on its
-    # next routine re-check, with NO re-activation. Best-effort; never blocks.
+    # endpoints (resolved: per-tenant over global) to the license-check response.
+    # The edge persists these on each re-check (see the persist block below), so a
+    # re-hosted deployment propagates to every edge on its next routine re-check,
+    # with NO re-activation.
+    #
+    # PERF (2026-07-15): resolve ONLY on the portal/cloud backend
+    # (TRUSTNODE_CONTROL_PLANE_BACKEND=cloud), where the Supabase read is local to
+    # the VPS. On the EDGE this backend IS the caller — resolving here would fire 2
+    # extra Supabase round-trips over the customer's WAN on EVERY re-check (the
+    # "Refreshing…" hang). The edge doesn't need to resolve: it receives the
+    # `infrastructure` block from the PORTAL's response during cloud-hydrate and the
+    # persist block below stores it. So skip the resolve when we're the edge.
     try:
-        _infra_tenant = str(resolved_tenant or tid or "")
-        _infra = control_plane_store.resolve_infrastructure_endpoints(tenant_id=_infra_tenant or None)
-        if _infra:
-            out["infrastructure"] = _infra
+        _bm = str(os.environ.get("TRUSTNODE_CONTROL_PLANE_BACKEND", "")).strip().lower()
+        if _bm == "cloud":
+            _infra_tenant = str(resolved_tenant or tid or "")
+            _infra = control_plane_store.resolve_infrastructure_endpoints(tenant_id=_infra_tenant or None)
+            if _infra:
+                out["infrastructure"] = _infra
     except Exception:
         pass
 
