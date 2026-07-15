@@ -3149,6 +3149,20 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
         except Exception as _mc_exc:
             logger.warning("module_configs enrichment failed: %s", _mc_exc)
 
+    # 2026-07-15 (SELF-HEALING RE-HOST): attach the deployment's infrastructure
+    # endpoints (resolved: per-tenant over global) to EVERY license-check response.
+    # The edge persists these on each re-check (see the persist block below), so
+    # if the deployment is re-hosted — the developer edits Infrastructure Endpoints
+    # in the portal — every edge picks up the new cloud/Supabase/AI URLs on its
+    # next routine re-check, with NO re-activation. Best-effort; never blocks.
+    try:
+        _infra_tenant = str(resolved_tenant or tid or "")
+        _infra = control_plane_store.resolve_infrastructure_endpoints(tenant_id=_infra_tenant or None)
+        if _infra:
+            out["infrastructure"] = _infra
+    except Exception:
+        pass
+
     # Operator 2026-06-18: SIGN the license payload server-side IF this
     # backend is running on the dev portal VPS (TRUSTNODE_LICENSE_SIGNING_PRIVATE_PEM
     # env var present). The customer's tray then verifies the signature
@@ -3187,10 +3201,27 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
     try:
         _cloud_ok = bool(out.get("ok"))
         _lic_payload = out.get("license") if isinstance(out.get("license"), dict) else None
-        if _cloud_ok and _lic_payload:
+        _infra_payload = out.get("infrastructure") if isinstance(out.get("infrastructure"), dict) else None
+        if (_cloud_ok and _lic_payload) or _infra_payload:
             _bs = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
             _s_persist = dict(_bs.get("app_settings") or {})
-            _s_persist["license"] = dict(_lic_payload)
+            if _cloud_ok and _lic_payload:
+                _s_persist["license"] = dict(_lic_payload)
+            # 2026-07-15 (SELF-HEALING RE-HOST): persist the deployment endpoints the
+            # portal sent, so re-hosting propagates to this edge on its next re-check
+            # with no re-activation. Mirrors edge_link_local_finalize's persistence.
+            if _infra_payload:
+                _eff_cloud = str(_infra_payload.get("cloud_api_url") or "").strip().rstrip("/")
+                if _eff_cloud:
+                    _s_persist["cloud_url"] = _eff_cloud
+                    _s_persist["cloud_api_url"] = _eff_cloud
+                if str(_infra_payload.get("supabase_url") or "").strip():
+                    _s_persist["supabase_url"] = str(_infra_payload.get("supabase_url")).strip()
+                if str(_infra_payload.get("ai_endpoint_url") or "").strip():
+                    _s_persist["ai_endpoint_url"] = str(_infra_payload.get("ai_endpoint_url")).strip()
+                if str(_infra_payload.get("web_client_url") or "").strip():
+                    _s_persist["tenant_web_client_url"] = str(_infra_payload.get("web_client_url")).strip()
+                _s_persist["infrastructure_endpoints"] = dict(_infra_payload)
             app_store.upsert_domain("app_settings", _s_persist, actor="license_check_persist")
             # Invalidate the 30s cache so license_inspect re-reads now.
             try:

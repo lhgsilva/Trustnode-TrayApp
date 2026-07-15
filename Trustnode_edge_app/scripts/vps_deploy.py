@@ -106,6 +106,18 @@ def main() -> int:
         run(client, f"cd {repo_root} && git stash drop", label="drop empty stash")
     else:
         print(f"[!] stash still has content after pull — leaving it in place. Inspect with: cd {repo_root} && git stash show -p")
+    # 2026-07-15: install Python deps in the backend venv BEFORE restart. The
+    # deploy previously only pulled + restarted, so a newly-added dependency
+    # (e.g. httpx for the Intelligence module) was never installed and the module
+    # failed to load with ModuleNotFoundError. Running pip on every deploy keeps
+    # the venv in sync with requirements.txt — no more dependency drift.
+    backend_dir = f"{repo_root}/Trustnode_edge_app/backend"
+    run(
+        client,
+        f"cd {backend_dir} && ./.venv/bin/pip install -q -r requirements.txt 2>&1 | tail -15",
+        label="pip install backend requirements",
+        allow_fail=True,
+    )
     run(client, "systemctl restart trustnode-backend", label="restart backend")
     # Wait briefly then confirm
     run(client, "sleep 2 && systemctl status trustnode-backend --no-pager | head -25", label="post-restart status")

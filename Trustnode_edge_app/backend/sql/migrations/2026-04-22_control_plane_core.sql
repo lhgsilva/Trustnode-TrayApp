@@ -130,6 +130,21 @@ CREATE TABLE IF NOT EXISTS cp_security_audit_log (
   details_json JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
+-- Infrastructure endpoints (developer-admin managed, 2026-07-15). Single source
+-- of truth for where the deployment's services live (control-plane API, Supabase,
+-- AI, ...). tenant_id '__global__' is the deployment-wide default; a per-tenant
+-- row overrides it. endpoints_json is kept as TEXT (a JSON string) to match the
+-- ControlPlaneStore accessor which json.loads/dumps it — do NOT change to JSONB
+-- without updating the store. Idempotent so re-running the migration is safe and
+-- a fresh Supabase gets it automatically (no hand-created tables ever).
+CREATE TABLE IF NOT EXISTS cp_infrastructure_config (
+  tenant_id TEXT PRIMARY KEY,
+  endpoints_json TEXT NOT NULL DEFAULT '{}',
+  updated_by TEXT,
+  updated_utc TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE INDEX IF NOT EXISTS ix_cp_customers_tenant ON cp_customers(tenant_id);
 CREATE INDEX IF NOT EXISTS ix_cp_edges_tenant ON cp_edges(tenant_id);
 CREATE INDEX IF NOT EXISTS ix_cp_users_tenant ON cp_users(tenant_id);
