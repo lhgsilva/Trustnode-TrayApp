@@ -83,9 +83,6 @@ def _safety_gate(force: bool) -> int:
 
 
 def load_env(p: Path) -> dict[str, str]:
-
-
-def load_env(p: Path) -> dict[str, str]:
     out = {}
     if p.is_file():
         for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
