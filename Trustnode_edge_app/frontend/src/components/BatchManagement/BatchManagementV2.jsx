@@ -102,6 +102,19 @@ function fmtNum(v, unit) {
   return `${t}${unit && unit !== "count" ? " " + unit : ""}`;
 }
 
+// Friendly, plain-language name for a limit type (instead of "spec_upper").
+const LIMIT_TYPE_LABELS = {
+  spec_upper: "Above upper spec",
+  spec_lower: "Below lower spec",
+  warning_upper: "Above warning level",
+  warning_lower: "Below warning level",
+  operating_upper: "Above operating limit",
+  operating_lower: "Below operating limit",
+};
+function limitTypeLabel(t) {
+  return LIMIT_TYPE_LABELS[String(t || "")] || String(t || "").replace(/_/g, " ");
+}
+
 function Card({ title, actions, children, style }) {
   return (
     <section className="card" style={{ marginBottom: 14, ...(style || {}) }}>
@@ -113,6 +126,48 @@ function Card({ title, actions, children, style }) {
       )}
       {children}
     </section>
+  );
+}
+
+// Reusable data table that renders columns CORRECTLY. The app's `.table` container
+// is already display:grid, so putting grid-template-columns on it (as the earlier
+// batch tables did) collides thead+rows. Here the grid + columns live on the HEADER
+// and on EACH ROW (matching the app's .db-table pattern), with min-width:0 + ellipsis
+// cells so nothing overlaps, and an overflow-x wrapper so a wide table scrolls its
+// own container instead of blowing out the page.
+//   columns: [{ key, label, width?, render?(row), align? }]
+//   rows:    array of objects (must have a stable `id`)
+function DataTable({ columns, rows, onRowClick, empty = "No data.", minWidth = 0 }) {
+  const cols = columns.map((c) => c.width || "1fr").join(" ");
+  const rowGrid = { display: "grid", gridTemplateColumns: cols, gap: 8, alignItems: "center" };
+  if (!rows || !rows.length) {
+    return <div style={{ color: "var(--muted)", fontSize: 13, padding: "8px 2px" }}>{empty}</div>;
+  }
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <div style={{ minWidth: minWidth || undefined }}>
+        <div className="thead" style={{ ...rowGrid, fontSize: 12, color: "var(--muted)", fontWeight: 600,
+          padding: "6px 10px", borderBottom: "1px solid var(--stroke)" }}>
+          {columns.map((c) => (
+            <span key={c.key} style={{ textAlign: c.align || "left" }}>{c.label}</span>
+          ))}
+        </div>
+        {rows.map((r) => (
+          <div key={r.id} className="trow"
+            onClick={onRowClick ? () => onRowClick(r) : undefined}
+            style={{ ...rowGrid, padding: "8px 10px", borderBottom: "1px solid var(--stroke)",
+              cursor: onRowClick ? "pointer" : "default", fontSize: 13 }}>
+            {columns.map((c) => (
+              <span key={c.key} className="db-cell"
+                style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  textAlign: c.align || "left" }}>
+                {c.render ? c.render(r) : (r[c.key] ?? "—")}
+              </span>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -369,42 +424,41 @@ export function BatchOverviewV2Page({ canEdit = false }) {
 }
 
 function BatchTable({ rows, onOpen }) {
-  if (!rows.length) return <div style={{ color: "var(--muted)", fontSize: 13, padding: 8 }}>No batches yet.</div>;
   return (
-    <div className="table" style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 1.2fr 0.9fr 0.9fr", gap: 0 }}>
-      <div className="thead"><span>Reference</span><span>Status</span><span>Quality</span><span>Started</span><span>Duration</span><span>Data</span></div>
-      {rows.map((b) => (
-        <div className="trow" key={b.id} style={{ cursor: "pointer" }} onClick={() => onOpen(b.id)}>
-          <span className="db-cell" title={b.id}>{b.reference || b.id}</span>
-          <span className="db-cell"><Pill value={b.status} /></span>
-          <span className="db-cell"><Pill value={b.quality_status} /></span>
-          <span className="db-cell">{fmtTs(b.started_utc)}</span>
-          <span className="db-cell">{humanDur(b.started_utc, b.ended_utc)}</span>
-          <span className="db-cell"><Pill value={b.data_quality_status} /></span>
-        </div>
-      ))}
-    </div>
+    <DataTable
+      minWidth={720}
+      empty="No batches yet."
+      onRowClick={(b) => onOpen(b.id)}
+      columns={[
+        { key: "reference", label: "Reference", width: "1.6fr", render: (b) => b.reference || b.id },
+        { key: "status", label: "Status", width: "1fr", render: (b) => <Pill value={b.status} /> },
+        { key: "quality", label: "Quality", width: "1.3fr", render: (b) => <Pill value={b.quality_status} /> },
+        { key: "started", label: "Started", width: "1.4fr", render: (b) => fmtTs(b.started_utc) },
+        { key: "duration", label: "Duration", width: "0.9fr", render: (b) => humanDur(b.started_utc, b.ended_utc) },
+        { key: "data", label: "Data quality", width: "1.2fr", render: (b) => <Pill value={b.data_quality_status} /> },
+      ]}
+      rows={rows}
+    />
   );
 }
 
 function GroupTable({ rows, onOpen }) {
-  if (!rows.length) return <div style={{ color: "var(--muted)", fontSize: 13, padding: 8 }}>No batch groups yet.</div>;
   return (
-    <div className="table" style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 1fr 1.2fr", gap: 0 }}>
-      <div className="thead"><span>Reference</span><span>Status</span><span>Children</span><span>Progress</span><span>Started</span></div>
-      {rows.map((g) => {
-        const prog = g.expected_child_count ? Math.round((100 * (g.actual_child_count || 0)) / g.expected_child_count) : null;
-        return (
-          <div className="trow" key={g.id} style={{ cursor: "pointer" }} onClick={() => onOpen(g.id)}>
-            <span className="db-cell" title={g.id}>{g.reference || g.id}</span>
-            <span className="db-cell"><Pill value={g.status} /></span>
-            <span className="db-cell">{g.actual_child_count || 0}{g.expected_child_count ? ` / ${g.expected_child_count}` : ""}</span>
-            <span className="db-cell">{prog === null ? "—" : `${prog}%`}</span>
-            <span className="db-cell">{fmtTs(g.started_utc)}</span>
-          </div>
-        );
-      })}
-    </div>
+    <DataTable
+      minWidth={640}
+      empty="No batch groups yet."
+      onRowClick={(g) => onOpen(g.id)}
+      columns={[
+        { key: "reference", label: "Reference", width: "1.6fr", render: (g) => g.reference || g.id },
+        { key: "status", label: "Status", width: "1fr", render: (g) => <Pill value={g.status} /> },
+        { key: "children", label: "Children", width: "1fr",
+          render: (g) => `${g.actual_child_count || 0}${g.expected_child_count ? ` / ${g.expected_child_count}` : ""}` },
+        { key: "progress", label: "Progress", width: "0.9fr",
+          render: (g) => g.expected_child_count ? `${Math.round((100 * (g.actual_child_count || 0)) / g.expected_child_count)}%` : "—" },
+        { key: "started", label: "Started", width: "1.4fr", render: (g) => fmtTs(g.started_utc) },
+      ]}
+      rows={rows}
+    />
   );
 }
 
@@ -584,40 +638,39 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
 
       {tags.length > 0 && <Card title="Process trends"><TrendChart series={series} xKey="ts" limitLines={limitLines} /></Card>}
 
-      <Card title={`Excursions (${excursions.length})`}>
-        {excursions.length ? (
-          <div className="table" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 0.8fr 0.8fr 0.8fr 0.8fr", gap: 0 }}>
-            <div className="thead"><span>Tag</span><span>Limit</span><span>Value</span><span>Min</span><span>Max</span><span>Severity</span></div>
-            {excursions.map((x) => (
-              <div className="trow" key={x.id}>
-                <span className="db-cell">{x.tag_name}</span>
-                <span className="db-cell">{x.limit_type}</span>
-                <span className="db-cell">{fmtNum(x.limit_value)}</span>
-                <span className="db-cell">{fmtNum(x.actual_minimum)}</span>
-                <span className="db-cell">{fmtNum(x.actual_maximum)}</span>
-                <span className="db-cell"><Pill value={x.severity === "error" || x.severity === "critical" ? "out_of_specification" : "with_warnings"} /></span>
-              </div>
-            ))}
-          </div>
-        ) : <div style={{ color: "var(--muted)", fontSize: 13 }}>No excursions.</div>}
+      <Card title={`Limit alerts (${excursions.length})`}>
+        <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
+          Readings that went outside a configured limit during the batch.
+        </div>
+        <DataTable
+          minWidth={680}
+          empty="No limit alerts — every reading stayed within its limits."
+          columns={[
+            { key: "tag", label: "Tag", width: "1.4fr", render: (x) => x.tag_name },
+            { key: "limit", label: "Limit crossed", width: "1.4fr", render: (x) => limitTypeLabel(x.limit_type) },
+            { key: "value", label: "Limit", width: "0.9fr", align: "right", render: (x) => fmtNum(x.limit_value) },
+            { key: "reading", label: "Reading", width: "1.1fr", align: "right",
+              render: (x) => `${fmtNum(x.actual_minimum)} … ${fmtNum(x.actual_maximum)}` },
+            { key: "severity", label: "Severity", width: "1fr",
+              render: (x) => <Pill value={x.severity === "error" || x.severity === "critical" ? "out_of_specification" : "with_warnings"} /> },
+          ]}
+          rows={excursions}
+        />
       </Card>
 
       <Card title="Reports">
-        {reports.length ? (
-          <div className="table" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1.4fr", gap: 0 }}>
-            <div className="thead"><span>Kind</span><span>Status</span><span>Generated</span><span>Actions</span></div>
-            {reports.map((r) => (
-              <div className="trow" key={r.id}>
-                <span className="db-cell">{(r.report_kind || "").replace(/_/g, " ")}</span>
-                <span className="db-cell"><Pill value={r.report_status} /></span>
-                <span className="db-cell">{fmtTs(r.generated_utc)}</span>
-                <span className="db-cell" style={{ display: "flex", gap: 6 }}>
-                  <button className="btn btn-secondary btn-sm" onClick={() => setPreview(r)}>Preview</button>
-                </span>
-              </div>
-            ))}
-          </div>
-        ) : <div style={{ color: "var(--muted)", fontSize: 13 }}>No reports generated.</div>}
+        <DataTable
+          minWidth={560}
+          empty="No reports generated."
+          columns={[
+            { key: "kind", label: "Report", width: "1.2fr", render: (r) => (r.report_kind || "").replace(/_/g, " ") },
+            { key: "status", label: "Status", width: "1fr", render: (r) => <Pill value={r.report_status} /> },
+            { key: "generated", label: "Generated", width: "1.4fr", render: (r) => fmtTs(r.generated_utc) },
+            { key: "actions", label: "Actions", width: "1fr",
+              render: (r) => <button className="btn btn-secondary btn-sm" onClick={() => setPreview(r)}>Preview</button> },
+          ]}
+          rows={reports}
+        />
       </Card>
 
       <Card title="Event timeline">
@@ -733,19 +786,18 @@ function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
       </Card>
 
       <Card title="Reports">
-        {reports.length ? (
-          <div className="table" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 0 }}>
-            <div className="thead"><span>Kind</span><span>Status</span><span>Generated</span><span>Actions</span></div>
-            {reports.map((r) => (
-              <div className="trow" key={r.id}>
-                <span className="db-cell">{(r.report_kind || "").replace(/_/g, " ")}</span>
-                <span className="db-cell"><Pill value={r.report_status} /></span>
-                <span className="db-cell">{fmtTs(r.generated_utc)}</span>
-                <span className="db-cell"><button className="btn btn-secondary btn-sm" onClick={() => setPreview(r)}>Preview</button></span>
-              </div>
-            ))}
-          </div>
-        ) : <div style={{ color: "var(--muted)", fontSize: 13 }}>No reports.</div>}
+        <DataTable
+          minWidth={560}
+          empty="No reports."
+          columns={[
+            { key: "kind", label: "Report", width: "1.2fr", render: (r) => (r.report_kind || "").replace(/_/g, " ") },
+            { key: "status", label: "Status", width: "1fr", render: (r) => <Pill value={r.report_status} /> },
+            { key: "generated", label: "Generated", width: "1.4fr", render: (r) => fmtTs(r.generated_utc) },
+            { key: "actions", label: "Actions", width: "1fr",
+              render: (r) => <button className="btn btn-secondary btn-sm" onClick={() => setPreview(r)}>Preview</button> },
+          ]}
+          rows={reports}
+        />
       </Card>
 
       {preview && <ReportPreviewModal report={preview} canEdit={canEdit} onClose={() => setPreview(null)} onRegenerate={genReport}
@@ -761,7 +813,7 @@ const WIZ_STEPS = ["General", "Structure", "Identification", "Start", "Stop", "T
 const KPI_CHOICES = [
   ["cycle_time", "Cycle time"], ["running_time", "Running time"], ["hold_time", "Hold time"],
   ["avg", "Average (per tag)"], ["min", "Min (per tag)"], ["max", "Max (per tag)"],
-  ["excursion_count", "Excursion count"], ["total", "Total (per tag)"], ["count", "Sample count"],
+  ["excursion_count", "Limit-alert count"], ["total", "Total (per tag)"], ["count", "Sample count"],
 ];
 const LIMIT_TYPES = ["spec_lower", "spec_upper", "warning_lower", "warning_upper", "operating_lower", "operating_upper"];
 const TAG_CATEGORIES = ["process_value", "setpoint", "count", "energy", "flow", "pressure", "temperature", "electrical", "machine_state", "alarm", "status", "test_result"];
@@ -785,22 +837,19 @@ export function BatchDefinitionsV2Page({ canEdit = false, gatewayConfigs = [] })
     <>
       {err && <Banner tone="error">{err}</Banner>}
       <Card title="Batch Definitions" actions={canEdit && <button className="btn btn-primary btn-sm" onClick={() => setEditing("new")}>+ New definition</button>}>
-        {defs.length ? (
-          <div className="table" style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 0.8fr 0.8fr 1fr", gap: 0 }}>
-            <div className="thead"><span>Name</span><span>Status</span><span>Version</span><span>Equipment</span><span>Actions</span></div>
-            {defs.map((d) => (
-              <div className="trow" key={d.id}>
-                <span className="db-cell">{d.name}</span>
-                <span className="db-cell"><Pill value={d.status} /></span>
-                <span className="db-cell">v{d.cur_version_number || d.version_number || 1}</span>
-                <span className="db-cell">{d.equipment_id || "—"}</span>
-                <span className="db-cell" style={{ display: "flex", gap: 6 }}>
-                  <button className="btn btn-secondary btn-sm" onClick={() => setEditing(d.id)}>{canEdit ? "Edit" : "View"}</button>
-                </span>
-              </div>
-            ))}
-          </div>
-        ) : <div style={{ color: "var(--muted)", fontSize: 13 }}>No definitions yet. {canEdit && "Create one to start monitoring batches."}</div>}
+        <DataTable
+          minWidth={720}
+          empty={canEdit ? "No definitions yet. Create one to start monitoring batches." : "No definitions yet."}
+          columns={[
+            { key: "name", label: "Name", width: "1.8fr", render: (d) => d.name },
+            { key: "status", label: "Status", width: "1fr", render: (d) => <Pill value={d.status} /> },
+            { key: "version", label: "Version", width: "0.8fr", render: (d) => `v${d.cur_version_number || d.version_number || 1}` },
+            { key: "equipment", label: "Equipment", width: "1.2fr", render: (d) => d.equipment_id || "—" },
+            { key: "actions", label: "Actions", width: "1fr",
+              render: (d) => <button className="btn btn-secondary btn-sm" onClick={() => setEditing(d.id)}>{canEdit ? "Edit" : "View"}</button> },
+          ]}
+          rows={defs}
+        />
       </Card>
       {editing && <DefinitionWizard definitionId={editing === "new" ? null : editing} gateways={gateways} canEdit={canEdit}
         onClose={() => setEditing(null)} onSaved={() => { setEditing(null); load(); }} />}
@@ -1217,22 +1266,23 @@ function AnalysisReports({ canEdit }) {
     })();
   }, []);
   if (err) return <Banner tone="error">{err}</Banner>;
-  if (!rows.length) return <div style={{ color: "var(--muted)", fontSize: 13 }}>No reports generated yet.</div>;
   return (
     <>
-      <div className="table" style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 1fr 1fr 0.8fr", gap: 0 }}>
-        <div className="thead"><span>Reference</span><span>Kind</span><span>Status</span><span>Email</span><span>Generated</span><span>Actions</span></div>
-        {rows.map((r) => (
-          <div className="trow" key={r.id}>
-            <span className="db-cell">{r.owner_ref}</span>
-            <span className="db-cell">{(r.report_kind || "").replace(/_/g, " ")}</span>
-            <span className="db-cell"><Pill value={r.report_status} /></span>
-            <span className="db-cell"><Pill value={r.email_status === "sent" ? "good" : r.email_status === "failed" ? "failed" : "planned"} /></span>
-            <span className="db-cell">{fmtTs(r.generated_utc)}</span>
-            <span className="db-cell"><button className="btn btn-secondary btn-sm" onClick={() => { setPreview(r); setPreviewOwner({ kind: r.owner_kind, id: r.owner_id }); }}>Preview</button></span>
-          </div>
-        ))}
-      </div>
+      <DataTable
+        minWidth={820}
+        empty="No reports generated yet."
+        columns={[
+          { key: "reference", label: "Reference", width: "1.3fr", render: (r) => r.owner_ref },
+          { key: "kind", label: "Report", width: "1.1fr", render: (r) => (r.report_kind || "").replace(/_/g, " ") },
+          { key: "status", label: "Status", width: "1fr", render: (r) => <Pill value={r.report_status} /> },
+          { key: "email", label: "Email", width: "1fr",
+            render: (r) => <Pill value={r.email_status === "sent" ? "good" : r.email_status === "failed" ? "failed" : "planned"} /> },
+          { key: "generated", label: "Generated", width: "1.3fr", render: (r) => fmtTs(r.generated_utc) },
+          { key: "actions", label: "Actions", width: "0.9fr",
+            render: (r) => <button className="btn btn-secondary btn-sm" onClick={() => { setPreview(r); setPreviewOwner({ kind: r.owner_kind, id: r.owner_id }); }}>Preview</button> },
+        ]}
+        rows={rows}
+      />
       {preview && <ReportPreviewModal report={preview} canEdit={canEdit} onClose={() => setPreview(null)}
         onRegenerate={async () => { previewOwner.kind === "batch" ? await bmv2GenerateBatchReport(previewOwner.id) : await bmv2GenerateGroupReport(previewOwner.id); }}
         onEmail={(refId, recips) => previewOwner.kind === "batch" ? bmv2EmailBatchReport(previewOwner.id, refId, { recipients: recips }) : bmv2EmailGroupReport(previewOwner.id, refId, { recipients: recips })} />}
@@ -1285,22 +1335,28 @@ function AnalysisExcursions({ canEdit }) {
   useEffect(() => { load(); }, [load]);
   const ack = async (id) => { try { await bmv2AckExcursion(id, { acknowledged: true }); load(); } catch (e) { setErr(errText(e)); } };
   if (err) return <Banner tone="error">{err}</Banner>;
-  if (!rows.length) return <div style={{ color: "var(--muted)", fontSize: 13 }}>No excursions recorded.</div>;
   return (
-    <div className="table" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 0.8fr 0.8fr 1fr 0.8fr 0.8fr", gap: 0 }}>
-      <div className="thead"><span>Tag</span><span>Limit</span><span>Value</span><span>Actual</span><span>Started</span><span>Severity</span><span>Ack</span></div>
-      {rows.map((x) => (
-        <div className="trow" key={x.id}>
-          <span className="db-cell">{x.tag_name}</span>
-          <span className="db-cell">{x.limit_type}</span>
-          <span className="db-cell">{fmtNum(x.limit_value)}</span>
-          <span className="db-cell">{fmtNum(x.actual_minimum)}…{fmtNum(x.actual_maximum)}</span>
-          <span className="db-cell">{fmtTs(x.started_utc)}</span>
-          <span className="db-cell">{x.severity}</span>
-          <span className="db-cell">{x.acknowledged ? "✓" : (canEdit ? <button className="btn btn-ghost btn-sm" onClick={() => ack(x.id)}>Ack</button> : "—")}</span>
-        </div>
-      ))}
-    </div>
+    <>
+      <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
+        All readings that crossed a configured limit, across every batch. Acknowledge one to mark it reviewed.
+      </div>
+      <DataTable
+        minWidth={860}
+        empty="No limit alerts recorded."
+        columns={[
+          { key: "tag", label: "Tag", width: "1.3fr", render: (x) => x.tag_name },
+          { key: "limit", label: "Limit crossed", width: "1.4fr", render: (x) => limitTypeLabel(x.limit_type) },
+          { key: "value", label: "Limit", width: "0.8fr", align: "right", render: (x) => fmtNum(x.limit_value) },
+          { key: "reading", label: "Reading", width: "1.1fr", align: "right", render: (x) => `${fmtNum(x.actual_minimum)} … ${fmtNum(x.actual_maximum)}` },
+          { key: "started", label: "Started", width: "1.3fr", render: (x) => fmtTs(x.started_utc) },
+          { key: "severity", label: "Severity", width: "0.9fr",
+            render: (x) => <Pill value={x.severity === "error" || x.severity === "critical" ? "out_of_specification" : "with_warnings"} /> },
+          { key: "ack", label: "Reviewed", width: "0.9fr",
+            render: (x) => x.acknowledged ? "✓" : (canEdit ? <button className="btn btn-ghost btn-sm" onClick={() => ack(x.id)}>Acknowledge</button> : "—") },
+        ]}
+        rows={rows}
+      />
+    </>
   );
 }
 
