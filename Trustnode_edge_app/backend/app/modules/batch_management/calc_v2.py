@@ -61,6 +61,8 @@ class BatchCalcService(_BatchV2Base):
         any_out_of_spec = False
         any_warning = False
 
+        pass_tag_count = 0
+        fail_tag_count = 0
         for tag, agg in per_tag.items():
             vals = agg["vals"]
             tag_limits = limits.get(tag, [])
@@ -73,6 +75,13 @@ class BatchCalcService(_BatchV2Base):
             excursion_rows += exc
             any_out_of_spec = any_out_of_spec or out_spec
             any_warning = any_warning or warn
+            # --- pass/fail per tag (only tags that HAVE a spec limit count toward pass%) ---
+            has_spec = any(str(l.get("limit_type")) in (_SPEC_UPPER, _SPEC_LOWER) for l in tag_limits)
+            if has_spec and vals:
+                if out_spec:
+                    fail_tag_count += 1
+                else:
+                    pass_tag_count += 1
 
         # --- batch-level KPIs ---
         kpi_rows.append(self._kpi("cycle_time", "Cycle Time", total_duration, "s"))
@@ -110,6 +119,17 @@ class BatchCalcService(_BatchV2Base):
             for e in excursion_rows:
                 self._insert_excursion(c, tid, batch_id, batch.get("batch_group_id"), e)
             self._exe.set_quality(c, tid, batch_id, quality=quality, data_quality=dq["status"])
+            # 2026-07-15: stash the tag pass/fail counts on the batch metadata so the
+            # Overview can show a Result (Passed/Failed) + pass% without extra queries.
+            from .service import _json_load, _json_or_none
+            _md = _json_load(batch.get("metadata")) if isinstance(batch.get("metadata"), str) else (batch.get("metadata") or {})
+            if not isinstance(_md, dict):
+                _md = {}
+            _md["pass_tag_count"] = pass_tag_count
+            _md["fail_tag_count"] = fail_tag_count
+            _md["result"] = ("fail" if fail_tag_count > 0 else ("pass" if pass_tag_count > 0 else "na"))
+            c.execute("UPDATE batch SET metadata_json = ? WHERE id = ? AND tenant_id = ?",
+                      (_json_or_none(_md), batch_id, tid))
             self._event(c, batch_id=batch_id, batch_group_id=batch.get("batch_group_id"),
                         event_type="batch.calculated", source="system",
                         message=f"quality={quality} data_quality={dq['status']} kpis={len(kpi_rows)} excursions={len(excursion_rows)}")

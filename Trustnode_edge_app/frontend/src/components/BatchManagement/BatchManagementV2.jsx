@@ -45,6 +45,21 @@ function errText(e) {
   if (isTransientFetchError(e)) return "";
   return e?.message || String(e || "");
 }
+
+// One-time CSS for the batch tables: subtle row-hover highlight + row-actions that
+// only appear on hover (cleaner, less busy tables). Injected once at module load.
+if (typeof document !== "undefined" && !document.getElementById("bm-v2-style")) {
+  const st = document.createElement("style");
+  st.id = "bm-v2-style";
+  st.textContent = `
+    .bm-datatable .trow { transition: background .12s ease; }
+    .bm-datatable .trow:hover { background: var(--table-row, rgba(255,255,255,0.04)); }
+    .bm-datatable .bm-row-actions { opacity: 0; transition: opacity .12s ease; }
+    .bm-datatable .trow:hover .bm-row-actions { opacity: 1; }
+  `;
+  document.head.appendChild(st);
+}
+
 function Modal({ onClose, children, width }) {
   const node = (
     <div className="modal-backdrop" onClick={onClose}
@@ -102,6 +117,32 @@ function fmtNum(v, unit) {
   return `${t}${unit && unit !== "count" ? " " + unit : ""}`;
 }
 
+// Result = the plant-operator answer: did the batch PASS or FAIL its limits?
+// Derived from the computed quality_status. Not-yet-evaluated / still-running
+// batches read PENDING; a batch with missing data reads INCOMPLETE.
+function batchResult(b) {
+  const q = String(b?.quality_status || "not_evaluated");
+  if (q === "within_specification") return { label: "PASSED", cls: "status-online" };
+  if (q === "with_warnings") return { label: "PASSED (warnings)", cls: "status-warning" };
+  if (q === "out_of_specification") return { label: "FAILED", cls: "status-offline" };
+  if (q === "data_incomplete") return { label: "INCOMPLETE", cls: "status-warning" };
+  return { label: "PENDING", cls: "status-warning" };
+}
+function ResultPill({ batch }) {
+  const r = batchResult(batch);
+  return <span className={`status-pill ${r.cls}`}>{r.label}</span>;
+}
+// pass% from the batch's tag pass/fail counts (in metadata) when present.
+function passPct(b) {
+  const p = Number(b?.metadata?.pass_tag_count);
+  const f = Number(b?.metadata?.fail_tag_count);
+  if (!isFinite(p) || !isFinite(f) || (p + f) === 0) return null;
+  return Math.round((100 * p) / (p + f));
+}
+function batchKind(b) {
+  return b?.batch_group_id ? "Group child" : "Single";
+}
+
 // Friendly, plain-language name for a limit type (instead of "spec_upper").
 const LIMIT_TYPE_LABELS = {
   spec_upper: "Above upper spec",
@@ -144,7 +185,7 @@ function DataTable({ columns, rows, onRowClick, empty = "No data.", minWidth = 0
     return <div style={{ color: "var(--muted)", fontSize: 13, padding: "8px 2px" }}>{empty}</div>;
   }
   return (
-    <div style={{ overflowX: "auto" }}>
+    <div className="bm-datatable" style={{ overflowX: "auto" }}>
       <div style={{ minWidth: minWidth || undefined }}>
         <div className="thead" style={{ ...rowGrid, fontSize: 12, color: "var(--muted)", fontWeight: 600,
           padding: "6px 10px", borderBottom: "1px solid var(--stroke)" }}>
@@ -303,38 +344,57 @@ function TrendChart({ series, xKey = "ts", height = 260, limitLines = [] }) {
 // license state on every mount. Once we've seen enabled=true, we keep it and only
 // refresh in the background — a transient /status error (timeout, aborted fetch on
 // fast navigation) must never downgrade a known-good license to "not licensed".
-let _bmLicCache = null;        // null=unknown, true=licensed, false=confirmed-not
-let _bmLicCheckedAt = 0;       // ms epoch of last successful check
-const _BM_LIC_TTL = 30000;     // re-check at most every 30s in the background
+// Bulletproof license state. The batch backend gate reads the edge's LOCAL license
+// snapshot, which can momentarily be stale (right after boot / a re-check), and
+// /status can 404/timeout transiently. Neither must ever make the pages flash
+// "not licensed" once we've established the module IS licensed. Rules:
+//   - Persist the last-known-GOOD (enabled=true) to localStorage -> survives reloads
+//     and page navigation; a licensed edge never shows the unlicensed banner again
+//     unless the module is DEFINITIVELY revoked (2 consecutive confirmed false).
+//   - A single enabled:false is NOT trusted (could be a stale snapshot / soft 404
+//     from bmv2Status's own catch) — require two in a row before we believe it.
+const _BM_LIC_LS = "trustnode_bm_licensed_v1";
+let _bmLicCache = (() => { try { return localStorage.getItem(_BM_LIC_LS) === "1" ? true : null; } catch { return null; } })();
+let _bmLicCheckedAt = 0;
+let _bmFalseStreak = 0;
+const _BM_LIC_TTL = 30000;
 
 function useLicense() {
   const [ok, setOk] = useState(_bmLicCache);
   useEffect(() => {
     let m = true;
-    // If we already know it's licensed and the cache is fresh, don't re-fetch.
     const fresh = Date.now() - _bmLicCheckedAt < _BM_LIC_TTL;
     if (_bmLicCache === true && fresh) { setOk(true); return () => { m = false; }; }
     bmv2Status()
       .then((s) => {
         const enabled = !!s?.enabled;
-        // Only cache a definitive answer. Treat a soft/empty response as "unknown"
-        // rather than a hard "not licensed".
-        if (s && typeof s.enabled !== "undefined") {
-          _bmLicCache = enabled;
-          _bmLicCheckedAt = Date.now();
+        if (enabled) {
+          _bmFalseStreak = 0;
+          _bmLicCache = true; _bmLicCheckedAt = Date.now();
+          try { localStorage.setItem(_BM_LIC_LS, "1"); } catch {}
+        } else if (s && typeof s.enabled !== "undefined") {
+          // A definitive false — but require 2 in a row before believing a
+          // previously-good edge is now unlicensed (guards stale-snapshot blips).
+          _bmFalseStreak += 1;
+          if (_bmFalseStreak >= 2 || _bmLicCache === null) {
+            _bmLicCache = false; _bmLicCheckedAt = Date.now();
+            try { localStorage.removeItem(_BM_LIC_LS); } catch {}
+          }
         }
         if (m) setOk(_bmLicCache);
       })
-      .catch(() => {
-        // Transient error: keep whatever we last knew. Never downgrade true->false.
-        if (m) setOk(_bmLicCache);
-      });
+      .catch(() => { if (m) setOk(_bmLicCache); });  // transient: keep last-known
     return () => { m = false; };
   }, []);
   return ok;
 }
 function Unlicensed() {
-  return <Card><Banner>Batch Management is not licensed on this edge. Contact your administrator.</Banner></Card>;
+  return (
+    <Card>
+      <Banner>Batch Management is not licensed on this edge. If you just activated or renewed,
+        open Settings → License → Refresh, then reopen this page.</Banner>
+    </Card>
+  );
 }
 
 /* --------------------------------------------------------------------- */
@@ -353,19 +413,35 @@ export function BatchOverviewV2Page({ canEdit = false }) {
   const [err, setErr] = useState("");
   const [defs, setDefs] = useState([]);
 
+  // Load ALL rows ONCE (no filter params). Filtering is done client-side below so
+  // it's instant and typing in the search box never fires a network request.
+  // `load` has NO filter deps, so the 8s refresh interval + effect stay stable.
   const load = useCallback(async () => {
     setErr("");
     try {
       const [b, g] = await Promise.all([
-        bmv2ListBatches({ limit: 200, status: statusFilter, search }),
+        bmv2ListBatches({ limit: 300 }),
         bmv2ListGroups({ limit: 100 }),
       ]);
       setBatches(b.rows || []); setGroups(g.rows || []);
     } catch (e) { setErr(errText(e)); }
-  }, [statusFilter, search]);
+  }, []);
 
   useEffect(() => { if (lic) { load(); bmv2ListDefinitions().then(setDefs).catch(() => {}); } }, [lic, load]);
   useEffect(() => { if (!lic) return; const t = setInterval(load, 8000); return () => clearInterval(t); }, [lic, load]);
+
+  // client-side filter — instant, no refetch on keystroke
+  const filteredBatches = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return (batches || []).filter((b) => {
+      if (statusFilter && b.status !== statusFilter) return false;
+      if (q) {
+        const hay = `${b.reference || ""} ${b.product || ""} ${b.id || ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [batches, statusFilter, search]);
 
   if (lic === false) return <Unlicensed />;
   if (lic === null) return <Card><div style={{ color: "var(--muted)" }}>Loading…</div></Card>;
@@ -411,7 +487,7 @@ export function BatchOverviewV2Page({ canEdit = false }) {
               </select>
               <input placeholder="Search reference / product…" value={search} onChange={(e) => setSearch(e.target.value)} style={{ maxWidth: 260 }} />
             </div>
-            <BatchTable rows={batches} onOpen={setOpenBatch} />
+            <BatchTable rows={filteredBatches} onOpen={setOpenBatch} />
           </>
         )}
         {tab === "groups" && <GroupTable rows={groups} onOpen={setOpenGroup} />}
@@ -426,16 +502,22 @@ export function BatchOverviewV2Page({ canEdit = false }) {
 function BatchTable({ rows, onOpen }) {
   return (
     <DataTable
-      minWidth={720}
+      minWidth={900}
       empty="No batches yet."
       onRowClick={(b) => onOpen(b.id)}
       columns={[
-        { key: "reference", label: "Reference", width: "1.6fr", render: (b) => b.reference || b.id },
+        { key: "reference", label: "Reference", width: "1.5fr", render: (b) => b.reference || b.id },
+        { key: "type", label: "Type", width: "0.9fr", render: (b) => batchKind(b) },
         { key: "status", label: "Status", width: "1fr", render: (b) => <Pill value={b.status} /> },
-        { key: "quality", label: "Quality", width: "1.3fr", render: (b) => <Pill value={b.quality_status} /> },
-        { key: "started", label: "Started", width: "1.4fr", render: (b) => fmtTs(b.started_utc) },
+        { key: "result", label: "Result", width: "1.2fr", render: (b) => <ResultPill batch={b} /> },
+        { key: "passpct", label: "Pass %", width: "0.8fr", align: "right",
+          render: (b) => { const p = passPct(b); return p === null ? "—" : `${p}%`; } },
+        { key: "started", label: "Started", width: "1.3fr", render: (b) => fmtTs(b.started_utc) },
+        { key: "ended", label: "Ended", width: "1.3fr", render: (b) => fmtTs(b.ended_utc) },
         { key: "duration", label: "Duration", width: "0.9fr", render: (b) => humanDur(b.started_utc, b.ended_utc) },
-        { key: "data", label: "Data quality", width: "1.2fr", render: (b) => <Pill value={b.data_quality_status} /> },
+        { key: "actions", label: "", width: "0.9fr", align: "right",
+          render: (b) => <span className="bm-row-actions"><button className="btn btn-secondary btn-sm"
+            onClick={(e) => { e.stopPropagation(); onOpen(b.id); }}>Open</button></span> },
       ]}
       rows={rows}
     />
