@@ -406,6 +406,7 @@ export function BatchOverviewV2Page({ canEdit = false }) {
   const [batches, setBatches] = useState([]);
   const [groups, setGroups] = useState([]);
   const [statusFilter, setStatusFilter] = useState("");
+  const [groupStatusFilter, setGroupStatusFilter] = useState("");
   const [search, setSearch] = useState("");
   const [openBatch, setOpenBatch] = useState(null);   // batch id -> detail
   const [openGroup, setOpenGroup] = useState(null);
@@ -442,6 +443,19 @@ export function BatchOverviewV2Page({ canEdit = false }) {
       return true;
     });
   }, [batches, statusFilter, search]);
+
+  // groups get the same instant client-side filter
+  const filteredGroups = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return (groups || []).filter((g) => {
+      if (groupStatusFilter && g.status !== groupStatusFilter) return false;
+      if (q) {
+        const hay = `${g.reference || ""} ${g.external_reference || ""} ${g.id || ""}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [groups, groupStatusFilter, search]);
 
   if (lic === false) return <Unlicensed />;
   if (lic === null) return <Card><div style={{ color: "var(--muted)" }}>Loading…</div></Card>;
@@ -490,7 +504,18 @@ export function BatchOverviewV2Page({ canEdit = false }) {
             <BatchTable rows={filteredBatches} onOpen={setOpenBatch} />
           </>
         )}
-        {tab === "groups" && <GroupTable rows={groups} onOpen={setOpenGroup} />}
+        {tab === "groups" && (
+          <>
+            <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+              <select value={groupStatusFilter} onChange={(e) => setGroupStatusFilter(e.target.value)} style={{ maxWidth: 180 }}>
+                <option value="">All statuses</option>
+                {["planned", "active", "completed", "aborted"].map((s) => <option key={s} value={s}>{s}</option>)}
+              </select>
+              <input placeholder="Search group reference…" value={search} onChange={(e) => setSearch(e.target.value)} style={{ maxWidth: 260 }} />
+            </div>
+            <GroupTable rows={filteredGroups} onOpen={setOpenGroup} />
+          </>
+        )}
       </Card>
 
       {creating === "batch" && <CreateBatchModal defs={defs} onClose={() => setCreating(null)} onCreated={() => { setCreating(null); load(); }} />}
@@ -527,17 +552,23 @@ function BatchTable({ rows, onOpen }) {
 function GroupTable({ rows, onOpen }) {
   return (
     <DataTable
-      minWidth={640}
+      minWidth={860}
       empty="No batch groups yet."
       onRowClick={(g) => onOpen(g.id)}
       columns={[
-        { key: "reference", label: "Reference", width: "1.6fr", render: (g) => g.reference || g.id },
+        { key: "reference", label: "Reference", width: "1.5fr", render: (g) => g.reference || g.id },
+        { key: "type", label: "Type", width: "0.8fr", render: () => "Group" },
         { key: "status", label: "Status", width: "1fr", render: (g) => <Pill value={g.status} /> },
-        { key: "children", label: "Children", width: "1fr",
+        { key: "children", label: "Children", width: "0.9fr",
           render: (g) => `${g.actual_child_count || 0}${g.expected_child_count ? ` / ${g.expected_child_count}` : ""}` },
-        { key: "progress", label: "Progress", width: "0.9fr",
+        { key: "progress", label: "Progress", width: "0.9fr", align: "right",
           render: (g) => g.expected_child_count ? `${Math.round((100 * (g.actual_child_count || 0)) / g.expected_child_count)}%` : "—" },
-        { key: "started", label: "Started", width: "1.4fr", render: (g) => fmtTs(g.started_utc) },
+        { key: "started", label: "Started", width: "1.3fr", render: (g) => fmtTs(g.started_utc) },
+        { key: "ended", label: "Ended", width: "1.3fr", render: (g) => fmtTs(g.completed_utc) },
+        { key: "duration", label: "Duration", width: "0.9fr", render: (g) => humanDur(g.started_utc, g.completed_utc) },
+        { key: "actions", label: "", width: "0.9fr", align: "right",
+          render: (g) => <span className="bm-row-actions"><button className="btn btn-secondary btn-sm"
+            onClick={(e) => { e.stopPropagation(); onOpen(g.id); }}>Open</button></span> },
       ]}
       rows={rows}
     />
@@ -903,14 +934,25 @@ const TAG_CATEGORIES = ["process_value", "setpoint", "count", "energy", "flow", 
 export function BatchDefinitionsV2Page({ canEdit = false, gatewayConfigs = [] }) {
   const lic = useLicense();
   const [defs, setDefs] = useState([]);
+  const [loaded, setLoaded] = useState(false);
   const [editing, setEditing] = useState(null);   // definition id or "new"
   const [err, setErr] = useState("");
   const gateways = useMemo(() => bmv2NormalizeGatewayTags(gatewayConfigs), [gatewayConfigs]);
 
+  // Reliable load: keep the last GOOD list (never blank it on a transient
+  // error/aborted fetch), and light auto-refresh so a definition created elsewhere
+  // (or a first-load race) always appears without leaving the page.
   const load = useCallback(async () => {
-    try { setDefs(await bmv2ListDefinitions()); } catch (e) { setErr(errText(e)); }
+    try {
+      const rows = await bmv2ListDefinitions();
+      if (Array.isArray(rows)) { setDefs(rows); setLoaded(true); setErr(""); }
+    } catch (e) {
+      const t = errText(e);
+      if (t) setErr(t);          // transient/abort -> errText returns "" -> ignored; keep old list
+    }
   }, []);
   useEffect(() => { if (lic) load(); }, [lic, load]);
+  useEffect(() => { if (!lic) return; const t = setInterval(load, 8000); return () => clearInterval(t); }, [lic, load]);
 
   if (lic === false) return <Unlicensed />;
   if (lic === null) return <Card><div style={{ color: "var(--muted)" }}>Loading…</div></Card>;
@@ -1304,26 +1346,35 @@ function StepPublish({ validation, onValidate, onPublish, canEdit, published, bu
 export function BatchAnalysisV2Page({ canEdit = false }) {
   const lic = useLicense();
   const [tab, setTab] = useState("reports");
+  const [openBatch, setOpenBatch] = useState(null);   // drill into a batch from Analysis
+  const [openGroup, setOpenGroup] = useState(null);
   if (lic === false) return <Unlicensed />;
   if (lic === null) return <Card><div style={{ color: "var(--muted)" }}>Loading…</div></Card>;
+
+  // Drill-in: open a batch/group detail from any Analysis tab; Back returns HERE.
+  if (openBatch) return <BatchDetailV2 batchId={openBatch} canEdit={canEdit}
+    onBack={() => setOpenBatch(null)} onOpenGroup={(gid) => { setOpenBatch(null); setOpenGroup(gid); }} />;
+  if (openGroup) return <BatchGroupDetailV2 groupId={openGroup} canEdit={canEdit}
+    onBack={() => setOpenGroup(null)} onOpenBatch={(bid) => { setOpenGroup(null); setOpenBatch(bid); }} />;
+
   return (
     <>
       <Card title="Batch Reports & Analysis" actions={
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          {[["reports", "Reports"], ["comparison", "Batch Comparison"], ["excursions", "Excursions"]].map(([k, l]) => (
+          {[["reports", "Reports"], ["comparison", "Batch Comparison"], ["excursions", "Limit alerts"]].map(([k, l]) => (
             <button key={k} className={`btn btn-sm ${tab === k ? "btn-primary" : "btn-ghost"}`} onClick={() => setTab(k)}>{l}</button>
           ))}
         </div>
       }>
-        {tab === "reports" && <AnalysisReports canEdit={canEdit} />}
-        {tab === "comparison" && <AnalysisComparison />}
-        {tab === "excursions" && <AnalysisExcursions canEdit={canEdit} />}
+        {tab === "reports" && <AnalysisReports canEdit={canEdit} onOpenBatch={setOpenBatch} onOpenGroup={setOpenGroup} />}
+        {tab === "comparison" && <AnalysisComparison onOpenBatch={setOpenBatch} />}
+        {tab === "excursions" && <AnalysisExcursions canEdit={canEdit} onOpenBatch={setOpenBatch} />}
       </Card>
     </>
   );
 }
 
-function AnalysisReports({ canEdit }) {
+function AnalysisReports({ canEdit, onOpenBatch, onOpenGroup }) {
   // aggregate report references across recent batches + groups
   const [rows, setRows] = useState([]);
   const [preview, setPreview] = useState(null);
@@ -1343,15 +1394,19 @@ function AnalysisReports({ canEdit }) {
           rs.forEach((r) => acc.push({ ...r, owner_ref: g.reference || g.id, owner_kind: "group", owner_id: g.id }));
         }
         acc.sort((a, b) => String(b.created_utc).localeCompare(String(a.created_utc)));
-        setRows(acc);
-      } catch (e) { setErr(errText(e)); }
+        setRows(acc); setErr("");
+      } catch (e) { const t = errText(e); if (t) setErr(t); }  // keep last-good on transient
     })();
   }, []);
+  const openOwner = (r) => {
+    if (r.owner_kind === "group") onOpenGroup && onOpenGroup(r.owner_id);
+    else onOpenBatch && onOpenBatch(r.owner_id);
+  };
   if (err) return <Banner tone="error">{err}</Banner>;
   return (
     <>
       <DataTable
-        minWidth={820}
+        minWidth={900}
         empty="No reports generated yet."
         columns={[
           { key: "reference", label: "Reference", width: "1.3fr", render: (r) => r.owner_ref },
@@ -1360,8 +1415,11 @@ function AnalysisReports({ canEdit }) {
           { key: "email", label: "Email", width: "1fr",
             render: (r) => <Pill value={r.email_status === "sent" ? "good" : r.email_status === "failed" ? "failed" : "planned"} /> },
           { key: "generated", label: "Generated", width: "1.3fr", render: (r) => fmtTs(r.generated_utc) },
-          { key: "actions", label: "Actions", width: "0.9fr",
-            render: (r) => <button className="btn btn-secondary btn-sm" onClick={() => { setPreview(r); setPreviewOwner({ kind: r.owner_kind, id: r.owner_id }); }}>Preview</button> },
+          { key: "actions", label: "Actions", width: "1.4fr",
+            render: (r) => <span style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+              <button className="btn btn-secondary btn-sm" onClick={() => { setPreview(r); setPreviewOwner({ kind: r.owner_kind, id: r.owner_id }); }}>Preview</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => openOwner(r)}>Open {r.owner_kind}</button>
+            </span> },
         ]}
         rows={rows}
       />
@@ -1372,13 +1430,13 @@ function AnalysisReports({ canEdit }) {
   );
 }
 
-function AnalysisComparison() {
+function AnalysisComparison({ onOpenBatch }) {
   const [batches, setBatches] = useState([]);
   const [picked, setPicked] = useState([]);
   const [tags, setTags] = useState("");
   const [data, setData] = useState([]);
   const [err, setErr] = useState("");
-  useEffect(() => { bmv2ListBatches({ limit: 50, status: "completed" }).then((r) => setBatches(r.rows || [])).catch((e) => setErr(errText(e))); }, []);
+  useEffect(() => { bmv2ListBatches({ limit: 50, status: "completed" }).then((r) => { if (r?.rows) setBatches(r.rows); }).catch((e) => { const t = errText(e); if (t) setErr(t); }); }, []);
   const run = async () => {
     try { setData(await bmv2AnalysisComparison(picked, tags.split(/[,;\s]+/).filter(Boolean))); }
     catch (e) { setErr(errText(e)); }
@@ -1404,37 +1462,43 @@ function AnalysisComparison() {
         </div>
       </div>
       {data.length > 0 && data.map((d) => (
-        <Card key={d.batch_id} title={d.reference || d.batch_id}><TrendChart series={d.series} xKey="elapsed_s" height={220} /></Card>
+        <Card key={d.batch_id} title={d.reference || d.batch_id}
+          actions={onOpenBatch && <button className="btn btn-ghost btn-sm" onClick={() => onOpenBatch(d.batch_id)}>Open batch</button>}>
+          <TrendChart series={d.series} xKey="elapsed_s" height={220} /></Card>
       ))}
     </div>
   );
 }
 
-function AnalysisExcursions({ canEdit }) {
+function AnalysisExcursions({ canEdit, onOpenBatch }) {
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState("");
-  const load = useCallback(() => { bmv2AnalysisExcursions(500).then(setRows).catch((e) => setErr(errText(e))); }, []);
+  const load = useCallback(() => { bmv2AnalysisExcursions(500).then((r) => { if (Array.isArray(r)) setRows(r); }).catch((e) => setErr(errText(e))); }, []);
   useEffect(() => { load(); }, [load]);
   const ack = async (id) => { try { await bmv2AckExcursion(id, { acknowledged: true }); load(); } catch (e) { setErr(errText(e)); } };
   if (err) return <Banner tone="error">{err}</Banner>;
   return (
     <>
       <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
-        All readings that crossed a configured limit, across every batch. Acknowledge one to mark it reviewed.
+        All readings that crossed a configured limit, across every batch. Click a row to open its batch; acknowledge to mark it reviewed.
       </div>
       <DataTable
-        minWidth={860}
+        minWidth={960}
         empty="No limit alerts recorded."
+        onRowClick={onOpenBatch ? (x) => x.batch_id && onOpenBatch(x.batch_id) : undefined}
         columns={[
-          { key: "tag", label: "Tag", width: "1.3fr", render: (x) => x.tag_name },
-          { key: "limit", label: "Limit crossed", width: "1.4fr", render: (x) => limitTypeLabel(x.limit_type) },
-          { key: "value", label: "Limit", width: "0.8fr", align: "right", render: (x) => fmtNum(x.limit_value) },
+          { key: "tag", label: "Tag", width: "1.2fr", render: (x) => x.tag_name },
+          { key: "limit", label: "Limit crossed", width: "1.3fr", render: (x) => limitTypeLabel(x.limit_type) },
+          { key: "value", label: "Limit", width: "0.7fr", align: "right", render: (x) => fmtNum(x.limit_value) },
           { key: "reading", label: "Reading", width: "1.1fr", align: "right", render: (x) => `${fmtNum(x.actual_minimum)} … ${fmtNum(x.actual_maximum)}` },
-          { key: "started", label: "Started", width: "1.3fr", render: (x) => fmtTs(x.started_utc) },
-          { key: "severity", label: "Severity", width: "0.9fr",
+          { key: "started", label: "Started", width: "1.2fr", render: (x) => fmtTs(x.started_utc) },
+          { key: "severity", label: "Severity", width: "0.8fr",
             render: (x) => <Pill value={x.severity === "error" || x.severity === "critical" ? "out_of_specification" : "with_warnings"} /> },
-          { key: "ack", label: "Reviewed", width: "0.9fr",
-            render: (x) => x.acknowledged ? "✓" : (canEdit ? <button className="btn btn-ghost btn-sm" onClick={() => ack(x.id)}>Acknowledge</button> : "—") },
+          { key: "ack", label: "Reviewed", width: "1fr",
+            render: (x) => x.acknowledged ? "✓" : (canEdit ? <button className="btn btn-ghost btn-sm" onClick={(e) => { e.stopPropagation(); ack(x.id); }}>Acknowledge</button> : "—") },
+          { key: "open", label: "", width: "0.9fr", align: "right",
+            render: (x) => x.batch_id ? <span className="bm-row-actions"><button className="btn btn-secondary btn-sm"
+              onClick={(e) => { e.stopPropagation(); onOpenBatch && onOpenBatch(x.batch_id); }}>Open batch</button></span> : null },
         ]}
         rows={rows}
       />
