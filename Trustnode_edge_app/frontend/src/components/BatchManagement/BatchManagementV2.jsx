@@ -395,45 +395,56 @@ let _bmFalseStreak = 0;
 const _BM_LIC_TTL = 30000;
 
 function useLicense() {
+  // INSTANT render rule: if we've EVER seen this edge licensed (in-memory cache
+  // or the persisted localStorage flag), return `true` synchronously on every
+  // mount and revalidate silently in the background. Navigating between the
+  // batch pages must NEVER block the page body on a /status round-trip once the
+  // module is known-good — that was the "Loading… then paint" delay. Only a
+  // DEFINITIVELY revoked license (2 consecutive backend-confirmed falses)
+  // downgrades, and even then only after the page has already rendered.
   const [ok, setOk] = useState(_bmLicCache);
   useEffect(() => {
     let m = true;
+    const known = _bmLicCache === true;
     const fresh = Date.now() - _bmLicCheckedAt < _BM_LIC_TTL;
-    if (_bmLicCache === true && fresh) { setOk(true); return () => { m = false; }; }
+    // Known-good & fresh: nothing to do, page is already showing.
+    if (known && fresh) return () => { m = false; };
+    // Commit a backend-reported false only after 2 in a row (guards a stale
+    // snapshot right after boot / re-check). A single false never flips a
+    // known-good edge, and never blocks render.
+    const commitFalse = () => {
+      _bmFalseStreak += 1;
+      if (_bmFalseStreak >= 2) {
+        _bmLicCache = false; _bmLicCheckedAt = Date.now();
+        try { localStorage.removeItem(_BM_LIC_LS); } catch {}
+        if (m) setOk(false);
+      }
+    };
+    const commitTrue = () => {
+      _bmFalseStreak = 0;
+      _bmLicCache = true; _bmLicCheckedAt = Date.now();
+      try { localStorage.setItem(_BM_LIC_LS, "1"); } catch {}
+      if (m) setOk(true);
+    };
     bmv2Status()
       .then((s) => {
-        const enabled = !!s?.enabled;
-        if (enabled) {
-          _bmFalseStreak = 0;
-          _bmLicCache = true; _bmLicCheckedAt = Date.now();
-          try { localStorage.setItem(_BM_LIC_LS, "1"); } catch {}
-        } else if (s && typeof s.enabled !== "undefined") {
-          // A backend-reported false. ALWAYS require 2 in a row before believing
-          // it — even from a cold (null) cache. The batch license snapshot can be
-          // momentarily absent right after boot / a re-check, and the very first
-          // /status of a session can race that. One soft false must never commit
-          // the "not licensed" banner; the 2nd confirmed false does.
-          _bmFalseStreak += 1;
-          if (_bmFalseStreak >= 2) {
-            _bmLicCache = false; _bmLicCheckedAt = Date.now();
-            try { localStorage.removeItem(_BM_LIC_LS); } catch {}
-          } else {
-            // first false: re-check shortly; keep showing loading, not the banner
-            setTimeout(() => { bmv2Status().then((s2) => {
-              if (s2 && s2.enabled) {
-                _bmFalseStreak = 0; _bmLicCache = true; _bmLicCheckedAt = Date.now();
-                try { localStorage.setItem(_BM_LIC_LS, "1"); } catch {}
-              } else if (s2 && typeof s2.enabled !== "undefined") {
-                _bmFalseStreak += 1;
-                if (_bmFalseStreak >= 2) { _bmLicCache = false; _bmLicCheckedAt = Date.now(); try { localStorage.removeItem(_BM_LIC_LS); } catch {} }
-              }
-              if (m) setOk(_bmLicCache);
-            }).catch(() => {}); }, 800);
+        if (s && s.enabled) { commitTrue(); return; }
+        if (s && typeof s.enabled !== "undefined") {
+          // first false + not yet known-good → re-check once shortly before
+          // deciding, so a boot-race can't strand a licensed edge on the banner
+          if (_bmFalseStreak === 0 && !known) {
+            setTimeout(() => {
+              bmv2Status()
+                .then((s2) => { if (s2 && s2.enabled) commitTrue(); else if (s2 && typeof s2.enabled !== "undefined") commitFalse(); })
+                .catch(() => {});
+            }, 800);
+            _bmFalseStreak += 1;  // count this first soft-false
+            return;
           }
+          commitFalse();
         }
-        if (m) setOk(_bmLicCache);
       })
-      .catch(() => { if (m) setOk(_bmLicCache); });  // transient: keep last-known
+      .catch(() => { /* transient: keep last-known; never downgrade */ });
     return () => { m = false; };
   }, []);
   return ok;
