@@ -234,9 +234,38 @@ function TrendChart({ series, xKey = "ts", height = 260, limitLines = [] }) {
 /* --------------------------------------------------------------------- */
 /*  License gate wrapper                                                  */
 /* --------------------------------------------------------------------- */
+// Module-level cache so navigating between the 3 batch pages does NOT re-flip the
+// license state on every mount. Once we've seen enabled=true, we keep it and only
+// refresh in the background — a transient /status error (timeout, aborted fetch on
+// fast navigation) must never downgrade a known-good license to "not licensed".
+let _bmLicCache = null;        // null=unknown, true=licensed, false=confirmed-not
+let _bmLicCheckedAt = 0;       // ms epoch of last successful check
+const _BM_LIC_TTL = 30000;     // re-check at most every 30s in the background
+
 function useLicense() {
-  const [ok, setOk] = useState(null);
-  useEffect(() => { let m = true; bmv2Status().then((s) => m && setOk(!!s.enabled)).catch(() => m && setOk(false)); return () => { m = false; }; }, []);
+  const [ok, setOk] = useState(_bmLicCache);
+  useEffect(() => {
+    let m = true;
+    // If we already know it's licensed and the cache is fresh, don't re-fetch.
+    const fresh = Date.now() - _bmLicCheckedAt < _BM_LIC_TTL;
+    if (_bmLicCache === true && fresh) { setOk(true); return () => { m = false; }; }
+    bmv2Status()
+      .then((s) => {
+        const enabled = !!s?.enabled;
+        // Only cache a definitive answer. Treat a soft/empty response as "unknown"
+        // rather than a hard "not licensed".
+        if (s && typeof s.enabled !== "undefined") {
+          _bmLicCache = enabled;
+          _bmLicCheckedAt = Date.now();
+        }
+        if (m) setOk(_bmLicCache);
+      })
+      .catch(() => {
+        // Transient error: keep whatever we last knew. Never downgrade true->false.
+        if (m) setOk(_bmLicCache);
+      });
+    return () => { m = false; };
+  }, []);
   return ok;
 }
 function Unlicensed() {
