@@ -25,7 +25,7 @@ import {
   bmv2ValidateDefinition, bmv2PublishDefinition, bmv2ListVersions, bmv2NewVersion,
   bmv2ListBatches, bmv2GetBatch, bmv2CreateBatch, bmv2BatchAction, bmv2AddComment,
   bmv2BatchEvents, bmv2BatchTrends, bmv2BatchKpis, bmv2RecomputeBatch, bmv2BatchExcursions,
-  bmv2BatchCollectedTags, bmv2ListBatchReports, bmv2GenerateBatchReport, bmv2EmailBatchReport,
+  bmv2BatchCollectedTags, bmv2BatchProperties, bmv2ListBatchReports, bmv2GenerateBatchReport, bmv2EmailBatchReport,
   bmv2ListGroups, bmv2GetGroup, bmv2CreateGroup, bmv2CompleteGroup, bmv2AbortGroup,
   bmv2GroupBatches, bmv2GroupKpis, bmv2ListGroupReports, bmv2GenerateGroupReport, bmv2EmailGroupReport,
   bmv2AnalysisExcursions, bmv2AckExcursion, bmv2AnalysisComparison,
@@ -641,9 +641,22 @@ function GroupTable({ rows, onOpen }) {
 }
 
 function CreateBatchModal({ defs, onClose, onCreated }) {
-  const [form, setForm] = useState({ definition_id: "", reference: "", product: "", notes: "" });
+  const [form, setForm] = useState({ definition_id: "", reference: "", product: "", notes: "", properties: {} });
   const [busy, setBusy] = useState(false); const [err, setErr] = useState("");
+  const [manualProps, setManualProps] = useState([]);   // manual props declared on the chosen definition
   const published = (defs || []).filter((d) => d.status === "published");
+  // When a definition is picked, load its MANUAL properties so the operator can
+  // fill them for THIS batch. Linked/snapshot props are captured automatically
+  // at start/end and never prompted here.
+  useEffect(() => {
+    if (!form.definition_id) { setManualProps([]); return; }
+    let m = true;
+    bmv2GetDefinition(form.definition_id)
+      .then((d) => { if (m) setManualProps((d?.config?.properties || []).filter((p) => p.source !== "linked")); })
+      .catch(() => { if (m) setManualProps([]); });
+    return () => { m = false; };
+  }, [form.definition_id]);
+  const setProp = (key, v) => setForm((f) => ({ ...f, properties: { ...f.properties, [key]: v } }));
   const save = async () => {
     setBusy(true); setErr("");
     try { await bmv2CreateBatch(form); onCreated(); }
@@ -664,7 +677,19 @@ function CreateBatchModal({ defs, onClose, onCreated }) {
         <label>Product<input value={form.product} onChange={(e) => setForm({ ...form, product: e.target.value })} /></label>
         <label>Notes<input value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></label>
       </div>
-      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+      {manualProps.length > 0 && (
+        <div style={{ marginTop: 10, borderTop: "1px solid var(--stroke)", paddingTop: 10 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Batch properties</div>
+          <div className="form-grid">
+            {manualProps.map((p) => (
+              <label key={p.key}>{p.label || p.key}
+                <input value={form.properties[p.key] || ""} onChange={(e) => setProp(p.key, e.target.value)} />
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 12 }}>
         <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
         <button className="btn btn-primary btn-sm" disabled={busy} onClick={save}>{busy ? "Creating…" : "Create"}</button>
       </div>
@@ -725,6 +750,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
   const [series, setSeries] = useState([]);
   const [reports, setReports] = useState([]);
   const [tags, setTags] = useState([]);
+  const [properties, setProperties] = useState(() => cacheGet(`batch:props:${batchId}`, []));
   const [preview, setPreview] = useState(null);
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
@@ -735,12 +761,12 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
     try {
       const b = await bmv2GetBatch(batchId);
       setBatch(b); cacheSet(`batch:full:${batchId}`, b);
-      const [k, x, e, r, tg] = await Promise.all([
+      const [k, x, e, r, tg, pr] = await Promise.all([
         bmv2BatchKpis(batchId), bmv2BatchExcursions(batchId), bmv2BatchEvents(batchId, 100),
-        bmv2ListBatchReports(batchId), bmv2BatchCollectedTags(batchId),
+        bmv2ListBatchReports(batchId), bmv2BatchCollectedTags(batchId), bmv2BatchProperties(batchId),
       ]);
-      setKpis(k); setExcursions(x); setEvents(e); setReports(r); setTags(tg);
-      cacheSet(`batch:kpis:${batchId}`, k); cacheSet(`batch:exc:${batchId}`, x);
+      setKpis(k); setExcursions(x); setEvents(e); setReports(r); setTags(tg); setProperties(pr);
+      cacheSet(`batch:kpis:${batchId}`, k); cacheSet(`batch:exc:${batchId}`, x); cacheSet(`batch:props:${batchId}`, pr);
       setErr("");
       if (tg.length) setSeries(await bmv2BatchTrends(batchId, tg.slice(0, 4).join(","), 400));
     } catch (ex) { const t = errText(ex); if (t) setErr(t); }
@@ -801,6 +827,19 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
           <Field label="Start reason">{batch.start_reason || "—"}</Field>
           <Field label="Stop reason">{batch.stop_reason || "—"}</Field>
         </div>
+        {properties.length > 0 && (
+          <div style={{ marginTop: 12, borderTop: "1px solid var(--stroke)", paddingTop: 10 }}>
+            <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 6 }}>BATCH PROPERTIES</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10, fontSize: 13 }}>
+              {properties.map((p) => (
+                <Field key={p.prop_key} label={p.label || p.prop_key}>
+                  {(p.value_text ?? (p.value_numeric != null ? String(p.value_numeric) : "")) || "—"}
+                  {p.source === "linked" && <span style={{ fontSize: 10, color: "var(--muted)" }}> · {p.tag_name} @{p.capture_at}</span>}
+                </Field>
+              ))}
+            </div>
+          </div>
+        )}
       </Card>
 
       <Card title="KPIs">
@@ -1001,6 +1040,43 @@ const KPI_CHOICES = [
 const LIMIT_TYPES = ["spec_lower", "spec_upper", "warning_lower", "warning_upper", "operating_lower", "operating_upper"];
 const TAG_CATEGORIES = ["process_value", "setpoint", "count", "energy", "flow", "pressure", "temperature", "electrical", "machine_state", "alarm", "status", "test_result"];
 
+// Reusable gateway -> tag LINKED picker. Two dropdowns: pick a gateway, then
+// pick one of THAT gateway's actually-collected tags. This replaces free-text
+// tag/gateway entry so a definition links to real collected tags (the gateway
+// already polls them once into the historian; batch just reads them). Falls
+// back to a free-text input when a gateway exposes no tag list, so nothing
+// breaks on gateways we don't have a cached tag catalog for.
+function GatewayTagPicker({ gateways, gatewayId, tagName, onChange, disabled, compact }) {
+  const gw = (gateways || []).find((g) => g.id === gatewayId);
+  const tagOptions = gw ? gw.tags.map((t) => t.name) : [];
+  const cell = { minWidth: 0 };
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: compact ? "1fr 1fr" : "1fr 1.2fr", gap: 6 }}>
+      <select disabled={disabled} value={gatewayId || ""} style={cell}
+        onChange={(e) => {
+          const g = (gateways || []).find((x) => x.id === e.target.value);
+          // reset tag if it isn't valid for the newly-picked gateway
+          const keep = g && g.tags.some((t) => t.name === tagName) ? tagName : "";
+          onChange({ gateway_id: e.target.value, tag_name: keep });
+        }}>
+        <option value="">— gateway —</option>
+        {(gateways || []).map((g) => <option key={g.id} value={g.id}>{g.name || g.id}</option>)}
+      </select>
+      {gw && tagOptions.length ? (
+        <select disabled={disabled} value={tagName || ""} style={cell}
+          onChange={(e) => onChange({ gateway_id: gatewayId, tag_name: e.target.value })}>
+          <option value="">— tag —</option>
+          {tagOptions.map((n) => <option key={n} value={n}>{n}</option>)}
+        </select>
+      ) : (
+        // gateway has no cached tag list (or none picked) -> free-text fallback
+        <input disabled={disabled} placeholder="tag name" value={tagName || ""} list="bmv2-tags" style={cell}
+          onChange={(e) => onChange({ gateway_id: gatewayId, tag_name: e.target.value })} />
+      )}
+    </div>
+  );
+}
+
 export function BatchDefinitionsV2Page({ canEdit = false, gatewayConfigs = [] }) {
   const lic = useLicense();
   const [defs, setDefs] = useCachedState("defs:list", []);
@@ -1066,7 +1142,7 @@ function DefinitionWizard({ definitionId, gateways, canEdit, onClose, onSaved })
       start_config: { method: "manual" }, stop_config: { method: "manual" },
       report_config: {}, batch_report_template_id: "tpl-batch-detailed", batch_group_report_template_id: "tpl-batch-group-summary",
       auto_generate_batch_report: false, auto_email_batch_report: false, email_config: { recipients: "", subject: "", body: "" },
-      tags: [], triggers: [], kpis: [],
+      tags: [], triggers: [], kpis: [], properties: [],
     },
   });
 
@@ -1093,6 +1169,7 @@ function DefinitionWizard({ definitionId, gateways, canEdit, onClose, onSaved })
           email_config: d.config?.email_config || { recipients: "", subject: "", body: "" },
           tags: (d.config?.tags || []).map((t) => ({ ...t, limits: t.limits || [] })),
           triggers: d.config?.triggers || [], kpis: d.config?.kpis || [],
+          properties: d.config?.properties || [],
         },
       });
       setLoading(false);
@@ -1150,7 +1227,7 @@ function DefinitionWizard({ definitionId, gateways, canEdit, onClose, onSaved })
       </div>
 
       <div style={{ minHeight: 260 }}>
-        {step === 0 && <StepGeneral form={form} setForm={setForm} readOnly={readOnly} />}
+        {step === 0 && <StepGeneral form={form} setForm={setForm} setCfg={setCfg} gateways={gateways} readOnly={readOnly} />}
         {step === 1 && <StepStructure cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
         {step === 2 && <StepIdentification cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
         {step === 3 && <StepCondition which="start_config" title="Start" cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
@@ -1174,19 +1251,140 @@ function DefinitionWizard({ definitionId, gateways, canEdit, onClose, onSaved })
 
 function Lbl({ label, children }) { return <label>{label}{children}</label>; }
 
-function StepGeneral({ form, setForm, readOnly }) {
+function StepGeneral({ form, setForm, setCfg, gateways, readOnly }) {
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  // compact 3-col grid + tight row gaps -> minimal vertical space
+  const grid = { display: "grid", gridTemplateColumns: "repeat(3, minmax(0,1fr))", gap: "8px 10px" };
+  const field = (label, key) => (
+    <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+      <span style={{ color: "var(--muted)" }}>{label}</span>
+      <input disabled={readOnly} value={form[key] || ""} onChange={(e) => set(key, e.target.value)} />
+    </label>
+  );
   return (
-    <div className="form-grid" style={{ gridTemplateColumns: "repeat(2, minmax(0,1fr))" }}>
-      <Lbl label="Name *"><input disabled={readOnly} value={form.name} onChange={(e) => set("name", e.target.value)} /></Lbl>
-      <Lbl label="Code"><input disabled={readOnly} value={form.code} onChange={(e) => set("code", e.target.value)} /></Lbl>
-      <Lbl label="Plant"><input disabled={readOnly} value={form.plant} onChange={(e) => set("plant", e.target.value)} /></Lbl>
-      <Lbl label="Area"><input disabled={readOnly} value={form.area} onChange={(e) => set("area", e.target.value)} /></Lbl>
-      <Lbl label="Equipment (gateway id)"><input disabled={readOnly} value={form.equipment_id} onChange={(e) => set("equipment_id", e.target.value)} /></Lbl>
-      <Lbl label="Product / process"><input disabled={readOnly} value={form.product} onChange={(e) => set("product", e.target.value)} /></Lbl>
-      <Lbl label="Owner"><input disabled={readOnly} value={form.owner} onChange={(e) => set("owner", e.target.value)} /></Lbl>
-      <Lbl label="Description"><input disabled={readOnly} value={form.description} onChange={(e) => set("description", e.target.value)} /></Lbl>
+    <div>
+      <div style={grid}>
+        {field("Name *", "name")}
+        {field("Code", "code")}
+        {field("Equipment (gateway id)", "equipment_id")}
+        {field("Plant", "plant")}
+        {field("Area", "area")}
+        {field("Product / process", "product")}
+        {field("Owner", "owner")}
+        <label style={{ gridColumn: "span 2", display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+          <span style={{ color: "var(--muted)" }}>Description</span>
+          <input disabled={readOnly} value={form.description || ""} onChange={(e) => set("description", e.target.value)} />
+        </label>
+      </div>
+      <BatchProperties cfg={form.config} setCfg={setCfg} gateways={gateways} readOnly={readOnly} />
     </div>
+  );
+}
+
+// Custom batch properties: barcode / order # / equipment / lot, etc. Each is
+// MANUAL (typed per batch at start) or LINKED (snapshot of a collected tag at
+// batch start/end). Linked props do NOT trend — the gateway already collects
+// the tag once; we read the last value in the window. Added via a modal.
+const PROP_SOURCE_LABEL = { manual: "Manual (typed per batch)", linked: "Linked to a tag (snapshot)" };
+function slugKey(name, existing) {
+  let base = String(name || "prop").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "prop";
+  let key = base, n = 2;
+  while (existing.includes(key)) { key = `${base}_${n++}`; }
+  return key;
+}
+function BatchProperties({ cfg, setCfg, gateways, readOnly }) {
+  const props = cfg.properties || [];
+  const [adding, setAdding] = useState(null);   // draft property being added/edited
+  const remove = (key) => setCfg({ properties: props.filter((p) => p.key !== key) });
+  const upsert = (p) => {
+    const others = props.filter((x) => x.key !== p.key);
+    setCfg({ properties: [...others, p] });
+    setAdding(null);
+  };
+  return (
+    <div style={{ marginTop: 14, borderTop: "1px solid var(--stroke)", paddingTop: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+        <span style={{ fontSize: 12, fontWeight: 600 }}>Custom properties <span style={{ color: "var(--muted)", fontWeight: 400 }}>(barcode, order #, equipment…)</span></span>
+        {!readOnly && <button className="btn btn-ghost btn-sm" onClick={() => setAdding({ key: "", label: "", source: "manual", capture_at: "start", gateway_id: "", tag_name: "" })}>+ Add property</button>}
+      </div>
+      {!props.length && <div style={{ color: "var(--muted)", fontSize: 12 }}>No custom properties. Add barcode / order number / equipment — manual or snapshot from a PLC tag.</div>}
+      {props.length > 0 && (
+        <div style={{ display: "grid", gap: 4 }}>
+          {props.map((p) => (
+            <div key={p.key} style={{ display: "grid", gridTemplateColumns: "1.4fr 1.3fr 1.6fr auto", gap: 8, alignItems: "center",
+              fontSize: 12, border: "1px solid var(--stroke)", borderRadius: 6, padding: "6px 8px" }}>
+              <span style={{ fontWeight: 600 }}>{p.label || p.key}</span>
+              <span style={{ color: "var(--muted)" }}>{PROP_SOURCE_LABEL[p.source] || p.source}</span>
+              <span style={{ color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {p.source === "linked" ? `${p.tag_name || "—"} @${p.capture_at || "start"}${p.gateway_id ? ` · ${p.gateway_id}` : ""}` : "—"}
+              </span>
+              {!readOnly && <span style={{ display: "flex", gap: 4, justifyContent: "flex-end" }}>
+                <button className="btn btn-ghost btn-sm" onClick={() => setAdding({ ...p })}>Edit</button>
+                <button className="btn btn-danger btn-sm" onClick={() => remove(p.key)}>×</button>
+              </span>}
+            </div>
+          ))}
+        </div>
+      )}
+      {adding && <PropertyModal draft={adding} existingKeys={props.map((p) => p.key).filter((k) => k !== adding.key)}
+        gateways={gateways} onCancel={() => setAdding(null)} onSave={upsert} />}
+    </div>
+  );
+}
+
+function PropertyModal({ draft, existingKeys, gateways, onCancel, onSave }) {
+  const [p, setP] = useState(draft);
+  const set = (patch) => setP((x) => ({ ...x, ...patch }));
+  const valid = p.label.trim() && (p.source === "manual" || (p.source === "linked" && p.tag_name));
+  const save = () => {
+    const key = p.key || slugKey(p.label, existingKeys);
+    onSave({ key, label: p.label.trim(), source: p.source,
+      capture_at: p.source === "linked" ? (p.capture_at || "start") : null,
+      gateway_id: p.source === "linked" ? (p.gateway_id || "") : null,
+      tag_name: p.source === "linked" ? (p.tag_name || "") : null });
+  };
+  return (
+    <Modal onClose={onCancel} width={520}>
+      <h3 style={{ marginTop: 0 }}>{draft.key ? "Edit property" : "Add property"}</h3>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+          <span style={{ color: "var(--muted)" }}>Name *</span>
+          <input value={p.label} placeholder="e.g. Order number" onChange={(e) => set({ label: e.target.value })} />
+        </label>
+        <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+          <span style={{ color: "var(--muted)" }}>Source</span>
+          <select value={p.source} onChange={(e) => set({ source: e.target.value })}>
+            <option value="manual">Manual — operator types it per batch</option>
+            <option value="linked">Linked to a tag — snapshot at batch start/end</option>
+          </select>
+        </label>
+        {p.source === "linked" && (
+          <>
+            <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+              <span style={{ color: "var(--muted)" }}>Tag (already collected by a gateway)</span>
+              <GatewayTagPicker gateways={gateways} gatewayId={p.gateway_id} tagName={p.tag_name}
+                onChange={(patch) => set(patch)} />
+            </label>
+            <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+              <span style={{ color: "var(--muted)" }}>Capture when</span>
+              <select value={p.capture_at || "start"} onChange={(e) => set({ capture_at: e.target.value })}>
+                <option value="start">At batch start</option>
+                <option value="end">At batch end</option>
+              </select>
+            </label>
+            <div style={{ fontSize: 11, color: "var(--muted)" }}>
+              Reads the last value of this tag from the historian at the chosen moment. It is <b>not</b> collected
+              again or trended — the gateway already collects it once. If start is PLC-triggered, this snapshot
+              fires automatically with the trigger.
+            </div>
+          </>
+        )}
+      </div>
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+        <button className="btn btn-ghost btn-sm" onClick={onCancel}>Cancel</button>
+        <button className="btn btn-primary btn-sm" disabled={!valid} onClick={save}>{draft.key ? "Save" : "Add"}</button>
+      </div>
+    </Modal>
   );
 }
 
@@ -1304,9 +1502,9 @@ function StepTags({ cfg, setCfg, gateways, readOnly }) {
       {!tags.length && <div style={{ color: "var(--muted)", fontSize: 13 }}>No tags selected. Add the historian tags to monitor for this batch.</div>}
       {tags.map((t, i) => (
         <div key={i} style={{ border: "1px solid var(--stroke)", borderRadius: 8, padding: 10, marginBottom: 8 }}>
-          <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr auto auto auto", gap: 6, alignItems: "center" }}>
-            <input disabled={readOnly} placeholder="tag name" list="bmv2-tags" value={t.tag_name} onChange={(e) => setTag(i, { tag_name: e.target.value })} />
-            <input disabled={readOnly} placeholder="gateway id" value={t.gateway_id || ""} onChange={(e) => setTag(i, { gateway_id: e.target.value })} />
+          <div style={{ display: "grid", gridTemplateColumns: "2.4fr 1fr auto auto auto", gap: 6, alignItems: "center" }}>
+            <GatewayTagPicker gateways={gateways} gatewayId={t.gateway_id} tagName={t.tag_name} disabled={readOnly}
+              onChange={(patch) => setTag(i, patch)} />
             <select disabled={readOnly} value={t.tag_category || "process_value"} onChange={(e) => setTag(i, { tag_category: e.target.value })}>
               {TAG_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
             </select>

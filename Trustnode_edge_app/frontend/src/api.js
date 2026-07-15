@@ -3361,6 +3361,9 @@ export async function bmv2BatchKpis(id) { return (await _bmGet(`/batches/${encod
 export async function bmv2RecomputeBatch(id) { return _bmSend(`/batches/${encodeURIComponent(id)}/recompute`, "POST", {}); }
 export async function bmv2BatchExcursions(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/excursions`)).rows || []; }
 export async function bmv2BatchCollectedTags(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/collected-tags`)).tags || []; }
+// Custom batch properties (barcode / order # / equipment / ...).
+export async function bmv2BatchProperties(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/properties`)).rows || []; }
+export async function bmv2BatchDefinitionProperties(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/definition-properties`)).rows || []; }
 export async function bmv2ListBatchReports(id) { return (await _bmGet(`/batches/${encodeURIComponent(id)}/reports`)).rows || []; }
 export async function bmv2GenerateBatchReport(id, templateId = null) {
   return _bmSend(`/batches/${encodeURIComponent(id)}/reports`, "POST", { template_id: templateId });

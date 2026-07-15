@@ -4906,6 +4906,36 @@ class AppStore:
                     CREATE INDEX IF NOT EXISTS idx_brepref_batch ON batch_report_reference(batch_id);
                     CREATE INDEX IF NOT EXISTS idx_brepref_group ON batch_report_reference(batch_group_id);
                     CREATE INDEX IF NOT EXISTS idx_brepref_status ON batch_report_reference(tenant_id, report_status, email_status);
+
+                    /* -- Batch Property Value (2026-07-15) -------------------- */
+                    /* Custom batch metadata (barcode, order #, equipment, ...). */
+                    /* The property SCHEMA lives in the definition config_json     */
+                    /* (config.properties[]); captured VALUES live here, one row   */
+                    /* per (batch, property). A LINKED property snapshots a single */
+                    /* value from the historian at batch start/end (NOT trended) — */
+                    /* the gateway already collects the tag once; this just reads   */
+                    /* the last value in the window. A MANUAL property is typed per */
+                    /* batch at create/start. */
+                    CREATE TABLE IF NOT EXISTS batch_property_value (
+                      id TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL DEFAULT 'default',
+                      batch_id TEXT NOT NULL,
+                      batch_group_id TEXT NULL,
+                      prop_key TEXT NOT NULL,           -- stable key from the definition property
+                      label TEXT NULL,                  -- display name at capture time
+                      source TEXT NOT NULL DEFAULT 'manual',  -- manual|linked
+                      capture_at TEXT NULL,             -- start|end (linked only)
+                      gateway_id TEXT NULL,             -- linked source
+                      tag_name TEXT NULL,               -- linked source
+                      value_text TEXT NULL,             -- captured/typed value (string form)
+                      value_numeric REAL NULL,          -- captured numeric (if the tag was numeric)
+                      captured_utc TEXT NULL,           -- when the snapshot/entry was recorded
+                      captured_source TEXT NULL,        -- system|api|operator
+                      created_utc TEXT NOT NULL
+                    );
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_bprop_batch_key ON batch_property_value(tenant_id, batch_id, prop_key);
+                    CREATE INDEX IF NOT EXISTS idx_bprop_batch ON batch_property_value(batch_id);
+                    CREATE INDEX IF NOT EXISTS idx_bprop_group ON batch_property_value(batch_group_id);
                     """
                 )
                 hist_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(historian_readings)").fetchall()}

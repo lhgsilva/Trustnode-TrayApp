@@ -173,6 +173,10 @@ class BatchIn(BaseModel):
     trigger_mode: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
     idempotency_key: Optional[str] = None
+    # Manual custom-property values typed per batch at create time, keyed by the
+    # definition property key: {"order_no": "ORD-1001", "barcode": "..."}.
+    # Linked/snapshot properties are captured later at start/end (not here).
+    properties: Optional[dict[str, Any]] = None
 
 
 class BatchActionIn(BaseModel):

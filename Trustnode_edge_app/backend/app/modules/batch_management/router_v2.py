@@ -286,6 +286,20 @@ def batch_collected_tags(batch_id: str) -> dict:
     return {"tags": _exe().collected_tags_in_window(batch_id)}
 
 
+# ---- Custom properties (barcode / order # / equipment / ...) -------------
+@router.get("/batches/{batch_id}/properties", dependencies=_LIC)
+def batch_properties(batch_id: str) -> dict:
+    """Captured property values for a batch (detail header + reports)."""
+    return {"rows": _exe().list_properties(batch_id)}
+
+
+@router.get("/batches/{batch_id}/definition-properties", dependencies=_LIC)
+def batch_definition_properties(batch_id: str) -> dict:
+    """Property SCHEMA that applies to this batch, so the UI can prompt the
+    operator for the MANUAL ones at start (linked ones snapshot automatically)."""
+    return {"rows": _exe().definition_properties_for_batch(batch_id)}
+
+
 # ---- Batch reports (reuse Report module) --------------------------------
 @router.get("/batches/{batch_id}/reports", dependencies=_LIC)
 def list_batch_reports(batch_id: str) -> dict:

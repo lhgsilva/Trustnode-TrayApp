@@ -559,6 +559,11 @@ class BatchDefinitionService(_BatchV2Base):
             "FROM kpi_definition WHERE definition_version_id = ? ORDER BY sort_order", (version_id,)).fetchall()]
         for k in cfg["kpis"]:
             k["configuration"] = _json_load(k.pop("configuration_json", None))
+        # Custom properties live ONLY in the raw configuration_json (no child
+        # table). Re-inject them so the wizard shows saved properties on edit.
+        raw = _json_load(v["configuration_json"]) or {}
+        if isinstance(raw, dict) and raw.get("properties"):
+            cfg["properties"] = raw["properties"]
         return cfg
 
     def _latest_version_id(self, c, definition_id, tid) -> Optional[str]:
@@ -771,10 +776,128 @@ class BatchExecutionService(_BatchV2Base):
             )
             self._event(c, batch_id=bid, batch_group_id=gid, event_type="batch.created",
                         source=source, message=ref, actor=actor)
+            # Persist any MANUAL property values supplied at create time (per-batch
+            # entries like order # / barcode the operator typed). Linked/snapshot
+            # properties are captured later, at start/end, in _capture_properties.
+            self._store_manual_properties(c, tid, bid, gid, defn_version_id,
+                                          payload.get("properties") or {}, actor)
             if gid:
                 self._groups.refresh_child_count(c, gid, tid)
             c.commit()
         return self.get_batch(bid) or {}
+
+    # -- custom properties (barcode / order # / equipment / ...) -------
+    def _definition_properties(self, version_id: Optional[str]) -> list[dict[str, Any]]:
+        """The property SCHEMA declared on the definition, read from the version's
+        configuration_json (config.properties[]). Returns [] when none/absent."""
+        if not version_id:
+            return []
+        tid = self._tenant()
+        with self._connect_readonly() as c:
+            r = c.execute(
+                "SELECT configuration_json FROM batch_definition_version WHERE id = ? AND tenant_id = ?",
+                (version_id, tid)).fetchone()
+        if not r:
+            return []
+        cfg = _json_load(r["configuration_json"]) or {}
+        props = cfg.get("properties") if isinstance(cfg, dict) else None
+        return [p for p in (props or []) if isinstance(p, dict) and p.get("key")]
+
+    def _latest_historian_value(self, c, tid, gateway_id, tag_name, at_utc):
+        """Snapshot the single most-recent historian value for a tag AT (or just
+        before) a timestamp. This is the whole point of a LINKED property: the
+        gateway already collected the tag once — we just read the last value in
+        the window. No PLC re-poll, no continuous trending."""
+        if not tag_name:
+            return None, None
+        params: list[Any] = [tid, str(tag_name), str(at_utc)]
+        gw_clause = ""
+        if gateway_id:
+            gw_clause = " AND gateway_id = ?"; params.append(str(gateway_id))
+        row = c.execute(
+            f"""SELECT value, value_text FROM historian_readings
+                WHERE tenant_id = ? AND tag_name = ? AND ts_utc <= ?{gw_clause}
+                ORDER BY ts_utc DESC LIMIT 1""",
+            params).fetchone()
+        if not row:
+            return None, None
+        num = _opt_num(row["value"])
+        txt = row["value_text"]
+        if txt is None and num is not None:
+            txt = str(num)
+        return num, txt
+
+    def _store_manual_properties(self, c, tid, batch_id, group_id, version_id, values, actor) -> None:
+        """Upsert manual property values (typed per batch). `values` is
+        {prop_key: text}. Only keys declared manual on the definition are stored."""
+        if not values:
+            return
+        schema = {p["key"]: p for p in self._definition_properties(version_id)}
+        now = _utc_now()
+        for key, raw in (values or {}).items():
+            spec = schema.get(key)
+            if not spec or spec.get("source") == "linked":
+                continue  # unknown or linked -> not a manual entry
+            txt = "" if raw is None else str(raw)
+            c.execute(
+                """
+                INSERT INTO batch_property_value
+                  (id, tenant_id, batch_id, batch_group_id, prop_key, label, source,
+                   capture_at, gateway_id, tag_name, value_text, value_numeric,
+                   captured_utc, captured_source, created_utc)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(tenant_id, batch_id, prop_key) DO UPDATE SET
+                   value_text = excluded.value_text, value_numeric = excluded.value_numeric,
+                   captured_utc = excluded.captured_utc, captured_source = excluded.captured_source
+                """,
+                (_new_id("bprop"), tid, batch_id, group_id, key, spec.get("label") or key,
+                 "manual", None, None, None, txt, _opt_num(raw), now, "operator", now),
+            )
+
+    def _capture_properties(self, c, tid, batch_id, group_id, version_id, when, at_utc, actor) -> None:
+        """Capture LINKED property snapshots whose capture_at == `when` (start|end).
+        Reads the latest historian value for each linked tag at at_utc and upserts
+        it. Runs inside the caller's transaction (the start/stop transition)."""
+        props = [p for p in self._definition_properties(version_id)
+                 if p.get("source") == "linked" and (p.get("capture_at") or "start") == when]
+        if not props:
+            return
+        now = _utc_now()
+        for p in props:
+            gw = p.get("gateway_id"); tag = p.get("tag_name")
+            num, txt = self._latest_historian_value(c, tid, gw, tag, at_utc)
+            c.execute(
+                """
+                INSERT INTO batch_property_value
+                  (id, tenant_id, batch_id, batch_group_id, prop_key, label, source,
+                   capture_at, gateway_id, tag_name, value_text, value_numeric,
+                   captured_utc, captured_source, created_utc)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(tenant_id, batch_id, prop_key) DO UPDATE SET
+                   value_text = excluded.value_text, value_numeric = excluded.value_numeric,
+                   gateway_id = excluded.gateway_id, tag_name = excluded.tag_name,
+                   captured_utc = excluded.captured_utc, captured_source = excluded.captured_source
+                """,
+                (_new_id("bprop"), tid, batch_id, group_id, p["key"], p.get("label") or p["key"],
+                 "linked", when, gw, tag, txt, num, at_utc, "system", now),
+            )
+
+    def list_properties(self, batch_id: str) -> list[dict[str, Any]]:
+        """Captured property values for a batch (for the detail header + reports)."""
+        tid = self._tenant()
+        with self._connect_readonly() as c:
+            rows = c.execute(
+                "SELECT prop_key, label, source, capture_at, gateway_id, tag_name, "
+                "value_text, value_numeric, captured_utc FROM batch_property_value "
+                "WHERE batch_id = ? AND tenant_id = ? ORDER BY created_utc",
+                (batch_id, tid)).fetchall()
+        return [dict(r) for r in rows]
+
+    def definition_properties_for_batch(self, batch_id: str) -> list[dict[str, Any]]:
+        """Property SCHEMA that applies to a batch (so the UI can prompt for the
+        manual ones at start). Reads the batch's pinned definition version."""
+        b = self.get_batch(batch_id)
+        return self._definition_properties(b.get("definition_version_id")) if b else []
 
     # -- state transitions --------------------------------------------
     def _transition(
@@ -818,6 +941,15 @@ class BatchExecutionService(_BatchV2Base):
                 self._open_window(c, tid, batch_id, eq, now)     # resume: open a fresh window
             if set_ended:
                 self._close_open_window(c, tid, batch_id, now)
+            # Capture LINKED custom-property snapshots at the moment of start/end.
+            # When start is PLC-trigger-driven, this rides the same transition —
+            # the @start snapshot fires automatically with the trigger, no extra
+            # wiring. Reads the latest historian value (no PLC re-poll).
+            ver = r["definition_version_id"]
+            if set_started:
+                self._capture_properties(c, tid, batch_id, r["batch_group_id"], ver, "start", now, actor)
+            if set_ended:
+                self._capture_properties(c, tid, batch_id, r["batch_group_id"], ver, "end", now, actor)
             self._event(c, batch_id=batch_id, batch_group_id=r["batch_group_id"],
                         event_type=f"batch.{target}", source=source, message=reason, actor=actor)
             c.commit()
