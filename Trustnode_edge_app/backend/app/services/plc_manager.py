@@ -1583,8 +1583,26 @@ class GatewayWorker:
             return "sqlite+pysqlite:///:memory:"
 
         # Resolve relative paths under a writable user directory.
+        #
+        # DATA-DIR NESTING BUG (2026-07-16): the stock sink config ships
+        # sqlite_path="./data/trustnode_edge.db", but _default_data_dir()
+        # ALREADY ends in ".../.trustnode_edge/data". Naively joining them
+        # produced ".../.trustnode_edge/data/data/trustnode_edge.db" — a
+        # SECOND, nested store. The gateway happily wrote 3M rows there while
+        # every reader (batch module, trigger daemon, charts) looked at the
+        # canonical store and saw an empty historian: no triggers fired, no
+        # series/limits/KPIs rendered. Strip a leading "./data/" (or "data/")
+        # when the base dir already ends in "data" so the configured default
+        # resolves to the SAME file readers use. Absolute paths are untouched —
+        # an operator who deliberately points elsewhere still gets that path.
         if not os.path.isabs(path_norm):
-            path_norm = os.path.join(self._default_data_dir(), path_norm)
+            base = self._default_data_dir()
+            rel = path_norm.replace("\\", "/").lstrip("./")
+            if os.path.basename(os.path.normpath(base)).lower() == "data":
+                low = rel.lower()
+                if low.startswith("data/"):
+                    rel = rel[len("data/"):]
+            path_norm = os.path.join(base, rel)
         path_norm = os.path.abspath(path_norm)
         parent = os.path.dirname(path_norm)
         if parent:
