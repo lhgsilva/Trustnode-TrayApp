@@ -3253,7 +3253,22 @@ class PLCManager:
                     # reorder writes. Then attempt the current cycle. If
                     # either fails, the unwritten rows go into the FIFO
                     # buffer for the next attempt. No bare-except drop.
-                    await self._run_collection_io(self._flush_historian_buffer_then_write, rows)
+                    #
+                    # 2026-07-16 REGRESSION FIX: this used to call
+                    # self._run_collection_io(...), but that helper lives on
+                    # GatewayWorker — NOT on PLCManager (which owns
+                    # _broadcast). Every cycle raised AttributeError, the broad
+                    # `except` below swallowed it, and the rows were buffered
+                    # forever: app_store.historian_readings stayed EMPTY while
+                    # the sink DB filled. That silently broke every historian
+                    # reader — batch triggers never fired, and batch views had
+                    # no series/limits/charts/KPIs. Run the write on the owning
+                    # worker's dedicated collection executor (keeping the
+                    # thread-pool isolation), falling back to a plain thread.
+                    if worker is not None and hasattr(worker, "_run_collection_io"):
+                        await worker._run_collection_io(self._flush_historian_buffer_then_write, rows)
+                    else:
+                        await asyncio.to_thread(self._flush_historian_buffer_then_write, rows)
         except Exception as exc:
             # We must NEVER drop rows silently here. If we reached this
             # point with a non-empty rows list it means the helper above
