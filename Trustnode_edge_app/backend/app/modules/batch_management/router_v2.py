@@ -182,6 +182,11 @@ def get_batch(batch_id: str) -> dict:
     return {"row": row}
 
 
+@router.delete("/batches/{batch_id}", dependencies=_LIC)
+def delete_batch(batch_id: str, request: Request) -> dict:
+    return {"ok": _guard(lambda: _exe().delete_batch(batch_id, actor=_actor(request)))}
+
+
 def _terminal_hook(batch_id: str, actor: Optional[str]) -> None:
     """After a batch reaches a terminal state: compute + optionally auto-report/email.
     Best-effort; never raises."""
@@ -343,6 +348,11 @@ def email_batch_report(batch_id: str, reference_id: str, payload: dict = Body(de
         body=p.get("html_body") or p.get("body"), email_settings=p.get("email_settings")))
 
 
+@router.delete("/batches/{batch_id}/reports/{reference_id}", dependencies=_LIC)
+def delete_batch_report(batch_id: str, reference_id: str, request: Request) -> dict:
+    return {"ok": _guard(lambda: _reports().delete_report(reference_id, actor=_actor(request)))}
+
+
 # ---- Batch Groups --------------------------------------------------------
 @router.get("/groups", dependencies=_LIC)
 def list_groups(limit: int = 200, offset: int = 0, status: Optional[str] = None) -> dict:
@@ -362,6 +372,11 @@ def get_group(group_id: str) -> dict:
     if not row:
         raise HTTPException(status_code=404, detail="group not found")
     return {"row": row}
+
+
+@router.delete("/groups/{group_id}", dependencies=_LIC)
+def delete_group(group_id: str, request: Request) -> dict:
+    return {"ok": _guard(lambda: _groups().delete_group(group_id, actor=_actor(request)))}
 
 
 @router.post("/groups/{group_id}/complete", dependencies=_LIC)
@@ -415,6 +430,11 @@ def email_group_report(group_id: str, reference_id: str, payload: dict = Body(de
     return _guard(lambda: _reports().email_report(
         reference_id, recipients=p.get("recipients") or [], subject=p.get("subject"),
         body=p.get("html_body") or p.get("body"), email_settings=p.get("email_settings")))
+
+
+@router.delete("/groups/{group_id}/reports/{reference_id}", dependencies=_LIC)
+def delete_group_report(group_id: str, reference_id: str, request: Request) -> dict:
+    return {"ok": _guard(lambda: _reports().delete_report(reference_id, actor=_actor(request)))}
 
 
 # ---- Analysis ------------------------------------------------------------

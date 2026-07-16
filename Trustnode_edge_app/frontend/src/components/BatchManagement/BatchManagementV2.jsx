@@ -26,6 +26,7 @@ import {
   bmv2ListBatches, bmv2GetBatch, bmv2CreateBatch, bmv2BatchAction, bmv2AddComment,
   bmv2BatchEvents, bmv2BatchTrends, bmv2BatchKpis, bmv2RecomputeBatch, bmv2BatchExcursions,
   bmv2BatchCollectedTags, bmv2BatchProperties, bmv2BatchMatrix, bmv2ListBatchReports, bmv2GenerateBatchReport, bmv2EmailBatchReport,
+  bmv2DeleteBatch, bmv2DeleteGroup, bmv2DeleteBatchReport, bmv2DeleteGroupReport,
   bmv2ListGroups, bmv2GetGroup, bmv2CreateGroup, bmv2CompleteGroup, bmv2AbortGroup,
   bmv2GroupBatches, bmv2GroupKpis, bmv2ListGroupReports, bmv2GenerateGroupReport, bmv2EmailGroupReport,
   bmv2AnalysisExcursions, bmv2AckExcursion, bmv2AnalysisComparison,
@@ -109,6 +110,32 @@ function Modal({ onClose, children, width }) {
     </div>
   );
   return typeof document === "undefined" ? node : createPortal(node, document.body);
+}
+
+// Confirm-delete modal. `target` = {label, warn?} of the item being deleted;
+// onConfirm returns a promise. Shows a spinner + surfaces errors inline (e.g.
+// "stop the running batch first" from the backend guard).
+function ConfirmDelete({ target, onCancel, onConfirm }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const go = async () => {
+    setBusy(true); setErr("");
+    try { await onConfirm(); }
+    catch (e) { setErr(e?.message || String(e)); setBusy(false); }
+  };
+  return (
+    <Modal onClose={busy ? () => {} : onCancel} width={460}>
+      <h3 style={{ marginTop: 0 }}>Delete {target?.label}?</h3>
+      <div style={{ fontSize: 13, color: "var(--muted)", marginBottom: 12 }}>
+        {target?.warn || "This permanently removes it and its data. This cannot be undone."}
+      </div>
+      {err && <Banner tone="error">{err}</Banner>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+        <button className="btn btn-ghost btn-sm" onClick={onCancel} disabled={busy}>Cancel</button>
+        <button className="btn btn-danger btn-sm" onClick={go} disabled={busy}>{busy ? "Deleting…" : "Delete"}</button>
+      </div>
+    </Modal>
+  );
 }
 
 const STATUS_CLASS = {
@@ -575,6 +602,7 @@ export function BatchOverviewV2Page({ canEdit = false }) {
   const [openBatch, setOpenBatch] = useState(null);   // batch id -> detail
   const [openGroup, setOpenGroup] = useState(null);
   const [creating, setCreating] = useState(null);      // "batch" | "group"
+  const [deleting, setDeleting] = useState(null);      // {kind:"batch"|"group", row}
   const [err, setErr] = useState("");
   const [defs, setDefs] = useCachedState("ov:defs", []);
 
@@ -669,7 +697,7 @@ export function BatchOverviewV2Page({ canEdit = false }) {
               </select>
               <input placeholder="Search reference / product…" value={search} onChange={(e) => setSearch(e.target.value)} style={{ maxWidth: 260 }} />
             </div>
-            <BatchTable rows={filteredBatches} onOpen={setOpenBatch} />
+            <BatchTable rows={filteredBatches} onOpen={setOpenBatch} onDelete={canEdit ? (b) => setDeleting({ kind: "batch", row: b }) : undefined} />
           </>
         )}
         {tab === "groups" && (
@@ -681,21 +709,36 @@ export function BatchOverviewV2Page({ canEdit = false }) {
               </select>
               <input placeholder="Search group reference…" value={search} onChange={(e) => setSearch(e.target.value)} style={{ maxWidth: 260 }} />
             </div>
-            <GroupTable rows={filteredGroups} onOpen={setOpenGroup} />
+            <GroupTable rows={filteredGroups} onOpen={setOpenGroup} onDelete={canEdit ? (g) => setDeleting({ kind: "group", row: g }) : undefined} />
           </>
         )}
       </Card>
 
       {creating === "batch" && <CreateBatchModal defs={defs} onClose={() => setCreating(null)} onCreated={() => { setCreating(null); load(); }} />}
       {creating === "group" && <CreateGroupModal defs={defs} onClose={() => setCreating(null)} onCreated={() => { setCreating(null); load(); }} />}
+      {deleting && <ConfirmDelete
+        target={{
+          label: deleting.kind === "group"
+            ? `group "${deleting.row.reference || deleting.row.id}"`
+            : `batch "${deleting.row.reference || deleting.row.id}"`,
+          warn: deleting.kind === "group"
+            ? "This deletes the group AND all its child batches, with their KPIs, excursions, and reports. This cannot be undone."
+            : "This permanently removes the batch and its KPIs, excursions, properties, and reports. This cannot be undone.",
+        }}
+        onCancel={() => setDeleting(null)}
+        onConfirm={async () => {
+          if (deleting.kind === "group") await bmv2DeleteGroup(deleting.row.id);
+          else await bmv2DeleteBatch(deleting.row.id);
+          setDeleting(null); load();
+        }} />}
     </>
   );
 }
 
-function BatchTable({ rows, onOpen }) {
+function BatchTable({ rows, onOpen, onDelete }) {
   return (
     <DataTable
-      minWidth={900}
+      minWidth={960}
       empty="No batches yet."
       onRowClick={(b) => onOpen(b.id)}
       columns={[
@@ -708,19 +751,21 @@ function BatchTable({ rows, onOpen }) {
         { key: "started", label: "Started", width: "1.3fr", render: (b) => fmtTs(b.started_utc) },
         { key: "ended", label: "Ended", width: "1.3fr", render: (b) => fmtTs(b.ended_utc) },
         { key: "duration", label: "Duration", width: "0.9fr", render: (b) => humanDur(b.started_utc, b.ended_utc) },
-        { key: "actions", label: "", width: "0.9fr", align: "right",
-          render: (b) => <span className="bm-row-actions"><button className="btn btn-secondary btn-sm"
-            onClick={(e) => { e.stopPropagation(); onOpen(b.id); }}>Open</button></span> },
+        { key: "actions", label: "", width: onDelete ? "1.3fr" : "0.9fr", align: "right",
+          render: (b) => <span className="bm-row-actions" style={{ display: "inline-flex", gap: 6, justifyContent: "flex-end" }}>
+            <button className="btn btn-secondary btn-sm" onClick={(e) => { e.stopPropagation(); onOpen(b.id); }}>Open</button>
+            {onDelete && <button className="btn btn-danger btn-sm" onClick={(e) => { e.stopPropagation(); onDelete(b); }}>Delete</button>}
+          </span> },
       ]}
       rows={rows}
     />
   );
 }
 
-function GroupTable({ rows, onOpen }) {
+function GroupTable({ rows, onOpen, onDelete }) {
   return (
     <DataTable
-      minWidth={860}
+      minWidth={920}
       empty="No batch groups yet."
       onRowClick={(g) => onOpen(g.id)}
       columns={[
@@ -734,9 +779,11 @@ function GroupTable({ rows, onOpen }) {
         { key: "started", label: "Started", width: "1.3fr", render: (g) => fmtTs(g.started_utc) },
         { key: "ended", label: "Ended", width: "1.3fr", render: (g) => fmtTs(g.completed_utc) },
         { key: "duration", label: "Duration", width: "0.9fr", render: (g) => humanDur(g.started_utc, g.completed_utc) },
-        { key: "actions", label: "", width: "0.9fr", align: "right",
-          render: (g) => <span className="bm-row-actions"><button className="btn btn-secondary btn-sm"
-            onClick={(e) => { e.stopPropagation(); onOpen(g.id); }}>Open</button></span> },
+        { key: "actions", label: "", width: onDelete ? "1.3fr" : "0.9fr", align: "right",
+          render: (g) => <span className="bm-row-actions" style={{ display: "inline-flex", gap: 6, justifyContent: "flex-end" }}>
+            <button className="btn btn-secondary btn-sm" onClick={(e) => { e.stopPropagation(); onOpen(g.id); }}>Open</button>
+            {onDelete && <button className="btn btn-danger btn-sm" onClick={(e) => { e.stopPropagation(); onDelete(g); }}>Delete</button>}
+          </span> },
       ]}
       rows={rows}
     />
@@ -861,6 +908,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
   const [err, setErr] = useState("");
   const [comment, setComment] = useState("");
   const [confirmAction, setConfirmAction] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -930,6 +978,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
                 onClick={() => (a === "abort" ? setConfirmAction(a) : doAction(a))}>{busy === a ? "…" : label}</button>
             ))}
             {canEdit && <button className="btn btn-secondary btn-sm" disabled={busy === "report"} onClick={genReport}>{busy === "report" ? "…" : "Generate report"}</button>}
+            {canEdit && batch.status !== "running" && <button className="btn btn-danger btn-sm" onClick={() => setConfirmDelete(true)}>Delete</button>}
           </>
         }
       >
@@ -1018,8 +1067,11 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
             { key: "kind", label: "Report", width: "1.2fr", render: (r) => (r.report_kind || "").replace(/_/g, " ") },
             { key: "status", label: "Status", width: "1fr", render: (r) => <Pill value={r.report_status} /> },
             { key: "generated", label: "Generated", width: "1.4fr", render: (r) => fmtTs(r.generated_utc) },
-            { key: "actions", label: "Actions", width: "1fr",
-              render: (r) => <button className="btn btn-secondary btn-sm" onClick={() => setPreview(r)}>Preview</button> },
+            { key: "actions", label: "Actions", width: canEdit ? "1.5fr" : "1fr",
+              render: (r) => <span style={{ display: "inline-flex", gap: 6 }}>
+                <button className="btn btn-secondary btn-sm" onClick={() => setPreview(r)}>Preview</button>
+                {canEdit && <button className="btn btn-danger btn-sm" onClick={async () => { try { await bmv2DeleteBatchReport(batchId, r.id); load(); } catch (e) { setErr(errText(e)); } }}>Delete</button>}
+              </span> },
           ]}
           rows={reports}
         />
@@ -1056,6 +1108,11 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
           </div>
         </Modal>
       )}
+      {confirmDelete && <ConfirmDelete
+        target={{ label: `batch "${batch.reference || batch.id}"`,
+          warn: "This permanently removes the batch and its KPIs, excursions, properties, and reports. This cannot be undone." }}
+        onCancel={() => setConfirmDelete(false)}
+        onConfirm={async () => { await bmv2DeleteBatch(batchId); setConfirmDelete(false); onBack && onBack(); }} />}
     </>
   );
 }
@@ -1074,6 +1131,7 @@ function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
   const [kpis, setKpis] = useState(() => cacheGet(`group:kpis:${groupId}`, []));
   const [reports, setReports] = useState([]);
   const [preview, setPreview] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState(""); const [err, setErr] = useState("");
 
   const load = useCallback(async () => {
@@ -1112,6 +1170,7 @@ function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
             {canEdit && group.status === "active" && <button className="btn btn-primary btn-sm" disabled={busy === "complete"} onClick={() => act("complete")}>Complete</button>}
             {canEdit && group.status === "active" && <button className="btn btn-danger btn-sm" disabled={busy === "abort"} onClick={() => act("abort")}>Abort</button>}
             {canEdit && <button className="btn btn-secondary btn-sm" disabled={busy === "report"} onClick={genReport}>Generate report</button>}
+            {canEdit && <button className="btn btn-danger btn-sm" onClick={() => setConfirmDelete(true)}>Delete</button>}
           </>
         }
       >
@@ -1151,8 +1210,11 @@ function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
             { key: "kind", label: "Report", width: "1.2fr", render: (r) => (r.report_kind || "").replace(/_/g, " ") },
             { key: "status", label: "Status", width: "1fr", render: (r) => <Pill value={r.report_status} /> },
             { key: "generated", label: "Generated", width: "1.4fr", render: (r) => fmtTs(r.generated_utc) },
-            { key: "actions", label: "Actions", width: "1fr",
-              render: (r) => <button className="btn btn-secondary btn-sm" onClick={() => setPreview(r)}>Preview</button> },
+            { key: "actions", label: "Actions", width: canEdit ? "1.5fr" : "1fr",
+              render: (r) => <span style={{ display: "inline-flex", gap: 6 }}>
+                <button className="btn btn-secondary btn-sm" onClick={() => setPreview(r)}>Preview</button>
+                {canEdit && <button className="btn btn-danger btn-sm" onClick={async () => { try { await bmv2DeleteGroupReport(groupId, r.id); load(); } catch (e) { setErr(errText(e)); } }}>Delete</button>}
+              </span> },
           ]}
           rows={reports}
         />
@@ -1160,6 +1222,11 @@ function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
 
       {preview && <ReportPreviewModal report={preview} canEdit={canEdit} onClose={() => setPreview(null)} onRegenerate={genReport}
         onEmail={(refId, recips) => bmv2EmailGroupReport(groupId, refId, { recipients: recips })} />}
+      {confirmDelete && <ConfirmDelete
+        target={{ label: `group "${group.reference || group.id}"`,
+          warn: "This deletes the group AND all its child batches, with their KPIs, excursions, and reports. This cannot be undone." }}
+        onCancel={() => setConfirmDelete(false)}
+        onConfirm={async () => { await bmv2DeleteGroup(groupId); setConfirmDelete(false); onBack && onBack(); }} />}
     </>
   );
 }
@@ -1254,6 +1321,7 @@ export function BatchDefinitionsV2Page({ canEdit = false, gatewayConfigs = [] })
   const [defs, setDefs] = useCachedState("defs:list", []);
   const [loaded, setLoaded] = useState(() => _bmCache.has("defs:list"));
   const [editing, setEditing] = useState(null);   // definition id or "new"
+  const [deleting, setDeleting] = useState(null); // definition row
   const [err, setErr] = useState("");
   const gateways = useMemo(() => bmv2NormalizeGatewayTags(gatewayConfigs), [gatewayConfigs]);
 
@@ -1287,14 +1355,24 @@ export function BatchDefinitionsV2Page({ canEdit = false, gatewayConfigs = [] })
             { key: "status", label: "Status", width: "1fr", render: (d) => <Pill value={d.status} /> },
             { key: "version", label: "Version", width: "0.8fr", render: (d) => `v${d.cur_version_number || d.version_number || 1}` },
             { key: "equipment", label: "Equipment", width: "1.2fr", render: (d) => d.equipment_id || "—" },
-            { key: "actions", label: "Actions", width: "1fr",
-              render: (d) => <button className="btn btn-secondary btn-sm" onClick={() => setEditing(d.id)}>{canEdit ? "Edit" : "View"}</button> },
+            { key: "actions", label: "Actions", width: canEdit ? "1.4fr" : "1fr",
+              render: (d) => <span style={{ display: "inline-flex", gap: 6 }}>
+                <button className="btn btn-secondary btn-sm" onClick={() => setEditing(d.id)}>{canEdit ? "Edit" : "View"}</button>
+                {canEdit && <button className="btn btn-danger btn-sm" onClick={() => setDeleting(d)}>Delete</button>}
+              </span> },
           ]}
           rows={defs}
         />
       </Card>
       {editing && <DefinitionWizard definitionId={editing === "new" ? null : editing} gateways={gateways} canEdit={canEdit}
         onClose={() => setEditing(null)} onSaved={() => { setEditing(null); load(); }} />}
+      {deleting && <ConfirmDelete
+        target={{
+          label: `definition "${deleting.name}"`,
+          warn: "A draft definition is deleted outright. A published definition that already has batches is RETIRED (kept for its batches' history) rather than removed.",
+        }}
+        onCancel={() => setDeleting(null)}
+        onConfirm={async () => { await bmv2DeleteDefinition(deleting.id); setDeleting(null); load(); }} />}
     </>
   );
 }
@@ -1886,28 +1964,28 @@ function AnalysisReports({ canEdit, onOpenBatch, onOpenGroup }) {
   const [rows, setRows] = useCachedState("an:reports", []);
   const [preview, setPreview] = useState(null);
   const [previewOwner, setPreviewOwner] = useState(null); // {kind, id}
+  const [deleting, setDeleting] = useState(null);         // report row
   const [err, setErr] = useState("");
-  useEffect(() => {
-    (async () => {
-      try {
-        const [bl, gl] = await Promise.all([bmv2ListBatches({ limit: 50 }), bmv2ListGroups({ limit: 30 })]);
-        // Fetch every owner's report list IN PARALLEL (was a sequential await
-        // loop of up to 80 requests -> ~1s+ of serial round-trips on each open;
-        // that was the "reports/comparison takes long to load"). Promise.all
-        // collapses it to a couple of round-trips.
-        const acc = [];
-        const bReqs = (bl.rows || []).map((b) =>
-          bmv2ListBatchReports(b.id).then((rs) => rs.forEach((r) =>
-            acc.push({ ...r, owner_ref: b.reference || b.id, owner_kind: "batch", owner_id: b.id }))).catch(() => {}));
-        const gReqs = (gl.rows || []).map((g) =>
-          bmv2ListGroupReports(g.id).then((rs) => rs.forEach((r) =>
-            acc.push({ ...r, owner_ref: g.reference || g.id, owner_kind: "group", owner_id: g.id }))).catch(() => {}));
-        await Promise.all([...bReqs, ...gReqs]);
-        acc.sort((a, b) => String(b.created_utc).localeCompare(String(a.created_utc)));
-        setRows(acc); setErr("");
-      } catch (e) { const t = errText(e); if (t) setErr(t); }  // keep last-good on transient
-    })();
+  const load = useCallback(async () => {
+    try {
+      const [bl, gl] = await Promise.all([bmv2ListBatches({ limit: 50 }), bmv2ListGroups({ limit: 30 })]);
+      // Fetch every owner's report list IN PARALLEL (was a sequential await
+      // loop of up to 80 requests -> ~1s+ of serial round-trips on each open;
+      // that was the "reports/comparison takes long to load"). Promise.all
+      // collapses it to a couple of round-trips.
+      const acc = [];
+      const bReqs = (bl.rows || []).map((b) =>
+        bmv2ListBatchReports(b.id).then((rs) => rs.forEach((r) =>
+          acc.push({ ...r, owner_ref: b.reference || b.id, owner_kind: "batch", owner_id: b.id }))).catch(() => {}));
+      const gReqs = (gl.rows || []).map((g) =>
+        bmv2ListGroupReports(g.id).then((rs) => rs.forEach((r) =>
+          acc.push({ ...r, owner_ref: g.reference || g.id, owner_kind: "group", owner_id: g.id }))).catch(() => {}));
+      await Promise.all([...bReqs, ...gReqs]);
+      acc.sort((a, b) => String(b.created_utc).localeCompare(String(a.created_utc)));
+      setRows(acc); setErr("");
+    } catch (e) { const t = errText(e); if (t) setErr(t); }  // keep last-good on transient
   }, [setRows]);
+  useEffect(() => { load(); }, [load]);
   const openOwner = (r) => {
     if (r.owner_kind === "group") onOpenGroup && onOpenGroup(r.owner_id);
     else onOpenBatch && onOpenBatch(r.owner_id);
@@ -1925,10 +2003,11 @@ function AnalysisReports({ canEdit, onOpenBatch, onOpenGroup }) {
           { key: "email", label: "Email", width: "1fr",
             render: (r) => <Pill value={r.email_status === "sent" ? "good" : r.email_status === "failed" ? "failed" : "planned"} /> },
           { key: "generated", label: "Generated", width: "1.3fr", render: (r) => fmtTs(r.generated_utc) },
-          { key: "actions", label: "Actions", width: "1.4fr",
+          { key: "actions", label: "Actions", width: canEdit ? "1.9fr" : "1.4fr",
             render: (r) => <span style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
               <button className="btn btn-secondary btn-sm" onClick={() => { setPreview(r); setPreviewOwner({ kind: r.owner_kind, id: r.owner_id }); }}>Preview</button>
               <button className="btn btn-ghost btn-sm" onClick={() => openOwner(r)}>Open {r.owner_kind}</button>
+              {canEdit && <button className="btn btn-danger btn-sm" onClick={() => setDeleting(r)}>Delete</button>}
             </span> },
         ]}
         rows={rows}
@@ -1936,6 +2015,15 @@ function AnalysisReports({ canEdit, onOpenBatch, onOpenGroup }) {
       {preview && <ReportPreviewModal report={preview} canEdit={canEdit} onClose={() => setPreview(null)}
         onRegenerate={async () => { previewOwner.kind === "batch" ? await bmv2GenerateBatchReport(previewOwner.id) : await bmv2GenerateGroupReport(previewOwner.id); }}
         onEmail={(refId, recips) => previewOwner.kind === "batch" ? bmv2EmailBatchReport(previewOwner.id, refId, { recipients: recips }) : bmv2EmailGroupReport(previewOwner.id, refId, { recipients: recips })} />}
+      {deleting && <ConfirmDelete
+        target={{ label: `report for "${deleting.owner_ref}"`,
+          warn: "This deletes the report and its generated file (it also disappears from Generated Reports). This cannot be undone." }}
+        onCancel={() => setDeleting(null)}
+        onConfirm={async () => {
+          if (deleting.owner_kind === "group") await bmv2DeleteGroupReport(deleting.owner_id, deleting.id);
+          else await bmv2DeleteBatchReport(deleting.owner_id, deleting.id);
+          setDeleting(null); load();
+        }} />}
     </>
   );
 }

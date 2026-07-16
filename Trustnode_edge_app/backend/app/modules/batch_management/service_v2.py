@@ -656,6 +656,33 @@ class BatchGroupService(_BatchV2Base):
             ).fetchall()
         return [_row_to_batch(r) for r in rows]
 
+    def delete_group(self, group_id: str, *, actor: Optional[str] = None) -> bool:
+        """Delete a group and ALL its child batches (with their owned rows). A
+        group with a RUNNING child must be stopped first."""
+        tid = self._tenant()
+        with self._connect() as c:
+            g = c.execute("SELECT 1 FROM batch_group WHERE id = ? AND tenant_id = ?", (group_id, tid)).fetchone()
+            if not g:
+                return False
+            running = c.execute(
+                "SELECT 1 FROM batch WHERE batch_group_id = ? AND tenant_id = ? AND LOWER(status)='running' LIMIT 1",
+                (group_id, tid)).fetchone()
+            if running:
+                raise BatchStateError("Stop the group's running batch(es) before deleting the group")
+            child_ids = [r["id"] for r in c.execute(
+                "SELECT id FROM batch WHERE batch_group_id = ? AND tenant_id = ?", (group_id, tid)).fetchall()]
+            for bid in child_ids:
+                for tbl in ("batch_kpi_result", "batch_excursion", "batch_event",
+                            "batch_data_window", "batch_property_value", "batch_report_reference"):
+                    c.execute(f"DELETE FROM {tbl} WHERE batch_id = ? AND tenant_id = ?", (bid, tid))
+            c.execute("DELETE FROM batch WHERE batch_group_id = ? AND tenant_id = ?", (group_id, tid))
+            # group-level owned rows
+            for tbl in ("batch_kpi_result", "batch_excursion", "batch_event", "batch_report_reference"):
+                c.execute(f"DELETE FROM {tbl} WHERE batch_group_id = ? AND tenant_id = ?", (group_id, tid))
+            c.execute("DELETE FROM batch_group WHERE id = ? AND tenant_id = ?", (group_id, tid))
+            c.commit()
+        return True
+
     def _transition_group(self, group_id, target, *, actor, event) -> dict[str, Any]:
         tid = self._tenant()
         now = _utc_now()
@@ -727,6 +754,34 @@ class BatchExecutionService(_BatchV2Base):
         with self._connect_readonly() as c:
             r = c.execute("SELECT * FROM batch WHERE id = ? AND tenant_id = ?", (batch_id, tid)).fetchone()
         return _row_to_batch(r) if r else None
+
+    def delete_batch(self, batch_id: str, *, actor: Optional[str] = None) -> bool:
+        """Hard-delete a batch and ALL of its owned rows (KPIs, excursions,
+        events, data windows, properties, report references). A RUNNING batch
+        must be stopped/aborted first (guards accidental deletion of live data).
+        If it's a group child, refresh the parent's child count afterward."""
+        tid = self._tenant()
+        with self._connect() as c:
+            r = c.execute("SELECT status, batch_group_id FROM batch WHERE id = ? AND tenant_id = ?",
+                          (batch_id, tid)).fetchone()
+            if not r:
+                return False
+            if str(r["status"] or "").lower() == "running":
+                raise BatchStateError("Stop or abort the batch before deleting it")
+            gid = r["batch_group_id"]
+            for tbl in ("batch_kpi_result", "batch_excursion", "batch_event",
+                        "batch_data_window", "batch_property_value", "batch_report_reference"):
+                c.execute(f"DELETE FROM {tbl} WHERE batch_id = ? AND tenant_id = ?", (batch_id, tid))
+            c.execute("DELETE FROM batch WHERE id = ? AND tenant_id = ?", (batch_id, tid))
+            if gid:
+                try:
+                    self._groups.refresh_child_count(c, gid, tid)
+                except Exception:
+                    pass
+                self._event(c, batch_group_id=gid, event_type="batch.deleted", source="api",
+                            actor=actor, message=batch_id)
+            c.commit()
+        return True
 
     # -- create --------------------------------------------------------
     def create_batch(

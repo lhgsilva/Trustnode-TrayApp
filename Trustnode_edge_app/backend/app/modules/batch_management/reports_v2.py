@@ -205,6 +205,27 @@ class ReportIntegrationService(_BatchV2Base):
     def list_group_reports(self, group_id: str) -> list[dict[str, Any]]:
         return self._list_refs(group_id=group_id)
 
+    def delete_report(self, reference_id: str, *, actor: Optional[str] = None) -> bool:
+        """Delete a batch/group report: the batch_report_reference row AND the
+        underlying generated report in the Reports module (so it also disappears
+        from Generated Reports). Best-effort on the generated-report side."""
+        tid = self._tenant()
+        ref = self._get_ref(reference_id)
+        if not ref:
+            return False
+        gen_id = ref.get("generated_report_id")
+        if gen_id:
+            try:
+                _reports_store().delete_generated(gen_id)
+            except Exception:
+                pass
+        with self._connect() as c:
+            c.execute("DELETE FROM batch_report_reference WHERE id = ? AND tenant_id = ?", (reference_id, tid))
+            self._event(c, batch_id=ref.get("batch_id"), batch_group_id=ref.get("batch_group_id"),
+                        event_type="report.deleted", source="api", actor=actor, message=reference_id)
+            c.commit()
+        return True
+
     # -- email a generated report -------------------------------------
     def email_report(
         self, reference_id: str, *, recipients: Optional[list[str]] = None,

@@ -1730,6 +1730,21 @@ function rebuildTrayMenu() {
       click: () => { if (mainWindow) mainWindow.show(); }
     },
     {
+      // Open the FULL React app in the user's default browser. The backend
+      // already serves it over HTTP at /trustnode/full/app/ (the same path used
+      // for LAN sharing), so a browser can render it — unlike the packaged
+      // Electron window which loads the UI from a file:// bundle.
+      label: "Open in browser",
+      click: () => {
+        try {
+          const { shell } = require("electron");
+          const host = currentBackendHost && currentBackendHost !== "0.0.0.0" ? currentBackendHost : "127.0.0.1";
+          const url = `http://${host}:${currentBackendPort || BACKEND_PORT || 8000}/trustnode/full/app/`;
+          shell.openExternal(url).catch(() => {});
+        } catch (_) {}
+      }
+    },
+    {
       label: "Hide",
       click: () => { if (mainWindow) mainWindow.hide(); }
     },

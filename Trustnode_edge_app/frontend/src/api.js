@@ -3364,6 +3364,8 @@ export async function bmv2CreateBatch(payload) { return (await _bmSend(`/batches
 export async function bmv2BatchAction(id, action, payload = {}) {
   return (await _bmSend(`/batches/${encodeURIComponent(id)}/${action}`, "POST", payload)).row;
 }
+export async function bmv2DeleteBatch(id) { return _bmSend(`/batches/${encodeURIComponent(id)}`, "DELETE"); }
+export async function bmv2DeleteBatchReport(batchId, refId) { return _bmSend(`/batches/${encodeURIComponent(batchId)}/reports/${encodeURIComponent(refId)}`, "DELETE"); }
 export async function bmv2AddComment(id, message, actor = null) {
   return _bmSend(`/batches/${encodeURIComponent(id)}/comments`, "POST", { message, actor });
 }
@@ -3396,6 +3398,8 @@ export async function bmv2GetGroup(id) { return (await _bmGet(`/groups/${encodeU
 export async function bmv2CreateGroup(payload) { return (await _bmSend(`/groups`, "POST", payload)).row; }
 export async function bmv2CompleteGroup(id) { return (await _bmSend(`/groups/${encodeURIComponent(id)}/complete`, "POST", {})).row; }
 export async function bmv2AbortGroup(id) { return (await _bmSend(`/groups/${encodeURIComponent(id)}/abort`, "POST", {})).row; }
+export async function bmv2DeleteGroup(id) { return _bmSend(`/groups/${encodeURIComponent(id)}`, "DELETE"); }
+export async function bmv2DeleteGroupReport(groupId, refId) { return _bmSend(`/groups/${encodeURIComponent(groupId)}/reports/${encodeURIComponent(refId)}`, "DELETE"); }
 export async function bmv2GroupBatches(id) { return (await _bmGet(`/groups/${encodeURIComponent(id)}/batches`)).rows || []; }
 export async function bmv2GroupKpis(id) { return (await _bmGet(`/groups/${encodeURIComponent(id)}/kpis`)).rows || []; }
 export async function bmv2ListGroupReports(id) { return (await _bmGet(`/groups/${encodeURIComponent(id)}/reports`)).rows || []; }
