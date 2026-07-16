@@ -37,3 +37,6 @@ desktop/last working version/
 backend/keys/license_signing_private.pem
 backend/keys/*.private.pem
 
+
+# Local dev env (never shipped)
+Trustnode_edge_app/frontend/.env.local

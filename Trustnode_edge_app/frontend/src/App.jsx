@@ -180,6 +180,17 @@ import IntelligenceMenu from "../../trustnode_intelligence/frontend/Intelligence
 import IntelligenceChatPage from "../../trustnode_intelligence/frontend/IntelligenceChatPage.jsx";
 import IntelligenceInsightsPage from "../../trustnode_intelligence/frontend/IntelligenceInsightsPage.jsx";
 
+// DEV-ONLY license bypass. When running `npm run dev` against a LOCAL backend,
+// the cloud license-check handshake can't complete (the edge↔cloud endpoints
+// aren't served locally) and the local license snapshot may be empty, so the
+// license guard blocks the whole UI. Set VITE_TRUSTNODE_DEV_LICENSE_BYPASS=true
+// in a .env.local to treat the edge as licensed for local development. This is
+// a BUILD-TIME flag: production installer/portable builds never set it, so it
+// has ZERO effect on real deployments (the backend license enforcement is the
+// real gate regardless).
+const DEV_LICENSE_BYPASS =
+  String(import.meta.env.VITE_TRUSTNODE_DEV_LICENSE_BYPASS || "").toLowerCase() === "true";
+
 function getUiStorageScope() {
   try {
     const browserProtocol = String(window.location.protocol || "").toLowerCase();
@@ -10955,6 +10966,15 @@ function AppShell() {
 
   const runLicenseComplianceCheck = useCallback(async (forceCloud = false) => {
     if (!currentUser || isHostedWebClient) return;
+    // DEV bypass: unblock immediately, never probe the cloud (which 404s/floods
+    // the socket pool in local dev). Production builds never set this flag.
+    if (DEV_LICENSE_BYPASS) {
+      setLicenseGuardBlocked(false);
+      setLicenseGuardMessage("License active (dev bypass)");
+      setLicenseGuardLastCheckedUtc(tsNow());
+      licenseSyncUnreachableRef.current = false;
+      return;
+    }
     // Operator 2026-06-17: 30-day cache short-circuit. If the
     // localStorage snapshot is fresh AND positive, mark the license
     // OK and skip the cloud round-trip entirely. The operator can
@@ -17909,7 +17929,7 @@ const getGatewayHealth = (gateway) => {
   }, [cpPortalPage, refreshCpTrialHistory]);
 
   const syncControlPlaneEdgeHeartbeat = async () => {
-    if (isHostedWebClient) return false;
+    if (isHostedWebClient || DEV_LICENSE_BYPASS) return false;  // no cloud in dev
     const edgeId = String(edgeProfile?.edge_id || "").trim();
     if (!edgeId) return false;
     try {
