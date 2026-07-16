@@ -3421,11 +3421,23 @@ export async function bmv2AnalysisComparison(batchIds = [], tags = [], maxPoints
 // {id,name,tags:[{name,unit,data_type}]} for the definition builder's tag picker.
 // No network — reuses the config the app already holds.
 export function bmv2NormalizeGatewayTags(gatewayConfigs = []) {
+  // A gateway's `tags` may be EITHER a plain array of names
+  // (["BT_PVA_Level", ...] — what the gateway config actually stores) OR an
+  // array of objects ({name, unit, data_type}). The old code only handled the
+  // object form, so `t.name` was undefined for string tags, every tag got
+  // filtered out, and the batch-definition tag picker fell back to a free-text
+  // box instead of listing the gateway's real tags. Handle both shapes.
+  const toTag = (t) => {
+    if (typeof t === "string") return { name: t.trim(), unit: "", data_type: "" };
+    if (t && typeof t === "object") {
+      const name = String(t.name ?? t.tag_name ?? t.tag ?? t.id ?? "").trim();
+      return { name, unit: t.unit || t.engineering_unit || "", data_type: t.data_type || t.type || "" };
+    }
+    return { name: "", unit: "", data_type: "" };
+  };
   return (gatewayConfigs || []).map((g) => ({
     id: String(g.id || ""),
     name: String(g.name || g.id || ""),
-    tags: (g.tags || []).map((t) => ({
-      name: String(t.name || ""), unit: t.unit || "", data_type: t.data_type || "",
-    })).filter((t) => t.name),
+    tags: (g.tags || []).map(toTag).filter((t) => t.name),
   }));
 }

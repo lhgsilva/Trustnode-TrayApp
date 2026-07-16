@@ -1479,9 +1479,9 @@ function DefinitionWizard({ definitionId, gateways, canEdit, onClose, onSaved })
       <div style={{ minHeight: 260 }}>
         {step === 0 && <StepGeneral form={form} setForm={setForm} setCfg={setCfg} gateways={gateways} readOnly={readOnly} />}
         {step === 1 && <StepStructure cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
-        {step === 2 && <StepIdentification cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
-        {step === 3 && <StepCondition which="start_config" title="Start" cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
-        {step === 4 && <StepCondition which="stop_config" title="Stop" cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
+        {step === 2 && <StepIdentification cfg={form.config} setCfg={setCfg} gateways={gateways} readOnly={readOnly} />}
+        {step === 3 && <StepCondition which="start_config" title="Start" cfg={form.config} setCfg={setCfg} gateways={gateways} readOnly={readOnly} />}
+        {step === 4 && <StepCondition which="stop_config" title="Stop" cfg={form.config} setCfg={setCfg} gateways={gateways} readOnly={readOnly} />}
         {step === 5 && <StepTags cfg={form.config} setCfg={setCfg} gateways={gateways} readOnly={readOnly} />}
         {step === 6 && <StepCharts cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
         {step === 7 && <StepKpis cfg={form.config} setCfg={setCfg} readOnly={readOnly} />}
@@ -1665,9 +1665,11 @@ function StepStructure({ cfg, setCfg, readOnly }) {
   );
 }
 
-function StepIdentification({ cfg, setCfg, readOnly }) {
+function StepIdentification({ cfg, setCfg, gateways, readOnly }) {
   const id = cfg.identification || {};
   const set = (k, v) => setCfg({ identification: { ...id, [k]: v } });
+  const setMany = (patch) => setCfg({ identification: { ...id, ...patch } });
+  const usesTag = id.method === "plc_tag" || id.method === "combined";
   return (
     <div className="form-grid" style={{ gridTemplateColumns: "repeat(2, minmax(0,1fr))" }}>
       <Lbl label="Reference method">
@@ -1675,6 +1677,14 @@ function StepIdentification({ cfg, setCfg, readOnly }) {
           {["auto", "manual", "barcode", "plc_tag", "combined"].map((m) => <option key={m} value={m}>{m}</option>)}
         </select>
       </Lbl>
+      {/* plc_tag / combined take the batch reference FROM a tag — let the user
+          pick it from the gateway's real collected tags instead of typing it. */}
+      {usesTag && (
+        <Lbl label="Reference tag (from a gateway)">
+          <GatewayTagPicker gateways={gateways} gatewayId={id.gateway_id} tagName={id.tag_name} disabled={readOnly}
+            onChange={(patch) => setMany({ gateway_id: patch.gateway_id, tag_name: patch.tag_name })} />
+        </Lbl>
+      )}
       <Lbl label="Prefix"><input disabled={readOnly} value={id.prefix || ""} onChange={(e) => set("prefix", e.target.value)} /></Lbl>
       <Lbl label="Suffix"><input disabled={readOnly} value={id.suffix || ""} onChange={(e) => set("suffix", e.target.value)} /></Lbl>
       <Lbl label="Validation pattern (regex, optional)"><input disabled={readOnly} value={id.pattern || ""} onChange={(e) => set("pattern", e.target.value)} /></Lbl>
@@ -1682,7 +1692,7 @@ function StepIdentification({ cfg, setCfg, readOnly }) {
   );
 }
 
-function StepCondition({ which, title, cfg, setCfg, readOnly }) {
+function StepCondition({ which, title, cfg, setCfg, gateways, readOnly }) {
   const c = cfg[which] || { method: "manual" };
   const set = (patch) => setCfg({ [which]: { ...c, ...patch } });
   const scope = which === "start_config" ? "BATCH_START" : "BATCH_STOP";
@@ -1718,8 +1728,10 @@ function StepCondition({ which, title, cfg, setCfg, readOnly }) {
             {!readOnly && <button className="btn btn-ghost btn-sm" onClick={() => setTrigger({ ...trigger, condition: { ...trigger.condition, rules: [...rules, { tag: "", kind: "rising_edge" }] } })}>+ Rule</button>}
           </div>
           {rules.map((r, i) => (
-            <div key={i} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 0.8fr 0.8fr auto", gap: 6, marginBottom: 6 }}>
-              <input disabled={readOnly} placeholder="tag name" value={r.tag || ""} onChange={(e) => setRule(i, { tag: e.target.value })} />
+            <div key={i} style={{ display: "grid", gridTemplateColumns: "2.2fr 1fr 0.8fr 0.8fr auto", gap: 6, marginBottom: 6 }}>
+              {/* pick the trigger tag from a gateway's real collected tags */}
+              <GatewayTagPicker gateways={gateways} gatewayId={r.gateway_id} tagName={r.tag} disabled={readOnly}
+                onChange={(patch) => setRule(i, { gateway_id: patch.gateway_id, tag: patch.tag_name })} />
               <select disabled={readOnly} value={r.kind || "rising_edge"} onChange={(e) => setRule(i, { kind: e.target.value })}>
                 {["rising_edge", "falling_edge", "threshold", "equals"].map((k) => <option key={k} value={k}>{k}</option>)}
               </select>
