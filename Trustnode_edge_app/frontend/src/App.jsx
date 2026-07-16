@@ -10968,11 +10968,25 @@ function AppShell() {
     if (!currentUser || isHostedWebClient) return;
     // DEV bypass: unblock immediately, never probe the cloud (which 404s/floods
     // the socket pool in local dev). Production builds never set this flag.
+    // We SEED a synthetic license snapshot from the backend's own
+    // /api/health license_summary.modules so hasLicenseModule() works and the
+    // module-gated menus (Batch Management, AI/Intelligence, custom dashboards,
+    // etc.) render exactly as they do in the packaged app.
     if (DEV_LICENSE_BYPASS) {
       setLicenseGuardBlocked(false);
       setLicenseGuardMessage("License active (dev bypass)");
       setLicenseGuardLastCheckedUtc(tsNow());
       licenseSyncUnreachableRef.current = false;
+      try {
+        const h = await getHealth();
+        const mods = Array.isArray(h?.license_summary?.modules) ? h.license_summary.modules : [];
+        setEdgeLicenseSnapshot({
+          ok: true,
+          license: { status: "active", end_utc: null, modules: mods.map((k) => ({ module_key: String(k) })) },
+          grandfathered_modules: mods.map((k) => String(k)),
+          dev_bypass: true,
+        });
+      } catch (_) { /* health unreachable — menus stay on whatever's cached */ }
       return;
     }
     // Operator 2026-06-17: 30-day cache short-circuit. If the

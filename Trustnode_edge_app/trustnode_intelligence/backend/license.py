@@ -157,6 +157,13 @@ def _get_license_summary() -> Dict[str, Any]:
 
 def has_intelligence_module() -> bool:
     """True iff the active license includes the trustnode_intelligence module."""
+    # DEV bypass: local dev runs against a license snapshot that may not list
+    # the AI module, so /status 404s and the menu hides. Setting
+    # TRUSTNODE_DEV_LICENSE_BYPASS=1 (dev only) treats it as licensed. Never set
+    # in production builds — the real license gate applies there.
+    import os as _os
+    if str(_os.environ.get("TRUSTNODE_DEV_LICENSE_BYPASS", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return True
     summary = _get_license_summary()
     modules = summary.get("modules") or []
     grandfathered = summary.get("grandfathered") or []
