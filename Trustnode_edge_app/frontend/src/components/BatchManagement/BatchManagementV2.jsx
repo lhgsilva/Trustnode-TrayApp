@@ -866,23 +866,26 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
     try {
       const b = await bmv2GetBatch(batchId);
       setBatch(b); cacheSet(`batch:full:${batchId}`, b);
-      const [k, x, e, r, tg, pr, mx] = await Promise.all([
+      // Core detail data (all fast, indexed reads) — this is what the header +
+      // KPIs + limit-alerts need, so paint it first.
+      const [k, x, e, r, tg, pr] = await Promise.all([
         bmv2BatchKpis(batchId), bmv2BatchExcursions(batchId), bmv2BatchEvents(batchId, 100),
         bmv2ListBatchReports(batchId), bmv2BatchCollectedTags(batchId), bmv2BatchProperties(batchId),
-        bmv2BatchMatrix(batchId, "", 200).catch(() => null),
       ]);
       setKpis(k); setExcursions(x); setEvents(e); setReports(r); setTags(tg); setProperties(pr);
-      if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); }
       cacheSet(`batch:kpis:${batchId}`, k); cacheSet(`batch:exc:${batchId}`, x); cacheSet(`batch:props:${batchId}`, pr);
       setErr("");
-      // charts config comes from the batch's definition (config.charts[])
+      // The heavier reads (matrix over the historian window, trends, the
+      // definition's chart config) run in the BACKGROUND and update their own
+      // sections as they arrive — they must NOT block the detail from painting.
+      bmv2BatchMatrix(batchId, "", 200).then((mx) => { if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); } }).catch(() => {});
       if (b?.definition_id) {
         bmv2GetDefinition(b.definition_id).then((d) => {
           const ch = d?.config?.charts || [];
           setCharts(ch); cacheSet(`batch:charts:${batchId}`, ch);
         }).catch(() => {});
       }
-      if (tg.length) setSeries(await bmv2BatchTrends(batchId, tg.slice(0, 8).join(","), 500));
+      if (tg.length) bmv2BatchTrends(batchId, tg.slice(0, 8).join(","), 500).then(setSeries).catch(() => {});
     } catch (ex) { const t = errText(ex); if (t) setErr(t); }
   }, [batchId]);
 
@@ -1888,15 +1891,18 @@ function AnalysisReports({ canEdit, onOpenBatch, onOpenGroup }) {
     (async () => {
       try {
         const [bl, gl] = await Promise.all([bmv2ListBatches({ limit: 50 }), bmv2ListGroups({ limit: 30 })]);
+        // Fetch every owner's report list IN PARALLEL (was a sequential await
+        // loop of up to 80 requests -> ~1s+ of serial round-trips on each open;
+        // that was the "reports/comparison takes long to load"). Promise.all
+        // collapses it to a couple of round-trips.
         const acc = [];
-        for (const b of (bl.rows || [])) {
-          const rs = await bmv2ListBatchReports(b.id);
-          rs.forEach((r) => acc.push({ ...r, owner_ref: b.reference || b.id, owner_kind: "batch", owner_id: b.id }));
-        }
-        for (const g of (gl.rows || [])) {
-          const rs = await bmv2ListGroupReports(g.id);
-          rs.forEach((r) => acc.push({ ...r, owner_ref: g.reference || g.id, owner_kind: "group", owner_id: g.id }));
-        }
+        const bReqs = (bl.rows || []).map((b) =>
+          bmv2ListBatchReports(b.id).then((rs) => rs.forEach((r) =>
+            acc.push({ ...r, owner_ref: b.reference || b.id, owner_kind: "batch", owner_id: b.id }))).catch(() => {}));
+        const gReqs = (gl.rows || []).map((g) =>
+          bmv2ListGroupReports(g.id).then((rs) => rs.forEach((r) =>
+            acc.push({ ...r, owner_ref: g.reference || g.id, owner_kind: "group", owner_id: g.id }))).catch(() => {}));
+        await Promise.all([...bReqs, ...gReqs]);
         acc.sort((a, b) => String(b.created_utc).localeCompare(String(a.created_utc)));
         setRows(acc); setErr("");
       } catch (e) { const t = errText(e); if (t) setErr(t); }  // keep last-good on transient

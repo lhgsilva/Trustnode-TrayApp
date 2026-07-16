@@ -1394,11 +1394,26 @@ def list_gateway_runtime_status(request: Request) -> list[dict]:
             if isinstance(row, dict) and str(row.get("id") or "").strip()
         }
         if allowed_ids:
-            statuses = [
+            raw_statuses = list(statuses or [])
+            filtered = [
                 row
-                for row in (statuses or [])
+                for row in raw_statuses
                 if str((row or {}).get("gateway_id") or "").strip() in allowed_ids
             ]
+            # If the filter dropped a RUNNING worker (legacy/active path whose
+            # synthetic id doesn't match the scoped config id) and there's exactly
+            # ONE configured gateway, re-attach that running status under the
+            # configured id so the multi-gateway view agrees with /api/plc/status
+            # (which already shows running:true). Prevents the "Running but shows
+            # empty/stopped in the gateways table" desync. Only for the
+            # single-gateway case — real multi-gateway setups keep strict scoping.
+            if not filtered and len(allowed_ids) == 1:
+                running = next((r for r in raw_statuses if (r or {}).get("running")), None)
+                if running:
+                    running = dict(running)
+                    running["gateway_id"] = next(iter(allowed_ids))
+                    filtered = [running]
+            statuses = filtered
         # If local bootstrap rows are temporarily empty/unavailable, keep raw runtime
         # statuses to avoid false STOPPED flicker in the local footer.
     except Exception:

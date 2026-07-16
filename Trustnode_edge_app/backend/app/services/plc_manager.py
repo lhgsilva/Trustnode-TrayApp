@@ -3998,10 +3998,29 @@ class PLCManager:
 
     def list_gateway_statuses(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
+        seen_ids = set()
         for gid, w in self.workers.items():
             status = w.get_status().model_dump()
             status["gateway_id"] = gid
             out.append(status)
+            seen_ids.add(str(gid))
+        # Also surface the ACTIVE worker if it runs via the legacy single-gateway
+        # path (started before the multi-gateway map, so it isn't in self.workers).
+        # Without this, /api/plc/gateways/status returned [] while /api/plc/status
+        # showed running:true — a status desync that made the multi-gateway view
+        # misreport a collecting gateway as stopped. Read-only; never touches
+        # collection. We attach the resolved gateway id (active_gateway_id or the
+        # legacy "default") so the row lines up with the configured gateway.
+        try:
+            active = self.get_status()  # returns the running worker's status if any
+            if getattr(active, "running", False):
+                aid = str(self.active_gateway_id or "").strip()
+                if not aid or aid not in seen_ids:
+                    st = active.model_dump()
+                    st["gateway_id"] = aid or "default"
+                    out.append(st)
+        except Exception:
+            pass
         return out
 
     def get_gateway_snapshot(self, gateway_id: str) -> List[GatewayReading]:
