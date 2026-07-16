@@ -559,11 +559,16 @@ class BatchDefinitionService(_BatchV2Base):
             "FROM kpi_definition WHERE definition_version_id = ? ORDER BY sort_order", (version_id,)).fetchall()]
         for k in cfg["kpis"]:
             k["configuration"] = _json_load(k.pop("configuration_json", None))
-        # Custom properties live ONLY in the raw configuration_json (no child
-        # table). Re-inject them so the wizard shows saved properties on edit.
+        # Custom properties AND charts live ONLY in the raw configuration_json
+        # (neither has a child table, unlike tags/triggers/kpis). This rebuild
+        # walks the child tables, so both must be re-injected from the raw blob
+        # or they read back null — which is exactly why a definition's Charts
+        # step looked empty on edit and the batch view rendered no chart cards.
         raw = _json_load(v["configuration_json"]) or {}
-        if isinstance(raw, dict) and raw.get("properties"):
-            cfg["properties"] = raw["properties"]
+        if isinstance(raw, dict):
+            for _k in ("properties", "charts"):
+                if raw.get(_k):
+                    cfg[_k] = raw[_k]
         return cfg
 
     def _latest_version_id(self, c, definition_id, tid) -> Optional[str]:

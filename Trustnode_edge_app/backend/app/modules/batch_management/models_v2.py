@@ -97,6 +97,15 @@ class DefinitionVersionConfig(BaseModel):
     tags: Optional[list[DefinitionTagIn]] = None
     triggers: Optional[list[TriggerReferenceIn]] = None
     kpis: Optional[list[KpiDefinitionIn]] = None
+    # 2026-07-16: charts + custom properties are stored ONLY inside the version's
+    # configuration_json (they have no child table). They MUST be declared here —
+    # Pydantic drops unknown fields, so without these the wizard's Charts step and
+    # custom properties were silently stripped on save and always came back null.
+    #   charts:     [{id, title, type: line|area|scatter|bar, tags: [tag_name]}]
+    #   properties: [{key, label, source: manual|linked, capture_at: start|end,
+    #                 gateway_id, tag_name}]
+    charts: Optional[list[dict[str, Any]]] = None
+    properties: Optional[list[dict[str, Any]]] = None
 
 
 class BatchDefinitionIn(BaseModel):
