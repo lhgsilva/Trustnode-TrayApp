@@ -402,7 +402,7 @@ function TrendChart({ series, xKey = "ts", height = 260, limitLines = [] }) {
 // One configured chart card. Renders the chart's tags as series; each series
 // has a clickable chip to toggle it on/off for analysis. `series` is the batch's
 // full per-tag series ([{tag, points}]); we filter to this chart's tags.
-function ChartCard({ chart, series }) {
+function ChartCard({ chart, series, limitLines = [] }) {
   const chartTags = chart.tags || [];
   const [hidden, setHidden] = useState(() => new Set());
   const active = chartTags.filter((t) => !hidden.has(t));
@@ -464,16 +464,39 @@ function ChartCard({ chart, series }) {
             <ComposedChart data={data} margin={{ top: 6, right: 12, bottom: 6, left: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--stroke)" />
               <XAxis dataKey="x" tick={{ fontSize: 10 }} tickFormatter={(v) => String(v).slice(11, 19)} minTickGap={40} />
-              {axesInUse.map((k) => (
-                <YAxis key={k} yAxisId={k} orientation={AXIS_SIDE[k]} tick={{ fontSize: 10 }} width={48}
-                  domain={domainFor(k)} allowDataOverflow={false}
-                  tickFormatter={(v) => fmtAxisValue(v, axisCfg[k])}
-                  label={axisCfg[k]?.label ? { value: axisCfg[k].label, angle: -90, position: AXIS_SIDE[k] === "left" ? "insideLeft" : "insideRight", fontSize: 10, fill: "var(--muted)" } : undefined} />
-              ))}
+              {(() => {
+                // When two axes share a side, size each so ticks don't collide
+                // and put the label only on the OUTER one — no overlapping text.
+                const leftAxes = axesInUse.filter((k) => AXIS_SIDE[k] === "left");
+                const rightAxes = axesInUse.filter((k) => AXIS_SIDE[k] === "right");
+                const multi = leftAxes.length + rightAxes.length > 2 || leftAxes.length > 1 || rightAxes.length > 1;
+                const tickFont = multi ? 9 : 10;
+                return axesInUse.map((k) => {
+                  const sideAxes = AXIS_SIDE[k] === "left" ? leftAxes : rightAxes;
+                  const idxOnSide = sideAxes.indexOf(k);
+                  const stacked = sideAxes.length > 1;
+                  // outer axis (first left / last right) carries the text label
+                  const isOuter = AXIS_SIDE[k] === "left" ? idxOnSide === 0 : idxOnSide === sideAxes.length - 1;
+                  const cfgLabel = axisCfg[k]?.label;
+                  return (
+                    <YAxis key={k} yAxisId={k} orientation={AXIS_SIDE[k]} tick={{ fontSize: tickFont }}
+                      width={stacked ? 52 : 48} domain={domainFor(k)} allowDataOverflow={false}
+                      tickFormatter={(v) => fmtAxisValue(v, axisCfg[k])}
+                      label={cfgLabel && isOuter ? { value: cfgLabel, angle: -90, position: AXIS_SIDE[k] === "left" ? "insideLeft" : "insideRight", fontSize: 10, fill: "var(--muted)" } : undefined} />
+                  );
+                });
+              })()}
               <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--stroke)", color: "var(--text)", fontSize: 12 }}
                 formatter={(val, name) => [fmtAxisValue(val, axisCfg[chartAxisFor(chart, name)]), name]} />
               <Legend wrapperStyle={{ fontSize: 11 }} />
               {chartTags.map((t, i) => (hidden.has(t) ? null : renderSeries(t, i)))}
+              {/* limit lines drawn on the axis of the tag they belong to */}
+              {(limitLines || []).map((l, i) => {
+                const yId = l.tag && chartTags.includes(l.tag) ? chartAxisFor(chart, l.tag) : (axesInUse[0] || "left1");
+                if (l.tag && hidden.has(l.tag)) return null;
+                return <ReferenceLine key={`ll-${i}`} yAxisId={yId} y={l.value} stroke={l.color || "var(--danger)"}
+                  strokeDasharray="5 4" label={{ value: l.label, fontSize: 9, fill: l.color || "var(--danger)" }} />;
+              })}
             </ComposedChart>
           </ResponsiveContainer>
         </div>
@@ -1045,18 +1068,20 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
         ) : <div style={{ color: "var(--muted)", fontSize: 13 }}>No KPIs computed yet. {canEdit && <button className="btn btn-ghost btn-sm" onClick={async () => { await bmv2RecomputeBatch(batchId); load(); }}>Recompute</button>}</div>}
       </Card>
 
-      {/* Configured charts (from the definition). One card per chart; click a
-          series chip to toggle it on the chart for analysis. */}
-      {charts.length > 0 && (
-        <Card title="Charts">
+      {/* ONE trend section — the definition-configured chart(s) with their
+          axis/unit/tick config and click-to-toggle series, identical to what
+          the report templates render. Falls back to a generic all-tag trend
+          ONLY when the definition has no charts configured. Configuration is
+          done in the definition's Charts tab, never here. */}
+      {charts.length > 0 ? (
+        <Card title="Process trends">
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(360px, 1fr))", gap: 12 }}>
-            {charts.map((c) => <ChartCard key={c.id} chart={c} series={series} />)}
+            {charts.map((c) => <ChartCard key={c.id} chart={c} series={series} limitLines={limitLines} />)}
           </div>
         </Card>
+      ) : (
+        tags.length > 0 && <Card title="Process trends"><TrendChart series={series} xKey="ts" limitLines={limitLines} /></Card>
       )}
-
-      {/* Trends chart FIRST, then the detailed timestamp series table below it. */}
-      {tags.length > 0 && <Card title="Process trends"><TrendChart series={series} xKey="ts" limitLines={limitLines} /></Card>}
 
       {/* Detailed collected time-series (aligned tag matrix). */}
       <Card title="Collected data (time series)">

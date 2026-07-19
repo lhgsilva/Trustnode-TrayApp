@@ -55,6 +55,17 @@ function parseNumber(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Normalize a series' axis to one of the FOUR canonical axes. Legacy configs
+// stored only "left"/"right"; the multi-axis UI stores left1/left2/right1/
+// right2. Keep the 4-way value so Left 2 / Right 2 assignments render.
+function normSeriesAxis4(a) {
+  const s = String(a || "left1").toLowerCase();
+  if (s === "left2") return "left2";
+  if (s === "right2") return "right2";
+  if (s === "right" || s === "right1") return "right1";
+  return "left1";
+}
+
 function parseBool(v, fallback = false) {
   if (typeof v === "boolean") return v;
   if (typeof v === "string") {
@@ -802,7 +813,7 @@ function LiveTagChart({
         offset: Number.isFinite(Number(s.offset)) ? Number(s.offset) : 0,
         unit: String(s.unit || ""),
         suffix: String(s.suffix || ""),
-        axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
+        axis: normSeriesAxis4(s.axis),
         chartKind: (() => {
           const t = String(s.chart_type || "").toLowerCase();
           if (t === "bar") return "bar";
@@ -1437,6 +1448,9 @@ function LiveTagChart({
   const rightAxisLabel = String(cfg.y_axis_right_label || "");
   const left2AxisLabel = String(cfg.y_left2_label || "");
   const right2AxisLabel = String(cfg.y_right2_label || "");
+  // Two axes on the same side → compact fonts/widths so labels don't overlap.
+  const multiLeft = !!renderedData.axesUsed?.has("left2");
+  const multiRight = !!(renderedData.axesUsed?.has("right2") && (renderedData.hasRightAxis || renderedData.axesUsed?.has("right1")));
 
   // Style knobs the editor exposes — legend, point labels, line width,
   // line dot. Per-series overrides on extras win at render time; the
@@ -1656,21 +1670,24 @@ function LiveTagChart({
                 })()}
               />
             )}
+            {/* When two axes share a side, shrink the tick font and give each
+                its own width so ticks + rotated labels don't overlap. */}
             <YAxis
               yAxisId="left1"
               domain={yDomainLeft}
               ticks={manualY?.ticks}
               allowDataOverflow={!!manualY}
               tickFormatter={formatNumber}
-              fontSize={10}
+              fontSize={multiLeft ? 9 : 10}
+              width={multiLeft ? 46 : undefined}
               label={primaryAxisLabel
-                ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 }
+                ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: multiLeft ? 10 : 11 }
                 : undefined}
             />
             {(renderedData.axesUsed?.has("left2")) ? (
               <YAxis yAxisId="left2" orientation="left" domain={yDomainLeft2} ticks={manualYLeft2?.ticks}
-                allowDataOverflow={!!manualYLeft2} tickFormatter={formatNumber} fontSize={10}
-                label={left2AxisLabel ? { value: left2AxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined} />
+                allowDataOverflow={!!manualYLeft2} tickFormatter={formatNumber} fontSize={9} width={46}
+                label={left2AxisLabel ? { value: left2AxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
             ) : null}
             {(renderedData.hasRightAxis || renderedData.axesUsed?.has("right1")) ? (
               <YAxis
@@ -1680,16 +1697,17 @@ function LiveTagChart({
                 ticks={manualYRight?.ticks}
                 allowDataOverflow={!!manualYRight}
                 tickFormatter={formatNumber}
-                fontSize={10}
+                fontSize={multiRight ? 9 : 10}
+                width={multiRight ? 46 : undefined}
                 label={rightAxisLabel
-                  ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 }
+                  ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: multiRight ? 10 : 11 }
                   : undefined}
               />
             ) : null}
             {(renderedData.axesUsed?.has("right2")) ? (
               <YAxis yAxisId="right2" orientation="right" domain={yDomainRight2} ticks={manualYRight2?.ticks}
-                allowDataOverflow={!!manualYRight2} tickFormatter={formatNumber} fontSize={10}
-                label={right2AxisLabel ? { value: right2AxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined} />
+                allowDataOverflow={!!manualYRight2} tickFormatter={formatNumber} fontSize={9} width={46}
+                label={right2AxisLabel ? { value: right2AxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
             ) : null}
             <Tooltip labelFormatter={labelFmt} formatter={fmtVal} />
             {showLegend ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
@@ -2585,7 +2603,7 @@ function DashboardWidgetCardImpl({
         tag_name: String(s?.tag_name || "").trim(),
         label: String(s?.label || "").trim(),
         color: String(s?.color || ""),
-        axis: String(s?.axis || "left").toLowerCase() === "right" ? "right" : "left",
+        axis: normSeriesAxis4(s?.axis),
         chart_type: String(s?.chart_type || "").toLowerCase(),
         unit: String(s?.unit || "").trim(),
         suffix: String(s?.suffix || "").trim(),
@@ -3020,14 +3038,20 @@ function DashboardWidgetCardImpl({
     return undefined; // recharts auto-domain on the right axis when undefined
   }, [manualYRight]);
   // Multi-axis (2026-07-19): 2nd left + 2nd right axis for the heavy widget.
-  const _buildManual2 = (modeK, minK, maxK) => {
+  const _buildManual2 = (modeK, minK, maxK, stepK) => {
     if (String(cfg?.[modeK] || "auto") !== "manual") return null;
     const lo = Number(cfg?.[minK]); const hi = Number(cfg?.[maxK]);
     if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
-    return { lo, hi };
+    let ticks;
+    const step = Number(cfg?.[stepK]);
+    if (Number.isFinite(step) && step > 0 && (hi - lo) / step <= 100) {
+      ticks = [];
+      for (let v = lo; v <= hi + 1e-9; v += step) ticks.push(Number(v.toFixed(6)));
+    }
+    return { lo, hi, ticks };
   };
-  const manualYLeft2 = _buildManual2("y_left2_axis_mode", "y_left2_min", "y_left2_max");
-  const manualYRight2 = _buildManual2("y_right2_axis_mode", "y_right2_min", "y_right2_max");
+  const manualYLeft2 = _buildManual2("y_left2_axis_mode", "y_left2_min", "y_left2_max", "y_left2_tick_step");
+  const manualYRight2 = _buildManual2("y_right2_axis_mode", "y_right2_min", "y_right2_max", "y_right2_tick_step");
   const yLeft2Domain = manualYLeft2 ? [manualYLeft2.lo, manualYLeft2.hi] : undefined;
   const yRight2Domain = manualYRight2 ? [manualYRight2.lo, manualYRight2.hi] : undefined;
   const left2AxisLabel = String(cfg?.y_left2_label || "");
@@ -3045,6 +3069,10 @@ function DashboardWidgetCardImpl({
     for (const d of (resolvedLimitLines || [])) used.add(normAxis2(d.axis));
     return used;
   }, [extraSeriesDefs, resolvedLimitLines]);
+  // Two axes on the same side → compact width/font so labels don't overlap.
+  const heavyMultiLeft = heavyAxesUsed.has("left2");
+  const heavyMultiRight = heavyAxesUsed.has("right2");
+  const stackAxisProps = (compact) => (compact ? { width: 46, tick: { fontSize: 9 } } : {});
   // Bottom margin = breathing room for X-axis tick labels. Without this
   // the time labels ("01:18:57") were clipped against the card edge —
   // operator request 2026-06-11: "we need a little bit of space below
@@ -3413,31 +3441,33 @@ function DashboardWidgetCardImpl({
                   <YAxis
                     yAxisId="left1"
                     {...yAxisPresetProps}
+                    {...stackAxisProps(heavyMultiLeft)}
                     domain={yDomain}
                     ticks={manualYTicks || undefined}
                     allowDataOverflow={!!manualY}
-                    label={primaryAxisLabel ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined}
+                    label={primaryAxisLabel ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: heavyMultiLeft ? 10 : 11 } : undefined}
                   />
                   {heavyAxesUsed.has("left2") ? (
-                    <YAxis yAxisId="left2" orientation="left" {...yAxisPresetProps} domain={yLeft2Domain}
-                      allowDataOverflow={!!manualYLeft2}
-                      label={left2AxisLabel ? { value: left2AxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined} />
+                    <YAxis yAxisId="left2" orientation="left" {...yAxisPresetProps} {...stackAxisProps(true)} domain={yLeft2Domain}
+                      ticks={manualYLeft2?.ticks} allowDataOverflow={!!manualYLeft2}
+                      label={left2AxisLabel ? { value: left2AxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
                   ) : null}
                   {(anyRightAxis || heavyAxesUsed.has("right1")) ? (
                     <YAxis
                       yAxisId="right1"
                       orientation="right"
                       {...yAxisPresetProps}
+                      {...stackAxisProps(heavyMultiRight)}
                       domain={yRightDomain}
                       ticks={manualYRightTicks || undefined}
                       allowDataOverflow={!!manualYRight}
-                      label={rightAxisLabel ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined}
+                      label={rightAxisLabel ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: heavyMultiRight ? 10 : 11 } : undefined}
                     />
                   ) : null}
                   {heavyAxesUsed.has("right2") ? (
-                    <YAxis yAxisId="right2" orientation="right" {...yAxisPresetProps} domain={yRight2Domain}
-                      allowDataOverflow={!!manualYRight2}
-                      label={right2AxisLabel ? { value: right2AxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined} />
+                    <YAxis yAxisId="right2" orientation="right" {...yAxisPresetProps} {...stackAxisProps(true)} domain={yRight2Domain}
+                      ticks={manualYRight2?.ticks} allowDataOverflow={!!manualYRight2}
+                      label={right2AxisLabel ? { value: right2AxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
                   ) : null}
                   <Tooltip
                     {...chartTooltipProps}

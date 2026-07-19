@@ -13,6 +13,17 @@ import { filterRowsByRange, getLatestTagRow, toTsMs } from "./dashboardAnalytics
 import { listReportTemplates } from "../../api";
 import "./dashboard.css";
 
+// Normalize a series' axis assignment to one of the FOUR canonical axes.
+// Legacy configs stored only "left"/"right"; the multi-axis UI stores
+// left1/left2/right1/right2. Both spellings must survive save.
+function normSeriesAxis4(a) {
+  const s = String(a || "left1").toLowerCase();
+  if (s === "left2") return "left2";
+  if (s === "right2") return "right2";
+  if (s === "right" || s === "right1") return "right1";
+  return "left1";
+}
+
 const TYPE_GROUPS = ["Charts", "KPI", "Content", "Layout", "Media", "Reports", "System", "Batch"];
 const DASHBOARD_TIME_MODE_KEY = "trustnode_dashboard_time_mode";
 const DASHBOARD_TIME_RANGE_KEY = "trustnode_dashboard_time_range";
@@ -1599,7 +1610,7 @@ export function DashboardDesigner({
                 tag_name: String(s.tag_name || ""),
                 label: String(s.label || ""),
                 color: String(s.color || ""),
-                axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
+                axis: normSeriesAxis4(s.axis),
                 chart_type: String(s.chart_type || ""),
                 unit: String(s.unit || ""),
                 suffix: String(s.suffix || ""),
@@ -3790,7 +3801,7 @@ export function DashboardDesigner({
                   {/* 2nd left + 2nd right axis scale (only apply when a series
                       uses Left 2 / Right 2). Compact: mode + min/max. */}
                   {["left2", "right2"].map((ax) => {
-                    const modeK = `y_${ax}_axis_mode`, minK = `y_${ax}_min`, maxK = `y_${ax}_max`;
+                    const modeK = `y_${ax}_axis_mode`, minK = `y_${ax}_min`, maxK = `y_${ax}_max`, stepK = `y_${ax}_tick_step`;
                     const label = ax === "left2" ? "Left 2 Y axis" : "Right 2 Y axis";
                     const manual = String(form.config?.[modeK] || "auto").toLowerCase() === "manual";
                     return (
@@ -3814,6 +3825,11 @@ export function DashboardDesigner({
                               <span>{ax === "left2" ? "Left 2" : "Right 2"} Max</span>
                               <input type="number" step="any" value={form.config?.[maxK] ?? ""}
                                 onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, [maxK]: e.target.value === "" ? "" : Number(e.target.value) } }))} />
+                            </label>
+                            <label className="dashboard-query-field">
+                              <span>{ax === "left2" ? "Left 2" : "Right 2"} Tick step (optional)</span>
+                              <input type="number" step="any" value={form.config?.[stepK] ?? ""}
+                                onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, [stepK]: e.target.value === "" ? "" : Number(e.target.value) } }))} />
                             </label>
                           </>
                         ) : null}
