@@ -420,12 +420,26 @@ function ChartCard({ chart, series }) {
   }, [series, chart]);
   const toggle = (t) => setHidden((h) => { const n = new Set(h); n.has(t) ? n.delete(t) : n.add(t); return n; });
   const type = chart.type || "line";
+  const axisCfg = chart.axis_config || {};
+  // axes actually used by VISIBLE tags (default left1 when unassigned)
+  const axesInUse = useMemo(() => {
+    const used = new Set(chartTags.filter((t) => !hidden.has(t)).map((t) => chartAxisFor(chart, t)));
+    if (used.size === 0) used.add("left1");
+    return CHART_AXES.map(([k]) => k).filter((k) => used.has(k));
+  }, [chart, chartTags, hidden]);
+  const domainFor = (k) => {
+    const a = axisCfg[k] || {};
+    const lo = a.min === "" || a.min == null ? "auto" : Number(a.min);
+    const hi = a.max === "" || a.max == null ? "auto" : Number(a.max);
+    return [Number.isFinite(lo) ? lo : "auto", Number.isFinite(hi) ? hi : "auto"];
+  };
   const renderSeries = (tag, i) => {
     const color = SERIES_COLORS[i % SERIES_COLORS.length];
-    if (type === "area") return <Area key={tag} type="monotone" dataKey={tag} stroke={color} fill={color} fillOpacity={0.18} dot={false} isAnimationActive={false} connectNulls />;
-    if (type === "scatter") return <Scatter key={tag} dataKey={tag} fill={color} isAnimationActive={false} />;
-    if (type === "bar") return <Bar key={tag} dataKey={tag} fill={color} isAnimationActive={false} />;
-    return <Line key={tag} type="monotone" dataKey={tag} stroke={color} dot={false} strokeWidth={1.6} isAnimationActive={false} connectNulls />;
+    const yId = chartAxisFor(chart, tag);
+    if (type === "area") return <Area key={tag} yAxisId={yId} type="monotone" dataKey={tag} stroke={color} fill={color} fillOpacity={0.18} dot={false} isAnimationActive={false} connectNulls />;
+    if (type === "scatter") return <Scatter key={tag} yAxisId={yId} dataKey={tag} fill={color} isAnimationActive={false} />;
+    if (type === "bar") return <Bar key={tag} yAxisId={yId} dataKey={tag} fill={color} isAnimationActive={false} />;
+    return <Line key={tag} yAxisId={yId} type="monotone" dataKey={tag} stroke={color} dot={false} strokeWidth={1.6} isAnimationActive={false} connectNulls />;
   };
   return (
     <div style={{ border: "1px solid var(--stroke)", borderRadius: 10, padding: 10 }}>
@@ -450,8 +464,14 @@ function ChartCard({ chart, series }) {
             <ComposedChart data={data} margin={{ top: 6, right: 12, bottom: 6, left: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--stroke)" />
               <XAxis dataKey="x" tick={{ fontSize: 10 }} tickFormatter={(v) => String(v).slice(11, 19)} minTickGap={40} />
-              <YAxis tick={{ fontSize: 10 }} width={44} />
-              <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--stroke)", color: "var(--text)", fontSize: 12 }} />
+              {axesInUse.map((k) => (
+                <YAxis key={k} yAxisId={k} orientation={AXIS_SIDE[k]} tick={{ fontSize: 10 }} width={48}
+                  domain={domainFor(k)} allowDataOverflow={false}
+                  tickFormatter={(v) => fmtAxisValue(v, axisCfg[k])}
+                  label={axisCfg[k]?.label ? { value: axisCfg[k].label, angle: -90, position: AXIS_SIDE[k] === "left" ? "insideLeft" : "insideRight", fontSize: 10, fill: "var(--muted)" } : undefined} />
+              ))}
+              <Tooltip contentStyle={{ background: "var(--card)", border: "1px solid var(--stroke)", color: "var(--text)", fontSize: 12 }}
+                formatter={(val, name) => [fmtAxisValue(val, axisCfg[chartAxisFor(chart, name)]), name]} />
               <Legend wrapperStyle={{ fontSize: 11 }} />
               {chartTags.map((t, i) => (hidden.has(t) ? null : renderSeries(t, i)))}
             </ComposedChart>
@@ -1271,6 +1291,31 @@ function ChildBatchRow({ child, onOpen }) {
 /* --------------------------------------------------------------------- */
 const WIZ_STEPS = ["General", "Structure", "Identification", "Start", "Stop", "Tags & Limits", "Charts", "KPIs", "Reports & Email", "Publish"];
 const CHART_TYPES = [["line", "Line"], ["area", "Area"], ["scatter", "Scatter"], ["bar", "Bar"]];
+// Multi-axis: up to 2 primary (left) + 2 secondary (right) Y-axes per chart.
+const CHART_AXES = [
+  ["left1", "Left 1", "left"], ["left2", "Left 2", "left"],
+  ["right1", "Right 1", "right"], ["right2", "Right 2", "right"],
+];
+const AXIS_SIDE = { left1: "left", left2: "left", right1: "right", right2: "right" };
+// Format a numeric axis/value with the axis's unit + decimals config.
+function fmtAxisValue(v, axisCfg) {
+  if (v === null || v === undefined || v === "") return "";
+  const n = Number(v);
+  if (!isFinite(n)) return String(v);
+  const dec = axisCfg && axisCfg.decimals != null && axisCfg.decimals !== "" ? Math.max(0, Math.min(6, Number(axisCfg.decimals))) : null;
+  const t = dec != null ? n.toFixed(dec) : (Math.abs(n) >= 100 ? n.toFixed(0) : Math.abs(n) >= 1 ? n.toFixed(2) : n.toFixed(3));
+  const unit = axisCfg && axisCfg.unit ? String(axisCfg.unit).trim() : "";
+  return unit ? `${t}${unit}` : t;
+}
+// Resolve which axis a tag is on (default left1), and the axes actually in use.
+function chartAxisFor(chart, tag) {
+  return (chart.series_axis && chart.series_axis[tag]) || "left1";
+}
+function chartAxesInUse(chart) {
+  const used = new Set((chart.tags || []).map((t) => chartAxisFor(chart, t)));
+  // stable order: left1, left2, right1, right2
+  return CHART_AXES.map(([k]) => k).filter((k) => used.has(k));
+}
 const KPI_CHOICES = [
   ["cycle_time", "Cycle time"], ["running_time", "Running time"], ["hold_time", "Hold time"],
   ["avg", "Average (per tag)"], ["min", "Min (per tag)"], ["max", "Max (per tag)"],
@@ -1810,22 +1855,38 @@ function StepCharts({ cfg, setCfg, readOnly }) {
   const charts = cfg.charts || [];
   const defTags = (cfg.tags || []).map((t) => t.tag_name).filter(Boolean);
   const genId = () => `chart_${charts.length + 1}_${(charts.map((c) => c.id).join("").length)}`;
-  const addChart = () => setCfg({ charts: [...charts, { id: genId(), title: `Chart ${charts.length + 1}`, type: "line", tags: [] }] });
+  const addChart = () => setCfg({ charts: [...charts, { id: genId(), title: `Chart ${charts.length + 1}`, type: "line", tags: [], series_axis: {}, axis_config: {} }] });
   const setChart = (i, patch) => setCfg({ charts: charts.map((c, j) => (j === i ? { ...c, ...patch } : c)) });
   const toggleTag = (i, tag) => {
     const c = charts[i]; const has = (c.tags || []).includes(tag);
-    setChart(i, { tags: has ? c.tags.filter((t) => t !== tag) : [...(c.tags || []), tag] });
+    const nextTags = has ? c.tags.filter((t) => t !== tag) : [...(c.tags || []), tag];
+    const nextAxis = { ...(c.series_axis || {}) };
+    if (has) delete nextAxis[tag]; else if (!nextAxis[tag]) nextAxis[tag] = "left1";  // default new tag to Left 1
+    setChart(i, { tags: nextTags, series_axis: nextAxis });
+  };
+  const setTagAxis = (i, tag, axis) => {
+    const c = charts[i];
+    setChart(i, { series_axis: { ...(c.series_axis || {}), [tag]: axis } });
+  };
+  const setAxisCfg = (i, axisKey, patch) => {
+    const c = charts[i];
+    const ac = { ...(c.axis_config || {}) };
+    ac[axisKey] = { ...(ac[axisKey] || {}), ...patch };
+    setChart(i, { axis_config: ac });
   };
   return (
     <div>
       <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
-        Define charts to show on the batch view and in reports. Each chart plots the tags you pick; on the
-        batch view you can click a series to add/remove it for analysis.
+        Define charts to show on the batch view and in reports. Pick each series' tags and assign them to a
+        Y-axis — up to 2 primary (left) + 2 secondary (right). Configure each axis' label, unit, scale and
+        decimals. On the batch view you can click a series to add/remove it for analysis.
       </div>
       {!readOnly && <button className="btn btn-ghost btn-sm" onClick={addChart} style={{ marginBottom: 10 }} disabled={!defTags.length}>+ Add chart</button>}
       {!defTags.length && <div style={{ color: "var(--muted)", fontSize: 12 }}>Add tags in “Tags &amp; Limits” first — charts plot those tags.</div>}
       {!charts.length && defTags.length > 0 && <div style={{ color: "var(--muted)", fontSize: 12 }}>No charts yet. Add one to visualize tag trends.</div>}
-      {charts.map((c, i) => (
+      {charts.map((c, i) => {
+        const axesInUse = chartAxesInUse(c);
+        return (
         <div key={c.id || i} style={{ border: "1px solid var(--stroke)", borderRadius: 8, padding: 10, marginBottom: 8 }}>
           <div style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr auto", gap: 8, alignItems: "center", marginBottom: 8 }}>
             <input disabled={readOnly} placeholder="Chart title" value={c.title || ""} onChange={(e) => setChart(i, { title: e.target.value })} />
@@ -1834,20 +1895,48 @@ function StepCharts({ cfg, setCfg, readOnly }) {
             </select>
             {!readOnly && <button className="btn btn-danger btn-sm" onClick={() => setCfg({ charts: charts.filter((_, j) => j !== i) })}>×</button>}
           </div>
-          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>Series (tags in this chart)</div>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>Series (tag → axis)</div>
+          <div style={{ display: "grid", gap: 4, marginBottom: 8 }}>
             {defTags.map((tag) => {
               const on = (c.tags || []).includes(tag);
               return (
-                <button key={tag} type="button" disabled={readOnly} onClick={() => toggleTag(i, tag)}
-                  className={`btn btn-sm ${on ? "btn-primary" : "btn-ghost"}`} style={{ fontSize: 11 }}>
-                  {on ? "✓ " : ""}{tag}
-                </button>
+                <div key={tag} style={{ display: "grid", gridTemplateColumns: "1.6fr 1fr", gap: 8, alignItems: "center" }}>
+                  <button type="button" disabled={readOnly} onClick={() => toggleTag(i, tag)}
+                    className={`btn btn-sm ${on ? "btn-primary" : "btn-ghost"}`} style={{ fontSize: 11, justifyContent: "flex-start" }}>
+                    {on ? "✓ " : ""}{tag}
+                  </button>
+                  {on && (
+                    <select disabled={readOnly} value={chartAxisFor(c, tag)} onChange={(e) => setTagAxis(i, tag, e.target.value)} style={{ fontSize: 11 }}>
+                      {CHART_AXES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+                    </select>
+                  )}
+                </div>
               );
             })}
           </div>
+          {/* per-axis config for the axes actually used by this chart's tags */}
+          {axesInUse.length > 0 && (
+            <div style={{ borderTop: "1px solid var(--stroke)", paddingTop: 8 }}>
+              <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 6 }}>Axis settings</div>
+              {axesInUse.map((axisKey) => {
+                const ax = (c.axis_config || {})[axisKey] || {};
+                const label = CHART_AXES.find(([k]) => k === axisKey)?.[1] || axisKey;
+                return (
+                  <div key={axisKey} style={{ display: "grid", gridTemplateColumns: "auto 1.4fr 0.7fr 0.7fr 0.7fr 0.7fr", gap: 6, alignItems: "center", marginBottom: 5 }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, minWidth: 46 }}>{label}</span>
+                    <input disabled={readOnly} placeholder="label (e.g. Temperature)" value={ax.label || ""} onChange={(e) => setAxisCfg(i, axisKey, { label: e.target.value })} style={{ fontSize: 11 }} />
+                    <input disabled={readOnly} placeholder="unit" value={ax.unit || ""} onChange={(e) => setAxisCfg(i, axisKey, { unit: e.target.value })} style={{ fontSize: 11 }} />
+                    <input disabled={readOnly} placeholder="min" value={ax.min ?? ""} onChange={(e) => setAxisCfg(i, axisKey, { min: e.target.value })} style={{ fontSize: 11 }} />
+                    <input disabled={readOnly} placeholder="max" value={ax.max ?? ""} onChange={(e) => setAxisCfg(i, axisKey, { max: e.target.value })} style={{ fontSize: 11 }} />
+                    <input disabled={readOnly} placeholder="dec" value={ax.decimals ?? ""} onChange={(e) => setAxisCfg(i, axisKey, { decimals: e.target.value })} style={{ fontSize: 11 }} />
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

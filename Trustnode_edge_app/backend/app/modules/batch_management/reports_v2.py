@@ -22,7 +22,7 @@ from __future__ import annotations
 import base64
 from typing import Any, Optional
 
-from .service import _utc_now, _new_id, _json_load
+from .service import _utc_now, _new_id, _json_load, _opt_num
 from .service_v2 import _BatchV2Base, BatchExecutionService, BatchDefinitionService, BatchGroupService
 from .calc_v2 import BatchCalcService
 
@@ -381,14 +381,36 @@ class ReportIntegrationService(_BatchV2Base):
         out = []
         for ch in self._configured_charts(batch):
             sec_type = self._CHART_TYPE_MAP.get(str(ch.get("type") or "line"), "line_chart")
-            out.append({
+            series_axis = ch.get("series_axis") or {}
+            axis_cfg = ch.get("axis_config") or {}
+            # The batch view supports up to 2 left + 2 right axes; the PDF
+            # renderer supports a left + right axis, so we fold the operator's
+            # per-tag axis choice down to left/right (left1|left2 -> left,
+            # right1|right2 -> right) and carry the axis labels/units so the
+            # report chart matches the on-screen chart's intent.
+            def _side(tag):
+                a = str(series_axis.get(tag) or "left1").lower()
+                return "right" if a.startswith("right") else "left"
+            sec = {
                 "type": sec_type, "title": ch.get("title") or "Chart",
                 "time_range": {"preset": "batch", "batch_id": batch["id"]},
                 "series": [{"id": f"s{i}", "label": tg, "gateway_id": gw, "tag_name": tg,
-                            "axis": "left", "aggregation": "avg"}
+                            "axis": _side(tg), "aggregation": "avg"}
                            for i, tg in enumerate(ch.get("tags") or [])],
                 "show_legend": True, "readings_count": 500,
-            })
+            }
+            # carry axis labels/units + explicit ranges (first left/right axis)
+            la = axis_cfg.get("left1") or axis_cfg.get("left2") or {}
+            ra = axis_cfg.get("right1") or axis_cfg.get("right2") or {}
+            if la.get("label"): sec["y_axis_label"] = str(la["label"])
+            if la.get("unit"): sec["y_axis_unit"] = str(la["unit"])
+            if la.get("min") not in (None, ""): sec["y_min"] = _opt_num(la.get("min"))
+            if la.get("max") not in (None, ""): sec["y_max"] = _opt_num(la.get("max"))
+            if ra.get("label"): sec["y_axis_right_label"] = str(ra["label"])
+            if ra.get("unit"): sec["y_axis_right_unit"] = str(ra["unit"])
+            if ra.get("min") not in (None, ""): sec["y_right_min"] = _opt_num(ra.get("min"))
+            if ra.get("max") not in (None, ""): sec["y_right_max"] = _opt_num(ra.get("max"))
+            out.append(sec)
         return out
 
     def _tag_summary_text(self, batch: dict[str, Any]) -> str:

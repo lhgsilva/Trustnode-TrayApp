@@ -1322,8 +1322,14 @@ function LiveTagChart({
         rows.push(nullRow);
       }
     }
-    const hasRightAxis = seriesDefs.some((s) => s.axis === "right");
-    return { rows, hasRightAxis };
+    const hasRightAxis = seriesDefs.some((s) => { const a = String(s.axis || "left").toLowerCase(); return a === "right" || a === "right1" || a === "right2"; });
+    // which of the 4 axes are actually used by a series
+    const axesUsed = new Set();
+    for (const s of seriesDefs) {
+      const a = String(s.axis || "left").toLowerCase();
+      axesUsed.add(a === "left" ? "left1" : a === "right" ? "right1" : (["left1", "left2", "right1", "right2"].includes(a) ? a : "left1"));
+    }
+    return { rows, hasRightAxis, axesUsed };
     // tick changes are the signal that buffers mutated.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick, seriesDefs, capacity, pollMs, groupBucketMs, reducerKey, showGaps]);
@@ -1372,6 +1378,11 @@ function LiveTagChart({
   };
   const manualY = buildManualDomain("y_axis_mode", "y_min", "y_max", "y_tick_step");
   const manualYRight = buildManualDomain("y_right_axis_mode", "y_right_min", "y_right_max", "y_right_tick_step");
+  // Multi-axis (2026-07-19): a 2nd left + 2nd right axis. Existing widgets use
+  // "left"/"right" — those normalize to left1/right1, so nothing changes for
+  // them; left2/right2 only appear when a series is explicitly assigned to them.
+  const manualYLeft2 = buildManualDomain("y_left2_axis_mode", "y_left2_min", "y_left2_max", "y_left2_tick_step");
+  const manualYRight2 = buildManualDomain("y_right2_axis_mode", "y_right2_min", "y_right2_max", "y_right2_tick_step");
   const autoDomain = [
     (dataMin) => {
       const n = Number.isFinite(dataMin) ? dataMin : 0;
@@ -1392,6 +1403,17 @@ function LiveTagChart({
   };
   const yDomainLeft = buildDomain(manualY);
   const yDomainRight = buildDomain(manualYRight);
+  const yDomainLeft2 = buildDomain(manualYLeft2);
+  const yDomainRight2 = buildDomain(manualYRight2);
+  // Normalize a series' axis value to one of left1|left2|right1|right2.
+  const normAxis = (a) => {
+    const s = String(a || "left").toLowerCase();
+    if (s === "left" || s === "left1") return "left1";
+    if (s === "right" || s === "right1") return "right1";
+    if (s === "left2") return "left2";
+    if (s === "right2") return "right2";
+    return "left1";
+  };
 
   // Numeric format preset matches the heavy widget: int / 2dp / 3dp /
   // scientific / auto. Applied to tooltip values + optional point labels.
@@ -1413,6 +1435,8 @@ function LiveTagChart({
   // widget so saved widgets look identical after the routing change.
   const primaryAxisLabel = String(cfg.y_axis_label || cfg.primary_unit || "");
   const rightAxisLabel = String(cfg.y_axis_right_label || "");
+  const left2AxisLabel = String(cfg.y_left2_label || "");
+  const right2AxisLabel = String(cfg.y_right2_label || "");
 
   // Style knobs the editor exposes — legend, point labels, line width,
   // line dot. Per-series overrides on extras win at render time; the
@@ -1633,7 +1657,7 @@ function LiveTagChart({
               />
             )}
             <YAxis
-              yAxisId="left"
+              yAxisId="left1"
               domain={yDomainLeft}
               ticks={manualY?.ticks}
               allowDataOverflow={!!manualY}
@@ -1643,9 +1667,14 @@ function LiveTagChart({
                 ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 }
                 : undefined}
             />
-            {renderedData.hasRightAxis ? (
+            {(renderedData.axesUsed?.has("left2")) ? (
+              <YAxis yAxisId="left2" orientation="left" domain={yDomainLeft2} ticks={manualYLeft2?.ticks}
+                allowDataOverflow={!!manualYLeft2} tickFormatter={formatNumber} fontSize={10}
+                label={left2AxisLabel ? { value: left2AxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined} />
+            ) : null}
+            {(renderedData.hasRightAxis || renderedData.axesUsed?.has("right1")) ? (
               <YAxis
-                yAxisId="right"
+                yAxisId="right1"
                 orientation="right"
                 domain={yDomainRight}
                 ticks={manualYRight?.ticks}
@@ -1657,10 +1686,15 @@ function LiveTagChart({
                   : undefined}
               />
             ) : null}
+            {(renderedData.axesUsed?.has("right2")) ? (
+              <YAxis yAxisId="right2" orientation="right" domain={yDomainRight2} ticks={manualYRight2?.ticks}
+                allowDataOverflow={!!manualYRight2} tickFormatter={formatNumber} fontSize={10}
+                label={right2AxisLabel ? { value: right2AxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined} />
+            ) : null}
             <Tooltip labelFormatter={labelFmt} formatter={fmtVal} />
             {showLegend ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
             {seriesDefs.map((s) => {
-              const yId = s.axis === "right" ? "right" : "left";
+              const yId = normAxis(s.axis);
               // Per-series style overrides win when set; fall through to the
               // widget-wide defaults pulled out at the top of the render.
               const perSeriesLine = Number(s.lineWidth);
@@ -2985,6 +3019,32 @@ function DashboardWidgetCardImpl({
     }
     return undefined; // recharts auto-domain on the right axis when undefined
   }, [manualYRight]);
+  // Multi-axis (2026-07-19): 2nd left + 2nd right axis for the heavy widget.
+  const _buildManual2 = (modeK, minK, maxK) => {
+    if (String(cfg?.[modeK] || "auto") !== "manual") return null;
+    const lo = Number(cfg?.[minK]); const hi = Number(cfg?.[maxK]);
+    if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+    return { lo, hi };
+  };
+  const manualYLeft2 = _buildManual2("y_left2_axis_mode", "y_left2_min", "y_left2_max");
+  const manualYRight2 = _buildManual2("y_right2_axis_mode", "y_right2_min", "y_right2_max");
+  const yLeft2Domain = manualYLeft2 ? [manualYLeft2.lo, manualYLeft2.hi] : undefined;
+  const yRight2Domain = manualYRight2 ? [manualYRight2.lo, manualYRight2.hi] : undefined;
+  const left2AxisLabel = String(cfg?.y_left2_label || "");
+  const right2AxisLabel = String(cfg?.y_right2_label || "");
+  const normAxis2 = (a) => {
+    const s = String(a || "left").toLowerCase();
+    if (s === "left" || s === "left1") return "left1";
+    if (s === "right" || s === "right1") return "right1";
+    if (s === "left2" || s === "right2") return s;
+    return "left1";
+  };
+  const heavyAxesUsed = useMemo(() => {
+    const used = new Set(["left1"]);
+    for (const d of (extraSeriesDefs || [])) used.add(normAxis2(d.axis));
+    for (const d of (resolvedLimitLines || [])) used.add(normAxis2(d.axis));
+    return used;
+  }, [extraSeriesDefs, resolvedLimitLines]);
   // Bottom margin = breathing room for X-axis tick labels. Without this
   // the time labels ("01:18:57") were clipped against the card edge —
   // operator request 2026-06-11: "we need a little bit of space below
@@ -3351,16 +3411,21 @@ function DashboardWidgetCardImpl({
                       branch above). Mixed bar+line keeps the time scale. */}
                   <XAxis {...buildXAxisProps(data, cfg, { categorical: seriesDescriptors.length > 0 && seriesDescriptors.every((s) => s.kind === "bar_chart") })} />
                   <YAxis
-                    yAxisId="left"
+                    yAxisId="left1"
                     {...yAxisPresetProps}
                     domain={yDomain}
                     ticks={manualYTicks || undefined}
                     allowDataOverflow={!!manualY}
                     label={primaryAxisLabel ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined}
                   />
-                  {anyRightAxis ? (
+                  {heavyAxesUsed.has("left2") ? (
+                    <YAxis yAxisId="left2" orientation="left" {...yAxisPresetProps} domain={yLeft2Domain}
+                      allowDataOverflow={!!manualYLeft2}
+                      label={left2AxisLabel ? { value: left2AxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined} />
+                  ) : null}
+                  {(anyRightAxis || heavyAxesUsed.has("right1")) ? (
                     <YAxis
-                      yAxisId="right"
+                      yAxisId="right1"
                       orientation="right"
                       {...yAxisPresetProps}
                       domain={yRightDomain}
@@ -3368,6 +3433,11 @@ function DashboardWidgetCardImpl({
                       allowDataOverflow={!!manualYRight}
                       label={rightAxisLabel ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined}
                     />
+                  ) : null}
+                  {heavyAxesUsed.has("right2") ? (
+                    <YAxis yAxisId="right2" orientation="right" {...yAxisPresetProps} domain={yRight2Domain}
+                      allowDataOverflow={!!manualYRight2}
+                      label={right2AxisLabel ? { value: right2AxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 11 } : undefined} />
                   ) : null}
                   <Tooltip
                     {...chartTooltipProps}
@@ -3379,7 +3449,7 @@ function DashboardWidgetCardImpl({
                   />
                   {showChartLegend ? <Legend /> : null}
                   {seriesDescriptors.map((s) => {
-                    const yId = s.axis === "right" ? "right" : "left";
+                    const yId = normAxis2(s.axis);
                     // Per-series style: each series carries its own thickness/
                     // dot/bar-width/pattern (with fallback to widget defaults).
                     const seriesStrokeWidth = Math.max(1, Math.min(8, Number(s.line_width) || styleLineWidth));
@@ -3480,7 +3550,7 @@ function DashboardWidgetCardImpl({
                   })}
                   {resolvedLimitLines.map((ll) => {
                     if (!Number.isFinite(ll.resolved_value)) return null;
-                    const yId = ll.axis === "right" ? "right" : "left";
+                    const yId = normAxis2(ll.axis);
                     const label = ll.label || (ll.tag_name ? `${ll.tag_name} limit` : "Limit");
                     const dashByStyle = {
                       solid: "0",

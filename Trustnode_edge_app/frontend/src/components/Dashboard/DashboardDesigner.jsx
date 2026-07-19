@@ -3639,6 +3639,17 @@ export function DashboardDesigner({
                         onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_axis_right_label: e.target.value } }))}
                       />
                     </label>
+                    {/* 2nd left/right axis labels (only relevant if a series uses Left 2 / Right 2). */}
+                    <label className="dashboard-query-field">
+                      <span>Left 2 axis label</span>
+                      <input value={form.config.y_left2_label || ""} placeholder="optional"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_left2_label: e.target.value } }))} />
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>Right 2 axis label</span>
+                      <input value={form.config.y_right2_label || ""} placeholder="optional"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_right2_label: e.target.value } }))} />
+                    </label>
                   </div>
                   {/* Y axis range: auto (recharts computes from the data) or
                       manual (operator sets min, max and an optional tick
@@ -3776,6 +3787,39 @@ export function DashboardDesigner({
                       </>
                     ) : null}
                   </div>
+                  {/* 2nd left + 2nd right axis scale (only apply when a series
+                      uses Left 2 / Right 2). Compact: mode + min/max. */}
+                  {["left2", "right2"].map((ax) => {
+                    const modeK = `y_${ax}_axis_mode`, minK = `y_${ax}_min`, maxK = `y_${ax}_max`;
+                    const label = ax === "left2" ? "Left 2 Y axis" : "Right 2 Y axis";
+                    const manual = String(form.config?.[modeK] || "auto").toLowerCase() === "manual";
+                    return (
+                      <div key={ax} className="dashboard-query-grid" style={{ marginTop: 6 }}>
+                        <label className="dashboard-query-field">
+                          <span>{label}</span>
+                          <select value={manual ? "manual" : "auto"}
+                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, [modeK]: e.target.value === "manual" ? "manual" : "auto" } }))}>
+                            <option value="auto">Auto (from data)</option>
+                            <option value="manual">Manual (min / max)</option>
+                          </select>
+                        </label>
+                        {manual ? (
+                          <>
+                            <label className="dashboard-query-field">
+                              <span>{ax === "left2" ? "Left 2" : "Right 2"} Min</span>
+                              <input type="number" step="any" value={form.config?.[minK] ?? ""}
+                                onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, [minK]: e.target.value === "" ? "" : Number(e.target.value) } }))} />
+                            </label>
+                            <label className="dashboard-query-field">
+                              <span>{ax === "left2" ? "Left 2" : "Right 2"} Max</span>
+                              <input type="number" step="any" value={form.config?.[maxK] ?? ""}
+                                onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, [maxK]: e.target.value === "" ? "" : Number(e.target.value) } }))} />
+                            </label>
+                          </>
+                        ) : null}
+                      </div>
+                    );
+                  })}
                   {/* Per-widget styling: line thickness, dot marker, bar fill / width.
                       Placed inside the Series & Axes fieldset (instead of the
                       separate Chart Display section above) so operators see
@@ -3968,12 +4012,14 @@ export function DashboardDesigner({
                               title="Label"
                             />
                             <select
-                              value={row.axis || "left"}
-                              onChange={(e) => update({ axis: e.target.value === "right" ? "right" : "left" })}
-                              title="Axis"
+                              value={(() => { const a = String(row.axis || "left").toLowerCase(); return a === "left" ? "left1" : a === "right" ? "right1" : (["left1","left2","right1","right2"].includes(a) ? a : "left1"); })()}
+                              onChange={(e) => update({ axis: e.target.value })}
+                              title="Axis (up to 2 left + 2 right)"
                             >
-                              <option value="left">Left</option>
-                              <option value="right">Right</option>
+                              <option value="left1">Left 1</option>
+                              <option value="left2">Left 2</option>
+                              <option value="right1">Right 1</option>
+                              <option value="right2">Right 2</option>
                             </select>
                             <select
                               value={row.chart_type || ""}
