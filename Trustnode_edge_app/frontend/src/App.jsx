@@ -191,6 +191,22 @@ import IntelligenceInsightsPage from "../../trustnode_intelligence/frontend/Inte
 const DEV_LICENSE_BYPASS =
   String(import.meta.env.VITE_TRUSTNODE_DEV_LICENSE_BYPASS || "").toLowerCase() === "true";
 
+// True when a gateway's error means it can't reach its PLC (device off, cable
+// pulled, network/VPN change) — as opposed to a dead worker or a sink failure.
+// Shared by the PLC-unreachable banner and the zombie-banner suppression so the
+// two never fire together. Matches the pycomm3/pylogix/socket signatures.
+function isPlcUnreachableError(msg) {
+  const m = String(msg || "").toLowerCase();
+  if (!m) return false;
+  return (
+    m.includes("failed to open a connection") ||
+    m.includes("failed to open socket") ||
+    m.includes("route attempts failed") ||
+    m.includes("no connection could be made") ||
+    (m.includes("timed out") && (m.includes("read failed") || m.includes("every tag failed")))
+  );
+}
+
 function getUiStorageScope() {
   try {
     const browserProtocol = String(window.location.protocol || "").toLowerCase();
@@ -20037,6 +20053,12 @@ const getGatewayHealth = (gateway) => {
                 stamps.delete(String(g?.id || ""));
                 return false;
               }
+              // If this gateway is stalled specifically because the PLC is
+              // unreachable, the dedicated (calmer, accurate) PLC-unreachable
+              // banner below owns it — don't ALSO show the scary red "worker
+              // may have died" banner. Fixes the double-banner the operator saw
+              // during a PLC power-cycle.
+              if (isPlcUnreachableError(rt.last_error)) return false;
               const gid = String(g?.id || "");
               if (!stamps.has(gid)) stamps.set(gid, nowMs);
               const runningFor = nowMs - (stamps.get(gid) || nowMs);
@@ -20102,18 +20124,12 @@ const getGatewayHealth = (gateway) => {
               worker's last_error connection signatures. Kept distinct from the
               db-write banner (that's the SINK failing; this is the SOURCE). */}
           {!isPortalOnly && (() => {
-            const isPlcUnreachable = (msg) => {
-              const m = String(msg || "").toLowerCase();
-              return (
-                m.includes("failed to open a connection") ||
-                m.includes("failed to open socket") ||
-                m.includes("route attempts failed") ||
-                (m.includes("timed out") && (m.includes("read failed") || m.includes("every tag failed"))) ||
-                m.includes("no connection could be made")
-              );
-            };
+            // Show for any gateway whose last error is a PLC-connection failure,
+            // whether it's still actively retrying (running) or the watchdog has
+            // briefly paused retries (cooled down) — in both cases it will
+            // auto-resume when the PLC returns, so the message stays accurate.
             const offline = Object.values(gatewayRuntimeStatuses || {})
-              .filter((rt) => rt && rt.running === true && isPlcUnreachable(rt.last_error));
+              .filter((rt) => rt && isPlcUnreachableError(rt.last_error));
             if (offline.length === 0) return null;
             const names = offline.map((rt) => {
               const gid = String(rt.gateway_id || "");

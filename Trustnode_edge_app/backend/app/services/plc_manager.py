@@ -3474,22 +3474,25 @@ class PLCManager:
             except Exception:
                 pass
             w.last_error = (
-                f"Worker stalled and watchdog cooled down after "
-                f"{self._watchdog_burst_threshold} consecutive restarts in "
-                f"{self._watchdog_burst_window_s:.0f}s. Manual stop+start required."
+                f"PLC unreachable — paused retries for "
+                f"{self._restart_cooldown_s:.0f}s after {self._watchdog_burst_threshold} "
+                f"reconnect attempts in {self._watchdog_burst_window_s:.0f}s. "
+                f"Will retry automatically; collection resumes when the PLC is back."
             )
             w.running = False
-            # Operator 2026-06-24: also clear the runtime-state flag so
-            # the heartbeat-writer's _has_running_gateway() returns
-            # False, and the sidecar therefore considers an idle
-            # heartbeat acceptable. Without this we'd loop: cooldown
-            # → no rows → heartbeat stale → sidecar kills backend →
-            # respawn (no auto_resume) → still no rows → kill again.
-            try:
-                from app.state import telemetry_service
-                telemetry_service.mark_gateway_running(gateway_id, False)
-            except Exception:
-                pass
+            # 2026-07-19: do NOT clear last_running here. Cooldown is a
+            # temporary back-off (the PLC is briefly unreachable / power-
+            # cycling), NOT operator intent to stop. Keeping last_running=1
+            # means the supervisor's baseline auto-recover retries this
+            # gateway once the cooldown window expires — so a PLC that comes
+            # back after a long outage self-heals instead of staying dead
+            # until someone clicks Start. (Previously we cleared it, which
+            # permanently disabled auto-recover after the first burst.)
+            #
+            # The heartbeat-idle concern that originally motivated clearing
+            # it is handled elsewhere: the sidecar tolerates an idle
+            # heartbeat while a gateway is legitimately waiting on an
+            # offline PLC.
             return
         try:
             import logging
@@ -3791,7 +3794,19 @@ class PLCManager:
                     # Wraps midnight.
                     in_window = cur_minutes >= start_m or cur_minutes < stop_m
 
-            running = gid in self.workers and self.workers[gid].running
+            # A STALLED worker (running=True but no read cycle for
+            # threshold seconds — e.g. wedged in a driver call after a PLC
+            # power-cycle) must count as NOT running for recovery, or the
+            # supervisor sees running=True and never brings it back. This is
+            # exactly why a gateway stayed dead after the PLC came back.
+            _w = self.workers.get(gid)
+            _stalled = False
+            if _w is not None:
+                try:
+                    _stalled, _ = _w.is_stalled()
+                except Exception:
+                    _stalled = False
+            running = (_w is not None and _w.running and not _stalled)
             should_run = (not schedule_on) or in_window
 
             # Decide.
@@ -3977,13 +3992,27 @@ class PLCManager:
         for stale_id in stale_workers:
             await self.stop_gateway(stale_id)
 
+        # 2026-07-19 RECOVERY FIX: if a worker already exists but is NOT
+        # cleanly running (watchdog cooled it down after a PLC power-cycle, a
+        # stall left an abandoned task/driver session, or it's a zombie), do a
+        # full teardown and recreate a FRESH worker. Reusing a half-dead worker
+        # was why a manual Start (and auto-recover) did nothing: GatewayWorker
+        # .start() early-returns `if self.running`, and the stale run-loop
+        # task + PLC driver client never got disposed. Only reuse a worker that
+        # is genuinely, cleanly running (idempotent re-start of a healthy gw).
+        existing = self.workers.get(gateway_id)
+        if existing is not None:
+            stalled, _idle = existing.is_stalled()
+            if (not existing.running) or stalled:
+                await self.stop_gateway(gateway_id)  # dispose task + drivers, drop from map
+        # Clear any prior watchdog cooldown/history so a manual restart frees
+        # the gateway from a "gave up" state — BEFORE (re)creating the worker.
+        self._restart_cooldown_until_mono.pop(gateway_id, None)
+        self._restart_history.pop(gateway_id, None)
+        self._user_stopped.discard(gateway_id)
         w = self._get_or_create_worker(gateway_id, config, db_sink, db_sinks)
         self._refresh_global_triggers()
         self.active_gateway_id = gateway_id
-        # Clear any prior watchdog cooldown so a manual restart frees
-        # the gateway from a "gave up" state.
-        self._restart_cooldown_until_mono.pop(gateway_id, None)
-        self._restart_history.pop(gateway_id, None)
         await w.start(self._broadcast)
         # Make sure the supervisor watchdog is running. Cheap no-op if it is.
         self._ensure_watchdog_running()
