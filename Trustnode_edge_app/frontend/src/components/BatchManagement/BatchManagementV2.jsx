@@ -634,7 +634,7 @@ function Unlicensed() {
 /* --------------------------------------------------------------------- */
 /*  PAGE 1 — Batch Overview                                               */
 /* --------------------------------------------------------------------- */
-export function BatchOverviewV2Page({ canEdit = false }) {
+export function BatchOverviewV2Page({ canEdit = false, gatewayConfigs = [] }) {
   const lic = useLicense();
   const [tab, setTab] = useCachedState("ov:tab", "batches");
   const [batches, setBatches] = useCachedState("ov:batches", []);
@@ -699,7 +699,7 @@ export function BatchOverviewV2Page({ canEdit = false }) {
   if (lic === false) return <Unlicensed />;
   if (lic === null) return <Card><div style={{ color: "var(--muted)" }}>Loading…</div></Card>;
 
-  if (openBatch) return <BatchDetailV2 batchId={openBatch} canEdit={canEdit} onBack={() => { setOpenBatch(null); load(); }} onOpenGroup={(gid) => { setOpenBatch(null); setOpenGroup(gid); }} />;
+  if (openBatch) return <BatchDetailV2 batchId={openBatch} canEdit={canEdit} gatewayConfigs={gatewayConfigs} onBack={() => { setOpenBatch(null); load(); }} onOpenGroup={(gid) => { setOpenBatch(null); setOpenGroup(gid); }} />;
   if (openGroup) return <BatchGroupDetailV2 groupId={openGroup} canEdit={canEdit} onBack={() => { setOpenGroup(null); load(); }} onOpenBatch={(bid) => { setOpenGroup(null); setOpenBatch(bid); }} />;
 
   const activeBatches = batches.filter((b) => ["running", "held", "ready"].includes(b.status)).length;
@@ -933,7 +933,7 @@ const BATCH_ACTIONS = {
   held: [["resume", "Resume", "btn-primary"], ["stop", "Stop", "btn-secondary"], ["abort", "Abort", "btn-danger"]],
 };
 
-function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
+function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs = [] }) {
   // Seed from the row already in the list cache -> the header (reference/status)
   // paints INSTANTLY; the full KPIs/trends/events stream in from the fetch below.
   const [batch, setBatch] = useState(() => peekRow("batch", batchId) || cacheGet(`batch:full:${batchId}`, null));
@@ -983,11 +983,42 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
     } catch (ex) { const t = errText(ex); if (t) setErr(t); }
   }, [batchId]);
 
+  // Chart-only refresh: re-pulls just the trends + matrix (the two things that
+  // move every collection cycle) so the batch charts advance at the gateway's
+  // interval WITHOUT re-fetching KPIs/events/reports each tick.
+  const refreshCharts = useCallback(async () => {
+    try {
+      const tg = await bmv2BatchCollectedTags(batchId);
+      if (tg?.length) {
+        setTags(tg);
+        bmv2BatchTrends(batchId, tg.slice(0, 8).join(","), 500).then(setSeries).catch(() => {});
+      }
+      bmv2BatchMatrix(batchId, "", 20000).then((mx) => { if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); } }).catch(() => {});
+    } catch { /* transient — next tick retries */ }
+  }, [batchId]);
+
   useEffect(() => { load(); }, [load]);
+  // Refresh the batch view (trends + matrix) at the SAME cadence the batch's
+  // gateway collects, so the charts advance exactly like the dashboard. Falls
+  // back to 6s when the gateway interval is unknown; floored at 1s so a
+  // sub-second gateway can't hammer the historian reads.
+  const refreshMs = useMemo(() => {
+    const gid = String(batch?.equipment_id || "");
+    const g = (gatewayConfigs || []).find((x) => String(x?.id || "") === gid);
+    const iv = Number(g?.interval_ms || g?.poll_interval_ms || 0);
+    return Number.isFinite(iv) && iv > 0 ? Math.max(1000, iv) : 6000;
+  }, [batch?.equipment_id, gatewayConfigs]);
+  const isLive = batch && !["completed", "aborted", "invalid"].includes(batch.status);
+  // Fast beat: charts (trends + matrix) at the gateway interval.
   useEffect(() => {
-    if (!batch || ["completed", "aborted", "invalid"].includes(batch.status)) return;
+    if (!isLive) return;
+    const t = setInterval(refreshCharts, refreshMs); return () => clearInterval(t);
+  }, [isLive, refreshCharts, refreshMs]);
+  // Slow beat: full detail (KPIs/events/reports/status) every 6s.
+  useEffect(() => {
+    if (!isLive) return;
     const t = setInterval(load, 6000); return () => clearInterval(t);
-  }, [batch, load]);
+  }, [isLive, load]);
 
   const doAction = async (action) => {
     setBusy(action); setErr("");
@@ -2058,7 +2089,7 @@ function StepPublish({ validation, onValidate, onPublish, canEdit, published, bu
 /* --------------------------------------------------------------------- */
 /*  PAGE 3 — Batch Analysis (tabs)                                        */
 /* --------------------------------------------------------------------- */
-export function BatchAnalysisV2Page({ canEdit = false }) {
+export function BatchAnalysisV2Page({ canEdit = false, gatewayConfigs = [] }) {
   const lic = useLicense();
   const [tab, setTab] = useCachedState("an:tab", "reports");
   const [openBatch, setOpenBatch] = useState(null);   // drill into a batch from Analysis
@@ -2067,7 +2098,7 @@ export function BatchAnalysisV2Page({ canEdit = false }) {
   if (lic === null) return <Card><div style={{ color: "var(--muted)" }}>Loading…</div></Card>;
 
   // Drill-in: open a batch/group detail from any Analysis tab; Back returns HERE.
-  if (openBatch) return <BatchDetailV2 batchId={openBatch} canEdit={canEdit}
+  if (openBatch) return <BatchDetailV2 batchId={openBatch} canEdit={canEdit} gatewayConfigs={gatewayConfigs}
     onBack={() => setOpenBatch(null)} onOpenGroup={(gid) => { setOpenBatch(null); setOpenGroup(gid); }} />;
   if (openGroup) return <BatchGroupDetailV2 groupId={openGroup} canEdit={canEdit}
     onBack={() => setOpenGroup(null)} onOpenBatch={(bid) => { setOpenGroup(null); setOpenBatch(bid); }} />;

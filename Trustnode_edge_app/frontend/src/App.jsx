@@ -23547,13 +23547,13 @@ const getGatewayHealth = (gateway) => {
               has access. Pages live in their own component file under
               components/BatchManagement/ to keep this file manageable. */}
           {activePage === "batch_overview" ? (
-            <BatchOverviewV2Page canEdit={canEditPage("batch_overview") || canEditPage("batches") || currentUser?.role === "admin"} />
+            <BatchOverviewV2Page canEdit={canEditPage("batch_overview") || canEditPage("batches") || currentUser?.role === "admin"} gatewayConfigs={gatewayConfigs} />
           ) : null}
           {activePage === "batch_definitions" ? (
             <BatchDefinitionsV2Page canEdit={canEditPage("batch_definitions") || currentUser?.role === "admin"} gatewayConfigs={gatewayConfigs} />
           ) : null}
           {activePage === "batch_analysis" ? (
-            <BatchAnalysisV2Page canEdit={canEditPage("batch_overview") || canEditPage("batches") || currentUser?.role === "admin"} />
+            <BatchAnalysisV2Page canEdit={canEditPage("batch_overview") || canEditPage("batches") || currentUser?.role === "admin"} gatewayConfigs={gatewayConfigs} />
           ) : null}
 
           {activePage === "interface" ? (
