@@ -508,26 +508,38 @@ function ChartCard({ chart, series, limitLines = [] }) {
 // Aligned tag matrix table: rows=timestamps, cols=tags, last col = in-limits.
 // Scrollable + downsampled (the endpoint caps rows); shows total + sampled note.
 function TagMatrixTable({ matrix }) {
+  const [newestFirst, setNewestFirst] = useState(false);
   if (!matrix || !(matrix.rows || []).length) return <div style={{ color: "var(--muted)", fontSize: 13 }}>No collected data in the batch window.</div>;
   const cols = matrix.tags || [];
   const fmtCell = (v) => (v === null || v === undefined ? "—" : (typeof v === "number" ? fmtNum(v) : String(v)));
+  // Rows arrive oldest→newest; reverse a shallow copy when newest-first.
+  const rows = newestFirst ? [...matrix.rows].reverse() : matrix.rows;
   return (
     <div>
-      <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
-        {matrix.total} sample{matrix.total === 1 ? "" : "s"} in the batch window{matrix.sampled ? ` · batch is very long, showing ${matrix.rows.length} evenly-sampled rows` : " · every collected reading at the gateway interval"}.
-        {matrix.spec_tags?.length ? ` In-limits checks tags: ${matrix.spec_tags.join(", ")}.` : ""}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+        <div style={{ fontSize: 12, color: "var(--muted)" }}>
+          {matrix.total} sample{matrix.total === 1 ? "" : "s"} in the batch window{matrix.sampled ? ` · batch is very long, showing ${matrix.rows.length} evenly-sampled rows` : " · every collected reading at the gateway interval"}.
+          {matrix.spec_tags?.length ? ` In-limits checks tags: ${matrix.spec_tags.join(", ")}.` : ""}
+        </div>
+        <button className="btn btn-ghost btn-sm" style={{ fontSize: 11, whiteSpace: "nowrap" }}
+          onClick={() => setNewestFirst((v) => !v)} title="Toggle timestamp sort order">
+          {newestFirst ? "↓ Newest first" : "↑ Oldest first"}
+        </button>
       </div>
       <div style={{ overflowX: "auto", maxHeight: 420, overflowY: "auto", border: "1px solid var(--stroke)", borderRadius: 8 }}>
         <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12 }}>
           <thead>
             <tr style={{ position: "sticky", top: 0, background: "var(--card)" }}>
-              <th style={{ textAlign: "left", padding: "6px 10px", borderBottom: "1px solid var(--stroke)", whiteSpace: "nowrap" }}>Timestamp</th>
+              <th style={{ textAlign: "left", padding: "6px 10px", borderBottom: "1px solid var(--stroke)", whiteSpace: "nowrap", cursor: "pointer" }}
+                onClick={() => setNewestFirst((v) => !v)} title="Toggle sort order">
+                Timestamp {newestFirst ? "▼" : "▲"}
+              </th>
               {cols.map((c) => <th key={c} style={{ textAlign: "right", padding: "6px 10px", borderBottom: "1px solid var(--stroke)", whiteSpace: "nowrap" }}>{c}</th>)}
               <th style={{ textAlign: "center", padding: "6px 10px", borderBottom: "1px solid var(--stroke)" }}>In limits</th>
             </tr>
           </thead>
           <tbody>
-            {matrix.rows.map((r, i) => (
+            {rows.map((r, i) => (
               <tr key={i} style={{ borderBottom: "1px solid var(--stroke)" }}>
                 <td style={{ padding: "4px 10px", whiteSpace: "nowrap", color: "var(--muted)" }}>{String(r.ts).slice(0, 19)}</td>
                 {cols.map((c) => <td key={c} style={{ padding: "4px 10px", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{fmtCell(r.values?.[c])}</td>)}
@@ -943,6 +955,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
   const [series, setSeries] = useState([]);
   const [reports, setReports] = useState([]);
   const [tags, setTags] = useState([]);
+  const [definition, setDefinition] = useState(() => cacheGet(`batch:def:${batchId}`, null));
   const [properties, setProperties] = useState(() => cacheGet(`batch:props:${batchId}`, []));
   const [charts, setCharts] = useState(() => cacheGet(`batch:charts:${batchId}`, []));
   const [matrix, setMatrix] = useState(() => cacheGet(`batch:matrix:${batchId}`, null));
@@ -975,6 +988,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
       bmv2BatchMatrix(batchId, "", 20000).then((mx) => { if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); } }).catch(() => {});
       if (b?.definition_id) {
         bmv2GetDefinition(b.definition_id).then((d) => {
+          setDefinition(d); cacheSet(`batch:def:${batchId}`, d);
           const ch = d?.config?.charts || [];
           setCharts(ch); cacheSet(`batch:charts:${batchId}`, ch);
         }).catch(() => {});
@@ -985,17 +999,23 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
 
   // Chart-only refresh: re-pulls just the trends + matrix (the two things that
   // move every collection cycle) so the batch charts advance at the gateway's
-  // interval WITHOUT re-fetching KPIs/events/reports each tick.
+  // interval WITHOUT re-fetching KPIs/events/reports/tags each tick. Uses the
+  // tag list already in state (tags don't change mid-batch) so this callback is
+  // stable and the interval timer is NOT torn down and rebuilt every tick
+  // (which was stalling the refresh). Guards against overlapping in-flight
+  // fetches so a slow response can't pile up behind the interval.
+  const chartFetchBusyRef = useRef(false);
   const refreshCharts = useCallback(async () => {
+    if (chartFetchBusyRef.current) return;
+    chartFetchBusyRef.current = true;
     try {
-      const tg = await bmv2BatchCollectedTags(batchId);
-      if (tg?.length) {
-        setTags(tg);
-        bmv2BatchTrends(batchId, tg.slice(0, 8).join(","), 500).then(setSeries).catch(() => {});
-      }
-      bmv2BatchMatrix(batchId, "", 20000).then((mx) => { if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); } }).catch(() => {});
-    } catch { /* transient — next tick retries */ }
-  }, [batchId]);
+      const names = (tags || []).map((t) => t.tag_name || t).filter(Boolean).slice(0, 8);
+      const jobs = [];
+      if (names.length) jobs.push(bmv2BatchTrends(batchId, names.join(","), 500).then(setSeries).catch(() => {}));
+      jobs.push(bmv2BatchMatrix(batchId, "", 20000).then((mx) => { if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); } }).catch(() => {}));
+      await Promise.all(jobs);
+    } finally { chartFetchBusyRef.current = false; }
+  }, [batchId, tags]);
 
   useEffect(() => { load(); }, [load]);
   // Refresh the batch view (trends + matrix) at the SAME cadence the batch's
@@ -1016,9 +1036,11 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
     if (!iv) {
       for (const t of (tags || [])) { iv = ivOf(t?.gateway_id); if (iv) break; }
     }
-    // Match the gateway cadence; floor 1s (no hammering), default 2s when the
-    // interval is unknown so the chart still feels live.
-    return iv ? Math.max(1000, iv) : 2000;
+    // Match the gateway cadence; floor 1s (no hammering). Default 1s when the
+    // interval is unknown (gatewayConfigs may not be loaded yet) — the in-flight
+    // busy-guard in refreshCharts prevents overlap, so 1s is safe and keeps the
+    // view live at the typical gateway rate.
+    return iv ? Math.max(1000, iv) : 1000;
   }, [batch?.equipment_id, tags, gatewayConfigs]);
   const isLive = batch && !["completed", "aborted", "invalid"].includes(batch.status);
   // Fast beat: charts (trends + matrix) at the gateway interval.
@@ -1053,13 +1075,21 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
   const limitLines = []; // populated from excursions' limit values for context
   excursions.forEach((x) => { if (x.limit_value != null) limitLines.push({ value: Number(x.limit_value), label: `${x.tag_name} ${x.limit_type}`, color: "var(--danger)" }); });
 
+  // The DEFINITION's tags are the source of truth for what the batch view shows
+  // — NOT every tag collected in the historian window. `tags` (collected-tags)
+  // is a superset that can include tags not in this definition; we filter the
+  // charts + table to the definition's tag names so nothing unconfigured leaks.
+  const defTags = (definition?.config?.tags || []).filter((t) => t?.tag_name);
+  const defTagNames = defTags.map((t) => t.tag_name);
+  const defTagNameSet = new Set(defTagNames);
+
   // Charts to render: prefer explicit config.charts; otherwise synthesize ONE
-  // chart from the tags' per-tag axis assignment + axis_options (set on the
-  // Tags & Limits tab), so operators get a multi-axis trend without opening the
-  // separate Charts tab.
+  // chart from the DEFINITION tags' per-tag axis assignment + axis_options (set
+  // on the Tags & Limits tab), so operators get a multi-axis trend without
+  // opening the separate Charts tab.
   const effectiveCharts = useMemo(() => {
     if (charts && charts.length) return charts;
-    const trendTags = (tags || []).filter((t) => t?.tag_name && t.trend_enabled !== false);
+    const trendTags = defTags.filter((t) => t.trend_enabled !== false);
     if (!trendTags.length) return [];
     const series_axis = {}; const axis_config = {};
     for (const t of trendTags) {
@@ -1076,13 +1106,31 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
       };
     }
     return [{ id: "auto", title: "Process trends", type: "line", tags: trendTags.map((t) => t.tag_name), series_axis, axis_config }];
-  }, [charts, tags]);
+  }, [charts, definition]);
+
+  // Matrix filtered to the definition's tags only (drop unconfigured columns).
+  const filteredMatrix = useMemo(() => {
+    if (!matrix) return matrix;
+    if (!defTagNameSet.size) return matrix; // no definition tags known → show all
+    const keep = (matrix.tags || []).filter((t) => defTagNameSet.has(t));
+    if (keep.length === (matrix.tags || []).length) return matrix;
+    return {
+      ...matrix,
+      tags: keep,
+      rows: (matrix.rows || []).map((r) => ({
+        ...r,
+        values: Object.fromEntries(keep.map((t) => [t, r.values?.[t]])),
+      })),
+    };
+  }, [matrix, definition]);
 
   return (
     <>
       {err && <Banner tone="error">{err}</Banner>}
       <Card
-        title={<span>{batch.reference || batch.id} <Pill value={batch.status} /></span>}
+        title={<span>{batch.reference || batch.id} <Pill value={batch.status} />
+          {definition?.name && <span style={{ fontSize: 12, fontWeight: 400, color: "var(--muted)", marginLeft: 8 }}>· Definition: {definition.name}{definition.code ? ` (${definition.code})` : ""}</span>}
+        </span>}
         actions={
           <>
             <button className="btn btn-ghost btn-sm" onClick={onBack}>← Back</button>
@@ -1148,12 +1196,14 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
           </div>
         </Card>
       ) : (
-        tags.length > 0 && <Card title="Process trends"><TrendChart series={series} xKey="ts" limitLines={limitLines} /></Card>
+        defTagNames.length > 0 && <Card title="Process trends">
+          <TrendChart series={(series || []).filter((s) => defTagNameSet.has(s.tag))} xKey="ts" limitLines={limitLines} />
+        </Card>
       )}
 
-      {/* Detailed collected time-series (aligned tag matrix). */}
+      {/* Detailed collected time-series (aligned tag matrix), definition tags only. */}
       <Card title="Collected data (time series)">
-        <TagMatrixTable matrix={matrix} />
+        <TagMatrixTable matrix={filteredMatrix} />
       </Card>
 
       <Card title={`Limit alerts (${excursions.length})`}>

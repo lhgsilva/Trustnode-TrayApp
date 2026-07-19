@@ -370,10 +370,39 @@ class ReportIntegrationService(_BatchV2Base):
         # sampled readings matrix — so the report mirrors the batch view.
         secs.extend(configured)
         secs.append({"type": "text", "title": "Tag Summary", "text": self._tag_summary_text(batch)})
-        secs.append({"type": "text", "title": "Collected Data (time series)", "text": self._matrix_text(batch)})
+        secs.append({"type": "text", "title": "Collected Data (time series)",
+                     "text": self._matrix_text(batch, newest_first=self._report_newest_first(batch))})
         return template
 
     _CHART_TYPE_MAP = {"line": "line_chart", "area": "area_chart", "bar": "bar_chart", "scatter": "line_chart"}
+
+    def _definition_tag_names(self, batch: dict[str, Any]) -> Optional[list[str]]:
+        """The tag names configured on the batch's definition — the report table
+        + summary must show ONLY these, not every tag collected in the window.
+        Returns None when the definition has no tags (show whatever collected)."""
+        ver = batch.get("definition_version_id")
+        if not ver:
+            return None
+        with self._connect_readonly() as c:
+            r = c.execute("SELECT configuration_json FROM batch_definition_version WHERE id = ? AND tenant_id = ?",
+                          (ver, self._tenant())).fetchone()
+        cfg = _json_load(r["configuration_json"]) if r else {}
+        names = [str(t.get("tag_name")).strip() for t in ((cfg or {}).get("tags") or [])
+                 if isinstance(t, dict) and str(t.get("tag_name") or "").strip()]
+        return names or None
+
+    def _report_newest_first(self, batch: dict[str, Any]) -> bool:
+        """Whether the report's collected-data table sorts newest-first — from
+        the definition's report_config.collected_data_newest_first flag."""
+        ver = batch.get("definition_version_id")
+        if not ver:
+            return False
+        with self._connect_readonly() as c:
+            r = c.execute("SELECT configuration_json FROM batch_definition_version WHERE id = ? AND tenant_id = ?",
+                          (ver, self._tenant())).fetchone()
+        cfg = _json_load(r["configuration_json"]) if r else {}
+        rc = (cfg or {}).get("report_config") or {}
+        return bool(rc.get("collected_data_newest_first"))
 
     def _configured_charts(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
         """The charts[] declared on the batch's definition version config
@@ -458,7 +487,7 @@ class ReportIntegrationService(_BatchV2Base):
     def _tag_summary_text(self, batch: dict[str, Any]) -> str:
         """Per-tag min/max/avg + within-limits, computed from the batch window."""
         try:
-            mx = self._exe.tag_matrix(batch["id"], max_rows=5000)
+            mx = self._exe.tag_matrix(batch["id"], tags=self._definition_tag_names(batch), max_rows=5000)
         except Exception:
             return "No collected data."
         cols = mx.get("tags") or []
@@ -483,20 +512,25 @@ class ReportIntegrationService(_BatchV2Base):
             lines.append(f"{c}: min {lo:g}, max {hi:g}, avg {av:g}{flag}")
         return "\n".join(lines) or "No collected data."
 
-    def _matrix_text(self, batch: dict[str, Any], max_rows: int = 300) -> str:
+    def _matrix_text(self, batch: dict[str, Any], max_rows: int = 300, newest_first: bool = False) -> str:
         """A readings table as text. Shows every collected row at the gateway's
         real interval up to max_rows; only very long batches get sampled (the
-        note reflects which). max_rows keeps PDFs a sane size."""
+        note reflects which). max_rows keeps PDFs a sane size. newest_first
+        reverses the timestamp order to match the batch view's sort toggle."""
         try:
-            mx = self._exe.tag_matrix(batch["id"], max_rows=max_rows)
+            mx = self._exe.tag_matrix(batch["id"], tags=self._definition_tag_names(batch), max_rows=max_rows)
         except Exception:
             return "No collected data."
         cols = mx.get("tags") or []
         if not cols:
             return "No collected data in the batch window."
+        order = "newest first" if newest_first else "oldest first"
         header = "Timestamp".ljust(20) + "".join(str(c)[:12].rjust(13) for c in cols) + "   In-limits"
-        lines = [header]
-        for r in mx.get("rows") or []:
+        lines = [f"(sorted {order})", header]
+        rows = list(mx.get("rows") or [])
+        if newest_first:
+            rows = list(reversed(rows))
+        for r in rows:
             ts = str(r.get("ts") or "")[:19].ljust(20)
             cells = ""
             for c in cols:
