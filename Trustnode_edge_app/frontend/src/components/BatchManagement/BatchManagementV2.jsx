@@ -402,7 +402,7 @@ function TrendChart({ series, xKey = "ts", height = 260, limitLines = [] }) {
 // One configured chart card. Renders the chart's tags as series; each series
 // has a clickable chip to toggle it on/off for analysis. `series` is the batch's
 // full per-tag series ([{tag, points}]); we filter to this chart's tags.
-function ChartCard({ chart, series, limitLines = [] }) {
+function ChartCard({ chart, series, limitLines = [], height = 220 }) {
   const chartTags = chart.tags || [];
   const [hidden, setHidden] = useState(() => new Set());
   const active = chartTags.filter((t) => !hidden.has(t));
@@ -459,7 +459,7 @@ function ChartCard({ chart, series, limitLines = [] }) {
         ))}
       </div>
       {data.length && active.length ? (
-        <div style={{ height: 220 }}>
+        <div style={{ height }}>
           <ResponsiveContainer width="100%" height="100%">
             <ComposedChart data={data} margin={{ top: 6, right: 12, bottom: 6, left: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--stroke)" />
@@ -552,6 +552,72 @@ function TagMatrixTable({ matrix }) {
             ))}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+// Batch Monitor: a fullscreen popup for process analysis of the batch's charts,
+// analogous to the dashboard's Tag Monitor. Shows the configured chart(s) large
+// with all data, click-to-toggle series, a chart-type switch, and per-tag
+// min/max/avg/last stats over the whole batch window.
+function BatchMonitorModal({ charts, series, limitLines, title, onClose }) {
+  const [chartType, setChartType] = useState("");   // "" = use each chart's own type
+  // Per-tag stats over the full series (the same data the charts plot).
+  const stats = useMemo(() => {
+    const byTag = new Map();
+    (series || []).forEach((s) => {
+      const vals = (s.points || []).map((p) => p.value).filter((v) => typeof v === "number");
+      if (!vals.length) { byTag.set(s.tag, null); return; }
+      const last = vals[vals.length - 1];
+      byTag.set(s.tag, { min: Math.min(...vals), max: Math.max(...vals),
+        avg: vals.reduce((a, b) => a + b, 0) / vals.length, last, n: vals.length });
+    });
+    return byTag;
+  }, [series]);
+  const chartTags = Array.from(new Set((charts || []).flatMap((c) => c.tags || [])));
+  return (
+    <div className="modal-backdrop" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1200, padding: 24 }} onClick={onClose}>
+      <div style={{ background: "var(--card)", border: "1px solid var(--stroke)", borderRadius: 12, width: "min(1400px, 96vw)", maxHeight: "94vh", overflowY: "auto", padding: 18 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 12 }}>
+          <div style={{ fontSize: 16, fontWeight: 700 }}>Batch Monitor{title ? ` — ${title}` : ""}</div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <select className="btn btn-sm" value={chartType} onChange={(e) => setChartType(e.target.value)} title="Chart type">
+              <option value="">Chart type: as configured</option>
+              <option value="line">Line</option>
+              <option value="area">Area</option>
+              <option value="bar">Bar</option>
+              <option value="scatter">Scatter</option>
+            </select>
+            <button className="btn btn-ghost btn-sm" onClick={onClose} aria-label="Close" title="Close">✕ Close</button>
+          </div>
+        </div>
+        {/* Per-tag stats over the whole batch window. */}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+          {chartTags.map((t, i) => {
+            const st = stats.get(t);
+            return (
+              <div key={t} style={{ border: "1px solid var(--stroke)", borderRadius: 8, padding: "8px 12px", minWidth: 150 }}>
+                <div style={{ fontSize: 11, color: "var(--muted)", display: "flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 2, background: SERIES_COLORS[i % SERIES_COLORS.length] }} />{t}
+                </div>
+                {st ? (
+                  <div style={{ fontSize: 12, marginTop: 4, lineHeight: 1.5 }}>
+                    <div>last <b>{fmtNum(st.last)}</b></div>
+                    <div style={{ color: "var(--muted)" }}>min {fmtNum(st.min)} · max {fmtNum(st.max)} · avg {fmtNum(st.avg)}</div>
+                    <div style={{ color: "var(--muted)", fontSize: 11 }}>{st.n} pts</div>
+                  </div>
+                ) : <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>no numeric data</div>}
+              </div>
+            );
+          })}
+        </div>
+        {/* Large charts. */}
+        <div style={{ display: "grid", gap: 14 }}>
+          {(charts || []).map((c) => (
+            <ChartCard key={c.id} chart={chartType ? { ...c, type: chartType } : c} series={series} limitLines={limitLines} height={460} />
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -965,6 +1031,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
   const [comment, setComment] = useState("");
   const [confirmAction, setConfirmAction] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [monitorOpen, setMonitorOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -1216,7 +1283,9 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
           synthesized from each tag's per-tag axis assignment (Tags & Limits
           tab). Falls back to a generic all-tag trend only when neither exists. */}
       {effectiveCharts.length > 0 ? (
-        <Card title="Process trends">
+        <Card title="Process trends"
+          actions={<button className="btn btn-secondary btn-sm" onClick={() => setMonitorOpen(true)}
+            title="Open full-screen Batch Monitor for process analysis">⤢ Batch Monitor</button>}>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(360px, 1fr))", gap: 12 }}>
             {effectiveCharts.map((c) => <ChartCard key={c.id} chart={c} series={chartSeries} limitLines={limitLines} />)}
           </div>
@@ -1225,6 +1294,10 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
         defTagNames.length > 0 && <Card title="Process trends">
           <TrendChart series={(chartSeries || []).filter((s) => defTagNameSet.has(s.tag))} xKey="ts" limitLines={limitLines} />
         </Card>
+      )}
+      {monitorOpen && effectiveCharts.length > 0 && (
+        <BatchMonitorModal charts={effectiveCharts} series={chartSeries} limitLines={limitLines}
+          title={batch.reference || batch.id} onClose={() => setMonitorOpen(false)} />
       )}
 
       {/* Detailed collected time-series (aligned tag matrix), definition tags only. */}
