@@ -199,6 +199,9 @@ class BatchActionIn(BaseModel):
     actor: Optional[str] = None
     equipment_id: Optional[str] = None       # used by start to scope the window
     quality_status: Optional[QualityStatus] = None   # optional manual override on stop
+    # Scanned barcode for barcode-gated start/stop. Validated against the
+    # definition's start_config/stop_config barcode rules before the transition.
+    barcode: Optional[str] = None
 
 
 class BatchCommentIn(BaseModel):
@@ -242,6 +245,54 @@ class ExcursionAckIn(BaseModel):
     acknowledged: bool = True
     actor: Optional[str] = None
     comment: Optional[str] = None
+
+
+# --------------------------------------------------------------------------- #
+#  Barcode start/stop validation
+# --------------------------------------------------------------------------- #
+# A start_config/stop_config with method == "barcode" carries a `barcode` rule:
+#   {
+#     "min_digits": int|null, "max_digits": int|null,   # length bounds
+#     "exact": "ABC123"|null,   "prefix": "ORD-"|null,   # literal / prefix match
+#     "regex": "^\\d{8}$"|null,                          # full regex
+#     "same_code_start_stop": bool,   # (stop only) must equal the start barcode
+#   }
+# Any subset may be set; all present rules must pass.
+def validate_barcode(rule: Optional[dict[str, Any]], code: Optional[str],
+                     *, start_code: Optional[str] = None) -> Optional[str]:
+    """Return None if `code` satisfies `rule`, else a human-readable error.
+    `start_code` is the barcode that started the batch (for same_code_start_stop)."""
+    import re
+    rule = rule or {}
+    code = (code or "").strip()
+    if not code:
+        return "A barcode is required to proceed."
+    mn = rule.get("min_digits")
+    mx = rule.get("max_digits")
+    try:
+        if mn not in (None, "") and len(code) < int(mn):
+            return f"Barcode must be at least {int(mn)} characters."
+        if mx not in (None, "") and len(code) > int(mx):
+            return f"Barcode must be at most {int(mx)} characters."
+    except (TypeError, ValueError):
+        pass
+    exact = rule.get("exact")
+    if exact not in (None, "") and code != str(exact):
+        return f"Barcode does not match the expected value."
+    prefix = rule.get("prefix")
+    if prefix not in (None, "") and not code.startswith(str(prefix)):
+        return f"Barcode must start with '{prefix}'."
+    pattern = rule.get("regex")
+    if pattern not in (None, ""):
+        try:
+            if not re.fullmatch(str(pattern), code):
+                return "Barcode does not match the required pattern."
+        except re.error:
+            return "The barcode pattern configured on the definition is invalid."
+    if rule.get("same_code_start_stop") and start_code not in (None, ""):
+        if code != str(start_code):
+            return "Stop barcode must match the barcode used to start this batch."
+    return None
 
 
 # Resolve forward references eagerly so the models are fully defined regardless

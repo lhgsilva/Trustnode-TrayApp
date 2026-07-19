@@ -775,6 +775,36 @@ class BatchExecutionService(_BatchV2Base):
             r = c.execute("SELECT * FROM batch WHERE id = ? AND tenant_id = ?", (batch_id, tid)).fetchone()
         return _row_to_batch(r) if r else None
 
+    def version_config_for_batch(self, batch_id: str) -> Optional[dict[str, Any]]:
+        """The batch's definition-version configuration_json (start/stop config,
+        tags, charts, report config). Read-only; used for barcode rules etc."""
+        tid = self._tenant()
+        b = self.get_batch(batch_id)
+        ver = (b or {}).get("definition_version_id")
+        if not ver:
+            return None
+        with self._connect_readonly() as c:
+            r = c.execute("SELECT configuration_json FROM batch_definition_version WHERE id = ? AND tenant_id = ?",
+                          (ver, tid)).fetchone()
+        return (_json_load(r["configuration_json"]) if r else None) or None
+
+    def set_batch_metadata(self, batch_id: str, patch: dict[str, Any]) -> bool:
+        """Merge `patch` into the batch's metadata_json (shallow)."""
+        tid = self._tenant()
+        with self._connect() as c:
+            r = c.execute("SELECT metadata_json FROM batch WHERE id = ? AND tenant_id = ?",
+                          (batch_id, tid)).fetchone()
+            if not r:
+                return False
+            meta = _json_load(r["metadata_json"]) or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta.update(patch or {})
+            c.execute("UPDATE batch SET metadata_json = ?, updated_utc = ? WHERE id = ? AND tenant_id = ?",
+                      (_json_or_none(meta), _utc_now(), batch_id, tid))
+            c.commit()
+        return True
+
     def delete_batch(self, batch_id: str, *, actor: Optional[str] = None) -> bool:
         """Hard-delete a batch and ALL of its owned rows (KPIs, excursions,
         events, data windows, properties, report references). A RUNNING batch

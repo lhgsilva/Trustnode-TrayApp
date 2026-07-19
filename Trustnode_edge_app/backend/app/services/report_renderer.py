@@ -1501,6 +1501,20 @@ def build_template_render_data(template: dict[str, Any]) -> dict[str, Any]:
                     "rows": [[("" if c is None else str(c)) for c in r] for r in body[:200]],
                     "row_count": len(body),
                 })
+            elif stype == "static_table":
+                # A table whose header + rows are supplied literally by the
+                # caller (KPIs, pass/fail, limits) — no historian query. Renders
+                # identically to a data table.
+                s_header = [str(h) for h in (section.get("header") or [])]
+                s_rows = [[("" if c is None else str(c)) for c in r]
+                          for r in (section.get("rows") or [])[:500]]
+                out_sections.append({
+                    "type": "table",
+                    "title": title,
+                    "header": s_header,
+                    "rows": s_rows,
+                    "row_count": len(s_rows),
+                })
             elif stype == "image":
                 # Image sections carry a data URL or a relative path. The
                 # data URL transports cleanly through the JSON envelope;
@@ -1569,6 +1583,9 @@ def build_template_dataset_files(template: dict[str, Any], output_dir: Path, bas
         try:
             if stype == "table":
                 header, body = build_data_table_rows(section)
+            elif stype == "static_table":
+                header = [str(h) for h in (section.get("header") or [])]
+                body = [list(r) for r in (section.get("rows") or [])]
             elif stype in {"line_chart", "area_chart", "bar_chart"}:
                 header, body = build_chart_section_rows(section)
             else:

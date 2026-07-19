@@ -358,20 +358,19 @@ class ReportIntegrationService(_BatchV2Base):
                 sec["subtitle"] = f"{batch.get('reference') or batch['id']}"
             kept.append(sec)
         template["definition"]["sections"] = kept
-        # Insert a computed-KPI text block (cycle/hold/excursions + quality) that
-        # the historian can't derive — rendered as a text section so we don't need
-        # renderer changes. Placed right after the header.
-        summary_text = self._computed_kpi_text(batch)
         secs = template["definition"].setdefault("sections", [])
         insert_at = 1 if secs and secs[0].get("type") == "header" else 0
-        secs.insert(insert_at, {"type": "text", "title": "Batch Results", "text": summary_text})
-        # Append the definition's CONFIGURED charts (one section per chart, its
-        # type + its tags), a per-tag summary (min/max/avg + pass/fail), and a
-        # sampled readings matrix — so the report mirrors the batch view.
+        # Batch pass/fail verdict + a computed-KPI table (cycle/hold/quality) —
+        # both as real tables, placed right after the header.
+        secs.insert(insert_at, self._kpi_table_section(batch))
+        secs.insert(insert_at, self._passfail_section(batch))
+        # Append the definition's CONFIGURED charts, a per-tag summary TABLE with
+        # pass/fail, a limits TABLE, and the collected time-series TABLE — so the
+        # report mirrors the batch view (all real tables, not plain text).
         secs.extend(configured)
-        secs.append({"type": "text", "title": "Tag Summary", "text": self._tag_summary_text(batch)})
-        secs.append({"type": "text", "title": "Collected Data (time series)",
-                     "text": self._matrix_text(batch, newest_first=self._report_newest_first(batch))})
+        secs.append(self._tag_summary_table_section(batch))
+        secs.append(self._limits_table_section(batch))
+        secs.append(self._matrix_table_section(batch, newest_first=self._report_newest_first(batch)))
         return template
 
     _CHART_TYPE_MAP = {"line": "line_chart", "area": "area_chart", "bar": "bar_chart", "scatter": "line_chart"}
@@ -575,6 +574,116 @@ class ReportIntegrationService(_BatchV2Base):
             _fmt("excursion_count", "Excursions", ""),
         ) if x]
         return "\n".join(lines)
+
+    # --- table sections (real tables, not plain text) -----------------------
+    def _passfail_section(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """A compact pass/fail verdict table for the batch."""
+        q = str(batch.get("quality_status") or "not_evaluated")
+        dq = str(batch.get("data_quality_status") or "not_evaluated")
+        exc = self._calc.list_excursions(batch_id=batch["id"]) or []
+        n_fail = sum(1 for e in exc if str(e.get("severity") or "") in ("error", "critical"))
+        verdict = "PASS" if q in ("pass", "within_spec", "valid") else ("FAIL" if q in ("fail", "out_of_spec") else q.replace("_", " ").upper())
+        rows = [
+            ["Result", verdict],
+            ["Quality", q.replace("_", " ")],
+            ["Data quality", dq.replace("_", " ")],
+            ["Limit excursions", str(len(exc))],
+            ["Failing excursions (error/critical)", str(n_fail)],
+        ]
+        return {"type": "static_table", "title": "Batch Result (Pass / Fail)",
+                "header": ["Check", "Value"], "rows": rows}
+
+    def _kpi_table_section(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Computed KPIs as a real table (code, name, value, unit)."""
+        kpis = self._calc.list_kpis(batch["id"]) or []
+        rows = []
+        for k in kpis:
+            v = k.get("numeric_value")
+            if v is None and not k.get("text_value"):
+                continue
+            val = k.get("text_value") if v is None else (f"{v:g}")
+            rows.append([k.get("label") or k.get("kpi_code"), val, k.get("unit") or ""])
+        if not rows:
+            rows = [["No KPIs computed yet", "", ""]]
+        return {"type": "static_table", "title": "Key Results (KPIs)",
+                "header": ["KPI", "Value", "Unit"], "rows": rows}
+
+    def _tag_summary_table_section(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """Per-tag min/max/avg + pass/fail as a real table."""
+        try:
+            mx = self._exe.tag_matrix(batch["id"], tags=self._definition_tag_names(batch), max_rows=5000)
+        except Exception:
+            mx = {}
+        cols = mx.get("tags") or []
+        spec = set(mx.get("spec_tags") or [])
+        rows = []
+        for c in cols:
+            vals = [(r.get("values") or {}).get(c) for r in (mx.get("rows") or [])]
+            vals = [v for v in vals if isinstance(v, (int, float))]
+            if not vals:
+                rows.append([c, "—", "—", "—", "n/a"]); continue
+            lo, hi, av = min(vals), max(vals), sum(vals) / len(vals)
+            verdict = "—"
+            if c in spec:
+                out_n = sum(1 for r in (mx.get("rows") or [])
+                            if isinstance((r.get("values") or {}).get(c), (int, float)) and r.get("in_limits") is False)
+                verdict = "PASS" if out_n == 0 else f"FAIL ({out_n} out)"
+            rows.append([c, f"{lo:g}", f"{hi:g}", f"{av:g}", verdict])
+        if not rows:
+            rows = [["No collected data", "", "", "", ""]]
+        return {"type": "static_table", "title": "Tag Summary (Pass / Fail)",
+                "header": ["Tag", "Min", "Max", "Avg", "Result"], "rows": rows}
+
+    def _limits_table_section(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """The configured limits + any recorded excursions as a real table."""
+        rows = []
+        # configured limits from the definition
+        cfg = self._exe.version_config_for_batch(batch["id"]) or {}
+        for t in (cfg.get("tags") or []):
+            for l in (t.get("limits") or []):
+                if l.get("enabled") is False:
+                    continue
+                rows.append([t.get("tag_name"), str(l.get("limit_type") or ""),
+                             str(l.get("limit_value") if l.get("limit_value") is not None else ""),
+                             str(l.get("severity") or ""), ""])
+        # mark tags that actually breached
+        exc = self._calc.list_excursions(batch_id=batch["id"]) or []
+        breached = {}
+        for e in exc:
+            key = (e.get("tag_name"), str(e.get("limit_type") or ""))
+            breached[key] = breached.get(key, 0) + 1
+        for r in rows:
+            n = breached.get((r[0], r[1]), 0)
+            r[4] = "OK" if n == 0 else f"BREACHED ({n})"
+        if not rows:
+            rows = [["No limits configured", "", "", "", ""]]
+        return {"type": "static_table", "title": "Limits & Excursions",
+                "header": ["Tag", "Limit type", "Value", "Severity", "Status"], "rows": rows}
+
+    def _matrix_table_section(self, batch: dict[str, Any], newest_first: bool = False) -> dict[str, Any]:
+        """The collected time-series as a real table (timestamp + tag columns +
+        in-limits), definition tags only, at the gateway cadence up to a cap."""
+        try:
+            mx = self._exe.tag_matrix(batch["id"], tags=self._definition_tag_names(batch), max_rows=300)
+        except Exception:
+            mx = {}
+        cols = mx.get("tags") or []
+        header = ["Timestamp", *[str(c) for c in cols], "In limits"]
+        rows = []
+        data = list(mx.get("rows") or [])
+        if newest_first:
+            data = list(reversed(data))
+        for r in data:
+            cells = [str(r.get("ts") or "")[:19]]
+            for c in cols:
+                v = (r.get("values") or {}).get(c)
+                cells.append(f"{v:g}" if isinstance(v, (int, float)) else ("" if v is None else str(v)))
+            cells.append("—" if r.get("in_limits") is None else ("OK" if r.get("in_limits") else "OUT"))
+            rows.append(cells)
+        if not rows:
+            rows = [["No collected data in the batch window", *["" for _ in cols], ""]]
+        title = "Collected Data (time series)" + (" — newest first" if newest_first else "")
+        return {"type": "static_table", "title": title, "header": header, "rows": rows}
 
     def _concretize_group(self, group: dict[str, Any], tpl_id: str) -> dict[str, Any]:
         rs = _reports_store()

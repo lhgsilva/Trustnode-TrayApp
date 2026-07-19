@@ -102,6 +102,32 @@ def report_templates() -> dict:
     return list_batch_templates()
 
 
+@router.post("/report-templates/{template_id}/duplicate", dependencies=_LIC)
+def duplicate_report_template(template_id: str, payload: dict = Body(default={})) -> dict:
+    """Duplicate a batch/group report template into a new editable template
+    (same definition + batch_scope, fresh id + name). The copy lands in the
+    shared Reports store, so it's listable/editable/exportable in the Reports
+    module and selectable in the definition wizard."""
+    from app.services.reports_store import _new_id
+    from .reports_v2 import _reports_store
+    rs = _reports_store()
+    src = rs.get_template(template_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="Template not found")
+    definition = dict(src.get("definition") or {})
+    # preserve batch/group classification so the copy stays in the right list
+    if "batch_scope" not in definition and src.get("batch_scope"):
+        definition["batch_scope"] = src.get("batch_scope")
+    new_name = str((payload or {}).get("name") or f"{src.get('name') or 'Batch Report'} (copy)")
+    created = rs.upsert_template({
+        "id": _new_id("tpl"),
+        "name": new_name,
+        "description": src.get("description") or "",
+        "definition": definition,
+    })
+    return {"ok": True, "template": created}
+
+
 # ---- Batch Definitions ---------------------------------------------------
 @router.get("/definitions", dependencies=_LIC)
 def list_definitions() -> dict:
@@ -200,16 +226,50 @@ def _terminal_hook(batch_id: str, actor: Optional[str]) -> None:
         pass
 
 
+def _barcode_rule(batch_id: str, which: str) -> Optional[dict]:
+    """The barcode rule dict for start_config|stop_config, or None when the
+    batch's definition doesn't gate that transition on a barcode."""
+    exe = _exe()
+    b = exe.get_batch(batch_id)
+    if not b or not b.get("definition_version_id"):
+        return None
+    cfg = exe.version_config_for_batch(batch_id) or {}
+    node = cfg.get(which) or {}
+    if str(node.get("method") or "") != "barcode":
+        return None
+    return node.get("barcode") or {}
+
+
 @router.post("/batches/{batch_id}/start", dependencies=_LIC)
 def start_batch(batch_id: str, payload: BatchActionIn, request: Request) -> dict:
+    from .models_v2 import validate_barcode
+    rule = _barcode_rule(batch_id, "start_config")
+    if rule is not None:
+        err = validate_barcode(rule, payload.barcode)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
     row = _guard(lambda: _exe().start_batch(batch_id, actor=_actor(request), source="manual",
                                             reason=payload.reason, equipment_id=payload.equipment_id))
-    return {"ok": True, "row": row}
+    # Remember the start barcode so a same-code stop rule can compare against it.
+    if payload.barcode:
+        try:
+            _exe().set_batch_metadata(batch_id, {"start_barcode": payload.barcode.strip()})
+        except Exception:
+            pass
+    return {"ok": True, "row": _exe().get_batch(batch_id) or row}
 
 
 @router.post("/batches/{batch_id}/stop", dependencies=_LIC)
 def stop_batch(batch_id: str, payload: BatchActionIn, request: Request) -> dict:
+    from .models_v2 import validate_barcode
     actor = _actor(request)
+    rule = _barcode_rule(batch_id, "stop_config")
+    if rule is not None:
+        b = _exe().get_batch(batch_id)
+        start_code = ((b or {}).get("metadata") or {}).get("start_barcode")
+        err = validate_barcode(rule, payload.barcode, start_code=start_code)
+        if err:
+            raise HTTPException(status_code=400, detail=err)
     row = _guard(lambda: _exe().stop_batch(batch_id, actor=actor, source="manual",
                                            reason=payload.reason, quality_status=payload.quality_status))
     _terminal_hook(batch_id, actor)
@@ -284,9 +344,33 @@ def batch_trends(batch_id: str, tags: str = "", max_points: int = 400) -> dict:
     return {"series": out_series}
 
 
+# Live-KPI throttle: recompute a RUNNING/HELD batch's KPIs at most this often
+# when its KPIs are polled, so the batch page shows live KPIs without a separate
+# recompute call or hammering the historian every poll.
+_LIVE_KPI_MIN_INTERVAL_S = 3.0
+_live_kpi_last: dict[str, float] = {}
+
+
 @router.get("/batches/{batch_id}/kpis", dependencies=_LIC)
 def batch_kpis(batch_id: str) -> dict:
-    return {"rows": _calc().list_kpis(batch_id)}
+    calc = _calc()
+    # Live KPIs: if the batch is still collecting, recompute over the open window
+    # (throttled) so values update as data arrives — not just on stop.
+    try:
+        b = _exe().get_batch(batch_id)
+        if b and str(b.get("status") or "") in ("running", "held"):
+            import time as _t
+            now = _t.monotonic()
+            last = _live_kpi_last.get(batch_id, 0.0)
+            if now - last >= _LIVE_KPI_MIN_INTERVAL_S:
+                _live_kpi_last[batch_id] = now
+                try:
+                    calc.compute_batch(batch_id)
+                except Exception:
+                    pass  # transient (partial window) — serve last-known KPIs
+    except Exception:
+        pass
+    return {"rows": calc.list_kpis(batch_id)}
 
 
 @router.post("/batches/{batch_id}/recompute", dependencies=_LIC)

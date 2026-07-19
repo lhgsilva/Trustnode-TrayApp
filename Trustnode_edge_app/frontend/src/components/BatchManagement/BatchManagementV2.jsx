@@ -20,7 +20,7 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ReferenceLine,
 } from "recharts";
 import {
-  bmv2Status, bmv2SeedReportTemplates, bmv2ReportTemplates,
+  bmv2Status, bmv2SeedReportTemplates, bmv2ReportTemplates, bmv2DuplicateReportTemplate,
   bmv2ListDefinitions, bmv2GetDefinition, bmv2SaveDefinition, bmv2DeleteDefinition,
   bmv2ValidateDefinition, bmv2PublishDefinition, bmv2ListVersions, bmv2NewVersion,
   bmv2ListBatches, bmv2GetBatch, bmv2CreateBatch, bmv2BatchAction, bmv2AddComment,
@@ -1032,6 +1032,8 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
   const [confirmAction, setConfirmAction] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [monitorOpen, setMonitorOpen] = useState(false);
+  const [barcode, setBarcode] = useState("");
+  const [headerCollapsed, setHeaderCollapsed] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -1121,9 +1123,9 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
     const t = setInterval(load, 6000); return () => clearInterval(t);
   }, [isLive, load]);
 
-  const doAction = async (action) => {
+  const doAction = async (action, payload = {}) => {
     setBusy(action); setErr("");
-    try { await bmv2BatchAction(batchId, action, {}); await load(); }
+    try { await bmv2BatchAction(batchId, action, payload); setBarcode(""); await load(); }
     catch (ex) { setErr(errText(ex)); } finally { setBusy(""); setConfirmAction(null); }
   };
   const genReport = async () => {
@@ -1139,9 +1141,6 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
   if (!batch) return <Card><div style={{ color: "var(--muted)" }}>{err ? <Banner tone="error">{err}</Banner> : "Loading…"}</div></Card>;
 
   const actions = BATCH_ACTIONS[batch.status] || [];
-  const limitLines = []; // populated from excursions' limit values for context
-  excursions.forEach((x) => { if (x.limit_value != null) limitLines.push({ value: Number(x.limit_value), label: `${x.tag_name} ${x.limit_type}`, color: "var(--danger)" }); });
-
   // The DEFINITION's tags are the source of truth for what the batch view shows
   // — NOT every tag collected in the historian window. `tags` (collected-tags)
   // is a superset that can include tags not in this definition; we filter the
@@ -1149,6 +1148,32 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
   const defTags = (definition?.config?.tags || []).filter((t) => t?.tag_name);
   const defTagNames = defTags.map((t) => t.tag_name);
   const defTagNameSet = new Set(defTagNames);
+
+  // Limit lines drawn on the charts — from the DEFINITION's configured tag
+  // limits, so they appear from the moment the batch is running (not only after
+  // an excursion is recorded). Each carries its tag so ChartCard can put it on
+  // the tag's axis. spec_upper/spec_lower render as solid; warnings dashed.
+  const LIMIT_COLORS = { spec_upper: "var(--danger)", spec_lower: "var(--danger)", warn_upper: "var(--warning, #d99a00)", warn_lower: "var(--warning, #d99a00)" };
+  const limitLines = [];
+  defTags.forEach((t) => {
+    (t.limits || []).forEach((l) => {
+      if (l.enabled === false) return;
+      const v = Number(l.limit_value);
+      if (!Number.isFinite(v)) return;
+      limitLines.push({ tag: t.tag_name, value: v, label: `${t.tag_name} ${l.limit_type}`,
+        color: LIMIT_COLORS[l.limit_type] || "var(--danger)" });
+    });
+  });
+  // Fall back to any excursion limit values if the definition carries none.
+  if (!limitLines.length) {
+    excursions.forEach((x) => { if (x.limit_value != null) limitLines.push({ tag: x.tag_name, value: Number(x.limit_value), label: `${x.tag_name} ${x.limit_type}`, color: "var(--danger)" }); });
+  }
+
+  // Barcode gating: does this batch's definition require a scanned barcode to
+  // start / stop? (start_config/stop_config.method === "barcode")
+  const startBarcodeReq = String(definition?.config?.start_config?.method || "") === "barcode";
+  const stopBarcodeReq = String(definition?.config?.stop_config?.method || "") === "barcode";
+  const needBarcodeFor = (a) => (a === "start" && startBarcodeReq) || (a === "stop" && stopBarcodeReq);
 
   // Charts to render: prefer explicit config.charts; otherwise synthesize ONE
   // chart from the DEFINITION tags' per-tag axis assignment + axis_options (set
@@ -1226,17 +1251,29 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
         </span>}
         actions={
           <>
+            <button className="btn btn-ghost btn-sm" title={headerCollapsed ? "Expand details" : "Collapse details"}
+              onClick={() => setHeaderCollapsed((v) => !v)}>{headerCollapsed ? "▸ Details" : "▾ Details"}</button>
             <button className="btn btn-ghost btn-sm" onClick={onBack}>← Back</button>
             {batch.batch_group_id && <button className="btn btn-secondary btn-sm" onClick={() => onOpenGroup(batch.batch_group_id)}>↑ Group</button>}
+            {/* Barcode scan field — shown when start/stop is barcode-gated and
+                that action is currently available. Enter triggers the action. */}
+            {canEdit && actions.some(([a]) => needBarcodeFor(a)) && (
+              <input value={barcode} onChange={(e) => setBarcode(e.target.value)} placeholder="Scan barcode…"
+                autoFocus className="input-sm" style={{ maxWidth: 180, fontSize: 12 }}
+                onKeyDown={(e) => { if (e.key === "Enter") { const act = actions.find(([a]) => needBarcodeFor(a)); if (act && barcode.trim()) doAction(act[0], { barcode: barcode.trim() }); } }} />
+            )}
             {canEdit && actions.map(([a, label, cls]) => (
-              <button key={a} className={`btn ${cls} btn-sm`} disabled={busy === a}
-                onClick={() => (a === "abort" ? setConfirmAction(a) : doAction(a))}>{busy === a ? "…" : label}</button>
+              <button key={a} className={`btn ${cls} btn-sm`}
+                disabled={busy === a || (needBarcodeFor(a) && !barcode.trim())}
+                title={needBarcodeFor(a) && !barcode.trim() ? "Scan a barcode first" : undefined}
+                onClick={() => (a === "abort" ? setConfirmAction(a) : doAction(a, needBarcodeFor(a) ? { barcode: barcode.trim() } : {}))}>{busy === a ? "…" : label}</button>
             ))}
             {canEdit && <button className="btn btn-secondary btn-sm" disabled={busy === "report"} onClick={genReport}>{busy === "report" ? "…" : "Generate report"}</button>}
             {canEdit && batch.status !== "running" && <button className="btn btn-danger btn-sm" onClick={() => setConfirmDelete(true)}>Delete</button>}
           </>
         }
       >
+        {!headerCollapsed && <>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10, fontSize: 13 }}>
           <Field label="Quality"><Pill value={batch.quality_status} /></Field>
           <Field label="Data quality"><Pill value={batch.data_quality_status} /></Field>
@@ -1261,6 +1298,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
             </div>
           </div>
         )}
+        </>}
       </Card>
 
       <Card title="KPIs">
@@ -2004,10 +2042,40 @@ function StepCondition({ which, title, cfg, setCfg, gateways, readOnly }) {
           <select disabled={readOnly} value={c.method || "manual"} onChange={(e) => set({ method: e.target.value })}>
             <option value="manual">Manual</option>
             <option value="gateway_trigger">Existing gateway trigger (tag condition)</option>
+            <option value="barcode">Barcode scan</option>
             {which === "stop_config" && <option value="duration">Elapsed time</option>}
           </select>
         </Lbl>
       </div>
+      {c.method === "barcode" && (
+        <div style={{ marginTop: 10, border: "1px solid var(--stroke)", borderRadius: 8, padding: 12 }}>
+          <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
+            Rules the scanned barcode must satisfy to {which === "start_config" ? "start" : "stop"} the batch. Leave a field blank to skip that check.
+          </div>
+          {(() => {
+            const bc = c.barcode || {};
+            const setBc = (patch) => set({ barcode: { ...bc, ...patch } });
+            const numOr = (v) => (v === "" ? "" : Number(v));
+            return (
+              <div className="form-grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
+                <Lbl label="Min length (digits/chars)"><input type="number" disabled={readOnly} value={bc.min_digits ?? ""} onChange={(e) => setBc({ min_digits: numOr(e.target.value) })} /></Lbl>
+                <Lbl label="Max length (digits/chars)"><input type="number" disabled={readOnly} value={bc.max_digits ?? ""} onChange={(e) => setBc({ max_digits: numOr(e.target.value) })} /></Lbl>
+                <Lbl label="Exact value"><input disabled={readOnly} placeholder="e.g. ORD-1001" value={bc.exact ?? ""} onChange={(e) => setBc({ exact: e.target.value })} /></Lbl>
+                <Lbl label="Prefix"><input disabled={readOnly} placeholder="e.g. ORD-" value={bc.prefix ?? ""} onChange={(e) => setBc({ prefix: e.target.value })} /></Lbl>
+                <Lbl label="Regex pattern"><input disabled={readOnly} placeholder="e.g. ^\d{8}$" value={bc.regex ?? ""} onChange={(e) => setBc({ regex: e.target.value })} /></Lbl>
+                {which === "stop_config" && (
+                  <Lbl label="Same code to start & stop">
+                    <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13 }}>
+                      <input type="checkbox" disabled={readOnly} checked={!!bc.same_code_start_stop} onChange={(e) => setBc({ same_code_start_stop: e.target.checked })} />
+                      Stop barcode must equal the start barcode
+                    </label>
+                  </Lbl>
+                )}
+              </div>
+            );
+          })()}
+        </div>
+      )}
       {c.method === "gateway_trigger" && (
         <div style={{ marginTop: 10 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
@@ -2297,19 +2365,44 @@ function StepReports({ cfg, setCfg, readOnly }) {
     if (currentId && !arr.some((t) => t.id === currentId)) arr.unshift({ id: currentId, name: currentId });
     return arr;
   };
+  const [dupBusy, setDupBusy] = useState("");
+  // Duplicate a template into a new editable one (lands in the Reports module,
+  // stays batch/group-scoped) and select the copy.
+  const duplicate = async (which) => {
+    const id = which === "group" ? cfg.batch_group_report_template_id : cfg.batch_report_template_id;
+    if (!id) return;
+    setDupBusy(which);
+    try {
+      const r = await bmv2DuplicateReportTemplate(id);
+      const copy = r?.template;
+      const fresh = await bmv2ReportTemplates();
+      if (fresh) { const v = { batch: fresh.batch || [], group: fresh.group || [] }; cacheSet("bm:report-templates", v); setTpls(v); }
+      if (copy?.id) setCfg(which === "group" ? { batch_group_report_template_id: copy.id } : { batch_report_template_id: copy.id });
+    } catch { /* ignore */ } finally { setDupBusy(""); }
+  };
   return (
     <div className="form-grid" style={{ gridTemplateColumns: "repeat(2, minmax(0,1fr))" }}>
       <Lbl label="Batch report template">
-        <select disabled={readOnly} value={cfg.batch_report_template_id || ""} onChange={(e) => setCfg({ batch_report_template_id: e.target.value })}>
-          <option value="">(default batch summary)</option>
-          {optionsFor(tpls.batch, cfg.batch_report_template_id).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-        </select>
+        <div style={{ display: "flex", gap: 6 }}>
+          <select style={{ flex: 1 }} disabled={readOnly} value={cfg.batch_report_template_id || ""} onChange={(e) => setCfg({ batch_report_template_id: e.target.value })}>
+            <option value="">(default batch summary)</option>
+            {optionsFor(tpls.batch, cfg.batch_report_template_id).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+          {!readOnly && <button type="button" className="btn btn-ghost btn-sm" disabled={!cfg.batch_report_template_id || dupBusy === "batch"}
+            title="Duplicate this template into an editable/exportable copy (appears in the Reports module)"
+            onClick={() => duplicate("batch")}>{dupBusy === "batch" ? "…" : "Duplicate"}</button>}
+        </div>
       </Lbl>
       <Lbl label="Group report template">
-        <select disabled={readOnly} value={cfg.batch_group_report_template_id || ""} onChange={(e) => setCfg({ batch_group_report_template_id: e.target.value })}>
-          <option value="">(default group summary)</option>
-          {optionsFor(tpls.group, cfg.batch_group_report_template_id).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-        </select>
+        <div style={{ display: "flex", gap: 6 }}>
+          <select style={{ flex: 1 }} disabled={readOnly} value={cfg.batch_group_report_template_id || ""} onChange={(e) => setCfg({ batch_group_report_template_id: e.target.value })}>
+            <option value="">(default group summary)</option>
+            {optionsFor(tpls.group, cfg.batch_group_report_template_id).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </select>
+          {!readOnly && <button type="button" className="btn btn-ghost btn-sm" disabled={!cfg.batch_group_report_template_id || dupBusy === "group"}
+            title="Duplicate this template into an editable/exportable copy (appears in the Reports module)"
+            onClick={() => duplicate("group")}>{dupBusy === "group" ? "…" : "Duplicate"}</button>}
+        </div>
       </Lbl>
       <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 13 }}>
         <input type="checkbox" disabled={readOnly} checked={!!cfg.auto_generate_batch_report} onChange={(e) => setCfg({ auto_generate_batch_report: e.target.checked })} />

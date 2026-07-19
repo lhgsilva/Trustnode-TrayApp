@@ -3339,6 +3339,11 @@ export async function bmv2SeedReportTemplates() { return _bmSend("/seed-report-t
 // Report templates the definition wizard can offer, {batch:[...], group:[...]},
 // including custom customer templates from the Reports module.
 export async function bmv2ReportTemplates() { return _bmGet("/report-templates"); }
+// Duplicate a batch/group report template into a new editable+exportable one
+// (lands in the shared Reports store, keeps its batch/group scope).
+export async function bmv2DuplicateReportTemplate(templateId, name) {
+  return _bmSend(`/report-templates/${encodeURIComponent(templateId)}/duplicate`, "POST", name ? { name } : {});
+}
 
 // ---- Definitions ----
 export async function bmv2ListDefinitions() { return (await _bmGet("/definitions")).rows || []; }
