@@ -330,9 +330,18 @@ class ReportIntegrationService(_BatchV2Base):
              "aggregation": "avg", "time_range": {"preset": "batch", "batch_id": batch["id"]}}
             for i, tg in enumerate(tags[:8])
         ]
+        # If the definition has configured/synthesized (axis-aware) charts, we
+        # append those below and must NOT also fill the template's generic
+        # placeholder chart, or the report shows the same trend twice — once
+        # without axis config. Drop placeholder chart sections in that case.
+        configured = self._configured_chart_sections(batch, gw)
+        drop_placeholder_charts = bool(configured)
+        kept = []
         for sec in template["definition"].get("sections", []):
             t = sec.get("type")
             if t in ("line_chart", "area_chart", "bar_chart"):
+                if drop_placeholder_charts:
+                    continue  # the axis-aware configured chart(s) below replace it
                 sec["time_range"] = {"preset": "batch", "batch_id": batch["id"]}
                 sec["series"] = [
                     {"id": f"s{i}", "label": tg, "gateway_id": gw, "tag_name": tg,
@@ -347,6 +356,8 @@ class ReportIntegrationService(_BatchV2Base):
                 sec["items"] = kpi_items
             elif t == "header":
                 sec["subtitle"] = f"{batch.get('reference') or batch['id']}"
+            kept.append(sec)
+        template["definition"]["sections"] = kept
         # Insert a computed-KPI text block (cycle/hold/excursions + quality) that
         # the historian can't derive — rendered as a text section so we don't need
         # renderer changes. Placed right after the header.
@@ -357,7 +368,7 @@ class ReportIntegrationService(_BatchV2Base):
         # Append the definition's CONFIGURED charts (one section per chart, its
         # type + its tags), a per-tag summary (min/max/avg + pass/fail), and a
         # sampled readings matrix — so the report mirrors the batch view.
-        secs.extend(self._configured_chart_sections(batch, gw))
+        secs.extend(configured)
         secs.append({"type": "text", "title": "Tag Summary", "text": self._tag_summary_text(batch)})
         secs.append({"type": "text", "title": "Collected Data (time series)", "text": self._matrix_text(batch)})
         return template
@@ -366,7 +377,10 @@ class ReportIntegrationService(_BatchV2Base):
 
     def _configured_charts(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
         """The charts[] declared on the batch's definition version config
-        (charts live only in configuration_json, like properties)."""
+        (charts live only in configuration_json, like properties). When no
+        explicit chart is declared, synthesize ONE chart from the tags' per-tag
+        axis assignment + axis_options (set on the Tags & Limits tab) so the
+        report chart matches the batch view exactly."""
         ver = batch.get("definition_version_id")
         if not ver:
             return []
@@ -374,8 +388,36 @@ class ReportIntegrationService(_BatchV2Base):
             r = c.execute("SELECT configuration_json FROM batch_definition_version WHERE id = ? AND tenant_id = ?",
                           (ver, self._tenant())).fetchone()
         cfg = _json_load(r["configuration_json"]) if r else {}
-        charts = (cfg or {}).get("charts") or []
-        return [ch for ch in charts if isinstance(ch, dict) and ch.get("tags")]
+        charts = [ch for ch in ((cfg or {}).get("charts") or []) if isinstance(ch, dict) and ch.get("tags")]
+        if charts:
+            return charts
+        # Synthesize from per-tag axis config (mirrors the frontend's effectiveCharts).
+        def _norm_axis(a):
+            s = str(a or "left1").lower()
+            return s if s in ("left1", "left2", "right1", "right2") else "left1"
+        trend_tags = [t for t in ((cfg or {}).get("tags") or [])
+                      if isinstance(t, dict) and str(t.get("tag_name") or "").strip()
+                      and t.get("trend_enabled") is not False]
+        if not trend_tags:
+            return []
+        series_axis: dict[str, str] = {}
+        axis_config: dict[str, dict] = {}
+        for t in trend_tags:
+            nm = str(t["tag_name"]).strip()
+            ax = _norm_axis(t.get("chart_axis"))
+            series_axis[nm] = ax
+            o = t.get("axis_options") or {}
+            prev = axis_config.get(ax, {})
+            axis_config[ax] = {
+                "label": o.get("label") if o.get("label") not in (None, "") else prev.get("label", ""),
+                "unit": o.get("unit") if o.get("unit") not in (None, "") else prev.get("unit", ""),
+                "min": o.get("min") if o.get("min") not in (None, "") else prev.get("min", ""),
+                "max": o.get("max") if o.get("max") not in (None, "") else prev.get("max", ""),
+                "decimals": o.get("decimals") if o.get("decimals") not in (None, "") else prev.get("decimals", ""),
+            }
+        return [{"id": "auto", "title": "Process Trends", "type": "line",
+                 "tags": [str(t["tag_name"]).strip() for t in trend_tags],
+                 "series_axis": series_axis, "axis_config": axis_config}]
 
     def _configured_chart_sections(self, batch: dict[str, Any], gw) -> list[dict[str, Any]]:
         out = []

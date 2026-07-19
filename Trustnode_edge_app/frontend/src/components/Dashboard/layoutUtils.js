@@ -6,6 +6,19 @@ import {
   newWidgetId,
 } from "./widgetRegistry";
 
+// Normalize a series' axis to one of the FOUR canonical axes. Legacy configs
+// stored only "left"/"right"; the multi-axis UI stores left1/left2/right1/
+// right2. This MUST keep the 4-way value or Left 2 / Right 2 assignments are
+// silently flattened to Left 1 every time a widget is normalized (save, load,
+// live preview) — the root cause of "4-axis config doesn't persist".
+function normSeriesAxis4(a) {
+  const s = String(a || "left1").toLowerCase();
+  if (s === "left2") return "left2";
+  if (s === "right2") return "right2";
+  if (s === "right" || s === "right1") return "right1";
+  return "left1";
+}
+
 const CHART_INTERPOLATION_VALUES = new Set(["stepAfter", "linear", "monotone", "natural", "stepBefore"]);
 const QUERY_GROUP_VALUES = new Set(["none", "1s", "5s", "10s", "30s", "1m", "5m", "15m", "1h", "1d"]);
 const QUERY_AGG_VALUES = new Set(["count", "sum", "avg", "min", "max", "latest"]);
@@ -231,7 +244,7 @@ export function normalizeWidgets(rawWidgets) {
                 tag_name: String(s.tag_name || ""),
                 label: String(s.label || ""),
                 color: String(s.color || ""),
-                axis: String(s.axis || "left").toLowerCase() === "right" ? "right" : "left",
+                axis: normSeriesAxis4(s.axis),
                 chart_type: String(s.chart_type || ""),
                 unit: String(s.unit || ""),
                 suffix: String(s.suffix || ""),

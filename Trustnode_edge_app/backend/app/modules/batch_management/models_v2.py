@@ -54,6 +54,11 @@ class DefinitionTagIn(BaseModel):
     report_enabled: bool = True
     trend_enabled: bool = True
     chart_group: Optional[str] = None
+    # per-tag chart axis assignment (left1|left2|right1|right2) + axis
+    # formatting {label, unit, min, max, tick, decimals}. Set on the Tags &
+    # Limits tab; the batch view synthesizes a multi-axis trend from these.
+    chart_axis: Optional[str] = None
+    axis_options: Optional[dict[str, Any]] = None
     expected_sample_rate_s: Optional[float] = None
     sort_order: int = 0
     # per-tag limits (flattened into batch_limit_definition on save)

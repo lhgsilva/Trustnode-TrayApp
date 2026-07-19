@@ -1003,11 +1003,23 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
   // back to 6s when the gateway interval is unknown; floored at 1s so a
   // sub-second gateway can't hammer the historian reads.
   const refreshMs = useMemo(() => {
-    const gid = String(batch?.equipment_id || "");
-    const g = (gatewayConfigs || []).find((x) => String(x?.id || "") === gid);
-    const iv = Number(g?.interval_ms || g?.poll_interval_ms || 0);
-    return Number.isFinite(iv) && iv > 0 ? Math.max(1000, iv) : 6000;
-  }, [batch?.equipment_id, gatewayConfigs]);
+    const cfgs = gatewayConfigs || [];
+    const ivOf = (gid) => {
+      if (!gid) return 0;
+      const g = cfgs.find((x) => String(x?.id || "") === String(gid));
+      const iv = Number(g?.interval_ms || g?.poll_interval_ms || 0);
+      return Number.isFinite(iv) && iv > 0 ? iv : 0;
+    };
+    // Prefer the batch's equipment gateway; else the gateway on the first
+    // collected tag (tags carry gateway_id in the definition).
+    let iv = ivOf(batch?.equipment_id);
+    if (!iv) {
+      for (const t of (tags || [])) { iv = ivOf(t?.gateway_id); if (iv) break; }
+    }
+    // Match the gateway cadence; floor 1s (no hammering), default 2s when the
+    // interval is unknown so the chart still feels live.
+    return iv ? Math.max(1000, iv) : 2000;
+  }, [batch?.equipment_id, tags, gatewayConfigs]);
   const isLive = batch && !["completed", "aborted", "invalid"].includes(batch.status);
   // Fast beat: charts (trends + matrix) at the gateway interval.
   useEffect(() => {
@@ -1040,6 +1052,31 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
   const actions = BATCH_ACTIONS[batch.status] || [];
   const limitLines = []; // populated from excursions' limit values for context
   excursions.forEach((x) => { if (x.limit_value != null) limitLines.push({ value: Number(x.limit_value), label: `${x.tag_name} ${x.limit_type}`, color: "var(--danger)" }); });
+
+  // Charts to render: prefer explicit config.charts; otherwise synthesize ONE
+  // chart from the tags' per-tag axis assignment + axis_options (set on the
+  // Tags & Limits tab), so operators get a multi-axis trend without opening the
+  // separate Charts tab.
+  const effectiveCharts = useMemo(() => {
+    if (charts && charts.length) return charts;
+    const trendTags = (tags || []).filter((t) => t?.tag_name && t.trend_enabled !== false);
+    if (!trendTags.length) return [];
+    const series_axis = {}; const axis_config = {};
+    for (const t of trendTags) {
+      const ax = normTagAxis4(t.chart_axis);
+      series_axis[t.tag_name] = ax;
+      const o = t.axis_options || {};
+      // last-writer-wins per axis; tags on the same axis share the axis label/unit
+      axis_config[ax] = {
+        label: o.label ?? axis_config[ax]?.label ?? "",
+        unit: o.unit ?? axis_config[ax]?.unit ?? "",
+        min: o.min ?? axis_config[ax]?.min ?? "",
+        max: o.max ?? axis_config[ax]?.max ?? "",
+        decimals: o.decimals ?? axis_config[ax]?.decimals ?? "",
+      };
+    }
+    return [{ id: "auto", title: "Process trends", type: "line", tags: trendTags.map((t) => t.tag_name), series_axis, axis_config }];
+  }, [charts, tags]);
 
   return (
     <>
@@ -1099,15 +1136,15 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
         ) : <div style={{ color: "var(--muted)", fontSize: 13 }}>No KPIs computed yet. {canEdit && <button className="btn btn-ghost btn-sm" onClick={async () => { await bmv2RecomputeBatch(batchId); load(); }}>Recompute</button>}</div>}
       </Card>
 
-      {/* ONE trend section — the definition-configured chart(s) with their
-          axis/unit/tick config and click-to-toggle series, identical to what
-          the report templates render. Falls back to a generic all-tag trend
-          ONLY when the definition has no charts configured. Configuration is
-          done in the definition's Charts tab, never here. */}
-      {charts.length > 0 ? (
+      {/* ONE trend section — the configured chart(s) with their axis/unit/tick
+          config and click-to-toggle series, identical to what the report
+          templates render. Charts come from the definition's Charts tab, or are
+          synthesized from each tag's per-tag axis assignment (Tags & Limits
+          tab). Falls back to a generic all-tag trend only when neither exists. */}
+      {effectiveCharts.length > 0 ? (
         <Card title="Process trends">
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(360px, 1fr))", gap: 12 }}>
-            {charts.map((c) => <ChartCard key={c.id} chart={c} series={series} limitLines={limitLines} />)}
+            {effectiveCharts.map((c) => <ChartCard key={c.id} chart={c} series={series} limitLines={limitLines} />)}
           </div>
         </Card>
       ) : (
@@ -1861,7 +1898,8 @@ function StepCondition({ which, title, cfg, setCfg, gateways, readOnly }) {
 
 function StepTags({ cfg, setCfg, gateways, readOnly }) {
   const tags = cfg.tags || [];
-  const addTag = () => setCfg({ tags: [...tags, { tag_name: "", gateway_id: "", tag_category: "process_value", required: false, trend_enabled: true, report_enabled: true, limits: [] }] });
+  const [axisEdit, setAxisEdit] = useState(null); // index of the tag whose axis options are open
+  const addTag = () => setCfg({ tags: [...tags, { tag_name: "", gateway_id: "", tag_category: "process_value", required: false, trend_enabled: true, report_enabled: true, chart_axis: "left1", axis_options: {}, limits: [] }] });
   const setTag = (i, patch) => setCfg({ tags: tags.map((t, j) => (j === i ? { ...t, ...patch } : t)) });
   const allTagNames = gateways.flatMap((g) => g.tags.map((t) => t.name));
   return (
@@ -1870,20 +1908,92 @@ function StepTags({ cfg, setCfg, gateways, readOnly }) {
       {!tags.length && <div style={{ color: "var(--muted)", fontSize: 13 }}>No tags selected. Add the historian tags to monitor for this batch.</div>}
       {tags.map((t, i) => (
         <div key={i} style={{ border: "1px solid var(--stroke)", borderRadius: 8, padding: 10, marginBottom: 8 }}>
-          <div style={{ display: "grid", gridTemplateColumns: "2.4fr 1fr auto auto auto", gap: 6, alignItems: "center" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "2.2fr 1fr 1fr auto auto auto auto", gap: 6, alignItems: "center" }}>
             <GatewayTagPicker gateways={gateways} gatewayId={t.gateway_id} tagName={t.tag_name} disabled={readOnly}
               onChange={(patch) => setTag(i, patch)} />
             <select disabled={readOnly} value={t.tag_category || "process_value"} onChange={(e) => setTag(i, { tag_category: e.target.value })}>
               {TAG_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
             </select>
+            {/* Per-tag chart axis: which of the 4 axes this tag plots against. */}
+            <select disabled={readOnly} value={normTagAxis4(t.chart_axis)} title="Chart axis for this tag"
+              onChange={(e) => setTag(i, { chart_axis: e.target.value })}>
+              {CHART_AXES.map(([k, lbl]) => <option key={k} value={k}>{lbl}</option>)}
+            </select>
             <label style={{ display: "flex", gap: 4, fontSize: 11, alignItems: "center" }}><input type="checkbox" disabled={readOnly} checked={!!t.required} onChange={(e) => setTag(i, { required: e.target.checked })} />req</label>
             <label style={{ display: "flex", gap: 4, fontSize: 11, alignItems: "center" }}><input type="checkbox" disabled={readOnly} checked={t.trend_enabled !== false} onChange={(e) => setTag(i, { trend_enabled: e.target.checked })} />trend</label>
+            {/* Per-row action: edit this tag's axis options (label/unit/scale). */}
+            <button className="btn btn-ghost btn-sm" title="Edit axis options (label, unit, scale, ticks)"
+              onClick={() => setAxisEdit(i)} style={{ fontSize: 11 }}>⚙ Axis</button>
             {!readOnly && <button className="btn btn-danger btn-sm" onClick={() => setCfg({ tags: tags.filter((_, j) => j !== i) })}>×</button>}
           </div>
           <TagLimits tag={t} onChange={(limits) => setTag(i, { limits })} readOnly={readOnly} />
         </div>
       ))}
       <datalist id="bmv2-tags">{allTagNames.map((n) => <option key={n} value={n} />)}</datalist>
+      {axisEdit != null && tags[axisEdit] && (
+        <AxisOptionsModal tag={tags[axisEdit]} readOnly={readOnly}
+          onClose={() => setAxisEdit(null)}
+          onSave={(patch) => { setTag(axisEdit, patch); setAxisEdit(null); }} />
+      )}
+    </div>
+  );
+}
+
+// Normalize a per-tag axis to one of the 4 canonical axes (default left1).
+function normTagAxis4(a) {
+  const s = String(a || "left1").toLowerCase();
+  return ["left1", "left2", "right1", "right2"].includes(s) ? s : "left1";
+}
+
+// Modal to edit ONE tag's axis assignment + axis formatting (label, unit,
+// min/max, tick step, decimals). Stored on the tag as chart_axis + axis_options.
+function AxisOptionsModal({ tag, onSave, onClose, readOnly }) {
+  const [axis, setAxis] = useState(normTagAxis4(tag.chart_axis));
+  const [opt, setOpt] = useState({ ...(tag.axis_options || {}) });
+  const set = (k, v) => setOpt((o) => ({ ...o, [k]: v }));
+  const numOrEmpty = (v) => (v === "" || v == null ? "" : Number(v));
+  const field = (label, key, ph = "") => (
+    <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+      <span style={{ color: "var(--muted)" }}>{label}</span>
+      <input disabled={readOnly} value={opt[key] ?? ""} placeholder={ph}
+        onChange={(e) => set(key, e.target.value)} />
+    </label>
+  );
+  const numField = (label, key, ph = "") => (
+    <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+      <span style={{ color: "var(--muted)" }}>{label}</span>
+      <input type="number" step="any" disabled={readOnly} value={opt[key] ?? ""} placeholder={ph}
+        onChange={(e) => set(key, e.target.value === "" ? "" : Number(e.target.value))} />
+    </label>
+  );
+  return (
+    <div className="modal-backdrop" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={onClose}>
+      <div className="card" style={{ background: "var(--card)", border: "1px solid var(--stroke)", borderRadius: 12, padding: 18, width: 460, maxWidth: "92vw" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Axis options</div>
+        <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12 }}>{tag.tag_name || "(tag)"}</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <label style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 12 }}>
+            <span style={{ color: "var(--muted)" }}>Axis</span>
+            <select disabled={readOnly} value={axis} onChange={(e) => setAxis(e.target.value)}>
+              {CHART_AXES.map(([k, lbl]) => <option key={k} value={k}>{lbl}</option>)}
+            </select>
+          </label>
+          {field("Axis label", "label", "e.g. Temperature")}
+          {field("Unit", "unit", "e.g. °C")}
+          {numField("Decimals", "decimals", "e.g. 1")}
+          {numField("Min", "min", "auto")}
+          {numField("Max", "max", "auto")}
+          {numField("Tick step", "tick", "auto")}
+        </div>
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
+          {!readOnly && <button className="btn btn-primary btn-sm" onClick={() => onSave({ chart_axis: axis, axis_options: {
+            ...opt,
+            min: numOrEmpty(opt.min), max: numOrEmpty(opt.max), tick: numOrEmpty(opt.tick),
+            decimals: opt.decimals === "" || opt.decimals == null ? "" : Number(opt.decimals),
+          } })}>Save</button>}
+        </div>
+      </div>
     </div>
   );
 }

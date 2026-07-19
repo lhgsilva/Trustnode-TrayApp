@@ -569,6 +569,21 @@ class BatchDefinitionService(_BatchV2Base):
             for _k in ("properties", "charts"):
                 if raw.get(_k):
                     cfg[_k] = raw[_k]
+            # Per-tag chart axis + axis_options have no dedicated columns, so the
+            # child-table rebuild above drops them. Re-inject from the raw blob,
+            # matched by tag_name, so the Tags & Limits axis config round-trips.
+            raw_by_name = {}
+            for rt in (raw.get("tags") or []):
+                nm = str((rt or {}).get("tag_name") or "").strip()
+                if nm:
+                    raw_by_name[nm] = rt
+            for td in cfg["tags"]:
+                rt = raw_by_name.get(str(td.get("tag_name") or "").strip())
+                if rt:
+                    if rt.get("chart_axis") is not None:
+                        td["chart_axis"] = rt.get("chart_axis")
+                    if rt.get("axis_options") is not None:
+                        td["axis_options"] = rt.get("axis_options")
         return cfg
 
     def _latest_version_id(self, c, definition_id, tid) -> Optional[str]:
