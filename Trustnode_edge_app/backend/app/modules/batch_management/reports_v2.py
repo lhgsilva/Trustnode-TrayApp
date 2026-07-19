@@ -359,7 +359,7 @@ class ReportIntegrationService(_BatchV2Base):
         # sampled readings matrix — so the report mirrors the batch view.
         secs.extend(self._configured_chart_sections(batch, gw))
         secs.append({"type": "text", "title": "Tag Summary", "text": self._tag_summary_text(batch)})
-        secs.append({"type": "text", "title": "Collected Data (sampled)", "text": self._matrix_text(batch)})
+        secs.append({"type": "text", "title": "Collected Data (time series)", "text": self._matrix_text(batch)})
         return template
 
     _CHART_TYPE_MAP = {"line": "line_chart", "area": "area_chart", "bar": "bar_chart", "scatter": "line_chart"}
@@ -441,8 +441,10 @@ class ReportIntegrationService(_BatchV2Base):
             lines.append(f"{c}: min {lo:g}, max {hi:g}, avg {av:g}{flag}")
         return "\n".join(lines) or "No collected data."
 
-    def _matrix_text(self, batch: dict[str, Any], max_rows: int = 60) -> str:
-        """A compact sampled readings table as text (keeps PDFs a sane size)."""
+    def _matrix_text(self, batch: dict[str, Any], max_rows: int = 300) -> str:
+        """A readings table as text. Shows every collected row at the gateway's
+        real interval up to max_rows; only very long batches get sampled (the
+        note reflects which). max_rows keeps PDFs a sane size."""
         try:
             mx = self._exe.tag_matrix(batch["id"], max_rows=max_rows)
         except Exception:

@@ -305,12 +305,14 @@ def batch_collected_tags(batch_id: str) -> dict:
 
 
 @router.get("/batches/{batch_id}/matrix", dependencies=_LIC)
-def batch_matrix(batch_id: str, tags: str = "", max_rows: int = 200) -> dict:
-    """Aligned tag matrix (rows=timestamps, cols=tags, per-row in-limits),
-    downsampled. Powers the single-batch time-series section + group child
-    expand."""
+def batch_matrix(batch_id: str, tags: str = "", max_rows: int = 5000) -> dict:
+    """Aligned tag matrix (rows=timestamps, cols=tags, per-row in-limits).
+    Returns EVERY collected row up to max_rows so the table reflects the
+    gateway's real collection cadence (e.g. one row per second for a 1s
+    gateway); only very long batches are downsampled, and the response flags
+    that. Powers the single-batch time-series section + group child expand."""
     taglist = [t.strip() for t in (tags or "").split(",") if t.strip()] or None
-    return _exe().tag_matrix(batch_id, tags=taglist, max_rows=max(10, min(max_rows, 2000)))
+    return _exe().tag_matrix(batch_id, tags=taglist, max_rows=max(10, min(max_rows, 50000)))
 
 
 # ---- Custom properties (barcode / order # / equipment / ...) -------------

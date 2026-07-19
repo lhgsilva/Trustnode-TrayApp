@@ -491,7 +491,7 @@ function TagMatrixTable({ matrix }) {
   return (
     <div>
       <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
-        {matrix.total} sample{matrix.total === 1 ? "" : "s"} in the batch window{matrix.sampled ? ` · showing ${matrix.rows.length} evenly-sampled rows` : ""}.
+        {matrix.total} sample{matrix.total === 1 ? "" : "s"} in the batch window{matrix.sampled ? ` · batch is very long, showing ${matrix.rows.length} evenly-sampled rows` : " · every collected reading at the gateway interval"}.
         {matrix.spec_tags?.length ? ` In-limits checks tags: ${matrix.spec_tags.join(", ")}.` : ""}
       </div>
       <div style={{ overflowX: "auto", maxHeight: 420, overflowY: "auto", border: "1px solid var(--stroke)", borderRadius: 8 }}>
@@ -946,7 +946,10 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
       // The heavier reads (matrix over the historian window, trends, the
       // definition's chart config) run in the BACKGROUND and update their own
       // sections as they arrive — they must NOT block the detail from painting.
-      bmv2BatchMatrix(batchId, "", 200).then((mx) => { if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); } }).catch(() => {});
+      // Request FULL resolution so the timestamp table reflects the gateway's
+      // real collection cadence (every 1s row), not a decimated view. The
+      // endpoint caps very long batches (see max_rows) and flags when it does.
+      bmv2BatchMatrix(batchId, "", 20000).then((mx) => { if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); } }).catch(() => {});
       if (b?.definition_id) {
         bmv2GetDefinition(b.definition_id).then((d) => {
           const ch = d?.config?.charts || [];
@@ -1052,12 +1055,13 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup }) {
         </Card>
       )}
 
-      {/* Detailed collected time-series (aligned tag matrix, downsampled). */}
+      {/* Trends chart FIRST, then the detailed timestamp series table below it. */}
+      {tags.length > 0 && <Card title="Process trends"><TrendChart series={series} xKey="ts" limitLines={limitLines} /></Card>}
+
+      {/* Detailed collected time-series (aligned tag matrix). */}
       <Card title="Collected data (time series)">
         <TagMatrixTable matrix={matrix} />
       </Card>
-
-      {tags.length > 0 && <Card title="Process trends"><TrendChart series={series} xKey="ts" limitLines={limitLines} /></Card>}
 
       <Card title={`Limit alerts (${excursions.length})`}>
         <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
@@ -1261,7 +1265,7 @@ function ChildBatchRow({ child, onOpen }) {
   useEffect(() => {
     if (!open || matrix) return;
     setLoading(true);
-    bmv2BatchMatrix(child.id, "", 200)
+    bmv2BatchMatrix(child.id, "", 20000)
       .then((m) => { setMatrix(m); cacheSet(`batch:matrix:${child.id}`, m); })
       .catch(() => {})
       .finally(() => setLoading(false));
