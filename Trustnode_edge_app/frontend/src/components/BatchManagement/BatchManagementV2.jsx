@@ -1009,13 +1009,13 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
     if (chartFetchBusyRef.current) return;
     chartFetchBusyRef.current = true;
     try {
-      const names = (tags || []).map((t) => t.tag_name || t).filter(Boolean).slice(0, 8);
-      const jobs = [];
-      if (names.length) jobs.push(bmv2BatchTrends(batchId, names.join(","), 500).then(setSeries).catch(() => {}));
-      jobs.push(bmv2BatchMatrix(batchId, "", 20000).then((mx) => { if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); } }).catch(() => {}));
-      await Promise.all(jobs);
+      // ONLY the matrix per tick — the chart derives its series from this same
+      // matrix (see chartSeries), so table and chart advance in lockstep at the
+      // full gateway cadence. No separate capped trends fetch to lag behind.
+      const mx = await bmv2BatchMatrix(batchId, "", 20000).catch(() => null);
+      if (mx) { setMatrix(mx); cacheSet(`batch:matrix:${batchId}`, mx); }
     } finally { chartFetchBusyRef.current = false; }
-  }, [batchId, tags]);
+  }, [batchId]);
 
   useEffect(() => { load(); }, [load]);
   // Refresh the batch view (trends + matrix) at the SAME cadence the batch's
@@ -1086,9 +1086,20 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
   // Charts to render: prefer explicit config.charts; otherwise synthesize ONE
   // chart from the DEFINITION tags' per-tag axis assignment + axis_options (set
   // on the Tags & Limits tab), so operators get a multi-axis trend without
-  // opening the separate Charts tab.
+  // opening the separate Charts tab. EITHER WAY, every chart's tag list is
+  // filtered to the definition's tags — a chart configured earlier may still
+  // reference tags since removed from the definition; those must not render.
   const effectiveCharts = useMemo(() => {
-    if (charts && charts.length) return charts;
+    const restrict = (chart) => {
+      if (!defTagNameSet.size) return chart; // definition unknown → leave as-is
+      const keptTags = (chart.tags || []).filter((t) => defTagNameSet.has(t));
+      const series_axis = {};
+      for (const t of keptTags) if (chart.series_axis?.[t]) series_axis[t] = chart.series_axis[t];
+      return { ...chart, tags: keptTags, series_axis: { ...series_axis } };
+    };
+    if (charts && charts.length) {
+      return charts.map(restrict).filter((c) => (c.tags || []).length > 0);
+    }
     const trendTags = defTags.filter((t) => t.trend_enabled !== false);
     if (!trendTags.length) return [];
     const series_axis = {}; const axis_config = {};
@@ -1123,6 +1134,21 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
       })),
     };
   }, [matrix, definition]);
+
+  // Chart series derived from the SAME matrix the table shows, so the chart and
+  // the timestamp table advance in lockstep at the full gateway cadence. (The
+  // separate trends fetch capped at 500 pts and lagged the table on long
+  // batches.) Shape: [{tag, points:[{ts, value}]}].
+  const chartSeries = useMemo(() => {
+    const mx = filteredMatrix;
+    if (!mx || !(mx.rows || []).length) return series; // fall back to trends fetch
+    return (mx.tags || []).map((tag) => ({
+      tag,
+      points: mx.rows
+        .map((r) => ({ ts: r.ts, value: r.values?.[tag] }))
+        .filter((p) => p.value != null && p.value !== ""),
+    }));
+  }, [filteredMatrix, series]);
 
   return (
     <>
@@ -1192,12 +1218,12 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
       {effectiveCharts.length > 0 ? (
         <Card title="Process trends">
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(360px, 1fr))", gap: 12 }}>
-            {effectiveCharts.map((c) => <ChartCard key={c.id} chart={c} series={series} limitLines={limitLines} />)}
+            {effectiveCharts.map((c) => <ChartCard key={c.id} chart={c} series={chartSeries} limitLines={limitLines} />)}
           </div>
         </Card>
       ) : (
         defTagNames.length > 0 && <Card title="Process trends">
-          <TrendChart series={(series || []).filter((s) => defTagNameSet.has(s.tag))} xKey="ts" limitLines={limitLines} />
+          <TrendChart series={(chartSeries || []).filter((s) => defTagNameSet.has(s.tag))} xKey="ts" limitLines={limitLines} />
         </Card>
       )}
 

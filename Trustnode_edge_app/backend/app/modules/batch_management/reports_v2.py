@@ -417,7 +417,20 @@ class ReportIntegrationService(_BatchV2Base):
             r = c.execute("SELECT configuration_json FROM batch_definition_version WHERE id = ? AND tenant_id = ?",
                           (ver, self._tenant())).fetchone()
         cfg = _json_load(r["configuration_json"]) if r else {}
-        charts = [ch for ch in ((cfg or {}).get("charts") or []) if isinstance(ch, dict) and ch.get("tags")]
+        # Definition tags are the source of truth: a chart configured earlier may
+        # still list tags since removed from the definition — filter them out so
+        # only defined tags appear on the report chart (matches the batch view).
+        def_names = {str(t.get("tag_name")).strip() for t in ((cfg or {}).get("tags") or [])
+                     if isinstance(t, dict) and str(t.get("tag_name") or "").strip()}
+        charts = []
+        for ch in ((cfg or {}).get("charts") or []):
+            if not (isinstance(ch, dict) and ch.get("tags")):
+                continue
+            kept = [t for t in ch["tags"] if not def_names or t in def_names]
+            if not kept:
+                continue
+            sa = {t: (ch.get("series_axis") or {}).get(t) for t in kept if (ch.get("series_axis") or {}).get(t)}
+            charts.append({**ch, "tags": kept, "series_axis": sa})
         if charts:
             return charts
         # Synthesize from per-tag axis config (mirrors the frontend's effectiveCharts).
