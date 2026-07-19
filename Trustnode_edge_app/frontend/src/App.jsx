@@ -282,7 +282,7 @@ const NAV_SECTIONS = [
     title: "Gateway and Edge Control",
     items: ["Gateway Configuration", "Devices", "Tags", "Triggers and Limits"]
   },
-  { id: "reporting", title: "Reporting", items: ["Reports", "Scheduled Reports"] },
+  { id: "reporting", title: "Reporting", items: ["Reports", "Scheduled Reports", "Generated Reports"] },
   { id: "notifications", title: "Notifications", items: ["Alarms", "Email and Notifications"] },
   { id: "data_log", title: "Data History", items: ["Historian", "Logs"] },
   // Operator 2026-06-23: Batch Management & Traceability module. Each
@@ -357,6 +357,7 @@ function pageTitle(page) {
   if (page === "batch_definitions") return "Batch Definitions";
   if (page === "batch_analysis") return "Batch Analysis";
   if (page === "scheduled_reports") return "Scheduled Reports";
+  if (page === "generated_reports") return "Generated Reports";
   if (page === "reports") return "Reports";
   if (page === "power_overview") return "Power Overview";
   if (page === "power_configuration") return "Power Configuration";
@@ -1542,6 +1543,8 @@ function MenuIcon({ page }) {
       return <svg {...common}><path d="M4 6h16v12H4z" /><path d="M4 8l8 6 8-6" /></svg>;
     case "scheduled_reports":
       return <svg {...common}><circle cx="12" cy="12" r="8" /><path d="M12 8v5l3 2" /></svg>;
+    case "generated_reports":
+      return <svg {...common}><path d="M6 2h9l3 3v17H6z" /><path d="M14 2v4h4" /><path d="M9 12h6M9 16h6" /></svg>;
     case "interface":
       return <svg {...common}><circle cx="12" cy="12" r="3" /><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.5-2.4 1a7 7 0 0 0-1.7-1L14.5 3h-5L9 6a7 7 0 0 0-1.7 1l-2.4-1-2 3.5L5 11a7 7 0 0 0 0 2l-2.1 1.5 2 3.5 2.4-1a7 7 0 0 0 1.7 1l.5 3h5l.5-3a7 7 0 0 0 1.7-1l2.4 1 2-3.5L18.9 13c.1-.3.1-.7.1-1z" /></svg>;
     case "frontend_source":
@@ -1977,6 +1980,7 @@ const CLIENT_MODULE_DEFS = [
   { page: "power_overview", key: "power_overview", label: "Power Management Overview" },
   { page: "alarms", key: "client_module_alarms", label: "Alarms" },
   { page: "reporting", key: "client_module_reporting", label: "Reporting" },
+  { page: "generated_reports", key: "client_module_reporting", label: "Reporting" },
   { page: "historian", key: "historian", label: "Historian" },
   { page: "interface", key: "client_module_interface", label: "Interface" },
 ];
@@ -2011,6 +2015,10 @@ const MODULE_KEY_BY_PAGE = {
   historian: "historian",
   alarms: "alarms",
   reporting: "reporting",
+  // Generated Reports shares the SAME reporting license module as the Reports
+  // page, so it appears/hides exactly like the Reporting module across
+  // client/lite/full views.
+  generated_reports: "reporting",
   interface: "interface",
   // Operator 2026-06-18: new license modules.
   // - lan_access → gates LAN sharing toggle + per-user LAN web access
@@ -10613,7 +10621,7 @@ function AppShell() {
       if (page === "power_overview") return Boolean(perms.power_overview ?? perms.database ?? false);
       if (page === "historian") return Boolean(perms.historian ?? perms.data_log ?? true);
       if (page === "alarms") return Boolean(perms.client_module_alarms ?? perms.alarms ?? false);
-      if (page === "reporting") return Boolean(perms.client_module_reporting ?? perms.reporting ?? false);
+      if (page === "reporting" || page === "generated_reports") return Boolean(perms.client_module_reporting ?? perms.reporting ?? false);
       if (page === "interface") return Boolean(perms.client_module_interface ?? perms.interface ?? false);
       return false;
     },
@@ -10660,6 +10668,10 @@ function AppShell() {
                 ? "users_and_access_control"
               : page === "email_and_notifications" || page === "scheduled_reports"
                 ? "users_and_access_control"
+              // Generated Reports follows the Reporting module permission (same
+              // as the Reports page), NOT a per-page edit flag.
+              : page === "generated_reports"
+                ? "reporting"
           // Batch Management v2: operational pages (overview/analysis) follow the
           // operational "batches" permission. The definition builder
           // (batch_definitions) is configuration -> falls through so only admins
@@ -10684,7 +10696,7 @@ function AppShell() {
     // from admins because of it.
     const role = String(currentUser?.role || "").toLowerCase();
     const isAdmin = role === "admin" || role === "super";
-    if (!isAdmin && !isPageLicensed(page) && ["dashboard", "power_overview", "historian", "alarms", "reporting", "interface"].includes(page)) {
+    if (!isAdmin && !isPageLicensed(page) && ["dashboard", "power_overview", "historian", "alarms", "reporting", "generated_reports", "interface"].includes(page)) {
       return false;
     }
     // Operator 2026-06-18: new license-gated pages.
@@ -10730,7 +10742,7 @@ function AppShell() {
     if (page === "power_overview") return hasClientModuleAccess("power_overview");
     if (page === "historian") return hasClientModuleAccess("historian");
     if (page === "alarms") return hasClientModuleAccess("alarms");
-    if (page === "reporting") return hasClientModuleAccess("reporting");
+    if (page === "reporting" || page === "generated_reports") return hasClientModuleAccess("reporting");
     if (page === "interface") return hasClientModuleAccess("interface");
     // Operator 2026-06-20: Database and Backup is admin-only. The
     // permission flag was historically settable per-user, but in
@@ -24087,9 +24099,22 @@ const getGatewayHealth = (gateway) => {
             </>
           ) : null}
 
+          {activePage === "generated_reports" ? (
+            <div className="page-fill single">
+              <ScheduledReportsManager
+                mode="generated"
+                emailSettings={buildEmailTransportPayload(emailSettings || {})}
+                onNotify={(n) => {
+                  if (n?.type === "error") setError(String(n.message || ""));
+                }}
+              />
+            </div>
+          ) : null}
+
           {activePage === "scheduled_reports" ? (
             <>
               <ScheduledReportsManager
+                mode="schedule"
                 gatewayOptions={allGatewayOptions || []}
                 tagsByGateway={triggerTagsByGateway || {}}
                 emailSettings={buildEmailTransportPayload(emailSettings || {})}

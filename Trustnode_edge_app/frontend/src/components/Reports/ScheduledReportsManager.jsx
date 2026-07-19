@@ -162,7 +162,14 @@ export function ScheduledReportsManager({
   emailSettings = null,
   formatTagForDisplay = (x) => x,
   onNotify = () => {},
+  // Which cards to render: "all" (default) = schedule config + generated list;
+  // "schedule" = config only; "generated" = generated list only. Lets the same
+  // component power both the Scheduled Reports page and a standalone Generated
+  // Reports page without duplicating any fetch/handler logic.
+  mode = "all",
 }) {
+  const showSchedule = mode === "all" || mode === "schedule";
+  const showGenerated = mode === "all" || mode === "generated";
   const [templates, setTemplates] = useState([]);
   const [schedules, setSchedules] = useState([]);
   const [generated, setGenerated] = useState([]);
@@ -368,6 +375,7 @@ export function ScheduledReportsManager({
 
   return (
     <div className="scheduled-reports-page">
+      {showSchedule && (
       <section className="tn-collapsible-card is-open scheduled-reports-card">
         <header className="tn-card-head">
           <div className="tn-card-head-text">
@@ -764,7 +772,9 @@ export function ScheduledReportsManager({
           </div>
         </div>
       </section>
+      )}
 
+      {showGenerated && (
       <section className="tn-collapsible-card is-open generated-reports-card">
         <header className="tn-card-head">
           <div className="tn-card-head-text">
@@ -876,6 +886,7 @@ export function ScheduledReportsManager({
           )}
         </div>
       </section>
+      )}
 
       {emailDialog ? (
         <div
