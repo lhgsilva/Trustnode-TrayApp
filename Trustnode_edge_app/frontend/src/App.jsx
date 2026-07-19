@@ -20092,6 +20092,44 @@ const getGatewayHealth = (gateway) => {
               </div>
             );
           })()}
+          {/* PLC-UNREACHABLE banner (operator 2026-07-19): when a RUNNING
+              gateway can't open a connection to its PLC (cable pulled, PLC
+              powered down, network/VPN change), every read times out and no
+              data flows — charts freeze and it looks "broken". Surface a clear,
+              reassuring banner: the gateway is NOT stopped, it keeps retrying
+              every cycle, and collection auto-resumes the moment the PLC is
+              reachable again (no operator action needed). Detected from the
+              worker's last_error connection signatures. Kept distinct from the
+              db-write banner (that's the SINK failing; this is the SOURCE). */}
+          {!isPortalOnly && (() => {
+            const isPlcUnreachable = (msg) => {
+              const m = String(msg || "").toLowerCase();
+              return (
+                m.includes("failed to open a connection") ||
+                m.includes("failed to open socket") ||
+                m.includes("route attempts failed") ||
+                (m.includes("timed out") && (m.includes("read failed") || m.includes("every tag failed"))) ||
+                m.includes("no connection could be made")
+              );
+            };
+            const offline = Object.values(gatewayRuntimeStatuses || {})
+              .filter((rt) => rt && rt.running === true && isPlcUnreachable(rt.last_error));
+            if (offline.length === 0) return null;
+            const names = offline.map((rt) => {
+              const gid = String(rt.gateway_id || "");
+              const cfg = (gatewayConfigsRef.current || []).find((g) => String(g?.id || "") === gid);
+              return cfg?.name || gid || "?";
+            }).join(", ");
+            return (
+              <div className="lock-note" style={{ marginBottom: 10, borderLeft: "3px solid var(--warning, #d97706)" }}>
+                <strong>PLC unreachable — waiting to reconnect:</strong> {names}.
+                The gateway is still running and retrying every cycle, but it can't reach the PLC
+                (device offline, cable unplugged, or network change). Collection will
+                <strong> resume automatically</strong> the moment the PLC is back online — no action needed.
+                Check the PLC power/network if this persists.
+              </div>
+            );
+          })()}
           {!isPortalOnly && activePage === "gateway_configuration" && appStoreHydrated && startupWarningsReady && unknownRunningGateways.length ? (
             <div className="error">
               Found running gateway workers not mapped in this page ({unknownRunningGateways.map((g) => g.gateway_id).join(", ")}).
