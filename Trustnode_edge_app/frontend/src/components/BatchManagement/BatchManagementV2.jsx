@@ -218,16 +218,30 @@ function limitTypeLabel(t) {
   return LIMIT_TYPE_LABELS[String(t || "")] || String(t || "").replace(/_/g, " ");
 }
 
-function Card({ title, actions, children, style }) {
+// A card. When `collapsible`, a chevron icon on the title toggles the body
+// (open by default; pass defaultCollapsed to start closed). The chevron is an
+// icon-only control — no text label.
+function Card({ title, actions, children, style, collapsible = false, defaultCollapsed = false }) {
+  const [open, setOpen] = useState(!defaultCollapsed);
+  const showBody = !collapsible || open;
   return (
     <section className="card" style={{ marginBottom: 14, ...(style || {}) }}>
       {(title || actions) && (
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, gap: 8, flexWrap: "wrap" }}>
-          {title ? <h3 style={{ margin: 0 }}>{title}</h3> : <span />}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: showBody ? 10 : 0, gap: 8, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+            {collapsible && (
+              <button type="button" onClick={() => setOpen((v) => !v)}
+                aria-label={open ? "Collapse" : "Expand"} title={open ? "Collapse" : "Expand"}
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text)", fontSize: 14, lineHeight: 1, padding: 2, transform: open ? "rotate(90deg)" : "rotate(0deg)", transition: "transform .15s" }}>
+                ▶
+              </button>
+            )}
+            {title ? <h3 style={{ margin: 0 }}>{title}</h3> : <span />}
+          </div>
           {actions ? <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>{actions}</div> : null}
         </div>
       )}
-      {children}
+      {showBody && children}
     </section>
   );
 }
@@ -1033,7 +1047,6 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [monitorOpen, setMonitorOpen] = useState(false);
   const [barcode, setBarcode] = useState("");
-  const [headerCollapsed, setHeaderCollapsed] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -1249,10 +1262,9 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
         title={<span>{batch.reference || batch.id} <Pill value={batch.status} />
           {definition?.name && <span style={{ fontSize: 12, fontWeight: 400, color: "var(--muted)", marginLeft: 8 }}>· Definition: {definition.name}{definition.code ? ` (${definition.code})` : ""}</span>}
         </span>}
+        collapsible
         actions={
           <>
-            <button className="btn btn-ghost btn-sm" title={headerCollapsed ? "Expand details" : "Collapse details"}
-              onClick={() => setHeaderCollapsed((v) => !v)}>{headerCollapsed ? "▸ Details" : "▾ Details"}</button>
             <button className="btn btn-ghost btn-sm" onClick={onBack}>← Back</button>
             {batch.batch_group_id && <button className="btn btn-secondary btn-sm" onClick={() => onOpenGroup(batch.batch_group_id)}>↑ Group</button>}
             {/* Barcode scan field — shown when start/stop is barcode-gated and
@@ -1273,7 +1285,6 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
           </>
         }
       >
-        {!headerCollapsed && <>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 10, fontSize: 13 }}>
           <Field label="Quality"><Pill value={batch.quality_status} /></Field>
           <Field label="Data quality"><Pill value={batch.data_quality_status} /></Field>
@@ -1298,10 +1309,9 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
             </div>
           </div>
         )}
-        </>}
       </Card>
 
-      <Card title="KPIs">
+      <Card title="KPIs" collapsible>
         {kpis.length ? (
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             {kpis.filter((k) => k.numeric_value != null).slice(0, 16).map((k) => (
@@ -1321,7 +1331,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
           synthesized from each tag's per-tag axis assignment (Tags & Limits
           tab). Falls back to a generic all-tag trend only when neither exists. */}
       {effectiveCharts.length > 0 ? (
-        <Card title="Process trends"
+        <Card title="Process trends" collapsible
           actions={<button className="btn btn-secondary btn-sm" onClick={() => setMonitorOpen(true)}
             title="Open full-screen Batch Monitor for process analysis">⤢ Batch Monitor</button>}>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(360px, 1fr))", gap: 12 }}>
@@ -1329,7 +1339,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
           </div>
         </Card>
       ) : (
-        defTagNames.length > 0 && <Card title="Process trends">
+        defTagNames.length > 0 && <Card title="Process trends" collapsible>
           <TrendChart series={(chartSeries || []).filter((s) => defTagNameSet.has(s.tag))} xKey="ts" limitLines={limitLines} />
         </Card>
       )}
@@ -1339,11 +1349,11 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
       )}
 
       {/* Detailed collected time-series (aligned tag matrix), definition tags only. */}
-      <Card title="Collected data (time series)">
+      <Card title="Collected data (time series)" collapsible>
         <TagMatrixTable matrix={filteredMatrix} />
       </Card>
 
-      <Card title={`Limit alerts (${excursions.length})`}>
+      <Card title={`Limit alerts (${excursions.length})`} collapsible>
         <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
           Readings that went outside a configured limit during the batch.
         </div>
@@ -1363,7 +1373,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
         />
       </Card>
 
-      <Card title="Reports">
+      <Card title="Reports" collapsible>
         <DataTable
           minWidth={560}
           empty="No reports generated."
@@ -1381,7 +1391,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
         />
       </Card>
 
-      <Card title="Event timeline">
+      <Card title="Event timeline" collapsible>
         {canEdit && (
           <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
             <input placeholder="Add a comment…" value={comment} onChange={(e) => setComment(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addComment()} />
@@ -1485,7 +1495,7 @@ function BatchGroupDetailV2({ groupId, canEdit, onBack, onOpenBatch }) {
         </div>
       </Card>
 
-      <Card title="Group KPIs">
+      <Card title="Group KPIs" collapsible>
         {kpis.length ? (
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             {kpis.filter((k) => k.numeric_value != null).map((k) => (
