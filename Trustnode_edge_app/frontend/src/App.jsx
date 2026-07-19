@@ -4229,6 +4229,11 @@ function AppShell() {
     alarm_subject: "[ALARM] {{gateway}} - {{tag}}",
     report_subject: "[REPORT] {{name}}",
     batch_subject: "[BATCH] {{name}}",
+    // Infrastructure/gateway fault emails (PLC unreachable, gateway stalled/
+    // died, DB sink write failing). Reuses the alarm recipient list + transport;
+    // this toggle lets the operator mute just the infra emails. Default ON.
+    infra_fault_email_enabled: true,
+    infra_fault_subject: "[FAULT] {{gateway}} - {{fault}}",
     alarm_template:
       "<h2 style='color:#dc2626'>Alarm Triggered</h2><p><b>Gateway:</b> {{gateway}}</p><p><b>Tag:</b> {{tag}}</p><p><b>Value:</b> {{value}}</p><p><b>Time:</b> {{ts}}</p>",
     report_template:
@@ -5716,6 +5721,136 @@ function AppShell() {
       setGatewayRuntimeTransitions(transitions);
     }
   }, [gatewayRuntimeStatuses]);
+
+  // ---------------------------------------------------------------------
+  // INFRASTRUCTURE-FAULT monitor (operator 2026-07-19).
+  // Watches gateway runtime status and raises ALARMS + EMAILS for
+  // infrastructure faults — the same pipeline tag alarms use — so PLC,
+  // energy-meter, gateway and database problems reach the operator's inbox:
+  //   - plc_unreachable : gateway can't connect to the PLC (device off,
+  //                        cable, network). Applies to any AB/OPC/meter gw.
+  //   - gateway_stalled : running but no fresh sample/check in 90 s (worker
+  //                       wedged/died).
+  //   - db_write_failing: collection runs but rows aren't reaching the sink
+  //                       (SQLite/Postgres/Supabase), excluding transient
+  //                       cloud store-and-forward blips.
+  // Each fault raises an "active" alarm on the transition INTO fault and a
+  // "clear" alarm when it recovers, deduped per (gateway, fault) so we don't
+  // spam. Emails reuse the alarm recipients + transport and honor the
+  // infra_fault_email_enabled toggle. Fully independent of the tag-alarm loop.
+  const infraFaultStateRef = useRef({});   // faultKey -> "active" (in-fault set)
+  useEffect(() => {
+    if (isPortalOnly) return;
+    const cfg = emailSettingsRef.current || {};
+    const statuses = gatewayRuntimeStatuses || {};
+    const nowTs = tsNow();
+    const configs = gatewayConfigsRef.current || [];
+    const nameFor = (gid) => {
+      const c = configs.find((g) => String(g?.id || "") === String(gid));
+      return c?.name || String(gid) || "?";
+    };
+    const isDbWriteFailing = (rt) => {
+      const e = String(rt?.db_last_error || "").trim();
+      return Boolean(e) && !isTransientCloudDbError(e);
+    };
+    // Compute the CURRENT fault set from all known gateways.
+    const faults = [];   // { key, gateway_id, gateway_name, fault, detail }
+    for (const rt of Object.values(statuses)) {
+      if (!rt || !rt.gateway_id) continue;
+      const gid = String(rt.gateway_id);
+      const gname = nameFor(gid);
+      // PLC-unreachable applies whether running or briefly cooled-down.
+      if (isPlcUnreachableError(rt.last_error)) {
+        faults.push({ key: `${gid}:plc_unreachable`, gateway_id: gid, gateway_name: gname,
+          fault: "PLC unreachable", detail: String(rt.last_error || "") });
+      } else if (rt.running === true) {
+        // Only meaningful while the worker claims to be running.
+        const lc = parseTimestampMs(String(rt.last_check_utc || ""));
+        const lw = parseTimestampMs(String(rt.db_last_write_utc || ""));
+        const nowMs = Date.now();
+        const stale = (!Number.isFinite(lc) || (nowMs - lc) > 90000) &&
+                      (!Number.isFinite(lw) || (nowMs - lw) > 90000) &&
+                      !hasFreshGatewayLiveSignal({ id: gid });
+        if (stale && (Number.isFinite(lc) || Number.isFinite(lw))) {
+          faults.push({ key: `${gid}:gateway_stalled`, gateway_id: gid, gateway_name: gname,
+            fault: "Gateway stopped collecting", detail: "No fresh sample or check in 90 s." });
+        }
+      }
+      if (isDbWriteFailing(rt)) {
+        faults.push({ key: `${gid}:db_write_failing`, gateway_id: gid, gateway_name: gname,
+          fault: "Database write failing", detail: String(rt.db_last_error || "") });
+      }
+    }
+    const activeKeys = new Set(faults.map((f) => f.key));
+    const prevState = infraFaultStateRef.current || {};
+
+    const sendInfraEmail = async (f, eventType) => {
+      if (cfg.infra_fault_email_enabled === false) return;
+      const recipients = parseEmailList(cfg.alarm_recipients);
+      if (!recipients.length) return;
+      const gateKey = `infra:${f.key}`;
+      if (alarmEmailGateRef.current[gateKey] === eventType) return;  // dedupe per state
+      const context = {
+        gateway: f.gateway_name, tag: "—", value: "—", ts: nowTs,
+        severity: eventType === "active" ? "Critical" : "Info",
+        fault: eventType === "active" ? f.fault : `${f.fault} — RECOVERED`,
+        message: eventType === "active"
+          ? `${f.fault} on gateway ${f.gateway_name}. ${f.detail}`
+          : `${f.fault} on gateway ${f.gateway_name} has recovered — collection resumed.`,
+      };
+      const subject = applyTemplate(cfg.infra_fault_subject || "[FAULT] {{gateway}} - {{fault}}", context);
+      const html = applyTemplate(cfg.alarm_template, context);
+      const text = `${context.severity} | ${context.gateway} | ${context.fault} | ${context.ts}`;
+      try {
+        const res = await sendNotificationEmail({
+          ...buildEmailTransportPayload(cfg), to: recipients, subject, html_body: html, text_body: text,
+        });
+        addAppLog({ level: res?.ok ? "info" : "error", category: "notifications",
+          message: res?.ok ? `Infrastructure-fault email sent (${f.fault}, ${recipients.length} recipients).`
+                           : `Infrastructure-fault email failed: ${res?.message || "unknown"}` });
+        if (res?.ok) alarmEmailGateRef.current[gateKey] = eventType;
+      } catch (err) {
+        addAppLog({ level: "error", category: "notifications", message: `Infrastructure-fault email error: ${err?.message || err}` });
+      }
+    };
+
+    const newAlarms = [];
+    // NEW faults (active transition)
+    for (const f of faults) {
+      if (prevState[f.key] === "active") continue;   // already in-fault
+      newAlarms.push({
+        id: `infra-${f.key}-${Date.now()}`, ts: nowTs, severity: "Critical",
+        message: `[${f.gateway_name}] ${f.fault}. ${f.detail}`.trim(),
+        value: "—", tag: null, alert_key: `infra:${f.key}`, event_type: "active",
+        gateway_id: f.gateway_id, gateway_name: f.gateway_name,
+        acknowledged: false, notification_paused: false, infra_fault: true,
+      });
+      alarmEmailGateRef.current[`infra:${f.key}`] = undefined;  // allow a fresh active email
+      sendInfraEmail(f, "active");
+    }
+    // RECOVERED faults (clear transition)
+    for (const key of Object.keys(prevState)) {
+      if (activeKeys.has(key)) continue;             // still in fault
+      const gid = key.split(":")[0];
+      const faultLabel = ({ plc_unreachable: "PLC unreachable", gateway_stalled: "Gateway stopped collecting", db_write_failing: "Database write failing" })[key.split(":")[1]] || "Fault";
+      const gname = nameFor(gid);
+      newAlarms.push({
+        id: `infra-${key}-clear-${Date.now()}`, ts: nowTs, severity: "Info",
+        message: `[${gname}] ${faultLabel} — RECOVERED. Collection resumed.`,
+        value: "—", tag: null, alert_key: `infra:${key}`, event_type: "clear",
+        gateway_id: gid, gateway_name: gname,
+        acknowledged: true, notification_paused: false, infra_fault: true,
+      });
+      alarmEmailGateRef.current[`infra:${key}`] = undefined;  // allow a clear email
+      sendInfraEmail({ key, gateway_id: gid, gateway_name: gname, fault: faultLabel, detail: "" }, "clear");
+    }
+
+    // Update the in-fault set.
+    const nextState = {};
+    for (const k of activeKeys) nextState[k] = "active";
+    infraFaultStateRef.current = nextState;
+    if (newAlarms.length) setAlarms((prev) => [...newAlarms, ...(prev || [])].slice(0, 300));
+  }, [gatewayRuntimeStatuses, isPortalOnly]);
 
   useEffect(() => {
     gatewayRuntimeTransitionsRef.current = gatewayRuntimeTransitions || {};
@@ -23876,6 +24011,16 @@ const getGatewayHealth = (gateway) => {
                   <label>
                     Batch Subject Template
                     <input value={emailSettings.batch_subject || ""} onChange={(e) => setEmailSettings((p) => ({ ...p, batch_subject: e.target.value }))} />
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <input type="checkbox" checked={emailSettings.infra_fault_email_enabled !== false}
+                      onChange={(e) => setEmailSettings((p) => ({ ...p, infra_fault_email_enabled: e.target.checked }))} />
+                    Email infrastructure/gateway faults (PLC unreachable, gateway stalled, DB write failing) — uses Alarm Recipients
+                  </label>
+                  <label>
+                    Infrastructure-Fault Subject Template
+                    <input value={emailSettings.infra_fault_subject || "[FAULT] {{gateway}} - {{fault}}"}
+                      onChange={(e) => setEmailSettings((p) => ({ ...p, infra_fault_subject: e.target.value }))} />
                   </label>
                 </div>
                 <div className="card" style={{ padding: 10 }}>
