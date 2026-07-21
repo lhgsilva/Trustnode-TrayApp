@@ -3650,16 +3650,46 @@ export function DashboardDesigner({
                         onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_axis_right_label: e.target.value } }))}
                       />
                     </label>
-                    {/* 2nd left/right axis labels (only relevant if a series uses Left 2 / Right 2). */}
+                    <label className="dashboard-query-field">
+                      <span>Right axis unit</span>
+                      <input value={form.config.y_axis_right_unit || ""} placeholder="e.g. %"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_axis_right_unit: e.target.value } }))} />
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>Right axis suffix</span>
+                      <input value={form.config.y_axis_right_suffix || ""} placeholder="optional"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_axis_right_suffix: e.target.value } }))} />
+                    </label>
+                    {/* 2nd left/right axis labels + units (only relevant if a series uses Left 2 / Right 2). */}
                     <label className="dashboard-query-field">
                       <span>Left 2 axis label</span>
                       <input value={form.config.y_left2_label || ""} placeholder="optional"
                         onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_left2_label: e.target.value } }))} />
                     </label>
                     <label className="dashboard-query-field">
+                      <span>Left 2 axis unit</span>
+                      <input value={form.config.y_left2_unit || ""} placeholder="optional"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_left2_unit: e.target.value } }))} />
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>Left 2 axis suffix</span>
+                      <input value={form.config.y_left2_suffix || ""} placeholder="optional"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_left2_suffix: e.target.value } }))} />
+                    </label>
+                    <label className="dashboard-query-field">
                       <span>Right 2 axis label</span>
                       <input value={form.config.y_right2_label || ""} placeholder="optional"
                         onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_right2_label: e.target.value } }))} />
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>Right 2 axis unit</span>
+                      <input value={form.config.y_right2_unit || ""} placeholder="optional"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_right2_unit: e.target.value } }))} />
+                    </label>
+                    <label className="dashboard-query-field">
+                      <span>Right 2 axis suffix</span>
+                      <input value={form.config.y_right2_suffix || ""} placeholder="optional"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_right2_suffix: e.target.value } }))} />
                     </label>
                   </div>
                   {/* Y axis range: auto (recharts computes from the data) or

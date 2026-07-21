@@ -1442,6 +1442,23 @@ function LiveTagChart({
     }
   };
 
+  // Per-axis unit + suffix, appended to each Y-axis tick so configured units
+  // actually show on the chart (previously the live path used a bare number
+  // formatter and dropped them). Config keys mirror the axis label keys.
+  const AXIS_UNIT_KEYS = {
+    left1:  { unit: "primary_unit",       suffix: "primary_suffix" },
+    right1: { unit: "y_axis_right_unit",  suffix: "y_axis_right_suffix" },
+    left2:  { unit: "y_left2_unit",       suffix: "y_left2_suffix" },
+    right2: { unit: "y_right2_unit",      suffix: "y_right2_suffix" },
+  };
+  const axisTickFmt = (axisId) => {
+    const k = AXIS_UNIT_KEYS[axisId] || {};
+    const unit = String(cfg[k.unit] || "").trim();
+    const suffix = String(cfg[k.suffix] || "").trim();
+    if (!unit && !suffix) return formatNumber;
+    return (v) => `${formatNumber(v)}${unit ? ` ${unit}` : ""}${suffix ? ` ${suffix}` : ""}`;
+  };
+
   // Axis labels (rotated 90° inside the chart) — same as the heavy
   // widget so saved widgets look identical after the routing change.
   const primaryAxisLabel = String(cfg.y_axis_label || cfg.primary_unit || "");
@@ -1677,16 +1694,16 @@ function LiveTagChart({
               domain={yDomainLeft}
               ticks={manualY?.ticks}
               allowDataOverflow={!!manualY}
-              tickFormatter={formatNumber}
+              tickFormatter={axisTickFmt("left1")}
               fontSize={multiLeft ? 9 : 10}
-              width={multiLeft ? 46 : undefined}
+              width={multiLeft ? 54 : undefined}
               label={primaryAxisLabel
                 ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: multiLeft ? 10 : 11 }
                 : undefined}
             />
             {(renderedData.axesUsed?.has("left2")) ? (
               <YAxis yAxisId="left2" orientation="left" domain={yDomainLeft2} ticks={manualYLeft2?.ticks}
-                allowDataOverflow={!!manualYLeft2} tickFormatter={formatNumber} fontSize={9} width={46}
+                allowDataOverflow={!!manualYLeft2} tickFormatter={axisTickFmt("left2")} fontSize={9} width={54}
                 label={left2AxisLabel ? { value: left2AxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
             ) : null}
             {(renderedData.hasRightAxis || renderedData.axesUsed?.has("right1")) ? (
@@ -1696,9 +1713,9 @@ function LiveTagChart({
                 domain={yDomainRight}
                 ticks={manualYRight?.ticks}
                 allowDataOverflow={!!manualYRight}
-                tickFormatter={formatNumber}
+                tickFormatter={axisTickFmt("right1")}
                 fontSize={multiRight ? 9 : 10}
-                width={multiRight ? 46 : undefined}
+                width={multiRight ? 54 : undefined}
                 label={rightAxisLabel
                   ? { value: rightAxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: multiRight ? 10 : 11 }
                   : undefined}
@@ -1706,7 +1723,7 @@ function LiveTagChart({
             ) : null}
             {(renderedData.axesUsed?.has("right2")) ? (
               <YAxis yAxisId="right2" orientation="right" domain={yDomainRight2} ticks={manualYRight2?.ticks}
-                allowDataOverflow={!!manualYRight2} tickFormatter={formatNumber} fontSize={9} width={46}
+                allowDataOverflow={!!manualYRight2} tickFormatter={axisTickFmt("right2")} fontSize={9} width={54}
                 label={right2AxisLabel ? { value: right2AxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
             ) : null}
             <Tooltip labelFormatter={labelFmt} formatter={fmtVal} />
@@ -3056,6 +3073,23 @@ function DashboardWidgetCardImpl({
   const yRight2Domain = manualYRight2 ? [manualYRight2.lo, manualYRight2.hi] : undefined;
   const left2AxisLabel = String(cfg?.y_left2_label || "");
   const right2AxisLabel = String(cfg?.y_right2_label || "");
+  // Per-axis unit + suffix appended to each Y-axis tick (heavy path), so
+  // configured units/suffixes show on all four axes — not just the value label.
+  const HEAVY_AXIS_UNIT_KEYS = {
+    left1:  { unit: "primary_unit",       suffix: "primary_suffix" },
+    right1: { unit: "y_axis_right_unit",  suffix: "y_axis_right_suffix" },
+    left2:  { unit: "y_left2_unit",       suffix: "y_left2_suffix" },
+    right2: { unit: "y_right2_unit",      suffix: "y_right2_suffix" },
+  };
+  const heavyAxisTickFmt = (axisId) => {
+    const k = HEAVY_AXIS_UNIT_KEYS[axisId] || {};
+    const unit = String(cfg?.[k.unit] || "").trim();
+    const suffix = String(cfg?.[k.suffix] || "").trim();
+    return (v) => {
+      const base = formatByPreset(v, chartValueFormat);
+      return `${base}${unit ? ` ${unit}` : ""}${suffix ? ` ${suffix}` : ""}`;
+    };
+  };
   const normAxis2 = (a) => {
     const s = String(a || "left").toLowerCase();
     if (s === "left" || s === "left1") return "left1";
@@ -3442,13 +3476,14 @@ function DashboardWidgetCardImpl({
                     yAxisId="left1"
                     {...yAxisPresetProps}
                     {...stackAxisProps(heavyMultiLeft)}
+                    tickFormatter={heavyAxisTickFmt("left1")}
                     domain={yDomain}
                     ticks={manualYTicks || undefined}
                     allowDataOverflow={!!manualY}
                     label={primaryAxisLabel ? { value: primaryAxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: heavyMultiLeft ? 10 : 11 } : undefined}
                   />
                   {heavyAxesUsed.has("left2") ? (
-                    <YAxis yAxisId="left2" orientation="left" {...yAxisPresetProps} {...stackAxisProps(true)} domain={yLeft2Domain}
+                    <YAxis yAxisId="left2" orientation="left" {...yAxisPresetProps} {...stackAxisProps(true)} tickFormatter={heavyAxisTickFmt("left2")} domain={yLeft2Domain}
                       ticks={manualYLeft2?.ticks} allowDataOverflow={!!manualYLeft2}
                       label={left2AxisLabel ? { value: left2AxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
                   ) : null}
@@ -3458,6 +3493,7 @@ function DashboardWidgetCardImpl({
                       orientation="right"
                       {...yAxisPresetProps}
                       {...stackAxisProps(heavyMultiRight)}
+                      tickFormatter={heavyAxisTickFmt("right1")}
                       domain={yRightDomain}
                       ticks={manualYRightTicks || undefined}
                       allowDataOverflow={!!manualYRight}
@@ -3465,7 +3501,7 @@ function DashboardWidgetCardImpl({
                     />
                   ) : null}
                   {heavyAxesUsed.has("right2") ? (
-                    <YAxis yAxisId="right2" orientation="right" {...yAxisPresetProps} {...stackAxisProps(true)} domain={yRight2Domain}
+                    <YAxis yAxisId="right2" orientation="right" {...yAxisPresetProps} {...stackAxisProps(true)} tickFormatter={heavyAxisTickFmt("right2")} domain={yRight2Domain}
                       ticks={manualYRight2?.ticks} allowDataOverflow={!!manualYRight2}
                       label={right2AxisLabel ? { value: right2AxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
                   ) : null}

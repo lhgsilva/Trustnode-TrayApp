@@ -121,8 +121,28 @@ def _batch_service():
         return None
 
 
+def _resolve_batch_v2(batch_id: str):
+    """v2 batches (the current module) live in a different table shape than v1,
+    so a v2 batch id must be resolved via BatchExecutionService, not the legacy
+    BatchService. Try v2 FIRST for an explicit id — otherwise batch-anchored
+    report charts get an empty window and render blank."""
+    if not batch_id:
+        return None
+    try:
+        from app.modules.batch_management.service_v2 import BatchExecutionService
+        b = BatchExecutionService(_app_store()).get_batch(batch_id)
+        return b or None
+    except Exception:
+        return None
+
+
 def _resolve_batch(batch_id: str = "", batch_of_type_id: str = "") -> dict[str, Any] | None:
-    """Return a batch dict for an explicit id, or the latest batch of a type."""
+    """Return a batch dict for an explicit id, or the latest batch of a type.
+    v2 first (current module), then legacy v1 as a fallback."""
+    if batch_id:
+        v2 = _resolve_batch_v2(batch_id)
+        if v2:
+            return v2
     svc = _batch_service()
     if not svc:
         return None
