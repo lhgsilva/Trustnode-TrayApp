@@ -189,29 +189,46 @@ TOOL_CATALOG: Dict[str, Tool] = {
     "get_batch_summary": Tool(
         name="get_batch_summary",
         category="read_only",
-        description="Get the summary record for a single batch (start, stop, cycle time, tag stats).",
+        description=(
+            "Full summary for ONE batch: status, quality/pass-fail, duration, KPIs, "
+            "limit excursions, and per-tag min/max/avg with pass/fail. Pass batch_id "
+            "OR reference; with neither, returns the most recent batch. Use for "
+            "'did the last batch pass', 'batch B-123 results', 'batch KPIs'."
+        ),
         schema={
             "type": "object",
             "properties": {
-                "batch_id": {"type": "string"},
+                "batch_id": {"type": "string", "description": "Batch id (optional)."},
+                "reference": {"type": "string", "description": "Batch reference/name (optional)."},
             },
-            "required": ["batch_id"],
+            "required": [],
         },
         runner=batch_summary.run_get_batch_summary,
     ),
     "list_recent_batches": Tool(
         name="list_recent_batches",
         category="read_only",
-        description="List the most recent N batches with id, state, start, stop. Useful for 'show me running batches'.",
+        description=(
+            "List the most recent N batches with id, reference, status, quality, "
+            "start/stop and duration. Optionally filter by status. Use for "
+            "'show running batches', 'last 5 batches', 'batches today'."
+        ),
         schema={
             "type": "object",
             "properties": {
                 "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200},
-                "state": {"type": "string", "enum": ["all", "running", "completed", "failed"], "default": "all"},
+                "state": {"type": "string", "enum": ["all", "running", "held", "completed", "aborted"], "default": "all"},
             },
             "required": [],
         },
         runner=batch_summary.run_list_recent_batches,
+    ),
+    "list_batch_definitions": Tool(
+        name="list_batch_definitions",
+        category="read_only",
+        description="List the batch definitions (recipes): id, name, code, equipment, product, status. Use for 'what batch types exist'.",
+        schema={"type": "object", "properties": {}, "required": []},
+        runner=batch_summary.run_list_batch_definitions,
     ),
     "list_recent_alarms": Tool(
         name="list_recent_alarms",

@@ -143,22 +143,23 @@ DEFAULT_PRESETS: List[Dict[str, Any]] = [
         ],
     },
     {
-        "key": "compare", "label": "Compare · Multi-series · Batches",
-        "hint": "Overlays, correlation, period-over-period, batches",
+        "key": "compare", "label": "Compare · Multi-series",
+        "hint": "Overlays, correlation, period-over-period",
         "queries": [
             "Compare {multi} grouped by 1 minute over the last hour and show correlation",
             "Correlate {t1} and {t2} every 5 seconds over the last 30 minutes",
             "Trend {multi} in the same chart",
             "Compare {t1} this hour to the same hour yesterday",
-            "Trend {multi} for the last batch",
-            "Show the last 5 batches and their durations",
-            "Compare {t1} across the last 3 batches",
             "Trend {t1} since the process started",
             "Trend {t1} since it last crossed a high value",
             "Which of {multi} move together? Analyze the correlation over the last hour.",
         ],
     },
 ]
+# NOTE: the "Batch" shortcut group is injected by the FRONTEND only when the
+# batch_management module is licensed (see PredefinedQueries.jsx / BATCH_CATEGORY)
+# — intentionally NOT in these defaults so it tracks the license and never gets
+# baked into a customer's saved palette.
 
 
 # --- Helpers --------------------------------------------------------------
@@ -252,6 +253,16 @@ def _user_ctx(request: Request) -> Dict[str, str]:
 # anyio pool free: the coroutine awaits without holding a pool slot, so
 # CRUD never starves even while status waits on a busy lock.
 
+def _batch_module_available() -> bool:
+    """Whether the Batch Management module is licensed — the AI surfaces batch
+    shortcuts + tools only when it is."""
+    try:
+        from app.modules.batch_management.license import is_batch_management_enabled  # type: ignore
+        return bool(is_batch_management_enabled())
+    except Exception:
+        return False
+
+
 def _build_status() -> Dict[str, Any]:
     cfg = _cfg.get_ai_config()
     portal = get_module_config()
@@ -262,6 +273,8 @@ def _build_status() -> Dict[str, Any]:
         "endpoint_configured": cfg.is_configured,
         "model_configured": bool(cfg.model),
         "endpoint_url_set": bool(cfg.endpoint_url),
+        # Which OTHER modules the AI can lean on (drives batch shortcuts/tools).
+        "batch_available": _batch_module_available(),
         "features": {
             "insights": get_feature_flag("insights", True),
             "email_schedule": get_feature_flag("email_schedule", True),

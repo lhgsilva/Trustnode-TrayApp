@@ -13,8 +13,26 @@ import intelligenceApi from "../api.js";
  * customer's REAL tag names (from `tags`), so nothing is process-specific.
  */
 
-const CAT_COLORS = { data: "#14b8a6", analytics: "#f59e0b", compare: "#a855f7" };
+const CAT_COLORS = { data: "#14b8a6", analytics: "#f59e0b", compare: "#a855f7", batch: "#3b82f6" };
 const catColor = (key, i) => CAT_COLORS[key] || ["#14b8a6", "#f59e0b", "#a855f7", "#3b82f6"][i % 4];
+
+// Batch-management shortcut group — injected ONLY when the batch module is
+// licensed (see `batchAvailable` prop). Kept separate from the bundled defaults
+// so it appears/disappears with the license without editing the saved palette.
+const BATCH_CATEGORY = {
+  key: "batch", label: "Batch", hint: "Batch results, KPIs, pass/fail, definitions", queries: [
+    "Did the last batch pass or fail?",
+    "Summarize the results of the last batch.",
+    "Show the last 5 batches and their durations.",
+    "Which batches are running right now?",
+    "What KPIs were computed for the last batch?",
+    "Were there any limit excursions in the last batch?",
+    "Give me the per-tag min, max and average for the last batch.",
+    "Compare {t1} across the last 3 batches.",
+    "Trend {multi} for the last batch.",
+    "What batch definitions (recipes) are configured?",
+  ],
+};
 
 // Bundled DEFAULT palette — mirrors the backend DEFAULT_PRESETS. We render this
 // INSTANTLY so the palette never sits in a "Loading" limbo (and never flickers
@@ -45,14 +63,11 @@ const BUNDLED_DEFAULTS = [
     "Assess whether the gateway is collecting reliably or has gaps.",
     "Identify the noisiest tag and explain its variability.",
   ]},
-  { key: "compare", label: "Compare · Multi-series · Batches", hint: "Overlays, correlation, period-over-period, batches", queries: [
+  { key: "compare", label: "Compare · Multi-series", hint: "Overlays, correlation, period-over-period", queries: [
     "Compare {multi} grouped by 1 minute over the last hour and show correlation",
     "Correlate {t1} and {t2} every 5 seconds over the last 30 minutes",
     "Trend {multi} in the same chart",
     "Compare {t1} this hour to the same hour yesterday",
-    "Trend {multi} for the last batch",
-    "Show the last 5 batches and their durations",
-    "Compare {t1} across the last 3 batches",
     "Trend {t1} since the process started",
     "Trend {t1} since it last crossed a high value",
     "Which of {multi} move together? Analyze the correlation over the last hour.",
@@ -73,13 +88,23 @@ function fillTemplate(q, tags) {
     .replaceAll("{t1}", t1).replaceAll("{t2}", t2).replaceAll("{t3}", t3).replaceAll("{multi}", multi);
 }
 
-export function PredefinedQueries({ onPick, tags }) {
+export function PredefinedQueries({ onPick, tags, batchAvailable = false }) {
   // Seed from cache if present, else the bundled defaults — so we ALWAYS have a
   // palette to show immediately (never a "Loading" limbo, never a flicker).
-  const [cats, setCats] = useState(_PRESET_CACHE.categories || BUNDLED_DEFAULTS);
+  const [rawCats, setCats] = useState(_PRESET_CACHE.categories || BUNDLED_DEFAULTS);
   const [isDefault, setIsDefault] = useState(_PRESET_CACHE.isDefault);
-  const [active, setActive] = useState((_PRESET_CACHE.categories || BUNDLED_DEFAULTS)[0]?.key || "data");
   const [editing, setEditing] = useState(false);
+
+  // Inject the Batch shortcut group ONLY when the batch module is licensed.
+  // Injected at render time (not persisted) so it tracks the license. Any
+  // custom palette the customer saved that already has a "batch" key wins.
+  const cats = useMemo(() => {
+    const base = Array.isArray(rawCats) ? rawCats : [];
+    if (!batchAvailable) return base.filter((c) => c.key !== "batch");
+    if (base.some((c) => c.key === "batch")) return base;
+    return [...base, BATCH_CATEGORY];
+  }, [rawCats, batchAvailable]);
+  const [active, setActive] = useState((_PRESET_CACHE.categories || BUNDLED_DEFAULTS)[0]?.key || "data");
 
   // Fetch the customer's saved palette ONCE (if not already cached). This only
   // OVERRIDES the bundled defaults when the customer has actually customized —
@@ -104,10 +129,14 @@ export function PredefinedQueries({ onPick, tags }) {
   const meta = useMemo(() => (cats || []).find((c) => c.key === active) || (cats || [])[0] || null, [cats, active]);
 
   const saveEdits = async (next) => {
-    setCats(next);
-    _PRESET_CACHE.categories = next; _PRESET_CACHE.isDefault = false;
+    // Persist WITHOUT the license-injected batch group so it stays driven by the
+    // batch license, not baked into the saved palette. If the batch module is
+    // off, `next` already has no batch group.
+    const persisted = batchAvailable ? (next || []).filter((c) => c.key !== "batch") : next;
+    setCats(persisted);
+    _PRESET_CACHE.categories = persisted; _PRESET_CACHE.isDefault = false;
     setIsDefault(false);
-    try { await intelligenceApi.savePresets(next); }
+    try { await intelligenceApi.savePresets(persisted); }
     catch { /* keep local edits; will retry on next save */ }
   };
   const resetDefaults = async () => {

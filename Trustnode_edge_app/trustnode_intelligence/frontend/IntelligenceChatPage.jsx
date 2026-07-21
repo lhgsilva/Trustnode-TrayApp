@@ -425,7 +425,7 @@ export default function IntelligenceChatPage() {
           flex: 1, overflowY: "auto", padding: "16px 24px", background: "var(--bg)",
         }}>
           {messages.length === 0 && !busy ? (
-            <PredefinedQueries onPick={(q) => send(q)} tags={liveTags} />
+            <PredefinedQueries onPick={(q) => send(q)} tags={liveTags} batchAvailable={!!status?.batch_available} />
           ) : null}
           {messages.map((m, i) => {
             const handleSave = m.role === "assistant" ? () => {
