@@ -7543,6 +7543,8 @@ function AppShell() {
                     tag: String(r.tag_name || ""),
                     ts: readingTs,
                     value: r.value,
+                    // TEXT-typed tags carry their value here (value is NULL).
+                    value_text: r.value_text ?? null,
                     quality: r.quality,
                     quality_label: r.quality_label || qualityLabelFromCode(r.quality)
                   };
@@ -7894,6 +7896,8 @@ function AppShell() {
                 database_name: dbName,
                 tag: rawTag,
                 value: row?.value,
+                // TEXT-typed tags carry their value here (value is NULL).
+                value_text: row?.value_text ?? null,
                 quality,
                 quality_label: qualityLabel
               });
@@ -12917,7 +12921,12 @@ const getGatewayHealth = (gateway) => {
           gateway_id: gw.id,
           gateway_name: gw.name || gw.id,
           period_ms: Number(gw.interval_ms || 0),
-          last_value: latest?.value ?? live?.value ?? "-",
+          // TEXT-typed tags (PLC STRING) store value=NULL and carry the string
+          // in value_text — show that instead of "-". Numeric tags keep their
+          // existing behaviour exactly.
+          last_value: (latest?.value_text != null && String(latest.value_text) !== "")
+            ? String(latest.value_text)
+            : (latest?.value ?? live?.value_text ?? live?.value ?? "-"),
           last_ts: latest?.ts ? fmtTs(latest.ts) : live?.ts ? fmtTs(live.ts) : "-"
         });
       }
@@ -12942,7 +12951,12 @@ const getGatewayHealth = (gateway) => {
           gateway_id: gw.id,
           gateway_name: gw.name || gw.id,
           period_ms: Number(gw.interval_ms || 1000),
-          last_value: latest?.value ?? live?.value ?? "-",
+          // TEXT-typed tags (PLC STRING) store value=NULL and carry the string
+          // in value_text — show that instead of "-". Numeric tags keep their
+          // existing behaviour exactly.
+          last_value: (latest?.value_text != null && String(latest.value_text) !== "")
+            ? String(latest.value_text)
+            : (latest?.value ?? live?.value_text ?? live?.value ?? "-"),
           last_ts: latest?.ts ? fmtTs(latest.ts) : live?.ts ? fmtTs(live.ts) : "-"
         });
       }

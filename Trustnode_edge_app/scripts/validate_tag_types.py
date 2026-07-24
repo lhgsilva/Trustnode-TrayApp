@@ -265,6 +265,28 @@ def validate_frontend() -> None:
         ck("[R7] CSV export includes value_text",
            "value_text" in a and "csv_header" in a)
 
+    # R11 — a text tag must never render as a number (or "-") anywhere the
+    # operator looks. These are the exact spots that showed "0.000" / "-".
+    dd = os.path.join(REPO, "frontend", "src", "components", "Dashboard", "DashboardDesigner.jsx")
+    if os.path.exists(dd):
+        d = open(dd, encoding="utf-8").read()
+        m = re.search(r"function formatHeaderValue\(value, decimals = 3\)\s*\{(.*?)\n\}", d, re.S)
+        ck("[R11] formatHeaderValue returns '-' for null (not 0.000)",
+           bool(m) and "value === null" in m.group(1),
+           "Number(null) === 0 passes isFinite -> a text tag rendered as 0.000")
+        ck("[R11] widget header prefers last_value_text",
+           d.count("last_value_text != null") >= 2,
+           "primary series AND extra series must both prefer text")
+    if os.path.exists(app):
+        a = open(app, encoding="utf-8").read()
+        ck("[R11] tag table renders value_text when numeric is NULL",
+           "latest?.value_text != null" in a,
+           'previously `latest?.value ?? live?.value ?? "-"` showed "-" for text tags')
+        ck("[R11] live tag value map carries value_text",
+           a.count("value_text: r.value_text ?? null") >= 1
+           and a.count("value_text: row?.value_text ?? null") >= 1,
+           "both live-reading builders must carry text")
+
 
 # ------------------------------------------------------------------- 6. PLC
 def validate_live_plc(ip: str) -> None:

@@ -317,6 +317,11 @@ function clamp(n, min, max) {
 }
 
 function formatHeaderValue(value, decimals = 3) {
+  // null/undefined/"" are ABSENT, not zero. Number(null) === 0 and passes
+  // isFinite, so without this guard a text tag (stored value=NULL) rendered as
+  // "0.000" in the widget header — an absent value must never look like a
+  // real reading.
+  if (value === null || value === undefined || value === "") return "-";
   const n = Number(value);
   if (!Number.isFinite(n)) return "-";
   const d = Number.isFinite(Number(decimals))
@@ -1128,7 +1133,12 @@ export function DashboardDesigner({
     const tagName = String(cfg.tag_name || "");
     const latest = getLatestTagRow(dashboardRows, gatewayId, tagName);
     const headerDecimals = cfg.value_decimals;
-    const latestValue = formatHeaderValue(latest?.last_value, headerDecimals);
+    // TEXT-typed tags (PLC STRING) store value=NULL + the string in
+    // value_text. Show the text — it IS the tag's value — instead of the
+    // numeric formatter's placeholder. Numeric tags are unaffected.
+    const latestValue = latest?.last_value_text != null && String(latest.last_value_text) !== ""
+      ? String(latest.last_value_text)
+      : formatHeaderValue(latest?.last_value, headerDecimals);
     const plcTag = formatTagForDisplay ? formatTagForDisplay(tagName) : tagName || "-";
     const lastTsMs = toTsMs(latest?.last_ts || "");
     const liveLatencyMs = Number.isFinite(lastTsMs) ? Math.max(0, Date.now() - lastTsMs) : null;
@@ -1174,7 +1184,10 @@ export function DashboardDesigner({
       if (!sTag) continue;
       const sGw = String(s?.gateway_id || gatewayId || "").trim();
       const sLatest = getLatestTagRow(dashboardRows, sGw, sTag);
-      const sValue = formatHeaderValue(sLatest?.last_value);
+      // Same text-first rule as the primary series (see above).
+      const sValue = sLatest?.last_value_text != null && String(sLatest.last_value_text) !== ""
+        ? String(sLatest.last_value_text)
+        : formatHeaderValue(sLatest?.last_value);
       const sLabel = String(s?.label || "").trim() || (formatTagForDisplay ? formatTagForDisplay(sTag) : sTag);
       seriesItems.push({
         value: decorateValue(sValue, s?.unit, s?.suffix),
