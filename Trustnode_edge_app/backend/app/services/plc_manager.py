@@ -1732,6 +1732,7 @@ class GatewayWorker:
                           ts_utc TEXT NOT NULL,
                           tag_name TEXT NOT NULL,
                           value REAL NULL,
+                          value_text TEXT NULL,
                           quality INTEGER NULL,
                           quality_label TEXT NULL,
                           source TEXT NULL,
@@ -1794,6 +1795,7 @@ class GatewayWorker:
                     "ts_utc": r.ts_utc,
                     "tag_name": r.tag_name,
                     "value": r.value,
+                    "value_text": r.value_text,
                     "quality": r.quality,
                     "quality_label": r.quality_label,
                     "source": r.source,
@@ -1809,8 +1811,8 @@ class GatewayWorker:
                 text(
                     """
                     INSERT INTO outbox_readings
-                    (gateway_id, ts_utc, tag_name, value, quality, quality_label, source, site, area, equipment, raw_payload, sink_id)
-                    VALUES (:gateway_id, :ts_utc, :tag_name, :value, :quality, :quality_label, :source, :site, :area, :equipment, :raw_payload, :sink_id)
+                    (gateway_id, ts_utc, tag_name, value, value_text, quality, quality_label, source, site, area, equipment, raw_payload, sink_id)
+                    VALUES (:gateway_id, :ts_utc, :tag_name, :value, :value_text, :quality, :quality_label, :source, :site, :area, :equipment, :raw_payload, :sink_id)
                     """
                 ),
                 rows,
@@ -2329,6 +2331,7 @@ class GatewayWorker:
                           ts_utc TEXT NOT NULL DEFAULT (datetime('now')),
                           tag_name TEXT NOT NULL,
                           value REAL NULL,
+                          value_text TEXT NULL,
                           quality INTEGER NULL,
                           source TEXT NULL,
                           site TEXT NULL,
@@ -2340,12 +2343,20 @@ class GatewayWorker:
                         """
                     )
                 )
+                # Back-fill value_text on tables provisioned before STRING tags
+                # were supported (CREATE TABLE IF NOT EXISTS won't add a column).
+                try:
+                    _cols = [r[1] for r in conn.execute(text(f'PRAGMA table_info("{table}")')).fetchall()]
+                    if "value_text" not in _cols:
+                        conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN value_text TEXT NULL'))
+                except Exception:
+                    pass
                 conn.execute(
                     text(
                         f"""
                         INSERT INTO "{table}"
-                        (ts_utc, tag_name, value, quality, source, site, area, equipment, raw_payload)
-                        VALUES (:ts_utc, :tag_name, :value, :quality, :source, :site, :area, :equipment, :raw_payload)
+                        (ts_utc, tag_name, value, value_text, quality, source, site, area, equipment, raw_payload)
+                        VALUES (:ts_utc, :tag_name, :value, :value_text, :quality, :source, :site, :area, :equipment, :raw_payload)
                         """
                     ),
                     [
@@ -2353,6 +2364,7 @@ class GatewayWorker:
                             "ts_utc": r.ts_utc,
                             "tag_name": r.tag_name,
                             "value": r.value,
+                            "value_text": r.value_text,
                             "quality": r.quality,
                             "source": r.source,
                             "site": r.site,
@@ -2798,6 +2810,7 @@ class GatewayWorker:
                                   ts_utc TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                                   tag_name TEXT NOT NULL,
                                   value DOUBLE PRECISION NULL,
+                                  value_text TEXT NULL,
                                   quality INTEGER NULL,
                                   quality_label TEXT NULL,
                                   source TEXT NULL,
@@ -2819,6 +2832,10 @@ class GatewayWorker:
                         )
                         # Keep compatibility with already-provisioned tables that were
                         # created before cloud mirror columns existed.
+                        # value_text carries STRING-typed tag values (PLC STRING,
+                        # OPC-UA String). Without it a status string would only
+                        # survive inside raw_payload JSON — not queryable.
+                        conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS value_text TEXT'))
                         conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS quality_label TEXT'))
                         conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS gateway_id TEXT'))
                         conn.execute(text(f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS gateway_name TEXT'))
@@ -2842,6 +2859,7 @@ class GatewayWorker:
                                   plc_ip TEXT NULL,
                                   database_name TEXT NULL,
                                   value DOUBLE PRECISION NULL,
+                                  value_text TEXT NULL,
                                   quality INTEGER NULL,
                                   quality_label TEXT NULL,
                                   updated_utc TIMESTAMPTZ NULL,
@@ -2850,6 +2868,7 @@ class GatewayWorker:
                                 """
                             )
                         )
+                        conn.execute(text(f'ALTER TABLE "{schema}"."live_latest" ADD COLUMN IF NOT EXISTS value_text TEXT'))
                         conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_tenant_ts" ON "{schema}"."live_latest"(tenant_id, ts_utc DESC)'))
                         conn.execute(text(f'CREATE INDEX IF NOT EXISTS "ix_live_latest_ts" ON "{schema}"."live_latest"(ts_utc DESC)'))
                         self._db_schema_ready_key = key
@@ -2861,6 +2880,7 @@ class GatewayWorker:
                         "ts_utc": r.ts_utc,
                         "tag_name": r.tag_name,
                         "value": r.value,
+                        "value_text": r.value_text,
                         "quality": r.quality,
                         "quality_label": r.quality_label,
                         "source": r.source,
@@ -2903,6 +2923,7 @@ class GatewayWorker:
                         "plc_ip": str(r.get("plc_ip") or self.config.plc_ip),
                         "database_name": str(r.get("database_name") or db_name),
                         "value": r.get("value"),
+                        "value_text": r.get("value_text"),
                         "quality": r.get("quality"),
                         "quality_label": str(r.get("quality_label") or ""),
                         "updated_utc": now_utc,
@@ -2914,8 +2935,8 @@ class GatewayWorker:
                         text(
                             f"""
                             INSERT INTO "{schema}"."{table}"
-                            (ts_utc, tag_name, value, quality, quality_label, source, gateway_id, gateway_name, device_name, plc_ip, database_name, site, area, equipment, tenant_id, created_utc, raw_payload)
-                            VALUES (CAST(:ts_utc AS timestamptz), :tag_name, :value, :quality, :quality_label, :source, :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :site, :area, :equipment, :tenant_id, CAST(:created_utc AS timestamptz), CAST(:raw_payload AS jsonb))
+                            (ts_utc, tag_name, value, value_text, quality, quality_label, source, gateway_id, gateway_name, device_name, plc_ip, database_name, site, area, equipment, tenant_id, created_utc, raw_payload)
+                            VALUES (CAST(:ts_utc AS timestamptz), :tag_name, :value, :value_text, :quality, :quality_label, :source, :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :site, :area, :equipment, :tenant_id, CAST(:created_utc AS timestamptz), CAST(:raw_payload AS jsonb))
                             """
                         ),
                         rows,
@@ -2925,9 +2946,9 @@ class GatewayWorker:
                             text(
                                 f"""
                                 INSERT INTO "{schema}"."live_latest"
-                                (tenant_id, gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, quality, quality_label, updated_utc)
+                                (tenant_id, gateway_id, tag_name, ts_utc, source, gateway_name, device_name, plc_ip, database_name, value, value_text, quality, quality_label, updated_utc)
                                 VALUES
-                                (:tenant_id, :gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
+                                (:tenant_id, :gateway_id, :tag_name, CAST(:ts_utc AS timestamptz), :source, :gateway_name, :device_name, :plc_ip, :database_name, :value, :value_text, :quality, :quality_label, CAST(:updated_utc AS timestamptz))
                                 ON CONFLICT(tenant_id, gateway_id, tag_name) DO UPDATE SET
                                   ts_utc = excluded.ts_utc,
                                   source = excluded.source,
@@ -2936,6 +2957,7 @@ class GatewayWorker:
                                   plc_ip = excluded.plc_ip,
                                   database_name = excluded.database_name,
                                   value = excluded.value,
+                                  value_text = excluded.value_text,
                                   quality = excluded.quality,
                                   quality_label = excluded.quality_label,
                                   updated_utc = excluded.updated_utc
@@ -2978,6 +3000,7 @@ class GatewayWorker:
                               ts_utc TEXT NOT NULL DEFAULT (datetime('now')),
                               tag_name TEXT NOT NULL,
                               value REAL NULL,
+                              value_text TEXT NULL,
                               quality INTEGER NULL,
                               source TEXT NULL,
                               site TEXT NULL,
@@ -2995,6 +3018,7 @@ class GatewayWorker:
                     "ts_utc": r.ts_utc,
                     "tag_name": r.tag_name,
                     "value": r.value,
+                    "value_text": r.value_text,
                     "quality": r.quality,
                     "source": r.source,
                     "site": r.site,
@@ -3005,12 +3029,20 @@ class GatewayWorker:
                 for r in readings
             ]
             with self._db_engine.begin() as conn:
+                # Back-fill value_text on tables provisioned before STRING tags
+                # were supported (CREATE TABLE IF NOT EXISTS won't add a column).
+                try:
+                    _cols = [r[1] for r in conn.execute(text(f'PRAGMA table_info("{table}")')).fetchall()]
+                    if "value_text" not in _cols:
+                        conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN value_text TEXT NULL'))
+                except Exception:
+                    pass
                 conn.execute(
                     text(
                         f"""
                         INSERT INTO "{table}"
-                        (ts_utc, tag_name, value, quality, source, site, area, equipment, raw_payload)
-                        VALUES (:ts_utc, :tag_name, :value, :quality, :source, :site, :area, :equipment, :raw_payload)
+                        (ts_utc, tag_name, value, value_text, quality, source, site, area, equipment, raw_payload)
+                        VALUES (:ts_utc, :tag_name, :value, :value_text, :quality, :source, :site, :area, :equipment, :raw_payload)
                         """
                     ),
                     rows,

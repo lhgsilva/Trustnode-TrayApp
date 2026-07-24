@@ -13125,6 +13125,18 @@ const getGatewayHealth = (gateway) => {
       const last = points.length ? points[points.length - 1] : null;
       const prev = points.length > 1 ? points[points.length - 2] : null;
       const delta = last && prev ? Number(last.value) - Number(prev.value) : 0;
+      // STRING-typed tags carry their value in value_text and have a NULL
+      // numeric `value`, so they never appear in `points` (numeric-only).
+      // Recover the newest raw text so the monitor shows 'BATCH READY'
+      // instead of "-" / NaN.
+      const lastRawTextRow = (() => {
+        for (let i = filteredRows.length - 1; i >= 0; i -= 1) {
+          const t = filteredRows[i]?.value_text;
+          if (t != null && String(t) !== "") return filteredRows[i];
+        }
+        return null;
+      })();
+      const lastTextValue = lastRawTextRow ? String(lastRawTextRow.value_text) : null;
       const visualLast = series.length ? series[series.length - 1] : null;
       const freshness = computeFreshness(last?.ts_ms || null, renderNowMs);
       const monitorRow = {
@@ -13134,8 +13146,13 @@ const getGatewayHealth = (gateway) => {
         gateway_id: w.gateway_id,
         gateway_name: gateway?.name || w.gateway_id || "-",
         period_ms: Number(gateway?.interval_ms || 0),
-        last_value: visualLast ? Number(visualLast.value).toFixed(3) : "-",
-        last_ts: last?.ts || "-"
+        // Text-first for STRING tags, numeric otherwise.
+        last_value: lastTextValue != null
+          ? lastTextValue
+          : (visualLast && Number.isFinite(Number(visualLast.value))
+              ? Number(visualLast.value).toFixed(3)
+              : "-"),
+        last_ts: last?.ts || (lastRawTextRow ? String(lastRawTextRow.ts || lastRawTextRow.ts_utc || "-") : "-")
       };
       return {
         ...w,
@@ -13143,8 +13160,10 @@ const getGatewayHealth = (gateway) => {
         title: w.title || formatTagForDisplay(w.tag_name),
         gateway_name: gateway?.name || "-",
         device_name: device?.name || "-",
-        last_value: visualLast ? Number(visualLast.value) : null,
-        last_ts: last?.ts || "-",
+        last_value: visualLast && Number.isFinite(Number(visualLast.value)) ? Number(visualLast.value) : null,
+        // STRING tags: expose the text so tiles/KPIs can render it.
+        last_value_text: lastTextValue,
+        last_ts: last?.ts || (lastRawTextRow ? String(lastRawTextRow.ts || lastRawTextRow.ts_utc || "-") : "-"),
         delta,
         series,
         yDomain,
