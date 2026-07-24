@@ -3854,6 +3854,14 @@ class PLCManager:
                     _trace(f"2.shutdown.{label}.shutdown_ok")
                 except Exception as exc:
                     _trace(f"2.shutdown.{label}.shutdown_exc={type(exc).__name__}:{exc}")
+                # close() releases the fd + the CIP connection. shutdown() alone
+                # unblocks a pending recv but leaves the connection allocated on
+                # the PLC — leaking one connection slot per restart until the
+                # controller's CIP limit is hit and open() starts hanging.
+                try:
+                    raw.close()
+                except Exception:
+                    pass
             except Exception as exc:
                 _trace(f"2.shutdown.{label}.outer_exc={type(exc).__name__}:{exc}")
         _shutdown_socket("ab_pycomm3", w._ab_pycomm3_client)
