@@ -139,6 +139,8 @@ class GatewayWorker:
         # without this they each open a connection and fetch the tag database
         # twice.
         self._ab_connect_lock = threading.Lock()
+        # One-shot flag so we log boot->first-row latency exactly once.
+        self._first_row_logged = False
         self._ab_pylogix_client = None
         self._ab_pylogix_ip: str | None = None
         self._ab_pylogix_slot: int | None = None
@@ -487,7 +489,16 @@ class GatewayWorker:
                         now_mono = time.monotonic()
                         if now_mono - self._telemetry_runtime_refresh_monotonic >= 10.0:
                             try:
-                                bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+                                # get_bootstrap does a full DB read + JSON decode
+                                # and acquires app_store._lock, which a cloud-sync
+                                # thread can hold for seconds. Running it INLINE on
+                                # the event loop stalled the loop long enough to
+                                # trip the wedge-watchdog's "event loop stale" kill
+                                # (observed 26 s stalls -> whole process respawned
+                                # -> "running but no data"). Offload to a thread.
+                                bootstrap = await asyncio.to_thread(
+                                    lambda: app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+                                )
                                 telemetry_service.configure_from_bootstrap(bootstrap)
                             except Exception:
                                 pass
@@ -503,6 +514,18 @@ class GatewayWorker:
                         )
                         persisted_local = bool(ok)
                         persisted_edge_record_id = edge_record_id
+                        # Metric: time from start() to the FIRST durable row. This
+                        # is the true "boot to data" latency — status shows
+                        # running well before this, so it's the number that
+                        # matters for the "running but no data" complaint.
+                        if ok and not self._first_row_logged:
+                            self._first_row_logged = True
+                            boot0 = self._startup_started_monotonic or 0.0
+                            if boot0 > 0:
+                                _GW_LOG.info(
+                                    "first-row gateway=%s boot_to_first_row=%.2fs",
+                                    self.gateway_id, time.monotonic() - boot0,
+                                )
                         if not ok:
                             collection_allowed = False
                             self.collection_blocked = True
@@ -3818,44 +3841,54 @@ class PLCManager:
             db_path = getattr(_store, "_db_path", None)
             if not db_path:
                 return
-            import sqlite3 as _sqlite3
-            import json as _json
-            gw_rows: list = []
-            db_rows: list = []
-            seen_gw_ids: set = set()
-            seen_db_ids: set = set()
-            con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
-            try:
-                for (payload,) in con.execute(
-                    "SELECT payload_json FROM config_documents_scoped WHERE domain='gateway_configurations'"
-                ):
-                    try:
-                        data = _json.loads(payload) if isinstance(payload, str) else payload
-                    except Exception:
-                        continue
-                    items = data if isinstance(data, list) else (data.get('gateways') or data.get('items') or [])
-                    for g in items:
-                        if not isinstance(g, dict): continue
-                        gid = str(g.get('id') or '').strip()
-                        if not gid or gid in seen_gw_ids: continue
-                        seen_gw_ids.add(gid)
-                        gw_rows.append(g)
-                for (payload,) in con.execute(
-                    "SELECT payload_json FROM config_documents_scoped WHERE domain='database_configurations'"
-                ):
-                    try:
-                        data = _json.loads(payload) if isinstance(payload, str) else payload
-                    except Exception:
-                        continue
-                    items = data if isinstance(data, list) else (data.get('databases') or data.get('items') or [])
-                    for d in items:
-                        if not isinstance(d, dict): continue
-                        did = str(d.get('id') or '').strip()
-                        if not did or did in seen_db_ids: continue
-                        seen_db_ids.add(did)
-                        db_rows.append(d)
-            finally:
-                con.close()
+
+            # This scan runs every _watchdog_interval_s on the EVENT LOOP. The
+            # SQLite connect + queries + JSON parse below (timeout 3s) blocked
+            # the loop each tick, adding jitter to collection cadence and, on a
+            # locked DB, contributing to the "event loop stale" kills. Offload
+            # the whole read to a thread; the policy logic after stays on-loop.
+            def _read_config_rows():
+                import sqlite3 as _sqlite3
+                import json as _json
+                _gw: list = []
+                _db: list = []
+                _seen_gw: set = set()
+                _seen_db: set = set()
+                con = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=3.0)
+                try:
+                    for (payload,) in con.execute(
+                        "SELECT payload_json FROM config_documents_scoped WHERE domain='gateway_configurations'"
+                    ):
+                        try:
+                            data = _json.loads(payload) if isinstance(payload, str) else payload
+                        except Exception:
+                            continue
+                        items = data if isinstance(data, list) else (data.get('gateways') or data.get('items') or [])
+                        for g in items:
+                            if not isinstance(g, dict): continue
+                            gid = str(g.get('id') or '').strip()
+                            if not gid or gid in _seen_gw: continue
+                            _seen_gw.add(gid)
+                            _gw.append(g)
+                    for (payload,) in con.execute(
+                        "SELECT payload_json FROM config_documents_scoped WHERE domain='database_configurations'"
+                    ):
+                        try:
+                            data = _json.loads(payload) if isinstance(payload, str) else payload
+                        except Exception:
+                            continue
+                        items = data if isinstance(data, list) else (data.get('databases') or data.get('items') or [])
+                        for d in items:
+                            if not isinstance(d, dict): continue
+                            did = str(d.get('id') or '').strip()
+                            if not did or did in _seen_db: continue
+                            _seen_db.add(did)
+                            _db.append(d)
+                finally:
+                    con.close()
+                return _gw, _db
+
+            gw_rows, db_rows = await asyncio.to_thread(_read_config_rows)
         except Exception:
             return
 

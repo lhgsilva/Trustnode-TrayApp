@@ -2574,7 +2574,13 @@ function DashboardWidgetCardImpl({
     const m = Number.isFinite(mul) && mul !== 0 ? mul : 1;
     const o = Number.isFinite(off) ? off : 0;
     if (m === 1 && o === 0) return latestRaw;
-    const v = Number(latestRaw?.last_value);
+    // A TEXT tag has last_value === null. Number(null) === 0 passes isFinite,
+    // so scaling it would overwrite null with 0*m+o and hide the text (the KPI
+    // then showed "0.000"). Only scale a genuine finite numeric; leave null
+    // (and its value_text) untouched.
+    const raw = latestRaw?.last_value;
+    if (raw === null || raw === undefined || raw === "") return latestRaw;
+    const v = Number(raw);
     if (!Number.isFinite(v)) return latestRaw;
     return { ...latestRaw, last_value: v * m + o };
   }, [latestRaw, cfg?.multiplier, cfg?.offset]);
