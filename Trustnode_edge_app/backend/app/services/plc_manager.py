@@ -641,8 +641,19 @@ class GatewayWorker:
                 )
                 if collection_allowed:
                     # DB sink writes can be blocking (sqlite/file/remote enqueue).
-                    # Execute off-loop to avoid delaying other gateways/API calls.
-                    await self._run_collection_io(self._persist_readings, readings)
+                    # Execute off-loop AND bound it — a hung sink (locked DB, dead
+                    # remote) must not stall the cycle. On timeout we log and move
+                    # on; the historian buffer + outbox already retry the data.
+                    try:
+                        await asyncio.wait_for(
+                            self._run_collection_io(self._persist_readings, readings),
+                            timeout=max(5.0, self._read_timeout_s),
+                        )
+                    except asyncio.TimeoutError:
+                        _GW_LOG.warning(
+                            "persist-timeout gateway=%s — sink slow, cycle continues",
+                            self.gateway_id,
+                        )
             except Exception as exc:
                 err_text = str(exc)
                 # Suppress transient handshake errors during the post-start
