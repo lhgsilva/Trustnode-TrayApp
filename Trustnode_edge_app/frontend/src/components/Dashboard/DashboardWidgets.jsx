@@ -1446,17 +1446,35 @@ function LiveTagChart({
   // actually show on the chart (previously the live path used a bare number
   // formatter and dropped them). Config keys mirror the axis label keys.
   const AXIS_UNIT_KEYS = {
-    left1:  { unit: "primary_unit",       suffix: "primary_suffix" },
-    right1: { unit: "y_axis_right_unit",  suffix: "y_axis_right_suffix" },
-    left2:  { unit: "y_left2_unit",       suffix: "y_left2_suffix" },
-    right2: { unit: "y_right2_unit",      suffix: "y_right2_suffix" },
+    left1:  { unit: "primary_unit",       suffix: "primary_suffix",       prefix: "y_axis_prefix",        decimals: "y_axis_decimals",        format: "y_axis_format" },
+    right1: { unit: "y_axis_right_unit",  suffix: "y_axis_right_suffix",  prefix: "y_axis_right_prefix",  decimals: "y_axis_right_decimals",  format: "y_axis_right_format" },
+    left2:  { unit: "y_left2_unit",       suffix: "y_left2_suffix",       prefix: "y_left2_prefix",       decimals: "y_left2_decimals",       format: "y_left2_format" },
+    right2: { unit: "y_right2_unit",      suffix: "y_right2_suffix",      prefix: "y_right2_prefix",      decimals: "y_right2_decimals",      format: "y_right2_format" },
   };
   const axisTickFmt = (axisId) => {
     const k = AXIS_UNIT_KEYS[axisId] || {};
     const unit = String(cfg[k.unit] || "").trim();
     const suffix = String(cfg[k.suffix] || "").trim();
-    if (!unit && !suffix) return formatNumber;
-    return (v) => `${formatNumber(v)}${unit ? ` ${unit}` : ""}${suffix ? ` ${suffix}` : ""}`;
+    const prefix = String(cfg[k.prefix] || "").trim();
+    const decRaw = cfg[k.decimals];
+    const dec = decRaw === "" || decRaw == null ? null : Math.max(0, Math.min(6, Number(decRaw)));
+    // Per-axis data format falls back to the widget-level Value Format.
+    const fmt = String(cfg[k.format] || "").trim() || String(chartValueFormat || "auto");
+    const noOverrides = !unit && !suffix && !prefix && dec == null && !String(cfg[k.format] || "").trim();
+    if (noOverrides) return formatNumber;
+    const fmtNum = (v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return "—";
+      if (dec != null) return n.toFixed(dec);
+      switch (fmt) {
+        case "int": return n.toFixed(0);
+        case "2dp": return n.toFixed(2);
+        case "3dp": return n.toFixed(3);
+        case "scientific": return n.toExponential(2);
+        default: return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
+      }
+    };
+    return (v) => `${prefix ? `${prefix}` : ""}${fmtNum(v)}${unit ? ` ${unit}` : ""}${suffix ? ` ${suffix}` : ""}`;
   };
 
   // Axis labels (rotated 90° inside the chart) — same as the heavy
@@ -1472,7 +1490,13 @@ function LiveTagChart({
   // Style knobs the editor exposes — legend, point labels, line width,
   // line dot. Per-series overrides on extras win at render time; the
   // widget-level values are used as defaults.
-  const showLegend = cfg.chart_show_legend === true || seriesDefs.length > 1;
+  // Legend visibility. An EXPLICIT setting always wins (previously the legend
+  // was forced on for any multi-series chart, so unchecking "Show legend" did
+  // nothing). Only when the flag was never set do we keep the historical
+  // default of showing it for multi-series charts.
+  const showLegend = (cfg.chart_show_legend === true || cfg.chart_show_legend === false)
+    ? cfg.chart_show_legend === true
+    : seriesDefs.length > 1;
   const showPointLabels = cfg.chart_show_point_labels === true;
   const widgetLineWidth = (() => {
     const n = Number(cfg.chart_line_width);
@@ -3076,18 +3100,24 @@ function DashboardWidgetCardImpl({
   // Per-axis unit + suffix appended to each Y-axis tick (heavy path), so
   // configured units/suffixes show on all four axes — not just the value label.
   const HEAVY_AXIS_UNIT_KEYS = {
-    left1:  { unit: "primary_unit",       suffix: "primary_suffix" },
-    right1: { unit: "y_axis_right_unit",  suffix: "y_axis_right_suffix" },
-    left2:  { unit: "y_left2_unit",       suffix: "y_left2_suffix" },
-    right2: { unit: "y_right2_unit",      suffix: "y_right2_suffix" },
+    left1:  { unit: "primary_unit",       suffix: "primary_suffix",       prefix: "y_axis_prefix",        decimals: "y_axis_decimals",        format: "y_axis_format" },
+    right1: { unit: "y_axis_right_unit",  suffix: "y_axis_right_suffix",  prefix: "y_axis_right_prefix",  decimals: "y_axis_right_decimals",  format: "y_axis_right_format" },
+    left2:  { unit: "y_left2_unit",       suffix: "y_left2_suffix",       prefix: "y_left2_prefix",       decimals: "y_left2_decimals",       format: "y_left2_format" },
+    right2: { unit: "y_right2_unit",      suffix: "y_right2_suffix",      prefix: "y_right2_prefix",      decimals: "y_right2_decimals",      format: "y_right2_format" },
   };
   const heavyAxisTickFmt = (axisId) => {
     const k = HEAVY_AXIS_UNIT_KEYS[axisId] || {};
     const unit = String(cfg?.[k.unit] || "").trim();
     const suffix = String(cfg?.[k.suffix] || "").trim();
+    const prefix = String(cfg?.[k.prefix] || "").trim();
+    const decRaw = cfg?.[k.decimals];
+    const dec = decRaw === "" || decRaw == null ? null : Math.max(0, Math.min(6, Number(decRaw)));
+    // Per-axis data format falls back to the widget-level Value Format.
+    const fmt = String(cfg?.[k.format] || "").trim() || chartValueFormat;
     return (v) => {
-      const base = formatByPreset(v, chartValueFormat);
-      return `${base}${unit ? ` ${unit}` : ""}${suffix ? ` ${suffix}` : ""}`;
+      const n = Number(v);
+      const base = dec != null && Number.isFinite(n) ? n.toFixed(dec) : formatByPreset(v, fmt);
+      return `${prefix ? `${prefix}` : ""}${base}${unit ? ` ${unit}` : ""}${suffix ? ` ${suffix}` : ""}`;
     };
   };
   const normAxis2 = (a) => {

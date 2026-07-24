@@ -24,6 +24,131 @@ function normSeriesAxis4(a) {
   return "left1";
 }
 
+// ---------------------------------------------------------------------------
+// Axis configuration — ONE place to configure each Y axis.
+// Every axis's settings live under the config keys below (kept EXACTLY as they
+// were so existing widgets keep working); the modal just presents them per axis
+// instead of as a flat wall of fields, and only shows axes actually in use.
+// ---------------------------------------------------------------------------
+const AXIS_DEFS = [
+  { id: "left1",  label: "Left 1",  side: "left",
+    keys: { label: "y_axis_label",       unit: "primary_unit",      prefix: "y_axis_prefix",
+            suffix: "primary_suffix",    decimals: "y_axis_decimals", format: "y_axis_format",
+            mode: "y_axis_mode",         min: "y_min",              max: "y_max", step: "y_tick_step" } },
+  { id: "left2",  label: "Left 2",  side: "left",
+    keys: { label: "y_left2_label",      unit: "y_left2_unit",      prefix: "y_left2_prefix",
+            suffix: "y_left2_suffix",    decimals: "y_left2_decimals", format: "y_left2_format",
+            mode: "y_left2_axis_mode",   min: "y_left2_min",        max: "y_left2_max", step: "y_left2_tick_step" } },
+  { id: "right1", label: "Right 1", side: "right",
+    keys: { label: "y_axis_right_label", unit: "y_axis_right_unit", prefix: "y_axis_right_prefix",
+            suffix: "y_axis_right_suffix", decimals: "y_axis_right_decimals", format: "y_axis_right_format",
+            mode: "y_right_axis_mode",   min: "y_right_min",        max: "y_right_max", step: "y_right_tick_step" } },
+  { id: "right2", label: "Right 2", side: "right",
+    keys: { label: "y_right2_label",     unit: "y_right2_unit",     prefix: "y_right2_prefix",
+            suffix: "y_right2_suffix",   decimals: "y_right2_decimals", format: "y_right2_format",
+            mode: "y_right2_axis_mode",  min: "y_right2_min",       max: "y_right2_max", step: "y_right2_tick_step" } },
+];
+
+// Which axes a chart actually uses: left1 is always present (the primary
+// series); the rest appear only when a series is assigned to them.
+function axesInUseFromConfig(cfg) {
+  const used = new Set(["left1"]);
+  const extras = Array.isArray(cfg?.series_extra) ? cfg.series_extra : [];
+  for (const s of extras) {
+    if (String(s?.chart_type || "").toLowerCase() === "limit") continue;
+    used.add(normSeriesAxis4(s?.axis));
+  }
+  return used;
+}
+
+// One modal to configure every Y axis in use: label, prefix/unit/suffix,
+// decimals, value format, and the scale (auto or manual min/max/tick).
+function AxisConfigModal({ config, onChange, onClose, widgetValueFormat }) {
+  const used = axesInUseFromConfig(config);
+  const shown = AXIS_DEFS.filter((a) => used.has(a.id));
+  const set = (key, value) => onChange({ [key]: value });
+  const txt = (k, ph, title) => (
+    <label className="dashboard-query-field" title={title || ""}>
+      <span>{ph.label}</span>
+      <input value={config?.[k] ?? ""} placeholder={ph.placeholder || "optional"}
+        onChange={(e) => set(k, e.target.value)} />
+    </label>
+  );
+  const num = (k, label, placeholder, extra = {}) => (
+    <label className="dashboard-query-field">
+      <span>{label}</span>
+      <input type="number" step="any" value={config?.[k] ?? ""} placeholder={placeholder || ""}
+        onChange={(e) => set(k, e.target.value === "" ? "" : Number(e.target.value))} {...extra} />
+    </label>
+  );
+  return (
+    <div className="modal-backdrop" style={{ zIndex: 70 }} onClick={onClose}>
+      <div className="modal-card dashboard-query-modal dashboard-query-modal-wide"
+        style={{ width: "min(1000px, 96vw)", maxHeight: "92vh", overflowY: "auto" }}
+        onClick={(e) => e.stopPropagation()}>
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+          <h3 style={{ margin: 0 }}>Axis configuration</h3>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={onClose}>✕</button>
+        </div>
+        <p className="dashboard-query-hint" style={{ marginTop: 0 }}>
+          Only axes used by a series are shown. Assign a series to Left 2 / Right 1 / Right 2 in
+          Series &amp; Axes to configure it here.
+        </p>
+        {shown.map((ax) => {
+          const k = ax.keys;
+          const manual = String(config?.[k.mode] || "auto").toLowerCase() === "manual";
+          return (
+            <fieldset key={ax.id} className="dashboard-query-fieldset" style={{ marginBottom: 10 }}>
+              <legend>{ax.label} <span style={{ opacity: 0.6, fontWeight: 400 }}>({ax.side})</span></legend>
+              {/* Row 1 — identity + formatting */}
+              <div className="dashboard-query-grid">
+                {txt(k.label,  { label: "Axis label", placeholder: "e.g. Temperature" })}
+                {txt(k.prefix, { label: "Prefix", placeholder: "e.g. $" })}
+                {txt(k.unit,   { label: "Unit", placeholder: "e.g. °C" })}
+                {txt(k.suffix, { label: "Suffix", placeholder: "optional" })}
+                {num(k.decimals, "Decimals", "auto", { min: 0, max: 6, step: 1 })}
+                <label className="dashboard-query-field">
+                  <span>Data format</span>
+                  <select value={String(config?.[k.format] || "")}
+                    onChange={(e) => set(k.format, e.target.value)}>
+                    <option value="">(widget: {String(widgetValueFormat || "auto")})</option>
+                    <option value="auto">Auto</option>
+                    <option value="int">Integer</option>
+                    <option value="2dp">2 decimals</option>
+                    <option value="3dp">3 decimals</option>
+                    <option value="scientific">Scientific</option>
+                  </select>
+                </label>
+              </div>
+              {/* Row 2 — scale */}
+              <div className="dashboard-query-grid" style={{ marginTop: 6 }}>
+                <label className="dashboard-query-field">
+                  <span>Scale</span>
+                  <select value={manual ? "manual" : "auto"}
+                    onChange={(e) => set(k.mode, e.target.value === "manual" ? "manual" : "auto")}>
+                    <option value="auto">Auto (from data)</option>
+                    <option value="manual">Manual (min / max / step)</option>
+                  </select>
+                </label>
+                {manual ? (
+                  <>
+                    {num(k.min, "Min", "")}
+                    {num(k.max, "Max", "")}
+                    {num(k.step, "Tick step", "auto", { min: 0 })}
+                  </>
+                ) : null}
+              </div>
+            </fieldset>
+          );
+        })}
+        <div className="row modal-actions">
+          <button type="button" className="btn btn-primary" onClick={onClose}>Done</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const TYPE_GROUPS = ["Charts", "KPI", "Content", "Layout", "Media", "Reports", "System", "Batch"];
 const DASHBOARD_TIME_MODE_KEY = "trustnode_dashboard_time_mode";
 const DASHBOARD_TIME_RANGE_KEY = "trustnode_dashboard_time_range";
@@ -892,6 +1017,8 @@ export function DashboardDesigner({
   const [liveBootstrapRows, setLiveBootstrapRows] = useState([]);
   const [liveBootstrapLoading, setLiveBootstrapLoading] = useState(false);
   const [queryModalOpen, setQueryModalOpen] = useState(false);
+  // Dedicated axis-configuration modal (all Y axes, one card per axis in use).
+  const [axisModalOpen, setAxisModalOpen] = useState(false);
   const [computedModalOpen, setComputedModalOpen] = useState(false);
   const [resizingId, setResizingId] = useState("");
   const gridRef = useRef(null);
@@ -2770,6 +2897,17 @@ export function DashboardDesigner({
                     >
                       Series & Axes (multi-tag, dual axis, units)
                     </button>
+                    {/* Axis settings are reachable WITHOUT opening the series
+                        modal — the common single-series case. */}
+                    <button
+                      type="button"
+                      className="dashboard-type-btn"
+                      style={{ marginTop: 6 }}
+                      onClick={() => setAxisModalOpen(true)}
+                      title="Label, prefix, unit, suffix, decimals, data format and scale for each Y axis in use"
+                    >
+                      Axis configuration (units, scale, decimals)
+                    </button>
                     {Array.isArray(form.config?.series_extra) && form.config.series_extra.length ? (
                       <div className="muted" style={{ marginTop: 4, fontSize: 12 }}>
                         {form.config.series_extra.length} extra series configured.
@@ -3321,6 +3459,17 @@ export function DashboardDesigner({
         </div>
       ) : null}
 
+      {/* Axis configuration — one card per axis IN USE. Opens from the main
+          Configure page (single-series) and from Series & Axes (multi-series). */}
+      {axisModalOpen && form ? (
+        <AxisConfigModal
+          config={form.config || {}}
+          widgetValueFormat={form.config?.chart_value_format || "auto"}
+          onChange={(patch) => setForm((p) => ({ ...p, config: { ...p.config, ...patch } }))}
+          onClose={() => setAxisModalOpen(false)}
+        />
+      ) : null}
+
       {queryModalOpen ? (
         <div className="modal-backdrop">
           <div className={`modal-card dashboard-widget-modal dashboard-query-modal dashboard-query-modal-wide ${["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? "dashboard-series-modal-wide" : ""}`}>
@@ -3618,254 +3767,18 @@ export function DashboardDesigner({
                     Plot multiple tags on the same chart. Each series can have its own unit, axis (left / right), chart style and color.
                   </p>
                   <div className="dashboard-query-grid">
-                    <label className="dashboard-query-field">
-                      <span>Primary unit</span>
-                      <input
-                        value={form.config.primary_unit || ""}
-                        placeholder="e.g. °C"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, primary_unit: e.target.value } }))}
-                      />
-                    </label>
-                    <label className="dashboard-query-field">
-                      <span>Primary suffix</span>
-                      <input
-                        value={form.config.primary_suffix || ""}
-                        placeholder="optional"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, primary_suffix: e.target.value } }))}
-                      />
-                    </label>
-                    <label className="dashboard-query-field">
-                      <span>Left axis label</span>
-                      <input
-                        value={form.config.y_axis_label || ""}
-                        placeholder="optional"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_axis_label: e.target.value } }))}
-                      />
-                    </label>
-                    <label className="dashboard-query-field">
-                      <span>Right axis label</span>
-                      <input
-                        value={form.config.y_axis_right_label || ""}
-                        placeholder="optional"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_axis_right_label: e.target.value } }))}
-                      />
-                    </label>
-                    <label className="dashboard-query-field">
-                      <span>Right axis unit</span>
-                      <input value={form.config.y_axis_right_unit || ""} placeholder="e.g. %"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_axis_right_unit: e.target.value } }))} />
-                    </label>
-                    <label className="dashboard-query-field">
-                      <span>Right axis suffix</span>
-                      <input value={form.config.y_axis_right_suffix || ""} placeholder="optional"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_axis_right_suffix: e.target.value } }))} />
-                    </label>
-                    {/* 2nd left/right axis labels + units (only relevant if a series uses Left 2 / Right 2). */}
-                    <label className="dashboard-query-field">
-                      <span>Left 2 axis label</span>
-                      <input value={form.config.y_left2_label || ""} placeholder="optional"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_left2_label: e.target.value } }))} />
-                    </label>
-                    <label className="dashboard-query-field">
-                      <span>Left 2 axis unit</span>
-                      <input value={form.config.y_left2_unit || ""} placeholder="optional"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_left2_unit: e.target.value } }))} />
-                    </label>
-                    <label className="dashboard-query-field">
-                      <span>Left 2 axis suffix</span>
-                      <input value={form.config.y_left2_suffix || ""} placeholder="optional"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_left2_suffix: e.target.value } }))} />
-                    </label>
-                    <label className="dashboard-query-field">
-                      <span>Right 2 axis label</span>
-                      <input value={form.config.y_right2_label || ""} placeholder="optional"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_right2_label: e.target.value } }))} />
-                    </label>
-                    <label className="dashboard-query-field">
-                      <span>Right 2 axis unit</span>
-                      <input value={form.config.y_right2_unit || ""} placeholder="optional"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_right2_unit: e.target.value } }))} />
-                    </label>
-                    <label className="dashboard-query-field">
-                      <span>Right 2 axis suffix</span>
-                      <input value={form.config.y_right2_suffix || ""} placeholder="optional"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, y_right2_suffix: e.target.value } }))} />
-                    </label>
-                  </div>
-                  {/* Y axis range: auto (recharts computes from the data) or
-                      manual (operator sets min, max and an optional tick
-                      step the way Excel does). Empty / invalid manual
-                      values fall back to auto so the chart never blanks
-                      mid-edit. */}
-                  <div className="dashboard-query-grid" style={{ marginTop: 6 }}>
-                    <label className="dashboard-query-field">
-                      <span>Left Y axis</span>
-                      <select
-                        value={String(form.config?.y_axis_mode || "auto").toLowerCase()}
-                        onChange={(e) =>
-                          setForm((p) => ({
-                            ...p,
-                            config: { ...p.config, y_axis_mode: e.target.value === "manual" ? "manual" : "auto" },
-                          }))
-                        }
+                    <label className="dashboard-query-field" style={{ gridColumn: "1 / -1" }}>
+                      <span>Axes</span>
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        onClick={() => setAxisModalOpen(true)}
+                        title="Configure every Y axis in use: label, prefix, unit, suffix, decimals, data format and scale"
                       >
-                        <option value="auto">Auto (from data)</option>
-                        <option value="manual">Manual (min / max / step)</option>
-                      </select>
+                        Axis configuration…
+                      </button>
                     </label>
-                    {String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual" ? (
-                      <>
-                        <label className="dashboard-query-field">
-                          <span>Min</span>
-                          <input
-                            type="number"
-                            step="any"
-                            value={form.config?.y_min ?? ""}
-                            onChange={(e) =>
-                              setForm((p) => ({
-                                ...p,
-                                config: { ...p.config, y_min: e.target.value === "" ? "" : Number(e.target.value) },
-                              }))
-                            }
-                          />
-                        </label>
-                        <label className="dashboard-query-field">
-                          <span>Max</span>
-                          <input
-                            type="number"
-                            step="any"
-                            value={form.config?.y_max ?? ""}
-                            onChange={(e) =>
-                              setForm((p) => ({
-                                ...p,
-                                config: { ...p.config, y_max: e.target.value === "" ? "" : Number(e.target.value) },
-                              }))
-                            }
-                          />
-                        </label>
-                        <label className="dashboard-query-field">
-                          <span>Tick step (optional)</span>
-                          <input
-                            type="number"
-                            step="any"
-                            min="0"
-                            value={form.config?.y_tick_step ?? ""}
-                            placeholder="e.g. 50"
-                            onChange={(e) =>
-                              setForm((p) => ({
-                                ...p,
-                                config: { ...p.config, y_tick_step: e.target.value === "" ? "" : Number(e.target.value) },
-                              }))
-                            }
-                            title="Spacing between Y-axis grid lines. Leave empty for auto ticks."
-                          />
-                        </label>
-                      </>
-                    ) : null}
                   </div>
-                  <div className="dashboard-query-grid" style={{ marginTop: 6 }}>
-                    <label className="dashboard-query-field">
-                      <span>Right Y axis</span>
-                      <select
-                        value={String(form.config?.y_right_axis_mode || "auto").toLowerCase()}
-                        onChange={(e) =>
-                          setForm((p) => ({
-                            ...p,
-                            config: { ...p.config, y_right_axis_mode: e.target.value === "manual" ? "manual" : "auto" },
-                          }))
-                        }
-                      >
-                        <option value="auto">Auto (from data)</option>
-                        <option value="manual">Manual (min / max / step)</option>
-                      </select>
-                    </label>
-                    {String(form.config?.y_right_axis_mode || "auto").toLowerCase() === "manual" ? (
-                      <>
-                        <label className="dashboard-query-field">
-                          <span>Right Min</span>
-                          <input
-                            type="number"
-                            step="any"
-                            value={form.config?.y_right_min ?? ""}
-                            onChange={(e) =>
-                              setForm((p) => ({
-                                ...p,
-                                config: { ...p.config, y_right_min: e.target.value === "" ? "" : Number(e.target.value) },
-                              }))
-                            }
-                          />
-                        </label>
-                        <label className="dashboard-query-field">
-                          <span>Right Max</span>
-                          <input
-                            type="number"
-                            step="any"
-                            value={form.config?.y_right_max ?? ""}
-                            onChange={(e) =>
-                              setForm((p) => ({
-                                ...p,
-                                config: { ...p.config, y_right_max: e.target.value === "" ? "" : Number(e.target.value) },
-                              }))
-                            }
-                          />
-                        </label>
-                        <label className="dashboard-query-field">
-                          <span>Right tick step</span>
-                          <input
-                            type="number"
-                            step="any"
-                            min="0"
-                            value={form.config?.y_right_tick_step ?? ""}
-                            placeholder="e.g. 5"
-                            onChange={(e) =>
-                              setForm((p) => ({
-                                ...p,
-                                config: { ...p.config, y_right_tick_step: e.target.value === "" ? "" : Number(e.target.value) },
-                              }))
-                            }
-                          />
-                        </label>
-                      </>
-                    ) : null}
-                  </div>
-                  {/* 2nd left + 2nd right axis scale (only apply when a series
-                      uses Left 2 / Right 2). Compact: mode + min/max. */}
-                  {["left2", "right2"].map((ax) => {
-                    const modeK = `y_${ax}_axis_mode`, minK = `y_${ax}_min`, maxK = `y_${ax}_max`, stepK = `y_${ax}_tick_step`;
-                    const label = ax === "left2" ? "Left 2 Y axis" : "Right 2 Y axis";
-                    const manual = String(form.config?.[modeK] || "auto").toLowerCase() === "manual";
-                    return (
-                      <div key={ax} className="dashboard-query-grid" style={{ marginTop: 6 }}>
-                        <label className="dashboard-query-field">
-                          <span>{label}</span>
-                          <select value={manual ? "manual" : "auto"}
-                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, [modeK]: e.target.value === "manual" ? "manual" : "auto" } }))}>
-                            <option value="auto">Auto (from data)</option>
-                            <option value="manual">Manual (min / max)</option>
-                          </select>
-                        </label>
-                        {manual ? (
-                          <>
-                            <label className="dashboard-query-field">
-                              <span>{ax === "left2" ? "Left 2" : "Right 2"} Min</span>
-                              <input type="number" step="any" value={form.config?.[minK] ?? ""}
-                                onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, [minK]: e.target.value === "" ? "" : Number(e.target.value) } }))} />
-                            </label>
-                            <label className="dashboard-query-field">
-                              <span>{ax === "left2" ? "Left 2" : "Right 2"} Max</span>
-                              <input type="number" step="any" value={form.config?.[maxK] ?? ""}
-                                onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, [maxK]: e.target.value === "" ? "" : Number(e.target.value) } }))} />
-                            </label>
-                            <label className="dashboard-query-field">
-                              <span>{ax === "left2" ? "Left 2" : "Right 2"} Tick step (optional)</span>
-                              <input type="number" step="any" value={form.config?.[stepK] ?? ""}
-                                onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, [stepK]: e.target.value === "" ? "" : Number(e.target.value) } }))} />
-                            </label>
-                          </>
-                        ) : null}
-                      </div>
-                    );
-                  })}
                   {/* Per-widget styling: line thickness, dot marker, bar fill / width.
                       Placed inside the Series & Axes fieldset (instead of the
                       separate Chart Display section above) so operators see
