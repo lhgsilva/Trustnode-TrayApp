@@ -444,6 +444,29 @@ class GatewayWorker:
         current pool (the zombie drains into it and dies when its socket finally
         times out) and hands the next cycle a clean slate. Called on read-timeout
         and by the watchdog restart."""
+        # FORCE-CLOSE the hung client's socket FIRST. A read stuck in recv()
+        # blocks even past the socket timeout in some half-open TCP states, so
+        # the zombie thread lives forever — we saw the process reach 237 threads,
+        # whose GIL churn starved the event loop so the read-timeout timer and
+        # the restarted loop could barely run. shutdown(SHUT_RDWR) makes the
+        # blocked recv raise immediately, so the thread exits instead of leaking.
+        stale_client = self._ab_pycomm3_client
+        stale_opc = self._opc_client
+        for label, cli in (("ab", stale_client), ("opc", stale_opc)):
+            try:
+                raw = getattr(getattr(cli, "_sock", None), "sock", None)
+                if raw is not None:
+                    import socket as _sk
+                    try:
+                        raw.shutdown(_sk.SHUT_RDWR)
+                    except Exception:
+                        pass
+                    try:
+                        raw.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         try:
             with self._collection_executor_lock:
                 old_ex = self._collection_executor
