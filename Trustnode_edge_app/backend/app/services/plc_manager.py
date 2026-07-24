@@ -100,6 +100,14 @@ class GatewayWorker:
         self._collection_executor: ThreadPoolExecutor | None = None
         self._collection_executor_lock = threading.Lock()
 
+        # SEPARATE pool for persistence (sink writes / outbox enqueue). Persist
+        # must NEVER share slots with the PLC read: if a sink write parks (locked
+        # DB, slow remote), a shared pool would starve the read and stall the
+        # whole loop — the "running but no data" failure. Keeping persist on its
+        # own 2-slot pool means the worst a wedged persist can do is delay the
+        # NEXT persist; the read cycle keeps advancing and charts keep updating.
+        self._persist_executor: ThreadPoolExecutor | None = None
+
         self._db_engine = None
         self._db_engine_key = ""
         self._db_schema_ready_key = ""
@@ -369,6 +377,13 @@ class GatewayWorker:
                 ex.shutdown(wait=False, cancel_futures=False)
         except Exception:
             pass
+        try:
+            pex = self._persist_executor
+            self._persist_executor = None
+            if pex is not None:
+                pex.shutdown(wait=False, cancel_futures=False)
+        except Exception:
+            pass
 
     def is_stalled(self) -> tuple[bool, float]:
         """True iff the worker is supposed to be running but hasn't
@@ -433,6 +448,32 @@ class GatewayWorker:
                         thread_name_prefix=f"tn-collect-{self.gateway_id[:8]}",
                     )
         return self._collection_executor
+
+    def _get_persist_executor(self) -> ThreadPoolExecutor:
+        """Lazily create this gateway's DEDICATED persistence thread pool,
+        SEPARATE from the read pool. A stalled sink write parks a persist
+        worker here and NOT a read worker, so the collection cycle keeps
+        advancing (and charts keep updating) even while a sink is slow.
+        2 workers so one in-flight slow write still leaves room for the next
+        batch to enqueue locally without waiting."""
+        if self._persist_executor is None:
+            with self._collection_executor_lock:
+                if self._persist_executor is None:
+                    self._persist_executor = ThreadPoolExecutor(
+                        max_workers=2,
+                        thread_name_prefix=f"tn-persist-{self.gateway_id[:8]}",
+                    )
+        return self._persist_executor
+
+    async def _run_persist_io(self, fn, *args):
+        """Run a blocking persistence call on the DEDICATED persist pool
+        (never the read pool). Drop-in async wrapper like `_run_collection_io`."""
+        loop = asyncio.get_running_loop()
+        executor = self._get_persist_executor()
+        if args:
+            import functools
+            return await loop.run_in_executor(executor, functools.partial(fn, *args))
+        return await loop.run_in_executor(executor, fn)
 
     def _orphan_collection_runtime(self) -> None:
         """Swap in a FRESH executor + connect lock and drop the driver client.
@@ -668,13 +709,19 @@ class GatewayWorker:
                     # remote) must not stall the cycle. On timeout we log and move
                     # on; the historian buffer + outbox already retry the data.
                     try:
+                        # DEDICATED persist pool — a slow/locked sink parks a
+                        # persist worker, never a read worker, so the next read
+                        # cycle still runs on cadence. On timeout we log and move
+                        # on; the persist keeps draining on its own pool and the
+                        # historian buffer + outbox already hold the data.
                         await asyncio.wait_for(
-                            self._run_collection_io(self._persist_readings, readings),
+                            self._run_persist_io(self._persist_readings, readings),
                             timeout=max(5.0, self._read_timeout_s),
                         )
                     except asyncio.TimeoutError:
                         _GW_LOG.warning(
-                            "persist-timeout gateway=%s — sink slow, cycle continues",
+                            "persist-timeout gateway=%s — sink slow, cycle continues "
+                            "(read loop unaffected; persist draining on its own pool)",
                             self.gateway_id,
                         )
             except Exception as exc:
@@ -1905,7 +1952,7 @@ class GatewayWorker:
         return os.path.join(self._default_data_dir(), filename)
 
     def _ensure_buffer_engine(self):
-        from sqlalchemy import create_engine, text
+        from sqlalchemy import create_engine, event, text
 
         buffer_path = (self.db_sink or {}).get("store_forward_path") or self._default_data_file("trustnode_store_forward.db")
         key = self._sqlite_url_from_path(str(buffer_path))
@@ -1915,7 +1962,42 @@ class GatewayWorker:
                     self._buffer_engine.dispose()
                 except Exception:
                     pass
-            self._buffer_engine = create_engine(key, pool_pre_ping=True)
+            # WAL + a BOUNDED busy_timeout are the whole ballgame here. The
+            # store-forward outbox is written from TWO threads at once: the
+            # collection executor (via `_enqueue_outbox`, on the hot cycle
+            # path) and the background flush daemon (`_flush_remote_outbox_once`
+            # → `_mark_sent`/`_mark_failed`). In SQLite's DEFAULT rollback-journal
+            # mode a writer takes an exclusive DB lock, so while the flush thread
+            # holds it the enqueue blocks — and with NO busy_timeout set, the
+            # default handler could keep the enqueue thread parked long enough to
+            # exceed the 5 s persist-timeout in `_run_loop`. That abandons the
+            # executor thread (it keeps running, holding 1 of only 3 slots); after
+            # a few cycles all 3 slots are wedged and the read loop can't run at
+            # all → the exact "first row then stall forever until the 300 s
+            # cooldown" signature we saw in the field. WAL lets the reader/flush
+            # and the writer proceed concurrently, and busy_timeout caps any
+            # residual contention at a few hundred ms (well under the 5 s persist
+            # budget) so a lock is a fast retriable error, never an unbounded park.
+            self._buffer_engine = create_engine(
+                key,
+                pool_pre_ping=True,
+                connect_args={"check_same_thread": False, "timeout": 3.0},
+            )
+
+            @event.listens_for(self._buffer_engine, "connect")
+            def _set_buffer_pragmas(dbapi_conn, _rec):  # noqa: ANN001
+                try:
+                    cur = dbapi_conn.cursor()
+                    cur.execute("PRAGMA journal_mode=WAL")
+                    cur.execute("PRAGMA synchronous=NORMAL")
+                    # 3000 ms: a locked DB retries internally for up to 3 s, still
+                    # under the 5 s persist-timeout, then raises OperationalError
+                    # (caught by the persist path) instead of parking forever.
+                    cur.execute("PRAGMA busy_timeout=3000")
+                    cur.close()
+                except Exception:
+                    pass
+
             self._buffer_engine_key = key
             with self._buffer_engine.begin() as conn:
                 conn.execute(
