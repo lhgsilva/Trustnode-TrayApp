@@ -5224,7 +5224,27 @@ class AppStore:
                     sleep_s = 60
             except Exception:
                 sleep_s = 60
+            # Keep the WAL small regardless of retention. An un-checkpointed WAL
+            # (seen at 5.3 MB / 941 pages) makes every read page through it and
+            # lets it grow without bound. A PASSIVE checkpoint never blocks
+            # writers, so it's safe to run each tick.
+            try:
+                self._checkpoint_wal_passive()
+            except Exception:
+                pass
             self._stop_event.wait(timeout=sleep_s)
+
+    def _checkpoint_wal_passive(self) -> None:
+        """PRAGMA wal_checkpoint(PASSIVE) — reclaim WAL frames without ever
+        blocking a concurrent writer. Best-effort + short timeout."""
+        try:
+            con = sqlite3.connect(self._db_path, timeout=2.0)
+            try:
+                con.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            finally:
+                con.close()
+        except Exception:
+            pass
 
     def get_retention_policy(self) -> Dict[str, Any]:
         with self._lock:

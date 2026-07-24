@@ -141,6 +141,15 @@ class GatewayWorker:
         self._ab_connect_lock = threading.Lock()
         # One-shot flag so we log boot->first-row latency exactly once.
         self._first_row_logged = False
+        # Wall-clock cap on a single read cycle. Above a healthy ~0.15s cycle,
+        # below the 30s stall watchdog, so a hung read self-heals in seconds
+        # rather than tripping a restart. Env-tunable; 0 disables the cap.
+        try:
+            self._read_timeout_s = float(
+                os.environ.get("TRUSTNODE_READ_TIMEOUT_SECONDS", "8.0") or "8.0"
+            )
+        except Exception:
+            self._read_timeout_s = 8.0
         self._ab_pylogix_client = None
         self._ab_pylogix_ip: str | None = None
         self._ab_pylogix_slot: int | None = None
@@ -425,6 +434,34 @@ class GatewayWorker:
                     )
         return self._collection_executor
 
+    def _orphan_collection_runtime(self) -> None:
+        """Swap in a FRESH executor + connect lock and drop the driver client.
+
+        A hung read/connect thread cannot be cancelled (Python threads), and if
+        it hung inside plc.open() it still holds the connect lock. Reusing either
+        lets one zombie thread wedge the next cycle — and after 3 they saturate
+        the 3-slot pool and the loop can never start again. This retires the
+        current pool (the zombie drains into it and dies when its socket finally
+        times out) and hands the next cycle a clean slate. Called on read-timeout
+        and by the watchdog restart."""
+        try:
+            with self._collection_executor_lock:
+                old_ex = self._collection_executor
+                self._collection_executor = None
+            if old_ex is not None:
+                old_ex.shutdown(wait=False, cancel_futures=False)
+        except Exception:
+            pass
+        # Fresh lock so a zombie still inside plc.open() can't block the next
+        # connect; drop the client refs so the next cycle reconnects clean.
+        self._ab_connect_lock = threading.Lock()
+        try:
+            self._ab_pycomm3_client = None
+            self._ab_pycomm3_path = None
+            self._opc_client = None
+        except Exception:
+            pass
+
     async def _run_collection_io(self, fn, *args):
         """Run a BLOCKING collection call (PLC read / historian write) on the
         gateway's DEDICATED executor instead of asyncio's shared default pool, so
@@ -458,7 +495,38 @@ class GatewayWorker:
                 # at the bottom of the cycle catches any read exception and
                 # the next cycle reconnects through `_ensure_ab_pycomm3_client`
                 # / `_ensure_opc_client`, which already handle stale sessions.
-                readings = await self._run_collection_io(self._read_from_gateway)
+                # Bound the READ with a wall-clock timeout well above a healthy
+                # cycle (~0.15 s) but below the 30 s watchdog, so one hung read
+                # self-heals in seconds instead of stalling for 30 s and tripping
+                # the restart death-spiral. A prior naive wait_for was reverted
+                # because it (a) used a 30 s floor and (b) eagerly disposed the
+                # session on EVERY timeout. This version times out fast AND, on
+                # timeout, ORPHANS the executor + connect lock so the hung thread
+                # can't wedge the next cycle (the same clean-slate the watchdog
+                # restart now does), then reconnects. Configurable; 0 disables.
+                read_to = self._read_timeout_s
+                try:
+                    if read_to and read_to > 0:
+                        readings = await asyncio.wait_for(
+                            self._run_collection_io(self._read_from_gateway), timeout=read_to
+                        )
+                    else:
+                        readings = await self._run_collection_io(self._read_from_gateway)
+                except asyncio.TimeoutError:
+                    # The read thread is hung (half-open socket / slow CIP). Swap
+                    # in a fresh executor + connect lock so the zombie thread is
+                    # orphaned and drains on its own; drop the client so the next
+                    # cycle reconnects. Do NOT stamp progress — this cycle failed.
+                    self._orphan_collection_runtime()
+                    self.last_error = (
+                        f"PLC read exceeded {read_to:.0f}s — session reset, retrying."
+                    )
+                    _GW_LOG.warning(
+                        "read-timeout gateway=%s after=%.0fs — orphaned executor, reconnecting",
+                        self.gateway_id, read_to,
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
                 self.latest_readings = readings
                 # Liveness stamp — successful read = worker is alive.
                 # The supervisor watchdog reads this to decide whether
@@ -1873,6 +1941,34 @@ class GatewayWorker:
                 text("UPDATE outbox_readings SET sent_remote = 1, sent_utc = :su, last_error = NULL WHERE id = :id"),
                 [{"id": int(i), "su": sent_utc} for i in ids],
             )
+        self._prune_sent_outbox()
+
+    def _prune_sent_outbox(self) -> None:
+        """Delete acknowledged (sent_remote=1) outbox rows older than the
+        retention horizon. Without this the store-and-forward DB grows
+        unbounded — it reached 2.37M rows / 1.1 GB of already-sent data, which
+        slowed every INSERT/UPDATE. Throttled to at most once per 10 min and
+        bounded per run so it never holds a long write lock."""
+        now = time.monotonic()
+        last = getattr(self, "_outbox_prune_mono", 0.0)
+        if now - last < 600.0:
+            return
+        self._outbox_prune_mono = now
+        try:
+            from sqlalchemy import text
+            days = int(os.environ.get("TRUSTNODE_OUTBOX_KEEP_DAYS", "3") or "3")
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).strftime("%Y-%m-%d %H:%M:%S")
+            engine = self._ensure_buffer_engine()
+            with engine.begin() as conn:
+                conn.execute(
+                    text("DELETE FROM outbox_readings WHERE sent_remote = 1 "
+                         "AND (sent_utc IS NULL OR sent_utc < :cut) "
+                         "AND id IN (SELECT id FROM outbox_readings WHERE sent_remote = 1 "
+                         "AND (sent_utc IS NULL OR sent_utc < :cut) LIMIT 100000)"),
+                    {"cut": cutoff},
+                )
+        except Exception as exc:
+            _GW_LOG.debug("outbox-prune skipped gateway=%s: %s", self.gateway_id, exc)
 
     def _mark_failed(self, ids: List[int], err: str) -> None:
         from sqlalchemy import text
@@ -3702,6 +3798,25 @@ class PLCManager:
         except Exception as exc:
             _trace(f"3.null_refs.exc={type(exc).__name__}:{exc}")
 
+        # 3b. CRITICAL — retire the collection executor and the connect lock.
+        #
+        # A stall means a read/connect thread is HUNG inside the dedicated
+        # ThreadPoolExecutor (Python can't cancel it) — and if it hung mid
+        # `plc.open()` it still holds `_ab_connect_lock`. The old code reused
+        # both across the restart, so every restart added another zombie thread
+        # to the 3-slot pool and the new worker blocked on the still-held lock.
+        # After ~3 stalls the pool was fully saturated -> the new cycle could
+        # never even start -> the event loop went stale -> the whole process was
+        # killed (the death-spiral). Swap in a FRESH executor and a FRESH lock so
+        # the new worker starts clean; the zombie thread drains into the orphaned
+        # pool and dies on its own when its socket finally times out.
+        _trace("3b.retire_executor.begin")
+        try:
+            w._orphan_collection_runtime()
+            _trace("3b.retire_executor.done")
+        except Exception as exc:
+            _trace(f"3b.retire_executor.exc={type(exc).__name__}:{exc}")
+
         # 4. Operator 2026-06-25 (12h soak finding): the prior
         # asyncio.wait_for(asyncio.shield(task), timeout=2.0) was the
         # wedge point. After the socket shutdown in step 2 (verified
@@ -3909,7 +4024,11 @@ class PLCManager:
         last_running_ids: set[str] = set()
         try:
             from app.state import telemetry_service as _ts
-            last_running_ids = set(_ts.list_running_gateways() or [])
+            # list_running_gateways() opens the telemetry DB (2 GB) — if a
+            # collection thread holds its write lock, sqlite3.connect blocks up
+            # to its timeout ON THE EVENT LOOP. Two such blocks back-to-back
+            # tripped the "event loop stale" process-kill. Offload to a thread.
+            last_running_ids = set(await asyncio.to_thread(_ts.list_running_gateways) or [])
         except Exception:
             pass
 
