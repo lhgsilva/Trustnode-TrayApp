@@ -126,28 +126,37 @@ export function getTagSeries(rows, gatewayId, tagName, readingsCount = 120) {
 }
 
 export function getLatestTagRow(rows, gatewayId, tagName) {
-  // String-typed tags don't survive getTagSeries' numeric filter, so we
-  // separately look up the most recent raw row to recover value_text.
+  // The latest reading is the NEWEST raw row for this tag — value and
+  // value_text must come from the SAME row.
+  //
+  // The previous version took last_value from a numeric-filtered series and
+  // value_text from the newest raw row independently. When a tag had HISTORICAL
+  // numeric rows (e.g. a STRING tag that used to be stored as 0.0 before the
+  // type fix) plus current NULL+text rows, the numeric series' newest entry was
+  // a stale 0.0 while value_text was current — so a KPI saw value=0 (not null)
+  // and rendered "0.000" instead of the live text. Reading both from the single
+  // newest row makes the value and the text always consistent.
   const src = Array.isArray(rows) ? rows : [];
   const gwNeedle = norm(gatewayId);
   const tagNeedle = norm(tagName);
   const byTag = src.filter((r) => norm(r?.tag || r?.tag_name || "") === tagNeedle);
   const strict = byTag.filter((r) => norm(r?.gateway_id || "") === gwNeedle);
   const pool = strict.length > 1 ? strict : byTag;
-  const sorted = [...pool].sort(
-    (a, b) => toTsMs(a?.ts || a?.ts_utc) - toTsMs(b?.ts || b?.ts_utc)
-  );
-  const lastRaw = sorted[sorted.length - 1];
-  const series = getTagSeries(rows, gatewayId, tagName, 5000);
-  const lastNumeric = series.length ? series[series.length - 1] : null;
-  if (!lastNumeric && !lastRaw) return null;
-  const lastText = lastRaw && (lastRaw.value_text != null && lastRaw.value_text !== "")
+  if (!pool.length) return null;
+  let lastRaw = pool[0];
+  let lastMs = toTsMs(lastRaw?.ts || lastRaw?.ts_utc);
+  for (let i = 1; i < pool.length; i += 1) {
+    const ms = toTsMs(pool[i]?.ts || pool[i]?.ts_utc);
+    if (ms >= lastMs) { lastMs = ms; lastRaw = pool[i]; }
+  }
+  const num = toNum(lastRaw?.value);           // null when the newest row is text/absent
+  const lastText = lastRaw.value_text != null && lastRaw.value_text !== ""
     ? String(lastRaw.value_text)
     : null;
   return {
-    last_value: lastNumeric ? lastNumeric.value : null,
+    last_value: num,
     last_value_text: lastText,
-    last_ts: lastNumeric ? lastNumeric.ts : String(lastRaw?.ts || lastRaw?.ts_utc || ""),
+    last_ts: String(lastRaw?.ts || lastRaw?.ts_utc || ""),
   };
 }
 
