@@ -43,7 +43,12 @@ class GatewayReading(BaseModel):
     # store the original text in `value_text` and set `value` to NaN-equivalent
     # 0.0 so existing numeric consumers don't crash; downstream code should
     # branch on `value_text is not None` to render text-first.
-    value: float
+    #
+    # None means the read FAILED (quality BAD, `value_text` carries the driver
+    # error). It is deliberately NOT 0.0: fabricating a zero made a broken tag
+    # render as a legitimate flat-zero trend on charts and in reports, which
+    # hid real faults (e.g. program-scoped tags that were never being read).
+    value: float | None = None
     value_text: str | None = None
     quality: int = 192
     quality_label: str = "GOOD"

@@ -1,4 +1,9 @@
 function toNum(v) {
+  // null/undefined/"" are ABSENT values, not zero. Number(null) === 0 and
+  // passes isFinite, so without this guard a failed PLC read (stored as NULL)
+  // would plot as a real 0 on the chart — exactly the false "flat zero" that
+  // hid unreadable tags. Absent stays absent so charts show a gap.
+  if (v === null || v === undefined || v === "") return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }

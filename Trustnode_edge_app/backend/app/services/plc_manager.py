@@ -630,6 +630,10 @@ class GatewayWorker:
             reading = latest_by_tag.get(tag)
             if not reading:
                 continue
+            # A failed read (value None / BAD quality) must never satisfy a
+            # trigger — absence of data is not a threshold crossing.
+            if reading.value is None:
+                continue
             try:
                 threshold = float(tr.get("value"))
                 op = str(tr.get("operator") or ">=").strip()
@@ -799,7 +803,14 @@ class GatewayWorker:
         import re as _re
         def _tag_base_for_validation(t: str) -> str:
             cleaned = _re.sub(r"\[[^\]]*\]", "", str(t or "").strip())
-            # Take the controller-tag root (everything before the first '.').
+            # PROGRAM-scoped tags are keyed by pycomm3 as
+            # "Program:<ProgName>.<TagName>", so the root is the FIRST TWO
+            # segments — splitting on the first '.' would yield the useless
+            # "Program:MainProgram". Everything after that is struct members.
+            if cleaned.startswith("Program:"):
+                parts = cleaned.split(".")
+                return ".".join(parts[:2]) if len(parts) >= 2 else cleaned
+            # Controller-scoped: the root is everything before the first '.'.
             return cleaned.split(".", 1)[0]
 
         for path in candidate_paths:
@@ -818,11 +829,17 @@ class GatewayWorker:
                     # range subscripts (e.g. SimDINT[99] when the array
                     # is size 10) still surface as a per-tag read error
                     # — they just don't fail this presence check.
-                    # Program-scoped tags ("Program:Foo.bar") are skipped
-                    # because we open with init_program_tags=False; their
-                    # base name won't be in known_tags but they're valid.
+                    # Program-scoped tags ARE validated now that we connect
+                    # with init_program_tags=True, so a mistyped program tag
+                    # surfaces immediately instead of silently logging 0.0.
+                    # Guard: if the controller returned no program tags at all
+                    # (older firmware / permission), skip validating them
+                    # rather than failing every poll.
+                    has_program_tags = any(k.startswith("Program:") for k in known_tags)
                     def _validatable(t: str) -> bool:
-                        return not str(t or "").strip().startswith("Program:")
+                        if str(t or "").strip().startswith("Program:"):
+                            return has_program_tags
+                        return True
                     missing = [
                         t for t in tags
                         if _validatable(t) and _tag_base_for_validation(t) not in known_tags
@@ -879,7 +896,12 @@ class GatewayWorker:
                             GatewayReading(
                                 ts_utc=ts,
                                 tag_name=requested_tag,
-                                value=0.0,
+                                # NULL, never 0.0 — a failed read is ABSENCE of
+                                # data, not a real zero. Storing 0.0 made a
+                                # broken tag look like a legitimate flat-zero
+                                # trend on charts and in reports. The error
+                                # text + BAD quality carry the diagnosis.
+                                value=None,
                                 value_text=status,
                                 quality=quality,
                                 quality_label=quality_label,
@@ -984,7 +1006,8 @@ class GatewayWorker:
                             GatewayReading(
                                 ts_utc=ts,
                                 tag_name=tag,
-                                value=0.0,
+                                # NULL, not 0.0 — a failed read is absence of data.
+                                value=None,
                                 value_text=status,
                                 quality=quality,
                                 quality_label=quality_label,
@@ -1220,7 +1243,8 @@ class GatewayWorker:
                     GatewayReading(
                         ts_utc=ts,
                         tag_name=unresolved,
-                        value=0.0,
+                        # NULL, not 0.0 — a failed read is absence of data.
+                        value=None,
                         quality=0,
                         quality_label="BAD",
                         source=self.config.gateway_type,
@@ -1282,7 +1306,8 @@ class GatewayWorker:
                         GatewayReading(
                             ts_utc=ts,
                             tag_name=requested_tag,
-                            value=0.0,
+                            # NULL, not 0.0 — a failed read is absence of data.
+                        value=None,
                             quality=0,
                             quality_label="BAD",
                             source=self.config.gateway_type,
@@ -1326,7 +1351,8 @@ class GatewayWorker:
                         GatewayReading(
                             ts_utc=ts,
                             tag_name=requested_tag,
-                            value=0.0,
+                            # NULL, not 0.0 — a failed read is absence of data.
+                        value=None,
                             value_text=str(exc),
                             quality=0,
                             quality_label="BAD",
@@ -1461,10 +1487,19 @@ class GatewayWorker:
         # database at connect. Without it, indexed-tag reads such as
         # `SimREAL[1]` fail with "Tag doesn't exist - SimREAL" because
         # pycomm3 strips the [1] suffix and looks up the bare name in
-        # its empty cache. init_program_tags stays False — we never
-        # poll program-scoped tags from this code path, and fetching
-        # them roughly doubles connect time on real PLCs.
-        plc = logix_driver_cls(path, init_tags=True, init_program_tags=False)
+        # its empty cache.
+        #
+        # init_program_tags MUST also be True whenever the gateway polls
+        # PROGRAM-scoped tags ("Program:MainProgram.Foo"). pycomm3 resolves
+        # every read against the cache it built at connect; with program tags
+        # excluded, each such read fails with
+        #   "Tag doesn't exist - Program:MainProgram.Foo"
+        # and the per-tag handler below stores it as 0.0/BAD — so a tag the
+        # operator can watch changing in Studio 5000 showed a flat 0 in the
+        # edge app. Fetching program tags costs extra time at CONNECT only
+        # (paid once on Start, not per poll), which is the right trade for
+        # correct reads.
+        plc = logix_driver_cls(path, init_tags=True, init_program_tags=True)
         # Operator 2026-06-24: write directly to _cfg["socket_timeout"]
         # BEFORE plc.open(). pycomm3 1.2.14 reads this key when it
         # constructs the underlying Socket(timeout=…). Note the typo
@@ -3124,6 +3159,11 @@ class PLCManager:
         for r in readings or []:
             tag = self._normalize_tag(r.tag_name)
             if not tag:
+                continue
+            # Skip failed reads (value None): float(None) would raise and break
+            # the whole collection gate, and a bad read must not overwrite the
+            # last known-good live value.
+            if r.value is None:
                 continue
             self.global_live_values[f"{gateway_id}::{tag}"] = {"value": float(r.value), "ts_epoch": now_epoch}
 
