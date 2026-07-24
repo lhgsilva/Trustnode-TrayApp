@@ -7307,6 +7307,10 @@ class AppStore:
         if not safe_rows:
             return 0
         max_local_id = 0
+        # Single _hist_lock scope for BOTH the DB write and the live-latest cache
+        # update, so a reader can never see the committed row without the cache
+        # (the old double-acquire left a stale-cache window) and we pay one lock
+        # round-trip per cycle instead of two.
         with self._hist_lock:
             with self._connect() as conn:
                 conn.executemany(
@@ -7322,11 +7326,7 @@ class AppStore:
                     max_local_id = int(row["id"] or 0) if row else 0
                 except Exception:
                     max_local_id = 0
-        if pending_live_rows:
-            # Keep a fast local latest cache for UI/live endpoints.
-            # Same _hist_lock as the readers at get_live_latest_rows so the
-            # cache is consistently guarded, but off the config lock.
-            with self._hist_lock:
+            if pending_live_rows:
                 for row in pending_live_rows:
                     key = (
                         normalize_tenant_id(str(row.get("tenant_id") or tenant_id)),
@@ -7335,6 +7335,7 @@ class AppStore:
                     )
                     if key[1] and key[2]:
                         self._local_live_latest_cache[key] = dict(row)
+        if pending_live_rows:
             self._enqueue_live_fast_pending(pending_live_rows, max_local_id=max_local_id)
         self._sync_wakeup_event.set()
         self._live_sync_wakeup_event.set()

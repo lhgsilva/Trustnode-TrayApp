@@ -525,7 +525,11 @@ class GatewayWorker:
                         "read-timeout gateway=%s after=%.0fs — orphaned executor, reconnecting",
                         self.gateway_id, read_to,
                     )
-                    await asyncio.sleep(1.0)
+                    # Brief recovery pause scaled to the configured cadence (not a
+                    # hard 1s), so a fast gateway retries promptly and a slow one
+                    # doesn't spin.
+                    _iv = max(0.2, min(2.0, (int(self.config.interval_ms or 1000) / 1000.0)))
+                    await asyncio.sleep(_iv)
                     continue
                 self.latest_readings = readings
                 # Liveness stamp — successful read = worker is alive.
@@ -564,7 +568,12 @@ class GatewayWorker:
                                 # trip the wedge-watchdog's "event loop stale" kill
                                 # (observed 26 s stalls -> whole process respawned
                                 # -> "running but no data"). Offload to a thread.
-                                bootstrap = await asyncio.to_thread(
+                                # On the gateway's DEDICATED executor, not the
+                                # shared anyio pool — the shared pool is also used
+                                # by API handlers + cloud sync and can starve,
+                                # queuing this call for 100s of ms and dragging
+                                # the cycle over its interval.
+                                bootstrap = await self._run_collection_io(
                                     lambda: app_store.get_bootstrap(prefer_cloud_reads=False) or {}
                                 )
                                 telemetry_service.configure_from_bootstrap(bootstrap)
@@ -572,7 +581,11 @@ class GatewayWorker:
                                 pass
                             self._telemetry_runtime_refresh_monotonic = now_mono
 
-                        ok, err, edge_record_id = await asyncio.to_thread(
+                        # DEDICATED executor (not shared anyio pool). This write
+                        # gates the chart write below, so shared-pool queuing here
+                        # directly delayed every chart update; isolating it keeps
+                        # the cycle on-cadence.
+                        ok, err, edge_record_id = await self._run_collection_io(
                             lambda: telemetry_service.record_collection_cycle(
                                 gateway_id=self.gateway_id,
                                 config=self.config,
@@ -595,21 +608,23 @@ class GatewayWorker:
                                     self.gateway_id, time.monotonic() - boot0,
                                 )
                         if not ok:
-                            collection_allowed = False
-                            self.collection_blocked = True
-                            self.collection_block_reason = f"Local persistence failed: {err}"
-                            self.last_error = self.collection_block_reason
+                            # Telemetry/cloud-outbox write failed. Surface it, but
+                            # DO NOT block the cycle: the historian (chart) DB is
+                            # independent and healthy, so charts must still get
+                            # this sample. Only the cloud outbox missed it (it
+                            # re-syncs from the historian). Leaving collection_allowed
+                            # True keeps _broadcast writing the chart row.
+                            self.last_error = f"Cloud-record write failed: {err}"
                             _GW_LOG.warning(
-                                "persist-fail gateway=%s reason=%s",
+                                "telemetry-write-fail gateway=%s reason=%s (charts unaffected)",
                                 self.gateway_id, err,
                             )
                     except Exception as exc:
-                        collection_allowed = False
-                        self.collection_blocked = True
-                        self.collection_block_reason = f"Local persistence failed: {exc}"
-                        self.last_error = self.collection_block_reason
-                        _GW_LOG.exception(
-                            "persist-exception gateway=%s exc=%s",
+                        # Same policy: a telemetry-write exception must not blank
+                        # the charts. Log and continue with collection_allowed True.
+                        self.last_error = f"Cloud-record write error: {exc}"
+                        _GW_LOG.warning(
+                            "telemetry-write-exception gateway=%s exc=%s (charts unaffected)",
                             self.gateway_id, exc,
                         )
                 await emit_event(
@@ -683,6 +698,16 @@ class GatewayWorker:
             self._stall_threshold_s = max(30.0, 3.0 * target_s)
             elapsed_s = max(0.0, time.monotonic() - cycle_started)
             self._measured_cycle_ms = elapsed_s * 1000.0
+            # Structured cadence metric every ~60 cycles: measured cycle vs
+            # configured interval, so drift is visible in the log without
+            # waiting for an overrun streak.
+            self._cycle_metric_count = (getattr(self, "_cycle_metric_count", 0) or 0) + 1
+            if self._cycle_metric_count % 60 == 0:
+                _GW_LOG.info(
+                    "cadence gateway=%s cycle_ms=%.0f interval_ms=%d tags=%d",
+                    self.gateway_id, self._measured_cycle_ms, configured_ms,
+                    len(self.config.tags or []),
+                )
             if elapsed_s * 1000.0 > configured_ms * 1.5:
                 self._cycle_overrun_streak = (getattr(self, "_cycle_overrun_streak", 0) or 0) + 1
             else:
@@ -2159,11 +2184,21 @@ class GatewayWorker:
         # and would otherwise produce duplicate rows.
         try:
             settings = None
-            # Reuse the import-light path: pull settings directly via
-            # the global app_store singleton from app.state.
-            from app.state import app_store as _app_store
-            bootstrap = _app_store.get_bootstrap(prefer_cloud_reads=False) or {}
-            settings = bootstrap.get("app_settings") if isinstance(bootstrap.get("app_settings"), dict) else {}
+            # get_bootstrap acquires app_store._lock (a cloud-sync thread can
+            # hold it). Calling it EVERY cycle from this hot path added lock
+            # contention for a value that changes rarely — cache the mirror
+            # settings for 10s.
+            now_mono = time.monotonic()
+            cached = getattr(self, "_mirror_settings_cache", None)
+            cached_at = getattr(self, "_mirror_settings_cache_mono", 0.0)
+            if cached is not None and (now_mono - cached_at) < 10.0:
+                settings = cached
+            else:
+                from app.state import app_store as _app_store
+                bootstrap = _app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+                settings = bootstrap.get("app_settings") if isinstance(bootstrap.get("app_settings"), dict) else {}
+                self._mirror_settings_cache = settings
+                self._mirror_settings_cache_mono = now_mono
         except Exception:
             return
         if not settings:
@@ -3439,12 +3474,18 @@ class PLCManager:
 
     async def _broadcast(self, message: Dict[str, Any]) -> None:
         # Persist historian at backend-side so collection does not depend on UI websocket state.
+        #
+        # The historian (chart) DB is INDEPENDENT of the telemetry/cloud-outbox
+        # DB. We deliberately do NOT gate this write on `persisted_local` (the
+        # telemetry write result): a transient telemetry.db hiccup must not blank
+        # the charts for that cycle. We only require that the collection gate
+        # allowed the cycle (a trigger-based block genuinely means "don't record")
+        # and that there are readings to write.
         try:
             if (
                 isinstance(message, dict)
                 and message.get("type") == "reading"
                 and message.get("collection_allowed") is not False
-                and bool(message.get("persisted_local"))
                 and isinstance(message.get("readings"), list)
             ):
                 from app.state import app_store  # local import to avoid circular import timing
