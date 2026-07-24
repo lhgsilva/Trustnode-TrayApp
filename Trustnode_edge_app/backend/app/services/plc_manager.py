@@ -1694,6 +1694,20 @@ class GatewayWorker:
             # It is enabled ONLY when this gateway polls such tags, because the
             # extra CIP round-trips measurably slow every connect/reconnect.
             want_program_tags = self._needs_program_tags()
+            # Sticky de-escalation: once init_program_tags has caused a buffer/
+            # packet-space failure on this controller, stop requesting it. The
+            # heavy program-tag TEMPLATE read (pycomm3 _read_template) can exceed
+            # a busy ControlLogix's packet buffer ("Insufficient Packet Space" /
+            # "No buffer memory"), and retrying it every reconnect turns a
+            # transient buffer shortage into a permanent connect-fail spiral.
+            # Auto-recover: retry program tags again after a cooldown, in case
+            # the buffer shortage was transient (a busy batch run, etc.).
+            if getattr(self, "_ab_skip_program_tags", False):
+                since = time.monotonic() - getattr(self, "_ab_skip_program_tags_mono", 0.0)
+                if since < 300.0:
+                    want_program_tags = False
+                else:
+                    self._ab_skip_program_tags = False  # give the full init another chance
             plc = logix_driver_cls(path, init_tags=True, init_program_tags=want_program_tags)
             # Operator 2026-06-24: write directly to _cfg["socket_timeout"]
             # BEFORE plc.open(). pycomm3 1.2.14 reads this key when it
@@ -1713,7 +1727,38 @@ class GatewayWorker:
                 plc._cfg["socket_timeout"] = sock_timeout
             except Exception:
                 pass
-            plc.open()
+            try:
+                plc.open()
+            except Exception as open_exc:
+                msg = str(open_exc).lower()
+                buffer_err = (
+                    "buffer" in msg or "packet space" in msg
+                    or "insufficient" in msg or "no memory" in msg
+                )
+                if want_program_tags and buffer_err:
+                    # The controller couldn't serve the program-tag templates.
+                    # Latch it off and reconnect controller-only so collection
+                    # recovers instead of spiralling on forward_open failures.
+                    self._ab_skip_program_tags = True
+                    self._ab_skip_program_tags_mono = time.monotonic()
+                    _GW_LOG.warning(
+                        "ab-open program-tags too heavy for controller (%s) — "
+                        "reconnecting controller-only", type(open_exc).__name__,
+                    )
+                    try:
+                        plc.close()
+                    except Exception:
+                        pass
+                    plc = logix_driver_cls(path, init_tags=True, init_program_tags=False)
+                    try:
+                        plc._cfg["socket_timeout"] = float(
+                            os.environ.get("TRUSTNODE_AB_SOCKET_TIMEOUT_SECONDS", "2.0") or "2.0"
+                        )
+                    except Exception:
+                        pass
+                    plc.open()
+                else:
+                    raise
             # Also force-apply the timeout to the live socket after open(),
             # in case the open path cached a socket created with a default
             # value before our _cfg update propagated.
