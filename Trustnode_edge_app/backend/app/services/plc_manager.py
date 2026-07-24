@@ -134,6 +134,11 @@ class GatewayWorker:
         self._ab_preferred_path: str | None = None
         self._ab_pycomm3_client = None
         self._ab_pycomm3_path: str | None = None
+        # Guards LogixDriver creation. The startup prewarm thread and the run
+        # loop's first cycle both call _ensure_ab_pycomm3_client concurrently;
+        # without this they each open a connection and fetch the tag database
+        # twice.
+        self._ab_connect_lock = threading.Lock()
         self._ab_pylogix_client = None
         self._ab_pylogix_ip: str | None = None
         self._ab_pylogix_slot: int | None = None
@@ -720,13 +725,25 @@ class GatewayWorker:
         # snap7 + others: skip — their driver state machines may not
         # tolerate an out-of-band open here.
 
-    def _coerce_value(self, raw: Any, tag_name: str) -> tuple[float, str | None]:
+    def _coerce_value(self, raw: Any, tag_name: str) -> tuple[float | None, str | None]:
         """Return (numeric_value, text_value).
 
-        Numeric tags return (float, None). String-typed tags (PLC text
-        registers, OPC-UA String/ByteString, smart-meter strings) return
-        (0.0, text). The caller writes both columns; downstream views render
-        text-first when text_value is set.
+        Numeric tags return (float, None).
+
+        TEXT-typed values (PLC STRING, OPC-UA String/ByteString, smart-meter
+        strings) ALWAYS return their text, and return a numeric ONLY when the
+        text genuinely parses as a number:
+            'BT-RC2026-002'  -> (None, 'BT-RC2026-002')
+            '77'             -> (77.0, '77')
+        Two rules matter here:
+          * the text is NEVER discarded. Previously a numeric-looking string
+            such as '77' was stored as 77.0 with value_text=NULL, so the
+            moment it became '77A' the tag silently flipped to 0.0 — a fake
+            discontinuity in history.
+          * a non-numeric string NEVER fabricates 0.0. It used to, which made
+            a status string chart as a flat zero line and dragged AVG/MIN/MAX
+            aggregates to meaningless zeros. NULL = "not a number", so charts
+            show a gap and aggregates correctly skip it.
         """
         if raw is None:
             raise RuntimeError(f"Tag '{tag_name}' returned null value.")
@@ -739,12 +756,18 @@ class GatewayWorker:
                 txt = bytes(raw).decode("utf-8", errors="replace")
             except Exception:
                 txt = repr(raw)
-            return (0.0, txt)
+            return (self._opt_float(txt), txt)
         text = str(raw).strip()
+        return (self._opt_float(text), text)
+
+    @staticmethod
+    def _opt_float(text: str) -> float | None:
+        """float(text) when it parses, else None. Never fabricates a zero."""
         try:
-            return (float(text), None)
+            val = float(str(text).strip())
         except Exception:
-            return (0.0, text)
+            return None
+        return val if val == val and val not in (float("inf"), float("-inf")) else None
 
     def _coerce_value_to_float(self, raw: Any, tag_name: str) -> float:
         if raw is None:
@@ -1325,12 +1348,14 @@ class GatewayWorker:
                         raw_status=status_name,
                     )
                     if value is None:
-                        num_val, txt_val = 0.0, None
+                        # No value from the server: absence, not zero.
+                        num_val, txt_val = None, None
                     else:
                         try:
                             num_val, txt_val = self._coerce_value(value, requested_tag)
                         except Exception:
-                            num_val, txt_val = 0.0, str(value)
+                            # Unparseable payload — keep the text, no fake zero.
+                            num_val, txt_val = None, str(value)
                     out.append(
                         GatewayReading(
                             ts_utc=ts,
@@ -1479,60 +1504,80 @@ class GatewayWorker:
         self._db_engine_key = ""
         self._db_schema_ready_key = ""
 
+    def _needs_program_tags(self) -> bool:
+        """True when this gateway actually polls PROGRAM-scoped tags.
+
+        Fetching the program-tag database at connect is expensive (a separate
+        CIP request sequence per program), so we only pay it when at least one
+        configured tag is "Program:...". Controller-only gateways connect as
+        fast as they always did.
+        """
+        for t in (self.config.tags or []):
+            if str(t or "").strip().startswith("Program:"):
+                return True
+        return False
+
     def _ensure_ab_pycomm3_client(self, path: str, logix_driver_cls):
         if self._ab_pycomm3_client is not None and self._ab_pycomm3_path == path:
             return self._ab_pycomm3_client
-        self._close_ab_pycomm3_client()
-        # init_tags MUST be True so pycomm3 fetches the controller's tag
-        # database at connect. Without it, indexed-tag reads such as
-        # `SimREAL[1]` fail with "Tag doesn't exist - SimREAL" because
-        # pycomm3 strips the [1] suffix and looks up the bare name in
-        # its empty cache.
-        #
-        # init_program_tags MUST also be True whenever the gateway polls
-        # PROGRAM-scoped tags ("Program:MainProgram.Foo"). pycomm3 resolves
-        # every read against the cache it built at connect; with program tags
-        # excluded, each such read fails with
-        #   "Tag doesn't exist - Program:MainProgram.Foo"
-        # and the per-tag handler below stores it as 0.0/BAD — so a tag the
-        # operator can watch changing in Studio 5000 showed a flat 0 in the
-        # edge app. Fetching program tags costs extra time at CONNECT only
-        # (paid once on Start, not per poll), which is the right trade for
-        # correct reads.
-        plc = logix_driver_cls(path, init_tags=True, init_program_tags=True)
-        # Operator 2026-06-24: write directly to _cfg["socket_timeout"]
-        # BEFORE plc.open(). pycomm3 1.2.14 reads this key when it
-        # constructs the underlying Socket(timeout=…). Note the typo
-        # in pycomm3's property setter (`socket_timout`) means
-        # `plc.socket_timeout = X` doesn't take effect; we have to
-        # set the dict key directly.
-        # Value 2.0s: each per-fragment recv() will time out in 2s,
-        # so a maximally-fragmented response can complete in <30s
-        # before the watchdog 30s threshold fires. Combined with the
-        # read-batching at the read site, a healthy cycle now
-        # completes in ~150ms total.
-        try:
-            sock_timeout = float(
-                os.environ.get("TRUSTNODE_AB_SOCKET_TIMEOUT_SECONDS", "2.0") or "2.0"
-            )
-            plc._cfg["socket_timeout"] = sock_timeout
-        except Exception:
-            pass
-        plc.open()
-        # Also force-apply the timeout to the live socket after open(),
-        # in case the open path cached a socket created with a default
-        # value before our _cfg update propagated.
-        try:
-            sock = getattr(getattr(plc, "_sock", None), "sock", None)
-            if sock is not None:
-                sock.settimeout(float(
+        # Serialise connects. start() fires _prewarm_client in a thread AND the
+        # run loop's first cycle calls this from another thread; without a lock
+        # they race and BOTH open a LogixDriver, doubling the tag-database
+        # fetch against the PLC (and sometimes getting one connection
+        # rejected). The loser of the race now waits and reuses the winner's
+        # cached client.
+        with self._ab_connect_lock:
+            if self._ab_pycomm3_client is not None and self._ab_pycomm3_path == path:
+                return self._ab_pycomm3_client
+            self._close_ab_pycomm3_client()
+            # init_tags MUST be True so pycomm3 fetches the controller's tag
+            # database at connect. Without it, indexed-tag reads such as
+            # `SimREAL[1]` fail with "Tag doesn't exist - SimREAL" because
+            # pycomm3 strips the [1] suffix and looks up the bare name in
+            # its empty cache.
+            #
+            # init_program_tags is required to read PROGRAM-scoped tags
+            # ("Program:MainProgram.Foo"): pycomm3 resolves every read against
+            # the cache built at connect, so without it those reads fail with
+            # "Tag doesn't exist" and used to be stored as 0.0/BAD — a tag the
+            # operator could watch changing in Studio 5000 showed a flat 0.
+            # It is enabled ONLY when this gateway polls such tags, because the
+            # extra CIP round-trips measurably slow every connect/reconnect.
+            want_program_tags = self._needs_program_tags()
+            plc = logix_driver_cls(path, init_tags=True, init_program_tags=want_program_tags)
+            # Operator 2026-06-24: write directly to _cfg["socket_timeout"]
+            # BEFORE plc.open(). pycomm3 1.2.14 reads this key when it
+            # constructs the underlying Socket(timeout=…). Note the typo
+            # in pycomm3's property setter (`socket_timout`) means
+            # `plc.socket_timeout = X` doesn't take effect; we have to
+            # set the dict key directly.
+            # Value 2.0s: each per-fragment recv() will time out in 2s,
+            # so a maximally-fragmented response can complete in <30s
+            # before the watchdog 30s threshold fires. Combined with the
+            # read-batching at the read site, a healthy cycle now
+            # completes in ~150ms total.
+            try:
+                sock_timeout = float(
                     os.environ.get("TRUSTNODE_AB_SOCKET_TIMEOUT_SECONDS", "2.0") or "2.0"
-                ))
-        except Exception:
-            pass
-        self._ab_pycomm3_client = plc
-        self._ab_pycomm3_path = path
-        return plc
+                )
+                plc._cfg["socket_timeout"] = sock_timeout
+            except Exception:
+                pass
+            plc.open()
+            # Also force-apply the timeout to the live socket after open(),
+            # in case the open path cached a socket created with a default
+            # value before our _cfg update propagated.
+            try:
+                sock = getattr(getattr(plc, "_sock", None), "sock", None)
+                if sock is not None:
+                    sock.settimeout(float(
+                        os.environ.get("TRUSTNODE_AB_SOCKET_TIMEOUT_SECONDS", "2.0") or "2.0"
+                    ))
+            except Exception:
+                pass
+            self._ab_pycomm3_client = plc
+            self._ab_pycomm3_path = path
+            return plc
 
     def _close_ab_pycomm3_client(self) -> None:
         if self._ab_pycomm3_client is not None:

@@ -542,36 +542,69 @@ async def _deferred_startup() -> None:
     # operator does. A failed integrity check usually points at a
     # disk-full / power-loss event that left the WAL inconsistent;
     # the operator should restore from .preVACUUM_* / .bak_* backup.
-    try:
-        import sqlite3 as _sqlite_check
-        integrity_results = {}
-        for label, path_attr in (("app_store", "_db_path"), ("telemetry", "_db_path")):
-            try:
+    # Operator 2026-07-24 (STARTUP DELAY FIX): these checks used to run
+    # SEQUENTIALLY and AWAITED here, before any gateway was started. On a real
+    # install that is brutal: a 2 GB telemetry DB takes ~46 s for a single
+    # quick_check, so collection did not begin until ~47 s after boot — the
+    # "app takes minutes to start collecting" report.
+    #
+    # The check is diagnostic, not a precondition for collecting: nothing below
+    # consumes its result except /api/health. So it now runs as a BACKGROUND
+    # task (both DBs concurrently) while startup proceeds to start gateways.
+    # Corruption is still detected and logged, just without blocking data.
+    async def _run_integrity_checks_bg() -> None:
+        try:
+            import sqlite3 as _sqlite_check
+            import time as _time_integrity
+
+            def _check(p):
+                con = _sqlite_check.connect(f"file:{p}?mode=ro", uri=True, timeout=10.0)
+                try:
+                    return str((con.execute("PRAGMA quick_check").fetchone() or ["unknown"])[0])
+                finally:
+                    con.close()
+
+            targets = []
+            for label, path_attr in (("app_store", "_db_path"), ("telemetry", "_db_path")):
                 target = app_store if label == "app_store" else telemetry_service
                 db_path = getattr(target, path_attr, None)
-                if not db_path:
-                    continue
+                if db_path:
+                    targets.append((label, db_path))
 
-                def _check(p):
-                    con = _sqlite_check.connect(f"file:{p}?mode=ro", uri=True, timeout=10.0)
-                    try:
-                        return str((con.execute("PRAGMA quick_check").fetchone() or ["unknown"])[0])
-                    finally:
-                        con.close()
-                result = await asyncio.to_thread(_check, db_path)
-                integrity_results[label] = result
-                if result.lower() != "ok":
-                    print(f"[trustnode][boot][integrity] {label} quick_check returned {result!r} — investigate before extended use", flush=True)
-            except Exception as exc:
-                integrity_results[label] = f"error: {exc!r}"
-                print(f"[trustnode][boot][integrity] {label} check raised: {exc!r}", flush=True)
-        # Stash the result on app_store so /api/health can surface it.
-        try:
-            setattr(app_store, "_last_integrity_results", integrity_results)
-        except Exception:
-            pass
-    except Exception as exc:
-        print(f"[trustnode][boot][integrity] check skipped: {exc!r}", flush=True)
+            async def _one(label: str, db_path: str) -> tuple[str, str]:
+                try:
+                    return label, await asyncio.to_thread(_check, db_path)
+                except Exception as exc:
+                    return label, f"error: {exc!r}"
+
+            t0 = _time_integrity.time()
+            pairs = await asyncio.gather(*(_one(l, p) for l, p in targets))
+            integrity_results = dict(pairs)
+            for label, result in integrity_results.items():
+                if str(result).lower() != "ok":
+                    print(
+                        f"[trustnode][boot][integrity] {label} quick_check returned {result!r}"
+                        " — investigate before extended use",
+                        flush=True,
+                    )
+            print(
+                f"[trustnode][boot][integrity] background check finished in {_time_integrity.time() - t0:.1f}s: "
+                f"{integrity_results}",
+                flush=True,
+            )
+            try:
+                setattr(app_store, "_last_integrity_results", integrity_results)
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"[trustnode][boot][integrity] check skipped: {exc!r}", flush=True)
+
+    try:
+        # Mark as pending so /api/health doesn't report a stale/absent result.
+        setattr(app_store, "_last_integrity_results", {"status": "pending"})
+    except Exception:
+        pass
+    asyncio.create_task(_run_integrity_checks_bg())
 
     bootstrap = None
     try:
