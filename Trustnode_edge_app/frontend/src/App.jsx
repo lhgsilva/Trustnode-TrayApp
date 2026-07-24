@@ -2,6 +2,7 @@ import { Component, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { Login } from "./components/Login/Login";
 import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
 import { DASHBOARD_GRID_VERSION, migrateWidgetsToFinerGrid } from "./components/Dashboard/widgetRegistry";
+import { registerDeclaredTagTypes } from "./components/Dashboard/tagTypes";
 import { ReportTemplateDesigner } from "./components/Reports/ReportTemplateDesigner";
 import { ScheduledReportsManager } from "./components/Reports/ScheduledReportsManager";
 // Batch Management module pages. Self-contained file; license gating in
@@ -14934,6 +14935,13 @@ const getGatewayHealth = (gateway) => {
         max_tags: 5000
       });
       const tags = Array.isArray(res.tags) ? res.tags : [];
+      // Remember the controller's DECLARED data types so the dashboard widget
+      // editor can stop a TEXT tag being dropped on a numeric-only widget even
+      // before the tag has ever been collected. Best-effort + additive: older
+      // backends omit `types` and the UI falls back to inferring from data.
+      try {
+        registerDeclaredTagTypes(gatewayForm.id || gatewayForm.plc_ip || "", res.types);
+      } catch { /* non-fatal */ }
       setGatewayOpcBrowseNodes([]);
       setGatewayOpcNodeSummary({ total: 0, objects: 0, variables: 0, methods: 0 });
       setGatewayDiscoveredTags(tags);

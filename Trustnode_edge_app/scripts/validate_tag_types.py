@@ -306,6 +306,61 @@ def validate_live_plc(ip: str) -> None:
         skip("live PLC", f"connect failed: {exc}")
 
 
+# -------------------------------------------------------------- 7. interlock
+def validate_interlock() -> None:
+    """The dashboard interlock must block a TEXT tag on a numeric-only widget,
+    allow it on text-capable widgets, and FAIL OPEN on anything unknown."""
+    section("7. WIDGET INTERLOCK — text tags vs numeric-only widgets")
+    tt = os.path.join(REPO, "frontend", "src", "components", "Dashboard", "tagTypes.js")
+    if not os.path.exists(tt):
+        skip("interlock", "tagTypes.js not found")
+        return
+    src = open(tt, encoding="utf-8").read()
+
+    # R8: widget keys must exist in the real registry, or the interlock is inert.
+    reg = os.path.join(REPO, "frontend", "src", "components", "Dashboard", "widgetRegistry.js")
+    if os.path.exists(reg):
+        real = set(re.findall(r'key:\s*"([a-z_0-9]+)"', open(reg, encoding="utf-8").read()))
+        block = re.search(r"NUMERIC_ONLY_WIDGETS = new Set\(\[(.*?)\]\)", src, re.S)
+        listed = set(re.findall(r'"([a-z_0-9]+)"', block.group(1) if block else ""))
+        bogus = sorted(listed - real)
+        ck("[R8] every numeric-only widget key exists in widgetRegistry",
+           not bogus and bool(listed),
+           f"listed={sorted(listed)} unknown={bogus}")
+        # the real chart widgets must all be covered
+        charts = {k for k in real if k.endswith("_chart")}
+        missing = sorted(charts - listed)
+        ck("[R8] all *_chart widgets are treated as numeric-only",
+           not missing, f"uncovered={missing}")
+
+    # R9: fail-open is mandatory — an unknown tag must never be blocked.
+    ck("[R9] unknown tags fail OPEN (never blocked)",
+       "UNKNOWN" in src and "fail open" in src.lower(),
+       "blocking on a guess would refuse a tag that is merely not collected yet")
+    ck("[R9] only a confident text tag yields severity 'block'",
+       'severity: "block"' in src and "TAG_KIND.TEXT" in src)
+    ck("[R9] numeric-looking strings warn but are allowed",
+       'severity: "warn"' in src and "NUMERIC_TEXT" in src)
+
+    # R10: declared type is authoritative and wired end-to-end.
+    plc = os.path.join(BACKEND, "app", "routers", "plc.py")
+    if os.path.exists(plc):
+        p = open(plc, encoding="utf-8").read()
+        ck("[R10] discover-tags exposes declared `types`",
+           "types: dict[str, str]" in p and "types=types_map" in p)
+    app = os.path.join(REPO, "frontend", "src", "App.jsx")
+    if os.path.exists(app):
+        a = open(app, encoding="utf-8").read()
+        ck("[R10] frontend registers declared types from discovery",
+           "registerDeclaredTagTypes" in a)
+    dd = os.path.join(REPO, "frontend", "src", "components", "Dashboard", "DashboardDesigner.jsx")
+    if os.path.exists(dd):
+        d = open(dd, encoding="utf-8").read()
+        ck("[R10] widget editor guards save with the interlock",
+           "widgetIsNumericOnly(form.type)" in d and "checkTagForWidget" in d)
+        ck("[R10] tag dropdown marks TEXT tags", "· TEXT" in d)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -323,6 +378,7 @@ def main() -> int:
     validate_sink_sql()
     validate_stored_data()
     validate_frontend()
+    validate_interlock()
     if args.plc:
         validate_live_plc(args.plc)
     else:

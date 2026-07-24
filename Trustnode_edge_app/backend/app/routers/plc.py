@@ -60,6 +60,12 @@ class TagDiscoveryResult(BaseModel):
     ok: bool
     tags: list[str] = Field(default_factory=list)
     message: str
+    # Declared controller data type per tag, e.g. {"Batch_Status_String": "STRING",
+    # "BT_PVA_Level": "REAL"}. Optional and additive: older callers ignore it,
+    # and every discovery path that can't determine types simply omits it.
+    # The UI uses this to stop a TEXT tag being dropped onto a numeric-only
+    # widget (line/gauge/pie) BEFORE the tag has ever been collected.
+    types: dict[str, str] = Field(default_factory=dict)
 
 
 class OpcUaBrowseRequest(BaseModel):
@@ -744,7 +750,38 @@ def _discover_ab_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
                         msg += f"; filtered {bad_count} unreadable tag(s)"
                     if partial:
                         msg += f"; probe-read budget exceeded — last {len(candidates) - i} tag(s) returned unverified"
-                    return TagDiscoveryResult(ok=True, tags=good, message=msg)
+                    # Declared data type per discovered tag. Indexed/member names
+                    # (Arr[3], S.field) inherit their base tag's type. Best-effort:
+                    # any failure just yields an empty map and the UI falls back
+                    # to inferring from collected data.
+                    types_map: dict[str, str] = {}
+                    try:
+                        base_types: dict[str, str] = {}
+                        for td in tag_defs:
+                            if not isinstance(td, dict):
+                                continue
+                            nm = _base_name(td)
+                            if not nm:
+                                continue
+                            dt = td.get("data_type")
+                            if isinstance(dt, dict):
+                                dt = dt.get("name") or "STRUCT"
+                            dt = str(dt or "").strip().upper()
+                            if dt:
+                                base_types[nm] = dt
+                        for nm in good:
+                            root = re.sub(r"\[[^\]]*\]", "", str(nm))
+                            if root.startswith("Program:"):
+                                parts = root.split(".")
+                                root = ".".join(parts[:2]) if len(parts) >= 2 else root
+                            else:
+                                root = root.split(".", 1)[0]
+                            dt = base_types.get(root) or base_types.get(str(nm))
+                            if dt:
+                                types_map[str(nm)] = dt
+                    except Exception:
+                        types_map = {}
+                    return TagDiscoveryResult(ok=True, tags=good, message=msg, types=types_map)
                 return TagDiscoveryResult(
                     ok=False,
                     tags=[],

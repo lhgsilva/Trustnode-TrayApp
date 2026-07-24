@@ -10,6 +10,7 @@ import {
 import { compactWidgets, findFirstFreeSpot, normalizeWidgets, reflowWidgetsForMove, reflowWidgetsForMoveToPoint, reflowWidgetsForResize } from "./layoutUtils";
 import { materializePowerDashboardPayload } from "./powerDashboardTemplate";
 import { filterRowsByRange, getLatestTagRow, toTsMs } from "./dashboardAnalytics";
+import { classifyTag, checkTagForWidget, widgetIsNumericOnly, TAG_KIND } from "./tagTypes";
 import { listReportTemplates } from "../../api";
 import "./dashboard.css";
 
@@ -1019,6 +1020,9 @@ export function DashboardDesigner({
   const [queryModalOpen, setQueryModalOpen] = useState(false);
   // Dedicated axis-configuration modal (all Y axes, one card per axis in use).
   const [axisModalOpen, setAxisModalOpen] = useState(false);
+  // Live rows used ONLY to infer a tag's type when the controller's declared
+  // type isn't known (see tagTypes.js). Never used for rendering.
+  const tagRowsForTypes = Array.isArray(dataLogView) ? dataLogView : (Array.isArray(tagRows) ? tagRows : []);
   const [computedModalOpen, setComputedModalOpen] = useState(false);
   const [resizingId, setResizingId] = useState("");
   const gridRef = useRef(null);
@@ -1610,6 +1614,35 @@ export function DashboardDesigner({
   }, [form?.config, editingId, canEdit, modalOpen, queryModalOpen]);
 
   const saveWidget = () => {
+    // TAG TYPE INTERLOCK — a numeric-only widget (chart/gauge/pie) cannot plot
+    // a TEXT tag: the historian stores those with value=NULL, so the widget
+    // would render an empty/flat chart with no explanation. Block ONLY when we
+    // are confident the tag carries text (declared STRING, or observed
+    // text-only). Anything unknown is allowed through by design — a tag that
+    // simply hasn't been collected yet must never be refused.
+    if (widgetIsNumericOnly(form.type)) {
+      const offenders = [];
+      const primaryGwId = String(form?.config?.gateway_id || "").trim();
+      const primaryTag = String(form?.config?.tag_name || "").trim();
+      if (primaryTag) {
+        const v = checkTagForWidget(form.type, primaryGwId, primaryTag, tagRowsForTypes);
+        if (v.severity === "block") offenders.push(v.message);
+      }
+      for (const s of (Array.isArray(form?.config?.series_extra) ? form.config.series_extra : [])) {
+        const tg = String(s?.tag_name || "").trim();
+        if (!tg) continue;
+        if (String(s?.chart_type || "").toLowerCase() === "limit") continue;
+        const v = checkTagForWidget(form.type, String(s?.gateway_id || "").trim() || primaryGwId, tg, tagRowsForTypes);
+        if (v.severity === "block") offenders.push(v.message);
+      }
+      if (offenders.length) {
+        const msg = "This widget type can only plot numeric tags:\n\n"
+          + offenders.map((m) => `• ${m}`).join("\n")
+          + "\n\nShow text tags with a Value KPI or a Table widget instead.";
+        try { window.alert(msg); } catch (_) {}
+        return;
+      }
+    }
     // Operator 2026-06-16: trend widgets can carry multiple series
     // (primary + series_extra) — but the X-axis is a single shared
     // time axis. If two series come from gateways with different
@@ -2692,12 +2725,37 @@ export function DashboardDesigner({
                           })}
                         >
                           <option value="">Select tag</option>
-                          {selectedGatewayTags.map((tag) => (
-                            <option key={tag} value={tag}>
-                              {formatTagForDisplay ? formatTagForDisplay(tag) : tag}
-                            </option>
-                          ))}
+                          {selectedGatewayTags.map((tag) => {
+                            // Mark text tags so the operator can see, at a
+                            // glance, which ones a numeric widget can't plot.
+                            const k = classifyTag(form.config?.gateway_id, tag, tagRowsForTypes);
+                            const suffix = k === TAG_KIND.TEXT ? "  · TEXT"
+                              : k === TAG_KIND.NUMERIC_TEXT ? "  · TEXT (numeric)"
+                              : "";
+                            return (
+                              <option key={tag} value={tag}>
+                                {(formatTagForDisplay ? formatTagForDisplay(tag) : tag) + suffix}
+                              </option>
+                            );
+                          })}
                         </select>
+                        {/* Interlock notice. Never blocks an unknown tag —
+                            only a tag we are confident carries text. */}
+                        {(() => {
+                          const v = checkTagForWidget(form.type, form.config?.gateway_id, form.config?.tag_name, tagRowsForTypes);
+                          if (v.severity === "none") return null;
+                          const isBlock = v.severity === "block";
+                          return (
+                            <div style={{
+                              marginTop: 6, padding: "6px 9px", borderRadius: 6, fontSize: 12,
+                              border: `1px solid ${isBlock ? "var(--danger, #d9534f)" : "var(--warning, #d99a00)"}`,
+                              color: isBlock ? "var(--danger, #d9534f)" : "var(--warning, #d99a00)",
+                            }}>
+                              {isBlock ? "⚠ " : "ℹ "}{v.message}
+                              {v.suggest ? <div style={{ opacity: 0.85, marginTop: 2 }}>{v.suggest}</div> : null}
+                            </div>
+                          );
+                        })()}
                       </label>
                     ) : null}
                   </>
