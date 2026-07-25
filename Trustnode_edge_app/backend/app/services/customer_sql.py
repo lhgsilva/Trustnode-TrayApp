@@ -129,7 +129,20 @@ def get_engine(target: Dict[str, Any]) -> Tuple[Any, str]:
                 max_overflow=10,
                 pool_pre_ping=True,
                 pool_recycle=300,
-                connect_args={"connect_timeout": 5},
+                connect_args={
+                    "connect_timeout": 5,
+                    # 2026-07-25: connect_timeout alone let an ESTABLISHED
+                    # connection with a slow/hung query block its caller
+                    # FOREVER — observed parking the V2 storage writer for
+                    # 59+ min mid-INSERT (WAN write to the cloud DB). A hard
+                    # statement ceiling + TCP keepalives turn "hung forever"
+                    # into a retriable error within seconds.
+                    "options": "-c statement_timeout=8000 -c lock_timeout=4000",
+                    "keepalives": 1,
+                    "keepalives_idle": 30,
+                    "keepalives_interval": 10,
+                    "keepalives_count": 3,
+                },
             )
         except Exception as exc:
             _engine_last_error = f"engine create failed: {type(exc).__name__}: {exc}"

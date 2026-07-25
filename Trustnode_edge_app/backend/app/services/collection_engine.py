@@ -198,7 +198,16 @@ class ReaderV2(threading.Thread):
 
 
 class StorageWriterV2(threading.Thread):
-    """Single writer: batched historian commits + per-cycle telemetry/sinks."""
+    """HISTORIAN committer (V2.1): local WAL-SQLite commits ONLY — never
+    touches a network. Committed batches are handed to DistributionV2 on a
+    second bounded queue, so a hung cloud write can lag distribution but can
+    NEVER freeze the local historian again.
+
+    V2.0 lesson (2026-07-25, live): one thread did historian + telemetry +
+    sinks; a cloud-PG INSERT with no statement_timeout parked it for 59+ min.
+    Charts (fed by the reader) stayed at 100%, but the historian froze and
+    ~3.5k cycles piled up in RAM. Splitting the pipeline + statement_timeout
+    on the PG engine removes both failure modes."""
 
     MAX_QUEUE_CYCLES = 4096          # bounded: ~68 min of 1 s cycles
     MAX_REBUFFER_ROWS = 50_000       # historian retry buffer bound
@@ -212,10 +221,12 @@ class StorageWriterV2(threading.Thread):
         self.dropped_cycles = 0
         self._hist_rebuffer: list[dict] = []
         self._last_bootstrap_refresh = 0.0
+        self._distributor = DistributionV2()
 
     def stop(self) -> None:
         self._stop_evt.set()
         self._wake.set()
+        self._distributor.stop()
 
     def enqueue(self, batch: _CycleBatch) -> None:
         with self._lock:
@@ -232,7 +243,9 @@ class StorageWriterV2(threading.Thread):
 
     def queue_stats(self) -> tuple[int, int]:
         with self._lock:
-            return len(self._queue), self.dropped_cycles
+            hist_q, hist_drop = len(self._queue), self.dropped_cycles
+        dist_q, dist_drop = self._distributor.stats()
+        return hist_q + dist_q, hist_drop + dist_drop
 
     # -- row building (same shape _broadcast produced in V1) -------------
     @staticmethod
@@ -291,18 +304,94 @@ class StorageWriterV2(threading.Thread):
                 f", DROPPED {lost} oldest" if lost > 0 else "",
             )
 
-    def _telemetry_and_sinks(self, batch: _CycleBatch) -> None:
+    def run(self) -> None:
+        flush_s = _flush_interval_s()
+        if not self._distributor.is_alive():
+            self._distributor.start()
+        _LOG.info("v2-writer started (flush=%.0fms, queue cap=%d cycles, "
+                  "distribution split off)", flush_s * 1000, self.MAX_QUEUE_CYCLES)
+        while not self._stop_evt.is_set():
+            self._wake.wait(timeout=flush_s)
+            self._wake.clear()
+            with self._lock:
+                batches = list(self._queue)
+                self._queue.clear()
+            if not batches and not self._hist_rebuffer:
+                continue
+            t0 = time.monotonic()
+            self._write_historian(batches)
+            hist_ms = (time.monotonic() - t0) * 1000.0
+            # Hand the committed batches to distribution (telemetry + cloud +
+            # parallel sinks). Never inline — a slow cloud write must not delay
+            # the NEXT historian commit.
+            for b in batches:
+                self._distributor.submit(b)
+            if hist_ms > 2000:
+                _LOG.warning(
+                    "v2-writer slow HISTORIAN flush: %d cycle(s) in %.0f ms "
+                    "(local DB lagging)", len(batches), hist_ms,
+                )
+        _LOG.info("v2-writer exited")
+
+
+class DistributionV2(threading.Thread):
+    """Telemetry + sinks/outbox distribution, decoupled from the historian.
+
+    Consumes committed cycle batches; every stage is TIMED and logged when
+    slow so a blocking call names itself in the log (the V2.0 park was only
+    attributable after the fact — never again). Bounded queue: if the cloud
+    stays stuck past ~2h of 1s cycles, oldest DISTRIBUTION work drops (the
+    local historian already holds the data; the store-forward outbox re-syncs
+    cloud gaps from it on recovery)."""
+
+    MAX_QUEUE_CYCLES = 8192
+
+    def __init__(self) -> None:
+        super().__init__(daemon=True, name="tn-v2-dist")
+        self._queue: deque = deque(maxlen=self.MAX_QUEUE_CYCLES)
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop_evt = threading.Event()
+        self.dropped = 0
+        self._last_bootstrap_refresh = 0.0
+        self._slow_log_mono = 0.0
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        self._wake.set()
+
+    def submit(self, batch: _CycleBatch) -> None:
+        with self._lock:
+            if len(self._queue) == self._queue.maxlen:
+                self.dropped += 1
+                if self.dropped % 100 == 1:
+                    _LOG.warning(
+                        "v2-dist queue FULL — dropped %d cycle(s) of DISTRIBUTION "
+                        "work (historian already durable; outbox re-syncs cloud)",
+                        self.dropped,
+                    )
+            self._queue.append(batch)
+        self._wake.set()
+
+    def stats(self) -> tuple[int, int]:
+        with self._lock:
+            return len(self._queue), self.dropped
+
+    def _distribute_one(self, batch: _CycleBatch) -> None:
         from app.state import telemetry_service, app_store
 
         w = batch.worker
-        now_mono = time.monotonic()
-        if now_mono - self._last_bootstrap_refresh >= 10.0:
-            self._last_bootstrap_refresh = now_mono
+        boot_ms = tel_ms = sink_ms = 0.0
+        t = time.monotonic()
+        if t - self._last_bootstrap_refresh >= 10.0:
+            self._last_bootstrap_refresh = t
             try:
                 bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
                 telemetry_service.configure_from_bootstrap(bootstrap)
             except Exception:
                 pass
+            boot_ms = (time.monotonic() - t) * 1000.0
+        t = time.monotonic()
         try:
             ok, err, _rec_id = telemetry_service.record_collection_cycle(
                 gateway_id=batch.gateway_id,
@@ -322,38 +411,44 @@ class StorageWriterV2(threading.Thread):
                 w.last_error = f"Cloud-record write failed: {err}"
         except Exception as exc:
             w.last_error = f"Cloud-record write error: {exc}"
+        tel_ms = (time.monotonic() - t) * 1000.0
+        t = time.monotonic()
         try:
             w._persist_readings(batch.readings)
         except Exception as exc:
             _LOG.warning(
-                "v2-writer sink persist failed gateway=%s: %s: %s",
+                "v2-dist sink persist failed gateway=%s: %s: %s",
                 batch.gateway_id, type(exc).__name__, exc,
+            )
+        sink_ms = (time.monotonic() - t) * 1000.0
+        total = boot_ms + tel_ms + sink_ms
+        # Name the culprit when distribution is slow — rate-limited to one
+        # line per 30 s so a degraded cloud doesn't flood the log.
+        if total > 1000.0 and (time.monotonic() - self._slow_log_mono) > 30.0:
+            self._slow_log_mono = time.monotonic()
+            q_len, _ = self.stats()
+            _LOG.warning(
+                "v2-dist slow cycle gateway=%s total=%.0fms "
+                "(bootstrap=%.0f tel=%.0f sinks=%.0f) backlog=%d",
+                batch.gateway_id, total, boot_ms, tel_ms, sink_ms, q_len,
             )
 
     def run(self) -> None:
-        flush_s = _flush_interval_s()
-        _LOG.info("v2-writer started (flush=%.0fms, queue cap=%d cycles)",
-                  flush_s * 1000, self.MAX_QUEUE_CYCLES)
+        _LOG.info("v2-dist started (queue cap=%d cycles)", self.MAX_QUEUE_CYCLES)
         while not self._stop_evt.is_set():
-            self._wake.wait(timeout=flush_s)
+            self._wake.wait(timeout=0.5)
             self._wake.clear()
-            with self._lock:
-                batches = list(self._queue)
-                self._queue.clear()
-            if not batches and not self._hist_rebuffer:
-                continue
-            t0 = time.monotonic()
-            self._write_historian(batches)
-            for b in batches:
-                self._telemetry_and_sinks(b)
-            flush_ms = (time.monotonic() - t0) * 1000.0
-            if flush_ms > 2000:
-                _LOG.warning(
-                    "v2-writer slow flush: %d cycle(s) in %.0f ms "
-                    "(storage lagging; queue absorbs the difference)",
-                    len(batches), flush_ms,
-                )
-        _LOG.info("v2-writer exited")
+            while not self._stop_evt.is_set():
+                with self._lock:
+                    batch = self._queue.popleft() if self._queue else None
+                if batch is None:
+                    break
+                try:
+                    self._distribute_one(batch)
+                except Exception as exc:
+                    _LOG.warning("v2-dist cycle failed: %s: %s",
+                                 type(exc).__name__, exc)
+        _LOG.info("v2-dist exited")
 
 
 class CollectionEngineV2:
