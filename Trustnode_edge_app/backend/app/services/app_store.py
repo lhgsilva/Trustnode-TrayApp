@@ -2383,6 +2383,44 @@ class AppStore:
         )
 
     def _pull_config_from_cloud_once(self) -> None:
+        """SINGLE-FLIGHT + TTL gate (2026-07-25).
+
+        This used to run a full WAN Postgres round-trip PER CALL — and
+        get_bootstrap calls it in hosted mode, so EVERY UI/API request
+        pulled the cloud. At boot the frontend fires dozens of bootstrap
+        reads at once: 200 anyio workers each doing a 1-10 s cloud pull
+        exhausted the thread pool, hung every API (including /api/health),
+        and starved the historian writer behind the lock convoy — the
+        "running but no data for minutes after boot" wedge observed live
+        three times on 2026-07-25 (14:42, 16:02, 22:01 boots).
+
+        Now: at most ONE pull in flight process-wide and at most one per
+        TTL window; every other caller returns immediately and reads the
+        (≤ TTL-stale) local config cache. Config freshness ≤ 5 s is far
+        better than the previous behavior under load (minutes of nothing).
+        """
+        ttl = 5.0
+        try:
+            ttl = max(1.0, float(os.environ.get("TRUSTNODE_CONFIG_PULL_TTL_SECONDS", "5") or "5"))
+        except Exception:
+            pass
+        if time.monotonic() - getattr(self, "_config_pull_done_mono", 0.0) < ttl:
+            return
+        gate = getattr(self, "_config_pull_gate", None)
+        if gate is None:
+            # Benign race: two threads may each build a Lock on the very
+            # first call — worst case one extra pull, then one instance wins.
+            gate = threading.Lock()
+            self._config_pull_gate = gate
+        if not gate.acquire(blocking=False):
+            return  # a pull is already in flight — use the local cache
+        try:
+            self._pull_config_from_cloud_once_inner()
+            self._config_pull_done_mono = time.monotonic()
+        finally:
+            gate.release()
+
+    def _pull_config_from_cloud_once_inner(self) -> None:
         cloud = self._get_cloud_database_target()
         if not cloud:
             return
