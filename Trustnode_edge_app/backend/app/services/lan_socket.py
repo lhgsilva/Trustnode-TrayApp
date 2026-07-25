@@ -98,6 +98,14 @@ def _serve_in_thread(port: int) -> None:
         port=int(port),
         log_level="warning",
         access_log=False,
+        # 2026-07-25: CRITICAL — this second server shares the main server's
+        # FastAPI app. With lifespan on (default), starting it re-fired EVERY
+        # @app.on_event("startup") handler: double auto-resume (gateway
+        # start-stop-start at boot), double watchdog/scheduler arming, doubled
+        # boot-time DB contention — and toggling LAN OFF would run the
+        # SHUTDOWN handlers while the app was still serving. The main server
+        # owns the lifespan; this one must never touch it.
+        lifespan="off",
     )
     server = uvicorn.Server(config)
     with _lan_lock:

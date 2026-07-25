@@ -892,8 +892,21 @@ async def _deferred_startup() -> None:
         pass
 
 
+# 2026-07-25: defense-in-depth against DOUBLE startup. The in-process LAN
+# server (lan_socket.py) shares this FastAPI app and used to re-fire the
+# lifespan (observed: every boot ran auto-resume twice — gateway start, stop,
+# start — and armed two watchdogs). lan_socket now runs with lifespan="off";
+# this guard keeps boot single-shot even if some future embedder forgets that.
+_STARTUP_RAN = False
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
+    global _STARTUP_RAN
+    if _STARTUP_RAN:
+        print("[trustnode][boot] duplicate startup_event suppressed", flush=True)
+        return
+    _STARTUP_RAN = True
     # Operator 2026-07-03 (COLLECTION-STARVATION FIX): raise the anyio
     # default thread limiter from 40 to 200. FastAPI runs every sync route
     # AND every `asyncio.to_thread` on this ONE shared pool. The PLC worker

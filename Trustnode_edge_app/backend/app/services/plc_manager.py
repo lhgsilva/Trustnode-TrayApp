@@ -2396,6 +2396,10 @@ class GatewayWorker:
         sinks_sql.bootstrap_customer_db short-circuits when the schema
         is already in place.
 
+        2026-07-25: failure backoff — after 3 consecutive write failures the
+        mirror pauses for 60 s (see the except block below) so a degraded
+        cloud can't tax every distribution cycle with a full timeout wait.
+
         Important: this path does NOT use the outbox (operator could
         still add the customer DB as an explicit parallel sink to
         get the M10 outbox guarantees). We chose best-effort here
@@ -2405,6 +2409,9 @@ class GatewayWorker:
         double the disk write rate.
         """
         if not readings:
+            return
+        # Failure backoff active? Skip the whole mirror attempt.
+        if time.monotonic() < getattr(self, "_mirror_skip_until_mono", 0.0):
             return
         # Skip mirroring if the customer DB is ALREADY one of the
         # configured parallel sinks — that path uses the M10 outbox
@@ -2493,10 +2500,26 @@ class GatewayWorker:
         try:
             _ss.write_historian_batch(engine, rows, schema=str(target.get("schema") or "public"))
             _ss.upsert_live_latest(engine, rows, schema=str(target.get("schema") or "public"))
-        except Exception:
+            self._mirror_fail_streak = 0
+        except Exception as exc:
             # Drop — local primary sink already has the rows. The
             # operator can promote the customer DB to an explicit
             # parallel sink for outbox-backed durability.
+            #
+            # 2026-07-25 backoff: this mirror is a synchronous WAN write on
+            # the distribution path (measured ~2.3 s/cycle; with the new
+            # statement_timeout a dead cloud costs up to 8 s per attempt).
+            # After 3 consecutive failures, skip mirroring for 60 s so a
+            # cloud outage degrades distribution by seconds, not by
+            # 8 s x every cycle.
+            self._mirror_fail_streak = int(getattr(self, "_mirror_fail_streak", 0)) + 1
+            if self._mirror_fail_streak >= 3:
+                self._mirror_skip_until_mono = time.monotonic() + 60.0
+                _GW_LOG.warning(
+                    "customer-db mirror failing (%d consecutive: %s) — pausing mirror 60s "
+                    "(local historian unaffected)",
+                    self._mirror_fail_streak, type(exc).__name__,
+                )
             return
 
     def _publish_to_outbound_connections(self, readings: List[GatewayReading]) -> None:
