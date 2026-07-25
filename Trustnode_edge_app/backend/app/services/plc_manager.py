@@ -312,6 +312,20 @@ class GatewayWorker:
         # handles a cold first cycle just fine. Fire-and-forget here
         # so the HTTP /api/plc/gateways/start returns instantly.
         asyncio.create_task(asyncio.to_thread(self._prewarm_client))
+        # V2 engine (feature flag): decoupled reader-thread pipeline instead of
+        # the asyncio run loop. Requires the manager (for thread-safe WS fanout)
+        # — resolved from the bound emit_event callback. Falls back to V1 when
+        # the flag is off or the manager can't be resolved.
+        try:
+            from app.services.collection_engine import engine_v2, engine_v2_enabled
+            _mgr = getattr(emit_event, "__self__", None)
+            if engine_v2_enabled() and _mgr is not None and hasattr(_mgr, "fanout_threadsafe"):
+                _mgr._loop = asyncio.get_running_loop()
+                self._task = None
+                engine_v2.start_reader(self, _mgr)
+                return
+        except Exception as exc:
+            _GW_LOG.warning("V2 engine start failed (%s) — falling back to V1 loop", exc)
         self._task = asyncio.create_task(self._run_loop(emit_event))
 
         def _on_run_loop_done(t: "asyncio.Task[Any]", gid: str = self.gateway_id) -> None:
@@ -359,6 +373,12 @@ class GatewayWorker:
         )
         with self._remote_flush_lock:
             self._remote_flush_inflight = False
+        # V2 engine: stop the reader thread (no-op when V2 never started).
+        try:
+            from app.services.collection_engine import engine_v2
+            engine_v2.stop_reader(self.gateway_id)
+        except Exception:
+            pass
         if self._task:
             self._task.cancel()
             try:
@@ -448,6 +468,24 @@ class GatewayWorker:
                         thread_name_prefix=f"tn-collect-{self.gateway_id[:8]}",
                     )
         return self._collection_executor
+
+    def _record_stage_ms(self, read_ms: float, tel_ms: float, emit_ms: float, per_ms: float) -> None:
+        """Phase-1 instrumentation: accumulate per-stage wall times over the
+        60-cycle cadence window (sum + max per stage). Read by the cadence
+        log line, then reset. Log-only — never raises."""
+        try:
+            win = getattr(self, "_stage_win", None)
+            if win is None:
+                win = {"n": 0, "sum": [0.0, 0.0, 0.0, 0.0], "max": [0.0, 0.0, 0.0, 0.0]}
+            vals = (read_ms, tel_ms, emit_ms, per_ms)
+            win["n"] += 1
+            for i, v in enumerate(vals):
+                win["sum"][i] += v
+                if v > win["max"][i]:
+                    win["max"][i] = v
+            self._stage_win = win
+        except Exception:
+            pass
 
     def _get_persist_executor(self) -> ThreadPoolExecutor:
         """Lazily create this gateway's DEDICATED persistence thread pool,
@@ -569,6 +607,10 @@ class GatewayWorker:
                 # can't wedge the next cycle (the same clean-slate the watchdog
                 # restart now does), then reconnects. Configurable; 0 disables.
                 read_to = self._read_timeout_s
+                # Phase-1 instrumentation: wall-clock per pipeline stage, so the
+                # cadence log attributes cycle time (read vs telemetry vs emit vs
+                # persist) instead of one opaque cycle_ms. Log-only; no behavior.
+                _t_read0 = time.monotonic()
                 try:
                     if read_to and read_to > 0:
                         readings = await asyncio.wait_for(
@@ -595,6 +637,7 @@ class GatewayWorker:
                     _iv = max(0.2, min(2.0, (int(self.config.interval_ms or 1000) / 1000.0)))
                     await asyncio.sleep(_iv)
                     continue
+                _read_ms = (time.monotonic() - _t_read0) * 1000.0
                 self.latest_readings = readings
                 # Liveness stamp — successful read = worker is alive.
                 # The supervisor watchdog reads this to decide whether
@@ -616,6 +659,7 @@ class GatewayWorker:
                     collection_allowed, block_reason = self._is_collection_allowed(readings)
                 self.collection_blocked = not collection_allowed
                 self.collection_block_reason = block_reason
+                _t_tel0 = time.monotonic()
                 if collection_allowed:
                     # Durable local commit is the definition of successful collection.
                     # If this fails, we keep runtime alive but we do not mark this cycle as collected.
@@ -691,6 +735,8 @@ class GatewayWorker:
                             "telemetry-write-exception gateway=%s exc=%s (charts unaffected)",
                             self.gateway_id, exc,
                         )
+                _tel_ms = (time.monotonic() - _t_tel0) * 1000.0
+                _t_emit0 = time.monotonic()
                 await emit_event(
                     {
                         "type": "reading",
@@ -703,11 +749,14 @@ class GatewayWorker:
                         "readings": [r.model_dump() for r in readings],
                     }
                 )
+                _emit_ms = (time.monotonic() - _t_emit0) * 1000.0
+                _per_ms = 0.0
                 if collection_allowed:
                     # DB sink writes can be blocking (sqlite/file/remote enqueue).
                     # Execute off-loop AND bound it — a hung sink (locked DB, dead
                     # remote) must not stall the cycle. On timeout we log and move
                     # on; the historian buffer + outbox already retry the data.
+                    _t_per0 = time.monotonic()
                     try:
                         # DEDICATED persist pool — a slow/locked sink parks a
                         # persist worker, never a read worker, so the next read
@@ -724,6 +773,8 @@ class GatewayWorker:
                             "(read loop unaffected; persist draining on its own pool)",
                             self.gateway_id,
                         )
+                    _per_ms = (time.monotonic() - _t_per0) * 1000.0
+                self._record_stage_ms(_read_ms, _tel_ms, _emit_ms, _per_ms)
             except Exception as exc:
                 err_text = str(exc)
                 # Suppress transient handshake errors during the post-start
@@ -784,11 +835,26 @@ class GatewayWorker:
             # waiting for an overrun streak.
             self._cycle_metric_count = (getattr(self, "_cycle_metric_count", 0) or 0) + 1
             if self._cycle_metric_count % 60 == 0:
+                # Per-stage attribution (avg/max ms over the window) so a slow
+                # cycle names its culprit: read (PLC), tel (telemetry+outbox
+                # gate), emit (historian write + WS fanout), persist (sinks).
+                win = getattr(self, "_stage_win", None) or {}
+                n = max(1, int(win.get("n") or 0))
+                s = win.get("sum") or [0.0] * 4
+                m = win.get("max") or [0.0] * 4
+                try:
+                    pq = self._persist_executor._work_queue.qsize() if self._persist_executor else 0
+                except Exception:
+                    pq = -1
                 _GW_LOG.info(
-                    "cadence gateway=%s cycle_ms=%.0f interval_ms=%d tags=%d",
+                    "cadence gateway=%s cycle_ms=%.0f interval_ms=%d tags=%d "
+                    "read_ms=%.0f/%.0f tel_ms=%.0f/%.0f emit_ms=%.0f/%.0f "
+                    "persist_ms=%.0f/%.0f persist_q=%d",
                     self.gateway_id, self._measured_cycle_ms, configured_ms,
                     len(self.config.tags or []),
+                    s[0] / n, m[0], s[1] / n, m[1], s[2] / n, m[2], s[3] / n, m[3], pq,
                 )
+                self._stage_win = None  # reset the window
             if elapsed_s * 1000.0 > configured_ms * 1.5:
                 self._cycle_overrun_streak = (getattr(self, "_cycle_overrun_streak", 0) or 0) + 1
             else:
@@ -3410,6 +3476,9 @@ class PLCManager:
         self.active_gateway_id: str | None = None
         self.legacy_config = GatewayConfig()
         self._subscribers: Set[asyncio.Queue] = set()
+        # Event-loop handle for thread-safe WS fanout (V2 readers). Captured
+        # lazily the first time a gateway starts on the loop.
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.global_collection_triggers: List[Dict[str, Any]] = []
         self.global_collection_trigger_mode: str = "any"
         self.global_live_values: Dict[str, Dict[str, Any]] = {}
@@ -3632,6 +3701,34 @@ class PLCManager:
 
     def unsubscribe(self, queue: asyncio.Queue) -> None:
         self._subscribers.discard(queue)
+
+    def fanout_threadsafe(self, message: Dict[str, Any]) -> None:
+        """Push an event to every WS subscriber from ANY thread (V2 readers).
+
+        asyncio.Queue.put_nowait is not thread-safe, so the actual push hops
+        onto the event loop via call_soon_threadsafe. A full queue (slow WS
+        client) drops that client's event — same policy as V1's _broadcast.
+        Never raises: fanout is best-effort by contract."""
+        loop = getattr(self, "_loop", None)
+        if loop is None or loop.is_closed():
+            return
+
+        def _push() -> None:
+            dead = []
+            for q in list(self._subscribers):
+                try:
+                    q.put_nowait(message)
+                except asyncio.QueueFull:
+                    continue
+                except Exception:
+                    dead.append(q)
+            for q in dead:
+                self._subscribers.discard(q)
+
+        try:
+            loop.call_soon_threadsafe(_push)
+        except RuntimeError:
+            pass  # loop shutting down
 
     async def _broadcast(self, message: Dict[str, Any]) -> None:
         # Persist historian at backend-side so collection does not depend on UI websocket state.
@@ -4065,8 +4162,17 @@ class PLCManager:
         w.running = True
         w._last_progress_mono = time.monotonic()
         try:
-            w._task = asyncio.create_task(w._run_loop(self._broadcast))
-            _trace("6.spawn.done")
+            # V2 engine: restart = stop + start a fresh reader thread. The
+            # asyncio-task spawn below is the V1 path only.
+            from app.services.collection_engine import engine_v2, engine_v2_enabled
+            if engine_v2_enabled() and hasattr(self, "fanout_threadsafe"):
+                engine_v2.stop_reader(gateway_id)
+                w._task = None
+                engine_v2.start_reader(w, self)
+                _trace("6.spawn.done (v2 reader)")
+            else:
+                w._task = asyncio.create_task(w._run_loop(self._broadcast))
+                _trace("6.spawn.done")
         except Exception as exc:
             _trace(f"6.spawn.exc={type(exc).__name__}:{exc}")
             raise
@@ -4087,7 +4193,8 @@ class PLCManager:
             except Exception:
                 pass
 
-        w._task.add_done_callback(_on_restart_done)
+        if w._task is not None:  # V1 only — the V2 reader thread has no task
+            w._task.add_done_callback(_on_restart_done)
 
     async def _watchdog_loop(self) -> None:
         try:
