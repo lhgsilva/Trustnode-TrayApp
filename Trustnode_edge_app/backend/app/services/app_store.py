@@ -254,6 +254,42 @@ class AppStore:
         self._live_sync_thread.start()
         self._cloud_live_cache_thread.start()
         self._sync_thread.start()
+        # 2026-07-26: lock-starvation detector. A 12h soak caught app_store's
+        # lock held for 11.5 HOURS (historian writer + distribution + all API
+        # handlers parked; zero open network sockets => an internal deadlock,
+        # not a slow cloud call) — and nothing in the process could say WHO
+        # held it. This thread probes the lock every 60 s; if it can't acquire
+        # within 45 s it dumps EVERY thread's stack to the log (rate-limited
+        # to one dump per 10 min), so the next starvation names its holder.
+        threading.Thread(target=self._lock_starvation_watchdog,
+                         name="tn-lock-watchdog", daemon=True).start()
+
+    def _lock_starvation_watchdog(self) -> None:
+        import sys as _sys
+        import traceback as _tb
+        last_dump = 0.0
+        time.sleep(120)  # let boot noise settle
+        while True:
+            try:
+                got = self._lock.acquire(timeout=45.0)
+                if got:
+                    self._lock.release()
+                    time.sleep(60)
+                    continue
+                now = time.monotonic()
+                if now - last_dump < 600:
+                    time.sleep(60)
+                    continue
+                last_dump = now
+                names = {t.ident: t.name for t in threading.enumerate()}
+                print("[trustnode][lock-watchdog] app_store lock STARVED >45s — "
+                      "dumping all thread stacks:", flush=True)
+                for tid, frame in _sys._current_frames().items():
+                    stack = "".join(_tb.format_stack(frame, limit=12))
+                    print(f"[trustnode][lock-watchdog] --- thread {names.get(tid, tid)} ---\n"
+                          f"{stack}", flush=True)
+            except Exception:
+                time.sleep(60)
 
     def _cloud_target_schema_key(self, cloud: dict[str, Any], schema: str) -> str:
         return "|".join(
