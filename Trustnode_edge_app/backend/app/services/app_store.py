@@ -35,7 +35,12 @@ class AppStore:
     DEFAULT_LOCAL_DB_ID = "local-sqlite-default"
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        # 2026-07-26: RLock (was Lock). With a plain Lock, any method that
+        # holds the lock and calls another method that re-acquires it
+        # SELF-DEADLOCKS FOREVER — the exact signature of the 11.5h overnight
+        # park (lock never released, zero open sockets). RLock makes
+        # same-thread re-entry legal; cross-thread semantics are unchanged.
+        self._lock = threading.RLock()
         # Historian telemetry (PLC writes + cloud-outbox reads + the live
         # latest-value cache) runs on a SEPARATE lock from config/scope/DB
         # state. The PLC writes ~5 rows/sec and the outbox flush fires every
@@ -44,7 +49,8 @@ class AppStore:
         # pattern). historian_readings/app_logs touch a disjoint set of rows
         # from config_documents, so they need no coordination with config —
         # only SQLite's own WAL write serialization, which this preserves.
-        self._hist_lock = threading.Lock()
+        # 2026-07-26: RLock for the same reason as self._lock above.
+        self._hist_lock = threading.RLock()
         self._cloud_schema_lock = threading.Lock()
         self._cloud_engine_lock = threading.Lock()
         self._cloud_schema_ready_keys: set[str] = set()
@@ -271,9 +277,16 @@ class AppStore:
         time.sleep(120)  # let boot noise settle
         while True:
             try:
-                got = self._lock.acquire(timeout=45.0)
-                if got:
-                    self._lock.release()
+                starved = None
+                for label, lk in (("config._lock", self._lock),
+                                  ("historian._hist_lock", self._hist_lock)):
+                    got = lk.acquire(timeout=45.0)
+                    if got:
+                        lk.release()
+                    else:
+                        starved = label
+                        break
+                if starved is None:
                     time.sleep(60)
                     continue
                 now = time.monotonic()
@@ -282,7 +295,7 @@ class AppStore:
                     continue
                 last_dump = now
                 names = {t.ident: t.name for t in threading.enumerate()}
-                print("[trustnode][lock-watchdog] app_store lock STARVED >45s — "
+                print(f"[trustnode][lock-watchdog] {starved} STARVED >45s — "
                       "dumping all thread stacks:", flush=True)
                 for tid, frame in _sys._current_frames().items():
                     stack = "".join(_tb.format_stack(frame, limit=12))
