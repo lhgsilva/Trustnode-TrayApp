@@ -2679,6 +2679,30 @@ export function DashboardDesigner({
                     so a redundant numeric input cluttered the dialog
                     without providing extra capability. The grid state
                     (form.w / form.h) is still persisted on save. */}
+                {form.type === "stacked_trend" ? (
+                  <>
+                    {/* Primary tag's lane Y bounds (blank = auto). Extra series
+                        carry their own Y min/max inputs in the Series editor. */}
+                    <label>
+                      Primary Lane Y Min
+                      <input
+                        type="number"
+                        value={form.config.primary_lane_min ?? ""}
+                        placeholder="auto"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, primary_lane_min: e.target.value } }))}
+                      />
+                    </label>
+                    <label>
+                      Primary Lane Y Max
+                      <input
+                        type="number"
+                        value={form.config.primary_lane_max ?? ""}
+                        placeholder="auto"
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, primary_lane_max: e.target.value } }))}
+                      />
+                    </label>
+                  </>
+                ) : null}
                 {form.type === "bar_chart" ? (
                   <>
                     {/* 2026-07-26: Grafana-style bar-gauge mode — one bar per
@@ -4136,6 +4160,30 @@ export function DashboardDesigner({
                               title="Suffix"
                               disabled={isLimit}
                             />
+                            {form.type === "stacked_trend" ? (
+                              <>
+                                {/* Per-LANE Y axis bounds (blank = auto). Only
+                                    meaningful for the strip-chart lanes. */}
+                                <input
+                                  type="number"
+                                  value={row.y_min ?? ""}
+                                  placeholder="Y min"
+                                  onChange={(e) => update({ y_min: e.target.value })}
+                                  title="Lane Y axis minimum (blank = auto)"
+                                  disabled={isLimit}
+                                  style={{ width: 66 }}
+                                />
+                                <input
+                                  type="number"
+                                  value={row.y_max ?? ""}
+                                  placeholder="Y max"
+                                  onChange={(e) => update({ y_max: e.target.value })}
+                                  title="Lane Y axis maximum (blank = auto)"
+                                  disabled={isLimit}
+                                  style={{ width: 66 }}
+                                />
+                              </>
+                            ) : null}
                             {/* Size cell: per-series thickness for line/area,
                                 bar width for bar, ignored for limit lines. */}
                             {(() => {

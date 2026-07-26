@@ -2660,6 +2660,9 @@ function DashboardWidgetCardImpl({
         suffix: String(s?.suffix || "").trim(),
         multiplier: Number(s?.multiplier ?? 1) || 1,
         offset: Number(s?.offset ?? 0) || 0,
+        // Per-lane Y bounds for the Stacked Trend widget ("" = auto).
+        y_min: s?.y_min === undefined || s?.y_min === null ? "" : String(s.y_min),
+        y_max: s?.y_max === undefined || s?.y_max === null ? "" : String(s.y_max),
         limit_value: s?.limit_value === undefined || s?.limit_value === null ? "" : String(s.limit_value),
         // Per-series style overrides (added 2026-05-14). Each row can carry
         // its own line thickness, dot marker, bar width, bar pattern, and
@@ -3208,33 +3211,64 @@ function DashboardWidgetCardImpl({
   switch (widget.type) {
     case "stacked_trend": {
       // ── STACKED TREND (strip chart / "isolated graphing") ─────────────
-      // SCADA-style lanes: every configured series gets its own horizontal
-      // band with an independent Y scale; all lanes share ONE time axis and
-      // a synchronized cursor (Recharts syncId). Data comes from the same
-      // union-of-timestamps rows the multi-series ComposedChart uses, so
-      // live updates, gap-breaking and readings-cap behave identically.
+      // Lanes derive ONLY from configured series: the primary Tag (when
+      // set) plus every multi-series row with a tag. Each lane has its own
+      // Y scale (per-series Y min/max from the Series editor, blank = auto)
+      // and the stack SELF-ADJUSTS to the number of tags — equal flex
+      // heights with a 64px floor and scrolling when many lanes exceed the
+      // widget. All lanes share one time axis + synchronized cursor.
       const laneSync = `tn-stack-${String(widget?.id || "w")}`;
       const primaryColorSt = getWidgetAccent(widget, "#14a89a");
       const primaryUnitSt = String(cfg?.primary_unit || "");
-      const lanes = [
-        {
+      const parseBound = (v) => {
+        if (v === undefined || v === null || String(v).trim() === "") return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      };
+      const lanes = [];
+      if (tagName) {
+        lanes.push({
           key: "value",
-          label: (displayTag || tagName || "Value") + (primaryUnitSt ? ` [${primaryUnitSt}]` : ""),
+          label: (displayTag || tagName) + (primaryUnitSt ? ` [${primaryUnitSt}]` : ""),
+          unit: primaryUnitSt,
           color: primaryColorSt,
           limit: null,
-        },
-        ...extraSeriesDefs.map((def) => ({
+          yMin: parseBound(cfg?.primary_lane_min),
+          yMax: parseBound(cfg?.primary_lane_max),
+        });
+      }
+      for (const def of extraSeriesDefs) {
+        lanes.push({
           key: `s_${def.id}`,
           label: (def.label || formatTagForDisplay(def.tag_name) || def.tag_name)
             + (def.unit ? ` [${def.unit}]` : ""),
+          unit: def.unit || "",
           color: def.color || "#5a7bd8",
           limit: def.limit_value !== "" && Number.isFinite(Number(def.limit_value))
             ? Number(def.limit_value) : null,
-        })),
-      ];
+          yMin: parseBound(def.y_min),
+          yMax: parseBound(def.y_max),
+        });
+      }
+      if (!lanes.length) {
+        return (
+          <div className="dashboard-widget-block dashboard-widget-block-chart">
+            <div className="dashboard-widget-placeholder">
+              Add tags in the Series editor (or pick a primary Tag) — each tag renders as its own lane.
+            </div>
+          </div>
+        );
+      }
       const laneLineWidth = Math.max(1, Math.min(8, Number(cfg?.chart_line_width) || 2));
       const stackRows = multiSeriesData;
       const fmtLaneVal = (v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(3) : "-");
+      const latestLaneVal = (key) => {
+        for (let i = stackRows.length - 1; i >= 0; i -= 1) {
+          const v = stackRows[i] ? stackRows[i][key] : null;
+          if (v !== null && v !== undefined && Number.isFinite(Number(v))) return Number(v);
+        }
+        return null;
+      };
       if (!stackRows.length) {
         return (
           <div className="dashboard-widget-block dashboard-widget-block-chart">
@@ -3244,13 +3278,23 @@ function DashboardWidgetCardImpl({
       }
       return (
         <div className="dashboard-widget-block dashboard-widget-block-chart">
-          <div style={{ display: "flex", flexDirection: "column", width: "100%", height: "100%", minHeight: 0 }}>
+          <div style={{ display: "flex", flexDirection: "column", width: "100%", height: "100%", minHeight: 0, overflowY: "auto" }}>
             {lanes.map((lane, i) => {
               const isLast = i === lanes.length - 1;
+              const live = latestLaneVal(lane.key);
+              const domain = [
+                lane.yMin !== null ? lane.yMin : "auto",
+                lane.yMax !== null ? lane.yMax : "auto",
+              ];
               return (
-                <div key={lane.key} style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-                  <div style={{ fontSize: 11, fontWeight: 600, color: lane.color, padding: "1px 6px 0" }}>
-                    {lane.label}
+                <div key={lane.key} style={{ flex: 1, minHeight: 64, display: "flex", flexDirection: "column" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "0 8px" }}>
+                    <span style={{ fontSize: 11, fontWeight: 600, color: lane.color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {lane.label}
+                    </span>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: lane.color, marginLeft: 8, flexShrink: 0 }}>
+                      {live === null ? "-" : `${fmtLaneVal(live)}${lane.unit ? ` ${lane.unit}` : ""}`}
+                    </span>
                   </div>
                   <div style={{ flex: 1, minHeight: 0 }}>
                     <ResponsiveContainer width="100%" height="100%">
@@ -3258,7 +3302,7 @@ function DashboardWidgetCardImpl({
                         margin={{ top: 2, right: 12, left: 0, bottom: isLast ? 2 : 0 }}>
                         <CartesianGrid strokeDasharray="3 3" vertical={false} />
                         <XAxis {...buildXAxisProps(stackRows, cfg)} hide={!isLast} height={isLast ? 26 : 0} />
-                        <YAxis width={56} tick={{ fontSize: 10 }} domain={["auto", "auto"]} />
+                        <YAxis width={56} tick={{ fontSize: 10 }} tickCount={3} domain={domain} allowDataOverflow={lane.yMin !== null || lane.yMax !== null} />
                         <Tooltip
                           formatter={(v) => fmtLaneVal(v)}
                           labelFormatter={(l, payload) => {
