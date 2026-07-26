@@ -1994,7 +1994,7 @@ function DashboardWidgetCardImpl({
   // broken" per the operator report. count only makes sense for
   // rule-based widgets that genuinely want sample frequencies; chart
   // widgets always want a real numeric reduction of the values.
-  const _isChartWidgetTypeForAggDefault = ["line_chart", "line_area_chart", "bar_chart", "value_kpi", "meter_chart"].includes(String(widget?.type || ""));
+  const _isChartWidgetTypeForAggDefault = ["line_chart", "line_area_chart", "bar_chart", "stacked_trend", "value_kpi", "meter_chart"].includes(String(widget?.type || ""));
   const cfgResultAggregation = String(
     cfg?.query_result_aggregation
     || (_isChartWidgetTypeForAggDefault ? "last" : "count")
@@ -2640,7 +2640,7 @@ function DashboardWidgetCardImpl({
   // work — extraSeriesDefs is empty for them.
   // All non-primary series, regardless of kind (data trace or limit line).
   const allExtraSeries = useMemo(() => {
-    const isChartWidget = ["line_chart", "line_area_chart", "bar_chart"].includes(widgetType);
+    const isChartWidget = ["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(widgetType);
     if (!isChartWidget) return [];
     const raw = Array.isArray(cfg?.series_extra) ? cfg.series_extra : [];
     return raw
@@ -3202,9 +3202,163 @@ function DashboardWidgetCardImpl({
   );
 
   switch (widget.type) {
+    case "stacked_trend": {
+      // ── STACKED TREND (strip chart / "isolated graphing") ─────────────
+      // SCADA-style lanes: every configured series gets its own horizontal
+      // band with an independent Y scale; all lanes share ONE time axis and
+      // a synchronized cursor (Recharts syncId). Data comes from the same
+      // union-of-timestamps rows the multi-series ComposedChart uses, so
+      // live updates, gap-breaking and readings-cap behave identically.
+      const laneSync = `tn-stack-${String(widget?.id || "w")}`;
+      const primaryColorSt = getWidgetAccent(widget, "#14a89a");
+      const primaryUnitSt = String(cfg?.primary_unit || "");
+      const lanes = [
+        {
+          key: "value",
+          label: (displayTag || tagName || "Value") + (primaryUnitSt ? ` [${primaryUnitSt}]` : ""),
+          color: primaryColorSt,
+          limit: null,
+        },
+        ...extraSeriesDefs.map((def) => ({
+          key: `s_${def.id}`,
+          label: (def.label || formatTagForDisplay(def.tag_name) || def.tag_name)
+            + (def.unit ? ` [${def.unit}]` : ""),
+          color: def.color || "#5a7bd8",
+          limit: def.limit_value !== "" && Number.isFinite(Number(def.limit_value))
+            ? Number(def.limit_value) : null,
+        })),
+      ];
+      const laneLineWidth = Math.max(1, Math.min(8, Number(cfg?.chart_line_width) || 2));
+      const stackRows = multiSeriesData;
+      const fmtLaneVal = (v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(3) : "-");
+      if (!stackRows.length) {
+        return (
+          <div className="dashboard-widget-block dashboard-widget-block-chart">
+            <div className="dashboard-widget-placeholder">No data yet for the configured tags.</div>
+          </div>
+        );
+      }
+      return (
+        <div className="dashboard-widget-block dashboard-widget-block-chart">
+          <div style={{ display: "flex", flexDirection: "column", width: "100%", height: "100%", minHeight: 0 }}>
+            {lanes.map((lane, i) => {
+              const isLast = i === lanes.length - 1;
+              return (
+                <div key={lane.key} style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: lane.color, padding: "1px 6px 0" }}>
+                    {lane.label}
+                  </div>
+                  <div style={{ flex: 1, minHeight: 0 }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={stackRows} syncId={laneSync}
+                        margin={{ top: 2, right: 12, left: 0, bottom: isLast ? 2 : 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                        <XAxis {...buildXAxisProps(stackRows, cfg)} hide={!isLast} height={isLast ? 26 : 0} />
+                        <YAxis width={56} tick={{ fontSize: 10 }} domain={["auto", "auto"]} />
+                        <Tooltip
+                          formatter={(v) => fmtLaneVal(v)}
+                          labelFormatter={(l, payload) => {
+                            const ts = payload && payload[0] && payload[0].payload ? payload[0].payload.ts : l;
+                            try { return new Date(ts).toLocaleTimeString(); } catch { return String(l); }
+                          }}
+                        />
+                        {lane.limit !== null ? (
+                          <ReferenceLine y={lane.limit} stroke="#d9534f" strokeDasharray="6 3" />
+                        ) : null}
+                        <Line
+                          type="monotone"
+                          dataKey={lane.key}
+                          stroke={lane.color}
+                          strokeWidth={laneLineWidth}
+                          dot={false}
+                          isAnimationActive={false}
+                          connectNulls={false}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
     case "line_chart":
     case "line_area_chart":
     case "bar_chart": {
+      // ── BAR GAUGE MODE (2026-07-26) ─────────────────────────────────
+      // Grafana-style "Reduce" bars: one bar per configured tag showing a
+      // single calculated value (Last / Min / Max / Average) over the
+      // widget's window. E.g. 3 tank-level tags -> 3 bars, each the tank's
+      // CURRENT level. Configured via bar_mode="latest_per_tag" + bar_calc.
+      if (widget.type === "bar_chart" && String(cfg?.bar_mode || "timeseries") === "latest_per_tag") {
+        const calc = String(cfg?.bar_calc || "last");
+        const reduceVals = (vals) => {
+          const nums = vals.filter((v) => Number.isFinite(v));
+          if (!nums.length) return null;
+          switch (calc) {
+            case "min": return Math.min(...nums);
+            case "max": return Math.max(...nums);
+            case "avg": return nums.reduce((a, b) => a + b, 0) / nums.length;
+            case "sum": return nums.reduce((a, b) => a + b, 0);
+            default: return nums[nums.length - 1]; // last
+          }
+        };
+        const gaugeAccent = getWidgetAccent(widget, "#1f3a5f");
+        const gaugeEntries = [];
+        if (tagName) {
+          gaugeEntries.push({
+            name: displayTag || tagName,
+            value: reduceVals(series.map((pt) => Number(pt?.value))),
+            fill: gaugeAccent,
+            unit: String(cfg?.primary_unit || cfg?.primary_suffix || ""),
+          });
+        }
+        for (const def of extraSeriesDefs) {
+          const rows = Array.isArray(extraSeriesRowsByDef[def.id]) ? extraSeriesRowsByDef[def.id] : [];
+          gaugeEntries.push({
+            name: def.label || formatTagForDisplay(def.tag_name) || def.tag_name,
+            value: reduceVals(rows.map((r) => {
+              const n = Number(r?.value);
+              return Number.isFinite(n) ? n * def.multiplier + def.offset : NaN;
+            })),
+            fill: def.color || "#5a7bd8",
+            unit: def.unit || def.suffix || "",
+          });
+        }
+        const shown = gaugeEntries.filter((e) => e.name);
+        const gaugeDecimals = Math.max(0, Math.min(6, Number(cfg?.value_decimals ?? 2)));
+        const fmtGauge = (v, entry) => v === null || !Number.isFinite(Number(v))
+          ? "-"
+          : `${Number(v).toFixed(gaugeDecimals)}${entry && entry.unit ? ` ${entry.unit}` : ""}`;
+        if (!shown.length) {
+          return (
+            <div className="dashboard-widget-block dashboard-widget-block-chart">
+              <div className="dashboard-widget-placeholder">Configure a tag (and optional extra series) for the bars.</div>
+            </div>
+          );
+        }
+        const gaugeBarWidth = Math.max(0, Math.min(120, Number(cfg?.chart_bar_width ?? 0)));
+        return (
+          <div className="dashboard-widget-block dashboard-widget-block-chart">
+            <div className="dashboard-widget-chart">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={shown} margin={{ top: 18, right: 12, left: 0, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="name" tick={{ fontSize: 11 }} interval={0} />
+                  <YAxis width={56} tick={{ fontSize: 10 }} domain={["auto", "auto"]} />
+                  <Tooltip formatter={(v, _n, item) => fmtGauge(v, item && item.payload)} />
+                  <Bar dataKey="value" isAnimationActive={false} {...(gaugeBarWidth > 0 ? { barSize: gaugeBarWidth } : {})}
+                    label={{ position: "top", fontSize: 11, formatter: (v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(gaugeDecimals) : "-") }}>
+                    {shown.map((e, i) => (<Cell key={`c-${i}`} fill={e.fill} />))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        );
+      }
       // ── LIVE FAST PATH ──────────────────────────────────────────────
       // When no time range, no grouping, and not in historical mode,
       // route the chart through LiveTagChart. It uses the
@@ -4209,6 +4363,80 @@ function DashboardWidgetCardImpl({
       // upstream). For advanced mode we use the raw scoped rows (not the filtered
       // ones), because each column independently picks its tag.
       const baseRows = Array.isArray(effectiveRows) ? effectiveRows : [];
+
+      // ── LATEST-PER-TAG MODE (2026-07-26) ───────────────────────────────
+      // Same Grafana-style "Reduce" idea as the bar-gauge: ONE row per tag
+      // showing a single calculated value (Last / Min / Max / Average) over
+      // the widget window. Tag scope = table_filter_tags when set, otherwise
+      // every tag present in the scoped rows. Text tags render their string.
+      if (String(cfg?.table_mode || "rows") === "latest_per_tag") {
+        const calc = String(cfg?.table_calc || "last");
+        const byTag = new Map();
+        for (const r of baseRows) {
+          const tg = String(r?.tag ?? r?.tag_name ?? "").trim();
+          if (!tg) continue;
+          if (tableFilterTagSet.size && !tableFilterTagSet.has(tg)) continue;
+          let bucket = byTag.get(tg);
+          if (!bucket) { bucket = []; byTag.set(tg, bucket); }
+          bucket.push(r);
+        }
+        const reduceRows = (rowsForTag) => {
+          const sorted = rowsForTag.slice().sort((a, b) => String(a?.ts || a?.ts_utc || "").localeCompare(String(b?.ts || b?.ts_utc || "")));
+          const newest = sorted[sorted.length - 1] || null;
+          const nums = sorted.map((r) => Number(r?.value)).filter((v) => Number.isFinite(v));
+          let num = null;
+          if (nums.length) {
+            switch (calc) {
+              case "min": num = Math.min(...nums); break;
+              case "max": num = Math.max(...nums); break;
+              case "avg": num = nums.reduce((a, b) => a + b, 0) / nums.length; break;
+              case "sum": num = nums.reduce((a, b) => a + b, 0); break;
+              default: num = nums[nums.length - 1];
+            }
+          }
+          return { newest, num };
+        };
+        const orderedTags = tableFilterTags.length ? tableFilterTags.filter((t) => byTag.has(t)) : Array.from(byTag.keys()).sort();
+        const latestRows = orderedTags.map((tg) => {
+          const { newest, num } = reduceRows(byTag.get(tg) || []);
+          const text = newest && newest.value == null && newest.value_text != null ? String(newest.value_text) : null;
+          return {
+            tag: tg,
+            display: text !== null ? text : (num === null ? "-" : num.toFixed(3)),
+            ts: newest ? String(newest.ts || newest.ts_utc || "") : "",
+            data_type: newest ? String(newest.data_type || (text !== null ? "STRING" : "")) : "",
+          };
+        });
+        return (
+          <div className="dashboard-widget-block">
+            <div className="dashboard-widget-table-wrap" style={{ overflow: "auto", width: "100%", height: "100%" }}>
+              <table className="dashboard-widget-table" style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: "left", padding: "4px 8px" }}>Tag</th>
+                    <th style={{ textAlign: "right", padding: "4px 8px" }}>{calc === "last" ? "Value" : calc.toUpperCase()}</th>
+                    <th style={{ textAlign: "left", padding: "4px 8px" }}>Type</th>
+                    <th style={{ textAlign: "left", padding: "4px 8px" }}>Updated</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {latestRows.map((r) => (
+                    <tr key={r.tag}>
+                      <td style={{ padding: "3px 8px" }}>{formatTagForDisplay(r.tag)}</td>
+                      <td style={{ padding: "3px 8px", textAlign: "right", fontWeight: 600 }}>{r.display}</td>
+                      <td style={{ padding: "3px 8px" }}>{r.data_type || "-"}</td>
+                      <td style={{ padding: "3px 8px" }}>{r.ts ? String(r.ts).slice(11, 19) : "-"}</td>
+                    </tr>
+                  ))}
+                  {!latestRows.length ? (
+                    <tr><td colSpan={4} style={{ padding: 8, opacity: 0.7 }}>No rows in scope — pick tags in the widget filter.</td></tr>
+                  ) : null}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      }
 
       // ---- where-condition evaluation ------------------------------------
       // A bucket of rows (one time bucket) passes if every condition has at

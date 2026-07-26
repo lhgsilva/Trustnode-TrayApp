@@ -134,6 +134,7 @@ const NUMERIC_ONLY_WIDGETS = new Set([
   "line_chart",
   "line_area_chart",
   "bar_chart",
+  "stacked_trend",
   "pie_chart",
   "meter_chart",
 ]);

@@ -12,6 +12,10 @@ export const WIDGET_TYPES = [
   { key: "line_chart", label: "Line Chart", group: "Charts", defaultSize: { w: 10, h: 8 } },
   { key: "line_area_chart", label: "Line Area Chart", group: "Charts", defaultSize: { w: 10, h: 8 } },
   { key: "bar_chart", label: "Bar Chart", group: "Charts", defaultSize: { w: 10, h: 8 } },
+  // 2026-07-26: SCADA strip-chart — each series in its own lane, shared
+  // time axis + synchronized cursor (FactoryTalk "isolated graphing",
+  // Ignition "subplots").
+  { key: "stacked_trend", label: "Stacked Trend (Strip Chart)", group: "Charts", defaultSize: { w: 14, h: 12 } },
   { key: "pie_chart", label: "Pie Chart", group: "Charts", defaultSize: { w: 8, h: 8 } },
   { key: "meter_chart", label: "Meter Chart", group: "Charts", defaultSize: { w: 8, h: 6 } },
   { key: "text_kpi", label: "Text KPI (Tag)", group: "KPI", defaultSize: { w: 6, h: 4 } },

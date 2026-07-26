@@ -686,7 +686,7 @@ function buildDefaultForm(type = "line_chart") {
       // Default to "last" for chart widgets so picking a time grouping
       // shows actual values not sample counts. "count" is only useful
       // for rule-based widgets.
-      query_result_aggregation: ["line_chart", "line_area_chart", "bar_chart", "value_kpi", "meter_chart"].includes(String(type))
+      query_result_aggregation: ["line_chart", "line_area_chart", "bar_chart", "stacked_trend", "value_kpi", "meter_chart"].includes(String(type))
         ? "last"
         : "count",
       query_row_selection: "all",
@@ -1123,7 +1123,7 @@ export function DashboardDesigner({
   const widgetHeaderParts = (widget) => {
     const typeLabel = String(widget?.title || getWidgetMeta(widget?.type)?.label || widget?.type || "-");
     const cfg = widget?.config || {};
-    const isChartWidget = ["line_chart", "line_area_chart", "bar_chart", "pie_chart", "meter_chart"].includes(String(widget?.type || ""));
+    const isChartWidget = ["line_chart", "line_area_chart", "bar_chart", "stacked_trend", "pie_chart", "meter_chart"].includes(String(widget?.type || ""));
     // Operator 2026-06-16: KPI widgets (text_kpi / value_kpi) also
     // get the same "value | tag | title" header treatment as charts
     // so the operator can see at a glance which tag a KPI maps to.
@@ -1663,7 +1663,7 @@ export function DashboardDesigner({
     // gappy because the slower series has missing union timestamps.
     // Block save with a clear message instead of letting the
     // operator chase visual artefacts.
-    if (["line_chart", "line_area_chart", "bar_chart"].includes(String(form.type))) {
+    if (["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(String(form.type))) {
       const primaryGw = String(form?.config?.gateway_id || "").trim();
       const extras = Array.isArray(form?.config?.series_extra) ? form.config.series_extra : [];
       const intervalOf = (gid) => {
@@ -1733,7 +1733,7 @@ export function DashboardDesigner({
         // not sample counts. Rule widgets keep "count".
         query_result_aggregation: RULE_AGGREGATIONS.some((opt) => opt.value === form?.config?.query_result_aggregation)
           ? form?.config?.query_result_aggregation
-          : (["line_chart", "line_area_chart", "bar_chart", "value_kpi", "meter_chart"].includes(String(form?.type || ""))
+          : (["line_chart", "line_area_chart", "bar_chart", "stacked_trend", "value_kpi", "meter_chart"].includes(String(form?.type || ""))
               ? "last"
               : "count"),
         query_row_selection: QUERY_SELECTION_OPTIONS.some((opt) => opt.value === form?.config?.query_row_selection)
@@ -2220,7 +2220,7 @@ export function DashboardDesigner({
               <div className="dashboard-widget-head-actions">
                 {canEdit ? (
                   <>
-                    {["line_chart", "line_area_chart", "bar_chart"].includes(String(widget?.type || "")) ? (
+                    {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(String(widget?.type || "")) ? (
                       <button
                         type="button"
                         className="dashboard-widget-menu-btn"
@@ -2604,7 +2604,7 @@ export function DashboardDesigner({
                     />
                   </label>
                 ) : null}
-                {["line_chart", "line_area_chart"].includes(form.type) ? (
+                {["line_chart", "line_area_chart", "stacked_trend"].includes(form.type) ? (
                   <label>
                     Interpolation
                     <select
@@ -2627,7 +2627,7 @@ export function DashboardDesigner({
                     showing only the actual collected samples connected
                     chronologically. Useful for batch processes where the
                     operator only cares about "when collection was on". */}
-                {["line_chart", "line_area_chart"].includes(form.type) ? (
+                {["line_chart", "line_area_chart", "stacked_trend"].includes(form.type) ? (
                   <label className="row" style={{ alignItems: "center", gap: 12, justifyContent: "space-between" }}>
                     <span>Show Disconnected Periods</span>
                     <span
@@ -2679,7 +2679,67 @@ export function DashboardDesigner({
                     so a redundant numeric input cluttered the dialog
                     without providing extra capability. The grid state
                     (form.w / form.h) is still persisted on save. */}
-                {["line_chart", "line_area_chart", "bar_chart", "meter_chart", "text_kpi", "value_kpi", "pie_chart", "table_list", "energy_tariffs"].includes(form.type) ? (
+                {form.type === "bar_chart" ? (
+                  <>
+                    {/* 2026-07-26: Grafana-style bar-gauge mode — one bar per
+                        tag showing a single reduced value over the window. */}
+                    <label>
+                      Bar Mode
+                      <select
+                        value={String(form.config.bar_mode || "timeseries")}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, bar_mode: e.target.value } }))}
+                      >
+                        <option value="timeseries">Time series (history bars)</option>
+                        <option value="latest_per_tag">Latest per tag (one bar per tag)</option>
+                      </select>
+                    </label>
+                    {String(form.config.bar_mode || "timeseries") === "latest_per_tag" ? (
+                      <label>
+                        Calculation
+                        <select
+                          value={String(form.config.bar_calc || "last")}
+                          onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, bar_calc: e.target.value } }))}
+                        >
+                          <option value="last">Last value</option>
+                          <option value="min">Minimum</option>
+                          <option value="max">Maximum</option>
+                          <option value="avg">Average</option>
+                          <option value="sum">Sum</option>
+                        </select>
+                      </label>
+                    ) : null}
+                  </>
+                ) : null}
+                {form.type === "table_list" ? (
+                  <>
+                    <label>
+                      Table Mode
+                      <select
+                        value={String(form.config.table_mode || "rows")}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, table_mode: e.target.value } }))}
+                      >
+                        <option value="rows">Historian rows (default)</option>
+                        <option value="latest_per_tag">Latest per tag (one row per tag)</option>
+                      </select>
+                    </label>
+                    {String(form.config.table_mode || "rows") === "latest_per_tag" ? (
+                      <label>
+                        Calculation
+                        <select
+                          value={String(form.config.table_calc || "last")}
+                          onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, table_calc: e.target.value } }))}
+                        >
+                          <option value="last">Last value</option>
+                          <option value="min">Minimum</option>
+                          <option value="max">Maximum</option>
+                          <option value="avg">Average</option>
+                          <option value="sum">Sum</option>
+                        </select>
+                      </label>
+                    ) : null}
+                  </>
+                ) : null}
+                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend", "meter_chart", "text_kpi", "value_kpi", "pie_chart", "table_list", "energy_tariffs"].includes(form.type) ? (
                   <>
                     <label>
                       Gateway
@@ -2774,7 +2834,7 @@ export function DashboardDesigner({
                   </>
                 ) : null}
 
-                {["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? (
+                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (
                   <label>
                     Reading points
                     <input
@@ -2819,7 +2879,7 @@ export function DashboardDesigner({
                       Row 2: Left axis  | min | max | tick step
                       Row 3: Right axis | min | max | tick step (only
                               when a right axis series exists). */}
-                {["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? (() => {
+                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (() => {
                   const manualOn = String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual";
                   const hasRightAxis = Array.isArray(form.config?.series_extra)
                     && form.config.series_extra.some((s) => String(s?.axis || "left").toLowerCase() === "right");
@@ -2901,7 +2961,7 @@ export function DashboardDesigner({
                   );
                 })() : null}
 
-                {["line_chart", "line_area_chart", "bar_chart", "pie_chart", "meter_chart"].includes(form.type) ? (
+                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend", "pie_chart", "meter_chart"].includes(form.type) ? (
                   <label>
                     Chart colors
                     <select
@@ -2958,7 +3018,7 @@ export function DashboardDesigner({
                     dual-axis editor that lives inside it. Surface a direct
                     button here so the option isn't hidden behind a modal
                     that's named for a different workflow. */}
-                {["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? (
+                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (
                   <div className="dashboard-full-row">
                     <button
                       type="button"
@@ -3749,7 +3809,7 @@ export function DashboardDesigner({
                   </div>
                 </fieldset>
               ) : null}
-              {["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? (
+              {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (
                 <fieldset className="dashboard-query-fieldset">
                   <legend>Chart display</legend>
                   <div className="dashboard-query-grid">
@@ -3831,7 +3891,7 @@ export function DashboardDesigner({
                   </div>
                 </fieldset>
               ) : null}
-              {["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? (
+              {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (
                 <fieldset className="dashboard-query-fieldset">
                   <legend>Series & axes</legend>
                   <p className="dashboard-query-hint">
@@ -3854,7 +3914,7 @@ export function DashboardDesigner({
                       Placed inside the Series & Axes fieldset (instead of the
                       separate Chart Display section above) so operators see
                       it without scrolling up through the modal. */}
-                  {["line_chart", "line_area_chart"].includes(form.type) ? (
+                  {["line_chart", "line_area_chart", "stacked_trend"].includes(form.type) ? (
                     <div className="dashboard-query-grid" style={{ marginTop: 6 }}>
                       <label className="dashboard-query-field">
                         <span>Line thickness (1–8 px)</span>
