@@ -275,6 +275,7 @@ class StorageWriterV2(threading.Thread):
                     "tag_name": tag,
                     "value": getattr(r, "value", None),
                     "value_text": getattr(r, "value_text", None),
+                    "data_type": str(getattr(r, "data_type", "") or ""),
                     "quality": getattr(r, "quality", None),
                     "quality_label": str(getattr(r, "quality_label", "") or ""),
                 }

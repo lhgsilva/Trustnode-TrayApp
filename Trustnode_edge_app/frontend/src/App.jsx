@@ -7629,16 +7629,26 @@ function AppShell() {
                 });
               }
               setDataLog((prev) => {
+                // Device resolution: prefer the configured device_id link; when it
+                // dangles (deleted device), fall back to matching by PLC IP so the
+                // Historian Device column stays populated.
+                const deviceByIp = !device && gateway?.plc_ip
+                  ? devicesRef.current.find((d) => String(d?.plc_ip || "") === String(gateway.plc_ip))
+                  : null;
                 const rows = data.readings.map((r) => ({
                   ts: String(r.ts_utc || ts),
                   source: r.source,
                   gateway_id: gatewayId,
                   gateway_name: gateway?.name || "",
-                  device_name: device?.name || "",
+                  device_name: device?.name || deviceByIp?.name || "",
                   plc_ip: gateway?.plc_ip || device?.plc_ip || "",
                   database_name: db?.name || (gateway?.database_id ? "Local SQLite" : ""),
                   tag: r.tag_name,
                   value: r.value,
+                  // STRING tags carry their text here (value is null); Type comes
+                  // from the PLC-declared type (or inferred STRING).
+                  value_text: r.value_text ?? null,
+                  data_type: r.data_type || "",
                   quality: r.quality,
                   quality_label: r.quality_label || qualityLabelFromCode(r.quality)
                 }));
@@ -7864,6 +7874,8 @@ function AppShell() {
                 tag: rawTag,
                 ts: readingTs,
                 value: row?.value,
+                value_text: row?.value_text ?? null,
+                data_type: row?.data_type || "",
                 quality,
                 quality_label: qualityLabel
               };
@@ -7898,6 +7910,7 @@ function AppShell() {
                 value: row?.value,
                 // TEXT-typed tags carry their value here (value is NULL).
                 value_text: row?.value_text ?? null,
+                data_type: row?.data_type || "",
                 quality,
                 quality_label: qualityLabel
               });
@@ -13922,6 +13935,10 @@ const getGatewayHealth = (gateway) => {
       gateway_id: gateway.id,
       config: {
         gateway_type: gateway.gateway_type,
+        // Display identity for historian rows (backend GatewayConfig fields).
+        name: gateway.name || "",
+        device_name: (devicesRef.current.find((d) => d.id === gateway.device_id)
+          || devicesRef.current.find((d) => String(d?.plc_ip || "") === String(gateway.plc_ip || "")))?.name || "",
         plc_ip: gateway.plc_ip,
         opc_url: gateway.opc_url || "",
         tags: gateway.tags || [],
@@ -24685,7 +24702,7 @@ const getGatewayHealth = (gateway) => {
                 <div className="table-scroll fill-scroll">
                   <div className="table historian-table">
                     <div className="thead">
-                      <span>Timestamp</span><span>Tag</span><span>Value</span><span>Quality</span><span>Device</span><span>Gateway</span><span>Database</span><span>PLC</span><span>Cloud</span>
+                      <span>Timestamp</span><span>Tag</span><span>Value</span><span>Type</span><span>Quality</span><span>Device</span><span>Gateway</span><span>Database</span><span>PLC</span><span>Cloud</span>
                     </div>
                     {historianRowsSliced.map((row, idx) => {
                       const pending = Boolean(row.pending_cloud_push);
@@ -24693,7 +24710,12 @@ const getGatewayHealth = (gateway) => {
                         <div key={`${row.ts}-${row.tag}-${idx}`} className="trow">
                           <span>{fmtTs(row.ts)}</span>
                           <span>{formatTagForDisplay(row.tag)}</span>
-                          <span>{formatStandardValue(row.value, 3)}</span>
+                          <span title={row.value_text != null ? String(row.value_text) : undefined}>
+                            {row.value == null && row.value_text != null
+                              ? String(row.value_text)
+                              : formatStandardValue(row.value, 3)}
+                          </span>
+                          <span>{row.data_type || (row.value_text != null && row.value == null ? "STRING" : "-")}</span>
                           <span>{row.quality_label} ({row.quality})</span>
                           <span>{row.device_name || "-"}</span>
                           <span>{row.gateway_name || row.gateway_id || "-"}</span>

@@ -947,12 +947,25 @@ class GatewayWorker:
     def _read_from_gateway(self) -> List[GatewayReading]:
         gateway_type = (self.config.gateway_type or "").strip().lower()
         if gateway_type == "siemens_opcua":
-            return self._read_from_opcua()
-        if gateway_type == "allen_bradley":
-            return self._read_from_allen_bradley()
-        if gateway_type == "siemens_snap7":
-            return self._read_from_snap7()
-        raise RuntimeError(f"Gateway type '{self.config.gateway_type}' is not implemented for real-time reads.")
+            readings = self._read_from_opcua()
+        elif gateway_type == "allen_bradley":
+            readings = self._read_from_allen_bradley()
+        elif gateway_type == "siemens_snap7":
+            readings = self._read_from_snap7()
+        else:
+            raise RuntimeError(f"Gateway type '{self.config.gateway_type}' is not implemented for real-time reads.")
+        # AUTOMATED string identification (2026-07-26): when a driver didn't
+        # declare a type but the reading is text-only (value None, value_text
+        # set, quality GOOD), stamp it STRING so every consumer — historian
+        # Type column, dashboards, batches, reports — branches text-vs-numeric
+        # from ONE canonical field instead of guessing per page.
+        for r in readings or []:
+            try:
+                if not r.data_type and r.value is None and r.value_text is not None and r.quality >= 192:
+                    r.data_type = "STRING"
+            except Exception:
+                pass
+        return readings
 
     def _prewarm_client(self) -> None:
         """Open the PLC driver session before the run loop starts.
@@ -1206,6 +1219,10 @@ class GatewayWorker:
                             tag_name=requested_tag,
                             value=value,
                             value_text=value_text,
+                            # PLC-declared type from pycomm3 (DINT/REAL/STRING/
+                            # BOOL/UDT name). Feeds the historian Type column
+                            # and text-vs-numeric branching everywhere.
+                            data_type=str(getattr(res, "type", "") or ""),
                             quality=quality,
                             quality_label=quality_label,
                             source=self.config.gateway_type,
@@ -1312,6 +1329,7 @@ class GatewayWorker:
                             tag_name=tag,
                             value=value,
                             value_text=value_text,
+                            data_type=str(getattr(res, "Type", "") or getattr(res, "type", "") or ""),
                             quality=quality,
                             quality_label=quality_label,
                             source=self.config.gateway_type,
@@ -2170,7 +2188,7 @@ class GatewayWorker:
             rs = conn.execute(
                 text(
                     """
-                    SELECT id, ts_utc, tag_name, value, quality, quality_label, source, site, area, equipment
+                    SELECT id, ts_utc, tag_name, value, value_text, quality, quality_label, source, site, area, equipment
                     FROM outbox_readings
                     WHERE sent_remote = 0 AND gateway_id = :gid
                     ORDER BY id ASC
@@ -2492,7 +2510,7 @@ class GatewayWorker:
                 "database_name": "",
                 "tag_name": str(getattr(r, "tag_name", "") or ""),
                 "value": getattr(r, "value", None),
-                "value_text": None,
+                "value_text": getattr(r, "value_text", None),
                 "quality": getattr(r, "quality", None),
                 "quality_label": str(getattr(r, "quality_label", "") or ""),
                 "source": str(getattr(r, "source", "") or ""),
@@ -2980,7 +2998,7 @@ class GatewayWorker:
                 "database_name": str(sink.get("name") or sink.get("id") or ""),
                 "tag_name": str(getattr(r, "tag_name", "") or ""),
                 "value": getattr(r, "value", None),
-                "value_text": None,
+                "value_text": getattr(r, "value_text", None),
                 "quality": getattr(r, "quality", None),
                 "quality_label": str(getattr(r, "quality_label", "") or ""),
                 "source": str(getattr(r, "source", "") or ""),
@@ -3054,7 +3072,11 @@ class GatewayWorker:
                     GatewayReading(
                         ts_utc=str(r.get("ts_utc") or ""),
                         tag_name=str(r.get("tag_name") or ""),
-                        value=float(r.get("value") if r.get("value") is not None else 0.0),
+                        # NULL stays NULL — fabricating 0.0 here turned every
+                        # cloud STRING tag into a fake "0.000" (seen on cloud
+                        # dashboards/KPIs). value_text carries the string.
+                        value=(float(r.get("value")) if r.get("value") is not None else None),
+                        value_text=(str(r.get("value_text")) if r.get("value_text") is not None else None),
                         quality=int(r.get("quality") if r.get("quality") is not None else 0),
                         quality_label=str(r.get("quality_label") or "UNKNOWN"),
                         source=str(r.get("source") or ""),
@@ -3289,8 +3311,8 @@ class GatewayWorker:
                         "quality_label": r.quality_label,
                         "source": r.source,
                         "gateway_id": self.gateway_id,
-                        "gateway_name": self.gateway_id,
-                        "device_name": "",
+                        "gateway_name": str(getattr(self.config, "name", "") or self.gateway_id),
+                        "device_name": str(getattr(self.config, "device_name", "") or ""),
                         "plc_ip": self.config.plc_ip,
                         "database_name": db_name,
                         "site": r.site,
@@ -3801,6 +3823,7 @@ class PLCManager:
                             "tag_name": tag_name,
                             "value": r.get("value"),
                             "value_text": r.get("value_text"),
+                            "data_type": str(r.get("data_type") or ""),
                             "quality": r.get("quality"),
                             "quality_label": str(r.get("quality_label") or ""),
                         }

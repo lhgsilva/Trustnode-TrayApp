@@ -1861,7 +1861,35 @@ body {
 
 .historian-table .thead,
 .historian-table .trow {
-  grid-template-columns: 1.35fr 1.3fr .8fr .9fr 1fr 1fr 1fr 1fr .7fr;
+  /* 2026-07-26 (operator): give TAG the flexible space (long program-scoped
+     names like Program:MainProgram.BT_Fbk_Buffer_Transfer_Open); size the
+     fixed-content columns (timestamp/value/type/quality/db/plc/cloud) to fit
+     their text. 10 columns incl. the new Type. */
+  grid-template-columns:
+    minmax(148px, .9fr)   /* Timestamp  */
+    minmax(240px, 2.6fr)  /* Tag        */
+    minmax(110px, 1.1fr)  /* Value      */
+    minmax(76px, .55fr)   /* Type       */
+    minmax(96px, .6fr)    /* Quality    */
+    minmax(90px, .7fr)    /* Device     */
+    minmax(90px, .7fr)    /* Gateway    */
+    minmax(100px, .8fr)   /* Database   */
+    minmax(118px, .7fr)   /* PLC        */
+    minmax(78px, .5fr);   /* Cloud      */
+}
+
+.historian-table .trow > span:nth-child(2) {
+  /* Tag names: keep on one line, ellipsize gracefully when extreme. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.historian-table .thead > span,
+.historian-table .trow > span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .logs-table .thead,

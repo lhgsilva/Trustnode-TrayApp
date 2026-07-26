@@ -822,6 +822,11 @@ class AppStore:
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS quality_label TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS source TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" ADD COLUMN IF NOT EXISTS created_utc TIMESTAMPTZ'))
+                # 2026-07-26: STRING-typed tags + PLC-declared type in the cloud
+                # historian tables (the data-sync INSERTs now carry both).
+                for _tbl in ("historian_readings", "plc_readings"):
+                    conn.execute(text(f'ALTER TABLE "{schema}"."{_tbl}" ADD COLUMN IF NOT EXISTS value_text TEXT'))
+                    conn.execute(text(f'ALTER TABLE "{schema}"."{_tbl}" ADD COLUMN IF NOT EXISTS data_type TEXT'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."historian_readings" DROP CONSTRAINT IF EXISTS "historian_readings_local_id_key"'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."plc_readings" DROP CONSTRAINT IF EXISTS "plc_readings_local_id_key"'))
                 conn.execute(text(f'ALTER TABLE "{schema}"."app_logs" DROP CONSTRAINT IF EXISTS "app_logs_local_id_key"'))
@@ -3777,7 +3782,7 @@ class AppStore:
                     db_rows = conn.execute(
                         """
                         SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                               tag_name, value, quality, quality_label, source
+                               tag_name, value, value_text, data_type, quality, quality_label, source
                         FROM historian_readings
                         ORDER BY ts_utc DESC
                         LIMIT ?
@@ -3788,7 +3793,7 @@ class AppStore:
                     db_rows = conn.execute(
                         """
                         SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                               tag_name, value, quality, quality_label, source
+                               tag_name, value, value_text, data_type, quality, quality_label, source
                         FROM historian_readings
                         WHERE id > ?
                         ORDER BY id ASC
@@ -3827,6 +3832,8 @@ class AppStore:
                 "plc_ip": str(r["plc_ip"] or ""),
                 "database_name": str(r["database_name"] or ""),
                 "value": r["value"],
+                "value_text": r["value_text"] if "value_text" in r.keys() else None,
+                "data_type": (r["data_type"] if "data_type" in r.keys() else None) or "",
                 "quality": r["quality"],
                 "quality_label": str(r["quality_label"] or ""),
                 "updated_utc": now,
@@ -3897,7 +3904,7 @@ class AppStore:
                     hist_rows = conn.execute(
                         """
                         SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                               tag_name, value, quality, quality_label, source, created_utc
+                               tag_name, value, value_text, data_type, quality, quality_label, source, created_utc
                         FROM historian_readings
                         WHERE id > ?
                         ORDER BY id ASC
@@ -3947,6 +3954,8 @@ class AppStore:
                             "database_name": str(r["database_name"] or ""),
                             "tag_name": str(r["tag_name"] or ""),
                             "value": r["value"],
+                            "value_text": r["value_text"] if "value_text" in r.keys() else None,
+                            "data_type": (r["data_type"] if "data_type" in r.keys() else None) or "",
                             "quality": r["quality"],
                             "quality_label": str(r["quality_label"] or ""),
                             "source": str(r["source"] or ""),
@@ -3959,9 +3968,9 @@ class AppStore:
                         text(
                             f"""
                             INSERT INTO "{schema}"."historian_readings"
-                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
+                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, value_text, data_type, quality, quality_label, source, created_utc)
                             VALUES
-                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
+                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :value_text, :data_type, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
                             ON CONFLICT(tenant_id, gateway_id, local_id) DO NOTHING
                             """
                         ),
@@ -3972,9 +3981,9 @@ class AppStore:
                         text(
                             f"""
                             INSERT INTO "{schema}"."plc_readings"
-                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
+                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, value_text, data_type, quality, quality_label, source, created_utc)
                             VALUES
-                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
+                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :value_text, :data_type, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
                             ON CONFLICT(tenant_id, gateway_id, local_id) DO NOTHING
                             """
                         ),
@@ -4137,6 +4146,15 @@ class AppStore:
             except Exception:
                 pass
 
+        # 2026-07-26: PLC-declared tag type (DINT/REAL/STRING/BOOL/UDT...).
+        # "" = unknown (legacy rows). Feeds the historian Type column and
+        # text-vs-numeric branching in dashboards / batches / reports.
+        if _table_exists("historian_readings") and not _column_exists("historian_readings", "data_type"):
+            try:
+                conn.execute("ALTER TABLE historian_readings ADD COLUMN data_type TEXT NULL")
+            except Exception:
+                pass
+
     def _ensure_schema(self) -> None:
         with self._lock:
             with self._connect() as conn:
@@ -4191,6 +4209,7 @@ class AppStore:
                       tag_name TEXT NOT NULL,
                       value REAL NULL,
                       value_text TEXT NULL,
+                      data_type TEXT NULL,      -- PLC-declared type (2026-07-26)
                       quality INTEGER NULL,
                       quality_label TEXT NULL,
                       source TEXT NULL,
@@ -6481,9 +6500,9 @@ class AppStore:
                         text(
                             f"""
                             INSERT INTO "{schema}"."historian_readings"
-                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
+                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, value_text, data_type, quality, quality_label, source, created_utc)
                             VALUES
-                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
+                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :value_text, :data_type, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
                             ON CONFLICT(tenant_id, gateway_id, local_id) DO NOTHING
                             """
                         ),
@@ -6493,9 +6512,9 @@ class AppStore:
                         text(
                             f"""
                             INSERT INTO "{schema}"."plc_readings"
-                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, quality, quality_label, source, created_utc)
+                            (local_id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, value_text, data_type, quality, quality_label, source, created_utc)
                             VALUES
-                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
+                            (:local_id, :tenant_id, CAST(:ts_utc AS timestamptz), :gateway_id, :gateway_name, :device_name, :plc_ip, :database_name, :tag_name, :value, :value_text, :data_type, :quality, :quality_label, :source, CAST(:created_utc AS timestamptz))
                             ON CONFLICT(tenant_id, gateway_id, local_id) DO NOTHING
                             """
                         ),
@@ -7351,6 +7370,7 @@ class AppStore:
             value = float(r.get("value")) if r.get("value") is not None else None
             value_text_raw = r.get("value_text")
             value_text = str(value_text_raw) if value_text_raw is not None and value_text_raw != "" else None
+            data_type = str(r.get("data_type") or "") or None
             quality = int(r.get("quality")) if r.get("quality") is not None else None
             quality_label = str(r.get("quality_label") or "")
             source = str(r.get("source") or "")
@@ -7366,6 +7386,7 @@ class AppStore:
                     tag_name,
                     value,
                     value_text,
+                    data_type,
                     quality,
                     quality_label,
                     source,
@@ -7403,8 +7424,8 @@ class AppStore:
                 conn.executemany(
                     """
                     INSERT INTO historian_readings
-                    (tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, value_text, quality, quality_label, source, created_utc)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name, tag_name, value, value_text, data_type, quality, quality_label, source, created_utc)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     safe_rows,
                 )
@@ -7950,7 +7971,7 @@ class AppStore:
             rows = conn.execute(
                 f"""
                 SELECT id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                       tag_name, value, value_text, quality, quality_label
+                       tag_name, value, value_text, data_type, quality, quality_label
                 FROM historian_readings
                 {where}
                 ORDER BY ts_utc DESC
@@ -7975,6 +7996,7 @@ class AppStore:
                     "tag": r["tag_name"] or "",
                     "value": r["value"],
                     "value_text": r["value_text"] if "value_text" in r.keys() else None,
+                    "data_type": (r["data_type"] if "data_type" in r.keys() else None) or "",
                     "quality": r["quality"],
                     "quality_label": r["quality_label"] or "",
                     # True until the cloud sync worker advances last_historian_id
@@ -8224,7 +8246,7 @@ class AppStore:
             rows = conn.execute(
                 f"""
                 SELECT id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                       tag_name, value, value_text, quality, quality_label
+                       tag_name, value, value_text, data_type, quality, quality_label
                 FROM historian_readings
                 {where}
                 ORDER BY ts_utc DESC
@@ -8238,7 +8260,7 @@ class AppStore:
                 rows = conn.execute(
                     f"""
                     SELECT id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
-                           tag_name, value, quality, quality_label
+                           tag_name, value, value_text, data_type, quality, quality_label
                     FROM historian_readings
                     {where_unscoped}
                     ORDER BY ts_utc DESC
@@ -8263,6 +8285,7 @@ class AppStore:
                     "tag": r["tag_name"] or "",
                     "value": r["value"],
                     "value_text": r["value_text"] if "value_text" in r.keys() else None,
+                    "data_type": (r["data_type"] if "data_type" in r.keys() else None) or "",
                     "quality": r["quality"],
                     "quality_label": r["quality_label"] or "",
                     "pending_cloud_push": row_id > last_pushed_id,
@@ -8991,6 +9014,8 @@ class AppStore:
                 "database_name": str(r["database_name"] or ""),
                 "tag": tag,
                 "value": r["value"],
+                "value_text": r["value_text"] if "value_text" in r.keys() else None,
+                "data_type": (r["data_type"] if "data_type" in r.keys() else None) or "",
                 "quality": r["quality"],
                 "quality_label": str(r["quality_label"] or ""),
             }

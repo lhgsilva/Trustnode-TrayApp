@@ -1232,6 +1232,10 @@ async def _websocket_cloud_live_loop(websocket: WebSocket, tenant_id: str) -> No
                         "database_name": "cloud_v1",
                         "tag": str((t or {}).get("tag_name") or ""),
                         "value": (t or {}).get("value"),
+                        # 2026-07-26: carry STRING tag text + declared type so
+                        # cloud-live consumers stop rendering 0.000 for text tags.
+                        "value_text": (t or {}).get("value_text"),
+                        "data_type": str((t or {}).get("data_type") or ""),
                         "quality": int((t or {}).get("quality_code") or state.get("quality_code") or 0),
                         "quality_label": str((t or {}).get("quality_label") or ""),
                         "edge_monotonic_seq": int(state.get("edge_monotonic_seq") or 0),

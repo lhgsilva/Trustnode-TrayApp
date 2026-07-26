@@ -483,6 +483,11 @@ class TelemetryService:
             {
                 "tag_name": str(r.tag_name),
                 "value": float(r.value) if r.value is not None else None,
+                # 2026-07-26: STRING tags live in value_text; without it the
+                # cloud-live KPIs (tags_json consumers) showed 0.000/blank for
+                # text tags. data_type lets cloud consumers branch correctly.
+                "value_text": (str(r.value_text) if getattr(r, "value_text", None) is not None else None),
+                "data_type": str(getattr(r, "data_type", "") or ""),
                 "quality_code": int(r.quality),
                 "quality_label": str(r.quality_label),
             }

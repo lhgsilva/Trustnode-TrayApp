@@ -8,6 +8,11 @@ GatewayType = Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston
 
 class GatewayConfig(BaseModel):
     gateway_type: GatewayType = "allen_bradley"
+    # Display identity (2026-07-26): the operator-facing gateway name and the
+    # resolved device name. The frontend sends them in the start payload so
+    # historian rows carry real names instead of raw IDs / empty strings.
+    name: str = ""
+    device_name: str = ""
     plc_ip: str = ""
     opc_url: str = ""
     tags: List[str] = Field(default_factory=list)
@@ -50,6 +55,12 @@ class GatewayReading(BaseModel):
     # hid real faults (e.g. program-scoped tags that were never being read).
     value: float | None = None
     value_text: str | None = None
+    # PLC-declared data type when the driver exposes it (pycomm3: "DINT",
+    # "REAL", "STRING", "BOOL", UDT names...). "" = unknown. When empty but
+    # value_text is set and value is None, readers infer "STRING" so every
+    # consumer (historian Type column, dashboards, batches, reports) can
+    # branch text-vs-numeric without guessing from the payload.
+    data_type: str = ""
     quality: int = 192
     quality_label: str = "GOOD"
     source: str
