@@ -513,7 +513,7 @@ async def partial_task(t0: float, stop_at: float) -> None:
             pass
 
 
-async def main() -> None:
+async def main() -> int:
     t0 = time.time()
     stop_at = t0 + DURATION_S
     emit({"t": "start", "duration": DURATION_S, "gw": GW})
@@ -529,7 +529,9 @@ async def main() -> None:
     with open(REPORT, "w", encoding="utf-8") as f:
         f.write(report)
     print(report, flush=True)
+    # Gate exit code for release automation: 0 = PASS, 2 = attention needed.
+    return 0 if "OVERALL: PASS" in report else 2
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

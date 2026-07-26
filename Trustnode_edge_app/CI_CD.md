@@ -75,3 +75,24 @@ The PowerShell build script `scripts/build-web-cloud-readonly.ps1` generates `we
 2. Rewriting `./assets/...` → `/assets/...` (absolute paths)
 
 Step 2 was missing previously and only surfaced after a deploy that left no fallback. Do not remove step 2.
+
+## Release validation gate (desktop builds) — MANDATORY since 2026-07-26
+
+Before committing/tagging a new desktop version, the freshly built app must
+pass the 10-minute full-system validation while running:
+
+```
+cd desktop && npm run dist          # 1. build both installers
+# 2. quit the old app, launch the new build (portable or Setup)
+python scripts/validate_release.py  # 3. the gate (exit 0 = PASS)
+```
+
+The gate validates: collection cadence + loss, chart-feed latency, historian
+freshness, outbox depth, cloud DB lag, API + AI-module probes, batches /
+reports / alarms / triggers snapshots, resource trends, and the log census
+(stalls, restarts, lock-watchdog dumps). Full report:
+`scripts/validation_out/validation_report.txt`.
+
+Only commit the version when the gate prints `OVERALL: PASS`. For deep soak
+certification (overnight), run the same suite at full length:
+`python scripts/validate_full_12h.py` (12 h default).
