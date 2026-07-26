@@ -51,6 +51,10 @@ const LAST_WIDGET_RULE_STATS_CACHE = new Map();
 const LAST_WIDGET_ROWS_CACHE = new Map();
 
 function parseNumber(v) {
+  // ABSENT is null, never 0. Number(null) === 0 passes isFinite, which made
+  // a STRING tag's null value render as "0.000" in the Value KPI while the
+  // real text sat unused in last_value_text (observed live 2026-07-26).
+  if (v === null || v === undefined || v === "") return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
@@ -4254,11 +4258,24 @@ function DashboardWidgetCardImpl({
           ...(unitColor ? { color: unitColor } : {}),
           fontSize: `${unitScale}em`,
         };
+      // 2026-07-26 (operator): the body used to show the TAG NAME, which made
+      // the widget useless for STRING tags — the actual text only appeared in
+      // the header. Now the body shows the tag's LIVE value (text preferred,
+      // numeric formatted as fallback); the tag name remains the fallback for
+      // an unconfigured/idle widget so old dashboards still render something.
+      const liveTextRaw = latest?.last_value_text;
+      const liveNumRaw = latest?.last_value;
+      const liveDisplay = liveTextRaw != null && String(liveTextRaw) !== ""
+        ? String(liveTextRaw)
+        : (liveNumRaw !== null && liveNumRaw !== undefined && liveNumRaw !== "" && Number.isFinite(Number(liveNumRaw))
+            ? Number(liveNumRaw).toFixed(3)
+            : null);
       return (
         <div className="dashboard-widget-block">
-          <div className="dashboard-kpi-text" style={{ fontSize: `${textSize}px`, ...(valueColor ? { color: valueColor } : {}) }}>
+          <div className="dashboard-kpi-text" style={{ fontSize: `${textSize}px`, ...(valueColor ? { color: valueColor } : {}) }}
+            title={liveDisplay || undefined}>
             <span>
-              {displayTag || "-"}{unitSuffix ? <span className="dashboard-kpi-unit" style={unitStyle}>{unitSuffix}</span> : null}
+              {liveDisplay ?? (displayTag || "-")}{unitSuffix ? <span className="dashboard-kpi-unit" style={unitStyle}>{unitSuffix}</span> : null}
             </span>
           </div>
         </div>
