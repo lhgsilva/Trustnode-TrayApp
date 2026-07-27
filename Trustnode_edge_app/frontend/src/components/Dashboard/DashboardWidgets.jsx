@@ -594,7 +594,14 @@ function computeWidgetTextScale(widget, minPx, maxPx) {
   const w = Number(widget?.w || 4);
   const h = Number(widget?.h || 3);
   const areaFactor = Math.max(0.75, Math.min(1.65, Math.sqrt(Math.max(1, (w * h) / 12))));
-  return Math.max(minPx, Math.min(maxPx, Math.round(maxPx * scale * areaFactor)));
+  // 2026-07-27 (operator): when a scale is EXPLICITLY configured, honour it
+  // fully — the old [minPx, maxPx] band swallowed changes (a 0.5x or 2.5x
+  // setting rendered the same as 1x once the band saturated). Only the
+  // auto (scale=1) case keeps the band; explicit scales get a hard 8px
+  // floor and no ceiling.
+  const px = Math.round(maxPx * scale * areaFactor);
+  if (scale !== 1) return Math.max(8, px);
+  return Math.max(minPx, Math.min(maxPx, px));
 }
 
 function parseLegendLayout(v, fallback = "side") {
@@ -1735,7 +1742,7 @@ function LiveTagChart({
             />
             {(renderedData.axesUsed?.has("left2")) ? (
               <YAxis yAxisId="left2" orientation="left" domain={yDomainLeft2} ticks={manualYLeft2?.ticks}
-                allowDataOverflow={!!manualYLeft2} tickFormatter={axisTickFmt("left2")} fontSize={9} width={54}
+                allowDataOverflow={!!manualYLeft2} tickFormatter={axisTickFmt("left2")} fontSize={Math.max(7, Math.round(9 * fontScale("font_axis_scale")))} width={54}
                 label={left2AxisLabel ? { value: left2AxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
             ) : null}
             {(renderedData.hasRightAxis || renderedData.axesUsed?.has("right1")) ? (
@@ -1755,11 +1762,11 @@ function LiveTagChart({
             ) : null}
             {(renderedData.axesUsed?.has("right2")) ? (
               <YAxis yAxisId="right2" orientation="right" domain={yDomainRight2} ticks={manualYRight2?.ticks}
-                allowDataOverflow={!!manualYRight2} tickFormatter={axisTickFmt("right2")} fontSize={9} width={54}
+                allowDataOverflow={!!manualYRight2} tickFormatter={axisTickFmt("right2")} fontSize={Math.max(7, Math.round(9 * fontScale("font_axis_scale")))} width={54}
                 label={right2AxisLabel ? { value: right2AxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
             ) : null}
             <Tooltip labelFormatter={labelFmt} formatter={fmtVal} />
-            {showLegend ? <Legend wrapperStyle={{ fontSize: 11 }} /> : null}
+            {showLegend ? <Legend wrapperStyle={{ fontSize: Math.round(11 * (() => { const s = Number(widget?.config?.font_legend_scale); return Number.isFinite(s) && s > 0 ? Math.max(0.3, Math.min(4, s)) : 1; })()) }} /> : null}
             {seriesDefs.map((s) => {
               const yId = normAxis(s.axis);
               // Per-series style overrides win when set; fall through to the
@@ -3038,6 +3045,16 @@ function DashboardWidgetCardImpl({
     // Keep UI live: while backend rule-stats is loading/slow, compute from currently available rows.
     return evaluateComputedRules(computedRowsTimeFiltered, rules, queryOptions);
   }, [serverRuleStats, lastGoodServerRuleStats, computedRowsTimeFiltered, rulesDepKey, queryOptions]);
+  // Widget-level TYPOGRAPHY scales (2026-07-27): every text family in the
+  // widget is operator-sizable. 1 = default; free range 0.3..4.
+  const fontScale = (key) => {
+    const v = Number(cfg?.[key]);
+    return Number.isFinite(v) && v > 0 ? Math.max(0.3, Math.min(4, v)) : 1;
+  };
+  const axisFontPx = Math.round(10 * fontScale("font_axis_scale"));
+  const labelFontPx = Math.round(11 * fontScale("font_labels_scale"));
+  const legendFontPx = Math.round(12 * fontScale("font_legend_scale"));
+
   const displayTag = tagName
     ? (formatTagForDisplay ? formatTagForDisplay(tagName) : tagName)
     : String(firstSeriesRow?.label || "").trim()
@@ -3333,7 +3350,7 @@ function DashboardWidgetCardImpl({
               return (
                 <div key={lane.key} style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "0 8px", lineHeight: 1.15, minHeight: 14 }}>
-                    <span style={{ fontSize: 10, fontWeight: 600, color: lane.color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    <span style={{ fontSize: Math.round(10 * fontScale("font_labels_scale")), fontWeight: 600, color: lane.color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {lane.label}
                     </span>
                     <span style={{ fontSize: Math.round(11 * (lane.textScale || 1)), fontWeight: 700, color: lane.color, marginLeft: 8, flexShrink: 0 }}>
@@ -3348,7 +3365,7 @@ function DashboardWidgetCardImpl({
                         <XAxis {...buildXAxisProps(stackRows, cfg)} hide height={0} />
                         <YAxis
                           width={56}
-                          tick={{ fontSize: 10 }}
+                          tick={{ fontSize: axisFontPx }}
                           domain={domain}
                           allowDataOverflow={lane.yMin !== null || lane.yMax !== null}
                           {...(ticks ? { ticks } : { tickCount: 3 })}
@@ -3467,10 +3484,10 @@ function DashboardWidgetCardImpl({
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={shown} margin={{ top: 18, right: 8, left: 0, bottom: 4 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                  <XAxis dataKey="name" tick={{ fontSize: 11 }} interval={0} />
+                  <XAxis dataKey="name" tick={{ fontSize: axisFontPx }} interval={0} />
                   <YAxis
                     width={64}
-                    tick={{ fontSize: 10 }}
+                    tick={{ fontSize: axisFontPx }}
                     domain={manualY ? [manualY.lo, manualY.hi] : ["auto", "auto"]}
                     allowDataOverflow={!!manualY}
                     {...(manualYTicks ? { ticks: manualYTicks } : {})}
@@ -3478,7 +3495,7 @@ function DashboardWidgetCardImpl({
                   />
                   <Tooltip formatter={(v, _n, item) => fmtGauge(v, item && item.payload)} />
                   <Bar dataKey="value" isAnimationActive={false} {...(gaugeBarWidth > 0 ? { barSize: gaugeBarWidth } : {})}
-                    label={{ position: "top", fontSize: 11, formatter: (v) => (Number.isFinite(Number(v)) ? formatWidgetValue(cfg, v) : "-") }}>
+                    label={{ position: "top", fontSize: labelFontPx, formatter: (v) => (Number.isFinite(Number(v)) ? formatWidgetValue(cfg, v) : "-") }}>
                     {shown.map((e, i) => (<Cell key={`c-${i}`} fill={e.fill} />))}
                   </Bar>
                 </BarChart>
@@ -3619,7 +3636,7 @@ function DashboardWidgetCardImpl({
                         formatter={(v) => fmtValueByUnit(v, primaryUnit, primarySuffix)}
                         labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
                       />
-                      {showChartLegend ? <Legend /> : null}
+                      {showChartLegend ? <Legend wrapperStyle={{ fontSize: legendFontPx }} /> : null}
                       <Area
                         type={interpolation}
                         dataKey="value"
@@ -3651,7 +3668,7 @@ function DashboardWidgetCardImpl({
                         formatter={(v) => fmtValueByUnit(v, primaryUnit, primarySuffix)}
                         labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
                       />
-                      {showChartLegend ? <Legend /> : null}
+                      {showChartLegend ? <Legend wrapperStyle={{ fontSize: legendFontPx }} /> : null}
                       <Bar
                         dataKey="value"
                         name={primaryLabel}
@@ -3676,7 +3693,7 @@ function DashboardWidgetCardImpl({
                         formatter={(v) => fmtValueByUnit(v, primaryUnit, primarySuffix)}
                         labelFormatter={(v) => series.find((p) => p.idx === v)?.ts || String(v)}
                       />
-                      {showChartLegend ? <Legend /> : null}
+                      {showChartLegend ? <Legend wrapperStyle={{ fontSize: legendFontPx }} /> : null}
                       <Line
                         type={interpolation}
                         dataKey="value"
@@ -3831,7 +3848,7 @@ function DashboardWidgetCardImpl({
                     }}
                     labelFormatter={tooltipLabelFmt}
                   />
-                  {showChartLegend ? <Legend /> : null}
+                  {showChartLegend ? <Legend wrapperStyle={{ fontSize: legendFontPx }} /> : null}
                   {seriesDescriptors.map((s) => {
                     const yId = normAxis2(s.axis);
                     // Per-series style: each series carries its own thickness/
@@ -4376,7 +4393,7 @@ function DashboardWidgetCardImpl({
         const valueColor = String(cfg.value_color || "").trim() || undefined;
         const unitColor = String(cfg.unit_color || "").trim() || undefined;
         const unitScale = Number.isFinite(Number(cfg.unit_size_scale))
-          ? Math.max(0.3, Math.min(2, Number(cfg.unit_size_scale)))
+          ? Math.max(0.1, Math.min(4, Number(cfg.unit_size_scale)))
           : 1;
         const unitStyle = {
           ...(unitColor ? { color: unitColor } : {}),
@@ -4432,7 +4449,7 @@ function DashboardWidgetCardImpl({
       const valueColor = String(cfg.value_color || "").trim() || getWidgetAccent(widget, "#14a89a");
       const unitColor = String(cfg.unit_color || "").trim() || undefined;
       const unitScale = Number.isFinite(Number(cfg.unit_size_scale))
-        ? Math.max(0.3, Math.min(2, Number(cfg.unit_size_scale)))
+        ? Math.max(0.1, Math.min(4, Number(cfg.unit_size_scale)))
         : 1;
       const unitStyle = {
         ...(unitColor ? { color: unitColor } : {}),
@@ -5050,7 +5067,7 @@ function EnergyTariffsWidgetImpl({ widget, tagRowsByGateway }) {
               ? [`€${Number(it.cost || 0).toFixed(2)} • ${Number(it.kwh || 0).toFixed(3)} kWh • ${pct.toFixed(1)}%`, it.name]
               : [`${Number(it.kwh || 0).toFixed(3)} kWh • €${Number(it.cost || 0).toFixed(2)} • ${pct.toFixed(1)}%`, it.name];
           }} />
-          <Legend verticalAlign="bottom" height={24} iconType="circle" wrapperStyle={{ fontSize: 11, paddingTop: 2 }} />
+          <Legend verticalAlign="bottom" height={24} iconType="circle" wrapperStyle={{ fontSize: legendFontPx, paddingTop: 2 }} />
         </PieChart>
       </ResponsiveContainer>
       <div style={{
@@ -5354,7 +5371,7 @@ function ReportHtmlPreview({ data }) {
                       <XAxis dataKey="ts" tickFormatter={(v) => String(v).slice(11, 19)} fontSize={10} padding={{ left: 12, right: 12 }} />
                       <YAxis fontSize={10} />
                       <Tooltip labelFormatter={(v) => String(v)} />
-                      <Legend wrapperStyle={{ fontSize: 11 }} />
+                      <Legend wrapperStyle={{ fontSize: legendFontPx }} />
                       {series.map((srs, sidx) => {
                         const color = srs.color || ["#14a89a", "#f97316", "#3b82f6", "#a855f7"][sidx % 4];
                         const props = {
@@ -5397,7 +5414,7 @@ function ReportHtmlPreview({ data }) {
                         ))}
                       </Pie>
                       <Tooltip />
-                      <Legend wrapperStyle={{ fontSize: 11 }} />
+                      <Legend wrapperStyle={{ fontSize: legendFontPx }} />
                     </PieChart>
                   </ResponsiveContainer>
                 </div>

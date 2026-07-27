@@ -2431,7 +2431,7 @@ export function DashboardDesigner({
                           return <React.Fragment key={`hd-${idx}`}>{pieces}</React.Fragment>;
                         })}
                         {showTitle && (showValue || showTag) ? joiner("title") : null}
-                        {showTitle ? <span>{parts.typeLabel}</span> : null}
+                        {showTitle ? <span style={(() => { const s = Number(widget?.config?.font_title_scale); return Number.isFinite(s) && s > 0 && s !== 1 ? { fontSize: `${Math.max(0.3, Math.min(4, s))}em` } : undefined; })()}>{parts.typeLabel}</span> : null}
                       </span>
                     );
                   }
@@ -2911,6 +2911,35 @@ export function DashboardDesigner({
                     so a redundant numeric input cluttered the dialog
                     without providing extra capability. The grid state
                     (form.w / form.h) is still persisted on save. */}
+                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend", "pie_chart", "meter_chart"].includes(form.type) ? (
+                  <fieldset className="dashboard-query-fieldset">
+                    <legend>Text sizes</legend>
+                    <p className="dashboard-query-hint" style={{ marginTop: 0 }}>
+                      Scale each text family (1 = default, free range 0.3–4). Type any value or use the arrows.
+                    </p>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(90px, 1fr))", gap: 8 }}>
+                      {[
+                        ["font_axis_scale", "Axis"],
+                        ["font_title_scale", "Title"],
+                        ["font_labels_scale", "Labels"],
+                        ["font_legend_scale", "Legend"],
+                      ].map(([key, label]) => (
+                        <label key={key} className="dashboard-query-field">
+                          <span>{label}</span>
+                          <input
+                            type="number"
+                            min="0.3"
+                            max="4"
+                            step="0.1"
+                            value={form.config[key] ?? 1}
+                            onBlur={(e) => setForm((p) => ({ ...p, config: { ...p.config, [key]: clamp(e.target.value, 0.3, 4) } }))}
+                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, [key]: e.target.value } }))}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                ) : null}
                 {form.type === "bar_chart" ? (
                   <>
                     {/* 2026-07-26: Grafana-style bar-gauge mode — one bar per
@@ -3306,7 +3335,7 @@ export function DashboardDesigner({
                       onBlur={(e) =>
                         setForm((p) => ({
                           ...p,
-                          config: { ...p.config, text_font_scale: clamp(e.target.value, 0.7, 2.5) },
+                          config: { ...p.config, text_font_scale: clamp(e.target.value, 0.3, 4) },
                         }))
                       }
                       onChange={(e) =>
@@ -3388,8 +3417,9 @@ export function DashboardDesigner({
                             min="0.3"
                             max="2"
                             step="0.05"
-                            value={Number.isFinite(Number(form.config.unit_size_scale)) ? Number(form.config.unit_size_scale) : 1}
-                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, unit_size_scale: clamp(e.target.value, 0.3, 2) } }))}
+                            value={form.config.unit_size_scale ?? 1}
+                            onBlur={(e) => setForm((p) => ({ ...p, config: { ...p.config, unit_size_scale: clamp(e.target.value, 0.1, 4) } }))}
+                            onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, unit_size_scale: e.target.value } }))}
                           />
                         </label>
                       </>

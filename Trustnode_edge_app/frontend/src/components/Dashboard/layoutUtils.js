@@ -235,7 +235,7 @@ export function normalizeWidgets(rawWidgets) {
         chart_value_format: VALUE_FORMAT_VALUES.has(String(raw?.config?.chart_value_format || ""))
           ? String(raw?.config?.chart_value_format)
           : "auto",
-        text_font_scale: clamp(raw?.config?.text_font_scale ?? 1, 0.7, 2.5),
+        text_font_scale: clamp(raw?.config?.text_font_scale ?? 1, 0.3, 4),
         table_filter_tags: Array.isArray(raw?.config?.table_filter_tags)
           ? raw.config.table_filter_tags.map((t) => String(t || "")).filter(Boolean)
           : [],
