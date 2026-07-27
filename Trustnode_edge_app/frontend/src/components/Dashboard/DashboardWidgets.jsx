@@ -40,6 +40,7 @@ import {
 import {
   buildFixedText,
   evaluateComputedRules,
+  formatSeriesValue,
   formatWidgetValue,
   getLatestTagRow,
   getTagSeries as getTagSeriesFiltered,
@@ -1888,8 +1889,15 @@ function DashboardWidgetCardImpl({
   const cfg = widget?.config || {};
   const gatewayId = cfg.gateway_id || "";
   const tagName = cfg.tag_name || "";
+  // SERIES UNIFICATION (2026-07-27): chart widgets may configure every tag
+  // in the series list with no first-page primary. The widget's effective
+  // gateway then comes from the first configured series row.
+  const firstSeriesRow = useMemo(() => {
+    const extras = Array.isArray(cfg?.series_extra) ? cfg.series_extra : [];
+    return extras.find((s) => s && String(s.chart_type || "") !== "limit" && String(s.tag_name || "").trim()) || null;
+  }, [cfg?.series_extra]);
   const resolvedGatewayId = useMemo(() => {
-    const raw = String(gatewayId || "").trim();
+    const raw = String(gatewayId || firstSeriesRow?.gateway_id || "").trim();
     // Path 1: the saved gateway_id is still alive somewhere in the
     // historian rows the dashboard already fetched. Cheapest hit.
     if (raw && Object.prototype.hasOwnProperty.call(tagRowsByGateway || {}, raw)) return raw;
@@ -3029,7 +3037,12 @@ function DashboardWidgetCardImpl({
     // Keep UI live: while backend rule-stats is loading/slow, compute from currently available rows.
     return evaluateComputedRules(computedRowsTimeFiltered, rules, queryOptions);
   }, [serverRuleStats, lastGoodServerRuleStats, computedRowsTimeFiltered, rulesDepKey, queryOptions]);
-  const displayTag = formatTagForDisplay ? formatTagForDisplay(tagName) : tagName;
+  const displayTag = tagName
+    ? (formatTagForDisplay ? formatTagForDisplay(tagName) : tagName)
+    : String(firstSeriesRow?.label || "").trim()
+      || (firstSeriesRow?.tag_name
+        ? (formatTagForDisplay ? formatTagForDisplay(firstSeriesRow.tag_name) : firstSeriesRow.tag_name)
+        : "");
   // Y axis range: auto (computed from the data) or manual (operator
   // specifies min, max, optional tick step). Empty / invalid manual values
   // fall back to auto so the chart never goes blank when the operator
@@ -3232,17 +3245,22 @@ function DashboardWidgetCardImpl({
       if (tagName) {
         lanes.push({
           key: "value",
+          def: null,
           label: (displayTag || tagName) + (primaryUnitSt ? ` [${primaryUnitSt}]` : ""),
           unit: primaryUnitSt,
           color: primaryColorSt,
           limit: null,
           yMin: parseBound(cfg?.primary_lane_min),
           yMax: parseBound(cfg?.primary_lane_max),
+          yTickStep: null,
+          yDecimals: null,
+          textScale: 1,
         });
       }
       for (const def of extraSeriesDefs) {
         lanes.push({
           key: `s_${def.id}`,
+          def,
           label: (def.label || formatTagForDisplay(def.tag_name) || def.tag_name)
             + (def.unit ? ` [${def.unit}]` : ""),
           unit: def.unit || "",
@@ -3251,6 +3269,10 @@ function DashboardWidgetCardImpl({
             ? Number(def.limit_value) : null,
           yMin: parseBound(def.y_min),
           yMax: parseBound(def.y_max),
+          yTickStep: parseBound(def.y_tick_step),
+          yDecimals: (def.y_decimals === "" || def.y_decimals === undefined || def.y_decimals === null)
+            ? null : Math.max(0, Math.min(6, Math.floor(Number(def.y_decimals)))),
+          textScale: (() => { const t = Number(def.text_scale); return Number.isFinite(t) && t > 0 ? Math.max(0.5, Math.min(2, t)) : 1; })(),
         });
       }
       if (!lanes.length) {
@@ -3264,7 +3286,7 @@ function DashboardWidgetCardImpl({
       }
       const laneLineWidth = Math.max(1, Math.min(8, Number(cfg?.chart_line_width) || 2));
       const stackRows = multiSeriesData;
-      const fmtLaneVal = (v) => formatWidgetValue(cfg, v);
+      const fmtLaneVal = (v, lane) => formatSeriesValue(cfg, lane ? lane.def : null, v);
       const latestLaneVal = (key) => {
         for (let i = stackRows.length - 1; i >= 0; i -= 1) {
           const v = stackRows[i] ? stackRows[i][key] : null;
@@ -3279,38 +3301,60 @@ function DashboardWidgetCardImpl({
           </div>
         );
       }
+      // Per-lane manual ticks: min + max + step all set -> explicit array.
+      const laneTicks = (lane) => {
+        if (lane.yMin === null || lane.yMax === null || lane.yTickStep === null || lane.yTickStep <= 0) return null;
+        const out = [];
+        for (let v = lane.yMin, i = 0; v <= lane.yMax + lane.yTickStep * 1e-9 && i < 50; v += lane.yTickStep, i += 1) {
+          out.push(Number(v.toFixed(10)));
+        }
+        return out;
+      };
+      const laneTickFmt = (lane) => (v) => {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return "";
+        return lane.yDecimals !== null ? n.toFixed(lane.yDecimals) : String(n);
+      };
       return (
         <div className="dashboard-widget-block dashboard-widget-block-chart">
           <div style={{ display: "flex", flexDirection: "column", width: "100%", height: "100%", minHeight: 0, overflow: "hidden" }}>
-            {lanes.map((lane, i) => {
-              const isLast = i === lanes.length - 1;
+            {/* EQUAL lane heights (operator 2026-07-27): the shared time axis
+                renders in its OWN bottom strip so the last lane's plot is no
+                longer shorter than the others — every lane gets an identical
+                flex share. */}
+            {lanes.map((lane) => {
               const live = latestLaneVal(lane.key);
               const domain = [
                 lane.yMin !== null ? lane.yMin : "auto",
                 lane.yMax !== null ? lane.yMax : "auto",
               ];
+              const ticks = laneTicks(lane);
               return (
                 <div key={lane.key} style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-                  {/* Self-fitting lanes (operator 2026-07-27): equal flex split
-                      with NO scrollbars — every lane always visible; compact
-                      header keeps the minimum spacing. */}
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "0 8px", lineHeight: 1.15, minHeight: 14 }}>
                     <span style={{ fontSize: 10, fontWeight: 600, color: lane.color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {lane.label}
                     </span>
-                    <span style={{ fontSize: 11, fontWeight: 700, color: lane.color, marginLeft: 8, flexShrink: 0 }}>
-                      {live === null ? "-" : `${fmtLaneVal(live)}${lane.unit ? ` ${lane.unit}` : ""}`}
+                    <span style={{ fontSize: Math.round(11 * (lane.textScale || 1)), fontWeight: 700, color: lane.color, marginLeft: 8, flexShrink: 0 }}>
+                      {live === null ? "-" : `${fmtLaneVal(live, lane)}${lane.unit ? ` ${lane.unit}` : ""}`}
                     </span>
                   </div>
                   <div style={{ flex: 1, minHeight: 0 }}>
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={stackRows} syncId={laneSync}
-                        margin={{ top: 2, right: 12, left: 0, bottom: isLast ? 2 : 0 }}>
+                        margin={{ top: 2, right: 12, left: 0, bottom: 0 }}>
                         <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                        <XAxis {...buildXAxisProps(stackRows, cfg)} hide={!isLast} height={isLast ? 26 : 0} />
-                        <YAxis width={56} tick={{ fontSize: 10 }} tickCount={3} domain={domain} allowDataOverflow={lane.yMin !== null || lane.yMax !== null} />
+                        <XAxis {...buildXAxisProps(stackRows, cfg)} hide height={0} />
+                        <YAxis
+                          width={56}
+                          tick={{ fontSize: 10 }}
+                          domain={domain}
+                          allowDataOverflow={lane.yMin !== null || lane.yMax !== null}
+                          {...(ticks ? { ticks } : { tickCount: 3 })}
+                          tickFormatter={laneTickFmt(lane)}
+                        />
                         <Tooltip
-                          formatter={(v) => fmtLaneVal(v)}
+                          formatter={(v) => fmtLaneVal(v, lane)}
                           labelFormatter={(l, payload) => {
                             const ts = payload && payload[0] && payload[0].payload ? payload[0].payload.ts : l;
                             try { return new Date(ts).toLocaleTimeString(); } catch { return String(l); }
@@ -3334,6 +3378,15 @@ function DashboardWidgetCardImpl({
                 </div>
               );
             })}
+            {/* Dedicated shared time-axis strip (fixed height, outside lanes). */}
+            <div style={{ height: 26, flexShrink: 0 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={stackRows} syncId={laneSync} margin={{ top: 0, right: 12, left: 0, bottom: 0 }}>
+                  <XAxis {...buildXAxisProps(stackRows, cfg)} height={24} />
+                  <YAxis width={56} tick={false} axisLine={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
           </div>
         </div>
       );
@@ -3372,6 +3425,7 @@ function DashboardWidgetCardImpl({
         for (const def of extraSeriesDefs) {
           const rows = Array.isArray(extraSeriesRowsByDef[def.id]) ? extraSeriesRowsByDef[def.id] : [];
           gaugeEntries.push({
+            def,
             name: def.label || formatTagForDisplay(def.tag_name) || def.tag_name,
             value: reduceVals(rows.map((r) => {
               const n = Number(r?.value);
@@ -3400,7 +3454,7 @@ function DashboardWidgetCardImpl({
         // per-axis configuration.
         const fmtGauge = (v, entry) => {
           if (v === null || !Number.isFinite(Number(v))) return "-";
-          const base = formatWidgetValue(cfg, v);
+          const base = formatSeriesValue(cfg, entry ? entry.def : null, v);
           const unit = entry && entry.unit ? entry.unit
             : (axisHasUnit ? `${String(cfg?.primary_suffix || "").trim() || String(cfg?.primary_unit || "").trim()}` : "");
           return unit ? `${base} ${unit}` : base;
@@ -4483,12 +4537,15 @@ function DashboardWidgetCardImpl({
           return { newest, num };
         };
         const orderedTags = tableFilterTags.length ? tableFilterTags.filter((t) => byTag.has(t)) : Array.from(byTag.keys()).sort();
+        const seriesByTag = new Map((Array.isArray(cfg?.series_extra) ? cfg.series_extra : [])
+          .filter((s) => s && String(s.tag_name || "").trim())
+          .map((s) => [String(s.tag_name), s]));
         const latestRows = orderedTags.map((tg) => {
           const { newest, num } = reduceRows(byTag.get(tg) || []);
           const text = newest && newest.value == null && newest.value_text != null ? String(newest.value_text) : null;
           return {
             tag: tg,
-            display: text !== null ? text : (num === null ? "-" : formatWidgetValue(cfg, num)),
+            display: text !== null ? text : (num === null ? "-" : formatSeriesValue(cfg, seriesByTag.get(tg) || null, num)),
             ts: newest ? String(newest.ts || newest.ts_utc || "") : "",
             data_type: newest ? String(newest.data_type || (text !== null ? "STRING" : "")) : "",
           };

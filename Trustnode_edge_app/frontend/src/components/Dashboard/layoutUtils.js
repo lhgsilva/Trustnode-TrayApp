@@ -268,6 +268,12 @@ export function normalizeWidgets(rawWidgets) {
                 // EVERY load/drag/reflow and used to strip these.
                 y_min: s.y_min === undefined || s.y_min === null ? "" : String(s.y_min),
                 y_max: s.y_max === undefined || s.y_max === null ? "" : String(s.y_max),
+                y_tick_step: s.y_tick_step === undefined || s.y_tick_step === null ? "" : String(s.y_tick_step),
+                y_decimals: s.y_decimals === undefined || s.y_decimals === null ? "" : String(s.y_decimals),
+                value_format: ["auto", "int", "2dp", "3dp", "scientific"].includes(String(s.value_format || ""))
+                  ? String(s.value_format) : "",
+                value_decimals: s.value_decimals === undefined || s.value_decimals === null ? "" : String(s.value_decimals),
+                text_scale: s.text_scale === undefined || s.text_scale === null ? "" : String(s.text_scale),
                 line_width: clamp(s.line_width ?? 2, 1, 8),
                 line_dot: ["none", "small", "medium", "large"].includes(String(s.line_dot || ""))
                   ? String(s.line_dot)

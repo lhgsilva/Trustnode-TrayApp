@@ -8,7 +8,7 @@ import {
   newWidgetId,
 } from "./widgetRegistry";
 import { compactWidgets, findFirstFreeSpot, normalizeWidgets, reflowWidgetsForMove, reflowWidgetsForMoveToPoint, reflowWidgetsForResize } from "./layoutUtils";
-import { formatWidgetValue } from "./dashboardAnalytics";
+import { formatSeriesValue, formatWidgetValue } from "./dashboardAnalytics";
 import { DASHBOARD_GRID_VIRTUAL_ROWS } from "./widgetRegistry";
 import { materializePowerDashboardPayload } from "./powerDashboardTemplate";
 import { filterRowsByRange, getLatestTagRow, toTsMs } from "./dashboardAnalytics";
@@ -76,7 +76,7 @@ function AxisConfigModal({ config, onChange, onClose, widgetValueFormat, widgetT
   const stackedLanes = isStacked
     ? [
         ...(String(config?.tag_name || "").trim()
-          ? [{ kind: "primary", label: String(config?.tag_name || "Primary"), min: config?.primary_lane_min ?? "", max: config?.primary_lane_max ?? "" }]
+          ? [{ kind: "primary", label: String(config?.tag_name || "Primary"), min: config?.primary_lane_min ?? "", max: config?.primary_lane_max ?? "", tick: config?.primary_lane_tick ?? "", decimals: config?.primary_lane_decimals ?? "" }]
           : []),
         ...((Array.isArray(config?.series_extra) ? config.series_extra : [])
           .map((s, idx) => ({ s, idx }))
@@ -86,16 +86,19 @@ function AxisConfigModal({ config, onChange, onClose, widgetValueFormat, widgetT
             label: String(s.label || s.tag_name || `Series ${idx + 1}`),
             color: String(s.color || ""),
             min: s.y_min ?? "", max: s.y_max ?? "",
+            tick: s.y_tick_step ?? "", decimals: s.y_decimals ?? "",
           }))),
       ]
     : [];
+  const LANE_FIELD_KEYS = { min: "y_min", max: "y_max", tick: "y_tick_step", decimals: "y_decimals" };
+  const LANE_PRIMARY_KEYS = { min: "primary_lane_min", max: "primary_lane_max", tick: "primary_lane_tick", decimals: "primary_lane_decimals" };
   const setLaneBound = (lane, field, value) => {
     if (lane.kind === "primary") {
-      onChange({ [field === "min" ? "primary_lane_min" : "primary_lane_max"]: value });
+      onChange({ [LANE_PRIMARY_KEYS[field] || field]: value });
       return;
     }
     const list = Array.isArray(config?.series_extra) ? [...config.series_extra] : [];
-    list[lane.idx] = { ...(list[lane.idx] || {}), [field === "min" ? "y_min" : "y_max"]: value };
+    list[lane.idx] = { ...(list[lane.idx] || {}), [LANE_FIELD_KEYS[field] || field]: value };
     onChange({ series_extra: list });
   };
   const set = (key, value) => onChange({ [key]: value });
@@ -132,12 +135,12 @@ function AxisConfigModal({ config, onChange, onClose, widgetValueFormat, widgetT
             <legend>Lanes (one per tag)</legend>
             {stackedLanes.length ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                <div style={{ display: "grid", gridTemplateColumns: "minmax(220px, 1fr) 140px 140px", gap: 8, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", opacity: 0.7, padding: "0 4px" }}>
-                  <span>Lane / Tag</span><span>Y Min</span><span>Y Max</span>
+                <div style={{ display: "grid", gridTemplateColumns: "minmax(200px, 1fr) 110px 110px 110px 100px", gap: 8, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", opacity: 0.7, padding: "0 4px" }}>
+                  <span>Lane / Tag</span><span>Y Min</span><span>Y Max</span><span>Tick step</span><span>Decimals</span>
                 </div>
                 {stackedLanes.map((lane) => (
                   <div key={`${lane.kind}-${lane.idx ?? "p"}`}
-                    style={{ display: "grid", gridTemplateColumns: "minmax(220px, 1fr) 140px 140px", gap: 8, alignItems: "center", padding: "2px 4px" }}>
+                    style={{ display: "grid", gridTemplateColumns: "minmax(200px, 1fr) 110px 110px 110px 100px", gap: 8, alignItems: "center", padding: "2px 4px" }}>
                     <span style={{ fontWeight: 600, color: lane.color || undefined, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
                       title={lane.label}>
                       {lane.label}
@@ -146,6 +149,12 @@ function AxisConfigModal({ config, onChange, onClose, widgetValueFormat, widgetT
                       onChange={(e) => setLaneBound(lane, "min", e.target.value)} />
                     <input type="number" step="any" value={lane.max} placeholder="auto"
                       onChange={(e) => setLaneBound(lane, "max", e.target.value)} />
+                    <input type="number" step="any" value={lane.tick} placeholder="auto"
+                      title="Y tick spacing (needs Min + Max set)"
+                      onChange={(e) => setLaneBound(lane, "tick", e.target.value)} />
+                    <input type="number" min="0" max="6" step="1" value={lane.decimals} placeholder="auto"
+                      title="Tick label decimals"
+                      onChange={(e) => setLaneBound(lane, "decimals", e.target.value)} />
                   </div>
                 ))}
               </div>
@@ -1084,6 +1093,8 @@ export function DashboardDesigner({
   const [queryModalOpen, setQueryModalOpen] = useState(false);
   // Dedicated axis-configuration modal (all Y axes, one card per axis in use).
   const [axisModalOpen, setAxisModalOpen] = useState(false);
+  // Per-series value-configuration modal (index into form.config.series_extra).
+  const [seriesValueCfgIdx, setSeriesValueCfgIdx] = useState(null);
   // Live rows used ONLY to infer a tag's type when the controller's declared
   // type isn't known (see tagTypes.js). Never used for rendering.
   const tagRowsForTypes = Array.isArray(dataLogView) ? dataLogView : (Array.isArray(tagRows) ? tagRows : []);
@@ -1246,10 +1257,12 @@ export function DashboardDesigner({
       // Same text-first rule as the primary series (see above).
       const sValue = sLatest?.last_value_text != null && String(sLatest.last_value_text) !== ""
         ? String(sLatest.last_value_text)
-        : formatWidgetValue(cfg, sLatest?.last_value);
+        : formatSeriesValue(cfg, s, sLatest?.last_value);
       const sLabel = String(s?.label || "").trim() || (formatTagForDisplay ? formatTagForDisplay(sTag) : sTag);
+      const sScale = Number(s?.text_scale);
       seriesItems.push({
         value: decorateValue(sValue, s?.unit, s?.suffix),
+        textScale: Number.isFinite(sScale) && sScale > 0 ? Math.max(0.5, Math.min(2, sScale)) : 1,
         tag: sLabel,
         color: String(s?.color || "").trim() || fallbackPalette[paletteIdx % fallbackPalette.length],
       });
@@ -1378,9 +1391,47 @@ export function DashboardDesigner({
     setModalOpen(true);
   };
 
+  const CHART_SERIES_TYPES = ["line_chart", "line_area_chart", "bar_chart", "stacked_trend"];
+
+  // 2026-07-27 SERIES UNIFICATION: chart widgets configure ALL their data
+  // series in ONE place — the Series editor. Legacy widgets that carry a
+  // primary tag on the first page are auto-converted on open: the primary
+  // becomes series row 0 (keeping its gateway/unit/suffix/color/scaling)
+  // and the first-page tag field is cleared. Storage stays fully backward
+  // compatible — renderers accept both shapes.
+  const unifySeriesOnOpen = (widget) => {
+    const cfg = widget?.config || {};
+    if (!CHART_SERIES_TYPES.includes(String(widget?.type || ""))) return cfg;
+    const primaryTag = String(cfg.tag_name || "").trim();
+    if (!primaryTag) return cfg;
+    const extras = Array.isArray(cfg.series_extra) ? [...cfg.series_extra] : [];
+    const alreadyThere = extras.some(
+      (s) => String(s?.tag_name || "") === primaryTag
+        && String(s?.gateway_id || cfg.gateway_id || "") === String(cfg.gateway_id || ""));
+    if (!alreadyThere) {
+      extras.unshift({
+        id: `s-primary-${Date.now().toString(36)}`,
+        gateway_id: String(cfg.gateway_id || ""),
+        tag_name: primaryTag,
+        label: String(widget?.title || "").trim() || primaryTag,
+        color: String(widget?.color || "#14a89a"),
+        axis: "left1",
+        chart_type: "",
+        unit: String(cfg.primary_unit || ""),
+        suffix: String(cfg.primary_suffix || ""),
+        multiplier: Number(cfg.multiplier ?? 1) || 1,
+        offset: Number(cfg.offset ?? 0) || 0,
+        y_min: cfg.primary_lane_min ?? "",
+        y_max: cfg.primary_lane_max ?? "",
+      });
+    }
+    return { ...cfg, series_extra: extras, tag_name: "", primary_unit: "", primary_suffix: "", primary_lane_min: "", primary_lane_max: "" };
+  };
+
   const openEdit = (widget) => {
     const meta = getWidgetMeta(widget.type);
     setEditingId(widget.id);
+    const unifiedCfg = unifySeriesOnOpen(widget);
     setForm({
       type: widget.type,
       title: widget.title || meta.label,
@@ -1397,9 +1448,9 @@ export function DashboardDesigner({
         // intact. The explicit defaults below still normalize the
         // known fields, but un-listed fields no longer get silently
         // wiped on open.
-        ...(widget?.config || {}),
-        gateway_id: widget?.config?.gateway_id || "",
-        tag_name: widget?.config?.tag_name || "",
+        ...(unifiedCfg || {}),
+        gateway_id: unifiedCfg?.gateway_id || "",
+        tag_name: unifiedCfg?.tag_name || "",
         readings_count: clamp(widget?.config?.readings_count ?? 120, 5, 5000),
         interpolation: CHART_INTERPOLATION_OPTIONS.some((opt) => opt.value === widget?.config?.interpolation)
           ? widget?.config?.interpolation
@@ -1452,11 +1503,11 @@ export function DashboardDesigner({
         query_advanced_columns: Array.isArray(widget?.config?.query_advanced_columns)
           ? widget.config.query_advanced_columns
           : [],
-        series_extra: Array.isArray(widget?.config?.series_extra)
-          ? widget.config.series_extra
+        series_extra: Array.isArray(unifiedCfg?.series_extra)
+          ? unifiedCfg.series_extra
           : [],
-        primary_unit: String(widget?.config?.primary_unit || ""),
-        primary_suffix: String(widget?.config?.primary_suffix || ""),
+        primary_unit: String(unifiedCfg?.primary_unit || ""),
+        primary_suffix: String(unifiedCfg?.primary_suffix || ""),
         y_axis_label: String(widget?.config?.y_axis_label || ""),
         y_axis_right_label: String(widget?.config?.y_axis_right_label || ""),
         chart_line_width: clamp(widget?.config?.chart_line_width ?? 2, 1, 8),
@@ -1854,6 +1905,12 @@ export function DashboardDesigner({
                 // until reopen, then vanished. "" = auto.
                 y_min: s.y_min === undefined || s.y_min === null ? "" : String(s.y_min),
                 y_max: s.y_max === undefined || s.y_max === null ? "" : String(s.y_max),
+                y_tick_step: s.y_tick_step === undefined || s.y_tick_step === null ? "" : String(s.y_tick_step),
+                y_decimals: s.y_decimals === undefined || s.y_decimals === null ? "" : String(s.y_decimals),
+                value_format: ["auto", "int", "2dp", "3dp", "scientific"].includes(String(s.value_format || ""))
+                  ? String(s.value_format) : "",
+                value_decimals: s.value_decimals === undefined || s.value_decimals === null ? "" : String(s.value_decimals),
+                text_scale: s.text_scale === undefined || s.text_scale === null ? "" : String(s.text_scale),
                 // Per-series style. Each row carries its own thickness /
                 // dot / bar-width / pattern so multi-series charts can
                 // have, say, a thick solid trend line plus a thin dotted
@@ -2277,7 +2334,7 @@ export function DashboardDesigner({
                   const showTitle = enabled.has("title");
                   const joiner = (key) => <span className="dashboard-widget-head-sep">|</span>;
                   const items = Array.isArray(parts.seriesItems) ? parts.seriesItems : [];
-                  if (items.length > 1) {
+                  if (items.length >= 1) {
                     // Multi-series widget: render one "value | tag" pair
                     // per visible series so the operator can read every
                     // current value without opening the chart legend.
@@ -2286,7 +2343,7 @@ export function DashboardDesigner({
                         {items.map((it, idx) => {
                           const pieces = [];
                           if (idx > 0) pieces.push(<span key={`sep-${idx}`} className="dashboard-widget-head-sep">·</span>);
-                          if (showValue) pieces.push(<span key={`v-${idx}`} className="dashboard-widget-head-value" style={{ color: it.color }}>{it.value}</span>);
+                          if (showValue) pieces.push(<span key={`v-${idx}`} className="dashboard-widget-head-value" style={{ color: it.color, ...(it.textScale && it.textScale !== 1 ? { fontSize: `${it.textScale}em` } : {}) }}>{it.value}</span>);
                           if (showValue && showTag) pieces.push(<span key={`vt-${idx}`} className="dashboard-widget-head-sep">|</span>);
                           if (showTag) pieces.push(<span key={`t-${idx}`}>{it.tag}</span>);
                           return <React.Fragment key={`hd-${idx}`}>{pieces}</React.Fragment>;
@@ -2856,10 +2913,13 @@ export function DashboardDesigner({
                         ))}
                       </select>
                     </label>
+                    {CHART_SERIES_TYPES.includes(form.type) ? (
+                      <p className="dashboard-query-hint" style={{ margin: "4px 0" }}>
+                        Data series for this chart are configured in <b>Series &amp; Axes</b> (the Series editor) —
+                        one place for every tag, including the first one. The gateway above is the widget's default.
+                      </p>
+                    ) : null}
                     {[
-                      "line_chart",
-                      "line_area_chart",
-                      "bar_chart",
                       "meter_chart",
                       "text_kpi",
                       "value_kpi",
@@ -3702,6 +3762,71 @@ export function DashboardDesigner({
 
       {/* Axis configuration — one card per axis IN USE. Opens from the main
           Configure page (single-series) and from Series & Axes (multi-series). */}
+      {seriesValueCfgIdx !== null && form ? (() => {
+        const rows = Array.isArray(form.config?.series_extra) ? form.config.series_extra : [];
+        const row = rows[seriesValueCfgIdx];
+        if (!row) { return null; }
+        const patchRow = (patch) => setForm((p) => {
+          const list = Array.isArray(p.config.series_extra) ? [...p.config.series_extra] : [];
+          list[seriesValueCfgIdx] = { ...(list[seriesValueCfgIdx] || {}), ...patch };
+          return { ...p, config: { ...p.config, series_extra: list } };
+        });
+        const rowLabel = String(row.label || row.tag_name || `Series ${seriesValueCfgIdx + 1}`);
+        return (
+          <div className="modal-backdrop" style={{ zIndex: 75 }} onClick={() => setSeriesValueCfgIdx(null)}>
+            <div className="modal-card dashboard-query-modal" style={{ width: "min(560px, 94vw)" }}
+              onClick={(e) => e.stopPropagation()}>
+              <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <h3 style={{ margin: 0 }}>Tag value configuration — {rowLabel}</h3>
+                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setSeriesValueCfgIdx(null)}>✕</button>
+              </div>
+              <p className="dashboard-query-hint" style={{ marginTop: 0 }}>
+                How THIS tag's values render everywhere in the widget (header, labels, tooltips,
+                lane readouts). Blank fields inherit the widget-wide settings.
+              </p>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <label className="dashboard-query-field">
+                  <span>Unit</span>
+                  <input value={row.unit || ""} placeholder="e.g. °C, %, bar"
+                    onChange={(e) => patchRow({ unit: e.target.value })} />
+                </label>
+                <label className="dashboard-query-field">
+                  <span>Suffix</span>
+                  <input value={row.suffix || ""} placeholder="hugs the number, e.g. %"
+                    onChange={(e) => patchRow({ suffix: e.target.value })} />
+                </label>
+                <label className="dashboard-query-field">
+                  <span>Value format</span>
+                  <select value={String(row.value_format || "")}
+                    onChange={(e) => patchRow({ value_format: e.target.value })}>
+                    <option value="">(widget default)</option>
+                    <option value="auto">Auto</option>
+                    <option value="int">Integer</option>
+                    <option value="2dp">2 decimals</option>
+                    <option value="3dp">3 decimals</option>
+                    <option value="scientific">Scientific</option>
+                  </select>
+                </label>
+                <label className="dashboard-query-field">
+                  <span>Decimals (0–6)</span>
+                  <input type="number" min="0" max="6" step="1"
+                    value={row.value_decimals ?? ""} placeholder="(widget default)"
+                    onChange={(e) => patchRow({ value_decimals: e.target.value })} />
+                </label>
+                <label className="dashboard-query-field">
+                  <span>Text size scale (0.5–2)</span>
+                  <input type="number" min="0.5" max="2" step="0.1"
+                    value={row.text_scale ?? ""} placeholder="1"
+                    onChange={(e) => patchRow({ text_scale: e.target.value })} />
+                </label>
+              </div>
+              <div className="row" style={{ justifyContent: "flex-end", marginTop: 10 }}>
+                <button type="button" className="btn btn-primary btn-sm" onClick={() => setSeriesValueCfgIdx(null)}>Done</button>
+              </div>
+            </div>
+          </div>
+        );
+      })() : null}
       {axisModalOpen && form ? (
         <AxisConfigModal
           config={form.config || {}}
@@ -4123,8 +4248,7 @@ export function DashboardDesigner({
                         <span>Label</span>
                         <span>Axis</span>
                         <span>Type</span>
-                        <span>Unit</span>
-                        <span>Suffix</span>
+                        <span>Values</span>
                         <span>Size</span>
                         <span>Style</span>
                         <span>Color</span>
@@ -4232,20 +4356,19 @@ export function DashboardDesigner({
                               <option value="bar">Bar</option>
                               <option value="limit">Limit line</option>
                             </select>
-                            <input
-                              value={row.unit || ""}
-                              placeholder={isLimit ? "(optional)" : "e.g. bar"}
-                              onChange={(e) => update({ unit: e.target.value })}
-                              title="Unit"
+                            {/* 2026-07-27: per-tag VALUE configuration lives in its
+                                own modal (unit, suffix, format, decimals, text size)
+                                — one gear per series row. */}
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm"
+                              title="Tag value configuration (unit, suffix, format, decimals, text size)"
                               disabled={isLimit}
-                            />
-                            <input
-                              value={row.suffix || ""}
-                              placeholder=""
-                              onChange={(e) => update({ suffix: e.target.value })}
-                              title="Suffix"
-                              disabled={isLimit}
-                            />
+                              onClick={() => setSeriesValueCfgIdx(idx)}
+                              style={{ padding: "4px 6px" }}
+                            >
+                              ⚙
+                            </button>
 
                             {/* Size cell: per-series thickness for line/area,
                                 bar width for bar, ignored for limit lines. */}

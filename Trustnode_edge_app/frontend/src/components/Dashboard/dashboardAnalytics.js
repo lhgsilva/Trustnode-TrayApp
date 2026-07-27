@@ -309,3 +309,28 @@ export function formatWidgetValue(cfg, v) {
     default: return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
   }
 }
+
+// Per-SERIES value formatting (2026-07-27): a series row's own value_format /
+// value_decimals (set in the per-tag "Tag value configuration" modal)
+// override the widget-wide rule; blank fields inherit formatWidgetValue.
+export function formatSeriesValue(cfg, seriesRow, v) {
+  if (v === null || v === undefined || v === "") return "-";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "-";
+  if (seriesRow) {
+    const dRaw = seriesRow.value_decimals;
+    const d = dRaw === "" || dRaw === null || dRaw === undefined
+      ? null
+      : Math.max(0, Math.min(6, Math.floor(Number(dRaw))));
+    if (d !== null && Number.isFinite(d)) return n.toFixed(d);
+    switch (String(seriesRow.value_format || "")) {
+      case "int": return n.toFixed(0);
+      case "2dp": return n.toFixed(2);
+      case "3dp": return n.toFixed(3);
+      case "scientific": return n.toExponential(2);
+      case "auto": return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
+      default: break; // "" = inherit widget rule
+    }
+  }
+  return formatWidgetValue(cfg, v);
+}
