@@ -1483,7 +1483,9 @@ function LiveTagChart({
 
   // Axis labels (rotated 90° inside the chart) — same as the heavy
   // widget so saved widgets look identical after the routing change.
-  const primaryAxisLabel = String(cfg.y_axis_label || cfg.primary_unit || "");
+  // Label ONLY when the operator sets it in Axis configuration. The unit
+  // used to leak in as a fallback and painted an unwanted axis title.
+  const primaryAxisLabel = String(cfg.y_axis_label || "");
   const rightAxisLabel = String(cfg.y_axis_right_label || "");
   const left2AxisLabel = String(cfg.y_left2_label || "");
   const right2AxisLabel = String(cfg.y_right2_label || "");
@@ -1604,7 +1606,7 @@ function LiveTagChart({
     && seriesDefs.every((s) => s?.chartKind === "bar");
   const margin = {
     top: 4,
-    right: rightAxisLabel ? 32 : 8,
+    right: rightAxisLabel ? 32 : 4,
     // Bump the left margin a touch on bar-only charts so the longest
     // Y-axis tick (e.g. "1,188.937") sits comfortably to the LEFT of
     // the first bar slot. 12px is enough for 7–8 digit ticks at
@@ -4315,7 +4317,7 @@ function DashboardWidgetCardImpl({
             ? Number(liveNumRaw).toFixed(3)
             : null);
       return (
-        <div className="dashboard-widget-block">
+        <div className="dashboard-widget-block dashboard-kpi-block">
           <div className="dashboard-kpi-text" style={{ fontSize: `${textSize}px`, ...(valueColor ? { color: valueColor } : {}) }}
             title={liveDisplay || undefined}>
             <span>
@@ -4360,7 +4362,7 @@ function DashboardWidgetCardImpl({
       };
       if (textValue !== null) {
         return (
-          <div className="dashboard-widget-block">
+          <div className="dashboard-widget-block dashboard-kpi-block">
             <div
               className="dashboard-kpi-value dashboard-kpi-text-value"
               style={{ color: valueColor, fontSize: `${textSize}px` }}
@@ -4374,7 +4376,7 @@ function DashboardWidgetCardImpl({
         );
       }
       return (
-        <div className="dashboard-widget-block">
+        <div className="dashboard-widget-block dashboard-kpi-block">
           <div
             className="dashboard-kpi-value"
             style={{ color: valueColor, fontSize: `${valueSize}px` }}

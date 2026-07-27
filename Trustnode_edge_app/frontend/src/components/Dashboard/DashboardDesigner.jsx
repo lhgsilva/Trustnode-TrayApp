@@ -64,9 +64,38 @@ function axesInUseFromConfig(cfg) {
 
 // One modal to configure every Y axis in use: label, prefix/unit/suffix,
 // decimals, value format, and the scale (auto or manual min/max/tick).
-function AxisConfigModal({ config, onChange, onClose, widgetValueFormat }) {
+function AxisConfigModal({ config, onChange, onClose, widgetValueFormat, widgetType }) {
+  const isStacked = String(widgetType || "") === "stacked_trend";
   const used = axesInUseFromConfig(config);
-  const shown = AXIS_DEFS.filter((a) => used.has(a.id));
+  const shown = isStacked ? [] : AXIS_DEFS.filter((a) => used.has(a.id));
+  // Stacked Trend lanes: ONE ROW PER TAG (primary + each data series).
+  // Bounds write to primary_lane_min/max and the series rows' y_min/y_max —
+  // exactly the fields the lane renderer reads, so changes apply on save.
+  const stackedLanes = isStacked
+    ? [
+        ...(String(config?.tag_name || "").trim()
+          ? [{ kind: "primary", label: String(config?.tag_name || "Primary"), min: config?.primary_lane_min ?? "", max: config?.primary_lane_max ?? "" }]
+          : []),
+        ...((Array.isArray(config?.series_extra) ? config.series_extra : [])
+          .map((s, idx) => ({ s, idx }))
+          .filter(({ s }) => s && String(s.chart_type || "") !== "limit" && String(s.tag_name || "").trim())
+          .map(({ s, idx }) => ({
+            kind: "series", idx,
+            label: String(s.label || s.tag_name || `Series ${idx + 1}`),
+            color: String(s.color || ""),
+            min: s.y_min ?? "", max: s.y_max ?? "",
+          }))),
+      ]
+    : [];
+  const setLaneBound = (lane, field, value) => {
+    if (lane.kind === "primary") {
+      onChange({ [field === "min" ? "primary_lane_min" : "primary_lane_max"]: value });
+      return;
+    }
+    const list = Array.isArray(config?.series_extra) ? [...config.series_extra] : [];
+    list[lane.idx] = { ...(list[lane.idx] || {}), [field === "min" ? "y_min" : "y_max"]: value };
+    onChange({ series_extra: list });
+  };
   const set = (key, value) => onChange({ [key]: value });
   const txt = (k, ph, title) => (
     <label className="dashboard-query-field" title={title || ""}>
@@ -92,9 +121,37 @@ function AxisConfigModal({ config, onChange, onClose, widgetValueFormat }) {
           <button type="button" className="btn btn-ghost btn-sm" onClick={onClose}>✕</button>
         </div>
         <p className="dashboard-query-hint" style={{ marginTop: 0 }}>
-          Only axes used by a series are shown. Assign a series to Left 2 / Right 1 / Right 2 in
-          Series &amp; Axes to configure it here.
+          {isStacked
+            ? "Each configured tag renders as its own lane. Set the lane's Y range here (blank = auto)."
+            : "Only axes used by a series are shown. Assign a series to Left 2 / Right 1 / Right 2 in Series & Axes to configure it here."}
         </p>
+        {isStacked ? (
+          <fieldset className="dashboard-query-fieldset">
+            <legend>Lanes (one per tag)</legend>
+            {stackedLanes.length ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "minmax(220px, 1fr) 140px 140px", gap: 8, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", opacity: 0.7, padding: "0 4px" }}>
+                  <span>Lane / Tag</span><span>Y Min</span><span>Y Max</span>
+                </div>
+                {stackedLanes.map((lane) => (
+                  <div key={`${lane.kind}-${lane.idx ?? "p"}`}
+                    style={{ display: "grid", gridTemplateColumns: "minmax(220px, 1fr) 140px 140px", gap: 8, alignItems: "center", padding: "2px 4px" }}>
+                    <span style={{ fontWeight: 600, color: lane.color || undefined, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                      title={lane.label}>
+                      {lane.label}
+                    </span>
+                    <input type="number" step="any" value={lane.min} placeholder="auto"
+                      onChange={(e) => setLaneBound(lane, "min", e.target.value)} />
+                    <input type="number" step="any" value={lane.max} placeholder="auto"
+                      onChange={(e) => setLaneBound(lane, "max", e.target.value)} />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="dashboard-query-hint">No lanes yet — pick a primary Tag or add series in the Series editor.</p>
+            )}
+          </fieldset>
+        ) : null}
         {shown.map((ax) => {
           const k = ax.keys;
           const manual = String(config?.[k.mode] || "auto").toLowerCase() === "manual";
@@ -1790,6 +1847,11 @@ export function DashboardDesigner({
                 multiplier: Number(s.multiplier ?? 1) || 1,
                 offset: Number(s.offset ?? 0) || 0,
                 limit_value: s.limit_value === undefined || s.limit_value === null ? "" : String(s.limit_value),
+                // Per-lane Y bounds (Stacked Trend). The allowlist used to
+                // DROP these on save — the operator's axis changes rendered
+                // until reopen, then vanished. "" = auto.
+                y_min: s.y_min === undefined || s.y_min === null ? "" : String(s.y_min),
+                y_max: s.y_max === undefined || s.y_max === null ? "" : String(s.y_max),
                 // Per-series style. Each row carries its own thickness /
                 // dot / bar-width / pattern so multi-series charts can
                 // have, say, a thick solid trend line plus a thin dotted
@@ -2679,30 +2741,6 @@ export function DashboardDesigner({
                     so a redundant numeric input cluttered the dialog
                     without providing extra capability. The grid state
                     (form.w / form.h) is still persisted on save. */}
-                {form.type === "stacked_trend" ? (
-                  <>
-                    {/* Primary tag's lane Y bounds (blank = auto). Extra series
-                        carry their own Y min/max inputs in the Series editor. */}
-                    <label>
-                      Primary Lane Y Min
-                      <input
-                        type="number"
-                        value={form.config.primary_lane_min ?? ""}
-                        placeholder="auto"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, primary_lane_min: e.target.value } }))}
-                      />
-                    </label>
-                    <label>
-                      Primary Lane Y Max
-                      <input
-                        type="number"
-                        value={form.config.primary_lane_max ?? ""}
-                        placeholder="auto"
-                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, primary_lane_max: e.target.value } }))}
-                      />
-                    </label>
-                  </>
-                ) : null}
                 {form.type === "bar_chart" ? (
                   <>
                     {/* 2026-07-26: Grafana-style bar-gauge mode — one bar per
@@ -2866,12 +2904,22 @@ export function DashboardDesigner({
                       min="5"
                       max="5000"
                       value={form.config.readings_count}
+                      onBlur={(e) =>
+                        setForm((p) => ({
+                          ...p,
+                          config: { ...p.config, readings_count: clamp(e.target.value, 5, 5000) },
+                        }))
+                      }
                       onChange={(e) =>
                         setForm((p) => ({
                           ...p,
                           config: {
                             ...p.config,
-                            readings_count: clamp(e.target.value, 5, 5000),
+                            // Free typing: keep the raw text while editing; the
+                            // clamp runs on blur and again at save. Clamping per
+                            // keystroke made "120" impossible to type (the "1"
+                            // snapped to the minimum before the user finished).
+                            readings_count: e.target.value,
                             // Reset any saved override so the new value
                             // applies to extras too. Operator wants ONE
                             // knob to control the chart's depth.
@@ -3081,11 +3129,19 @@ export function DashboardDesigner({
                       min="0.7"
                       max="2.5"
                       step="0.1"
-                      value={Number(form.config.text_font_scale || 1).toFixed(1)}
-                      onChange={(e) =>
+                      value={form.config.text_font_scale ?? 1}
+                      onBlur={(e) =>
                         setForm((p) => ({
                           ...p,
                           config: { ...p.config, text_font_scale: clamp(e.target.value, 0.7, 2.5) },
+                        }))
+                      }
+                      onChange={(e) =>
+                        setForm((p) => ({
+                          ...p,
+                          // Raw while typing (see readings_count note); clamped
+                          // on blur + save.
+                          config: { ...p.config, text_font_scale: e.target.value },
                         }))
                       }
                     />
@@ -3619,6 +3675,7 @@ export function DashboardDesigner({
       {axisModalOpen && form ? (
         <AxisConfigModal
           config={form.config || {}}
+          widgetType={form.type}
           widgetValueFormat={form.config?.chart_value_format || "auto"}
           onChange={(patch) => setForm((p) => ({ ...p, config: { ...p.config, ...patch } }))}
           onClose={() => setAxisModalOpen(false)}
@@ -3627,7 +3684,7 @@ export function DashboardDesigner({
 
       {queryModalOpen ? (
         <div className="modal-backdrop">
-          <div className={`modal-card dashboard-widget-modal dashboard-query-modal dashboard-query-modal-wide ${["line_chart", "line_area_chart", "bar_chart"].includes(form.type) ? "dashboard-series-modal-wide" : ""}`}>
+          <div className={`modal-card dashboard-widget-modal dashboard-query-modal dashboard-query-modal-wide ${["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? "dashboard-series-modal-wide" : ""}`}>
             <h3>
               {["line_chart", "line_area_chart", "bar_chart"].includes(form.type)
                 ? "Series, Axes & Data Query"
@@ -4062,7 +4119,6 @@ export function DashboardDesigner({
                               value={row.gateway_id || form.config.gateway_id || ""}
                               onChange={(e) => update({ gateway_id: e.target.value, tag_name: "" })}
                               title="Gateway"
-                              disabled={isLimit && !row.tag_name}
                             >
                               <option value="">(same as primary)</option>
                               {gatewayOptions.map((g) => (
@@ -4160,30 +4216,7 @@ export function DashboardDesigner({
                               title="Suffix"
                               disabled={isLimit}
                             />
-                            {form.type === "stacked_trend" ? (
-                              <>
-                                {/* Per-LANE Y axis bounds (blank = auto). Only
-                                    meaningful for the strip-chart lanes. */}
-                                <input
-                                  type="number"
-                                  value={row.y_min ?? ""}
-                                  placeholder="Y min"
-                                  onChange={(e) => update({ y_min: e.target.value })}
-                                  title="Lane Y axis minimum (blank = auto)"
-                                  disabled={isLimit}
-                                  style={{ width: 66 }}
-                                />
-                                <input
-                                  type="number"
-                                  value={row.y_max ?? ""}
-                                  placeholder="Y max"
-                                  onChange={(e) => update({ y_max: e.target.value })}
-                                  title="Lane Y axis maximum (blank = auto)"
-                                  disabled={isLimit}
-                                  style={{ width: 66 }}
-                                />
-                              </>
-                            ) : null}
+
                             {/* Size cell: per-series thickness for line/area,
                                 bar width for bar, ignored for limit lines. */}
                             {(() => {

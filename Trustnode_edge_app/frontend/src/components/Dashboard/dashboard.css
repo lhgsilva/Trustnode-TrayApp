@@ -1869,3 +1869,25 @@
   color: var(--text);
   text-align: left;
 }
+
+/* 2026-07-27 (operator): KPI bodies (Value KPI / Text KPI) center their
+   content BOTH axes within the card. The block fills the card and the
+   flexed KPI text sits dead-center regardless of header/title height. */
+.dashboard-kpi-block {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  flex: 1;
+  min-height: 0;
+}
+.dashboard-kpi-block .dashboard-kpi-value,
+.dashboard-kpi-block .dashboard-kpi-text {
+  margin: auto;
+  text-align: center;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  overflow-wrap: anywhere;
+}
