@@ -168,6 +168,11 @@ body {
 }
 
 .app-header {
+  /* Auto-hide support: animate away via margin so the content below
+     reclaims the space; transform alone would leave a blank band. */
+  transition: margin-top 0.22s ease, opacity 0.22s ease;
+  position: relative;
+  z-index: 60;
   background: var(--header);
   color: var(--header-text);
   display: grid;
@@ -1155,8 +1160,11 @@ body {
 }
 
 .page-title-row h1 {
-  margin: 0 0 12px;
-  font-size: 24px;
+  /* 2026-07-27 (operator): tighter vertical rhythm — the title block was
+     eating too much space above the dashboard action row. */
+  margin: 0 0 4px;
+  font-size: 20px;
+  line-height: 1.15;
 }
 
 .kpi-grid {
@@ -6199,3 +6207,45 @@ textarea {
   color: var(--muted, #8a98ab);
   background: transparent;
 }
+
+
+/* 2026-07-27: auto-hide header (operator). Hidden = slid up out of flow;
+   the hotzone at the very top reveals it on hover. */
+.app-header-hidden {
+  margin-top: -64px;
+  opacity: 0;
+  pointer-events: none;
+}
+.app-header-hotzone {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 10px;
+  z-index: 70;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+.app-header-reveal-tab {
+  font-size: 10px;
+  line-height: 1;
+  padding: 1px 14px;
+  border-radius: 0 0 8px 8px;
+  background: var(--header, #10222b);
+  color: var(--header-text, #dfe9ee);
+  opacity: 0.55;
+}
+.app-header-hotzone:hover .app-header-reveal-tab { opacity: 1; }
+.header-pin-btn {
+  border: none;
+  background: transparent;
+  color: var(--header-text, inherit);
+  cursor: pointer;
+  font-size: 12px;
+  opacity: 0.6;
+  padding: 4px 6px;
+  -webkit-app-region: no-drag;
+}
+.header-pin-btn:hover { opacity: 1; }
+.dashboard-tools { margin-top: 0; }

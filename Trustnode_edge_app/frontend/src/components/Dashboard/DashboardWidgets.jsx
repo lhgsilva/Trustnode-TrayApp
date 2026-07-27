@@ -2961,6 +2961,24 @@ function DashboardWidgetCardImpl({
     if (sortedTs.length > readingsCap) {
       sortedTs = sortedTs.slice(-readingsCap);
     }
+    // 2026-07-27 BLANK-WINDOW FIX (live mode): the extras merge keeps the
+    // server SEED batch from widget mount while the rolling live buffer
+    // evicts its middle — leaving an OLD cluster + a NEW cluster with a
+    // multi-minute artificial gap drawn between them (verified: the DB had
+    // 60/60 rows for the "blank" period). In live mode (no explicit time
+    // filter) trim timestamps older than the recency window implied by the
+    // Readings setting so only the continuous recent window renders.
+    const hasExplicitWindow =
+      String(cfg?.query_time_filter_preset || "none") !== "none"
+      || String(cfg?.query_time_filter_from || "").trim() !== ""
+      || String(cfg?.query_time_filter_to || "").trim() !== "";
+    if (!hasExplicitWindow && sortedTs.length > 1) {
+      const newest = sortedTs[sortedTs.length - 1];
+      const tickForWindow = Math.max(500, Number(gatewayIntervalMs || 1000));
+      const windowMs = readingsCap * tickForWindow * 1.5;
+      const trimmed = sortedTs.filter((t) => newest - t <= windowMs);
+      if (trimmed.length >= 2) sortedTs = trimmed;
+    }
     // Detect "gateway-stopped" gaps. Anything bigger than 3 × gateway
     // poll interval gets a null row inserted in the middle so Recharts'
     // connectNulls=true does NOT bridge the gap. Without this the chart
@@ -3000,7 +3018,7 @@ function DashboardWidgetCardImpl({
       }
     }
     return out;
-  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, cfgReadingsCount, gatewayIntervalMs, cfg?.show_gaps]);
+  }, [series, extraSeriesDefs, extraSeriesRowsByDef, resolvedLimitLines.length, cfgReadingsCount, gatewayIntervalMs, cfg?.show_gaps, cfg?.query_time_filter_preset, cfg?.query_time_filter_from, cfg?.query_time_filter_to]);
 
   const hasMultiSeries = extraSeriesDefs.length > 0 || resolvedLimitLines.length > 0;
   const anyRightAxis =

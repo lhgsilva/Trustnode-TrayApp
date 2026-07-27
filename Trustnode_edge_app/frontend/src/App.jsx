@@ -3710,6 +3710,16 @@ function AppShell() {
     enabled: true
   });
   const [triggerRules, setTriggerRules] = useState([]);
+  // Auto-hide header (2026-07-27): pinned = always visible (legacy look);
+  // unpinned = slides up, hover the top edge to reveal.
+  const [appHeaderPinned, setAppHeaderPinned] = useState(() => {
+    try { return localStorage.getItem("tn_header_pinned") !== "0"; } catch { return true; }
+  });
+  const [appHeaderVisible, setAppHeaderVisible] = useState(true);
+  useEffect(() => {
+    try { localStorage.setItem("tn_header_pinned", appHeaderPinned ? "1" : "0"); } catch {}
+    if (appHeaderPinned) setAppHeaderVisible(true);
+  }, [appHeaderPinned]);
   const [showTriggerModal, setShowTriggerModal] = useState(false);
   const [editingTriggerId, setEditingTriggerId] = useState(null);
   const [triggerForm, setTriggerForm] = useState({
@@ -19915,7 +19925,22 @@ const getGatewayHealth = (gateway) => {
           </div>
         </div>
       ) : null}
-      <header className={`app-header ${isPortalOnly ? "portal-header" : ""} ${useDesktopFramelessHeader ? "desktop-titlebar" : ""}`}>
+      {/* 2026-07-27 (operator): auto-hide header. When unpinned, the header
+          slides up out of the way; a slim top hotzone (and the reveal tab)
+          brings it back on hover. Preference persists per machine. */}
+      {!appHeaderPinned && !appHeaderVisible ? (
+        <div
+          className="app-header-hotzone"
+          onMouseEnter={() => setAppHeaderVisible(true)}
+          title="Show header"
+        >
+          <span className="app-header-reveal-tab">▾</span>
+        </div>
+      ) : null}
+      <header
+        onMouseLeave={() => { if (!appHeaderPinned) setAppHeaderVisible(false); }}
+        onMouseEnter={() => setAppHeaderVisible(true)}
+        className={`app-header ${isPortalOnly ? "portal-header" : ""} ${useDesktopFramelessHeader ? "desktop-titlebar" : ""} ${!appHeaderPinned && !appHeaderVisible ? "app-header-hidden" : ""}`}>
         <div className="header-left">
           {!useDesktopFramelessHeader ? (
             <button
@@ -19930,6 +19955,14 @@ const getGatewayHealth = (gateway) => {
           ) : null}
           <div className="brand">
             <img src={headerLogoSrc} alt="Trustnode Edge" className="brand-full-logo" onError={handleLogoLoadError} />
+            <button
+              type="button"
+              className="header-pin-btn"
+              title={appHeaderPinned ? "Unpin header (auto-hide, hover top edge to reveal)" : "Pin header (always visible)"}
+              onClick={() => setAppHeaderPinned((p) => !p)}
+            >
+              {appHeaderPinned ? "▲" : "📌"}
+            </button>
           </div>
         </div>
         <div className="header-center">
