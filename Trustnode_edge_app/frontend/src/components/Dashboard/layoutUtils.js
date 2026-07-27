@@ -1,6 +1,7 @@
 import {
   DASHBOARD_GRID_COLS,
   DASHBOARD_GRID_ROWS,
+  DASHBOARD_GRID_VIRTUAL_ROWS,
   WIDGET_TYPES,
   getWidgetMeta,
   newWidgetId,
@@ -36,7 +37,9 @@ function canPlace(candidate, placed) {
   const y1 = candidate.y;
   const x2 = x1 + candidate.w - 1;
   const y2 = y1 + candidate.h - 1;
-  if (x1 < 0 || y1 < 0 || x2 >= DASHBOARD_GRID_COLS || y2 >= DASHBOARD_GRID_ROWS) return false;
+  // Columns are hard-bounded; rows extend into the scrolling virtual space
+  // so a full first screen can NEVER force an overlap.
+  if (x1 < 0 || y1 < 0 || x2 >= DASHBOARD_GRID_COLS || y2 >= DASHBOARD_GRID_VIRTUAL_ROWS) return false;
   for (const p of placed) {
     const px1 = p.x;
     const py1 = p.y;
@@ -52,7 +55,7 @@ function placeAtOrNextFree(widget, preferred, placed) {
   const candidate = {
     ...widget,
     x: clamp(preferred?.x ?? widget.x ?? 0, 0, DASHBOARD_GRID_COLS - widget.w),
-    y: clamp(preferred?.y ?? widget.y ?? 0, 0, DASHBOARD_GRID_ROWS - widget.h),
+    y: clamp(preferred?.y ?? widget.y ?? 0, 0, DASHBOARD_GRID_VIRTUAL_ROWS - widget.h),
   };
   if (canPlace(candidate, placed)) return candidate;
   const free = findFirstFreeSpot({ w: widget.w, h: widget.h }, placed);
@@ -77,13 +80,20 @@ export function compactWidgets(widgets) {
 export function findFirstFreeSpot(widgetSize, placed) {
   const w = clamp(widgetSize?.w ?? 3, 1, DASHBOARD_GRID_COLS);
   const h = clamp(widgetSize?.h ?? 2, 1, DASHBOARD_GRID_ROWS);
-  for (let y = 0; y <= DASHBOARD_GRID_ROWS - h; y += 1) {
+  // Scan from the top of the canvas down PAST the lowest placed widget —
+  // the grid grows vertically, so there is always room further down.
+  const lowest = placed.reduce((m, p) => Math.max(m, (p.y || 0) + (p.h || 1)), 0);
+  const scanMaxY = Math.min(DASHBOARD_GRID_VIRTUAL_ROWS - h, lowest + h + 4);
+  for (let y = 0; y <= scanMaxY; y += 1) {
     for (let x = 0; x <= DASHBOARD_GRID_COLS - w; x += 1) {
       const candidate = { x, y, w, h };
       if (canPlace(candidate, placed)) return candidate;
     }
   }
-  return { x: 0, y: 0, w, h };
+  // Absolute fallback: directly BELOW everything at column 0. The old
+  // fallback returned {0,0} which STACKED widgets on top of each other at
+  // the origin — the "dashboard keeps overlapping" bug.
+  return { x: 0, y: Math.min(lowest, DASHBOARD_GRID_VIRTUAL_ROWS - h), w, h };
 }
 
 function migrateLegacyWidget(old, placed) {
@@ -150,7 +160,7 @@ export function normalizeWidgets(rawWidgets) {
     const w = clamp(raw.w ?? meta.defaultSize.w, 1, DASHBOARD_GRID_COLS);
     const h = clamp(raw.h ?? meta.defaultSize.h, 1, DASHBOARD_GRID_ROWS);
     const x = clamp(raw.x ?? 0, 0, DASHBOARD_GRID_COLS - w);
-    const y = clamp(raw.y ?? 0, 0, DASHBOARD_GRID_ROWS - h);
+    const y = clamp(raw.y ?? 0, 0, DASHBOARD_GRID_VIRTUAL_ROWS - h);
     const candidate = { x, y, w, h };
     const pos = canPlace(candidate, normalized) ? candidate : findFirstFreeSpot({ w, h }, normalized);
     normalized.push({
@@ -182,7 +192,10 @@ export function normalizeWidgets(rawWidgets) {
         ...(raw?.config && typeof raw.config === "object" ? raw.config : {}),
         gateway_id: String(raw?.config?.gateway_id || raw?.gateway_id || ""),
         tag_name: String(raw?.config?.tag_name || raw?.tag_name || ""),
-        readings_count: clamp(raw?.config?.readings_count ?? raw?.readings_count ?? 120, 20, 500),
+        // Aligned with the editor's 5..5000 range — this clamp used to cap
+        // at 500 and silently shrank bigger configured windows on every
+        // reflow.
+        readings_count: clamp(raw?.config?.readings_count ?? raw?.readings_count ?? 120, 5, 5000),
         interpolation: CHART_INTERPOLATION_VALUES.has(String(raw?.config?.interpolation || ""))
           ? String(raw?.config?.interpolation)
           : "stepAfter",
@@ -251,6 +264,10 @@ export function normalizeWidgets(rawWidgets) {
                 multiplier: Number(s.multiplier ?? 1) || 1,
                 offset: Number(s.offset ?? 0) || 0,
                 limit_value: s.limit_value === undefined || s.limit_value === null ? "" : String(s.limit_value),
+                // Per-lane Y bounds (Stacked Trend) — normalization runs on
+                // EVERY load/drag/reflow and used to strip these.
+                y_min: s.y_min === undefined || s.y_min === null ? "" : String(s.y_min),
+                y_max: s.y_max === undefined || s.y_max === null ? "" : String(s.y_max),
                 line_width: clamp(s.line_width ?? 2, 1, 8),
                 line_dot: ["none", "small", "medium", "large"].includes(String(s.line_dot || ""))
                   ? String(s.line_dot)

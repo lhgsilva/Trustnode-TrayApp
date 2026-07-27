@@ -3280,7 +3280,7 @@ function DashboardWidgetCardImpl({
       }
       return (
         <div className="dashboard-widget-block dashboard-widget-block-chart">
-          <div style={{ display: "flex", flexDirection: "column", width: "100%", height: "100%", minHeight: 0, overflowY: "auto" }}>
+          <div style={{ display: "flex", flexDirection: "column", width: "100%", height: "100%", minHeight: 0, overflow: "hidden" }}>
             {lanes.map((lane, i) => {
               const isLast = i === lanes.length - 1;
               const live = latestLaneVal(lane.key);
@@ -3289,12 +3289,15 @@ function DashboardWidgetCardImpl({
                 lane.yMax !== null ? lane.yMax : "auto",
               ];
               return (
-                <div key={lane.key} style={{ flex: 1, minHeight: 64, display: "flex", flexDirection: "column" }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "0 8px" }}>
-                    <span style={{ fontSize: 11, fontWeight: 600, color: lane.color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <div key={lane.key} style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+                  {/* Self-fitting lanes (operator 2026-07-27): equal flex split
+                      with NO scrollbars — every lane always visible; compact
+                      header keeps the minimum spacing. */}
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "0 8px", lineHeight: 1.15, minHeight: 14 }}>
+                    <span style={{ fontSize: 10, fontWeight: 600, color: lane.color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                       {lane.label}
                     </span>
-                    <span style={{ fontSize: 12, fontWeight: 700, color: lane.color, marginLeft: 8, flexShrink: 0 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: lane.color, marginLeft: 8, flexShrink: 0 }}>
                       {live === null ? "-" : `${fmtLaneVal(live)}${lane.unit ? ` ${lane.unit}` : ""}`}
                     </span>
                   </div>

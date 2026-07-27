@@ -82,7 +82,11 @@
   height: calc(100vh - 220px);
   min-height: 520px;
   max-height: calc(100vh - 220px);
-  overflow: hidden;
+  /* 2026-07-27: the canvas grows vertically past one screen (extra rows at
+     the same cell height) and scrolls, so widget placement never overlaps
+     because the first screen filled up. */
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .dashboard-widget-shell {

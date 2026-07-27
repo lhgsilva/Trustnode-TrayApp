@@ -6,6 +6,12 @@
 // widget payload so we only scale once.
 export const DASHBOARD_GRID_COLS = 40;
 export const DASHBOARD_GRID_ROWS = 40;
+// 2026-07-27: the dashboard grows VERTICALLY (scrolling) like professional
+// dashboard tools — placement is never forced into an overlap because the
+// canvas "ran out of rows". DASHBOARD_GRID_ROWS remains the visible
+// first-screen row count (cell height derives from it); VIRTUAL_ROWS is the
+// hard bound for how far content may extend below the fold.
+export const DASHBOARD_GRID_VIRTUAL_ROWS = 400;
 export const DASHBOARD_GRID_VERSION = 2;
 
 export const WIDGET_TYPES = [

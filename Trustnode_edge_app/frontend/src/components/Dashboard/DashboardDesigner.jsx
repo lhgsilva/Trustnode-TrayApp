@@ -8,6 +8,7 @@ import {
   newWidgetId,
 } from "./widgetRegistry";
 import { compactWidgets, findFirstFreeSpot, normalizeWidgets, reflowWidgetsForMove, reflowWidgetsForMoveToPoint, reflowWidgetsForResize } from "./layoutUtils";
+import { DASHBOARD_GRID_VIRTUAL_ROWS } from "./widgetRegistry";
 import { materializePowerDashboardPayload } from "./powerDashboardTemplate";
 import { filterRowsByRange, getLatestTagRow, toTsMs } from "./dashboardAnalytics";
 import { classifyTag, checkTagForWidget, widgetIsNumericOnly, TAG_KIND } from "./tagTypes";
@@ -1757,7 +1758,7 @@ export function DashboardDesigner({
       w: clamp(form.w ?? meta.defaultSize.w, 1, DASHBOARD_GRID_COLS),
       h: clamp(form.h ?? meta.defaultSize.h, 1, DASHBOARD_GRID_ROWS),
       x: Number.isFinite(Number(form.x)) ? clamp(form.x, 0, DASHBOARD_GRID_COLS - 1) : null,
-      y: Number.isFinite(Number(form.y)) ? clamp(form.y, 0, DASHBOARD_GRID_ROWS - 1) : null,
+      y: Number.isFinite(Number(form.y)) ? clamp(form.y, 0, DASHBOARD_GRID_VIRTUAL_ROWS - 1) : null,
       config: {
         // Spread the form's full config first so ANY field the operator
         // touched (Y axis mode/min/max/tick_step, right-axis variants,
@@ -1890,7 +1891,7 @@ export function DashboardDesigner({
       ? findFirstFreeSpot({ w: candidate.w, h: candidate.h }, others)
       : { x: candidate.x, y: candidate.y };
     candidate.x = clamp(pos.x, 0, DASHBOARD_GRID_COLS - candidate.w);
-    candidate.y = clamp(pos.y, 0, DASHBOARD_GRID_ROWS - candidate.h);
+    candidate.y = clamp(pos.y, 0, DASHBOARD_GRID_VIRTUAL_ROWS - candidate.h);
     setWidgets(compactWidgets([...others, candidate]));
     setModalOpen(false);
     setEditingId(null);
@@ -1940,14 +1941,37 @@ export function DashboardDesigner({
     setDraggingId("");
   };
 
+  // Rows the canvas must render: at least one full screen, growing with the
+  // lowest widget so there is always spare space to drop into.
+  const gridRowsNeeded = useMemo(() => {
+    const lowest = (Array.isArray(widgets) ? widgets : []).reduce(
+      (m, w) => Math.max(m, (Number(w?.y) || 0) + (Number(w?.h) || 1)), 0);
+    return Math.min(DASHBOARD_GRID_VIRTUAL_ROWS, Math.max(DASHBOARD_GRID_ROWS, lowest + 6));
+  }, [widgets]);
+
+  // Scroll-aware cell math shared by drag-over and resize: the grid content
+  // can be taller than the viewport now, so Y offsets must include
+  // scrollTop and divide by the REAL row pitch (row height + gap).
+  const gridCellMetrics = () => {
+    const el = gridRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const gap = 8;
+    const rows = Math.max(1, gridRowsNeeded);
+    const rowPitch = (el.scrollHeight + gap) / rows; // cell + gap
+    const cellW = rect.width / DASHBOARD_GRID_COLS;
+    return { el, rect, gap, rows, rowPitch, cellW };
+  };
+
   const onGridDragOver = (e) => {
     if (!canEdit || !draggingId || !gridRef.current) return;
     e.preventDefault();
-    const rect = gridRef.current.getBoundingClientRect();
-    const cellW = rect.width / DASHBOARD_GRID_COLS;
-    const cellH = rect.height / DASHBOARD_GRID_ROWS;
-    const x = clamp(Math.floor((e.clientX - rect.left) / Math.max(1, cellW)), 0, DASHBOARD_GRID_COLS - 1);
-    const y = clamp(Math.floor((e.clientY - rect.top) / Math.max(1, cellH)), 0, DASHBOARD_GRID_ROWS - 1);
+    const m = gridCellMetrics();
+    if (!m) return;
+    const x = clamp(Math.floor((e.clientX - m.rect.left) / Math.max(1, m.cellW)), 0, DASHBOARD_GRID_COLS - 1);
+    const y = clamp(
+      Math.floor((e.clientY - m.rect.top + m.el.scrollTop) / Math.max(1, m.rowPitch)),
+      0, DASHBOARD_GRID_VIRTUAL_ROWS - 1);
     dragHoverCellRef.current = { x, y };
   };
 
@@ -1957,9 +1981,9 @@ export function DashboardDesigner({
     e.stopPropagation();
     const gridEl = gridRef.current;
     if (!gridEl) return;
-    const rect = gridEl.getBoundingClientRect();
-    const cellW = rect.width / DASHBOARD_GRID_COLS;
-    const cellH = rect.height / DASHBOARD_GRID_ROWS;
+    const m0 = gridCellMetrics();
+    const cellW = m0 ? m0.cellW : gridEl.getBoundingClientRect().width / DASHBOARD_GRID_COLS;
+    const cellH = m0 ? m0.rowPitch : gridEl.getBoundingClientRect().height / DASHBOARD_GRID_ROWS;
     const startX = e.clientX;
     const startY = e.clientY;
     const startW = Number(widget?.w || 1);
@@ -2195,7 +2219,12 @@ export function DashboardDesigner({
         onDrop={onDropOn}
         style={{
           gridTemplateColumns: `repeat(${DASHBOARD_GRID_COLS}, minmax(0, 1fr))`,
-          gridTemplateRows: `repeat(${DASHBOARD_GRID_ROWS}, minmax(0, 1fr))`,
+          // 2026-07-27: the canvas GROWS vertically (and scrolls) instead of
+          // hard-capping at one screen. Row height stays what a 40-row
+          // first screen implies (identical look for existing layouts);
+          // extra rows render at the same height below the fold, so
+          // placement never has to overlap because it "ran out of rows".
+          gridTemplateRows: `repeat(${gridRowsNeeded}, max(8px, calc((100vh - 220px - ${(DASHBOARD_GRID_ROWS - 1) * 8}px) / ${DASHBOARD_GRID_ROWS})))`,
         }}
       >
         {normalizedWidgets.map((widget) => (
