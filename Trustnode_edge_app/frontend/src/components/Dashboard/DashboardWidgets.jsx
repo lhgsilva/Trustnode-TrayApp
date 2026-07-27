@@ -3378,10 +3378,6 @@ function DashboardWidgetCardImpl({
           });
         }
         const shown = gaugeEntries.filter((e) => e.name);
-        const gaugeDecimals = Math.max(0, Math.min(6, Number(cfg?.value_decimals ?? 2)));
-        const fmtGauge = (v, entry) => v === null || !Number.isFinite(Number(v))
-          ? "-"
-          : `${Number(v).toFixed(gaugeDecimals)}${entry && entry.unit ? ` ${entry.unit}` : ""}`;
         if (!shown.length) {
           return (
             <div className="dashboard-widget-block dashboard-widget-block-chart">
@@ -3389,18 +3385,38 @@ function DashboardWidgetCardImpl({
             </div>
           );
         }
+        // FULL Axis-configuration support (operator 2026-07-27): the gauge
+        // Y axis honours the SAME left-axis config the trend charts use —
+        // manual min/max + tick step (manualY/manualYTicks), and the unit /
+        // prefix / suffix / decimals / format via heavyAxisTickFmt("left1").
+        const axisFmtGauge = heavyAxisTickFmt("left1");
+        const axisHasUnit = Boolean(String(cfg?.primary_unit || "").trim() || String(cfg?.primary_suffix || "").trim());
+        const fmtGauge = (v, entry) => {
+          if (v === null || !Number.isFinite(Number(v))) return "-";
+          const base = axisFmtGauge(v);
+          // Append the series' own unit only when the axis doesn't already
+          // carry one (avoids "90.0 % %" double-unit).
+          return !axisHasUnit && entry && entry.unit ? `${base} ${entry.unit}` : base;
+        };
         const gaugeBarWidth = Math.max(0, Math.min(120, Number(cfg?.chart_bar_width ?? 0)));
         return (
           <div className="dashboard-widget-block dashboard-widget-block-chart">
             <div className="dashboard-widget-chart">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={shown} margin={{ top: 18, right: 12, left: 0, bottom: 4 }}>
+                <BarChart data={shown} margin={{ top: 18, right: 8, left: 0, bottom: 4 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} />
                   <XAxis dataKey="name" tick={{ fontSize: 11 }} interval={0} />
-                  <YAxis width={56} tick={{ fontSize: 10 }} domain={["auto", "auto"]} />
+                  <YAxis
+                    width={64}
+                    tick={{ fontSize: 10 }}
+                    domain={manualY ? [manualY.lo, manualY.hi] : ["auto", "auto"]}
+                    allowDataOverflow={!!manualY}
+                    {...(manualYTicks ? { ticks: manualYTicks } : {})}
+                    tickFormatter={axisFmtGauge}
+                  />
                   <Tooltip formatter={(v, _n, item) => fmtGauge(v, item && item.payload)} />
                   <Bar dataKey="value" isAnimationActive={false} {...(gaugeBarWidth > 0 ? { barSize: gaugeBarWidth } : {})}
-                    label={{ position: "top", fontSize: 11, formatter: (v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(gaugeDecimals) : "-") }}>
+                    label={{ position: "top", fontSize: 11, formatter: (v) => (Number.isFinite(Number(v)) ? axisFmtGauge(v) : "-") }}>
                     {shown.map((e, i) => (<Cell key={`c-${i}`} fill={e.fill} />))}
                   </Bar>
                 </BarChart>
