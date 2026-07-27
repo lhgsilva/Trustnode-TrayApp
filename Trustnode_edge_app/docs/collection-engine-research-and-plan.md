@@ -141,3 +141,20 @@ Key properties:
 - **Phase 2 (V2 engine)** — `backend/app/services/collection_engine.py`: `ReaderV2` (plain thread, absolute ticks, WS fanout before storage, OFFLINE state with 1/2/5/10/30 s backoff that keeps progress stamps fresh so the watchdog stays quiet) + `StorageWriterV2` (one thread, all gateways, one historian txn per flush, bounded queue + re-buffer). Integration: flag-gated branches in `GatewayWorker.start/stop`, the watchdog spawn step, and `PLCManager.fanout_threadsafe`. **Verified:** exact cadence with 450 ms-slow storage, zero row loss with batched flushes; calm OFFLINE recovery (max progress staleness 4.5 s vs 30 s threshold); V1 regression suites green with the flag off.
 - **Enable for A/B:** add `TRUSTNODE_ENGINE_V2=1` to `C:\Users\User\AppData\Local\TrustNode\.env` (the desktop app loads it at boot) after installing a build that contains 9b89781; remove the line to fall back to V1 instantly.
 - **Next:** Phase 3 (unified supervision as default), Phase 4 (simulator + fault-injection CI gate), Phase 5 (day-partitioned historian + idempotent cloud replay).
+
+## 9. Table / Query-Builder widget — Phase 2 roadmap (planned 2026-07-27)
+
+Phase 1 (shipped): searchable tag picker (chips), reorganized builder
+sections, sortable output (any column, asc/desc), and "Tag limit" columns
+sourced from Tags Limits & Triggers — enabling last | min | max | limit
+layouts for the same tag.
+
+Phase 2 (next): a data-source selector on the table widget adding
+  * Batches — latest batches with configurable columns (batch id, start,
+    end, status, type, duration) via the existing batch APIs;
+  * Power meters — current power / current / energy columns from the
+    power_manager tables;
+  * full pivot transpose (tags as rows × calculations as columns) and
+    query-result CSV export from the widget.
+Each source keeps the same filter/sort/limit chrome; historian remains the
+default source so existing widgets are untouched.

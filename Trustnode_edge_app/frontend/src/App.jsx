@@ -20415,6 +20415,7 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "dashboard" ? (
             <DashboardDesigner
+              triggerRules={triggerRules}
               canEdit={canEditPage("dashboard")}
               widgets={dashboardWidgets}
               setWidgets={setDashboardWidgets}

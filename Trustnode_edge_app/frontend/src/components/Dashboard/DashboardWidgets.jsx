@@ -1826,6 +1826,7 @@ function LiveTagChart({
 function DashboardWidgetCardImpl({
   widget,
   dataLogView,
+  triggerRules = [],
   tagRows,
   tagRowsByGateway,
   formatTagForDisplay,
@@ -4698,6 +4699,16 @@ function DashboardWidgetCardImpl({
                 .filter((r) => String(r?.tag || r?.tag_name || "").trim() === t)
                 .sort((a, b) => toTsMs(a?.ts || a?.ts_utc) - toTsMs(b?.ts || b?.ts_utc));
               cellValues[col.id] = aggregate(sorted, String(col.aggregation || "last"));
+            } else if (col.source === "limit") {
+              // Configured bound from Tags Limits & Triggers — constant per
+              // row; lets one table show last | min | max | limit side by side.
+              const t = String(col.tag || "").trim();
+              const rules = Array.isArray(triggerRules) ? triggerRules : [];
+              const rule = rules.find((r) => String(r?.tag_name || "").trim() === t && r?.enabled !== false);
+              const bound = String(col.bound || "upper") === "lower"
+                ? (rule && rule.lower_enabled ? Number(rule.lower_value) : null)
+                : (rule && rule.upper_enabled ? Number(rule.upper_value) : null);
+              cellValues[col.id] = Number.isFinite(bound) ? bound : null;
             }
           }
           // second pass: calc columns (a, b, c... map to tag columns by order)
@@ -4715,6 +4726,24 @@ function DashboardWidgetCardImpl({
           return { bucketMs, cellValues };
         });
 
+        // Sort (operator 2026-07-27): by timestamp or any non-ts column.
+        const sortColRaw = String(cfg?.table_sort_col ?? "");
+        const sortDir = String(cfg?.table_sort_dir || "desc") === "asc" ? 1 : -1;
+        if (sortColRaw === "ts") {
+          displayRows.sort((a, b) => (a.bucketMs - b.bucketMs) * sortDir);
+        } else if (sortColRaw !== "" && Number.isFinite(Number(sortColRaw))) {
+          const colDef = advancedColumns[Number(sortColRaw)];
+          if (colDef) {
+            displayRows.sort((a, b) => {
+              const av = Number(a.cellValues[colDef.id]);
+              const bv = Number(b.cellValues[colDef.id]);
+              const aa = Number.isFinite(av) ? av : -Infinity;
+              const bb = Number.isFinite(bv) ? bv : -Infinity;
+              return (aa - bb) * sortDir;
+            });
+          }
+        }
+
         return (
           <div className="dashboard-widget-block">
             {displayRows.length ? (
@@ -4723,7 +4752,7 @@ function DashboardWidgetCardImpl({
                   <thead>
                     <tr>
                       {advancedColumns.map((col) => (
-                        <th key={col.id}>{col.header || (col.source === "ts" ? "Timestamp" : col.tag || "Column")}</th>
+                        <th key={col.id}>{col.header || (col.source === "ts" ? "Timestamp" : col.source === "limit" ? `${col.tag || "?"} ${String(col.bound || "upper")} limit` : col.tag || "Column")}</th>
                       ))}
                     </tr>
                   </thead>

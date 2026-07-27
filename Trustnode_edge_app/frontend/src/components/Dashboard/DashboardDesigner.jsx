@@ -312,6 +312,7 @@ const TABLE_COLUMN_OPTIONS = [
 const TABLE_ADV_SOURCES = [
   { value: "ts", label: "Timestamp" },
   { value: "tag", label: "Tag value" },
+  { value: "limit", label: "Tag limit (from Limits & Triggers)" },
   { value: "calc", label: "Calculation" },
 ];
 const TABLE_ADV_AGGREGATIONS = [
@@ -529,6 +530,55 @@ function makeWhereCondId() {
   return `whr-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
+// 2026-07-27 (operator): searchable tag picker — type to filter, click to
+// add, chips with remove. Replaces the unusable wall of checkboxes for
+// dashboards with many tags.
+function TagMultiPicker({ allTags, selected, onChange, formatTagForDisplay, placeholder }) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const sel = Array.isArray(selected) ? selected : [];
+  const fmt = (t) => (formatTagForDisplay ? formatTagForDisplay(t) : t);
+  const q = query.trim().toLowerCase();
+  const candidates = (Array.isArray(allTags) ? allTags : [])
+    .filter((t) => !sel.includes(t))
+    .filter((t) => !q || String(t).toLowerCase().includes(q) || fmt(t).toLowerCase().includes(q))
+    .slice(0, 14);
+  const add = (t) => { onChange(Array.from(new Set([...sel, t]))); setQuery(""); };
+  const removeTag = (t) => onChange(sel.filter((v) => v !== t));
+  return (
+    <div className="dashboard-tagpicker">
+      {sel.length ? (
+        <div className="dashboard-tagpicker-chips">
+          {sel.map((t) => (
+            <span key={t} className="dashboard-tagpicker-chip" title={t}>
+              {fmt(t)}
+              <button type="button" aria-label={`Remove ${t}`} onClick={() => removeTag(t)}>✕</button>
+            </span>
+          ))}
+        </div>
+      ) : null}
+      <div className="dashboard-tagpicker-inputwrap">
+        <input
+          value={query}
+          placeholder={placeholder || "Type to search tags, click to add…"}
+          onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onBlur={() => setTimeout(() => setOpen(false), 150)}
+        />
+        {open && candidates.length ? (
+          <div className="dashboard-tagpicker-menu">
+            {candidates.map((t) => (
+              <button type="button" key={t} onMouseDown={(e) => e.preventDefault()} onClick={() => add(t)} title={t}>
+                {fmt(t)}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function TableWhereConditions({ form, setForm, selectedGatewayTags, formatTagForDisplay }) {
   const list = Array.isArray(form.config.query_where_conditions) ? form.config.query_where_conditions : [];
 
@@ -638,6 +688,16 @@ function TableAdvancedColumns({ form, setForm, selectedGatewayTags, formatTagFor
       refs: list.filter((c) => c.source === "tag").slice(0, 2).map((c) => c.id),
     },
   ]);
+  const addLimit = () => updateList([
+    ...list,
+    {
+      id: makeAdvColumnId(),
+      source: "limit",
+      header: "",
+      tag: selectedGatewayTags[0] || "",
+      bound: "upper",
+    },
+  ]);
 
   return (
     <fieldset className="dashboard-query-fieldset">
@@ -681,6 +741,26 @@ function TableAdvancedColumns({ form, setForm, selectedGatewayTags, formatTagFor
                   {TABLE_ADV_AGGREGATIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                 </select>
               </>
+            ) : c.source === "limit" ? (
+              <>
+                <select
+                  value={c.tag || ""}
+                  onChange={(e) => update(idx, { tag: e.target.value })}
+                >
+                  <option value="">Tag…</option>
+                  {selectedGatewayTags.map((t) => (
+                    <option key={t} value={t}>{formatTagForDisplay ? formatTagForDisplay(t) : t}</option>
+                  ))}
+                </select>
+                <select
+                  value={c.bound || "upper"}
+                  onChange={(e) => update(idx, { bound: e.target.value })}
+                  title="Which configured bound from Tags Limits & Triggers"
+                >
+                  <option value="upper">Upper limit</option>
+                  <option value="lower">Lower limit</option>
+                </select>
+              </>
             ) : c.source === "calc" ? (
               <>
                 <input
@@ -711,6 +791,7 @@ function TableAdvancedColumns({ form, setForm, selectedGatewayTags, formatTagFor
         <button type="button" className="dashboard-link-btn" onClick={addTimestamp}>+ Timestamp</button>
         <button type="button" className="dashboard-link-btn" onClick={addTag}>+ Tag value</button>
         <button type="button" className="dashboard-link-btn" onClick={addCalc}>+ Calculation</button>
+        <button type="button" className="btn btn-secondary btn-sm" onClick={addLimit}>+ Tag limit</button>
       </div>
     </fieldset>
   );
@@ -782,6 +863,7 @@ function buildDefaultForm(type = "line_chart") {
 }
 
 export function DashboardDesigner({
+  triggerRules = [],
   canEdit,
   widgets,
   setWidgets,
@@ -2520,6 +2602,7 @@ export function DashboardDesigner({
               </div>
             ) : null}
             <DashboardWidgetCard
+              triggerRules={triggerRules}
               widget={widget}
               dataLogView={dashboardRows}
               tagRows={tagRows}
@@ -4566,29 +4649,13 @@ export function DashboardDesigner({
                     <p className="dashboard-query-hint">
                       Limit the rows used by both simple and advanced columns to a subset of tags.
                     </p>
-                    <div className="dashboard-query-checkboxes">
-                      {selectedGatewayTags.length ? selectedGatewayTags.map((tag) => {
-                        const checked = (form.config.table_filter_tags || []).includes(tag);
-                        return (
-                          <label key={`tbl-tag-${tag}`} className="dashboard-query-checkbox">
-                            <input
-                              type="checkbox"
-                              checked={checked}
-                              onChange={(e) => {
-                                setForm((p) => {
-                                  const current = Array.isArray(p.config.table_filter_tags) ? p.config.table_filter_tags : [];
-                                  const next = e.target.checked
-                                    ? Array.from(new Set([...current, tag]))
-                                    : current.filter((v) => v !== tag);
-                                  return { ...p, config: { ...p.config, table_filter_tags: next } };
-                                });
-                              }}
-                            />
-                            <span>{formatTagForDisplay ? formatTagForDisplay(tag) : tag}</span>
-                          </label>
-                        );
-                      }) : <span className="dashboard-query-empty">No tags in selected gateway.</span>}
-                    </div>
+                    <TagMultiPicker
+                      allTags={selectedGatewayTags}
+                      selected={form.config.table_filter_tags || []}
+                      formatTagForDisplay={formatTagForDisplay}
+                      placeholder="Search a tag and click to add it to the filter…"
+                      onChange={(next) => setForm((p) => ({ ...p, config: { ...p.config, table_filter_tags: next } }))}
+                    />
                   </fieldset>
 
                   <TableWhereConditions
@@ -4604,6 +4671,36 @@ export function DashboardDesigner({
                     selectedGatewayTags={selectedGatewayTags}
                     formatTagForDisplay={formatTagForDisplay}
                   />
+
+                  <fieldset className="dashboard-query-fieldset">
+                    <legend>Sort</legend>
+                    <div className="dashboard-query-grid">
+                      <label className="dashboard-query-field">
+                        <span>Sort by</span>
+                        <select
+                          value={String(form.config.table_sort_col ?? "")}
+                          onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, table_sort_col: e.target.value } }))}
+                        >
+                          <option value="">Default (time, newest last)</option>
+                          <option value="ts">Timestamp</option>
+                          {(Array.isArray(form.config.query_advanced_columns) ? form.config.query_advanced_columns : [])
+                            .map((c, i) => c.source !== "ts"
+                              ? <option key={c.id || i} value={String(i)}>{c.header || c.tag || `Column ${i + 1}`}</option>
+                              : null)}
+                        </select>
+                      </label>
+                      <label className="dashboard-query-field">
+                        <span>Direction</span>
+                        <select
+                          value={String(form.config.table_sort_dir || "desc")}
+                          onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, table_sort_dir: e.target.value } }))}
+                        >
+                          <option value="desc">Descending</option>
+                          <option value="asc">Ascending</option>
+                        </select>
+                      </label>
+                    </div>
+                  </fieldset>
                 </>
               ) : null}
             </div>
