@@ -282,3 +282,30 @@ export function buildFixedText(template, computedItems) {
     return txt.replace(new RegExp(`{{\\s*${safeKey}\\s*}}`, "gi"), String(item?.value ?? ""));
   }, base);
 }
+
+// ---------------------------------------------------------------------------
+// ONE widget-wide value formatter (operator 2026-07-27): every value a widget
+// displays — header strip, KPI bodies, bar labels, tooltips, lane readouts,
+// table cells — obeys the SAME widget configuration:
+//   1. value_decimals (0..6) when explicitly set,
+//   2. else the widget's Value Format (auto / int / 2dp / 3dp / scientific),
+//   3. else auto (locale, max 3 decimals).
+// Chart AXES keep their independent per-axis configuration.
+// Absent (null/undefined/"") is "-", never a fabricated 0.
+export function formatWidgetValue(cfg, v) {
+  if (v === null || v === undefined || v === "") return "-";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "-";
+  const dRaw = cfg?.value_decimals;
+  const d = dRaw === "" || dRaw === null || dRaw === undefined
+    ? null
+    : Math.max(0, Math.min(6, Math.floor(Number(dRaw))));
+  if (d !== null && Number.isFinite(d)) return n.toFixed(d);
+  switch (String(cfg?.chart_value_format || "auto")) {
+    case "int": return n.toFixed(0);
+    case "2dp": return n.toFixed(2);
+    case "3dp": return n.toFixed(3);
+    case "scientific": return n.toExponential(2);
+    default: return n.toLocaleString(undefined, { maximumFractionDigits: 3 });
+  }
+}

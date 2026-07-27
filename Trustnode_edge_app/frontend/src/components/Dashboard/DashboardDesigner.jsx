@@ -8,6 +8,7 @@ import {
   newWidgetId,
 } from "./widgetRegistry";
 import { compactWidgets, findFirstFreeSpot, normalizeWidgets, reflowWidgetsForMove, reflowWidgetsForMoveToPoint, reflowWidgetsForResize } from "./layoutUtils";
+import { formatWidgetValue } from "./dashboardAnalytics";
 import { DASHBOARD_GRID_VIRTUAL_ROWS } from "./widgetRegistry";
 import { materializePowerDashboardPayload } from "./powerDashboardTemplate";
 import { filterRowsByRange, getLatestTagRow, toTsMs } from "./dashboardAnalytics";
@@ -1196,7 +1197,7 @@ export function DashboardDesigner({
     // numeric formatter's placeholder. Numeric tags are unaffected.
     const latestValue = latest?.last_value_text != null && String(latest.last_value_text) !== ""
       ? String(latest.last_value_text)
-      : formatHeaderValue(latest?.last_value, headerDecimals);
+      : formatWidgetValue(cfg, latest?.last_value);
     const plcTag = formatTagForDisplay ? formatTagForDisplay(tagName) : tagName || "-";
     const lastTsMs = toTsMs(latest?.last_ts || "");
     const liveLatencyMs = Number.isFinite(lastTsMs) ? Math.max(0, Date.now() - lastTsMs) : null;
@@ -1245,7 +1246,7 @@ export function DashboardDesigner({
       // Same text-first rule as the primary series (see above).
       const sValue = sLatest?.last_value_text != null && String(sLatest.last_value_text) !== ""
         ? String(sLatest.last_value_text)
-        : formatHeaderValue(sLatest?.last_value);
+        : formatWidgetValue(cfg, sLatest?.last_value);
       const sLabel = String(s?.label || "").trim() || (formatTagForDisplay ? formatTagForDisplay(sTag) : sTag);
       seriesItems.push({
         value: decorateValue(sValue, s?.unit, s?.suffix),

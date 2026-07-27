@@ -40,6 +40,7 @@ import {
 import {
   buildFixedText,
   evaluateComputedRules,
+  formatWidgetValue,
   getLatestTagRow,
   getTagSeries as getTagSeriesFiltered,
   toTsMs,
@@ -3263,7 +3264,7 @@ function DashboardWidgetCardImpl({
       }
       const laneLineWidth = Math.max(1, Math.min(8, Number(cfg?.chart_line_width) || 2));
       const stackRows = multiSeriesData;
-      const fmtLaneVal = (v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(3) : "-");
+      const fmtLaneVal = (v) => formatWidgetValue(cfg, v);
       const latestLaneVal = (key) => {
         for (let i = stackRows.length - 1; i >= 0; i -= 1) {
           const v = stackRows[i] ? stackRows[i][key] : null;
@@ -3394,12 +3395,15 @@ function DashboardWidgetCardImpl({
         // prefix / suffix / decimals / format via heavyAxisTickFmt("left1").
         const axisFmtGauge = heavyAxisTickFmt("left1");
         const axisHasUnit = Boolean(String(cfg?.primary_unit || "").trim() || String(cfg?.primary_suffix || "").trim());
+        // Bar VALUE labels + tooltip follow the WIDGET-wide value format
+        // (decimals / int / 2dp / ...); only the axis ticks follow the
+        // per-axis configuration.
         const fmtGauge = (v, entry) => {
           if (v === null || !Number.isFinite(Number(v))) return "-";
-          const base = axisFmtGauge(v);
-          // Append the series' own unit only when the axis doesn't already
-          // carry one (avoids "90.0 % %" double-unit).
-          return !axisHasUnit && entry && entry.unit ? `${base} ${entry.unit}` : base;
+          const base = formatWidgetValue(cfg, v);
+          const unit = entry && entry.unit ? entry.unit
+            : (axisHasUnit ? `${String(cfg?.primary_suffix || "").trim() || String(cfg?.primary_unit || "").trim()}` : "");
+          return unit ? `${base} ${unit}` : base;
         };
         const gaugeBarWidth = Math.max(0, Math.min(120, Number(cfg?.chart_bar_width ?? 0)));
         return (
@@ -3419,7 +3423,7 @@ function DashboardWidgetCardImpl({
                   />
                   <Tooltip formatter={(v, _n, item) => fmtGauge(v, item && item.payload)} />
                   <Bar dataKey="value" isAnimationActive={false} {...(gaugeBarWidth > 0 ? { barSize: gaugeBarWidth } : {})}
-                    label={{ position: "top", fontSize: 11, formatter: (v) => (Number.isFinite(Number(v)) ? axisFmtGauge(v) : "-") }}>
+                    label={{ position: "top", fontSize: 11, formatter: (v) => (Number.isFinite(Number(v)) ? formatWidgetValue(cfg, v) : "-") }}>
                     {shown.map((e, i) => (<Cell key={`c-${i}`} fill={e.fill} />))}
                   </Bar>
                 </BarChart>
@@ -4333,7 +4337,7 @@ function DashboardWidgetCardImpl({
       const liveDisplay = liveTextRaw != null && String(liveTextRaw) !== ""
         ? String(liveTextRaw)
         : (liveNumRaw !== null && liveNumRaw !== undefined && liveNumRaw !== "" && Number.isFinite(Number(liveNumRaw))
-            ? Number(liveNumRaw).toFixed(3)
+            ? formatWidgetValue(cfg, liveNumRaw)
             : null);
       return (
         <div className="dashboard-widget-block dashboard-kpi-block">
@@ -4401,7 +4405,7 @@ function DashboardWidgetCardImpl({
             style={{ color: valueColor, fontSize: `${valueSize}px` }}
           >
             <span>
-              {value === null ? "-" : value.toFixed(decimals)}{unitSuffix ? <span className="dashboard-kpi-unit" style={unitStyle}>{unitSuffix}</span> : null}
+              {value === null ? "-" : formatWidgetValue(cfg, value)}{unitSuffix ? <span className="dashboard-kpi-unit" style={unitStyle}>{unitSuffix}</span> : null}
             </span>
           </div>
         </div>
@@ -4484,7 +4488,7 @@ function DashboardWidgetCardImpl({
           const text = newest && newest.value == null && newest.value_text != null ? String(newest.value_text) : null;
           return {
             tag: tg,
-            display: text !== null ? text : (num === null ? "-" : num.toFixed(3)),
+            display: text !== null ? text : (num === null ? "-" : formatWidgetValue(cfg, num)),
             ts: newest ? String(newest.ts || newest.ts_utc || "") : "",
             data_type: newest ? String(newest.data_type || (text !== null ? "STRING" : "")) : "",
           };
@@ -4677,7 +4681,7 @@ function DashboardWidgetCardImpl({
                           const n = Number(cell);
                           return (
                             <td key={`${idx}-${col.id}`}>
-                              {Number.isFinite(n) ? n.toFixed(3) : "-"}
+                              {Number.isFinite(n) ? formatWidgetValue(cfg, n) : "-"}
                             </td>
                           );
                         })}
@@ -4728,7 +4732,7 @@ function DashboardWidgetCardImpl({
                     ? rows.map((r) => (
                         <tr key={`${r.id}`}>
                           <td>{r.label}</td>
-                          <td>{Number.isFinite(Number(r.value)) ? Number(r.value).toFixed(3) : "-"}</td>
+                          <td>{Number.isFinite(Number(r.value)) ? formatWidgetValue(cfg, r.value) : "-"}</td>
                         </tr>
                       ))
                     : rows.map((r, idx) => (
@@ -4742,7 +4746,7 @@ function DashboardWidgetCardImpl({
                             if (txt !== null && txt !== undefined && txt !== "") {
                               return <td key={`${idx}-value`} title={String(txt)}>{String(txt)}</td>;
                             }
-                            return <td key={`${idx}-value`}>{Number.isFinite(Number(r?.value)) ? Number(r.value).toFixed(3) : "-"}</td>;
+                            return <td key={`${idx}-value`}>{Number.isFinite(Number(r?.value)) ? formatWidgetValue(cfg, r.value) : "-"}</td>;
                           })}
                         </tr>
                       ))}
