@@ -77,14 +77,15 @@ export function compactWidgets(widgets) {
   return placed;
 }
 
-export function findFirstFreeSpot(widgetSize, placed) {
+export function findFirstFreeSpot(widgetSize, placed, startY = 0) {
   const w = clamp(widgetSize?.w ?? 3, 1, DASHBOARD_GRID_COLS);
   const h = clamp(widgetSize?.h ?? 2, 1, DASHBOARD_GRID_ROWS);
-  // Scan from the top of the canvas down PAST the lowest placed widget —
+  // Scan from startY (0 = top; an item's own row during resize so displaced
+  // neighbours push DOWN, never jump upward) past the lowest placed widget —
   // the grid grows vertically, so there is always room further down.
   const lowest = placed.reduce((m, p) => Math.max(m, (p.y || 0) + (p.h || 1)), 0);
   const scanMaxY = Math.min(DASHBOARD_GRID_VIRTUAL_ROWS - h, lowest + h + 4);
-  for (let y = 0; y <= scanMaxY; y += 1) {
+  for (let y = Math.max(0, Math.floor(startY)); y <= scanMaxY; y += 1) {
     for (let x = 0; x <= DASHBOARD_GRID_COLS - w; x += 1) {
       const candidate = { x, y, w, h };
       if (canPlace(candidate, placed)) return candidate;
@@ -371,6 +372,11 @@ export function reflowWidgetsForMoveToPoint(widgets, draggedId, targetX, targetY
 }
 
 export function reflowWidgetsForResize(widgets, resizedId, nextW, nextH) {
+  // 2026-07-28 (operator): resizing must feel like every professional grid —
+  // the widget GROWS DOWN/RIGHT from its own anchored corner and colliding
+  // neighbours are PUSHED DOWN. The previous version ran the result through
+  // compaction with a top-down free-spot search, which relocated widgets
+  // UPWARD mid-drag ("growing to the top").
   if (!resizedId) return normalizeWidgets(widgets);
   const current = normalizeWidgets(widgets);
   const resized = current.find((w) => w.id === resizedId);
@@ -381,17 +387,32 @@ export function reflowWidgetsForResize(widgets, resizedId, nextW, nextH) {
     w: clamp(nextW, 1, DASHBOARD_GRID_COLS),
     h: clamp(nextH, 1, DASHBOARD_GRID_ROWS),
   };
+  // Anchor: keep the widget's own x/y. Only the column edge can force a
+  // shift; rows extend into the virtual space so y never has to move.
   patched.x = clamp(patched.x, 0, DASHBOARD_GRID_COLS - patched.w);
-  patched.y = clamp(patched.y, 0, DASHBOARD_GRID_ROWS - patched.h);
+  patched.y = clamp(patched.y, 0, DASHBOARD_GRID_VIRTUAL_ROWS - patched.h);
 
-  const placed = [];
-  const first = placeAtOrNextFree(patched, { x: patched.x, y: patched.y }, placed);
-  placed.push(first);
-
-  for (const item of current) {
-    if (item.id === resizedId) continue;
-    const nextPlaced = placeAtOrNextFree({ ...item }, { x: item.x, y: item.y }, placed);
-    placed.push(nextPlaced);
+  const placed = [patched];
+  // Neighbours in reading order; anyone the grown widget now overlaps is
+  // re-placed scanning DOWN from their own row — push-down, never upward.
+  const others = current
+    .filter((w) => w.id !== resizedId)
+    .sort((a, b) => (a.y !== b.y ? a.y - b.y : a.x - b.x));
+  for (const item of others) {
+    if (canPlace(item, placed)) {
+      placed.push(item);
+      continue;
+    }
+    // TRUE push-down: first try the widget's OWN column, sliding down row
+    // by row (keeps the visual rhythm); only if the column is blocked all
+    // the way down fall back to the general scan from its row.
+    let spot = null;
+    for (let y = item.y; y <= DASHBOARD_GRID_VIRTUAL_ROWS - item.h; y += 1) {
+      const candidate = { x: item.x, y, w: item.w, h: item.h };
+      if (canPlace(candidate, placed)) { spot = candidate; break; }
+    }
+    if (!spot) spot = findFirstFreeSpot({ w: item.w, h: item.h }, placed, item.y);
+    placed.push({ ...item, x: spot.x, y: spot.y });
   }
-  return compactWidgets(placed);
+  return placed;
 }

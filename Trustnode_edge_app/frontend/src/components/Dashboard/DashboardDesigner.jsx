@@ -2137,7 +2137,17 @@ export function DashboardDesigner({
       const dh = Math.round(dy / Math.max(1, cellH));
       const nextW = clamp(startW + dw, 1, DASHBOARD_GRID_COLS);
       const nextH = clamp(startH + dh, 1, DASHBOARD_GRID_ROWS);
-      setWidgets((prev) => compactWidgets(reflowWidgetsForResize(normalizeWidgets(prev), widget.id, nextW, nextH)));
+      // Anchored push-down resize — NO compaction pass here (compaction's
+      // top-down scan is what made widgets crawl upward mid-drag).
+      setWidgets((prev) => reflowWidgetsForResize(normalizeWidgets(prev), widget.id, nextW, nextH));
+      // Auto-scroll the canvas when dragging near its bottom/top edge so a
+      // widget can be resized past the fold all the way down.
+      const gridNow = gridRef.current;
+      if (gridNow) {
+        const r = gridNow.getBoundingClientRect();
+        if (ev.clientY > r.bottom - 42) gridNow.scrollTop += 14;
+        else if (ev.clientY < r.top + 42) gridNow.scrollTop -= 14;
+      }
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
