@@ -1160,11 +1160,11 @@ body {
 }
 
 .page-title-row h1 {
-  /* 2026-07-27 (operator): tighter vertical rhythm — the title block was
-     eating too much space above the dashboard action row. */
-  margin: 0 0 4px;
+  /* 2026-07-28 (operator): fully compact — the dashboard toolbar now sits
+     ON the title line (see .dashboard-tools). */
+  margin: 0;
   font-size: 20px;
-  line-height: 1.15;
+  line-height: 1.2;
 }
 
 .kpi-grid {
@@ -1177,6 +1177,16 @@ body {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+  /* 2026-07-28 (operator): the toolbar shares the TITLE line — the title is
+     left-aligned, these actions are right-aligned, so pulling the row up
+     removes the dead band between "Dashboard" and the buttons. */
+  margin-top: -40px;
+  margin-bottom: 6px;
+  min-height: 34px;
+  justify-content: flex-end;
+}
+@media (max-width: 900px) {
+  .dashboard-tools { margin-top: 0; }
 }
 
 /* Dashboard profile selector: compact pill group that sits in the left
@@ -6212,7 +6222,9 @@ textarea {
 /* 2026-07-27: auto-hide header (operator). Hidden = slid up out of flow;
    the hotzone at the very top reveals it on hover. */
 .app-header-hidden {
-  margin-top: -64px;
+  /* Exact negative margin is applied inline from the MEASURED header
+     height, so the page reclaims the full space regardless of theme /
+     content height. */
   opacity: 0;
   pointer-events: none;
 }

@@ -3716,6 +3716,17 @@ function AppShell() {
     try { return localStorage.getItem("tn_header_pinned") !== "0"; } catch { return true; }
   });
   const [appHeaderVisible, setAppHeaderVisible] = useState(true);
+  const appHeaderRef = useRef(null);
+  const [appHeaderHeightPx, setAppHeaderHeightPx] = useState(64);
+  useEffect(() => {
+    const measure = () => {
+      const h = appHeaderRef.current ? appHeaderRef.current.offsetHeight : 0;
+      if (h > 0) setAppHeaderHeightPx(h);
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
   useEffect(() => {
     try { localStorage.setItem("tn_header_pinned", appHeaderPinned ? "1" : "0"); } catch {}
     if (appHeaderPinned) setAppHeaderVisible(true);
@@ -19938,8 +19949,10 @@ const getGatewayHealth = (gateway) => {
         </div>
       ) : null}
       <header
+        ref={appHeaderRef}
         onMouseLeave={() => { if (!appHeaderPinned) setAppHeaderVisible(false); }}
         onMouseEnter={() => setAppHeaderVisible(true)}
+        style={!appHeaderPinned && !appHeaderVisible ? { marginTop: -(appHeaderHeightPx || 64) } : undefined}
         className={`app-header ${isPortalOnly ? "portal-header" : ""} ${useDesktopFramelessHeader ? "desktop-titlebar" : ""} ${!appHeaderPinned && !appHeaderVisible ? "app-header-hidden" : ""}`}>
         <div className="header-left">
           {!useDesktopFramelessHeader ? (
@@ -19955,14 +19968,7 @@ const getGatewayHealth = (gateway) => {
           ) : null}
           <div className="brand">
             <img src={headerLogoSrc} alt="Trustnode Edge" className="brand-full-logo" onError={handleLogoLoadError} />
-            <button
-              type="button"
-              className="header-pin-btn"
-              title={appHeaderPinned ? "Unpin header (auto-hide, hover top edge to reveal)" : "Pin header (always visible)"}
-              onClick={() => setAppHeaderPinned((p) => !p)}
-            >
-              {appHeaderPinned ? "▲" : "📌"}
-            </button>
+
           </div>
         </div>
         <div className="header-center">
@@ -19999,6 +20005,21 @@ const getGatewayHealth = (gateway) => {
           ) : null}
         </div>
         <div className="header-right">
+          <button
+            type="button"
+            className="icon-btn header-pin-btn"
+            style={{ order: 99 }}
+            title={appHeaderPinned ? "Unpin header — auto-hide (hover the top edge to reveal)" : "Pin header — always visible"}
+            aria-label={appHeaderPinned ? "Unpin header" : "Pin header"}
+            onClick={() => setAppHeaderPinned((p) => !p)}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+              strokeLinecap="round" strokeLinejoin="round"
+              style={appHeaderPinned ? undefined : { transform: "rotate(40deg)" }}>
+              <path d="M12 17v5" />
+              <path d="M9 3h6l-1 7 3 2v2H7v-2l3-2z" />
+            </svg>
+          </button>
           {canOpenPage("alarms") ? (
             <button className="icon-btn" title="Notifications" onClick={() => handleNavClick("alarms")}>
               <BellIcon />

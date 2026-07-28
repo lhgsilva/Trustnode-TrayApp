@@ -82,6 +82,12 @@
   height: calc(100vh - 220px);
   min-height: 520px;
   max-height: calc(100vh - 220px);
+}
+/* Header hidden -> the dashboard canvas grows into the reclaimed space.
+   (Electron Chromium supports :has().) */
+body:has(.app-header-hidden) .dashboard-virtual-grid {
+  height: calc(100vh - 158px);
+  max-height: calc(100vh - 158px);
   /* 2026-07-27: the canvas grows vertically past one screen (extra rows at
      the same cell height) and scrolls, so widget placement never overlaps
      because the first screen filled up. */
