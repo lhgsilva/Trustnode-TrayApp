@@ -140,7 +140,9 @@ body {
 .shell {
   height: 100vh;
   display: grid;
-  grid-template-rows: 64px 1fr;
+  /* 2026-07-28 (operator): header track is AUTO so the auto-hide header's
+     collapsed height genuinely returns the space to the content row. */
+  grid-template-rows: auto 1fr;
   overflow: hidden;
 }
 
@@ -149,15 +151,15 @@ body {
 }
 
 .shell.with-window-bar {
-  grid-template-rows: 28px 64px 1fr;
+  grid-template-rows: 28px auto 1fr;
 }
 
 .shell.with-license-banner {
-  grid-template-rows: 64px auto 1fr;
+  grid-template-rows: auto auto 1fr;
 }
 
 .shell.with-window-bar.with-license-banner {
-  grid-template-rows: 28px 64px auto 1fr;
+  grid-template-rows: 28px auto auto 1fr;
 }
 
 .desktop-frameless-shell {
@@ -173,6 +175,7 @@ body {
   transition: margin-top 0.22s ease, opacity 0.22s ease;
   position: relative;
   z-index: 60;
+  min-height: 64px;
   background: var(--header);
   color: var(--header-text);
   display: grid;
@@ -6261,3 +6264,14 @@ textarea {
 }
 .header-pin-btn:hover { opacity: 1; }
 .dashboard-tools { margin-top: 0; }
+
+
+/* 2026-07-28 (operator): ONE-SCREEN dashboard canvas. When the dashboard
+   page is mounted, the content region becomes a flex column so the canvas
+   takes exactly the remaining space — automatically re-fitting when the
+   header/nav hide or in fullscreen. */
+.content:has(.dashboard-virtual-grid) {
+  display: flex;
+  flex-direction: column;
+}
+.content:has(.dashboard-virtual-grid) .page-title-row { flex: 0 0 auto; }

@@ -2086,7 +2086,7 @@ export function DashboardDesigner({
   const gridRowsNeeded = useMemo(() => {
     const lowest = (Array.isArray(widgets) ? widgets : []).reduce(
       (m, w) => Math.max(m, (Number(w?.y) || 0) + (Number(w?.h) || 1)), 0);
-    return Math.min(DASHBOARD_GRID_VIRTUAL_ROWS, Math.max(DASHBOARD_GRID_ROWS, lowest + 6));
+    return Math.min(DASHBOARD_GRID_VIRTUAL_ROWS, Math.max(DASHBOARD_GRID_ROWS, lowest));
   }, [widgets]);
 
   // Scroll-aware cell math shared by drag-over and resize: the grid content
@@ -2374,7 +2374,7 @@ export function DashboardDesigner({
           // first screen implies (identical look for existing layouts);
           // extra rows render at the same height below the fold, so
           // placement never has to overlap because it "ran out of rows".
-          gridTemplateRows: `repeat(${gridRowsNeeded}, max(8px, calc((100vh - 220px - ${(DASHBOARD_GRID_ROWS - 1) * 8}px) / ${DASHBOARD_GRID_ROWS})))`,
+          gridTemplateRows: `repeat(${gridRowsNeeded}, minmax(0, 1fr))`,
         }}
       >
         {normalizedWidgets.map((widget) => (
