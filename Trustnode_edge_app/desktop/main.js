@@ -59,20 +59,101 @@ function bootLog(line) {
 }
 process.on("uncaughtException", (err) => {
   bootLog(`uncaughtException: ${err && err.stack || err}`);
+  // Operator 2026-08-21 (NO-ORPHANS): an exception before the main window
+  // exists must not leave an invisible Electron + backend behind.
+  try { if (typeof bootPhase !== "undefined" && bootPhase !== "ready") abortBoot(`uncaughtException during boot: ${err && err.message || err}`, 1); } catch (_) {}
 });
 process.on("unhandledRejection", (reason) => {
   bootLog(`unhandledRejection: ${reason && reason.stack || reason}`);
+  try { if (typeof bootPhase !== "undefined" && bootPhase !== "ready") abortBoot(`unhandledRejection during boot: ${reason && reason.message || reason}`, 1); } catch (_) {}
 });
 bootLog(`boot start v${(() => { try { return app.getVersion(); } catch { return "?"; } })()} pid=${process.pid}`);
 
 let mainWindow = null;
 let splashWindow = null;
 let tray = null;
+// Operator 2026-08-21 (NO-ORPHANS FIX): boot state machine. Rule: while the
+// app is booting there must ALWAYS be something visible (splash, then main
+// window). If the splash is closed, boot throws, or nothing is visible for
+// 15 s, the whole process tree is torn down — Electron, renderer/GPU children,
+// backend (taskkill /T), tray — so an aborted start never leaves invisible
+// processes the user has to hunt in Task Manager.
+let bootPhase = "booting";        // booting | ready | aborted
+let mainWindowShown = false;
+let splashClosingByApp = false;
+let headlessWatchdogTimer = null;
+let headlessSinceMs = 0;
+
+function abortBoot(reason, code = 1) {
+  if (bootPhase === "aborted") return;
+  bootPhase = "aborted";
+  bootLog(`BOOT ABORTED: ${reason} (exit ${code})`);
+  try { logBackend(`BOOT ABORTED: ${reason} (exit ${code}) — tearing down every process`); } catch (_) {}
+  try { quitting = true; } catch (_) {}
+  app.isQuiting = true;
+  try { if (headlessWatchdogTimer) { clearInterval(headlessWatchdogTimer); headlessWatchdogTimer = null; } } catch (_) {}
+  try { stopBackendSupervisor(); } catch (_) {}
+  try { stopBackend(); } catch (_) {}
+  try { killBackendImageNamesWindows(); } catch (_) {}
+  try { if (tray) { tray.destroy(); tray = null; } } catch (_) {}
+  try {
+    for (const w of BrowserWindow.getAllWindows()) {
+      try { w.destroy(); } catch (_) {}
+    }
+  } catch (_) {}
+  try { app.exit(code); } catch (_) {}
+  setTimeout(() => { try { process.exit(code); } catch (_) {} }, 2000);
+}
+
+function anyWindowVisible() {
+  try {
+    return BrowserWindow.getAllWindows().some((w) => {
+      try { return !w.isDestroyed() && (w.isVisible() || w.isMinimized()); } catch (_) { return false; }
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+// Headless watchdog: armed once the splash exists. Fires when nothing has
+// been visible for 15 s during boot, or when the main window has not
+// appeared 90 s after we asked for it.
+function startHeadlessWatchdog() {
+  if (headlessWatchdogTimer) return;
+  const readyAskedAt = { t: 0 };
+  headlessWatchdogTimer = setInterval(() => {
+    if (bootPhase === "aborted") return;
+    if (mainWindowShown) {
+      clearInterval(headlessWatchdogTimer);
+      headlessWatchdogTimer = null;
+      return;
+    }
+    const now = Date.now();
+    if (bootPhase === "ready") {
+      if (!readyAskedAt.t) readyAskedAt.t = now;
+      if (now - readyAskedAt.t > 90000 && !anyWindowVisible()) {
+        abortBoot("main window never appeared within 90 s of boot completing", 1);
+      }
+      return;
+    }
+    if (anyWindowVisible()) {
+      headlessSinceMs = 0;
+      return;
+    }
+    if (!headlessSinceMs) headlessSinceMs = now;
+    if (now - headlessSinceMs >= 15000) {
+      abortBoot("no window visible for 15 s during boot (splash closed or failed)", 0);
+    }
+  }, 3000);
+}
 let backendProc = null;
 let backendExited = false;
 let backendExitCode = null;
 const backendLogs = [];
 let ownsBackendProcess = false;
+// Operator 2026-08-21 (BOOT-HEALTH FIX): when we spawned the backend, so the
+// splash wait can log spawn->first-200 timings the release gate asserts on.
+let backendSpawnAtMs = 0;
 let backendMonitorTimer = null;
 const APP_DISPLAY_NAME = "TrustNode";
 const APP_WINDOW_TITLE = "TrustNode";
@@ -169,10 +250,16 @@ function sweepStaleBackend() {
     } catch (_) { /* nothing to kill is the happy path */ }
   }
 }
-try { sweepStaleBackend(); } catch (err) { bootLog(`sweep failed: ${err && err.message || err}`); }
-
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 bootLog(`singleton lock acquired=${gotSingleInstanceLock}`);
+// Operator 2026-08-21 (NO-ORPHANS): the stale-backend sweep used to run BEFORE
+// this lock check, so a SECOND launch (user double-clicks again because nothing
+// is visible) killed the FIRST instance's live backend and then quit — leaving
+// the first instance headless with a respawning supervisor (08-18 log storm).
+// Only the lock holder may sweep.
+if (gotSingleInstanceLock) {
+  try { sweepStaleBackend(); } catch (err) { bootLog(`sweep failed: ${err && err.message || err}`); }
+}
 
 if (!gotSingleInstanceLock) {
   try {
@@ -788,7 +875,10 @@ async function startBackend() {
     TRUSTNODE_INTELLIGENCE: _intelExplicit || "on",
     TRUSTNODE_HOST: currentBackendHost,
     TRUSTNODE_PORT: String(currentBackendPort),
-    TRUSTNODE_DATA_DIR: dataDir
+    TRUSTNODE_DATA_DIR: dataDir,
+    // Operator 2026-08-21 (NO-ORPHANS): the backend watches this PID and exits
+    // the instant Electron dies (force-kill, crash, aborted boot).
+    TRUSTNODE_PARENT_PID: String(process.pid)
   };
 
   if (process.env.TRUSTNODE_BACKEND_CMD) {
@@ -820,6 +910,8 @@ async function startBackend() {
     });
   }
   ownsBackendProcess = true;
+  backendSpawnAtMs = Date.now();
+  logBackend(`Backend spawned pid=${backendProc?.pid ?? "?"} target=http://${currentBackendHost}:${currentBackendPort}`);
 
   backendProc.stdout?.on("data", (chunk) => {
     logBackend(`STDOUT ${String(chunk).trim()}`);
@@ -1159,7 +1251,14 @@ function createSplashWindow() {
     splashWindow.loadURL(
       "data:text/html;charset=utf-8," + encodeURIComponent(buildSplashHtml())
     );
-    splashWindow.on("closed", () => { splashWindow = null; });
+    splashWindow.on("closed", () => {
+      splashWindow = null;
+      // Operator 2026-08-21 (NO-ORPHANS): the user closing the splash while
+      // we are still booting means "stop" — never keep running invisibly.
+      if (bootPhase === "booting" && !splashClosingByApp) {
+        abortBoot("splash closed by the user during boot", 0);
+      }
+    });
     logBackend("Splash window created");
   } catch (err) {
     logBackend(`Splash window failed to create: ${err}`);
@@ -1179,6 +1278,7 @@ function closeSplash() {
     splashWindow = null;
     return;
   }
+  splashClosingByApp = true;
   try {
     splashWindow.close();
   } catch (_) {
@@ -1271,6 +1371,7 @@ function createWindow() {
   }
 
   mainWindow.once("ready-to-show", () => {
+    mainWindowShown = true;
     applyOverlayTheme(currentOverlayTheme);
     mainWindow.show();
     mainWindow.focus();
@@ -1620,6 +1721,7 @@ async function postLanSharing(action) {
 }
 
 function createTray() {
+  if (tray) return;  // created early at boot; later calls are no-ops
   const iconPath = app.isPackaged
     ? path.join(process.resourcesPath, "trustnode_logo.ico")
     : path.resolve(__dirname, "../../trustnode_logo.png");
@@ -1785,7 +1887,7 @@ function rebuildTrayMenu() {
   try { tray.setToolTip(tip); } catch (_) {}
 }
 
-app.whenReady().then(async () => {
+async function bootSequence() {
   app.setName(APP_DISPLAY_NAME);
   if (process.platform === "win32") {
     // Keep the AppUserModelId aligned with electron-builder's appId so the
@@ -1837,6 +1939,11 @@ app.whenReady().then(async () => {
   // SmartScreen-scanning machine; without a splash the user sees a
   // blank desktop and reasonably assumes nothing is happening.
   createSplashWindow();
+  // Operator 2026-08-21 (NO-ORPHANS): tray icon EARLY so "Quit TrustNode" is
+  // always one click away — even if the main window never appears — and the
+  // headless watchdog from here on guarantees something is always visible.
+  try { createTray(); } catch (err) { bootLog(`early tray failed: ${err && err.message || err}`); }
+  startHeadlessWatchdog();
   updateSplashStatus("Starting service…");
   await startBackend();
   updateSplashStatus("Service started. Waiting for health…");
@@ -1851,22 +1958,63 @@ app.whenReady().then(async () => {
   ipcMain.on("splash:retry", () => { if (splashResolver) { const r = splashResolver; splashResolver = null; r("retry"); } });
   ipcMain.on("splash:skip",  () => { if (splashResolver) { const r = splashResolver; splashResolver = null; r("skip"); } });
 
-  const waitForHealth = async (deadlineMs) => {
+  // Operator 2026-08-21 (BOOT-HEALTH FIX): the old wait gave the backend a
+  // flat 30 s with 500 ms probes and no notion of whether the process was
+  // even alive. On large installs boot-time lock contention made every probe
+  // time out although uvicorn was up at +5 s, so users saw "did not respond"
+  // on EVERY launch (backend.log 2026-08-21: uvicorn up +5 s, first deferred
+  // step +59 s). The backend side is fixed too (/api/health is now lock-free);
+  // this side: 1500 ms probes, a 120 s budget (TRUSTNODE_BOOT_HEALTH_BUDGET_MS),
+  // live elapsed status on the splash, a dead process fails FAST instead of
+  // waiting out the budget, and the outcome is logged with timings so the
+  // release gate (scripts/boot_log_check.py) can assert spawn->200 <= 15 s.
+  const BOOT_HEALTH_BUDGET_MS = Math.max(
+    30000,
+    Number(process.env.TRUSTNODE_BOOT_HEALTH_BUDGET_MS || 120000) || 120000
+  );
+  const waitForHealth = async (deadlineMs, label = "boot") => {
+    const startedAt = Date.now();
+    let lastStatusAt = 0;
     while (Date.now() < deadlineMs) {
+      if (ownsBackendProcess && backendExited) {
+        logBackend(`Backend health wait aborted: process exited (code ${backendExitCode ?? "null"}) after ${Date.now() - startedAt} ms [${label}]`);
+        return false;
+      }
       try {
-        if (await checkBackendHealth(currentBackendHost, currentBackendPort, 500)) return true;
+        if (await checkBackendHealth(currentBackendHost, currentBackendPort, 1500)) {
+          const sinceSpawn = backendSpawnAtMs ? (Date.now() - backendSpawnAtMs) : null;
+          logBackend(
+            `Backend health OK after ${Date.now() - startedAt} ms of polling` +
+            (sinceSpawn !== null ? ` (${sinceSpawn} ms since spawn)` : "") +
+            ` [${label}]`
+          );
+          return true;
+        }
       } catch (_) { /* keep polling */ }
-      await new Promise((r) => setTimeout(r, 200));
+      const now = Date.now();
+      if (now - lastStatusAt >= 2000) {
+        lastStatusAt = now;
+        const elapsedS = Math.round((now - startedAt) / 1000);
+        updateSplashStatus(`Starting service… ${elapsedS}s (waiting for the backend to answer)`);
+      }
+      await new Promise((r) => setTimeout(r, 250));
     }
+    logBackend(
+      `Backend health wait TIMED OUT after ${Date.now() - startedAt} ms (budget ${deadlineMs - startedAt} ms); ` +
+      `processExited=${backendExited} exitCode=${backendExitCode ?? "null"} owns=${ownsBackendProcess} [${label}]`
+    );
     return false;
   };
 
-  let backendAlive = await waitForHealth(Date.now() + 30000);
+  let backendAlive = await waitForHealth(Date.now() + BOOT_HEALTH_BUDGET_MS);
   while (!backendAlive) {
     updateSplashStatus("Backend service did not respond");
+    const reason = (ownsBackendProcess && backendExited)
+      ? `The backend process exited (code ${backendExitCode ?? "unknown"}) before it became ready. See backend.log for the error.`
+      : `Backend service did not respond within ${Math.round(BOOT_HEALTH_BUDGET_MS / 1000)} seconds. The service may have failed to start.`;
     try {
       splashWindow && splashWindow.webContents && splashWindow.webContents.send("splash:failures", {
-        failures: ["Backend service did not respond within 30 seconds. The service may have failed to start."],
+        failures: [reason],
       });
     } catch (_) {}
     const action = await new Promise((res) => { splashResolver = res; });
@@ -1876,7 +2024,7 @@ app.whenReady().then(async () => {
     await new Promise((r) => setTimeout(r, 1000));
     try { await startBackend(); } catch (_) {}
     updateSplashStatus("Waiting for backend…");
-    backendAlive = await waitForHealth(Date.now() + 30000);
+    backendAlive = await waitForHealth(Date.now() + BOOT_HEALTH_BUDGET_MS, "retry");
   }
 
   // Boot probe: check every configured device + DB reaches its
@@ -1916,10 +2064,15 @@ app.whenReady().then(async () => {
   }
 
   updateSplashStatus("Loading interface…");
+  bootPhase = "ready";
   createWindow();
   monitorBackendStartup();
   createTray();
-});
+}
+
+app.whenReady().then(() => bootSequence().catch((err) => {
+  abortBoot(`boot sequence failed: ${err && err.stack || err}`, 1);
+}));
 
 app.on("second-instance", () => {
   if (!mainWindow || mainWindow.isDestroyed()) return;

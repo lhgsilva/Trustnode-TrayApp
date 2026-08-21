@@ -13,18 +13,42 @@ from __future__ import annotations
 from typing import Any, Optional
 
 
+# Operator 2026-08-21 (CPU HOT-LOOP FIX): _runtime_for used to call
+# app_store.get_bootstrap() — a full read + JSON parse of EVERY config document
+# under app_store._lock — for EVERY tag on EVERY channel, every cycle: with 48
+# tags that was ~96 full config parses per second. py-spy showed the V2
+# distribution thread spending ~60% of its time there, the backlog climbing
+# past 300 cycles, CPU at 140-300%, and every other _lock user (health,
+# deferred boot init, config loops) queuing behind it. The runtime choice
+# changes only when the operator saves Connections settings, so a 10 s TTL
+# cache is more than fresh enough.
+import time as _time
+
+_RUNTIME_CACHE: dict = {"at": 0.0, "vals": {}}
+_RUNTIME_TTL_S = 10.0
+
+
 def _runtime_for(channel: str) -> str:
-    """Returns 'python' or 'native'."""
+    """Returns 'python' or 'native' (cached per channel for _RUNTIME_TTL_S)."""
+    now = _time.monotonic()
+    vals = _RUNTIME_CACHE["vals"]
+    if vals and (now - _RUNTIME_CACHE["at"]) < _RUNTIME_TTL_S:
+        return vals.get(channel, "python")
     try:
         from app.state import app_store
         bootstrap = app_store.get_bootstrap() or {}
     except Exception:
-        return "python"
+        return vals.get(channel, "python") if vals else "python"
     s = bootstrap.get("app_settings") if isinstance(bootstrap.get("app_settings"), dict) else {}
     conn = s.get("connections") if isinstance(s, dict) and isinstance(s.get("connections"), dict) else {}
-    cfg = conn.get(channel) if isinstance(conn.get(channel), dict) else {}
-    rt = str(cfg.get("runtime") or "python").lower()
-    return "native" if rt == "native" else "python"
+    fresh = {}
+    for ch in ("opcua", "mqtt"):
+        cfg = conn.get(ch) if isinstance(conn.get(ch), dict) else {}
+        rt = str(cfg.get("runtime") or "python").lower()
+        fresh[ch] = "native" if rt == "native" else "python"
+    _RUNTIME_CACHE["vals"] = fresh
+    _RUNTIME_CACHE["at"] = now
+    return fresh.get(channel, "python")
 
 
 def publish_opcua(gateway_id: str, device_name: str, tag_name: str,

@@ -205,7 +205,7 @@ export function normalizeWidgets(rawWidgets) {
         text: String(raw?.config?.text || ""),
         source_url: String(raw?.config?.source_url || ""),
         camera_url: String(raw?.config?.camera_url || ""),
-        list_limit: clamp(raw?.config?.list_limit ?? 8, 1, 50),
+        list_limit: clamp(raw?.config?.list_limit ?? 8, 1, 500),
         query_group_interval: QUERY_GROUP_VALUES.has(String(raw?.config?.query_group_interval || ""))
           ? String(raw?.config?.query_group_interval)
           : "none",

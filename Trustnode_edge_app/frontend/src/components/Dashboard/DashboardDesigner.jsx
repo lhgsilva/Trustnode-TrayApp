@@ -13,7 +13,7 @@ import { DASHBOARD_GRID_VIRTUAL_ROWS } from "./widgetRegistry";
 import { materializePowerDashboardPayload } from "./powerDashboardTemplate";
 import { filterRowsByRange, getLatestTagRow, toTsMs } from "./dashboardAnalytics";
 import { classifyTag, checkTagForWidget, widgetIsNumericOnly, TAG_KIND } from "./tagTypes";
-import { listReportTemplates } from "../../api";
+import { listReportTemplates, bmv2ListDefinitions } from "../../api";
 import "./dashboard.css";
 
 // Normalize a series' axis assignment to one of the FOUR canonical axes.
@@ -907,6 +907,18 @@ export function DashboardDesigner({
   const [dashboardTimeMode, setDashboardTimeMode] = useState("live");
   const [dashboardFrom, setDashboardFrom] = useState("");
   const [dashboardTo, setDashboardTo] = useState("");
+  // Operator 2026-07-30: published batch definitions for the Batch ID widget's
+  // optional definition scope. Fetched lazily the first time a batch_input
+  // widget is edited; cached for the session (404 when unlicensed -> stays []).
+  const [batchDefs, setBatchDefs] = useState(null);
+  useEffect(() => {
+    if (!modalOpen || form.type !== "batch_input" || batchDefs !== null) return;
+    let mounted = true;
+    bmv2ListDefinitions()
+      .then((rows) => { if (mounted) setBatchDefs((rows || []).filter((d) => d.status === "published")); })
+      .catch(() => { if (mounted) setBatchDefs([]); });
+    return () => { mounted = false; };
+  }, [modalOpen, form.type, batchDefs]);
   // ------------------------------------------------------------------------
   // Dashboard profiles: named snapshots of the current layout (widgets +
   // grid mode / cols + tag colors). Stored client-side in localStorage so
@@ -1542,7 +1554,7 @@ export function DashboardDesigner({
         text: widget?.config?.text || "",
         source_url: widget?.config?.source_url || "",
         camera_url: widget?.config?.camera_url || "",
-        list_limit: clamp(widget?.config?.list_limit ?? 8, 1, 50),
+        list_limit: clamp(widget?.config?.list_limit ?? 8, 1, 500),
         query_group_interval: QUERY_GROUP_OPTIONS.some((opt) => opt.value === widget?.config?.query_group_interval)
           ? widget?.config?.query_group_interval
           : "none",
@@ -1916,7 +1928,7 @@ export function DashboardDesigner({
         text: String(form?.config?.text || ""),
         source_url: String(form?.config?.source_url || ""),
         camera_url: String(form?.config?.camera_url || ""),
-        list_limit: clamp(form?.config?.list_limit ?? 8, 1, 50),
+        list_limit: clamp(form?.config?.list_limit ?? 8, 1, 500),
         query_group_interval: QUERY_GROUP_OPTIONS.some((opt) => opt.value === form?.config?.query_group_interval)
           ? form?.config?.query_group_interval
           : "none",
@@ -3467,15 +3479,41 @@ export function DashboardDesigner({
 
                 {form.type === "table_list" ? (
                   <label>
-                    List limit
+                    Rows shown (limit)
                     <input
                       type="number"
                       min="1"
-                      max="50"
+                      max="500"
                       value={form.config.list_limit}
-                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, list_limit: clamp(e.target.value, 1, 50) } }))}
+                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, list_limit: clamp(e.target.value, 1, 500) } }))}
                     />
                   </label>
+                ) : null}
+
+                {form.type === "batch_input" ? (
+                  <>
+                    <label>
+                      Batch definition (scan scope)
+                      <select
+                        value={form.config.definition_id || ""}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, definition_id: e.target.value } }))}
+                      >
+                        <option value="">(auto — match any barcode definition)</option>
+                        {(batchDefs || []).map((d) => (
+                          <option key={d.id} value={d.id}>{d.name}{d.code ? ` (${d.code})` : ""}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <input
+                        type="checkbox"
+                        checked={form.config.autofocus !== false}
+                        onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, autofocus: e.target.checked } }))}
+                        style={{ width: "auto" }}
+                      />
+                      Keep field focused for the scanner (auto-refocus after a few idle seconds)
+                    </label>
+                  </>
                 ) : null}
 
                 {(String(form.type) === "meter_chart" || (supportsComputed && form.config.data_source_type === "computed")) ? (

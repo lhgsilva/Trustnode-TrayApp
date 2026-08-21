@@ -55,6 +55,14 @@ LOGIN = {"username": os.environ.get("VAL_USER", "admin-mari"),
 DB = os.path.expanduser("~/.trustnode_edge/data/trustnode_app_store.db")
 SF_DB = os.path.expanduser("~/.trustnode_edge/data/trustnode_store_forward.db")
 LOG = os.path.expanduser(r"~\AppData\Roaming\trustnode-edge-desktop\backend.log")
+# Operator 2026-08-21 (BOOT-HEALTH FIX): every gate run also asserts the
+# REAL install's last boot — spawn -> first /api/health 200 within
+# VAL_BOOT_MAX_HEALTH_MS (15 s) and no splash "did not respond" — so the
+# boot regression that hit users on every launch can never ship again.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import boot_log_check as _boot  # noqa: E402
+BOOT_MAX_HEALTH_MS = int(os.environ.get("VAL_BOOT_MAX_HEALTH_MS", "15000"))
+boot_metrics: dict = {}
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation_out")
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -154,7 +162,8 @@ async def ws_task(stop_at: float) -> None:
                 emit({"t": "ws_conn"})
                 while time.time() < stop_at:
                     try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                        # never wait past stop_at (2026-08-21)
+                        msg = await asyncio.wait_for(ws.recv(), timeout=max(0.5, min(15.0, stop_at - time.time())))
                     except asyncio.TimeoutError:
                         emit({"t": "ws_idle15"})
                         continue
@@ -185,14 +194,34 @@ async def ws_task(stop_at: float) -> None:
             await asyncio.sleep(3.0)
 
 
+_TENANT = {"id": None}
+
+
+def _historian_newest_ts():
+    """Newest historian stamp for GW via the covering index
+    (tenant_id, gateway_id, ts_utc). The old MAX(ts_utc) WHERE gateway_id=?
+    query skip-scanned that index (~2.4 s on an 8 GB store) — and it ran on the
+    event loop, which is what produced the phantom WS holes. 2026-08-21."""
+    con = ro(DB)
+    try:
+        if not _TENANT["id"]:
+            row = con.execute(
+                "SELECT tenant_id FROM historian_readings WHERE gateway_id=? ORDER BY rowid DESC LIMIT 1",
+                (GW,)).fetchone()
+            _TENANT["id"] = row[0] if row and row[0] else "default"
+        row = con.execute(
+            "SELECT ts_utc FROM historian_readings WHERE tenant_id=? AND gateway_id=? "
+            "ORDER BY ts_utc DESC LIMIT 1", (_TENANT["id"], GW)).fetchone()
+        return row[0] if row else None
+    finally:
+        con.close()
+
+
 async def db_task(stop_at: float) -> None:
     while time.time() < stop_at:
         try:
-            con = ro(DB)
-            row = con.execute(
-                "SELECT MAX(ts_utc) FROM historian_readings WHERE gateway_id=?", (GW,)).fetchone()
-            con.close()
-            ts = parse_ts(row[0]) if row and row[0] else None
+            newest = await asyncio.to_thread(_historian_newest_ts)
+            ts = parse_ts(newest) if newest else None
             if ts:
                 lag = time.time() - ts.timestamp()
                 db_lags.append((time.time(), lag))
@@ -228,31 +257,38 @@ def _cloud_target() -> dict | None:
         return None
 
 
+def _cloud_lag_probe():
+    """Blocking cloud PG probe — always called via asyncio.to_thread (2026-08-21)."""
+    lag = None
+    import psycopg2
+    tgt = _cloud_target()
+    if tgt:
+        conn = psycopg2.connect(
+            host=tgt["host"], port=int(tgt.get("port") or 5432),
+            dbname=tgt.get("database") or "postgres",
+            user=tgt.get("username") or "", password=tgt.get("password") or "",
+            connect_timeout=8,
+            options="-c statement_timeout=8000",
+            sslmode="require" if tgt.get("tls", True) else "disable",
+        )
+        cur = conn.cursor()
+        schema = str(tgt.get("schema") or "public")
+        table = str(tgt.get("table") or "plc_readings")
+        cur.execute(
+            f'SELECT MAX(ts_utc) FROM "{schema}"."{table}" WHERE gateway_id = %s', (GW,))
+        row = cur.fetchone()
+        conn.close()
+        ts = parse_ts(row[0]) if row and row[0] else None
+        if ts:
+            lag = time.time() - ts.timestamp()
+    return lag
+
+
 async def cloud_task(stop_at: float) -> None:
     while time.time() < stop_at:
         lag = None
         try:
-            import psycopg2
-            tgt = _cloud_target()
-            if tgt:
-                conn = psycopg2.connect(
-                    host=tgt["host"], port=int(tgt.get("port") or 5432),
-                    dbname=tgt.get("database") or "postgres",
-                    user=tgt.get("username") or "", password=tgt.get("password") or "",
-                    connect_timeout=8,
-                    options="-c statement_timeout=8000",
-                    sslmode="require" if tgt.get("tls", True) else "disable",
-                )
-                cur = conn.cursor()
-                schema = str(tgt.get("schema") or "public")
-                table = str(tgt.get("table") or "plc_readings")
-                cur.execute(
-                    f'SELECT MAX(ts_utc) FROM "{schema}"."{table}" WHERE gateway_id = %s', (GW,))
-                row = cur.fetchone()
-                conn.close()
-                ts = parse_ts(row[0]) if row and row[0] else None
-                if ts:
-                    lag = time.time() - ts.timestamp()
+            lag = await asyncio.to_thread(_cloud_lag_probe)
         except Exception as exc:
             emit({"t": "cloud_err", "err": f"{type(exc).__name__}: {str(exc)[:90]}"})
         cloud_lags.append((time.time(), lag))
@@ -261,24 +297,43 @@ async def cloud_task(stop_at: float) -> None:
         await sleep_bounded(300.0, stop_at)
 
 
-async def resources_task(stop_at: float) -> None:
+def _resource_sample():
+    """Blocking psutil sample (cpu_percent sleeps 0.5 s) — via to_thread (2026-08-21).
+    Also recognises a source-run backend (python listening on :8000) so the
+    sample works against `python -m app` during diagnosis."""
     import psutil
+    proc = None
+    for p in psutil.process_iter(["name"]):
+        if p.info["name"] and p.info["name"].lower().startswith("trustnode-service"):
+            proc = p
+            break
+    if proc is None:
+        try:
+            for c in psutil.net_connections(kind="tcp"):
+                if c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == 8000 and c.pid:
+                    proc = psutil.Process(c.pid)
+                    break
+        except Exception:
+            proc = None
+    if not proc:
+        return None
+    with proc.oneshot():
+        cpu = proc.cpu_percent(interval=0.5)
+        rss = proc.memory_info().rss / 1024 / 1024
+        thr = proc.num_threads()
+    try:
+        conns = len(proc.net_connections())
+    except Exception:
+        conns = -1
+    return (cpu, rss, thr, conns)
+
+
+async def resources_task(stop_at: float) -> None:
     while time.time() < stop_at:
         try:
-            proc = None
-            for p in psutil.process_iter(["name"]):
-                if p.info["name"] and p.info["name"].lower().startswith("trustnode-service"):
-                    proc = p
-                    break
-            if proc:
-                with proc.oneshot():
-                    cpu = proc.cpu_percent(interval=0.5)
-                    rss = proc.memory_info().rss / 1024 / 1024
-                    thr = proc.num_threads()
-                try:
-                    conns = len(proc.net_connections())
-                except Exception:
-                    conns = -1
+            s = await asyncio.to_thread(_resource_sample)
+            if s:
+                cpu, rss, thr, conns = s
                 res_samples.append((time.time(), cpu, rss, thr, conns))
                 emit({"t": "res", "cpu": cpu, "rss_mb": round(rss, 1),
                       "threads": thr, "conns": conns})
@@ -289,14 +344,19 @@ async def resources_task(stop_at: float) -> None:
         await sleep_bounded(60.0, stop_at)
 
 
+def _outbox_pending():
+    con = ro(SF_DB)
+    try:
+        return con.execute("SELECT COUNT(*) FROM outbox_readings WHERE sent_remote=0").fetchone()[0]
+    finally:
+        con.close()
+
+
 async def outbox_task(stop_at: float) -> None:
     while time.time() < stop_at:
         try:
             if os.path.exists(SF_DB):
-                con = ro(SF_DB)
-                n = con.execute(
-                    "SELECT COUNT(*) FROM outbox_readings WHERE sent_remote=0").fetchone()[0]
-                con.close()
+                n = await asyncio.to_thread(_outbox_pending)
                 outbox_depths.append((time.time(), int(n)))
                 emit({"t": "outbox", "pending": int(n)})
         except Exception as exc:
@@ -304,33 +364,41 @@ async def outbox_task(stop_at: float) -> None:
         await sleep_bounded(60.0, stop_at)
 
 
+def _modules_snapshot() -> dict:
+    """Blocking module counters — via to_thread (2026-08-21)."""
+    snap: dict = {}
+    con = ro(DB)
+    try:
+        for label, q in (
+            ("batches_total", "SELECT COUNT(*) FROM batches"),
+            ("batches_open", "SELECT COUNT(*) FROM batches WHERE status IN ('open','running','active')"),
+            ("batch_events_newest", "SELECT MAX(created_utc) FROM batch_events"),
+            ("reports_generated", "SELECT COUNT(*) FROM generated_reports"),
+            ("reports_newest", "SELECT MAX(created_utc) FROM generated_reports"),
+            ("reports_scheduled", "SELECT COUNT(*) FROM scheduled_reports"),
+        ):
+            try:
+                snap[label] = con.execute(q).fetchone()[0]
+            except Exception:
+                snap[label] = "n/a"
+        for dom in ("alarms_setup", "triggers_limits"):
+            try:
+                row = con.execute(
+                    "SELECT COUNT(*) FROM config_documents_scoped WHERE domain=?",
+                    (dom,)).fetchone()
+                snap[dom] = int(row[0]) if row else 0
+            except Exception:
+                snap[dom] = "n/a"
+    finally:
+        con.close()
+    return snap
+
+
 async def modules_task(stop_at: float) -> None:
     while time.time() < stop_at:
         snap: dict = {}
         try:
-            con = ro(DB)
-            for label, q in (
-                ("batches_total", "SELECT COUNT(*) FROM batches"),
-                ("batches_open", "SELECT COUNT(*) FROM batches WHERE status IN ('open','running','active')"),
-                ("batch_events_newest", "SELECT MAX(created_utc) FROM batch_events"),
-                ("reports_generated", "SELECT COUNT(*) FROM generated_reports"),
-                ("reports_newest", "SELECT MAX(created_utc) FROM generated_reports"),
-                ("reports_scheduled", "SELECT COUNT(*) FROM scheduled_reports"),
-            ):
-                try:
-                    snap[label] = con.execute(q).fetchone()[0]
-                except Exception:
-                    snap[label] = "n/a"
-            # alarms / triggers / limits config presence
-            for dom in ("alarms_setup", "triggers_limits"):
-                try:
-                    row = con.execute(
-                        "SELECT COUNT(*) FROM config_documents_scoped WHERE domain=?",
-                        (dom,)).fetchone()
-                    snap[dom] = int(row[0]) if row else 0
-                except Exception:
-                    snap[dom] = "n/a"
-            con.close()
+            snap = await asyncio.to_thread(_modules_snapshot)
         except Exception as exc:
             snap["err"] = str(exc)[:90]
         module_checks.append((time.time(), snap))
@@ -345,6 +413,7 @@ async def log_task(stop_at: float) -> None:
     except Exception:
         return
     pats = [
+        ("boot_fail", re.compile(rb"did not respond|health wait TIMED OUT|BOOT ABORTED|\[boot\]\[health-watchdog\]")),
         ("recovery", re.compile(rb"Splash window created|Backend exited|respawn|first-row|auto-resumed")),
         ("stall", re.compile(rb"stalled \d+s|read-timeout|persist-timeout|event loop stale|cooldown")),
         ("engine", re.compile(rb"engine_v2|v2-dist|v2-writer|v2-reader")),
@@ -382,7 +451,11 @@ def pct(vals, p):
 
 def build_summary(t0: float, final: bool) -> str:
     now = time.time()
-    dur = now - t0
+    # 2026-08-21: the denominator is the MEASUREMENT WINDOW, not the report
+    # time. The final report is built after every task returned, and the WS
+    # reader's last recv() waits up to 15 s past stop_at, which inflated
+    # expected by ~6% (600 events in a 600 s window showed as 94%).
+    dur = min(now - t0, float(DURATION_S))
     exp = int(dur / INTERVAL_S)
     L: list[str] = []
     A = L.append
@@ -477,9 +550,21 @@ def build_summary(t0: float, final: bool) -> str:
     for at, cat, txt in [e for e in log_events if e[1] in ("recovery", "stall")][:25]:
         A(f"  {datetime.fromtimestamp(at, tz=timezone.utc).strftime('%H:%M:%S')}Z [{cat}] {txt[:150]}")
 
+    # boot health (2026-08-21): the last boot block of backend.log vs SLOs
+    A("\n[BOOT HEALTH] (last boot block of backend.log)")
+    for ln in _boot.summary_lines(boot_metrics):
+        A(ln)
+
     # verdict
     A("\n[VERDICT vs SLOs]")
     ok = True
+    b_ok, b_lines = _boot.verdict(boot_metrics, BOOT_MAX_HEALTH_MS)
+    for ln in b_lines:
+        A(ln)
+    ok &= b_ok
+    boot_fail_n = cats.get("boot_fail", 0)
+    A(f"  zero boot failures in run : {'PASS' if boot_fail_n == 0 else f'FAIL ({boot_fail_n})'}")
+    ok &= boot_fail_n == 0
     if n and exp:
         d = n / exp * 100
         A(f"  delivery >=95%           : {'PASS' if d >= 95 else 'FAIL'} ({d:.1f}%)")
@@ -517,6 +602,10 @@ async def main() -> int:
     t0 = time.time()
     stop_at = t0 + DURATION_S
     emit({"t": "start", "duration": DURATION_S, "gw": GW})
+    boot_metrics.update(_boot.analyze_last_boot(LOG))
+    emit({"t": "boot", **{k: v for k, v in boot_metrics.items() if k != "integrity"}})
+    _b_ok, _b_lines = _boot.verdict(boot_metrics, BOOT_MAX_HEALTH_MS)
+    print("[BOOT HEALTH] " + ("PASS" if _b_ok else "FAIL") + "\n" + "\n".join(_b_lines), flush=True)
     print(f"validation started {datetime.now(timezone.utc).isoformat()[:19]}Z "
           f"for {DURATION_S/3600:.1f}h — gateway {GW}", flush=True)
     get_token()

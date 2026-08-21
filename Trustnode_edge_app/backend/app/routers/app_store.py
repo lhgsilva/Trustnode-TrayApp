@@ -9,6 +9,49 @@ from app.tenant import get_current_tenant
 
 router = APIRouter(prefix="/api/app-store", tags=["app-store"])
 
+# --------------------------------------------------------------------------
+# Operator 2026-08-21 (BOUNDED READ SLOTS): heavy historian/live reads share a
+# small number of slots so they can never fill the shared sync-handler pool.
+# Seen in the field: 205-231 threads, 0% CPU, 15-22 MB/s page reads on the
+# 8 GB store, and the cheap status/health endpoints starved behind them (the
+# gateway footer showed "stopped" although collection was running). A request
+# that cannot get a slot within _READ_SLOT_WAIT_S gets a fast 503 and the UI
+# polls again; nothing else waits. Tunable via env for support.
+# --------------------------------------------------------------------------
+import os as _os_rs
+import threading as _threading_rs
+import time as _time_rs
+import logging as _logging_rs
+from fastapi import Depends as _Depends_rs, HTTPException as _HTTPException_rs
+
+_READ_SLOTS = max(2, int(_os_rs.environ.get("TRUSTNODE_HISTORIAN_READ_SLOTS", "8") or "8"))
+_READ_SLOT_WAIT_S = max(0.2, float(_os_rs.environ.get("TRUSTNODE_HISTORIAN_READ_SLOT_WAIT_S", "2") or "2"))
+_read_slots = _threading_rs.BoundedSemaphore(_READ_SLOTS)
+_read_slot_log = _logging_rs.getLogger("trustnode.historian-reads")
+_read_slot_state = {"last_warn_mono": 0.0, "rejected": 0}
+
+
+def _historian_read_slot():
+    """FastAPI dependency: hold one of the bounded read slots for the handler."""
+    if not _read_slots.acquire(timeout=_READ_SLOT_WAIT_S):
+        _read_slot_state["rejected"] += 1
+        now = _time_rs.monotonic()
+        if now - _read_slot_state["last_warn_mono"] > 30.0:
+            _read_slot_state["last_warn_mono"] = now
+            _read_slot_log.warning(
+                "historian read slots exhausted (%d slots busy > %.1fs) — %d request(s) rejected with 503 so far; "
+                "slow chart/table queries are saturating the store",
+                _READ_SLOTS, _READ_SLOT_WAIT_S, _read_slot_state["rejected"],
+            )
+        raise _HTTPException_rs(status_code=503, detail="historian busy — too many concurrent heavy reads; retry shortly")
+    try:
+        yield
+    finally:
+        try:
+            _read_slots.release()
+        except Exception:
+            pass
+
 
 def _normalize_host_header(request: Request) -> str:
     raw = str(request.headers.get("host") or "").strip().lower()
@@ -390,7 +433,7 @@ def append_logs(payload: AppendRowsRequest) -> dict:
     return {"ok": True, "tenant_id": get_current_tenant(), "count": count}
 
 
-@router.get("/historian")
+@router.get("/historian", dependencies=[_Depends_rs(_historian_read_slot)])
 def get_historian(
     request: Request,
     limit: int = 1000,
@@ -528,7 +571,7 @@ def record_data_continuity_decision(payload: DataContinuityDecisionRequest, requ
     return {"ok": True, "decision": decision}
 
 
-@router.get("/historian/range")
+@router.get("/historian/range", dependencies=[_Depends_rs(_historian_read_slot)])
 def get_historian_range(
     request: Request,
     from_utc: str = "",
@@ -561,7 +604,7 @@ def get_historian_range(
     }
 
 
-@router.get("/historian/agg")
+@router.get("/historian/agg", dependencies=[_Depends_rs(_historian_read_slot)])
 def get_historian_agg(
     request: Request,
     bucket: str = "minute",
@@ -593,7 +636,7 @@ def get_historian_agg(
     }
 
 
-@router.get("/historian/stats")
+@router.get("/historian/stats", dependencies=[_Depends_rs(_historian_read_slot)])
 def get_historian_stats(
     request: Request,
     from_utc: str = "",
@@ -640,7 +683,7 @@ def get_historian_rule_stats(
     }
 
 
-@router.get("/live")
+@router.get("/live", dependencies=[_Depends_rs(_historian_read_slot)])
 def get_live(request: Request, limit: int = 5000, edge_id: str = "") -> dict:
     prefer_cloud_reads = _resolve_prefer_cloud_reads(request)
     safe_limit = max(50, min(int(limit or 5000), 800 if prefer_cloud_reads else 5000))

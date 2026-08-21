@@ -23,27 +23,110 @@ def _collect_license_summary() -> dict:
         return {}
 
 
-# Operator 2026-07-03 (REGRESSION FIX): the UI polls /api/health frequently.
-# A short in-process cache means the routing + license reads happen at most
-# once per _HEALTH_TTL, NOT on every poll — so health stays cheap even under
-# heavy collection and never competes with the PLC write path.
-_HEALTH_CACHE = {"at": 0.0, "routing": {}, "license": {}}
+# Operator 2026-08-21 (BOOT-HEALTH FIX): /api/health must NEVER block.
+#
+# Root cause of the "Backend service did not respond within 30 seconds"
+# splash on large installs: on a cold cache this handler called
+# app_store.get_historian_read_routing_status() (takes app_store._lock)
+# and license_inspect.get_license_summary() (-> get_bootstrap -> _lock, plus
+# a direct SQLite open) INLINE on the request path, serialized behind a
+# module lock. During boot that lock is contended (activation restore /
+# mirror, config sync, the multi-GB quick_check saturating the disk), so
+# every 500 ms splash probe timed out although uvicorn had been serving
+# since +5 s. Observed 2026-08-21: uvicorn up at +5 s, first deferred step
+# done at +59 s, splash failure on every launch.
+#
+# Now the request path only READS an in-memory snapshot that a daemon
+# thread refreshes every _HEALTH_TTL seconds. No lock, no database, no
+# cloud on the request path. Until the first refresh lands the payload
+# says state="pending" — the splash only needs HTTP 200 — and the UI
+# re-polls until state="ready" (App.jsx health consumers).
+from app import boot_clock as _boot_clock
+
 _HEALTH_TTL = 5.0
-_HEALTH_LOCK = _threading.Lock()
+_SNAPSHOT: dict = {"at": 0.0, "routing": {}, "license": {}, "state": "pending"}
+_REFRESHER_LOCK = _threading.Lock()
+_REFRESHER_STARTED = False
+_FIRST_SERVED = {"mono": None, "age_s": None}
+
+
+def _refresh_once() -> None:
+    global _SNAPSHOT
+    routing = _collect_routing()
+    license_summary = _collect_license_summary()
+    _SNAPSHOT = {
+        "at": _time.monotonic(),
+        "routing": routing,
+        "license": license_summary,
+        "state": "ready",
+    }
+
+
+def _refresher_loop() -> None:
+    t0 = _time.monotonic()
+    first = True
+    while True:
+        try:
+            _refresh_once()
+            if first:
+                first = False
+                print(
+                    f"[trustnode][boot] health snapshot ready +{_boot_clock.age_s():.2f}s "
+                    f"after process start (first refresh took {_time.monotonic() - t0:.2f}s)",
+                    flush=True,
+                )
+        except Exception:
+            pass
+        _time.sleep(_HEALTH_TTL)
+
+
+def _ensure_refresher() -> None:
+    """Start the snapshot refresher once (idempotent, thread-safe)."""
+    global _REFRESHER_STARTED
+    if _REFRESHER_STARTED:
+        return
+    with _REFRESHER_LOCK:
+        if _REFRESHER_STARTED:
+            return
+        _REFRESHER_STARTED = True
+        _threading.Thread(
+            target=_refresher_loop, name="trustnode-health-refresher", daemon=True
+        ).start()
+
+
+def first_health_served_age_s():
+    """Seconds after process start when the first /api/health was served,
+    or None until it happens. Read by the boot-health watchdog (app.main)."""
+    return _FIRST_SERVED["age_s"]
+
+
+def snapshot_state() -> str:
+    return str(_SNAPSHOT.get("state") or "pending")
+
+
+# Kick the refresher at import so the snapshot is usually "ready" long
+# before the UI loads; the lazy call in health() covers any other order.
+try:
+    _ensure_refresher()
+except Exception:
+    pass
 
 
 @router.get("/health")
-def health() -> dict:
-    # Operator 2026-07-03 (REGRESSION FIX): reverted from `async def` +
-    # asyncio.to_thread back to a PLAIN `def`. The async+to_thread variant
-    # (added 2026-07-02) borrowed from the shared anyio threadpool on EVERY
-    # health poll. Under active collection the PLC worker's per-cycle
-    # to_thread(read_from_gateway) calls saturate that pool, so health's
-    # to_thread work QUEUED for ~1.25s AND stole threads from collection —
-    # causing the historian/chart GAPS the operator reported. A plain `def`
-    # runs inline in FastAPI's own worker slot (never spawns competing
-    # to_thread tasks), and the 5s cache below makes the reads near-free.
-    # This restores the fast, contention-free behavior of the working build.
+async def health() -> dict:
+    # async on purpose (2026-08-21): this handler is lock-free and does zero
+    # I/O, so it must NOT need a threadpool token. When app_store._lock is
+    # held for seconds, the sync handlers the UI polls pile up and exhaust the
+    # anyio pool (231 threads observed) — a sync health could not even be
+    # scheduled and the backend looked dead to the splash and the supervisor.
+    _ensure_refresher()
+    if _FIRST_SERVED["mono"] is None:
+        _FIRST_SERVED["mono"] = _time.monotonic()
+        _FIRST_SERVED["age_s"] = round(_boot_clock.age_s(), 2)
+        print(
+            f"[trustnode][boot] first /api/health served +{_FIRST_SERVED['age_s']:.2f}s after process start",
+            flush=True,
+        )
 
     # Operator 2026-06-19 (L5): surface the boot-time SQLite quick_check.
     integrity = {}
@@ -52,18 +135,7 @@ def health() -> dict:
     except Exception:
         integrity = {}
 
-    now = _time.monotonic()
-    with _HEALTH_LOCK:
-        fresh = (now - _HEALTH_CACHE["at"]) < _HEALTH_TTL and _HEALTH_CACHE["at"] > 0
-        if fresh:
-            routing = _HEALTH_CACHE["routing"]
-            license_summary = _HEALTH_CACHE["license"]
-        else:
-            routing = _collect_routing()
-            license_summary = _collect_license_summary()
-            _HEALTH_CACHE["at"] = now
-            _HEALTH_CACHE["routing"] = routing
-            _HEALTH_CACHE["license"] = license_summary
+    snap = _SNAPSHOT  # atomic dict swap in the refresher; never mutated in place
     return {
         "status": "ok",
         "api_build": "edge-2026-06-23-canonical-db-1",
@@ -84,8 +156,16 @@ def health() -> dict:
             "batch_management_module": True,
         },
         "integrity": integrity,
-        "historian_read_routing": routing,
-        "license_summary": license_summary,
+        "historian_read_routing": snap["routing"],
+        "license_summary": snap["license"],
+        "health_snapshot": {
+            "state": snap["state"],
+            "age_s": (round(_time.monotonic() - snap["at"], 1) if snap["at"] else None),
+        },
+        "boot": {
+            "process_age_s": round(_boot_clock.age_s(), 2),
+            "first_health_served_s": _FIRST_SERVED["age_s"],
+        },
     }
 
 

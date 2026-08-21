@@ -11,7 +11,9 @@ Release flow:
     4. on PASS (exit 0)           commit / tag / ship
        on FAIL (exit 2)           read scripts/validation_out/validation_report.txt
 
-Covers: collection cadence + loss, chart-feed latency, historian freshness,
+Covers: BOOT HEALTH of the last launch (spawn -> /api/health 200 <= 15 s, no
+splash "did not respond", backend boot instrumentation present — 2026-08-21),
+collection cadence + loss, chart-feed latency, historian freshness,
 local DB truth, outbox depth, cloud PG lag, API + AI-module probes,
 batch/report/alarm/trigger snapshots, resource trends, and the log census
 (stalls, restarts, lock-watchdog starvation dumps).

@@ -271,38 +271,66 @@ class AppStore:
                          name="tn-lock-watchdog", daemon=True).start()
 
     def _lock_starvation_watchdog(self) -> None:
+        # Operator 2026-08-21: the old probe (start +120 s, 45 s acquire timeout,
+        # 10-min dump rate limit) never caught the holds that actually hurt —
+        # the 30-40 s boot lock storm nor the 3-6 s burst holds that, with the
+        # UI polling, exhausted the threadpool (231 threads) and made the
+        # backend look dead. Now: start +45 s, probe every 10 s with a 6 s
+        # acquire timeout, dump at most every 120 s, and name the HOLDER
+        # candidates first (threads inside app_store that are not themselves
+        # waiting at a `with self._lock` line), then the waiters.
         import sys as _sys
         import traceback as _tb
         last_dump = 0.0
-        time.sleep(120)  # let boot noise settle
+        try:
+            probe_s = float(os.environ.get("TRUSTNODE_LOCK_WATCHDOG_PROBE_S", "10") or "10")
+            starve_s = float(os.environ.get("TRUSTNODE_LOCK_WATCHDOG_STARVE_S", "6") or "6")
+        except Exception:
+            probe_s, starve_s = 10.0, 6.0
+        time.sleep(45)  # let boot settle
         while True:
             try:
                 starved = None
                 for label, lk in (("config._lock", self._lock),
                                   ("historian._hist_lock", self._hist_lock)):
-                    got = lk.acquire(timeout=45.0)
+                    got = lk.acquire(timeout=starve_s)
                     if got:
                         lk.release()
                     else:
                         starved = label
                         break
                 if starved is None:
-                    time.sleep(60)
+                    time.sleep(probe_s)
                     continue
                 now = time.monotonic()
-                if now - last_dump < 600:
-                    time.sleep(60)
+                if now - last_dump < 120:
+                    time.sleep(probe_s)
                     continue
                 last_dump = now
                 names = {t.ident: t.name for t in threading.enumerate()}
-                print(f"[trustnode][lock-watchdog] {starved} STARVED >45s — "
-                      "dumping all thread stacks:", flush=True)
+                holders, waiters = [], []
                 for tid, frame in _sys._current_frames().items():
-                    stack = "".join(_tb.format_stack(frame, limit=12))
-                    print(f"[trustnode][lock-watchdog] --- thread {names.get(tid, tid)} ---\n"
-                          f"{stack}", flush=True)
+                    try:
+                        frames = _tb.extract_stack(frame, limit=14)
+                    except Exception:
+                        continue
+                    in_store = any("app_store" in (f.filename or "") for f in frames)
+                    if not in_store:
+                        continue
+                    last = frames[-1]
+                    waiting = "with self._lock" in (last.line or "") or "with self._hist_lock" in (last.line or "") \
+                        or (last.name == "acquire") or ("_lock.acquire" in (last.line or ""))
+                    desc = " <- ".join(f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}" for f in reversed(frames[-8:]))
+                    (waiters if waiting else holders).append(f"{names.get(tid, tid)}: {desc}")
+                print(f"[trustnode][lock-watchdog] {starved} STARVED >{starve_s:.0f}s — "
+                      f"{len(holders)} holder candidate(s), {len(waiters)} waiter(s), "
+                      f"{threading.active_count()} threads total", flush=True)
+                for h in holders[:6]:
+                    print(f"[trustnode][lock-watchdog] HOLDER? {h}", flush=True)
+                for w in waiters[:8]:
+                    print(f"[trustnode][lock-watchdog] waiter  {w}", flush=True)
             except Exception:
-                time.sleep(60)
+                time.sleep(probe_s)
 
     def _cloud_target_schema_key(self, cloud: dict[str, Any], schema: str) -> str:
         return "|".join(
@@ -3775,16 +3803,28 @@ class AppStore:
         with self._lock:
             with self._connect() as conn:
                 if max_id <= 0:
-                    # ORDER BY ts_utc DESC uses idx_hist_tenant_ts directly;
-                    # ORDER BY id DESC forces a full temp B-tree sort over the
-                    # entire table — 100s of ms on a busy edge. Same result
-                    # because ts_utc and id increase monotonically together.
+                    # Operator 2026-08-21 (BOOT LOCK-STORM FIX): the previous
+                    # comment had it backwards. `id` is INTEGER PRIMARY KEY
+                    # AUTOINCREMENT (the rowid), so ORDER BY id DESC LIMIT n is a
+                    # reverse rowid walk (2 ms on an 8 GB store). ORDER BY ts_utc
+                    # DESC has NO usable index without a tenant predicate
+                    # (idx_hist_tenant_ts is (tenant_id, ts_utc)): EXPLAIN showed
+                    # "SCAN ... COVERING INDEX idx_hist_tenant_ts | USE TEMP
+                    # B-TREE FOR ORDER BY" — a full scan + sort of the whole
+                    # table, ~38 s while HOLDING self._lock, and it re-ran every
+                    # live-sync tick while the cursor was still 0. Every other
+                    # _lock user (health refresh, config loops, deferred boot
+                    # init, UI handlers) queued behind it -> gateways resumed
+                    # 30-40 s late and, with the UI open, the sync handlers
+                    # exhausted the threadpool (231 threads) and the backend
+                    # looked dead. Same rows either way: ts_utc and id increase
+                    # monotonically together.
                     db_rows = conn.execute(
                         """
                         SELECT id, tenant_id, ts_utc, gateway_id, gateway_name, device_name, plc_ip, database_name,
                                tag_name, value, value_text, data_type, quality, quality_label, source
                         FROM historian_readings
-                        ORDER BY ts_utc DESC
+                        ORDER BY id DESC
                         LIMIT ?
                         """,
                         (self._live_fast_initial_rows,),
@@ -5751,13 +5791,15 @@ class AppStore:
         with self._lock:
             with self._connect() as conn:
                 rows = conn.execute("SELECT domain, payload_json FROM config_documents").fetchall()
-                for row in rows:
-                    domain = str(row["domain"])
-                    payload_text = str(row["payload_json"] or "null")
-                    try:
-                        out[domain] = json.loads(payload_text)
-                    except Exception:
-                        out[domain] = None
+        # 2026-08-21: parse OUTSIDE the lock — json.loads of every document
+        # (dashboards etc.) is the expensive part; the lock only guards the read.
+        for row in rows:
+            domain = str(row["domain"])
+            payload_text = str(row["payload_json"] or "null")
+            try:
+                out[domain] = json.loads(payload_text)
+            except Exception:
+                out[domain] = None
         if not out:
             try:
                 self._pull_config_from_cloud_once()
@@ -5766,13 +5808,15 @@ class AppStore:
             with self._lock:
                 with self._connect() as conn:
                     rows = conn.execute("SELECT domain, payload_json FROM config_documents").fetchall()
-                    for row in rows:
-                        domain = str(row["domain"])
-                        payload_text = str(row["payload_json"] or "null")
-                        try:
-                            out[domain] = json.loads(payload_text)
-                        except Exception:
-                            out[domain] = None
+            # 2026-08-21: parse OUTSIDE the lock — json.loads of every document
+            # (dashboards etc.) is the expensive part; the lock only guards the read.
+            for row in rows:
+                domain = str(row["domain"])
+                payload_text = str(row["payload_json"] or "null")
+                try:
+                    out[domain] = json.loads(payload_text)
+                except Exception:
+                    out[domain] = None
         out.setdefault("metadata", {})
         if isinstance(out.get("metadata"), dict):
             out["metadata"]["tenant_id"] = tenant_id

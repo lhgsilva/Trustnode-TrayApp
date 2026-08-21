@@ -4576,6 +4576,8 @@ function DashboardWidgetCardImpl({
         const seriesByTag = new Map((Array.isArray(cfg?.series_extra) ? cfg.series_extra : [])
           .filter((s) => s && String(s.tag_name || "").trim())
           .map((s) => [String(s.tag_name), s]));
+        // NOTE: no list_limit cap here — one row per SELECTED tag is the whole
+        // point of latest-per-tag mode; the operator's tag pick bounds the rows.
         const latestRows = orderedTags.map((tg) => {
           const { newest, num } = reduceRows(byTag.get(tg) || []);
           const text = newest && newest.value == null && newest.value_text != null ? String(newest.value_text) : null;
@@ -4779,9 +4781,19 @@ function DashboardWidgetCardImpl({
           }
         }
 
+        // 2026-07-30 (operator): the row cap ALWAYS applies. "Row selection:
+        // all" (the default) used to bypass the limit entirely, so the table
+        // painted every bucket in the window no matter what the operator set.
+        // The cap runs AFTER sorting — top-N of the chosen order; with no sort
+        // configured it keeps the most recent rows.
+        const displayCap = Math.max(1, Number(cfg.list_limit ?? 8) || 8);
+        const cappedRows = displayRows.length > displayCap
+          ? (sortColRaw !== "" ? displayRows.slice(0, displayCap) : displayRows.slice(-displayCap))
+          : displayRows;
+
         return (
           <div className="dashboard-widget-block">
-            {displayRows.length ? (
+            {cappedRows.length ? (
               <div className="dashboard-table-mini-wrap">
                 <table className="dashboard-table-mini">
                   <thead>
@@ -4792,7 +4804,7 @@ function DashboardWidgetCardImpl({
                     </tr>
                   </thead>
                   <tbody>
-                    {displayRows.map((row, idx) => (
+                    {cappedRows.map((row, idx) => (
                       <tr key={`${row.bucketMs}-${idx}`}>
                         {advancedColumns.map((col) => {
                           const cell = row.cellValues[col.id];

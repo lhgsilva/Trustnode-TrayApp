@@ -3078,6 +3078,9 @@ function LicenseDetailsPanel() {
         // values.
         const j = await getHealth();
         if (alive) setS(j?.license_summary || null);
+        // Operator 2026-08-21: /api/health serves a lock-free snapshot that can
+        // still be "pending" in the first seconds after boot — re-poll shortly.
+        if (alive && j?.health_snapshot?.state === "pending") setTimeout(tick, 2000);
       } catch { /* ignore */ }
     };
     tick();
@@ -3135,6 +3138,7 @@ function LicensePackageBanner() {
       try {
         const j = await getHealth();
         if (alive) setSummary(j?.license_summary || null);
+        if (alive && j?.health_snapshot?.state === "pending") setTimeout(tick, 2000);
       } catch { /* ignore */ }
     };
     tick();
@@ -11180,7 +11184,11 @@ function AppShell() {
       setLicenseGuardLastCheckedUtc(tsNow());
       licenseSyncUnreachableRef.current = false;
       try {
-        const h = await getHealth();
+        let h = await getHealth();
+        for (let i = 0; i < 5 && h?.health_snapshot?.state === "pending"; i += 1) {
+          await new Promise((r) => setTimeout(r, 1500));
+          h = await getHealth();
+        }
         const mods = Array.isArray(h?.license_summary?.modules) ? h.license_summary.modules : [];
         setEdgeLicenseSnapshot({
           ok: true,

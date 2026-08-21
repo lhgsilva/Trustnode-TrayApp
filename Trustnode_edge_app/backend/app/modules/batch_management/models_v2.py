@@ -204,6 +204,18 @@ class BatchActionIn(BaseModel):
     barcode: Optional[str] = None
 
 
+class BatchScanIn(BaseModel):
+    """Body for POST /batches/scan — a keyboard-wedge barcode scan (or a code
+    typed + Load in the dashboard widget). The server resolves what the code
+    means: stop a barcode-gated running batch, start a planned/ready one, or
+    create+start a batch from a published barcode-start definition."""
+    barcode: str
+    # Optional scope: only consider this definition (widget configured for one
+    # line/definition on sites where several barcode definitions coexist).
+    definition_id: Optional[str] = None
+    actor: Optional[str] = None
+
+
 class BatchCommentIn(BaseModel):
     message: str
     actor: Optional[str] = None
@@ -304,6 +316,6 @@ _ns = dict(globals())
 for _m in (
     DefinitionTagIn, TriggerReferenceIn, KpiDefinitionIn, DefinitionVersionConfig,
     BatchDefinitionIn, BatchDefinitionOut, BatchGroupIn, BatchGroupOut,
-    BatchIn, BatchActionIn, BatchCommentIn, BatchOut, BatchListResponse, ExcursionAckIn,
+    BatchIn, BatchActionIn, BatchScanIn, BatchCommentIn, BatchOut, BatchListResponse, ExcursionAckIn,
 ):
     _m.model_rebuild(_types_namespace=_ns)

@@ -31,8 +31,10 @@ import {
   bmv2GroupBatches, bmv2GroupKpis, bmv2ListGroupReports, bmv2GenerateGroupReport, bmv2EmailGroupReport,
   bmv2AnalysisExcursions, bmv2AckExcursion, bmv2AnalysisComparison,
   bmv2NormalizeGatewayTags, bmv2FileUrl, bmv2PreviewDataUrl,
+  bmv2ScanBatch,
   isTransientFetchError,
 } from "../../api";
+import BarcodeScanInput from "./BarcodeScanInput";
 
 /* --------------------------------------------------------------------- */
 /*  shared primitives                                                    */
@@ -740,6 +742,9 @@ export function BatchOverviewV2Page({ canEdit = false, gatewayConfigs = [] }) {
   const [deleting, setDeleting] = useState(null);      // {kind:"batch"|"group", row}
   const [err, setErr] = useState("");
   const [defs, setDefs] = useCachedState("ov:defs", []);
+  const [scanBusy, setScanBusy] = useState(false);
+  const [scanNote, setScanNote] = useState("");
+  const scanNoteTimer = useRef(null);
 
   // Load ALL rows ONCE (no filter params). Filtering is done client-side below so
   // it's instant and typing in the search box never fires a network request.
@@ -761,6 +766,27 @@ export function BatchOverviewV2Page({ canEdit = false, gatewayConfigs = [] }) {
 
   useEffect(() => { if (lic) { load(); bmv2ListDefinitions().then(setDefs).catch(() => {}); } }, [lic, load, setDefs]);
   useEffect(() => { if (!lic) return; const t = setInterval(load, 8000); return () => clearInterval(t); }, [lic, load]);
+
+  // Operator 2026-07-30: keyboard-wedge scan straight from the overview — the
+  // SAME server-side resolver as the dashboard Batch ID widget (stop a
+  // barcode-gated running batch, start a planned/ready one, or create+start
+  // from a published barcode-start definition).
+  const onScan = useCallback(async (code) => {
+    setScanBusy(true);
+    try {
+      const out = await bmv2ScanBatch({ barcode: code });
+      const row = out?.row || {};
+      const label = row.reference || row.id || code;
+      const what = out?.action === "stopped" ? "Stopped" : out?.action === "already_running" ? "Already running:" : "Started";
+      if (scanNoteTimer.current) clearTimeout(scanNoteTimer.current);
+      setScanNote(`${what} ${label}`);
+      scanNoteTimer.current = setTimeout(() => setScanNote(""), 5000);
+      setErr("");
+      await load();
+    } catch (e) { setErr(errText(e)); }
+    finally { setScanBusy(false); }
+  }, [load]);
+  useEffect(() => () => { if (scanNoteTimer.current) clearTimeout(scanNoteTimer.current); }, []);
 
   // client-side filter — instant, no refetch on keystroke
   const filteredBatches = useMemo(() => {
@@ -825,12 +851,22 @@ export function BatchOverviewV2Page({ canEdit = false, gatewayConfigs = [] }) {
       >
         {tab === "batches" && (
           <>
-            <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+            <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap", alignItems: "center" }}>
               <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} style={{ maxWidth: 180 }}>
                 <option value="">All statuses</option>
                 {["planned", "ready", "running", "held", "completed", "aborted", "invalid"].map((s) => <option key={s} value={s}>{s}</option>)}
               </select>
               <input placeholder="Search reference / product…" value={search} onChange={(e) => setSearch(e.target.value)} style={{ maxWidth: 260 }} />
+              {canEdit && (
+                <BarcodeScanInput
+                  onSubmit={onScan}
+                  busy={scanBusy}
+                  buttonLabel="Load"
+                  placeholder="Scan barcode…"
+                  style={{ marginLeft: "auto", minWidth: 240 }}
+                />
+              )}
+              {scanNote && <span style={{ fontSize: 12, color: "var(--muted)" }}>{scanNote}</span>}
             </div>
             <BatchTable rows={filteredBatches} onOpen={setOpenBatch} onDelete={canEdit ? (b) => setDeleting({ kind: "batch", row: b }) : undefined} />
           </>
@@ -1268,11 +1304,20 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
             <button className="btn btn-ghost btn-sm" onClick={onBack}>← Back</button>
             {batch.batch_group_id && <button className="btn btn-secondary btn-sm" onClick={() => onOpenGroup(batch.batch_group_id)}>↑ Group</button>}
             {/* Barcode scan field — shown when start/stop is barcode-gated and
-                that action is currently available. Enter triggers the action. */}
+                that action is currently available. Enter OR a scanner burst
+                triggers the action directly; the field reclaims focus after a
+                few idle seconds so the scanner always lands here. */}
             {canEdit && actions.some(([a]) => needBarcodeFor(a)) && (
-              <input value={barcode} onChange={(e) => setBarcode(e.target.value)} placeholder="Scan barcode…"
-                autoFocus className="input-sm" style={{ maxWidth: 180, fontSize: 12 }}
-                onKeyDown={(e) => { if (e.key === "Enter") { const act = actions.find(([a]) => needBarcodeFor(a)); if (act && barcode.trim()) doAction(act[0], { barcode: barcode.trim() }); } }} />
+              <BarcodeScanInput
+                value={barcode}
+                onValueChange={setBarcode}
+                showButton={false}
+                placeholder="Scan barcode…"
+                inputClassName="input-sm"
+                style={{ maxWidth: 200 }}
+                inputStyle={{ fontSize: 12 }}
+                onSubmit={(code) => { const act = actions.find(([a]) => needBarcodeFor(a)); if (act) doAction(act[0], { barcode: code }); }}
+              />
             )}
             {canEdit && actions.map(([a, label, cls]) => (
               <button key={a} className={`btn ${cls} btn-sm`}
