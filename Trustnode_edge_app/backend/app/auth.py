@@ -81,6 +81,13 @@ def create_access_token(user: Dict[str, Any], expires_seconds: int = 12 * 3600) 
         "iat": now,
         "exp": now + int(expires_seconds),
     }
+    # Operator 2026-08-21: token version -> revocable sessions (Remote Access
+    # "Revoke" bumps it; the auth middleware rejects older tokens).
+    try:
+        from app.state import auth_store as _as_tv
+        payload["tv"] = int(_as_tv.get_token_version(payload["sub"]))
+    except Exception:
+        payload["tv"] = 0
     header = {"alg": "HS256", "typ": "JWT"}
     part1 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
     part2 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))

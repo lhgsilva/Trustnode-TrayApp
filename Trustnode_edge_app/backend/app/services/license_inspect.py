@@ -35,8 +35,46 @@ _cache: dict = {
 }
 
 
+# Operator 2026-08-21 (Phase 3): one vocabulary. MODULE_CATALOG (what the portal
+# pushes) is the authority; the documented `view.*` / `studio.*` names from
+# docs/LICENSE_PACKAGES.md resolve onto it here so a portal that emits either
+# spelling gates the same features.
+_MODULE_ALIASES: dict[str, str] = {
+    "view.lan": "local_web_app",
+    "view.lan_dashboards": "local_web_app",
+    "view.lan_historian": "local_web_app",
+    "view.lan_alarms": "local_web_app",
+    "view.lan_reports": "local_web_app",
+    "view.lan_export": "historian_export",
+    "view.lan_share_links": "view_share_links",
+    "view.web": "cloud_lite_access",
+    "view.web_dashboards": "cloud_lite_access",
+    "view.web_historian": "cloud_lite_access",
+    "view.web_alarms": "cloud_lite_access",
+    "view.web_reports": "cloud_lite_access",
+    "view.web_multi_site": "cloud_client_view",
+    "cloud.database": "cloud_database",
+    "cloud.hosting": "cloud_database",
+    "studio.gateway_configuration": "gateway_configuration",
+    "studio.tags": "tags",
+    "studio.devices": "gateway_configuration",
+    "studio.triggers_limits": "triggers_limits",
+    "studio.dashboards_edit": "custom_dashboards",
+    "studio.users_access": "users_and_access_control",
+    "studio.backup_retention": "database",
+    "studio.system_diagnostics": "database",
+    "studio.batch_management": "batch_management",
+    "studio.remote_admin": "remote_admin_lan",
+    "remote_admin": "remote_admin_lan",
+    "lan_admin": "remote_admin_lan",
+    "gateway_runtime": "gateway_runtime_control",
+    "notifications": "email_notifications",
+}
+
+
 def _normalize_module_key(value: Any) -> str:
-    return str(value or "").strip().lower()
+    key = str(value or "").strip().lower()
+    return _MODULE_ALIASES.get(key, key)
 
 
 def _read_snapshot() -> dict[str, Any]:
@@ -127,8 +165,15 @@ def _evaluate() -> dict[str, Any]:
         for entry in modules_raw:
             if isinstance(entry, dict):
                 key = _normalize_module_key(entry.get("key") or entry.get("module_key"))
-                # If `enabled` is explicitly False, skip. Default True when absent.
-                if key and entry.get("enabled", True):
+                # 2026-08-21: `enabled` absent used to mean ON. For licences
+                # that carry a package_key (the new portal editor) absent now
+                # means OFF — an explicit allow-list. Legacy payloads (no
+                # package_key) keep the permissive reading.
+                if "enabled" in entry:
+                    on = bool(entry.get("enabled"))
+                else:
+                    on = not bool(str(license_obj.get("package_key") or "").strip())
+                if key and on:
                     enabled_modules.add(key)
             else:
                 key = _normalize_module_key(entry)
@@ -215,6 +260,18 @@ def get_limit(key: str) -> int:
 
 def get_limits() -> dict[str, int]:
     return dict(_refresh_if_stale().get("limits") or {})
+
+
+def raw_package_key() -> str:
+    """The package_key exactly as the licence payload carries it ('' when the
+    portal never set one — i.e. a pre-tier licence). get_package_key() defaults
+    to "edge" for the banner, which must NOT be used to detect legacy payloads."""
+    try:
+        s = _read_snapshot() or {}
+        lic = s.get("license") if isinstance(s.get("license"), dict) else {}
+        return str(lic.get("package_key") or "").strip().lower()
+    except Exception:
+        return ""
 
 
 def get_package_key() -> str:

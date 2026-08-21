@@ -185,3 +185,28 @@ old license:
    and matching limits. Verify the edge banner shows the new fields.
 3. Reissue remaining customers gradually at renewal time. No rush —
    legacy payloads work indefinitely.
+
+---
+
+## Addendum 2026-08-21 — tier names and keys actually enforced by the edge
+
+The edge evaluates `MODULE_CATALOG` keys (see the rewritten `LICENSE_PACKAGES.md`); the `studio.*` / `view.*` names above are accepted as aliases only.
+
+**Package dropdown values (owner decision 2026-08-21):**
+
+- TrustNode Edge / `edge`
+- TrustNode Local View / `local_view`
+- TrustNode Cloud View / `cloud_view`
+- TrustNode Operations / `operations`
+- TrustNode Enterprise / `enterprise`
+
+**Two new checkboxes** (group "Cloud / Web", default OFF):
+
+- `remote_admin_lan` — "TrustNode Edge over LAN (remote admin/engineer access)"
+- `view_share_links` — "Local View share links (no-login tokens)"
+
+**Rules the edge applies to payloads that carry a `package_key`:** a module entry without an explicit `enabled` is OFF; `local_view` must not tick `remote_admin_lan` nor any admin key; `cloud_view` must not tick `gateway_runtime_control`, `lan_access`, `local_web_app`, `remote_admin_lan`; `enterprise` limits are all 0 (unlimited).
+
+**Mirror columns:** the edge stores `package_key` and `limits_json` on its `cp_licenses` mirror row (`control_plane_store.update_license_tier`); add the same two columns to the portal database so tiers can be reported in SQL.
+
+**Refresh:** the edge re-pulls the licence when its last verification is older than 24 h; adding keys to the catalog no longer forces every edge to re-sync.

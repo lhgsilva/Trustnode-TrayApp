@@ -61,8 +61,10 @@ LOG = os.path.expanduser(r"~\AppData\Roaming\trustnode-edge-desktop\backend.log"
 # boot regression that hit users on every launch can never ship again.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import boot_log_check as _boot  # noqa: E402
+import validate_surfaces as _surf  # noqa: E402  (2026-08-21: LAN surfaces + access policy)
 BOOT_MAX_HEALTH_MS = int(os.environ.get("VAL_BOOT_MAX_HEALTH_MS", "15000"))
 boot_metrics: dict = {}
+surface_result: dict = {"ok": None, "lines": [], "metrics": {}}
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation_out")
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -589,6 +591,12 @@ def build_summary(t0: float, final: bool) -> str:
     for ln in _boot.summary_lines(boot_metrics):
         A(ln)
 
+    # surfaces + access policy (2026-08-21): bundles served, static guard,
+    # RBAC, licence gates, lockout, revocation — against the running build
+    A("\n[SURFACES / ACCESS POLICY]")
+    for ln in (surface_result.get("lines") or ["  (not run)"]):
+        A(ln)
+
     # ---- retention --------------------------------------------------------
     ret_ok = True
     ret_note = ""
@@ -638,6 +646,10 @@ def build_summary(t0: float, final: bool) -> str:
     for ln in b_lines:
         A(ln)
     ok &= b_ok
+    _s_ok = surface_result.get("ok")
+    _sm = surface_result.get("metrics") or {}
+    A(f"  surfaces + access policy   : {'PASS' if _s_ok else 'FAIL'} ({_sm.get('checks', 0) - _sm.get('failed', 0)}/{_sm.get('checks', 0)} checks)")
+    ok &= bool(_s_ok)
     boot_fail_n = cats.get("boot_fail", 0)
     A(f"  zero boot failures in run : {'PASS' if boot_fail_n == 0 else f'FAIL ({boot_fail_n})'}")
     ok &= boot_fail_n == 0
@@ -686,6 +698,13 @@ async def main() -> int:
     emit({"t": "boot", **{k: v for k, v in boot_metrics.items() if k != "integrity"}})
     _b_ok, _b_lines = _boot.verdict(boot_metrics, BOOT_MAX_HEALTH_MS)
     print("[BOOT HEALTH] " + ("PASS" if _b_ok else "FAIL") + "\n" + "\n".join(_b_lines), flush=True)
+    try:
+        _s_ok, _s_lines, _s_metrics = await asyncio.to_thread(_surf.run, True)
+    except Exception as exc:
+        _s_ok, _s_lines, _s_metrics = False, [f"  surfaces check crashed: {exc!r}"], {}
+    surface_result.update(ok=_s_ok, lines=_s_lines, metrics=_s_metrics)
+    emit({"t": "surfaces", "ok": _s_ok, **{k: v for k, v in (_s_metrics or {}).items() if k != "licensed"}})
+    print("[SURFACES] " + ("PASS" if _s_ok else "FAIL") + "\n" + "\n".join(_s_lines), flush=True)
     print(f"validation started {datetime.now(timezone.utc).isoformat()[:19]}Z "
           f"for {DURATION_S/3600:.1f}h — gateway {GW}", flush=True)
     get_token()

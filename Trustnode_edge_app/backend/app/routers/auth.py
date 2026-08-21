@@ -3,7 +3,8 @@ import time
 from collections import defaultdict
 from typing import Any, Dict
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Body, HTTPException, Request, Response
+from app.services import access_policy as _access
 from pydantic import BaseModel
 
 from app.auth import create_access_token, decode_access_token, verify_password
@@ -85,6 +86,27 @@ _FULL_PERMISSIONS: Dict[str, bool] = {
 }
 
 
+def _client_is_remote(host: str) -> bool:
+    try:
+        return not _access.is_loopback_host(host)
+    except Exception:
+        return False
+
+
+def _password_policy_error(password: str, role: str) -> str:
+    """Operator 2026-08-21: admin/engineer >= 12 chars with letters AND digits;
+    everyone else >= 8 chars. Returns '' when acceptable."""
+    pw = str(password or "")
+    r = str(role or "").strip().lower()
+    if r in ("admin", "engineer", "super"):
+        if len(pw) < 12 or not any(c.isalpha() for c in pw) or not any(c.isdigit() for c in pw):
+            return "Password policy: admin/engineer passwords need at least 12 characters with letters and digits"
+        return ""
+    if len(pw) < 8:
+        return "Password policy: at least 8 characters"
+    return ""
+
+
 def _master_admin_credentials() -> tuple[str, str]:
     user = str(__import__("os").environ.get("TRUSTNODE_MASTER_ADMIN_USER", "admin") or "admin").strip() or "admin"
     pwd = str(__import__("os").environ.get("TRUSTNODE_MASTER_ADMIN_PASSWORD", "admin") or "admin")
@@ -139,7 +161,7 @@ def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.post("/login")
-def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
+def login(payload: LoginRequest, request: Request, response: Response) -> Dict[str, Any]:
     """Operator 2026-06-18 — clean auth path.
 
     Hot path uses AuthStore EXCLUSIVELY: a dedicated SQLite file with no
@@ -168,12 +190,37 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
     if not username:
         raise HTTPException(status_code=400, detail="Username required")
 
+    # Operator 2026-08-21 (Remote Access hardening): per-account lockout
+    # (5 failures / 15 min -> 15 min lock) in addition to the per-IP limiter.
+    _locked_until = auth_store.locked_until(username)
+    if _locked_until:
+        try:
+            auth_store.record_login(username, ok=False, remote_ip=client_host, detail="locked_out")
+        except Exception:
+            pass
+        raise HTTPException(status_code=423, detail=f"Account temporarily locked after repeated failures. Try again after {_locked_until} UTC.")
+    _remote = _client_is_remote(client_host)
+
     # 1. Master-admin break-glass account. Works on every install, even
     #    a brand-new one where AuthStore is empty. ENV-overridable.
     master_user, master_pass = _master_admin_credentials()
     if username == master_user and verify_password(password, master_pass):
+        # 2026-08-21: the break-glass account with its DEFAULT password never
+        # works from the network — only from the edge desktop itself.
+        _master_default = not bool(str(__import__("os").environ.get("TRUSTNODE_MASTER_ADMIN_PASSWORD", "") or "").strip())
+        if _remote and _master_default:
+            try:
+                auth_store.record_login(username, ok=False, remote_ip=client_host, detail="master_default_remote_blocked")
+            except Exception:
+                pass
+            raise HTTPException(status_code=403, detail="The master account with its default password cannot be used from the network. Set TRUSTNODE_MASTER_ADMIN_PASSWORD or sign in with a named admin account.")
         user_public = _public_user(_master_admin_user_row())
-        token = create_access_token(user_public)
+        _ttl = 4 * 3600 if _remote else 12 * 3600
+        token = create_access_token(user_public, expires_seconds=_ttl)
+        try:
+            response.set_cookie(_access.SESSION_COOKIE, token, **_access.cookie_kwargs(request, _ttl))
+        except Exception:
+            pass
         auth_store.record_login(username, ok=True, remote_ip=client_host, detail="master")
         return {"ok": True, "token": token, "user": user_public}
 
@@ -256,6 +303,9 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
             auth_store.record_login(username, ok=False, remote_ip=client_host, detail="invalid_credentials")
         except Exception:
             pass
+        _until = auth_store.record_failed_attempt(username)
+        if _until:
+            raise HTTPException(status_code=423, detail=f"Account temporarily locked after repeated failures. Try again after {_until} UTC.")
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     user_public = _public_user(hit)
@@ -278,14 +328,31 @@ def login(payload: LoginRequest, request: Request) -> Dict[str, Any]:
         raise
     except Exception:
         pass
-    token = create_access_token(user_public)
+    # Operator 2026-08-21: shorter sessions for remote (LAN) logins; the
+    # HttpOnly cookie lets browser-native loads of the LAN surfaces
+    # (/trustnode/*/app/) pass the static-bundle guard.
+    _ttl = 4 * 3600 if _remote else 12 * 3600
+    token = create_access_token(user_public, expires_seconds=_ttl)
+    try:
+        auth_store.clear_failed_attempts(user_public["username"])
+    except Exception:
+        pass
+    try:
+        response.set_cookie(_access.SESSION_COOKIE, token, **_access.cookie_kwargs(request, _ttl))
+    except Exception:
+        pass
+    if _remote:
+        _access.audit("login.remote", outcome="ok", request=request,
+                      payload={"sub": user_public.get("username"), "role": user_public.get("role"),
+                               "tenant_id": user_public.get("tenant_id")}, details={})
     try:
         auth_store.record_login(user_public["username"], ok=True, remote_ip=client_host)
     except Exception:
         pass
     try:
         from app.services import view_sessions
-        view_sessions.mark_active(user_public.get("username", ""), str(user_public.get("role") or ""))
+        view_sessions.mark_active(user_public.get("username", ""), str(user_public.get("role") or ""),
+                                  ip=client_host, surface="login")
     except Exception:
         pass
     return {"ok": True, "token": token, "user": user_public}
@@ -341,6 +408,9 @@ def change_password(payload: ChangePasswordRequest, request: Request) -> Dict[st
         raise HTTPException(status_code=401, detail="No subject in token")
     if not str(payload.new_password or "").strip():
         raise HTTPException(status_code=400, detail="new_password_required")
+    _policy_err = _password_policy_error(str(payload.new_password or ""), str(jwt_payload.get("role") or ""))
+    if _policy_err:
+        raise HTTPException(status_code=400, detail=_policy_err)
 
     # Verify the current password through the same path that issued the
     # token. Force-change-password sessions still know their current
@@ -536,6 +606,13 @@ def reset_password(payload: _ResetPasswordPayload, request: Request) -> Dict[str
         except Exception:
             pass
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+    try:
+        _role_reset = str((auth_store.get_user(username) or {}).get("role") or "")
+    except Exception:
+        _role_reset = ""
+    _policy_err = _password_policy_error(new_password, _role_reset)
+    if _policy_err:
+        raise HTTPException(status_code=400, detail=_policy_err)
     # Hash with the same scheme app_store uses.
     try:
         new_hash = app_store._hash_password_if_needed(new_password)
@@ -556,3 +633,63 @@ def reset_password(payload: _ResetPasswordPayload, request: Request) -> Dict[str
     if not ok:
         raise HTTPException(status_code=500, detail="Could not update password")
     return {"ok": True, "message": "Password updated. You can now sign in."}
+
+
+# ---------------------------------------------------------------------------
+# Operator 2026-08-21 — Remote Access session endpoints
+# ---------------------------------------------------------------------------
+@router.post("/session-cookie")
+def session_cookie(request: Request, response: Response) -> Dict[str, Any]:
+    """Set the HttpOnly session cookie for an already-issued Bearer token
+    (the LAN login page calls this so browser-native loads of the surface
+    bundles pass the static guard)."""
+    auth = request.headers.get("Authorization", "")
+    token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+    try:
+        body = decode_access_token(token)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}") from exc
+    import time as _t
+    ttl = max(60, int(body.get("exp", 0)) - int(_t.time()))
+    response.set_cookie(_access.SESSION_COOKIE, token, **_access.cookie_kwargs(request, ttl))
+    return {"ok": True}
+
+
+@router.post("/logout")
+def logout(request: Request, response: Response) -> Dict[str, Any]:
+    """Clear the session cookie and free the live-session slot. Works with an
+    expired token too (public path)."""
+    auth = request.headers.get("Authorization", "")
+    token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        token = str(request.cookies.get(_access.SESSION_COOKIE) or "")
+    username = ""
+    if token:
+        try:
+            username = str(decode_access_token(token).get("sub") or "")
+        except Exception:
+            username = ""
+    try:
+        from app.services import view_sessions
+        if username:
+            view_sessions.forget(username)
+    except Exception:
+        pass
+    response.delete_cookie(_access.SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@router.post("/unlock")
+def unlock_account(request: Request, body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    """Admin: clear a lockout for a user."""
+    payload = getattr(request.state, "user_payload", None) or {}
+    if str(payload.get("role") or "").lower() not in ("admin", "super"):
+        raise HTTPException(status_code=403, detail="Admin role required")
+    username = str(body.get("username") or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="username required")
+    auth_store.clear_failed_attempts(username)
+    _access.audit("account.unlock", outcome="ok", request=request, payload=payload, details={"unlocked_user": username})
+    return {"ok": True, "username": username}

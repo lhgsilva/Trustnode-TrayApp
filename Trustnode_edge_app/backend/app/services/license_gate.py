@@ -77,6 +77,16 @@ def _evaluate() -> Tuple[bool, str]:
         return True, "ok"  # the activation flow will surface a clearer error
 
     # Expiry check.
+    # Operator 2026-08-21 (plan §3.3 item 4): a pure View licence (package
+    # local_view / cloud_view) never runs the collection engine's writes.
+    try:
+        from app.services import license_inspect as _li
+        _pkg = str(_li.get_package_key() or "").strip().lower()
+        if _pkg in {"local_view", "cloud_view", "view_lan", "view_cloud", "view.lan_only", "view.web_only"} \
+                and not _li.has_module("gateway_runtime_control"):
+            return False, "view_only_license"
+    except Exception:
+        pass
     end_utc = str(license_row.get("end_utc") or license_row.get("expires_utc") or "")
     if end_utc and _is_expired(end_utc):
         # An active trial grant overrides expiry until trial's own expiry.

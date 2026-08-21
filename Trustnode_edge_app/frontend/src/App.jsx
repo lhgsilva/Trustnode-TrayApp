@@ -14,9 +14,13 @@ import { BatchOverviewV2Page, BatchDefinitionsV2Page, BatchAnalysisV2Page } from
 // Developer-admin: deployment endpoints (single source of truth for re-hosting).
 import InfrastructureEndpoints from "./components/ControlPlane/InfrastructureEndpoints";
 import RetentionPanel from "./components/Retention/RetentionPanel";
+// Remote Access page (plan 2026-08-21 §3.5) — replaces the LAN Sharing card.
+import { RemoteAccessPage } from "./components/RemoteAccess/RemoteAccessPage";
 import {
   getHealth,
   getBootProbe,
+  getRuntimeSurface,
+  isHostedWebClientRuntime,
   postBootProbe,
   setForceSqliteReads,
   getBackendTarget,
@@ -211,20 +215,23 @@ function isPlcUnreachableError(msg) {
 
 function getUiStorageScope() {
   try {
-    const browserProtocol = String(window.location.protocol || "").toLowerCase();
-    const browserHost = String(window.location.hostname || "").toLowerCase();
-    const isLocalHost = browserHost === "localhost" || browserHost === "127.0.0.1" || browserHost === "::1";
-    const isElectronRuntime = /electron/i.test(String(window.navigator?.userAgent || ""));
-    const hasDesktopBackendOverride = Boolean(new URLSearchParams(window.location.search).get("backendUrl"));
-    const isHostedWebClient =
-      !isElectronRuntime &&
-      !hasDesktopBackendOverride &&
-      (browserProtocol === "https:" || browserProtocol === "http:") &&
-      !isLocalHost;
-    return isHostedWebClient ? "cloud" : "local";
+    // Single predicate shared with api.js (getRuntimeSurface): only the
+    // hosted cloud portal gets the "cloud" storage scope. Desktop AND the
+    // LAN-served surfaces (/trustnode/*/app/, same-origin edge) stay "local".
+    return isHostedWebClientRuntime() ? "cloud" : "local";
   } catch {
     return "local";
   }
+}
+
+// Desktop-only affordances (Electron preload bridges such as
+// window.trustnodeDialogs / window.trustnodeWorkspace). On browser-served
+// surfaces (LAN / cloud) we show this note instead of alert()/silent no-ops
+// (plan 2026-08-21 §3.5). Returns true when the bridge is missing AND we are
+// not on the desktop (the dev server keeps its legacy fallbacks).
+const DESKTOP_ONLY_NOTE = "Available on the edge desktop app";
+function isDesktopBridgeMissing(bridge) {
+  return !bridge && getRuntimeSurface() !== "desktop";
 }
 
 const UI_STORAGE_SCOPE = getUiStorageScope();
@@ -301,10 +308,12 @@ const NAV_SECTIONS = [
   // OPC UA + MQTT services the edge exposes to LAN clients.
   // Operator 2026-06-18: LAN Sharing moved IN here as a sub-page so
   // the admin can see endpoints + the toggle in one place.
+  // 2026-08-21: renamed "Remote Access" (page key stays "lan_sharing" so
+  // MODULE_KEY_BY_PAGE / licence gating keep working — see pageId()).
   {
     id: "connections",
     title: "Connections",
-    items: ["Connections Overview", "LAN Sharing", "OPC UA", "MQTT"]
+    items: ["Connections Overview", "Remote Access", "OPC UA", "MQTT"]
   },
   {
     id: "administration",
@@ -329,6 +338,9 @@ function pageId(label) {
   if (label.toLowerCase() === "batch overview") return "batch_overview";
   if (label.toLowerCase() === "batch definitions") return "batch_definitions";
   if (label.toLowerCase() === "batch analysis") return "batch_analysis";
+  // "Remote Access" keeps the historical page key so MODULE_KEY_BY_PAGE,
+  // canOpenPage and the render switch are untouched.
+  if (label.toLowerCase() === "remote access") return "lan_sharing";
   return label.toLowerCase().replace(/\s+/g, "_");
 }
 
@@ -368,7 +380,7 @@ function pageTitle(page) {
   if (page === "connections_overview") return "Connections Overview";
   if (page === "opc_ua") return "OPC UA";
   if (page === "mqtt") return "MQTT";
-  if (page === "lan_sharing") return "LAN Sharing";
+  if (page === "lan_sharing") return "Remote Access";
   if (page === "directories") return "Directories";
   return page.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
 }
@@ -1954,10 +1966,36 @@ const PERMISSION_LABELS = {
   email_and_notifications: "Email and Notifications",
   scheduled_reports: "Scheduled Reports",
   users_and_access_control: "Users and Access",
-  access_full: "Full app (LAN web)",
-  access_lite: "Lite (LAN web — read-only)",
-  access_client: "Client View (LAN web)",
+  access_full: "TrustNode Edge (full app over LAN)",
+  access_client: "TrustNode Local View (read-only over LAN)",
+  access_lite: "Lite (legacy read-only)",
 };
+
+// Owner-approved product names (plan 2026-08-21 §0/§7). Maps package_key
+// (edge / local_view / cloud_view / operations / enterprise) and the legacy
+// view keys to the commercial names printed by the package banner, the
+// licence panel and the Remote Access page.
+const PRODUCT_NAME_BY_KEY = {
+  edge: "TrustNode Edge",
+  local_view: "TrustNode Local View",
+  cloud_view: "TrustNode Cloud View",
+  operations: "TrustNode Operations",
+  enterprise: "TrustNode Enterprise",
+  // legacy / alias keys
+  view_lan: "TrustNode Local View",
+  view_cloud: "TrustNode Cloud View",
+  lite: "TrustNode Local View",
+  client_view: "TrustNode Local View",
+  local_web_app: "TrustNode Local View",
+  cloud_lite_access: "TrustNode Cloud View",
+  cloud_client_view: "TrustNode Cloud View",
+};
+function productName(key) {
+  const k = String(key || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (!k) return PRODUCT_NAME_BY_KEY.edge;
+  if (PRODUCT_NAME_BY_KEY[k]) return PRODUCT_NAME_BY_KEY[k];
+  return `TrustNode ${k.charAt(0).toUpperCase()}${k.slice(1).replace(/_/g, " ")}`;
+}
 
 const PERMISSION_GROUPS = [
   // Operator-facing module visibility — these toggles control which
@@ -1969,12 +2007,12 @@ const PERMISSION_GROUPS = [
   { title: "Notifications", items: ["alarms", "email_and_notifications"] },
   { title: "Administration", items: ["interface", "database", "backup_and_retention", "control_plane", "users_and_access_control", "data_log"] },
   // Operator 2026-06-18: per-user LAN-served UI access.
-  // - access_full   → /trustnode/full/app/   (FULL admin/editor React)
-  // - access_lite   → /trustnode/lite/app/   (SLIM cloud-style read-only Lite)
-  // - access_client → /trustnode/client/app/ (Client View React clientview)
+  // - access_full   → /trustnode/full/app/   (TrustNode Edge — full admin/editor React)
+  // - access_client → /trustnode/client/app/ (TrustNode Local View — read-only React)
+  // - access_lite   → /trustnode/lite/app/   (legacy vanilla Lite, frozen)
   // Admin generates a per-user view-link token; tray copy-URL picks the
   // first allowed mode (Full first if it's set; else Lite; else Client).
-  { title: "LAN Web Access", items: ["access_full", "access_lite", "access_client"] },
+  { title: "LAN Web Access", items: ["access_full", "access_client", "access_lite"] },
 ];
 
 const CLIENT_MODULE_DEFS = [
@@ -2636,9 +2674,9 @@ function UserClientViewCell({ row, tenantScope, edgeId, isAdminViewer }) {
         <span style={{ color: "#777", fontSize: 11 }}>no access flags</span>
       ) : (
         <>
-          {variantBtn("full", "Full",   canFull,   `Copy /trustnode/full/?token=… for ${userId}`)}
-          {variantBtn("lite", "Lite",   canLite,   `Copy /trustnode/lite/?token=… for ${userId}`)}
-          {variantBtn("client","Client",canClient, `Copy /trustnode/client/?token=… for ${userId}`)}
+          {variantBtn("full", "Edge",   canFull,   `Copy the TrustNode Edge link (/trustnode/full/?token=…) for ${userId}`)}
+          {variantBtn("client","Local View",canClient, `Copy the TrustNode Local View link (/trustnode/client/?token=…) for ${userId}`)}
+          {variantBtn("lite", "Lite",   canLite,   `Copy the legacy Lite link (/trustnode/lite/?token=…) for ${userId}`)}
         </>
       )}
       <button
@@ -2861,81 +2899,12 @@ function MqttSettingsPage({ canEdit }) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// LAN Sharing sub-page under Connections (operator 2026-06-18).
-// Admin-only. Reuses /api/lan-sharing/* endpoints. Shows the toggle
-// + endpoints list (one row per IP/URL pair: Lite / Full / Client).
+// Remote Access sub-page under Connections (was "LAN Sharing", operator
+// 2026-06-18; rebuilt 2026-08-21 per the LAN-access plan §3.5). Lives in
+// ./components/RemoteAccess/RemoteAccessPage.jsx — all calls go through
+// api.js (Bearer + getControlApiBase), URLs per IP/hostname with Copy + QR,
+// HTTPS posture, certificate download, licence strip, remote sessions.
 // ──────────────────────────────────────────────────────────────────────
-function LanSharingPage({ canEdit }) {
-  const [state, setState] = useState({
-    enabled: false, running: false, port: 0, lan_port: 0,
-    ips: [], lite_urls: [], full_urls: [], last_error: "",
-  });
-  const [busy, setBusy] = useState(false);
-  const refresh = useCallback(async () => {
-    try {
-      const res = await fetch("/api/lan-sharing/status", { method: "GET" });
-      if (res.ok) {
-        const body = await res.json();
-        setState((s) => ({ ...s, ...body }));
-      }
-    } catch (_) {}
-  }, []);
-  useEffect(() => { refresh(); const t = setInterval(refresh, 3000); return () => clearInterval(t); }, [refresh]);
-  const onToggle = async (enable) => {
-    setBusy(true);
-    try {
-      const action = enable ? "enable" : "disable";
-      await fetch(`/api/lan-sharing/${action}`, { method: "POST" });
-      await refresh();
-    } finally { setBusy(false); }
-  };
-  const rows = [];
-  for (let i = 0; i < (state.ips || []).length; i++) {
-    rows.push({
-      ip: state.ips[i],
-      lite: state.lite_urls?.[i] || "",
-      full: state.full_urls?.[i] || "",
-    });
-  }
-  return (
-    <section className="card">
-      <h3 style={{ marginTop: 0 }}>LAN Sharing</h3>
-      <p className="muted">When ON, the local edge backend binds to <code>0.0.0.0</code> so users on the same network can open Lite / Client View / Full URLs from their browser.</p>
-      <div className="row" style={{ alignItems: "center", gap: 10 }}>
-        <span className={`status-pill ${state.running ? "status-online" : "status-offline"}`}>
-          {state.running ? `Running on port ${state.lan_port || state.port}` : (state.enabled ? "Bind failed" : "Stopped")}
-        </span>
-        {!state.running && canEdit ? <button className="btn btn-primary" disabled={busy} onClick={() => onToggle(true)}>Turn ON</button> : null}
-        {state.running && canEdit  ? <button className="btn btn-danger"  disabled={busy} onClick={() => onToggle(false)}>Turn OFF</button> : null}
-      </div>
-      {state.last_error ? <div className="lock-note" style={{ marginTop: 10 }}>Last error: {state.last_error}</div> : null}
-
-      <h4 style={{ marginTop: 22 }}>Endpoints</h4>
-      {rows.length === 0 ? (
-        <div className="muted">No LAN endpoints active. Turn ON LAN Sharing to expose URLs.</div>
-      ) : (
-        <div className="table-scroll">
-          <div className="table directories-table">
-            <div className="thead">
-              <span>IP</span><span>Lite URL</span><span>Full URL</span><span>Actions</span>
-            </div>
-            {rows.map((r, idx) => (
-              <div key={`lan-${idx}`} className="trow">
-                <span>{r.ip}</span>
-                <span title={r.lite} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.lite}</span>
-                <span title={r.full} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.full}</span>
-                <span className="row-actions">
-                  <button className="btn btn-secondary btn-sm" title="Copy Lite URL" onClick={() => navigator.clipboard?.writeText(r.lite)}>Copy Lite</button>
-                  <button className="btn btn-secondary btn-sm" title="Copy Full URL" onClick={() => navigator.clipboard?.writeText(r.full)}>Copy Full</button>
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
 
 // ──────────────────────────────────────────────────────────────────────
 // Directories sub-page under Settings (operator 2026-06-18).
@@ -2956,9 +2925,14 @@ function DirectoriesPage({ canEdit }) {
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
 
+  // Browser-served surfaces (LAN / cloud) have no Electron preload bridge:
+  // inline muted note instead of alert() (plan 2026-08-21 §3.5).
+  const folderPickerAvailable = Boolean(window?.trustnodeDialogs?.pickFolder);
+  const folderPickerDesktopOnly = isDesktopBridgeMissing(window?.trustnodeDialogs?.pickFolder);
+  const [pickerNote, setPickerNote] = useState("");
   const onPick = async (key) => {
-    if (!window?.trustnodeDialogs?.pickFolder) {
-      window.alert("Folder picker is only available in the desktop tray app. Type the path manually instead.");
+    if (!folderPickerAvailable) {
+      setPickerNote(`Folder picker: ${DESKTOP_ONLY_NOTE.toLowerCase()}. Type the path manually instead.`);
       return;
     }
     const picked = await window.trustnodeDialogs.pickFolder({ title: "Pick folder" });
@@ -3005,6 +2979,11 @@ function DirectoriesPage({ canEdit }) {
     <section className="card">
       <h3 style={{ marginTop: 0 }}>Directories</h3>
       <p className="muted">Pick where the app saves generated files. Defaults work for most installs; override per row if you need a shared network folder or a customer-specific path.</p>
+      {folderPickerDesktopOnly || pickerNote ? (
+        <div className="muted" style={{ fontSize: 12 }}>
+          {pickerNote || `Folder picker and "Open": ${DESKTOP_ONLY_NOTE.toLowerCase()}. Type paths manually here.`}
+        </div>
+      ) : null}
       <div className="table-scroll" style={{ marginTop: 12 }}>
         <div className="table directories-table">
           <div className="thead">
@@ -3042,7 +3021,7 @@ function DirectoriesPage({ canEdit }) {
                 <span>{statusBadge}</span>
                 <span className="row-actions" style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                   <button className="btn btn-secondary btn-sm" onClick={() => onOpen(r.key)} title="Open in file manager">Open</button>
-                  <button className="btn btn-secondary btn-sm" onClick={() => onPick(r.key)} disabled={!canEdit} title="Pick a folder">Pick…</button>
+                  <button className="btn btn-secondary btn-sm" onClick={() => onPick(r.key)} disabled={!canEdit || folderPickerDesktopOnly} title={folderPickerDesktopOnly ? DESKTOP_ONLY_NOTE : "Pick a folder"}>Pick…</button>
                   {r.is_overridden ? (
                     <button className="btn btn-danger btn-sm" onClick={() => onReset(r.key)} disabled={!canEdit} title="Revert to default">Reset</button>
                   ) : null}
@@ -3110,7 +3089,7 @@ function LicenseDetailsPanel() {
   return (
     <div style={{ marginTop: 12, padding: 12, border: "1px solid var(--line)", borderRadius: 6 }}>
       <div style={{ fontWeight: 600, marginBottom: 8 }}>
-        Package: <span style={{ textTransform: "capitalize" }}>{s.package_key || "edge"}</span>
+        Package: <span>{productName(s.package_key || "edge")}</span>
       </div>
       {row("Tags configured", usage.tags, limits.max_tags)}
       {row("Gateways configured", usage.gateways, limits.max_gateways_per_edge)}
@@ -3155,8 +3134,7 @@ function LicensePackageBanner() {
     if (!c) return `${u} (unlimited)`;
     return `${u}/${c}`;
   };
-  const pkg = String(summary.package_key || "edge");
-  const pkgLabel = pkg.charAt(0).toUpperCase() + pkg.slice(1);
+  const pkgLabel = productName(summary.package_key || "edge");
   return (
     <div className="license-banner license-banner-ok" style={{ fontSize: 12 }}>
       <span className="license-banner-pill">PACKAGE</span>
@@ -3454,16 +3432,12 @@ function AppShell() {
       body.classList.remove("client-view-mobile");
     };
   }, [isClientView, useMobileLayout]);
-  const browserProtocol = String(window.location.protocol || "").toLowerCase();
-  const browserHost = String(window.location.hostname || "").toLowerCase();
-  const isLocalHost = browserHost === "localhost" || browserHost === "127.0.0.1" || browserHost === "::1";
   const isElectronRuntime = /electron/i.test(String(window.navigator?.userAgent || ""));
-  const hasDesktopBackendOverride = Boolean(new URLSearchParams(window.location.search).get("backendUrl"));
-  const isHostedWebClient =
-    !isElectronRuntime &&
-    !hasDesktopBackendOverride &&
-    (browserProtocol === "https:" || browserProtocol === "http:") &&
-    !isLocalHost;
+  // Single source of truth for "where does this bundle run" lives in api.js
+  // (getRuntimeSurface → desktop | lan_full | lan_client | lan_lite | cloud).
+  // A LAN-served full app (/trustnode/full/app/) is the edge itself with a
+  // same-origin API, so it is NOT the hosted cloud portal (plan §2.5 #6).
+  const isHostedWebClient = isHostedWebClientRuntime();
   const getFullscreenState = () => {
     const doc = document;
     return Boolean(doc.fullscreenElement || doc.webkitFullscreenElement);
@@ -5503,7 +5477,12 @@ function AppShell() {
     try {
       const protocol = String(window.location?.protocol || "");
       if (protocol === "file:") return "assets/trustenode-004.png";
-      return `${String(window.location?.origin || "").replace(/\/+$/, "")}/assets/trustenode-004.png`;
+      // Resolve against the served base (document.baseURI), NOT the origin:
+      // under the LAN mount (/trustnode/full/app/) the asset lives at
+      // <mount>/assets/… and `${origin}/assets/…` 404s (plan §2.5 #4). Vite
+      // builds with base "./", so the relative URL is also correct on the
+      // cloud portal and the dev server (both served from the root).
+      return new URL("assets/trustenode-004.png", document.baseURI).toString();
     } catch {
       const base = String(import.meta?.env?.BASE_URL || "/");
       const normalized = base.endsWith("/") ? base : `${base}/`;
@@ -10614,16 +10593,19 @@ function AppShell() {
     (moduleKey) => {
       const key = String(moduleKey || "").trim().toLowerCase();
       if (!key) return true;
-      // Same exemptions as isPageLicensed below: client portal users have
-      // cloud-backend gating; tampered license locks everything.
-      if (isClientView) return true;
+      // Client view (2026-08-21): the backend stays authoritative for DATA,
+      // but the UI must not blanket-allow every module. Only when no
+      // licence snapshot is available at all (unknown — e.g. the hosted
+      // portal, where the local compliance check never runs) do we fall
+      // back to "allowed"; otherwise evaluate the modules normally.
+      if (isClientView && !edgeLicenseSnapshot) return true;
       if (!edgeLicenseSnapshot?.ok) return false;
       if (licenseTampered) return false;
       if (grandfatheredModules.has(key)) return true;
       if (!licensedModuleKeys.length) return false;
       return licensedModuleKeys.includes(key);
     },
-    [isClientView, edgeLicenseSnapshot?.ok, licensedModuleKeys, grandfatheredModules, licenseTampered]
+    [isClientView, edgeLicenseSnapshot, licensedModuleKeys, grandfatheredModules, licenseTampered]
   );
 
   const isPageLicensed = useCallback(
@@ -11194,7 +11176,10 @@ function AppShell() {
         setEdgeLicenseSnapshot({
           ok: true,
           license: { status: "active", end_utc: null, modules: mods.map((k) => ({ module_key: String(k) })) },
-          grandfathered_modules: mods.map((k) => String(k)),
+          // 2026-08-21: never seed grandfathered modules from the bypass —
+          // the licence module list above is what gates the menus, exactly
+          // like the packaged app; grandfathering is a backend decision.
+          grandfathered_modules: [],
           dev_bypass: true,
         });
       } catch (_) { /* health unreachable — menus stay on whatever's cached */ }
@@ -19001,7 +18986,7 @@ const getGatewayHealth = (gateway) => {
     const uname = String(row.username);
     withConfirm(
       "Reset Password",
-      `Issue a temporary password for '${uname}'? The user must change it on their next login (works on the edge app and the Lite cloud app).`,
+      `Issue a temporary password for '${uname}'? The user must change it on their next login (works on the edge app and TrustNode Cloud View).`,
       async () => {
         setCpBusy(true);
         try {
@@ -22760,6 +22745,11 @@ const getGatewayHealth = (gateway) => {
                   license activation. Use these tools to back it up
                   before updates or to migrate to another machine.
                 </p>
+                {isDesktopBridgeMissing(window?.trustnodeWorkspace) ? (
+                  <div className="muted" style={{ marginBottom: 10, fontSize: 12 }}>
+                    Workspace detection and reset: {DESKTOP_ONLY_NOTE.toLowerCase()}. Export and import still work from here.
+                  </div>
+                ) : null}
                 {workspaceInfo.current ? (
                   <div className="info-note" style={{ marginBottom: 10 }}>
                     <strong>Active workspace:</strong> <code>{workspaceInfo.current}</code>
@@ -23540,7 +23530,11 @@ const getGatewayHealth = (gateway) => {
             <MqttSettingsPage canEdit={isPageLicensed("mqtt") && String(currentUser?.role || "").toLowerCase() === "admin"} />
           ) : null}
           {activePage === "lan_sharing" ? (
-            <LanSharingPage canEdit={isPageLicensed("connections_overview") && String(currentUser?.role || "").toLowerCase() === "admin"} />
+            <RemoteAccessPage
+              canEdit={isPageLicensed("connections_overview") && String(currentUser?.role || "").toLowerCase() === "admin"}
+              role={currentUser?.role}
+              onOpenUsers={() => handleNavClick("users_and_access_control")}
+            />
           ) : null}
           {activePage === "directories" ? (
             <DirectoriesPage canEdit={String(currentUser?.role || "").toLowerCase() === "admin"} />
@@ -25082,7 +25076,7 @@ const getGatewayHealth = (gateway) => {
                 <div className="table-scroll users-table-scroll">
                   <div className="table users-table users-table--lite-access">
                     <div className="thead">
-                      <span>User</span><span>Role</span><span>Client Modules</span><span>Gateway Config</span><span>Gateway Start/Stop</span><span>Database</span><span>User Admin</span><span title="Per-user read-only Lite access link (admin-only)">Lite Access</span><span>Actions</span>
+                      <span>User</span><span>Role</span><span>Client Modules</span><span>Gateway Config</span><span>Gateway Start/Stop</span><span>Database</span><span>User Admin</span><span title="Per-user remote access link (admin-only): TrustNode Edge / Local View / Lite over the LAN">Remote Access</span><span>Actions</span>
                     </div>
                     {users.map((u) => (
                       <div key={u.username} className="trow">
@@ -25796,7 +25790,7 @@ const getGatewayHealth = (gateway) => {
                             <span>Status</span>
                             <span>MFA</span>
                             {/* Operator 2026-06-17: per-user Lite share token. Admin-only. */}
-                            <span title="Per-user read-only Lite access link (admin-only)">Lite Access</span>
+                            <span title="Per-user remote access link (admin-only): TrustNode Edge / Local View / Lite over the LAN">Remote Access</span>
                             <span style={{ textAlign: "right" }}>Actions</span>
                           </div>
                           {(cpUsersFiltered || []).map((row, idx) => {
@@ -28964,8 +28958,13 @@ const getGatewayHealth = (gateway) => {
                                     title: "Choose a destination folder",
                                     defaultPath: defaultPath || undefined,
                                   });
+                                } else if (isDesktopBridgeMissing(window.trustnodeDialogs?.pickFolder)) {
+                                  // Browser-served surface (LAN / cloud): no
+                                  // Electron bridge — the inline note under the
+                                  // field explains; keep the typed value.
+                                  return;
                                 } else {
-                                  // Browser fallback: prompt with current value.
+                                  // Dev-server fallback: prompt with current value.
                                   chosen = window.prompt(
                                     "Destination folder",
                                     defaultPath || ""
@@ -28980,13 +28979,15 @@ const getGatewayHealth = (gateway) => {
                                 setError(`Folder picker failed: ${String(err?.message || err)}`);
                               }
                             }}
-                            disabled={!canEditPage("database")}
+                            disabled={!canEditPage("database") || isDesktopBridgeMissing(window.trustnodeDialogs?.pickFolder)}
                           >
                             <FolderIcon />
                           </button>
                         </div>
                         <small className="muted">
-                          Click the folder icon to choose a directory — the file name is generated from this connection's name and extension. You can still edit the final path before saving.
+                          {isDesktopBridgeMissing(window.trustnodeDialogs?.pickFolder)
+                            ? `Folder picker: ${DESKTOP_ONLY_NOTE.toLowerCase()}. Type the destination path manually — the file name is generated from this connection's name and extension.`
+                            : "Click the folder icon to choose a directory — the file name is generated from this connection's name and extension. You can still edit the final path before saving."}
                         </small>
                       </label>
                     </div>
@@ -30593,7 +30594,7 @@ const getGatewayHealth = (gateway) => {
                 </select>
               </label>
               <label>
-                Email (also the Lite login)
+                Email (also the TrustNode Cloud View login)
                 <input
                   type="email"
                   value={cpEditUser.email}
@@ -30640,7 +30641,7 @@ const getGatewayHealth = (gateway) => {
               Share these credentials with the user. The password is shown
               only this once — they will be required to set their own
               password on their next login (works in both the edge app
-              and the Lite cloud app at trustnode.lsapps.app/lite/).
+              and TrustNode Cloud View at trustnode.lsapps.app/lite/).
             </p>
             <div className="form-grid" style={{ marginTop: 8 }}>
               <label>
@@ -30648,7 +30649,7 @@ const getGatewayHealth = (gateway) => {
                 <input readOnly value={cpTempPasswordReveal.username} onFocus={(e) => e.target.select()} />
               </label>
               <label>
-                Email (Lite cloud login)
+                Email (TrustNode Cloud View login)
                 <input readOnly value={cpTempPasswordReveal.email} onFocus={(e) => e.target.select()} />
               </label>
               <label>
@@ -30666,7 +30667,7 @@ const getGatewayHealth = (gateway) => {
                 className="btn btn-primary"
                 onClick={() => {
                   try {
-                    const text = `Edge username: ${cpTempPasswordReveal.username}\nLite email: ${cpTempPasswordReveal.email}\nTemporary password: ${cpTempPasswordReveal.password}`;
+                    const text = `Edge username: ${cpTempPasswordReveal.username}\nCloud View email: ${cpTempPasswordReveal.email}\nTemporary password: ${cpTempPasswordReveal.password}`;
                     navigator.clipboard?.writeText?.(text);
                     setCpResult("Credentials copied to clipboard.");
                   } catch (_) {}

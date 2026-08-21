@@ -39,7 +39,7 @@ class PowerConnectionTestPayload(BaseModel):
 @router.get("/config")
 def get_power_config(request: Request) -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
-    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    prefer_cloud_reads = bool(app_store._prefer_cloud_reads())  # 2026-08-21: explicit deployment flag, not the Host header
     if prefer_cloud_reads:
         bootstrap = app_store.get_bootstrap(prefer_cloud_reads=True) or {}
         cfg = bootstrap.get("power_management_config")
@@ -90,7 +90,7 @@ def test_power_connection(payload: PowerConnectionTestPayload) -> dict:
 @router.get("/status")
 def get_power_status(request: Request) -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
-    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    prefer_cloud_reads = bool(app_store._prefer_cloud_reads())  # 2026-08-21: explicit deployment flag, not the Host header
     if not prefer_cloud_reads:
         return {"ok": True, "status": power_manager.get_status()}
 
@@ -165,7 +165,7 @@ def get_power_status(request: Request) -> dict:
 @router.get("/latest")
 def get_power_latest(request: Request, device_id: str = "") -> dict:
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
-    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    prefer_cloud_reads = bool(app_store._prefer_cloud_reads())  # 2026-08-21: explicit deployment flag, not the Host header
     if not prefer_cloud_reads:
         return {"ok": True, "sample": power_manager.get_latest(device_id=device_id or None)}
 
@@ -207,7 +207,7 @@ def get_power_latest(request: Request, device_id: str = "") -> dict:
 def get_power_history(request: Request, limit: int = 300, device_id: str = "") -> dict:
     lim = max(1, min(int(limit or 300), 50000))
     host = str(request.headers.get("host") or "").strip().lower().split(":")[0]
-    prefer_cloud_reads = bool(host and host not in {"localhost", "127.0.0.1"})
+    prefer_cloud_reads = bool(app_store._prefer_cloud_reads())  # 2026-08-21: explicit deployment flag, not the Host header
     # Operator 2026-06-16: push the source filter into SQL so we no
     # longer pull 8x the rows and discard most. With the SQL-side
     # filter the query walks the (tenant_id, ts_utc DESC) index and

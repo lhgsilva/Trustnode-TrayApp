@@ -194,10 +194,26 @@ function parseQuery() {
     ret:     u.searchParams.get("return")  || "",
   };
 }
+// Owner-approved product names (plan 2026-08-21 §0/§7).
 function variantLabel(v) {
-  if (v === "full")   return "Full App";
-  if (v === "client") return "Client View";
-  return "Lite";
+  if (v === "full")   return "TrustNode Edge";
+  if (v === "client") return "TrustNode Local View";
+  return "TrustNode Lite (legacy)";
+}
+
+// Static-bundle guard cookie (plan §3.3 item 3). /api/auth/login already
+// sets the HttpOnly cookie; this explicit call covers tokens issued before
+// the guard existed (e.g. a JWT left in localStorage by the React app).
+// Best effort — older backends answer 404 and we simply move on.
+async function ensureSessionCookie(token) {
+  if (!token) return;
+  try {
+    await fetch("/api/auth/session-cookie", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + token },
+      credentials: "same-origin",
+    });
+  } catch (_) { /* ignore */ }
 }
 function defaultReturnFor(variant) {
   if (variant === "full")   return "/trustnode/full/app/";
@@ -233,6 +249,7 @@ async function checkAccess(variant) {
 function render(state) {
   applyTheme(getTheme());
   const { variant, ret } = parseQuery();
+  try { document.title = variantLabel(variant) + " — Sign in"; } catch (_) {}
   const root = $("#root");
   root.innerHTML = "";
   const shell = document.createElement("div");
@@ -290,6 +307,8 @@ function render(state) {
         return;
       }
       localStorage.setItem(AUTH_TOKEN_KEY, body.token);
+      // HttpOnly cookie for the static-bundle guard (ignore failures).
+      await ensureSessionCookie(body.token);
       // Server-side variant gate.
       const gate = await checkAccess(variant);
       if (!gate.ok) {
@@ -308,8 +327,11 @@ function render(state) {
   // Already signed in AND has access? Skip the form.
   const existing = localStorage.getItem(AUTH_TOKEN_KEY);
   if (existing) {
-    checkAccess(variant).then((gate) => {
+    checkAccess(variant).then(async (gate) => {
       if (gate.ok) {
+        // The JWT may predate the static-bundle guard: refresh the cookie
+        // before sending the browser to the protected bundle.
+        await ensureSessionCookie(existing);
         window.location.replace(safeReturn(ret, variant));
       } else {
         render({});

@@ -466,7 +466,10 @@ except Exception:
 # which the auth middleware allow-lists by prefix. Returns the tenant +
 # edge scope a view-link viewer is allowed to see.
 @app.get("/api/lite-view/resolve/{token}")
-def _lite_view_resolve(token: str):
+def _lite_view_resolve(token: str, request: Request):
+    # Owner decision 2026-08-21: no-login share links are a licence option.
+    from app.services import access_policy as _acc
+    _acc.require_module("view_share_links")(request)
     return resolve_edge_view_link_public(token)
 app.include_router(reports_router)
 app.include_router(historian_export_router)
@@ -952,7 +955,7 @@ async def _deferred_startup() -> None:
         from app.services import lan_socket as _lan_socket
         s = bootstrap.get("app_settings") if isinstance(bootstrap, dict) and isinstance(bootstrap.get("app_settings"), dict) else {}
         if bool(s.get("lan_sharing_enabled")):
-            _lan_socket.sync_with_settings(True, int(settings.trustnode_port))
+            _lan_socket.sync_with_settings(True, int(settings.trustnode_port), s)
     except Exception:
         pass
     try:
@@ -1280,6 +1283,11 @@ async def startup_event() -> None:
 PUBLIC_PATHS = {
     "/api/health",
     "/api/boot-probe",
+    # Operator 2026-08-21 (Remote Access): the LAN certificate is a public key
+    # (needed BEFORE a browser can trust the HTTPS listener); logout must work
+    # with an expired token so the cookie can always be cleared.
+    "/api/lan-sharing/certificate",
+    "/api/auth/logout",
     # Intelligence status probe — must be public so the sidebar menu
     # component can decide whether to render. Endpoint still returns
     # 404 when the license doesn't list the module (license_inspect
@@ -1329,6 +1337,39 @@ def _allows_query_token(path: str) -> bool:
     )
 
 
+from app.services import access_policy as _access
+
+_tv_cache: dict = {}
+
+
+def _token_version_ok(payload: dict) -> tuple:
+    """Reject tokens whose `tv` claim is older than the user's current token
+    version (bumped on revoke). Cached 5 s per user — the AuthStore read is a
+    tiny indexed SELECT on its own SQLite file, never app_store._lock."""
+    try:
+        import time as _t
+        username = str(payload.get("sub") or payload.get("username") or "")
+        if not username:
+            return True, ""
+        claim = int(payload.get("tv") or 0)
+        now = _t.monotonic()
+        _key = username.lower()
+        hit = _access.TV_CACHE.get(_key)
+        if hit and now - hit[0] < 5.0:
+            current = hit[1]
+        else:
+            from app.state import auth_store as _as_mw
+            current = int(_as_mw.get_token_version(username))
+            _access.TV_CACHE[_key] = (now, current)
+            if len(_access.TV_CACHE) > 5000:
+                _access.TV_CACHE.clear()
+        if claim < current:
+            return False, "Session revoked — please sign in again"
+        return True, ""
+    except Exception:
+        return True, ""
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     def _apply_no_cache_headers(response):
@@ -1349,6 +1390,41 @@ async def auth_middleware(request: Request, call_next):
     if method == "OPTIONS":
         return _apply_no_cache_headers(await call_next(request))
     if not path.startswith("/api/"):
+        # Operator 2026-08-21 (plan §3.3 item 3): the LAN surface bundles
+        # (/trustnode/{full|client|lite}/app/) require a verified session —
+        # HttpOnly cookie set at login, or a Bearer for XHR. Previously the
+        # admin bundle was downloadable by any LAN peer and the only gate was
+        # a client-side redirect that failed OPEN on a network error. Landings
+        # and /trustnode/login/ stay public.
+        _surface = _access.surface_of(path)
+        if _surface:
+            from fastapi.responses import RedirectResponse as _Redir
+            _tok = _access.token_from_request(request)
+            _login = f"/trustnode/login/?variant={_surface}&return={path}"
+            if not _tok:
+                return _Redir(url=_login, status_code=302)
+            try:
+                _pl = decode_access_token(_tok)
+                _tv_ok, _ = _token_version_ok(_pl)
+                if not _tv_ok:
+                    return _Redir(url=_login, status_code=302)
+            except Exception:
+                return _Redir(url=_login, status_code=302)
+            _remote = _access.request_is_remote(request)
+            _ok, _why = _access.surface_access(_surface, _pl, _remote)
+            if not _ok:
+                _access.audit("surface", outcome="denied", request=request, payload=_pl,
+                              details={"surface": _surface, "reason": _why},
+                              rate_key=f"surf:{_surface}:{_pl.get('sub')}:{_why}")
+                if _why.startswith("licence:"):
+                    return JSONResponse(status_code=404, content={"detail": "Not found"})
+                return JSONResponse(status_code=403, content={"detail": f"Access to this surface is not allowed ({_why})"})
+            try:
+                from app.services import view_sessions as _vs
+                _vs.mark_active(str(_pl.get("sub") or ""), str(_pl.get("role") or ""),
+                                ip=_access.client_host(request), surface=f"lan_{_surface}")
+            except Exception:
+                pass
         return await call_next(request)
     # /api/cloud-live/* is handled by the pure-ASGI CloudLiveAuthMiddleware
     # above (BaseHTTPMiddleware can't stream SSE).
@@ -1393,6 +1469,9 @@ async def auth_middleware(request: Request, call_next):
     if not token and method == "GET" and _allows_query_token(path):
         token = str(request.query_params.get("access_token") or request.query_params.get("token") or "").strip()
     if not token:
+        # 2026-08-21: browser-native loads from a LAN surface carry the session cookie
+        token = str(request.cookies.get(_access.SESSION_COOKIE) or "").strip()
+    if not token:
         return _apply_no_cache_headers(JSONResponse(status_code=401, content={"detail": "Authentication required"}))
     try:
         payload = decode_access_token(token)
@@ -1410,16 +1489,30 @@ async def auth_middleware(request: Request, call_next):
         # authenticated request so the concurrent-session counter
         # accurately reflects who is actively using the View UI right
         # now. Failure here MUST NOT block the request.
+        # Operator 2026-08-21: revoked sessions (Remote Access "Revoke" bumps
+        # the user's token version; older tokens are refused).
+        _tv_ok, _tv_why = _token_version_ok(payload)
+        if not _tv_ok:
+            return _apply_no_cache_headers(JSONResponse(status_code=401, content={"detail": _tv_why}))
         try:
             from app.services import view_sessions
             view_sessions.mark_active(
                 str(payload.get("sub") or payload.get("username") or ""),
                 str(payload.get("role") or ""),
+                ip=_access.client_host(request),
+                surface=str(request.headers.get("X-Trustnode-Surface") or "").strip()[:24],
             )
         except Exception:
             pass
     except Exception as exc:
         return _apply_no_cache_headers(JSONResponse(status_code=401, content={"detail": f"Invalid token: {exc}"}))
+    # Operator 2026-08-21 (plan §3.3): central role + network policy. Reads are
+    # free for any authenticated role; configuration mutations need
+    # engineer/admin; remote mutations additionally need `remote_admin_lan`.
+    # Mode "lan" (default): ENFORCE for non-loopback clients, LOG for loopback.
+    _allowed, _reason, _eff = _access.evaluate(request, payload)
+    if not _allowed:
+        return _apply_no_cache_headers(JSONResponse(status_code=403, content={"detail": f"Forbidden: {_reason}"}))
     return _apply_no_cache_headers(await call_next(request))
 
 

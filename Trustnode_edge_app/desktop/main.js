@@ -1751,27 +1751,40 @@ function createTray() {
 
 function rebuildTrayMenu() {
   if (!tray) return;
-  // Build a per-URL submenu so the operator can click to copy.
-  const liteSubmenu = (lanSharingState.lite_urls || []).map((u) => ({
+  // Build per-URL submenus so the operator can click to copy + open.
+  // Operator 2026-08-21 (Remote Access): one entry per surface — Edge (full
+  // runtime), Local View (read-only React client view) and the legacy Lite —
+  // over HTTP and, when available, HTTPS.
+  const urlItem = (u) => ({
     label: u,
     click: () => {
       try {
         const { clipboard, shell } = require("electron");
         clipboard.writeText(u);
-        // Soft confirm via shell.openExternal so the URL opens in a browser
-        // — useful if the operator is testing locally.
         shell.openExternal(u).catch(() => {});
       } catch (_) {}
     }
-  }));
-  if (!liteSubmenu.length) {
-    liteSubmenu.push({ label: "(no LAN IPs detected)", enabled: false });
-  }
+  });
+  const httpsUrls = (lanSharingState.https && lanSharingState.https.urls) || {};
+  const surfaceItems = (label, httpList, httpsList) => {
+    const items = [{ label, enabled: false }];
+    (httpList || []).forEach((u) => items.push(urlItem(u)));
+    (httpsList || []).forEach((u) => items.push(urlItem(u)));
+    if (items.length === 1) items.push({ label: "  (no LAN IPs detected)", enabled: false });
+    return items;
+  };
+  const liteSubmenu = [
+    ...surfaceItems("TrustNode Edge (full runtime):", lanSharingState.full_urls, httpsUrls.full),
+    { type: "separator" },
+    ...surfaceItems("TrustNode Local View (read-only):", lanSharingState.view_urls, httpsUrls.view),
+    { type: "separator" },
+    ...surfaceItems("Lite (legacy read-only):", lanSharingState.lite_urls, httpsUrls.lite),
+  ];
   const lanSubmenu = [
     {
       label: lanSharingState.running
-        ? `LAN sharing: ON (port ${lanSharingState.lan_port || lanSharingState.port || 8000})`
-        : (lanSharingState.enabled ? "LAN sharing: bind failed" : "LAN sharing: OFF"),
+        ? `Remote Access: ON (http ${lanSharingState.lan_port || lanSharingState.port || 8000}${lanSharingState.https_port ? ` · https ${lanSharingState.https_port}` : ""})`
+        : (lanSharingState.enabled ? "Remote Access: bind failed" : "Remote Access: OFF"),
       enabled: false,
     },
     { type: "separator" },
@@ -1820,7 +1833,7 @@ function rebuildTrayMenu() {
     },
     { type: "separator" },
     {
-      label: "Lite URLs (click to copy + open):",
+      label: "URLs (click to copy + open):",
       enabled: false,
     },
     ...liteSubmenu,

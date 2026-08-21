@@ -1093,6 +1093,21 @@ def upsert_user(payload: UserUpsertRequest, request: Request, tenant_id: str | N
     assigned_tenant = (
         _customer_tenant_id(payload.customer_id) if str(payload.customer_id or "").strip() else caller_tid
     )
+    # Operator 2026-08-21 (Phase 3): enforce max_studio_admins on user creation.
+    try:
+        from app.services import license_inspect as _li
+        _role_new = str(payload.role or "").strip().lower()
+        if _role_new in ("admin", "engineer", "super"):
+            _limit = int(_li.get_limit("max_studio_admins") or 0)
+            if _limit > 0:
+                _existing = control_plane_store.get_user(tenant_id=assigned_tenant, username=payload.username) \
+                    if hasattr(control_plane_store, "get_user") else None
+                if not _existing and int(_li.count_configured_admin_users() or 0) >= _limit:
+                    raise HTTPException(status_code=403, detail=f"License limit reached: {_limit} admin/engineer account(s) allowed")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     row = control_plane_store.upsert_user(
         tenant_id=assigned_tenant,
         customer_id=payload.customer_id,
@@ -2690,12 +2705,26 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
         # count is > 0 but incomplete. Treat that as stale so we hit the
         # cloud and refresh the mirror. Detected by comparing local module
         # count against the catalog count — anything smaller is stale.
+        # Operator 2026-08-21: the old rule (local module count < catalog size)
+        # made EVERY edge consider itself stale the moment a key was added to
+        # the catalog and hammer the portal. Staleness is now age-based: the
+        # mirror is refreshed when it was last verified more than 24 h ago
+        # (or never), which is also what a renewed licence needs.
+        local_modules_stale = False
         try:
-            catalog_size = len(control_plane_store.module_catalog() or [])
+            from datetime import datetime as _dt_cls, timezone as _tz
+            _bs_stale = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+            _as_stale = _bs_stale.get("app_settings") if isinstance(_bs_stale.get("app_settings"), dict) else {}
+            _last = str(_as_stale.get("license_last_verified_utc") or "").strip()
+            if not _last:
+                local_modules_stale = True
+            else:
+                _t = _dt_cls.fromisoformat(_last.replace("Z", "+00:00"))
+                if _t.tzinfo is None:
+                    _t = _t.replace(tzinfo=_tz.utc)
+                local_modules_stale = (_dt_cls.now(_tz.utc) - _t).total_seconds() > 24 * 3600
         except Exception:
-            catalog_size = 0
-        local_count = len(local_modules) if isinstance(local_modules, list) else 0
-        local_modules_stale = catalog_size > 0 and local_count < catalog_size
+            local_modules_stale = True
         local_missing_details = (
             (not bool(out.get("ok")))
             or (not str(local_license.get("start_utc") or "").strip())
@@ -3232,6 +3261,15 @@ def edge_link_license_check(request: Request, edge_id: str = "", tenant_id: str 
                     _s_persist["tenant_web_client_url"] = str(_infra_payload.get("web_client_url")).strip()
                 _s_persist["infrastructure_endpoints"] = dict(_infra_payload)
             app_store.upsert_domain("app_settings", _s_persist, actor="license_check_persist")
+            # Operator 2026-08-21 (Phase 3): keep the tier columns on the mirror row.
+            try:
+                control_plane_store.update_license_tier(
+                    str(_lic_payload.get("license_id") or _s_persist.get("license_id") or ""),
+                    package_key=str(_lic_payload.get("package_key") or ""),
+                    limits=_lic_payload.get("limits") if isinstance(_lic_payload.get("limits"), dict) else {},
+                )
+            except Exception:
+                pass
             # Invalidate the 30s cache so license_inspect re-reads now.
             try:
                 from app.services import license_inspect as _li

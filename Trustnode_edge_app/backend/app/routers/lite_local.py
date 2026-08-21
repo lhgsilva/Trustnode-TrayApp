@@ -33,7 +33,7 @@ import secrets
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Depends
 from pydantic import BaseModel
 
 from app.state import app_store
@@ -45,7 +45,12 @@ from app.services import customer_sql, sinks_sql
 from app.state import control_plane_store
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/lite-local", tags=["lite-local"])
+from app.services import access_policy as _access
+
+# Operator 2026-08-21 (plan §3.3): the whole Local View API is licence-gated on
+# `local_web_app` (404 when absent for remote clients; log-only on loopback).
+router = APIRouter(prefix="/api/lite-local", tags=["lite-local"],
+                   dependencies=[Depends(_access.require_module("local_web_app"))])
 
 
 # ----------------------------------------------------------------------
@@ -173,7 +178,7 @@ def _extract_session(request: Request, token_qs: Optional[str]) -> Dict[str, Any
                 }
         except Exception:
             pass
-    if token_qs:
+    if token_qs and _access.has_module("view_share_links"):
         row = control_plane_store.get_edge_view_link_by_token(token=token_qs)
         if row and str(row.get("status") or "").lower() == "active":
             # Synthesize a session body so downstream reads can scope.
@@ -273,7 +278,10 @@ class ValidateRequest(BaseModel):
 
 
 @router.post("/validate")
-def post_validate(payload: ValidateRequest) -> dict:
+def post_validate(payload: ValidateRequest, request: Request) -> dict:
+    # Owner decision 2026-08-21: Local View requires a login; no-login share
+    # links exist only with the `view_share_links` licence option.
+    _access.require_module("view_share_links")(request)
     try:
         row = control_plane_store.get_edge_view_link_by_token(token=payload.token)
     except Exception as exc:
@@ -475,3 +483,54 @@ def get_historian(
     except Exception:
         rows = []
     return {"ok": True, "source": "local_sqlite", "rows": rows}
+
+
+# ---------------------------------------------------------------------------
+# Operator 2026-08-21 (plan Phase 4.3): reports for Local View. The LAN Lite
+# shim returned [] for generated_reports ("reports queue is cloud-only"); the
+# edge's own reports_store has them. Same session rules as the other
+# lite-local reads; file download accepts the session via header or ?token=.
+# ---------------------------------------------------------------------------
+@router.get("/reports")
+def get_lite_reports(request: Request, limit: int = 100, token: str = Query(default="")) -> dict:
+    sess = _extract_session(request, token)
+    tenant_id = str(sess.get("tenant_id") or "default")
+    try:
+        from app.state import reports_store
+        rows = reports_store.list_generated(tenant_id=tenant_id, limit=max(1, min(int(limit or 100), 500)))
+    except TypeError:
+        from app.state import reports_store
+        rows = reports_store.list_generated()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"reports unavailable: {type(exc).__name__}: {exc}") from exc
+    out = []
+    for r in rows or []:
+        out.append({
+            "id": r.get("id") or r.get("generated_id"),
+            "template_id": r.get("template_id"),
+            "template_name": r.get("template_name") or r.get("name"),
+            "created_utc": r.get("created_utc"),
+            "file_name": r.get("file_name"),
+            "file_bytes": r.get("file_bytes"),
+            "status": r.get("status") or "done",
+            "triggered_by": r.get("triggered_by"),
+        })
+    return {"ok": True, "rows": out, "source": "local_reports_store"}
+
+
+@router.get("/reports/{generated_id}/file")
+def get_lite_report_file(generated_id: str, request: Request, inline: bool = True, token: str = Query(default="")):
+    _extract_session(request, token)
+    from fastapi.responses import FileResponse
+    from pathlib import Path as _P
+    from app.state import reports_store
+    record = reports_store.get_generated(generated_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Report not found")
+    path = _P(str(record.get("file_path") or ""))
+    if not path.exists():
+        raise HTTPException(status_code=410, detail="Report file is no longer on disk")
+    disposition = "inline" if inline else "attachment"
+    name = record.get("file_name") or path.name
+    return FileResponse(str(path), media_type="application/pdf", filename=name,
+                        headers={"Content-Disposition": f'{disposition}; filename="{name}"'})

@@ -33,16 +33,51 @@ function getDefaultLocalApiBase() {
   return "";
 }
 
-function isHostedWebClientRuntime() {
-  const protocol = String(window.location.protocol || "").toLowerCase();
-  const host = String(window.location.hostname || "").toLowerCase();
-  const isLocalHost = host === "localhost" || host === "127.0.0.1" || host === "::1";
-  const userAgent = String(window.navigator?.userAgent || "");
-  const isElectronRuntime = /electron/i.test(userAgent);
-  if (isElectronRuntime) return false;
-  const hasDesktopBackendOverride = Boolean(new URLSearchParams(window.location.search).get("backendUrl"));
-  if (hasDesktopBackendOverride) return false;
-  return (protocol === "https:" || protocol === "http:") && !isLocalHost;
+// Runtime surface detection (plan 2026-08-21 §3.3/§3.5). ONE predicate for
+// "where is this bundle running", so the ~40 ad-hoc guards can converge on it:
+//   desktop    — Electron shell, file:// bundle, or an explicit ?backendUrl=
+//                override (dev server pointing at a local edge).
+//   lan_full   — this React app served by the edge itself at
+//                /trustnode/full/app/  ("TrustNode Edge" over the LAN).
+//   lan_client — the clientview build served at /trustnode/client/app/
+//                ("TrustNode Local View").
+//   lan_lite   — the frozen vanilla Lite at /trustnode/lite/app/.
+//   cloud      — any other http(s) non-localhost origin (hosted cloud portal /
+//                TrustNode Cloud View on the VPS).
+// lan_* surfaces are SAME-ORIGIN with the edge API: they must never be
+// treated as the hosted cloud portal (that routed reads to Supabase and
+// polluted localStorage with mode="cloud" — plan §2.5 landmine 6).
+const LAN_SURFACE_PATH_RE = /^\/trustnode\/(full|client|lite)\/app(?:\/|$)/;
+
+export function getRuntimeSurface() {
+  try {
+    const loc = window.location || {};
+    const protocol = String(loc.protocol || "").toLowerCase();
+    const host = String(loc.hostname || "").toLowerCase();
+    const pathname = String(loc.pathname || "");
+    const userAgent = String(window.navigator?.userAgent || "");
+    if (/electron/i.test(userAgent)) return "desktop";
+    if (protocol === "file:") return "desktop";
+    if (new URLSearchParams(String(loc.search || "")).get("backendUrl")) return "desktop";
+    const lan = pathname.match(LAN_SURFACE_PATH_RE);
+    if (lan) return `lan_${lan[1]}`;
+    const isLocalHost = host === "localhost" || host === "127.0.0.1" || host === "::1";
+    if ((protocol === "https:" || protocol === "http:") && !isLocalHost) return "cloud";
+    return "desktop";
+  } catch {
+    return "desktop";
+  }
+}
+
+// True only for the LAN-served surfaces (the edge serving its own bundles).
+export function isLanServedRuntime() {
+  return String(getRuntimeSurface()).startsWith("lan_");
+}
+
+// True ONLY for the hosted cloud portal. A LAN-served full app is the edge
+// itself (same-origin API), so it is NOT a hosted web client.
+export function isHostedWebClientRuntime() {
+  return getRuntimeSurface() === "cloud";
 }
 
 export function getBackendTarget() {
@@ -53,6 +88,13 @@ export function getBackendTarget() {
     const cloudUrl = normalizeBaseUrl(localStorage.getItem(STORAGE_CLOUD_URL_KEY) || window.location.origin || "");
     return { mode: "cloud", cloudUrl, forced: false };
   }
+  if (isLanServedRuntime()) {
+    // Served by this edge over the LAN: the API is always same-origin.
+    // Ignore any mode="cloud" a pre-fix session may have left in
+    // localStorage so reads never get redirected to a cloud URL.
+    const cloudUrl = localStorage.getItem(STORAGE_CLOUD_URL_KEY) || "";
+    return { mode: "local", cloudUrl, lan: true };
+  }
   const mode = localStorage.getItem(STORAGE_MODE_KEY) || "local";
   const cloudUrl = localStorage.getItem(STORAGE_CLOUD_URL_KEY) || "";
   return { mode, cloudUrl };
@@ -61,7 +103,9 @@ export function getBackendTarget() {
 export function setBackendTarget(mode, cloudUrl = "") {
   if (FORCE_CLOUD_URL) return;
   const hosted = isHostedWebClientRuntime();
-  const nextMode = hosted ? "cloud" : mode;
+  // lan_* surfaces never persist mode="cloud": the bundle is served by the
+  // edge it talks to, so "local" (same-origin) is the only valid target.
+  const nextMode = hosted ? "cloud" : (isLanServedRuntime() ? "local" : mode);
   const nextCloud = hosted
     ? normalizeBaseUrl(cloudUrl || window.location.origin || "")
     : normalizeBaseUrl(cloudUrl);
@@ -2053,6 +2097,61 @@ export function pickLanVariantForUser(permissions) {
   if (p.access_lite) return "lite";
   if (p.access_client) return "client";
   return null;
+}
+
+// --- Remote Access (LAN sharing) — plan 2026-08-21 §3.5 ---
+// Every call goes through fetchWithTimeout + getControlApiBase() so the
+// Bearer token is attached and the request targets the edge that serves
+// this bundle. The previous page used bare relative fetch("/api/lan-sharing/…")
+// which the auth middleware only waives for loopback → 401 from any LAN PC.
+// Fields beyond the legacy status shape (view_urls, hostname_urls, https,
+// licensed, sessions, http_enabled) may be absent on older backends; callers
+// must treat them as optional.
+
+export async function getLanSharingStatus() {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/lan-sharing/status`, {}, 8000);
+  await ensureOk(res, "Fetching Remote Access status failed");
+  return res.json();
+}
+
+export async function enableLanSharing() {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/lan-sharing/enable`, { method: "POST" }, 20000);
+  await ensureOk(res, "Turning Remote Access on failed");
+  return res.json().catch(() => ({}));
+}
+
+export async function disableLanSharing() {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/lan-sharing/disable`, { method: "POST" }, 20000);
+  await ensureOk(res, "Turning Remote Access off failed");
+  return res.json().catch(() => ({}));
+}
+
+// payload: { https_only?: bool, http_enabled?: bool, bind_host?: string }
+export async function updateLanSharingConfig(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/lan-sharing/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  }, 20000);
+  await ensureOk(res, "Saving Remote Access settings failed");
+  return res.json().catch(() => ({}));
+}
+
+export async function revokeLanSharingSession(username) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/lan-sharing/sessions/revoke`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: String(username || "") }),
+  });
+  await ensureOk(res, "Revoking remote session failed");
+  return res.json().catch(() => ({}));
+}
+
+// Absolute URL of the self-signed certificate (PEM download, public route).
+export function getLanSharingCertificateUrl(certUrl = "/api/lan-sharing/certificate") {
+  const path = String(certUrl || "/api/lan-sharing/certificate");
+  if (/^https?:\/\//i.test(path)) return path;
+  return `${getControlApiBase()}${path.startsWith("/") ? "" : "/"}${path}`;
 }
 
 // --- Outbound connections (OPC UA / MQTT, operator 2026-06-17) ---

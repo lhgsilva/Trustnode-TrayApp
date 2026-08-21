@@ -172,6 +172,16 @@ function storeSession(body) {
   } catch (_) {}
 }
 
+// Owner-approved product name for the surface this landing belongs to
+// (plan 2026-08-21 §0/§7): /trustnode/full/ → TrustNode Edge,
+// /trustnode/client/ → TrustNode Local View, /trustnode/lite/ → legacy Lite.
+function productNameForPath() {
+  const p = String(window.location.pathname || "");
+  if (p.startsWith("/trustnode/full/")) return "TrustNode Edge";
+  if (p.startsWith("/trustnode/client/")) return "TrustNode Local View";
+  return "TrustNode Lite (legacy)";
+}
+
 function redirectToApp() {
   // Detect the entry path and redirect to the matching /app/.
   // Operator 2026-06-18 — three LAN-served UIs:
@@ -190,6 +200,8 @@ function redirectToApp() {
 
 function render(state) {
   applyTheme(getTheme());
+  const productName = productNameForPath();
+  try { document.title = productName; } catch (_) {}
   const root = document.getElementById("root");
   root.innerHTML = "";
   const shell = document.createElement("div");
@@ -200,7 +212,7 @@ function render(state) {
       <div class="lite-auth-brand">
         <img src="assets/trustenode-002.png" alt="TrustNode" class="lite-auth-logo" onerror="this.style.display='none'" />
       </div>
-      <h2 class="lite-auth-heading">Enter your access token</h2>
+      <h2 class="lite-auth-heading">${escapeHtml(productName)} — enter your access token</h2>
       <p class="lite-auth-subtitle">Paste the read-only token your edge administrator generated for you.</p>
       <form id="tk-form" autocomplete="off">
         <label class="lite-auth-label">

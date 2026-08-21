@@ -1,7 +1,7 @@
 # TrustNode — Product Surfaces, LAN Runtime Access & View Licensing
 
 **Research report + target architecture + rollout plan**
-Date: 2026-08-21 · Status: APPROVED DIRECTION — decisions resolved by the owner on 2026-08-21 (see §7); no code changed yet · Scope: edge backend (`backend/app`), Electron shell (`desktop/`), React app (`frontend/`), LAN-served static UIs (`backend/static/*`), cloud read-only view (`web_cloud_readonly/`, VPS), portal contract, release gate.
+Date: 2026-08-21 · Status: IMPLEMENTED on branch `feature/surfaces-lan-licensing` (Phases 0-4, see §8) — decisions resolved by the owner on 2026-08-21 (§7) · Scope: edge backend (`backend/app`), Electron shell (`desktop/`), React app (`frontend/`), LAN-served static UIs (`backend/static/*`), cloud read-only view (`web_cloud_readonly/`, VPS), portal contract, release gate.
 
 > **Owner decisions (2026-08-21):** product names **TrustNode Edge / Local View / Cloud View**; **admin + engineer** may configure from the LAN; remote access must **work on any company network with zero friction** (so HTTPS is offered, not forced — §3.4); **Local View requires login**, no-login share links are a **licence option**; the **React client view becomes the single read-only UI**; **LAN-with-admin-login is the scope** (no portal-initiated remote admin for now).
 
@@ -270,3 +270,18 @@ Reverse-proxy mode (customer nginx/IIS in front, `X-Forwarded-*` trust), SSO (LD
 | Cloud view + VPS | `web_cloud_readonly/` (+ fork `0.0.0.1000/web_cloud_readonly/lite/`), `deploy/nginx/trustnode-edge.conf`, `.github/workflows/trustnode-edge-cicd.yml:84-95,229-249,377-378`, `scripts/push_lite_to_vps.py`, `scripts/build-web-cloud-readonly.ps1`, `db/migrations/20260518_*` |
 | Lite reports | `backend/app/services/lite_report_poller.py`, `reports_cloud_uploader.py`, `reports_store.py:646-702` |
 | Release gate | `scripts/validate_release.py`, `scripts/validate_full_12h.py`, `scripts/boot_log_check.py` (+ proposed `scripts/validate_surfaces.py`) |
+
+---
+
+## 8. Implementation status (2026-08-21, branch `feature/surfaces-lan-licensing`)
+
+| Phase | Status | Where |
+|---|---|---|
+| 0 — baseline | DONE: cloud Lite bundle restored to git (`web_cloud_readonly/lite/`); `_resolve_prefer_cloud_reads` uses the explicit deployment flag in `routers/app_store.py` + `routers/power.py` (x4); LAN-page calls authenticated (`api.js` lan-sharing helpers); logo path + clipboard fallback; firewall rule `profile=private,domain`; surface checks in the gate (`scripts/validate_surfaces.py`, folded into `validate_full_12h.py`) | backend, frontend, scripts |
+| 1 — enforcement | DONE: `services/access_policy.py` (role by method/prefix with operator allow-list, licence gates as 404 dependencies, network rule `remote_admin_lan`, audit to customer log + `cp_security_audit_log`, modes `lan`/`enforce`/`log`/`off`), static-surface session guard in `auth_middleware`, token versions (`tv` claim, `token_versions` table, revoke), `lite_local` gated on `local_web_app`, share links on `view_share_links`, catalog keys + legacy derivation, age-based licence refresh | `backend/app/main.py`, `services/access_policy.py`, `routers/lite_local.py`, `services/auth_store.py`, `auth.py` |
+| 2 — transport + UX | DONE: dual HTTP/HTTPS listeners (`services/lan_socket.py`, `services/lan_tls.py`, per-install self-signed cert, `custom.crt/key` override), Remote Access API (`routers/lan_sharing.py`: status/config/certificate/sessions/revoke), account lockout + password policy + 4 h LAN sessions + master-default blocked from LAN (`routers/auth.py`), Remote Access page with QR codes, certificate guide, sessions, HTTPS switches and first-enable wizard (`frontend/src/components/RemoteAccess/`), tray parity (`desktop/main.js`), desktop-only affordances, `docs/REMOTE_ACCESS_LAN_GUIDE.md` | backend, frontend, desktop, docs |
+| 3 — vocabulary | DONE: alias map + explicit-enabled rule (`license_inspect.py`), `raw_package_key()`, `cp_licenses.package_key/limits_json` + `update_license_tier`, `max_studio_admins` on user create, view-only write gate (`license_gate.py`), `LICENSE_PACKAGES.md` rewritten, portal spec addendum, client view no longer bypasses `hasLicenseModule`, DEV bypass no longer grandfathers | backend, frontend, docs |
+| 4 — consolidation | DONE (first step): `getRuntimeSurface()` replaces the three `isHostedWebClient` copies; LAN URLs present the React client view as **TrustNode Local View** (Lite marked legacy); Local View reports via `/api/lite-local/reports` (+ file). OPEN: retire the vanilla Lite after the React client view is verified on the VPS as Cloud View; portal editor dropdown (portal repo). | frontend, backend |
+| 5 — optional | not started (reverse proxy mode, SSO, per-IP allow-lists) | — |
+
+Verification: `scripts/validate_surfaces.py` (32 checks: listeners, certificate, static guard, RBAC from a LAN IP, lockout, revocation, master-default block) + `--boot-probe` + the 10-minute release gate on the running build.

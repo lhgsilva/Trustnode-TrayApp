@@ -50,6 +50,13 @@ class ControlPlaneStore:
         {"key": "local_web_app", "label": "Local Web App (LAN browser access)", "default_enabled": False, "group": "Cloud / Web"},
         {"key": "cloud_lite_access", "label": "Cloud Lite (web read-only)", "default_enabled": False, "group": "Cloud / Web"},
         {"key": "cloud_client_view", "label": "Cloud Client View (web)", "default_enabled": False, "group": "Cloud / Web"},
+        # --- Operator 2026-08-21: remote runtime + share links (plan §3.1) ---
+        # remote_admin_lan: the FULL edge runtime (/trustnode/full/app/) may be
+        # reached from a non-loopback address with an admin/engineer login.
+        # view_share_links: no-login view-link tokens for Local View are allowed
+        # (otherwise Local View always requires a login).
+        {"key": "remote_admin_lan", "label": "TrustNode Edge over LAN (remote admin/engineer access)", "default_enabled": False, "group": "Cloud / Web"},
+        {"key": "view_share_links", "label": "Local View share links (no-login tokens)", "default_enabled": False, "group": "Cloud / Web"},
         # --- Operator 2026-06-30: bolt-on application modules ------------
         # Both default_enabled=False so existing licenses are untouched
         # when MODULE_CATALOG is re-seeded; admins opt-in per-license via
@@ -117,6 +124,16 @@ class ControlPlaneStore:
                 conn.commit()
             except Exception:
                 pass
+        # Operator 2026-08-21 (Phase 3): tier reporting columns on the mirror.
+        try:
+            lic_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(cp_licenses)").fetchall()}
+            if "package_key" not in lic_cols:
+                conn.execute("ALTER TABLE cp_licenses ADD COLUMN package_key TEXT")
+            if "limits_json" not in lic_cols:
+                conn.execute("ALTER TABLE cp_licenses ADD COLUMN limits_json TEXT NOT NULL DEFAULT '{}'")
+            conn.commit()
+        except Exception:
+            pass
         return has_col
 
     def _utc_now(self) -> str:
@@ -454,6 +471,19 @@ class ControlPlaneStore:
                         ),
                     )
                 conn.commit()
+
+    def update_license_tier(self, license_id: str, package_key: str = "", limits: "Dict[str, Any] | None" = None) -> None:
+        """Operator 2026-08-21 (Phase 3): mirror the tier columns so support can
+        query licences by package on the edge too. Best-effort."""
+        try:
+            with self._lock:
+                with self._connect() as conn:
+                    conn.execute(
+                        "UPDATE cp_licenses SET package_key = ?, limits_json = ?, updated_utc = ? WHERE license_id = ?",
+                        (str(package_key or ""), json.dumps(limits or {}), _utc_now(), str(license_id or "")),
+                    )
+        except Exception:
+            pass
 
     def audit(self, *, actor_type: str, actor_id: str, tenant_id: str, action: str, outcome: str, correlation_id: str, details: Dict[str, Any]) -> None:
         with self._lock:

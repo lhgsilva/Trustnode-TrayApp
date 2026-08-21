@@ -71,13 +71,22 @@ def _normalize_host_header(request: Request) -> str:
 
 
 def _resolve_prefer_cloud_reads(request: Request, prefer_cloud: str = "") -> bool:
+    """Operator 2026-08-21 (LAN FULL-RUNTIME FIX): the old rule was "Host header
+    is not localhost => cloud". That made every browser on the LAN
+    (http://192.168.x.x:8088/trustnode/full/app/) read Supabase — or nothing —
+    instead of the local historian, and it suppressed the canonical customer-DB
+    route. Deployment intent is explicit now: the `?prefer_cloud=` query wins,
+    then TRUSTNODE_PREFER_CLOUD_READS / app_settings.endpoint_mode (what the VPS
+    and a hosted edge set). The request's host plays no part."""
     forced = str(prefer_cloud or "").strip().lower()
     if forced in {"1", "true", "yes", "on"}:
         return True
     if forced in {"0", "false", "no", "off"}:
         return False
-    host = _normalize_host_header(request)
-    return bool(host and host not in {"localhost", "127.0.0.1", "::1"})
+    try:
+        return bool(app_store._prefer_cloud_reads())
+    except Exception:
+        return False
 
 
 # Domains that represent COMPANY ASSETS shared by every operator on the

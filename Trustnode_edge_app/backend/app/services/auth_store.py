@@ -180,6 +180,12 @@ class AuthStore:
                     "ALTER TABLE users ADD COLUMN email TEXT",
                     "ALTER TABLE users ADD COLUMN reset_token TEXT",
                     "ALTER TABLE users ADD COLUMN reset_token_expires_utc TEXT",
+                    # Operator 2026-08-21 (Remote Access): per-user token version
+                    # (bumped on revoke -> every older JWT is rejected) and
+                    # per-account lockout state for LAN-exposed logins.
+                    "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0",
+                    "CREATE TABLE IF NOT EXISTS login_lockouts (username TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0, first_failure_utc TEXT, locked_until_utc TEXT, updated_utc TEXT)",
+                    "CREATE TABLE IF NOT EXISTS token_versions (username TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0, updated_utc TEXT)",
                 ):
                     try:
                         conn.execute(stmt)
@@ -443,6 +449,113 @@ class AuthStore:
                         "INSERT INTO login_audit(ts_utc, username, ok, remote_ip, detail) VALUES(?,?,?,?,?)",
                         (now, str(username or ""), 1 if ok else 0, str(remote_ip or ""), str(detail or "")),
                     )
+                    conn.commit()
+        except Exception:
+            pass
+
+    # ---- Remote Access (2026-08-21): token revocation + account lockout ------
+    def get_token_version(self, username: str) -> int:
+        """Current token version for a user — kept in its own table so revocation
+        works for users that live only in cp_users / the portal mirror."""
+        try:
+            with self._connect(read_only=True) as conn:
+                row = conn.execute(
+                    "SELECT version FROM token_versions WHERE LOWER(username) = LOWER(?)", (str(username or ""),)
+                ).fetchone()
+                return int(row[0] or 0) if row else 0
+        except Exception:
+            return 0
+
+    def bump_token_version(self, username: str) -> int:
+        """Invalidate every JWT issued so far for `username`."""
+        try:
+            with self._write_lock:
+                with self._connect() as conn:
+                    conn.execute(
+                        "INSERT INTO token_versions(username, version, updated_utc) VALUES(?, 1, ?) "
+                        "ON CONFLICT(username) DO UPDATE SET version = token_versions.version + 1, updated_utc = excluded.updated_utc",
+                        (str(username or "").lower(), _utc_now()),
+                    )
+                    conn.commit()
+            return self.get_token_version(username)
+        except Exception:
+            return 0
+
+    LOCKOUT_THRESHOLD = 5
+    LOCKOUT_WINDOW_S = 15 * 60
+    LOCKOUT_DURATION_S = 15 * 60
+
+    def locked_until(self, username: str) -> str:
+        """ISO timestamp while the account is locked, else ''."""
+        try:
+            with self._connect(read_only=True) as conn:
+                row = conn.execute(
+                    "SELECT locked_until_utc FROM login_lockouts WHERE LOWER(username) = LOWER(?)",
+                    (str(username or ""),),
+                ).fetchone()
+            until = str(row[0] or "") if row else ""
+            if not until:
+                return ""
+            import datetime as _dt
+            try:
+                u = _dt.datetime.fromisoformat(until.replace("Z", "+00:00"))
+                if u.tzinfo is None:
+                    u = u.replace(tzinfo=_dt.timezone.utc)
+                return until if u > _dt.datetime.now(_dt.timezone.utc) else ""
+            except Exception:
+                return ""
+        except Exception:
+            return ""
+
+    def record_failed_attempt(self, username: str) -> str:
+        """Count a failed login; returns locked_until (ISO) if this attempt
+        tripped the threshold (5 failures within 15 min -> 15 min lock)."""
+        if not username:
+            return ""
+        try:
+            import datetime as _dt
+            now_dt = _dt.datetime.now(_dt.timezone.utc)
+            now = _utc_now()
+            with self._write_lock:
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT failures, first_failure_utc FROM login_lockouts WHERE LOWER(username) = LOWER(?)",
+                        (str(username),),
+                    ).fetchone()
+                    failures, first = (int(row[0] or 0), str(row[1] or "")) if row else (0, "")
+                    window_open = False
+                    if first:
+                        try:
+                            f_dt = _dt.datetime.fromisoformat(first.replace("Z", "+00:00"))
+                            if f_dt.tzinfo is None:
+                                f_dt = f_dt.replace(tzinfo=_dt.timezone.utc)
+                            window_open = (now_dt - f_dt).total_seconds() < self.LOCKOUT_WINDOW_S
+                        except Exception:
+                            window_open = False
+                    failures = failures + 1 if window_open else 1
+                    first = first if window_open else now
+                    locked_until = ""
+                    if failures >= self.LOCKOUT_THRESHOLD:
+                        locked_until = (now_dt + _dt.timedelta(seconds=self.LOCKOUT_DURATION_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        failures = 0
+                        first = ""
+                    conn.execute(
+                        "INSERT INTO login_lockouts(username, failures, first_failure_utc, locked_until_utc, updated_utc) "
+                        "VALUES(?,?,?,?,?) ON CONFLICT(username) DO UPDATE SET failures=excluded.failures, "
+                        "first_failure_utc=excluded.first_failure_utc, locked_until_utc=excluded.locked_until_utc, "
+                        "updated_utc=excluded.updated_utc",
+                        (str(username), failures, first, locked_until, now),
+                    )
+                    conn.commit()
+            return locked_until
+        except Exception:
+            return ""
+
+    def clear_failed_attempts(self, username: str) -> None:
+        try:
+            with self._write_lock:
+                with self._connect() as conn:
+                    conn.execute("DELETE FROM login_lockouts WHERE LOWER(username) = LOWER(?)", (str(username or ""),))
                     conn.commit()
         except Exception:
             pass

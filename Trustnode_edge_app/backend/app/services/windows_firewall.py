@@ -103,7 +103,7 @@ def _add_rule(exe_path: str) -> tuple[bool, str]:
                 "protocol=TCP",
                 f"program={exe_path}",
                 "enable=yes",
-                "profile=any",
+                "profile=private,domain",  # 2026-08-21: never open the listener on Public networks
                 "description=Allow TrustNode local backend (Lite + control APIs).",
             ],
             capture_output=True,
