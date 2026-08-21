@@ -1413,6 +1413,88 @@ export async function getRetentionRuns(limit = 20) {
   return res.json();
 }
 
+/* ---------------------------------------------------------------------------
+   Retention / storage / backups v2 (operator 2026-08-21).
+   Tiered retention engine — see docs/historian-retention-and-forwarding-
+   architecture-2026-08-21.md. All mutating calls are admin-only on the server
+   and return 403 for anyone else, so the UI must gate its controls too.
+   --------------------------------------------------------------------------- */
+async function _retentionCall(path, { method = "GET", body } = {}) {
+  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store${path}`, {
+    method,
+    ...(body !== undefined
+      ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+      : {}),
+  });
+  if (!res.ok) {
+    // The server sends an operator-readable sentence in `detail` for both the
+    // 422 validation errors and the 403 admin gate — surface it verbatim.
+    let detail = "";
+    try {
+      const data = await res.json();
+      detail = typeof data?.detail === "string" ? data.detail : JSON.stringify(data?.detail || "");
+    } catch (_) { /* non-JSON body */ }
+    throw new Error(detail || `Request failed (${res.status})`);
+  }
+  return res.json();
+}
+
+export async function getRetentionStatus() {
+  return _retentionCall("/retention/v2/status");
+}
+export async function getRetentionOptions() {
+  return _retentionCall("/retention/v2/options");
+}
+export async function listRetentionPolicies() {
+  return _retentionCall("/retention/v2/policies");
+}
+export async function saveRetentionPolicyV2(policy) {
+  return _retentionCall("/retention/v2/policies", { method: "PUT", body: policy });
+}
+export async function activateRetentionPolicy(policyId) {
+  return _retentionCall(`/retention/v2/policies/${encodeURIComponent(policyId)}/activate`, { method: "POST" });
+}
+export async function deactivateRetentionPolicy() {
+  return _retentionCall("/retention/v2/deactivate", { method: "POST" });
+}
+export async function deleteRetentionPolicy(policyId) {
+  return _retentionCall(`/retention/v2/policies/${encodeURIComponent(policyId)}`, { method: "DELETE" });
+}
+export async function estimateRetentionPolicy(policy) {
+  return _retentionCall("/retention/v2/estimate", { method: "POST", body: policy });
+}
+export async function runRetentionV2(dryRun = true, force = false) {
+  return _retentionCall("/retention/v2/run", { method: "POST", body: { dry_run: dryRun, force } });
+}
+export async function getRetentionRunsV2(limit = 25) {
+  return _retentionCall(`/retention/v2/runs?limit=${encodeURIComponent(String(limit))}`);
+}
+export async function compactDatabase() {
+  return _retentionCall("/retention/v2/compact", { method: "POST" });
+}
+export async function cancelDatabaseCompaction() {
+  return _retentionCall("/retention/v2/compact/cancel", { method: "POST" });
+}
+export async function listBackupsV2(limit = 200) {
+  return _retentionCall(`/backups/v2?limit=${encodeURIComponent(String(limit))}`);
+}
+export async function createBackupV2(kind = "config", label = "") {
+  return _retentionCall("/backups/v2/create", { method: "POST", body: { kind, label } });
+}
+export async function restoreBackupV2(filename) {
+  return _retentionCall("/backups/v2/restore", { method: "POST", body: { filename } });
+}
+export async function cancelBackupRestore() {
+  return _retentionCall("/backups/v2/restore/cancel", { method: "POST" });
+}
+export async function deleteBackupV2(filename) {
+  return _retentionCall(`/backups/v2/${encodeURIComponent(filename)}`, { method: "DELETE" });
+}
+// Absolute URL so the download works from the desktop app (file:// origin).
+export function backupDownloadUrl(filename) {
+  return `${getAppStoreApiBase()}/api/app-store/backups/v2/${encodeURIComponent(filename)}/download`;
+}
+
 export async function getAppStoreBackups(limit = 200) {
   const res = await fetchWithTimeout(
     `${getAppStoreApiBase()}/api/app-store/backups?limit=${encodeURIComponent(String(limit))}`

@@ -162,6 +162,17 @@ def _build_scope_key(request: Request, bootstrap_hint: Dict[str, Any] | None = N
     return f"{tenant_id}|{customer_id or '-'}|{edge_id}|{username}"
 
 
+def _require_admin(request: Request) -> str:
+    """Operator 2026-08-21: these routes could delete the entire historian, and
+    were gated in the BROWSER only — any authenticated viewer could call them
+    directly. Same shape as routers/workspace.py:_require_admin."""
+    payload = getattr(request.state, "user_payload", None) or {}
+    role = str(payload.get("role") or "").strip().lower()
+    if role != "admin":
+        raise _HTTPException_rs(status_code=403, detail="admin role required")
+    return str(payload.get("sub") or payload.get("username") or "admin")
+
+
 class DomainSaveRequest(BaseModel):
     domain: str
     payload: Any
@@ -729,14 +740,27 @@ def get_retention_policy() -> dict:
 
 
 @router.put("/retention/policy")
-def set_retention_policy(payload: RetentionPolicyPayload) -> dict:
+def set_retention_policy(payload: RetentionPolicyPayload, request: Request) -> dict:
+    _require_admin(request)
     policy = app_store.set_retention_policy(payload.model_dump())
     return {"ok": True, "policy": policy}
 
 
 @router.post("/retention/run")
-def run_retention(payload: RetentionRunRequest) -> dict:
-    return app_store.run_retention(dry_run=payload.dry_run, actor=payload.actor)
+def run_retention(payload: RetentionRunRequest, request: Request) -> dict:
+    """Legacy endpoint. Delegates to the retention engine so the old button in
+    the UI does the CORRECT thing (rollup-then-prune with safety floors) instead
+    of the legacy job that deleted raw without ever aggregating it."""
+    actor = _require_admin(request)
+    try:
+        from app.services.retention_engine import get_engine
+        engine = get_engine()
+        if engine is not None:
+            return {"ok": True, "delegated": "retention_v2",
+                    "summary": engine.run_once(reason=f"legacy:{actor}", dry_run=payload.dry_run)}
+    except Exception as exc:
+        return {"ok": False, "message": f"Retention engine unavailable: {exc}"}
+    return {"ok": False, "message": "Retention engine unavailable."}
 
 
 @router.get("/retention/runs")
@@ -750,22 +774,26 @@ def get_backups(limit: int = 200) -> dict:
 
 
 @router.post("/backups/create")
-def create_backup(payload: BackupCreateRequest) -> dict:
+def create_backup(request: Request, payload: BackupCreateRequest) -> dict:
+    _require_admin(request)
     return app_store.create_backup(actor=payload.actor, label=payload.label)
 
 
 @router.post("/backups/restore")
-def restore_backup(payload: BackupRestoreRequest) -> dict:
+def restore_backup(request: Request, payload: BackupRestoreRequest) -> dict:
+    _require_admin(request)
     return app_store.restore_backup(filename=payload.filename, actor=payload.actor)
 
 
 @router.delete("/backups/{filename}")
-def delete_backup(filename: str) -> dict:
+def delete_backup(filename: str, request: Request) -> dict:
+    _require_admin(request)
     return app_store.delete_backup(filename=filename)
 
 
 @router.post("/cleanup-data")
-def cleanup_data(payload: CleanupDataRequest) -> dict:
+def cleanup_data(request: Request, payload: CleanupDataRequest) -> dict:
+    _require_admin(request)
     return app_store.cleanup_data(mode=payload.mode, actor=payload.actor)
 
 
@@ -990,5 +1018,6 @@ def clear_edge_ingest_queue(payload: ClearEdgeIngestQueueRequest) -> dict:
 
 
 @router.post("/reset/full")
-def reset_full(payload: FullResetRequest) -> dict:
+def reset_full(request: Request, payload: FullResetRequest) -> dict:
+    _require_admin(request)
     return app_store.reset_all_data_and_config(actor=payload.actor, clear_cloud_data=payload.clear_cloud_data)

@@ -12,7 +12,7 @@ import math
 from urllib.parse import quote_plus
 from datetime import timedelta
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.tenant import get_current_tenant, normalize_tenant_id
 
@@ -988,6 +988,15 @@ class AppStore:
             base = os.path.join(data_dir, "trustnode_app_store.db")
         base = os.path.abspath(base)
         os.makedirs(os.path.dirname(base), exist_ok=True)
+        # Operator 2026-08-21 (retention/backup): a staged restore or a
+        # compacted copy is swapped in HERE, because resolving the path is the
+        # last moment in the process where nothing has the database open yet.
+        # Never raises: a failed swap must still leave a bootable app.
+        try:
+            from app.services.retention_engine import apply_pending_db_swap
+            apply_pending_db_swap(base)
+        except Exception as _exc:  # pragma: no cover - defensive
+            print(f"[trustnode] WARN: pending db swap check failed: {_exc}", flush=True)
         return base
 
     def _get_backup_dir(self) -> str:
@@ -5360,16 +5369,21 @@ class AppStore:
         first_delay = 30  # 30 s — long enough for uvicorn to be serving
         self._stop_event.wait(timeout=first_delay)
         while not self._stop_event.is_set():
-            try:
-                policy = self.get_retention_policy()
-                if policy.get("enabled"):
-                    # Avoid overlapping runs.
-                    self.run_retention(dry_run=False, actor="scheduler")
-                    sleep_s = max(60, int(policy.get("schedule_minutes", 60)) * 60)
-                else:
-                    sleep_s = 60
-            except Exception:
-                sleep_s = 60
+            # Operator 2026-08-21: this loop NO LONGER runs retention.
+            #
+            # The legacy job was measured destroying history on a live edge: in
+            # 706 scheduled runs it produced ZERO rollup rows (its rollup window
+            # `[minute_cutoff, raw_cutoff)` is empty whenever minute_keep ==
+            # raw_keep) while still deleting raw readings, its 50k-row cap could
+            # not keep up with ingest, and it held the GLOBAL self._lock while
+            # scanning a multi-GB table 30 s after boot — which is what stalled
+            # /api/health and produced the "backend did not respond" splash.
+            #
+            # Retention now lives in services/retention_engine.py: tiered
+            # rollups, watermark-guarded deletes, paced batches, its own
+            # connection, and it never takes this lock. This thread keeps only
+            # the cheap WAL hygiene below.
+            sleep_s = 60
             # Keep the WAL small regardless of retention. An un-checkpointed WAL
             # (seen at 5.3 MB / 941 pages) makes every read page through it and
             # lets it grow without bound. A PASSIVE checkpoint never blocks
@@ -5379,6 +5393,39 @@ class AppStore:
             except Exception:
                 pass
             self._stop_event.wait(timeout=sleep_s)
+
+    def cloud_forward_cursor_ms(self) -> Optional[int]:
+        """Timestamp (ms) of the newest historian row the cloud mirror has taken.
+
+        The retention engine refuses to delete raw rows past this point, so a
+        cloud outage can never turn into permanent data loss (invariant I1).
+        Returns None when no cloud target is configured — then there is nothing
+        to wait for. Uses its own short-lived connection: never this class's lock.
+        """
+        try:
+            target = self._get_cloud_database_target()
+        except Exception:
+            target = None
+        if not target:
+            return None
+        try:
+            con = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=3.0)
+            try:
+                con.execute("PRAGMA busy_timeout=3000")
+                row = con.execute("SELECT last_historian_id FROM data_sync_state WHERE id=1").fetchone()
+                last_id = int(row[0]) if row and row[0] is not None else 0
+                if last_id <= 0:
+                    return 0  # nothing forwarded yet -> hold everything
+                ts = con.execute("SELECT ts_utc FROM historian_readings WHERE id<=? ORDER BY id DESC LIMIT 1",
+                                 (last_id,)).fetchone()
+                if not ts or not ts[0]:
+                    return None
+            finally:
+                con.close()
+        except Exception:
+            return None
+        from app.services.retention_engine import _sql_ts_to_ms
+        return _sql_ts_to_ms(str(ts[0]))
 
     def _checkpoint_wal_passive(self) -> None:
         """PRAGMA wal_checkpoint(PASSIVE) — reclaim WAL frames without ever
@@ -5393,6 +5440,9 @@ class AppStore:
             pass
 
     def get_retention_policy(self) -> Dict[str, Any]:
+        # NOTE: superseded by services/retention_engine.py (see the comment in
+        # _retention_scheduler_loop). Kept so the legacy endpoint keeps
+        # answering; the value is no longer acted on by any scheduler.
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute("SELECT * FROM retention_policy WHERE id = 1").fetchone()
@@ -5528,8 +5578,25 @@ class AppStore:
         filename = f"trustnode_app_store_{stamp}{suffix}.db"
         backup_dir = self._get_backup_dir()
         backup_path = os.path.join(backup_dir, filename)
-        with self._lock:
-            shutil.copy2(self._db_path, backup_path)
+        # Operator 2026-08-21: was `shutil.copy2` of the LIVE database while the
+        # PLC writer held a transaction — it copied the .db but never the -wal,
+        # so the "backup" could be torn, and it held self._lock for the whole
+        # multi-GB copy. SQLite's online backup API is consistent by design and
+        # yields between page batches, so collection keeps its cadence.
+        try:
+            src_conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=30.0)
+            try:
+                dst_conn = sqlite3.connect(backup_path)
+                try:
+                    src_conn.backup(dst_conn, pages=2048, sleep=0.02)
+                finally:
+                    dst_conn.close()
+            finally:
+                src_conn.close()
+        except Exception:
+            # Last resort only: a file copy is better than no backup at all.
+            with self._lock:
+                shutil.copy2(self._db_path, backup_path)
         # Operator 2026-06-18: backup retention. Customer's C: drive
         # filled to 100% (0.1 GB free) because 132 backups of ~2.4 GB
         # each accumulated unbounded over 4 months — the EXE build then

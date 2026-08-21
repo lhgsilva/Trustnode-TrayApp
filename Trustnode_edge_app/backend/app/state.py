@@ -10,6 +10,7 @@ from app.services.telemetry_service import TelemetryService
 from app.services.ingest_store import IngestStore
 from app.services.power_manager import PowerManager
 from app.services.reports_store import ReportsStore
+from app.services.retention_engine import RetentionEngine, set_engine as _set_retention_engine
 from app.services.report_renderer import render_template_to_pdf
 from app.services.report_scheduler import ReportRunner, ReportScheduler
 from app.services.lite_report_poller import LiteReportRequestPoller
@@ -77,6 +78,68 @@ control_plane_store = _build_control_plane_store()
 print("[trustnode][boot] state: ControlPlaneStore ready, instantiating ReportsStore", flush=True)
 reports_store = ReportsStore()
 print("[trustnode][boot] state: ReportsStore ready", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Retention engine (operator 2026-08-21). Constructed here so the API can reach
+# it, but it does NOT start work until app.main's deferred startup calls
+# .start() — and even then it waits out RETENTION_BOOT_DELAY_S plus the health
+# gate, so maintenance can never compete with boot.
+# ---------------------------------------------------------------------------
+def _retention_boot_ready() -> bool:
+    """True once /api/health has actually answered a request."""
+    try:
+        from app.routers.health import first_health_served_age_s
+        return first_health_served_age_s() is not None
+    except Exception:
+        return True
+
+
+def _retention_tag_stats() -> dict[str, Any]:
+    """Tag count + poll interval from the RUNNING gateways (in-memory, no lock),
+    so the storage estimate reflects this machine rather than a guess."""
+    try:
+        statuses = plc_manager.list_gateway_statuses() or []
+    except Exception:
+        statuses = []
+    tags = 0
+    interval_ms = 0
+    running = 0
+    for st in statuses:
+        data = st if isinstance(st, dict) else getattr(st, "__dict__", {}) or {}
+        try:
+            n = len(data.get("tags") or [])
+        except Exception:
+            n = 0
+        tags += n
+        try:
+            iv = int(data.get("interval_ms") or 0)
+        except Exception:
+            iv = 0
+        if iv > 0:
+            interval_ms = iv if interval_ms == 0 else min(interval_ms, iv)
+        if data.get("running"):
+            running += 1
+    if tags <= 0:
+        return {}
+    return {
+        "tag_count": tags,
+        "interval_s": (interval_ms / 1000.0) if interval_ms else 1.0,
+        "gateways": len(statuses),
+        "gateways_running": running,
+        "source": "gateways",
+    }
+
+
+retention_engine = RetentionEngine(
+    app_store._db_path,
+    backup_dir_fn=app_store._get_backup_dir,
+    boot_ready_fn=_retention_boot_ready,
+    cloud_cursor_fn=app_store.cloud_forward_cursor_ms,
+    tag_stats_fn=_retention_tag_stats,
+)
+_set_retention_engine(retention_engine)
+print("[trustnode][boot] state: retention engine constructed (idle until deferred start)", flush=True)
 
 # cp_users puller is created lazily on startup (main.py) once app_settings
 # are loaded — we need the cloud URL + tenant from the bootstrap config.

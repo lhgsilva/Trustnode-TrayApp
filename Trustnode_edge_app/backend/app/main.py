@@ -471,6 +471,14 @@ def _lite_view_resolve(token: str):
 app.include_router(reports_router)
 app.include_router(historian_export_router)
 app.include_router(workspace_router)
+# Retention / storage / backup API (operator 2026-08-21). Admin-gated in
+# the router itself; shares the /api/app-store prefix on purpose so the
+# frontend keeps one base URL.
+try:
+    from app.routers.retention import router as retention_router
+    app.include_router(retention_router)
+except Exception as _exc:  # pragma: no cover - never block boot on it
+    print(f"[trustnode][boot] retention router mount skipped: {_exc!r}", flush=True)
 
 # Operator 2026-06-23: Batch Management & Traceability module. Always
 # mounted — every endpoint inside the router is individually gated by
@@ -1029,6 +1037,15 @@ async def _deferred_startup() -> None:
             print(f"[trustnode][boot] activation mirrored to registry: hive={mirror.get('hive')}", flush=True)
     except Exception:
         pass
+    # Retention engine LAST: it is the only subsystem that may delete data, so
+    # it starts after everything else is up. It then waits out its own boot
+    # delay + health gate before the first pass (see retention_engine.I4).
+    try:
+        from app.state import retention_engine as _retention
+        _retention.start()
+    except Exception as exc:
+        print(f"[trustnode][boot] retention engine failed to start: {exc!r}", flush=True)
+
     print(f"[trustnode][boot] deferred init complete +{_boot_clock.age_s():.1f}s after process start", flush=True)
 
 
@@ -1591,6 +1608,11 @@ async def websocket_cloud_stream(websocket: WebSocket) -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    try:
+        from app.state import retention_engine as _retention
+        _retention.stop()
+    except Exception:
+        pass
     try:
         report_scheduler.stop()
     except Exception:

@@ -352,6 +352,40 @@ def _outbox_pending():
         con.close()
 
 
+retention_samples: list = []
+
+
+async def retention_task(stop_at: float) -> None:
+    """Retention health (operator 2026-08-21).
+
+    Guards what the tiered engine must hold on a RUNNING build: every configured
+    level keeps being materialised, raw does not outgrow its window, and no level
+    reports an error. With no policy active it records that fact — an edge
+    without retention is a valid (if growing) configuration, not a failure.
+    """
+    while time.time() < stop_at:
+        try:
+            st, _rtt = api_get("/api/app-store/retention/v2/status")
+            if isinstance(st, dict) and st.get("status"):
+                s = st["status"]
+                retention_samples.append({
+                    "t": time.time(),
+                    "policy": (s.get("policy") or {}).get("name"),
+                    "levels": [{"key": l.get("key"), "rows": l.get("rows"),
+                                "lag_s": l.get("lag_s"), "keep": l.get("keep"),
+                                "err": l.get("last_error")}
+                               for l in (s.get("levels") or [])],
+                    "db_bytes": (s.get("database") or {}).get("size_bytes"),
+                    "raw_rows": (s.get("database") or {}).get("raw_rows"),
+                    "oldest_raw": (s.get("database") or {}).get("oldest_raw_utc"),
+                    "cleanup": s.get("cleanup") or {},
+                    "engine_running": (s.get("engine") or {}).get("running"),
+                })
+                emit({"kind": "retention", **retention_samples[-1]})
+        except Exception:
+            pass
+        await sleep_bounded(120, stop_at)
+
 async def outbox_task(stop_at: float) -> None:
     while time.time() < stop_at:
         try:
@@ -555,6 +589,48 @@ def build_summary(t0: float, final: bool) -> str:
     for ln in _boot.summary_lines(boot_metrics):
         A(ln)
 
+    # ---- retention --------------------------------------------------------
+    ret_ok = True
+    ret_note = ""
+    if retention_samples:
+        first, last = retention_samples[0], retention_samples[-1]
+        A("")
+        A("[RETENTION]")
+        if not last.get("policy"):
+            A("  no active policy - history is kept in full (nothing is deleted)")
+            ret_note = "no policy"
+        else:
+            A(f"  policy: {last['policy']}")
+        for lv in last.get("levels") or []:
+            grew = ""
+            for f in first.get("levels") or []:
+                if f.get("key") == lv.get("key") and f.get("rows") is not None:
+                    grew = f"  (+{int(lv.get('rows') or 0) - int(f.get('rows') or 0):,} this run)"
+                    break
+            lag = lv.get("lag_s")
+            lag_txt = ("%.0fs" % lag) if lag is not None else "-"
+            A(f"  {str(lv.get('key')):>7}: rows={int(lv.get('rows') or 0):>10,}"
+              f" keep={str(lv.get('keep') or '-'):>6} lag={lag_txt:>8}{grew}")
+            if lv.get("err"):
+                A(f"           ERROR: {lv['err']}")
+                ret_ok = False
+        cl = last.get("cleanup") or {}
+        if cl.get("pending_rows"):
+            held = (" (" + str(cl.get("held_by")) + ")") if cl.get("held_by") else ""
+            A(f"  cleanup in progress: {int(cl['pending_rows']):,} readings still to remove{held}")
+        db0, db1 = first.get("db_bytes") or 0, last.get("db_bytes") or 0
+        if db0 and db1:
+            A(f"  database: {db0/1e9:.2f} GB -> {db1/1e9:.2f} GB")
+        if last.get("engine_running") is False:
+            A("  engine NOT running")
+            ret_ok = False
+        for lv in last.get("levels") or []:
+            if lv.get("key") == "raw":
+                continue
+            if last.get("policy") and (lv.get("rows") or 0) == 0 and lv.get("lag_s") is None:
+                A(f"  level {lv.get('key')} has never been built")
+                ret_ok = False
+
     # verdict
     A("\n[VERDICT vs SLOs]")
     ok = True
@@ -573,6 +649,10 @@ def build_summary(t0: float, final: bool) -> str:
         f95 = pct([l for _, l in db_lags], .95)
         A(f"  historian p95 <5s        : {'PASS' if f95 < 5 else 'FAIL'} ({f95:.1f}s)")
         ok &= f95 < 5
+    if retention_samples:
+        A(f"  retention healthy        : {'PASS' if ret_ok else 'FAIL'}"
+          f"{(' (' + ret_note + ')') if ret_note else ''}")
+        ok &= ret_ok
     stall_n = cats.get("stall", 0)
     A(f"  zero stall/wedge events  : {'PASS' if stall_n == 0 else f'FAIL ({stall_n})'}")
     ok &= stall_n == 0
@@ -612,7 +692,8 @@ async def main() -> int:
     await asyncio.gather(
         ws_task(stop_at), db_task(stop_at), api_task(stop_at),
         cloud_task(stop_at), resources_task(stop_at), outbox_task(stop_at),
-        modules_task(stop_at), log_task(stop_at), partial_task(t0, stop_at),
+        modules_task(stop_at), log_task(stop_at), retention_task(stop_at),
+        partial_task(t0, stop_at),
     )
     report = build_summary(t0, final=True)
     with open(REPORT, "w", encoding="utf-8") as f:

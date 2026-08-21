@@ -1,7 +1,39 @@
 # TrustNode Edge — Historian Retention, Tiered Rollups, Backup & Forwarding
 
 **Research report + target architecture + rollout plan**
-Date: 2026-08-21 · Status: PROPOSAL (no code changed) · Scope: edge backend (`backend/app`), frontend Backup & Retention page, remote/cloud sinks, release gate
+Date: 2026-08-21 · Status: **PHASES 0–3 IMPLEMENTED** (local engine, API, UI, gate) · Scope: edge backend (`backend/app`), frontend Backup & Retention page, remote/cloud sinks, release gate
+
+---
+
+## IMPLEMENTATION STATUS — 2026-08-21
+
+**Shipped in this change (local historian):**
+
+| Piece | Where |
+|---|---|
+| Tiered retention engine — policy model + validation, unified rollup table, hierarchical composition, watermark-guarded pruning, paced/adaptive batches, maintenance window, disk guard, online backups, compaction, status | `backend/app/services/retention_engine.py` (2.1k lines) |
+| Admin-gated API (policies CRUD/activate, status, estimate, run, runs, compact, backups create/list/restore/cancel/delete/download) | `backend/app/routers/retention.py` |
+| Server-side admin gate added to the LEGACY retention/backup/cleanup/**reset** routes (defect D8 — they were browser-gated only) | `backend/app/routers/app_store.py` |
+| Legacy scheduler retired (kept for WAL hygiene only); legacy `POST /retention/run` now delegates to the engine; `create_backup` switched to SQLite's online backup API; boot-time staged restore/compaction swap; cloud forward cursor for prune safety | `backend/app/services/app_store.py` |
+| Engine construction + lifecycle (starts LAST in deferred init, stops first on shutdown) | `backend/app/state.py`, `backend/app/main.py` |
+| Backup & Retention UI — storage status, policy list + editor with live cost estimate, backups by class, maintenance history | `frontend/src/components/Retention/RetentionPanel.jsx` (replaces 3 legacy cards in `App.jsx`) |
+| API helpers | `frontend/src/api.js` |
+| Correctness suite (76 checks) | `scripts/test_retention_engine.py` |
+| Release-gate probe + `[RETENTION]` section + `retention healthy` SLO | `scripts/validate_full_12h.py` |
+
+**Verification performed:**
+- **76/76** correctness checks — rollup matches a plain-Python reference exactly; `rollup(raw→1h) == rollup(rollup(raw→1m)→1h)`; idempotent; prune floors hold against rollup **and** cloud watermarks; backups valid/classified; estimator arithmetic; "no policy ⇒ nothing deleted".
+- **30/30** live HTTP checks against a running backend on a **copy of the real 8 GB / 8.06M-row production database**: boot, admin gate (403 for non-admin), validation 422 with readable text, estimate, save+activate, dry-run writes nothing, backups (21.7 MB settings backup in ~1 s vs. the legacy 8 GB file copy), download through the API, staged restore + cancel, legacy delegation, autonomous level building, health unaffected.
+- **End-to-end on real data**: all three levels built (135,792 × 1-min, 10,176 × 15-min, 2,832 × 1-h buckets, 8,593 text events), values cross-checked against surviving raw rows, `PRAGMA quick_check` ok, aggregated history reaches back to the original first reading, text tags (batch IDs) preserved.
+- Frontend builds clean (874 modules, exit 0).
+
+**Defect found and fixed by testing on real data:** deletes had no `ORDER BY`, so SQLite walked the `(tenant_id, ts_utc DESC)` index in its natural order and removed rows from the **middle** of the window — an interrupted catch-up left 07-27…07-30 intact while 08-18…08-20 were gone. Now `ORDER BY ts_utc ASC` (identical query plan, zero cost) keeps raw a contiguous recent window; regression test `[5b]` covers it.
+
+**Deliberately NOT included yet (Phases 4–5):** forwarding modes to LAN/cloud targets (`raw` / `raw_and_rollups` / `rollups_only`), remote retention execution, Postgres monthly partitions, the transparent tier-serving query router for dashboards/reports, and the slim raw schema / monthly partition files. The engine is local-only today; the cloud forward cursor is already honoured so nothing can be deleted before the cloud has taken it.
+
+**Defaults on upgrade:** no policy is active, so **nothing is ever deleted** until an admin chooses one. The legacy broken policy is not imported as active. Daily settings backups (small) run regardless.
+
+---
 
 > Companion to `docs/collection-engine-research-and-plan.md` (2026-07-25). Same method: measure the running system first, name every defect with a file:line, borrow the patterns the historian industry already converged on, then change the app in soak-gated phases that never put collection at risk.
 

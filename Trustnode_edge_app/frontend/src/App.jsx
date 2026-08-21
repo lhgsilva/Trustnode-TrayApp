@@ -13,6 +13,7 @@ import { BatchesPage, BatchTypesPage, BatchAuditPage } from "./components/BatchM
 import { BatchOverviewV2Page, BatchDefinitionsV2Page, BatchAnalysisV2Page } from "./components/BatchManagement/BatchManagementV2";
 // Developer-admin: deployment endpoints (single source of truth for re-hosting).
 import InfrastructureEndpoints from "./components/ControlPlane/InfrastructureEndpoints";
+import RetentionPanel from "./components/Retention/RetentionPanel";
 import {
   getHealth,
   getBootProbe,
@@ -22645,18 +22646,17 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "backup_and_retention" ? (
             <>
-              <section className="card">
-                <div className="table db-overview-table">
-                  <div className="thead"><span>Backup Targets</span><span>Snapshots</span><span>Scheduler</span><span>Retention</span><span>Last Run</span></div>
-                  <div className="trow">
-                    <span>{otherDatabaseRows.length}</span>
-                    <span>{backupRows.length}</span>
-                    <span>{retentionPolicy.enabled ? "ENABLED" : "DISABLED"}</span>
-                    <span>{`Raw ${Number(retentionPolicy.raw_keep_days || 7)}d | Min ${Number(retentionPolicy.minute_keep_days || 30)}d`}</span>
-                    <span>{retentionRuns?.[0]?.run_utc || "-"}</span>
-                  </div>
-                </div>
-              </section>
+              {/* Operator 2026-08-21: storage status, the tiered retention
+                  policy editor, and backups now live in one component
+                  (components/Retention/RetentionPanel.jsx) backed by
+                  services/retention_engine.py. It replaces the old summary
+                  strip, the Snapshot Backups card and the "Retention and
+                  Cleanup Policy" card — the latter drove a job that deleted
+                  raw history without ever aggregating it. */}
+              <RetentionPanel
+                canEdit={canEditPage("backup_and_retention")}
+                isAdmin={isAdminDatabaseUser}
+              />
 
               <section className="card db-simple-card">
                 <div className="db-simple-head">
@@ -22743,124 +22743,7 @@ const getGatewayHealth = (gateway) => {
                 </div>
               </section>
 
-              <section className="card">
-                <div className="row backup-card-header">
-                  <h3 className="card-title">Snapshot Backups</h3>
-                  <div className="row">
-                    <button className="btn btn-primary icon-text-btn" onClick={runCreateBackup} disabled={!canEditPage("backup_and_retention") || backupBusy}>
-                      <AddIcon />
-                      <span>{backupBusy ? "Working..." : "Create Snapshot"}</span>
-                    </button>
-                    <button
-                      className="btn btn-success"
-                      onClick={() => runRestoreBackup(selectedBackupFilename)}
-                      disabled={!canEditPage("backup_and_retention") || backupBusy || !selectedBackupFilename}
-                    >
-                      Restore Selected
-                    </button>
-                  </div>
-                </div>
-                <div className="table backup-files-table">
-                  <div className="thead"><span>Select</span><span>Created</span><span>File</span><span>Size</span><span>Actions</span></div>
-                  {backupRows.map((b) => (
-                    <div key={`bk-${b.filename}`} className="trow">
-                      <span className="db-cell">
-                        <input
-                          type="radio"
-                          name="backup-selected"
-                          checked={selectedBackupFilename === b.filename}
-                          onChange={() => setSelectedBackupFilename(b.filename)}
-                        />
-                      </span>
-                      <span className="db-cell">{b.modified_utc ? fmtTs(b.modified_utc) : "-"}</span>
-                      <span className="db-cell" title={b.path || b.filename}>{b.filename}</span>
-                      <span className="db-cell">{Number(b.size_bytes || 0).toLocaleString()} bytes</span>
-                      <span className="row-actions db-actions-cell">
-                        <button className="icon-btn table-action-btn" onClick={() => runDownloadBackup(b)} title="Download backup"><CsvIcon /></button>
-                        <button className="icon-btn table-action-btn danger" onClick={() => runDeleteBackup(b.filename)} disabled={!canEditPage("backup_and_retention") || backupBusy} title="Delete backup"><DeleteIcon /></button>
-                      </span>
-                    </div>
-                  ))}
-                  {!backupRows.length ? (
-                    <div className="trow">
-                      <span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">No backups created yet</span><span className="db-cell">-</span><span className="db-cell">-</span>
-                    </div>
-                  ) : null}
-                </div>
-                {backupResult ? <div className={backupResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 10 }}>{backupResult}</div> : null}
-              </section>
 
-              <section className="card">
-                <div className="row backup-card-header">
-                  <h3 className="card-title">Retention and Cleanup Policy</h3>
-                  <div className="row">
-                    <button className="btn btn-primary" onClick={saveRetentionPolicy} disabled={!canEditPage("backup_and_retention") || retentionBusy}>Save Policy</button>
-                    <button className="btn btn-success" onClick={() => executeRetentionRun(true)} disabled={!canEditPage("backup_and_retention") || retentionBusy}>Dry Run</button>
-                    <button className="btn btn-danger" onClick={() => executeRetentionRun(false)} disabled={!canEditPage("backup_and_retention") || retentionBusy}>Run Cleanup</button>
-                  </div>
-                </div>
-                <div className="retention-policy-grid">
-                  <label className="remember-row">
-                    <input type="checkbox" checked={Boolean(retentionPolicy.enabled)} onChange={(e) => setRetentionPolicy((p) => ({ ...p, enabled: e.target.checked }))} disabled={!canEditPage("backup_and_retention")} />
-                    <span className="remember-label">Enable scheduler</span>
-                  </label>
-                  <label>
-                    Keep PLC Tag Data
-                    <select value={retentionPresetKey} onChange={(e) => applyRetentionPreset(e.target.value)} disabled={!canEditPage("backup_and_retention")}>
-                      <option value="hour">Last hour</option>
-                      <option value="day">Last day</option>
-                      <option value="week">Last week</option>
-                      <option value="month">Last month</option>
-                    </select>
-                  </label>
-                  <label>Schedule (minutes)<input type="number" min="5" value={retentionPolicy.schedule_minutes} onChange={(e) => setRetentionPolicy((p) => ({ ...p, schedule_minutes: Number(e.target.value || 60) }))} disabled={!canEditPage("backup_and_retention")} /></label>
-                  <label>Keep Raw (days)<input type="number" min="1" value={retentionPolicy.raw_keep_days} onChange={(e) => setRetentionPolicy((p) => ({ ...p, raw_keep_days: Number(e.target.value || 7) }))} disabled={!canEditPage("backup_and_retention")} /></label>
-                  <label>Keep Minute (days)<input type="number" min="1" value={retentionPolicy.minute_keep_days} onChange={(e) => setRetentionPolicy((p) => ({ ...p, minute_keep_days: Number(e.target.value || 30) }))} disabled={!canEditPage("backup_and_retention")} /></label>
-                  <label>Keep Hour (days)<input type="number" min="1" value={retentionPolicy.hour_keep_days} onChange={(e) => setRetentionPolicy((p) => ({ ...p, hour_keep_days: Number(e.target.value || 180) }))} disabled={!canEditPage("backup_and_retention")} /></label>
-                  <label>Keep Day (days)<input type="number" min="1" value={retentionPolicy.day_keep_days} onChange={(e) => setRetentionPolicy((p) => ({ ...p, day_keep_days: Number(e.target.value || 730) }))} disabled={!canEditPage("backup_and_retention")} /></label>
-                  <label>Max Deletes / Run<input type="number" min="1000" step="1000" value={retentionPolicy.max_delete_rows_per_run} onChange={(e) => setRetentionPolicy((p) => ({ ...p, max_delete_rows_per_run: Number(e.target.value || 50000) }))} disabled={!canEditPage("backup_and_retention")} /></label>
-                  <label className="remember-row">
-                    <input type="checkbox" checked={Boolean(retentionPolicy.backup_before_cleanup)} onChange={(e) => setRetentionPolicy((p) => ({ ...p, backup_before_cleanup: e.target.checked }))} disabled={!canEditPage("backup_and_retention")} />
-                    <span className="remember-label">Backup before cleanup</span>
-                  </label>
-                  {/* Operator 2026-06-20: sub-day TTLs. When > 0, each
-                      `keep_minutes` overrides the corresponding `keep_days`
-                      above. Leave at 0 to keep the days-based behavior. */}
-                  <div className="gateway-span-2" style={{ fontWeight: 600, marginTop: 8 }}>
-                    Sub-day TTLs (override days when &gt; 0)
-                    <small className="muted" style={{ display: "block", fontWeight: 400, fontSize: 11, marginTop: 2 }}>
-                      Set "Raw (minutes) = 60" to keep raw historian data only for the last hour.
-                      Each minute value, when above 0, overrides its days counterpart.
-                    </small>
-                  </div>
-                  <label>Keep Raw (minutes)<input type="number" min="0" step="10" value={retentionPolicy.raw_keep_minutes || 0} onChange={(e) => setRetentionPolicy((p) => ({ ...p, raw_keep_minutes: Math.max(0, Number(e.target.value || 0)) }))} disabled={!canEditPage("backup_and_retention")} /></label>
-                  <label>Keep Minute (minutes)<input type="number" min="0" step="10" value={retentionPolicy.minute_keep_minutes || 0} onChange={(e) => setRetentionPolicy((p) => ({ ...p, minute_keep_minutes: Math.max(0, Number(e.target.value || 0)) }))} disabled={!canEditPage("backup_and_retention")} /></label>
-                  <label>Keep Hour (minutes)<input type="number" min="0" step="60" value={retentionPolicy.hour_keep_minutes || 0} onChange={(e) => setRetentionPolicy((p) => ({ ...p, hour_keep_minutes: Math.max(0, Number(e.target.value || 0)) }))} disabled={!canEditPage("backup_and_retention")} /></label>
-                  <label>Keep Day (minutes)<input type="number" min="0" step="60" value={retentionPolicy.day_keep_minutes || 0} onChange={(e) => setRetentionPolicy((p) => ({ ...p, day_keep_minutes: Math.max(0, Number(e.target.value || 0)) }))} disabled={!canEditPage("backup_and_retention")} /></label>
-                </div>
-                {retentionResult && retentionResultScope === "global" ? <div className={retentionResult.toLowerCase().includes("failed") ? "error" : "info-note"} style={{ marginTop: 10 }}>{retentionResult}</div> : null}
-                <div className="table retention-runs-table" style={{ marginTop: 12 }}>
-                  <div className="thead"><span>Run Time</span><span>Mode</span><span>Status</span><span>Delete Candidates</span><span>Backup</span></div>
-                  {retentionRuns.map((r) => {
-                    const d = r?.details?.deletes || {};
-                    const backupText = r?.details?.backup_path ? "YES" : (r?.details?.backup_error ? "ERROR" : "-");
-                    return (
-                      <div key={`retention-run-backup-page-${r.id}`} className="trow">
-                        <span className="db-cell">{r.run_utc ? fmtTs(r.run_utc) : "-"}</span>
-                        <span className="db-cell">{r.dry_run ? "DRY" : "EXECUTE"}</span>
-                        <span className="db-cell">{String(r.status || "").toUpperCase()}</span>
-                        <span className="db-cell">{`raw:${d.raw_candidates ?? 0} min:${d.minute_candidates ?? 0} hr:${d.hour_candidates ?? 0} day:${d.day_candidates ?? 0}`}</span>
-                        <span className="db-cell">{backupText}</span>
-                      </div>
-                    );
-                  })}
-                  {!retentionRuns.length ? (
-                    <div className="trow">
-                      <span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">-</span><span className="db-cell">No retention runs yet</span><span className="db-cell">-</span>
-                    </div>
-                  ) : null}
-                </div>
-              </section>
               {/* Operator 2026-06-18: Workspace card. Exposes the
                   data-safety primitives the customer can run without
                   filesystem access: export the whole config + license
