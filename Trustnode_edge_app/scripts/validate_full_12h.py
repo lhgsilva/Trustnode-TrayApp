@@ -698,6 +698,9 @@ async def main() -> int:
     emit({"t": "boot", **{k: v for k, v in boot_metrics.items() if k != "integrity"}})
     _b_ok, _b_lines = _boot.verdict(boot_metrics, BOOT_MAX_HEALTH_MS)
     print("[BOOT HEALTH] " + ("PASS" if _b_ok else "FAIL") + "\n" + "\n".join(_b_lines), flush=True)
+    print(f"validation started {datetime.now(timezone.utc).isoformat()[:19]}Z "
+          f"for {DURATION_S/3600:.1f}h — gateway {GW}", flush=True)
+    get_token()
     try:
         _s_ok, _s_lines, _s_metrics = await asyncio.to_thread(_surf.run, True)
     except Exception as exc:
@@ -705,9 +708,6 @@ async def main() -> int:
     surface_result.update(ok=_s_ok, lines=_s_lines, metrics=_s_metrics)
     emit({"t": "surfaces", "ok": _s_ok, **{k: v for k, v in (_s_metrics or {}).items() if k != "licensed"}})
     print("[SURFACES] " + ("PASS" if _s_ok else "FAIL") + "\n" + "\n".join(_s_lines), flush=True)
-    print(f"validation started {datetime.now(timezone.utc).isoformat()[:19]}Z "
-          f"for {DURATION_S/3600:.1f}h — gateway {GW}", flush=True)
-    get_token()
     await asyncio.gather(
         ws_task(stop_at), db_task(stop_at), api_task(stop_at),
         cloud_task(stop_at), resources_task(stop_at), outbox_task(stop_at),

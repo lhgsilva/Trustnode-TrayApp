@@ -170,7 +170,7 @@ def run(remote: bool = True) -> tuple[bool, list[str], dict]:
         st, b, _ = _call("GET", f"{LAN}/api/plc/gateways/status", token=vtok)
         chk("revoked token refused (401)", st == 401, f"status={st}")
     last = 0
-    for _ in range(6):
+    for _ in range(5):  # 5th failure trips the lockout; keeps total logins under the per-IP limiter (10/min)
         last, _, _, _ = _login(LAN, VIEWER[0], "definitely-wrong-pw")
     chk("lockout after repeated failures (423)", last == 423, f"last={last}")
     _call("POST", f"{API}/api/auth/unlock", token=admin, body={"username": VIEWER[0]})
