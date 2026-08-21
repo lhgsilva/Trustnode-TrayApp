@@ -100,6 +100,16 @@ print('compile-check OK')
         throw "Backend build failed: $exePath not found."
     }
 
+    # Operator 2026-08-21 (BOOT-HEALTH FIX): every build must PROVE the bundled
+    # backend answers /api/health fast on a cold start. The probe runs the EXE
+    # against a throwaway data dir on an ephemeral port (no .env, no cloud) and
+    # fails the build if the first 200 takes longer than the budget.
+    Write-Host "Running backend boot self-test (--boot-probe)..."
+    & $exePath --boot-probe
+    if ($LASTEXITCODE -ne 0) {
+        throw "Backend boot self-test FAILED (exit code: $LASTEXITCODE). /api/health did not come up in time - do not ship this build."
+    }
+
     Write-Host "Backend bundle created: $(Join-Path $backendRoot 'dist\trustnode-service')"
 }
 finally {

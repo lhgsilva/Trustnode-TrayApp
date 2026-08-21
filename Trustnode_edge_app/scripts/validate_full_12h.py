@@ -55,6 +55,14 @@ LOGIN = {"username": os.environ.get("VAL_USER", "admin-mari"),
 DB = os.path.expanduser("~/.trustnode_edge/data/trustnode_app_store.db")
 SF_DB = os.path.expanduser("~/.trustnode_edge/data/trustnode_store_forward.db")
 LOG = os.path.expanduser(r"~\AppData\Roaming\trustnode-edge-desktop\backend.log")
+# Operator 2026-08-21 (BOOT-HEALTH FIX): every gate run also asserts the
+# REAL install's last boot — spawn -> first /api/health 200 within
+# VAL_BOOT_MAX_HEALTH_MS (15 s) and no splash "did not respond" — so the
+# boot regression that hit users on every launch can never ship again.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import boot_log_check as _boot  # noqa: E402
+BOOT_MAX_HEALTH_MS = int(os.environ.get("VAL_BOOT_MAX_HEALTH_MS", "15000"))
+boot_metrics: dict = {}
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation_out")
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -345,6 +353,7 @@ async def log_task(stop_at: float) -> None:
     except Exception:
         return
     pats = [
+        ("boot_fail", re.compile(rb"did not respond|health wait TIMED OUT|BOOT ABORTED|\[boot\]\[health-watchdog\]")),
         ("recovery", re.compile(rb"Splash window created|Backend exited|respawn|first-row|auto-resumed")),
         ("stall", re.compile(rb"stalled \d+s|read-timeout|persist-timeout|event loop stale|cooldown")),
         ("engine", re.compile(rb"engine_v2|v2-dist|v2-writer|v2-reader")),
@@ -477,9 +486,21 @@ def build_summary(t0: float, final: bool) -> str:
     for at, cat, txt in [e for e in log_events if e[1] in ("recovery", "stall")][:25]:
         A(f"  {datetime.fromtimestamp(at, tz=timezone.utc).strftime('%H:%M:%S')}Z [{cat}] {txt[:150]}")
 
+    # boot health (2026-08-21): the last boot block of backend.log vs SLOs
+    A("\n[BOOT HEALTH] (last boot block of backend.log)")
+    for ln in _boot.summary_lines(boot_metrics):
+        A(ln)
+
     # verdict
     A("\n[VERDICT vs SLOs]")
     ok = True
+    b_ok, b_lines = _boot.verdict(boot_metrics, BOOT_MAX_HEALTH_MS)
+    for ln in b_lines:
+        A(ln)
+    ok &= b_ok
+    boot_fail_n = cats.get("boot_fail", 0)
+    A(f"  zero boot failures in run : {'PASS' if boot_fail_n == 0 else f'FAIL ({boot_fail_n})'}")
+    ok &= boot_fail_n == 0
     if n and exp:
         d = n / exp * 100
         A(f"  delivery >=95%           : {'PASS' if d >= 95 else 'FAIL'} ({d:.1f}%)")
@@ -517,6 +538,10 @@ async def main() -> int:
     t0 = time.time()
     stop_at = t0 + DURATION_S
     emit({"t": "start", "duration": DURATION_S, "gw": GW})
+    boot_metrics.update(_boot.analyze_last_boot(LOG))
+    emit({"t": "boot", **{k: v for k, v in boot_metrics.items() if k != "integrity"}})
+    _b_ok, _b_lines = _boot.verdict(boot_metrics, BOOT_MAX_HEALTH_MS)
+    print("[BOOT HEALTH] " + ("PASS" if _b_ok else "FAIL") + "\n" + "\n".join(_b_lines), flush=True)
     print(f"validation started {datetime.now(timezone.utc).isoformat()[:19]}Z "
           f"for {DURATION_S/3600:.1f}h — gateway {GW}", flush=True)
     get_token()

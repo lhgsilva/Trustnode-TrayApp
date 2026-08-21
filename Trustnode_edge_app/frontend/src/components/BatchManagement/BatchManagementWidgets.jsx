@@ -6,14 +6,14 @@
    404 and the widget renders a tiny "(unlicensed)" placeholder
    instead of crashing the dashboard.
 */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   listBatches,
-  createBatch,
-  startBatch,
   stopBatch,
   listBatchSummaries,
+  bmv2ScanBatch,
 } from "../../api";
+import BarcodeScanInput from "./BarcodeScanInput";
 
 
 function _fmt(ts) {
@@ -247,56 +247,57 @@ export function BatchTimelineWidget({ widget }) {
 // A dashboard widget that lets an operator type/scan a batch ID and
 // immediately create + start a batch. Designed for the "barcode scan
 // → batch start" workflow without ever leaving the dashboard.
+/* Operator 2026-07-30: reworked to the v2 scan resolver. The card is JUST the
+   field + Load button — the server decides whether the code starts a batch
+   (barcode-gated definition or ad-hoc) or stops the running one (barcode stop
+   mode). A transient one-line note confirms what happened, then fades so the
+   card returns to field+button only. The field auto-refocuses after a few
+   idle seconds so a keyboard-wedge scanner always lands here. */
 export function BatchInputWidget({ widget }) {
   const cfg = widget?.config || {};
-  const [value, setValue] = useState("");
-  const [batchTypeId, setBatchTypeId] = useState(cfg.batch_type_id || "");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [last, setLast] = useState(null);
+  const [note, setNote] = useState(null); // {tone:"ok"|"err", text}
+  const noteTimerRef = useRef(null);
 
-  const submit = useCallback(async () => {
-    const id = value.trim();
-    if (!id || busy) return;
-    setBusy(true); setError("");
+  const flash = useCallback((tone, text, ms) => {
+    if (noteTimerRef.current) clearTimeout(noteTimerRef.current);
+    setNote({ tone, text });
+    noteTimerRef.current = setTimeout(() => setNote(null), ms || (tone === "err" ? 8000 : 5000));
+  }, []);
+  useEffect(() => () => { if (noteTimerRef.current) clearTimeout(noteTimerRef.current); }, []);
+
+  const submit = useCallback(async (code) => {
+    if (busy) return;
+    setBusy(true);
     try {
-      const created = await createBatch({
-        identifier: id,
-        identifier_method: "manual",
-        batch_type_id: batchTypeId || undefined,
-        source: "dashboard",
+      const out = await bmv2ScanBatch({
+        barcode: code,
+        definition_id: cfg.definition_id || undefined,
       });
-      const started = await startBatch(created.id, {});
-      setLast(started);
-      setValue("");
+      const row = out?.row || {};
+      const label = row.reference || row.id || code;
+      if (out?.action === "stopped") flash("ok", `Stopped ${label}`);
+      else if (out?.action === "already_running") flash("ok", `${label} already running`);
+      else flash("ok", `Started ${label}`);
     } catch (e) {
-      setError(String(e?.message || e || ""));
+      flash("err", String(e?.message || e || "Scan failed"));
     } finally {
       setBusy(false);
     }
-  }, [value, batchTypeId, busy]);
+  }, [busy, cfg.definition_id, flash]);
 
   return (
-    <div className="widget-pad">
-      <div className="widget-title">{cfg.title || "Batch ID"}</div>
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <input
-          placeholder="Scan or type batch ID…"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
-          disabled={busy}
-          autoFocus={!!cfg.autofocus}
-          style={{ flex: 1 }}
-        />
-        <button className="btn btn-primary btn-sm" disabled={busy || !value.trim()} onClick={submit}>
-          {busy ? "…" : "Start"}
-        </button>
-      </div>
-      {error ? <div className="alert alert-error" style={{ marginTop: 6, fontSize: 12 }}>{error}</div> : null}
-      {last ? (
-        <div className="muted" style={{ marginTop: 6, fontSize: 12 }}>
-          Started <strong>{last.identifier}</strong> @ {_fmt(last.started_utc)}
+    <div className="widget-pad" style={{ display: "flex", flexDirection: "column", justifyContent: "center", height: "100%" }}>
+      <BarcodeScanInput
+        onSubmit={submit}
+        busy={busy}
+        buttonLabel="Load"
+        placeholder="Scan or type batch code…"
+        autoRefocus={cfg.autofocus !== false}
+      />
+      {note ? (
+        <div style={{ marginTop: 6, fontSize: 12, color: note.tone === "err" ? "var(--danger, #e5484d)" : "var(--muted)" }}>
+          {note.text}
         </div>
       ) : null}
     </div>

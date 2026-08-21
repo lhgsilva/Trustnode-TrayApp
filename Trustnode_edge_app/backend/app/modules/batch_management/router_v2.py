@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse
 
 from .license import require_batch_management_license, is_batch_management_enabled, MODULE_KEY
 from .models_v2 import (
-    BatchDefinitionIn, BatchGroupIn, BatchIn, BatchActionIn, BatchCommentIn, ExcursionAckIn,
+    BatchDefinitionIn, BatchGroupIn, BatchIn, BatchActionIn, BatchScanIn, BatchCommentIn, ExcursionAckIn,
 )
 from .service_v2 import (
     BatchDefinitionService, BatchExecutionService, BatchGroupService, BatchStateError,
@@ -238,6 +238,132 @@ def _barcode_rule(batch_id: str, which: str) -> Optional[dict]:
     if str(node.get("method") or "") != "barcode":
         return None
     return node.get("barcode") or {}
+
+
+@router.post("/batches/scan", dependencies=_LIC)
+def scan_batch(payload: BatchScanIn, request: Request) -> dict:
+    """One-shot resolver for a scanned/typed barcode (operator 2026-07-30).
+
+    Used by the dashboard Batch ID widget + the Batch Overview scan field, so a
+    keyboard-wedge scanner needs NO other UI interaction. Precedence:
+      1. STOP a running/held batch whose definition stop-mode is barcode and
+         the code passes its rule (incl. same-code-as-start).
+      2. If a running batch was STARTED with this exact code -> idempotent
+         no-op (prevents duplicate batches on a double scan).
+      3. START an existing planned/ready batch whose start-mode is barcode and
+         the code passes its rule.
+      4. CREATE + START a batch from the single published definition whose
+         start-mode is barcode and whose rule accepts the code (scoped to
+         payload.definition_id when the widget is configured for one). When the
+         definition's identification method is 'barcode', the code becomes the
+         batch reference.
+      5. Widget scoped to a specific non-barcode definition: the scan is the
+         manual start — create under that definition with the code as reference.
+      6. Only when NO barcode-gated definition exists at all: legacy ad-hoc
+         scan-to-start (reference = code), matching the old v1 widget.
+    Returns {ok, action: started|stopped|already_running, row}.
+    """
+    from .models_v2 import validate_barcode
+    exe = _exe()
+    actor = (payload.actor or "").strip() or _actor(request)
+    code = (payload.barcode or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="Empty barcode.")
+    scope_def = (payload.definition_id or "").strip() or None
+
+    def _rule_of(cfg: Optional[dict], which: str) -> Optional[dict]:
+        node = (cfg or {}).get(which) or {}
+        if str(node.get("method") or "") != "barcode":
+            return None
+        return node.get("barcode") or {}
+
+    def _batches(status: str) -> list:
+        rows, _total = exe.list_batches(limit=200, status=status)
+        if scope_def:
+            rows = [b for b in rows if str(b.get("definition_id") or "") == scope_def]
+        return rows
+
+    # 1) stop a barcode-gated active batch this code satisfies
+    active = _batches("running") + _batches("held")
+    for b in active:
+        rule = _rule_of(exe.version_config_for_batch(b["id"]), "stop_config")
+        if rule is None:
+            continue
+        start_code = ((b.get("metadata") or {}).get("start_barcode"))
+        if validate_barcode(rule, code, start_code=start_code) is None:
+            row = _guard(lambda: exe.stop_batch(b["id"], actor=actor, source="barcode",
+                                                reason=f"barcode scan {code}"))
+            _terminal_hook(b["id"], actor)
+            return {"ok": True, "action": "stopped", "row": exe.get_batch(b["id"]) or row}
+
+    # 2) double-scan guard: this code already started a running batch
+    for b in active:
+        if str((b.get("metadata") or {}).get("start_barcode") or "") == code:
+            return {"ok": True, "action": "already_running", "row": b}
+
+    def _start(batch_id: str) -> dict:
+        row = _guard(lambda: exe.start_batch(batch_id, actor=actor, source="barcode",
+                                             reason=f"barcode scan {code}"))
+        try:
+            exe.set_batch_metadata(batch_id, {"start_barcode": code})
+        except Exception:
+            pass
+        return {"ok": True, "action": "started", "row": exe.get_batch(batch_id) or row}
+
+    # 3) start an existing planned/ready barcode-gated batch
+    for b in _batches("ready") + _batches("planned"):
+        rule = _rule_of(exe.version_config_for_batch(b["id"]), "start_config")
+        if rule is not None and validate_barcode(rule, code) is None:
+            return _start(b["id"])
+
+    # 4) create + start from a published barcode-start definition
+    defs = _defs()
+    matches, errors = [], []
+    for d in defs.list_definitions():
+        if str(d.get("status") or "") != "published":
+            continue
+        if scope_def and str(d.get("id") or "") != scope_def:
+            continue
+        cfg = (defs.get_definition(d["id"]) or {}).get("config") or {}
+        rule = _rule_of(cfg, "start_config")
+        if rule is None:
+            continue
+        err = validate_barcode(rule, code)
+        if err:
+            errors.append(f"{d.get('name') or d['id']}: {err}")
+        else:
+            matches.append((d, cfg))
+    if len(matches) > 1:
+        names = ", ".join(str(d.get("name") or d["id"]) for d, _cfg in matches)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Barcode matches several definitions ({names}). "
+                   f"Configure the scan widget with a specific definition.")
+    if len(matches) == 1:
+        d, cfg = matches[0]
+        ident_method = str(((cfg.get("identification") or {}).get("method")) or "")
+        created = _guard(lambda: exe.create_batch(
+            {"definition_id": d["id"],
+             "reference": code if ident_method == "barcode" else None},
+            actor=actor, source="barcode"))
+        return _start(created["id"])
+    if errors:
+        # Barcode-gated definitions exist but none accepted the code — surface
+        # WHY instead of silently creating an ad-hoc batch from a typo.
+        raise HTTPException(status_code=400, detail=errors[0])
+
+    # 5) widget scoped to a specific NON-barcode definition -> the scan acts as
+    #    the manual start for it: create under that definition, code = reference.
+    if scope_def:
+        if not defs.get_definition(scope_def):
+            raise HTTPException(status_code=404, detail="Configured batch definition not found.")
+        created = _guard(lambda: exe.create_batch(
+            {"definition_id": scope_def, "reference": code}, actor=actor, source="barcode"))
+        return _start(created["id"])
+
+    # 6) no barcode-gated definitions on this system -> legacy ad-hoc behavior
+    created = _guard(lambda: exe.create_batch({"reference": code}, actor=actor, source="barcode"))
+    return _start(created["id"])
 
 
 @router.post("/batches/{batch_id}/start", dependencies=_LIC)

@@ -1,8 +1,10 @@
+from app import boot_clock as _boot_clock  # noqa: E402  (BOOT-HEALTH: capture T0 first)
 import asyncio
 import json
 import logging
 import os
 import sys
+import time as _time_mod
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -66,6 +68,11 @@ def _bootstrap_env_from_dotenv() -> None:
     binary location looking for `.env`, then from the source tree's
     backend directory. The first hit wins. Silent on missing file.
     """
+    # Operator 2026-08-21: the build-time boot self-test (`--boot-probe`) runs
+    # the bundled EXE against a throwaway data dir and must NOT pick up a
+    # developer/operator .env (cloud credentials) lying next to the binary.
+    if str(os.environ.get("TRUSTNODE_SKIP_DOTENV", "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return
     explicit = os.environ.get("TRUSTNODE_ENV_FILE", "").strip()
     candidates: list[Path] = []
     if explicit:
@@ -503,6 +510,81 @@ _cloud_live_app.include_router(_cloud_live_inner_router)
 _cloud_live_app.add_middleware(CloudLiveAuthMiddleware)
 
 
+# --------------------------------------------------------------------------
+# Operator 2026-08-21 (BOOT-HEALTH FIX): boot-time integrity check policy.
+# On an 8 GB app store the boot quick_check ran 126-203 s on EVERY boot and
+# saturated the disk exactly while the splash probed /api/health and the
+# first historian writes landed ("database is locked", 10 s flushes).
+#   TRUSTNODE_BOOT_INTEGRITY_CHECK   = weekly (default) | always | never
+#   TRUSTNODE_BOOT_INTEGRITY_DELAY_S = 180  (start only after boot settles)
+# The last successful run is persisted next to the DB so "weekly" survives
+# restarts. /api/health reports the current state either way.
+# --------------------------------------------------------------------------
+def _integrity_marker_path() -> str | None:
+    try:
+        db_path = str(getattr(app_store, "_db_path", "") or "")
+        if not db_path:
+            return None
+        return os.path.join(os.path.dirname(db_path), ".boot_integrity.json")
+    except Exception:
+        return None
+
+
+def _integrity_policy() -> tuple[str, str | None, float | None]:
+    policy = str(os.environ.get("TRUSTNODE_BOOT_INTEGRITY_CHECK", "weekly") or "weekly").strip().lower()
+    if policy not in {"weekly", "always", "never"}:
+        policy = "weekly"
+    marker = _integrity_marker_path()
+    last_ok: float | None = None
+    if marker and os.path.isfile(marker):
+        try:
+            with open(marker, "r", encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+            v = data.get("last_ok_ts")
+            if v is not None:
+                last_ok = float(v)
+        except Exception:
+            last_ok = None
+    return policy, marker, last_ok
+
+
+def _iso_from_ts(ts: float | None) -> str | None:
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()[:19] + "Z"
+    except Exception:
+        return None
+
+
+def _write_integrity_marker(marker: str | None, results: dict) -> None:
+    if not marker:
+        return
+    try:
+        all_ok = bool(results) and all(str(v).lower() == "ok" for v in results.values())
+        prev: dict = {}
+        if os.path.isfile(marker):
+            try:
+                with open(marker, "r", encoding="utf-8") as fh:
+                    prev = json.load(fh) or {}
+            except Exception:
+                prev = {}
+        now_ts = _time_mod.time()
+        data = {
+            "last_run_ts": now_ts,
+            "last_run_utc": _iso_from_ts(now_ts),
+            "last_results": {k: str(v) for k, v in results.items()},
+            "last_ok_ts": now_ts if all_ok else prev.get("last_ok_ts"),
+        }
+        data["last_ok_utc"] = _iso_from_ts(data.get("last_ok_ts"))
+        tmp = marker + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, marker)
+    except Exception:
+        pass
+
+
 async def _deferred_startup() -> None:
     """Phase 4a-2 (operator 2026-06-18): heavy boot work moved off the
     startup_event handler so uvicorn can answer /api/health the moment
@@ -517,18 +599,44 @@ async def _deferred_startup() -> None:
     # prevent uvicorn from binding. Symptom: customer's backend started,
     # printed [boot] markers, but /api/health never responded. Move to a
     # worker thread via asyncio.to_thread so uvicorn keeps its loop free.
+    # Operator 2026-08-21 (BOOT-HEALTH FIX): the restore/mirror pair was the
+    # FIRST deferred step and took 12 s -> 22 s -> 24 s -> 59 s across the last
+    # four boots (mirror -> export_activation_state -> get_bootstrap under
+    # app_store._lock, contended during boot). Nothing below needs the mirror,
+    # so it now runs LAST; the restore (only meaningful on an empty install)
+    # stays first but is BOUNDED: if it hasn't returned in 15 s we move on and
+    # let the worker finish in the background (its result is still logged).
+    async def _bounded(label: str, fn, timeout_s: float):
+        t0 = _time_mod.monotonic()
+        fut = asyncio.ensure_future(asyncio.to_thread(fn))
+        try:
+            res = await asyncio.wait_for(asyncio.shield(fut), timeout=timeout_s)
+            return res
+        except asyncio.TimeoutError:
+            print(f"[trustnode][boot] {label} still running after {timeout_s:.0f}s — continuing boot "
+                  f"without it (+{_boot_clock.age_s():.1f}s)", flush=True)
+
+            def _late(f):
+                try:
+                    exc = f.exception()
+                except Exception:
+                    exc = None
+                print(f"[trustnode][boot] {label} finished late after "
+                      f"{_time_mod.monotonic() - t0:.1f}s" + (f" with error {exc!r}" if exc else ""),
+                      flush=True)
+            fut.add_done_callback(_late)
+            return None
+        except Exception as exc:
+            print(f"[trustnode][boot] {label} failed: {exc!r}", flush=True)
+            return None
+
     try:
-        result = await asyncio.to_thread(control_plane_store.restore_activation_from_registry_if_empty)
-        if result.get("restored"):
+        result = await _bounded("activation registry restore",
+                                control_plane_store.restore_activation_from_registry_if_empty, 15.0)
+        if isinstance(result, dict) and result.get("restored"):
             print(f"[trustnode][boot] activation restored from registry: {result.get('applied')}", flush=True)
     except Exception as exc:
         print(f"[trustnode][boot] activation registry restore failed: {exc!r}", flush=True)
-    try:
-        mirror = await asyncio.to_thread(control_plane_store.mirror_activation_to_registry)
-        if mirror.get("ok"):
-            print(f"[trustnode][boot] activation mirrored to registry: hive={mirror.get('hive')}", flush=True)
-    except Exception:
-        pass
     try:
         await plc_manager.stop_all_gateways()
     except Exception:
@@ -596,15 +704,35 @@ async def _deferred_startup() -> None:
                 setattr(app_store, "_last_integrity_results", integrity_results)
             except Exception:
                 pass
+            _write_integrity_marker(_integrity_marker_path(), integrity_results)
         except Exception as exc:
             print(f"[trustnode][boot][integrity] check skipped: {exc!r}", flush=True)
 
+    _integ_policy, _integ_marker, _integ_last_ok = _integrity_policy()
     try:
-        # Mark as pending so /api/health doesn't report a stale/absent result.
-        setattr(app_store, "_last_integrity_results", {"status": "pending"})
+        _integ_delay_s = max(0.0, float(os.environ.get("TRUSTNODE_BOOT_INTEGRITY_DELAY_S", "180") or "180"))
     except Exception:
-        pass
-    asyncio.create_task(_run_integrity_checks_bg())
+        _integ_delay_s = 180.0
+    if _integ_policy == "never":
+        setattr(app_store, "_last_integrity_results", {"status": "disabled"})
+        print("[trustnode][boot][integrity] check disabled by policy", flush=True)
+    elif _integ_policy == "weekly" and _integ_last_ok is not None and (_time_mod.time() - _integ_last_ok) < 7 * 86400:
+        setattr(app_store, "_last_integrity_results",
+                {"status": "skipped_recent", "last_ok_utc": _iso_from_ts(_integ_last_ok)})
+        print(f"[trustnode][boot][integrity] skipped — last OK check "
+              f"{(_time_mod.time() - _integ_last_ok) / 3600:.1f}h ago (weekly policy)", flush=True)
+    else:
+        setattr(app_store, "_last_integrity_results",
+                {"status": "scheduled", "starts_in_s": _integ_delay_s, "policy": _integ_policy})
+        print(f"[trustnode][boot][integrity] scheduled in {_integ_delay_s:.0f}s (policy={_integ_policy})", flush=True)
+
+        async def _delayed_integrity() -> None:
+            try:
+                await asyncio.sleep(_integ_delay_s)
+                await _run_integrity_checks_bg()
+            except Exception:
+                pass
+        asyncio.create_task(_delayed_integrity())
 
     bootstrap = None
     try:
@@ -753,7 +881,7 @@ async def _deferred_startup() -> None:
                 except Exception as exc:
                     print(f"[trustnode][boot] auto-resume failed for {gid}: {exc!r}", flush=True)
             if resumed:
-                print(f"[trustnode][boot] auto-resumed {resumed} gateway(s)", flush=True)
+                print(f"[trustnode][boot] auto-resumed {resumed} gateway(s) +{_boot_clock.age_s():.1f}s after process start", flush=True)
             if skipped_opt_out:
                 print(f"[trustnode][boot] skipped {skipped_opt_out} gateway(s) — auto_resume=false (opt-in)", flush=True)
     except Exception as exc:
@@ -891,6 +1019,18 @@ async def _deferred_startup() -> None:
     except Exception:
         pass
 
+    # Operator 2026-08-21: activation mirror runs LAST (belt-and-braces copy of
+    # the activation rows into the registry). Bounded so a contended lock can
+    # never hold up anything — there is nothing after it anyway.
+    try:
+        mirror = await _bounded("activation registry mirror",
+                                control_plane_store.mirror_activation_to_registry, 20.0)
+        if isinstance(mirror, dict) and mirror.get("ok"):
+            print(f"[trustnode][boot] activation mirrored to registry: hive={mirror.get('hive')}", flush=True)
+    except Exception:
+        pass
+    print(f"[trustnode][boot] deferred init complete +{_boot_clock.age_s():.1f}s after process start", flush=True)
+
 
 # 2026-07-25: defense-in-depth against DOUBLE startup. The in-process LAN
 # server (lan_socket.py) shares this FastAPI app and used to re-fire the
@@ -907,6 +1047,13 @@ async def startup_event() -> None:
         print("[trustnode][boot] duplicate startup_event suppressed", flush=True)
         return
     _STARTUP_RAN = True
+    # Operator 2026-08-21 (NO-ORPHANS): exit with the desktop app. Armed only
+    # when Electron passed TRUSTNODE_PARENT_PID (dev runs are unaffected).
+    try:
+        from app import parent_watch as _parent_watch
+        _parent_watch.start_from_env()
+    except Exception as _pw_exc:
+        print(f"[trustnode][boot] WARN: parent-watch not armed: {_pw_exc!r}", flush=True)
     # Operator 2026-07-03 (COLLECTION-STARVATION FIX): raise the anyio
     # default thread limiter from 40 to 200. FastAPI runs every sync route
     # AND every `asyncio.to_thread` on this ONE shared pool. The PLC worker
@@ -1017,6 +1164,49 @@ async def startup_event() -> None:
         print("[trustnode][boot] wedge watchdog armed (60s loop-stale threshold)", flush=True)
     except Exception as exc:
         print(f"[trustnode][boot] WARN: wedge watchdog setup failed: {exc!r}", flush=True)
+
+    # Operator 2026-08-21 (BOOT-HEALTH FIX): boot-health watchdog. If the
+    # first /api/health has not been SERVED within 10 s of uvicorn startup
+    # (and again at 30 s), dump every thread's top frames once so a field
+    # log names whatever is holding boot up. Pure diagnostics — never kills.
+    try:
+        import threading as _threading_bh
+        import time as _time_bh
+        import sys as _sys_bh
+        import traceback as _tb_bh
+        from app.routers import health as _health_mod
+
+        def _boot_health_watchdog() -> None:
+            thresholds = [10.0, 30.0]
+            t0 = _time_bh.monotonic()
+            fired: set[float] = set()
+            while thresholds and (_time_bh.monotonic() - t0) < 90.0:
+                _time_bh.sleep(1.0)
+                if _health_mod.first_health_served_age_s() is not None:
+                    return
+                elapsed = _time_bh.monotonic() - t0
+                due = [t for t in thresholds if elapsed >= t and t not in fired]
+                if not due:
+                    continue
+                for t in due:
+                    fired.add(t)
+                    thresholds.remove(t)
+                names = {th.ident: th.name for th in _threading_bh.enumerate()}
+                print(f"[trustnode][boot][health-watchdog] /api/health NOT served {elapsed:.0f}s after "
+                      f"uvicorn startup (+{_boot_clock.age_s():.1f}s process age) — thread dump follows",
+                      flush=True)
+                for tid, frame in _sys_bh._current_frames().items():
+                    try:
+                        stack = _tb_bh.extract_stack(frame)[-8:]
+                        app_frames = [f for f in stack if "app" in (f.filename or "").replace("\\", "/")] or stack[-3:]
+                        desc = " <- ".join(f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}" for f in reversed(app_frames))
+                        print(f"[trustnode][boot][health-watchdog]   {names.get(tid, tid)}: {desc}", flush=True)
+                    except Exception:
+                        pass
+
+        _threading_bh.Thread(target=_boot_health_watchdog, name="trustnode-boot-health-watchdog", daemon=True).start()
+    except Exception as exc:
+        print(f"[trustnode][boot] WARN: boot-health watchdog setup failed: {exc!r}", flush=True)
 
 
 PUBLIC_PATHS = {

@@ -3369,6 +3369,14 @@ export async function bmv2CreateBatch(payload) { return (await _bmSend(`/batches
 export async function bmv2BatchAction(id, action, payload = {}) {
   return (await _bmSend(`/batches/${encodeURIComponent(id)}/${action}`, "POST", payload)).row;
 }
+
+// Operator 2026-07-30: one-shot barcode resolver — the server decides whether
+// the scanned/typed code stops a barcode-gated running batch, starts a
+// planned/ready one, or creates+starts from a published barcode-start
+// definition. Returns {ok, action: started|stopped|already_running, row}.
+export async function bmv2ScanBatch(payload) {
+  return await _bmSend(`/batches/scan`, "POST", payload);
+}
 export async function bmv2DeleteBatch(id) { return _bmSend(`/batches/${encodeURIComponent(id)}`, "DELETE"); }
 export async function bmv2DeleteBatchReport(batchId, refId) { return _bmSend(`/batches/${encodeURIComponent(batchId)}/reports/${encodeURIComponent(refId)}`, "DELETE"); }
 export async function bmv2AddComment(id, message, actor = null) {
