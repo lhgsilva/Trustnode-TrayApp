@@ -1049,6 +1049,14 @@ body {
   color: #ffffff;
 }
 
+/* Boot "not resolved yet" state — neutral slate, consistent with status-warning
+   pill tone but opaque enough to read on the fixed overlay background. */
+.footer-toggle-fab.checking {
+  background: #475569;
+  border-color: #334155;
+  color: #ffffff;
+}
+
 .page-tools {
   display: flex;
   justify-content: flex-end;

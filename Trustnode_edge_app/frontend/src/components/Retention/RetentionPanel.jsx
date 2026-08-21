@@ -125,8 +125,8 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
       ]);
       if (!mounted.current) return;
       if (st?.status) setStatus(st.status);
-      if (pol?.policies) setPolicies(pol.policies);
-      if (bk?.rows) setBackups(bk.rows);
+      if (Array.isArray(pol?.policies)) setPolicies(pol.policies);
+      if (Array.isArray(bk?.rows)) setBackups(bk.rows);
     } catch (err) {
       flash("error", String(err?.message || err));
     }
@@ -239,9 +239,14 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
             <span>Disk free</span><span>Reclaimable</span>
           </div>
           <div className="trow">
-            <span className="db-cell">{fmtBytes(db.size_bytes)}</span>
+            {/* `status` is null until the first fetch lands; showing 0 B / 0
+                readings then reads as "nothing stored", which is the opposite
+                of the truth. Say "measuring…" until we actually know. */}
+            <span className="db-cell">{status ? fmtBytes(db.size_bytes) : "measuring…"}</span>
             <span className="db-cell">
-              {fmtCount(db.raw_rows)} readings
+              {db.raw_rows === null || db.raw_rows === undefined
+                ? "measuring…"
+                : `${fmtCount(db.raw_rows)} readings`}
               {db.oldest_raw_utc ? ` · from ${fmtTs(db.oldest_raw_utc)}` : ""}
             </span>
             <span className="db-cell">
@@ -253,7 +258,7 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
               {disk.free_bytes ? `${fmtBytes(disk.free_bytes)} (${disk.free_pct}%)` : "—"}
               {disk.emergency ? " ⚠" : ""}
             </span>
-            <span className="db-cell">{fmtBytes(db.reclaimable_bytes)}</span>
+            <span className="db-cell">{status ? fmtBytes(db.reclaimable_bytes) : "—"}</span>
           </div>
         </div>
 
@@ -562,17 +567,65 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
 
 /* ------------------------------------------------------------ helpers */
 function describeSummary(summary) {
-  if (!summary || typeof summary !== "object") return "—";
-  const rolled = (summary.rollups || []).reduce((a, r) => a + Number(r.rows || 0), 0);
-  const pruned = (summary.prunes || []).reduce((a, p) => a + Number(p.deleted || 0), 0);
-  const held = (summary.prunes || []).filter((p) => p.held_by);
-  const parts = [];
-  if (rolled) parts.push(`${fmtCount(rolled)} rows aggregated`);
-  if (pruned) parts.push(`${fmtCount(pruned)} old readings removed`);
-  (summary.backups || []).forEach((b) => parts.push(`${b.kind === "config" ? "settings" : "full"} backup`));
-  if (held.length) parts.push(held[0].held_by);
-  if (!parts.length && (summary.notes || []).length) return summary.notes[0];
-  return parts.length ? parts.join(", ") : "nothing to do";
+  // Guard against any malformed input so a bad legacy row never takes the page down.
+  try {
+    if (!summary || typeof summary !== "object") return "—";
+
+    // Rows aggregated:
+    //   v2 engine  → summary.rollups is an ARRAY of {tier, rows, …}
+    //   legacy path → summary.rollups is an OBJECT {minute_upserts, hour_upserts, day_upserts}
+    let rolled = 0;
+    const rollups = summary.rollups;
+    if (Array.isArray(rollups)) {
+      rolled = rollups.reduce((a, r) => a + Number(r?.rows || 0), 0);
+    } else if (rollups && typeof rollups === "object") {
+      // Legacy: sum all numeric values (minute_upserts, hour_upserts, day_upserts)
+      rolled = Object.values(rollups).reduce(
+        (a, v) => a + (Number.isFinite(Number(v)) ? Number(v) : 0), 0
+      );
+    }
+
+    // Rows removed:
+    //   v2 engine  → summary.prunes is an ARRAY of {tier, deleted, remaining, held_by, …}
+    //   legacy path → summary.deletes is an OBJECT {raw_candidates, minute_candidates, …}
+    //                 (candidate counts — rows eligible for deletion, not necessarily deleted)
+    let pruned = 0;
+    const prunes = summary.prunes;
+    const legacyDeletes = summary.deletes;
+    if (Array.isArray(prunes)) {
+      pruned = prunes.reduce((a, p) => a + Number(p?.deleted || 0), 0);
+    } else if (legacyDeletes && typeof legacyDeletes === "object") {
+      pruned = Object.values(legacyDeletes).reduce(
+        (a, v) => a + (Number.isFinite(Number(v)) ? Number(v) : 0), 0
+      );
+    }
+
+    // held_by is only meaningful for the v2 prunes array.
+    const held = Array.isArray(prunes) ? prunes.filter((p) => p?.held_by) : [];
+
+    const parts = [];
+    if (rolled) parts.push(`${fmtCount(rolled)} rows aggregated`);
+    if (pruned) parts.push(`${fmtCount(pruned)} old readings removed`);
+
+    // Backups:
+    //   v2 → summary.backups is an ARRAY of {kind, …}
+    //   legacy → may carry a backup_path string (no array)
+    if (Array.isArray(summary.backups)) {
+      summary.backups.forEach((b) => parts.push(`${b?.kind === "config" ? "settings" : "full"} backup`));
+    } else if (summary.backup_path) {
+      parts.push("full backup");
+    }
+
+    if (held.length) parts.push(held[0].held_by);
+
+    // notes is a v2 field; may be absent or non-array in legacy rows.
+    const notesArr = Array.isArray(summary.notes) ? summary.notes : [];
+    if (!parts.length && notesArr.length) return notesArr[0];
+    return parts.length ? parts.join(", ") : "nothing to do";
+  } catch (_) {
+    // Malformed row — show a safe placeholder rather than crashing.
+    return "—";
+  }
 }
 
 function buildActivationWarning(policy, status) {

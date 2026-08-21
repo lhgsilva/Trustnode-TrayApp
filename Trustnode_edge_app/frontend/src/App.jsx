@@ -3444,6 +3444,10 @@ function AppShell() {
   };
   const [status, setStatus] = useState(null);
   const [gatewayRuntimeStatuses, setGatewayRuntimeStatuses] = useState({});
+  // True after the first successful /api/plc/gateways/status poll or a gateway_status
+  // WebSocket event arrives. Until then the footer FAB and status pills show "Checking…"
+  // rather than a false "Stopped" state.
+  const [gatewayRuntimeReady, setGatewayRuntimeReady] = useState(false);
   const [gatewayRuntimeTransitions, setGatewayRuntimeTransitions] = useState({});
   const [config, setConfig] = useState(null);
   const [error, setError] = useState("");
@@ -5397,6 +5401,10 @@ function AppShell() {
 
           return next;
         });
+        // After the first successful poll the "not resolved yet" boot state clears.
+        // This must come AFTER setGatewayRuntimeStatuses so both updates batch into
+        // the same React render and the footer never flashes "Stopped" on first paint.
+        if (!stopped) setGatewayRuntimeReady(true);
       } catch {
         // Keep last known runtime state to avoid false STOPPED/DB FAILS flicker
         // when a single status poll hits a transient timeout.
@@ -7513,6 +7521,9 @@ function AppShell() {
                   last_check_utc: tsNow(),
                 },
               }));
+              // A gateway_status event is an authoritative runtime signal —
+              // mark the footer as resolved so it exits the "Checking…" boot state.
+              setGatewayRuntimeReady(true);
             }
           }
           if (Array.isArray(data.readings)) {
@@ -7587,6 +7598,8 @@ function AppShell() {
                   },
                 };
               });
+              // Live readings confirm the gateway is running — resolve the boot state.
+              setGatewayRuntimeReady(true);
             }
             const collectionAllowed = data.collection_allowed !== false;
             const collectionBlockReason = String(data.collection_block_reason || "").trim();
@@ -8125,6 +8138,7 @@ function AppShell() {
               if (row?.gateway_id) map[row.gateway_id] = row;
             }
             setGatewayRuntimeStatuses((prev) => ({ ...prev, ...map }));
+            setGatewayRuntimeReady(true);
           }
           setWsState("connected");
         } catch {}
@@ -12401,7 +12415,10 @@ const getGatewayHealth = (gateway) => {
         : (dbFault ? "DB ERROR" : (st?.last_error ? "WAITING" : "IDLE"));
       return extraDb ? `${baseSink} + ${extraDb} | ${writing}` : `${baseSink} | ${writing}`;
     }
-    if (!gateway?.database_id) return "No DB selected";
+    // A runtime-only row (status poll answered before the gateway config list
+    // loaded) genuinely has no configured sink yet — say "loading", not the
+    // alarming "No DB selected" the operator would otherwise read for ~10 s.
+    if (!gateway?.database_id) return gateway?._runtimeOnly ? "…" : "No DB selected";
     const db = dbConnections.find((c) => c.id === gateway.database_id);
     // Operator 2026-06-25: same fallback as Start path + row dbName —
     // if the configured DB isn't in dbConnections (tenant scope race
@@ -12410,40 +12427,80 @@ const getGatewayHealth = (gateway) => {
     const dbName = db?.name
       || (String(gateway.database_id || "") === "local-sqlite-default" ? "Local SQLite" : "Local SQLite");
     const runtimeStatus = resolveGatewayRuntimeStatus(gateway);
-    const writes = Number(runtimeStatus?.db_write_count || 0);
+    // Prefer historian_write_count (durable local-historian commits) when the backend
+    // provides it; fall back to db_write_count for older backends.
+    const writes = Number(
+      runtimeStatus?.historian_write_count ??
+      runtimeStatus?.db_write_count ?? 0
+    );
     const lastCheckUtc = String(runtimeStatus?.last_check_utc || "");
-    // Compute writes/s from the delta vs the last observation. First
-    // observation seeds the cache and shows "—" until a second sample
-    // arrives so we don't print a misleading "writes/s" off a single
-    // datapoint.
+    // Time base for the rate: the BACKEND's own write stamp, never Date.now().
+    // The counter changes when the engine commits; the browser only notices at
+    // poll/render time, so measuring with local clocks divides a real delta by
+    // an unrelated interval (measured: 381 w/s against a true 52.8 rows/s).
+    const writeStampMs = parseTimestampMs(
+      String(runtimeStatus?.historian_last_write_utc
+             || runtimeStatus?.db_last_write_utc
+             || runtimeStatus?.last_check_utc || "")
+    );
+
+    // Writes/s rate — derived from consecutive DISTINCT counter observations,
+    // not from render timing. Previously the sample was recorded on every
+    // render regardless of whether the counter had changed, which produced
+    // wildly wrong rates (e.g. 187 w/s against a true 48 rows/s) because
+    // renders fire independently of the 2-s poll cadence.
+    //
+    // Rules:
+    //   • Record a new observation only when `writes` differs from the stored value.
+    //   • Between changes, keep showing the last computed rate ("sticky" display).
+    //   • Show "—" until two distinct observations exist (no single-point rate).
+    //   • Guard counter resets (new value < old) by restarting the baseline.
     const gid = String(gateway?.id || "");
     const sampleMap = gatewayWriteSamplesRef.current;
     const prev = sampleMap.get(gid);
-    const nowMs = Date.now();
-    let rateLabel = "—";
-    if (prev && Number.isFinite(prev.writes) && Number.isFinite(prev.tsMs)) {
-      const dCount = writes - prev.writes;
-      const dMs = nowMs - prev.tsMs;
-      if (dMs > 250) {
-        // Show in writes/s rounded to one decimal when sub-10, integer above.
-        const rate = (dCount / dMs) * 1000;
-        if (Number.isFinite(rate) && rate >= 0) {
-          rateLabel = rate < 10 ? `${rate.toFixed(1)} w/s` : `${Math.round(rate)} w/s`;
-        }
+    const nowMs = Number.isFinite(writeStampMs) ? writeStampMs : Date.now();
+    let rateLabel = prev?.lastRate ?? "—";
+
+    if (!prev || !Number.isFinite(prev.writes)) {
+      // First observation — seed cache; show "—" until a second distinct value arrives.
+      sampleMap.set(gid, { writes, tsMs: nowMs, lastRate: "—" });
+      rateLabel = "—";
+    } else if (writes !== prev.writes) {
+      if (writes < prev.writes) {
+        // Counter reset (gateway restarted) — restart baseline silently.
+        sampleMap.set(gid, { writes, tsMs: nowMs, lastRate: "—" });
+        rateLabel = "—";
       } else {
-        rateLabel = prev.lastRate || "—";
+        const dCount = writes - prev.writes;
+        const dMs = nowMs - prev.tsMs;
+        // At least a second of backend-stamped elapsed time before quoting a
+        // rate: shorter windows are dominated by flush granularity.
+        if (dMs >= 1000) {
+          // Show in writes/s rounded to one decimal when sub-10, integer above.
+          const rate = (dCount / dMs) * 1000;
+          const computed = Number.isFinite(rate) && rate >= 0
+            ? (rate < 10 ? `${rate.toFixed(1)} w/s` : `${Math.round(rate)} w/s`)
+            : "—";
+          sampleMap.set(gid, { writes, tsMs: nowMs, lastRate: computed });
+          rateLabel = computed;
+        }
+        // dMs <= 250: multiple reads in the same poll tick — keep previous rate
       }
     }
-    sampleMap.set(gid, {
-      writes,
-      tsMs: nowMs,
-      lastRate: rateLabel,
-    });
+    // writes === prev.writes: counter unchanged since last poll — keep showing last rate
+
+    // Warn when the extra-sink / cloud distribution path has stalled.
+    // This does NOT change the Status pill; it is appended to the cell text/title.
+    const distStalled = Number(runtimeStatus?.distribution_stalled_s ?? 0);
+    const stalledNote = distStalled > 120
+      ? ` | extra sinks/cloud distribution stalled ${Math.round(distStalled)}s`
+      : "";
+
     if (isHostedWebClient && endpointMode === "cloud") {
       const cloudState = isFreshCloudTs(lastCheckUtc, 15000) ? "LIVE" : "STALE";
-      return `${dbName} | ${rateLabel} | ${cloudState}`;
+      return `${dbName} | ${rateLabel} | ${cloudState}${stalledNote}`;
     }
-    return `${dbName} | ${rateLabel}`;
+    return `${dbName} | ${rateLabel}${stalledNote}`;
   };
   const dbOverviewStats = useMemo(() => {
     const total = dbConnections.length;
@@ -12831,9 +12888,13 @@ const getGatewayHealth = (gateway) => {
           (pg) => !(gatewayConfigsView || []).some((g) => String(g?.id || "") === String(pg?.id || ""))
         ),
       ];
-      return merged.some((g) => isGatewayRunning(g));
+      // Also count runtime-only rows: gateways the status poll knows are running
+      // before the config list has loaded. Without this the FAB shows "STOPPED"
+      // for the whole config-fetch window (~7 s at boot) even though the runtime
+      // poll already confirmed running=true.
+      return merged.some((g) => isGatewayRunning(g)) || unknownRunningGateways.length > 0;
     },
-    [gatewayConfigsView, powerGatewayDescriptors, isGatewayRunning]
+    [gatewayConfigsView, powerGatewayDescriptors, isGatewayRunning, unknownRunningGateways]
   );
   // Keep dashboard/content layout stable when gateway footer is expanded.
   // Footer behaves as an overlay and should not reflow page content.
@@ -26984,6 +27045,20 @@ const getGatewayHealth = (gateway) => {
                   ...(powerGatewayDescriptors || []).filter(
                     (pg) => !(gatewayConfigsView || []).some((g) => String(g?.id || "") === String(pg?.id || ""))
                   ),
+                  // Runtime-only rows: gateways the status poll knows about but the config
+                  // list hasn't returned yet (the config fetch is the long pole at boot).
+                  // Renders a row as soon as EITHER source (config OR runtime) knows about
+                  // a running gateway, not just after both have loaded.
+                  ...unknownRunningGateways.map((s) => ({
+                    id: s.gateway_id,
+                    name: s.gateway_name || String(s.gateway_id || ""),
+                    plc_ip: s.plc_ip || "",
+                    opc_url: s.opc_url || "",
+                    gateway_type: s.gateway_type || "",
+                    interval_ms: s.interval_ms || 0,
+                    database_id: "",
+                    _runtimeOnly: true,
+                  })),
                 ].map((g) => {
                 const health = getGatewayHealth(g);
                 const running = isGatewayRunning(g);
@@ -26998,13 +27073,28 @@ const getGatewayHealth = (gateway) => {
                 //   - otherwise show RUNNING when the gateway is actively
                 //     producing data OR runtime reports running=true,
                 //     STOPPED when neither is true.
-                const statusLabel = !health.ok && health.label
-                  && health.label !== "Stopped" && health.label !== "Running"
-                  ? health.label
-                  : (running ? "Running" : "Stopped");
-                const statusClass = !health.ok && statusLabel !== "Running" && statusLabel !== "Stopped"
-                  ? "status-warning"
-                  : (running ? "status-online" : "status-offline");
+                //
+                // Boot state: before the first runtime poll response arrives
+                // (gatewayRuntimeReady === false) show a neutral "Checking…"
+                // pill instead of the false "Stopped" that the empty initial
+                // state would produce. Anti-flicker logic is unaffected because
+                // "Checking…" is only shown BEFORE first resolution.
+                let statusLabel, statusClass;
+                if (!gatewayRuntimeReady) {
+                  statusLabel = "Checking…";
+                  statusClass = "status-warning";
+                } else {
+                  statusLabel = !health.ok && health.label
+                    && health.label !== "Stopped" && health.label !== "Running"
+                    ? health.label
+                    : (running ? "Running" : "Stopped");
+                  statusClass = !health.ok && statusLabel !== "Running" && statusLabel !== "Stopped"
+                    ? "status-warning"
+                    : (running ? "status-online" : "status-offline");
+                }
+                // Compute once per row to avoid calling the function twice
+                // (which was recording two samples per render into the rate ring).
+                const dbWritingText = getGatewayFooterDbWriting(g);
                 return (
                   <div key={`footer-${g.id}`} className="gateway-footer-row">
                     <span className="gateway-footer-cell" title={g.name}>{g.name}</span>
@@ -27020,7 +27110,7 @@ const getGatewayHealth = (gateway) => {
                         {intervalInfo.text}
                       </span>
                     </span>
-                    <span className="gateway-footer-cell" title={getGatewayFooterDbWriting(g)}>{getGatewayFooterDbWriting(g)}</span>
+                    <span className="gateway-footer-cell" title={dbWritingText}>{dbWritingText}</span>
                     <span className="row-actions gateway-footer-actions">
                       <button
                         className={`icon-btn table-action-btn footer-action-btn ${running ? "" : "icon-btn-start"}`}
@@ -27047,13 +27137,13 @@ const getGatewayHealth = (gateway) => {
           ) : null}
           {!isPortalOnly ? (
           <button
-            className={`footer-toggle-fab ${anyGatewayRunning ? "running" : "stopped"} ${footerCollapsed ? "is-collapsed" : "is-expanded"}`}
+            className={`footer-toggle-fab ${!gatewayRuntimeReady ? "checking" : (anyGatewayRunning ? "running" : "stopped")} ${footerCollapsed ? "is-collapsed" : "is-expanded"}`}
             onClick={() => setFooterCollapsed((v) => !v)}
             type="button"
             title={footerCollapsed ? "Show footer" : "Hide footer"}
             style={{ bottom: footerCollapsed ? 12 : Math.max(12, footerHeight + 10) }}
           >
-            {anyGatewayRunning ? "Running" : "Stopped"}
+            {!gatewayRuntimeReady ? "Checking…" : (anyGatewayRunning ? "Running" : "Stopped")}
           </button>
           ) : null}
         </main>

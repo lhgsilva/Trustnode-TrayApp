@@ -1189,6 +1189,51 @@ class RetentionEngine:
         self._last_backup_full = 0.0
         self._paused_until = 0.0
         self._activity: List[Dict[str, Any]] = []   # rolling in-memory job log
+        # Row census for the Storage card: COUNT(*) over the historian costs
+        # ~1.3 s at 9 M rows, so it is measured off the request path and served
+        # from this snapshot (same pattern as the lock-free /api/health one).
+        self._db_stats: Dict[str, Any] = {}
+        self._db_stats_lock = threading.Lock()
+        self._db_stats_thread: Optional[threading.Thread] = None
+
+    # -- row census (off the request path) --------------------------------
+    DB_STATS_TTL_S = 60.0
+
+    def _refresh_db_stats(self) -> None:
+        try:
+            conn = self.store.connect(readonly=True)
+            try:
+                rows = int(conn.execute(
+                    "SELECT COUNT(*) FROM historian_readings").fetchone()[0] or 0)
+            finally:
+                conn.close()
+            with self._db_stats_lock:
+                self._db_stats = {"raw_rows": rows, "measured_mono": time.monotonic(),
+                                  "measured_utc": _utc_now_text(), "measuring": False}
+        except Exception as exc:
+            log.debug("retention row census failed: %s", exc)
+        finally:
+            with self._db_stats_lock:
+                self._db_stats_thread = None
+
+    def _db_stats_cached(self) -> Dict[str, Any]:
+        """Last measured row count, refreshing in the background when stale.
+
+        Never blocks the caller: the first call returns `measuring` and the UI
+        shows "measuring…" instead of a wrong zero."""
+        with self._db_stats_lock:
+            snap = dict(self._db_stats)
+            fresh = snap and (time.monotonic() - float(snap.get("measured_mono") or 0)) < self.DB_STATS_TTL_S
+            busy = self._db_stats_thread is not None
+            if not fresh and not busy:
+                th = threading.Thread(target=self._refresh_db_stats,
+                                      name="tn-retention-census", daemon=True)
+                self._db_stats_thread = th
+            else:
+                th = None
+        if th is not None:
+            th.start()
+        return snap or {"raw_rows": None, "measuring": True}
 
     # -- lifecycle --------------------------------------------------------
     def start(self) -> None:
@@ -1992,13 +2037,24 @@ class RetentionEngine:
         try:
             page = int(conn.execute("PRAGMA page_size").fetchone()[0] or 4096)
             free = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
-            raw_rows = int(conn.execute("SELECT COUNT(*) FROM historian_readings").fetchone()[0] or 0)
-            oldest = conn.execute("SELECT MIN(ts_utc) FROM historian_readings").fetchone()[0]
-            newest = conn.execute("SELECT MAX(ts_utc) FROM historian_readings").fetchone()[0]
+            # rowid order == insertion order for the append-only historian, and
+            # retention only ever deletes from the oldest end, so the first/last
+            # row by id are the oldest/newest timestamps — 1 ms instead of the
+            # 2.1 s a MIN/MAX(ts_utc) full scan costs at 9 M rows.
+            _first = conn.execute(
+                "SELECT ts_utc FROM historian_readings ORDER BY id ASC LIMIT 1").fetchone()
+            _last = conn.execute(
+                "SELECT ts_utc FROM historian_readings ORDER BY id DESC LIMIT 1").fetchone()
+            oldest = _first[0] if _first else None
+            newest = _last[0] if _last else None
+            _census = self._db_stats_cached()
+            raw_rows = _census.get("raw_rows")
             out["database"] = {
                 "path": self.store.db_path, "size_bytes": db_size,
                 "reclaimable_bytes": free * page,
                 "raw_rows": raw_rows, "oldest_raw_utc": oldest, "newest_raw_utc": newest,
+                "raw_rows_measured_utc": _census.get("measured_utc"),
+                "raw_rows_measuring": bool(_census.get("measuring") or raw_rows is None),
                 "auto_vacuum": int(conn.execute("PRAGMA auto_vacuum").fetchone()[0] or 0),
             }
             out["levels"].append({

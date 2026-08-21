@@ -67,6 +67,41 @@ def _utc_str_to_local_iso(ts_utc: str) -> str:
         return raw
 
 
+def _dist_health() -> Dict[str, Any]:
+    """Distribution-thread health, or an empty dict when the v2 engine is off.
+
+    Cheap (plain attribute reads), so it is safe to touch on every
+    /api/plc/gateways/status call."""
+    try:
+        from app.services.collection_engine import engine_v2, engine_v2_enabled
+        if not engine_v2_enabled():
+            return {}
+        return engine_v2.distribution_health() or {}
+    except Exception:
+        return {}
+
+
+def _dist_stalled_s() -> float:
+    try:
+        return float(_dist_health().get("stalled_s") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _dist_restarts() -> int:
+    try:
+        return int(_dist_health().get("restarts") or 0)
+    except Exception:
+        return 0
+
+
+def _dist_stage():
+    try:
+        return str(_dist_health().get("stage") or "") or None
+    except Exception:
+        return None
+
+
 class GatewayWorker:
     def __init__(
         self,
@@ -116,6 +151,13 @@ class GatewayWorker:
 
         self.db_write_count = 0
         self.db_last_write_utc: str | None = None
+        # Durable local-historian commits (stamped by StorageWriterV2 / the
+        # legacy historian flush) — independent of the distribution path.
+        self.historian_write_count = 0
+        self.historian_last_write_utc: str | None = None
+        # Distribution/sink writes: the same events db_write_count counts.
+        self.sink_write_count = 0
+        self.sink_last_write_utc: str | None = None
         self.db_last_error: str | None = None
         self.db_pending_count = 0
         self.collection_blocked = False
@@ -266,6 +308,8 @@ class GatewayWorker:
         self.db_sinks = self._normalize_db_sinks(db_sink, db_sinks)
         self.db_write_count = 0
         self.db_last_write_utc = None
+        self.sink_write_count = 0
+        self.sink_last_write_utc = None
         self.db_last_error = None
         self.db_pending_count = 0
         with self._remote_flush_lock:
@@ -454,6 +498,13 @@ class GatewayWorker:
             db_pending_count=self.db_pending_count,
             collection_blocked=self.collection_blocked,
             collection_block_reason=self.collection_block_reason,
+            historian_write_count=self.historian_write_count,
+            historian_last_write_utc=self.historian_last_write_utc,
+            sink_write_count=self.sink_write_count,
+            sink_last_write_utc=self.sink_last_write_utc,
+            distribution_stalled_s=_dist_stalled_s(),
+            distribution_stage=_dist_stage(),
+            distribution_restarts=_dist_restarts(),
         )
 
     def _get_collection_executor(self) -> ThreadPoolExecutor:
@@ -1716,8 +1767,21 @@ class GatewayWorker:
     def _mark_db_write_success(self, count: int) -> None:
         self.db_write_count += max(0, int(count))
         self.db_last_write_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        # Same event under an honest name: this is the SINK/distribution write,
+        # not proof that the local historian holds the data.
+        self.sink_write_count = self.db_write_count
+        self.sink_last_write_utc = self.db_last_write_utc
         self.db_last_error = None
         self.last_error = None
+
+    def _mark_historian_commit(self, count: int) -> None:
+        """A batch of this gateway's readings is durably committed to the local
+        historian. Called from the storage writer (v2) and from the legacy
+        historian flush — never from the distribution thread, so a wedged
+        distributor can no longer freeze the signal the UI trusts."""
+        self.historian_write_count += max(0, int(count))
+        self.historian_last_write_utc = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S.%f")[:-3]
 
     def _mark_db_write_error(self, msg: str) -> None:
         text = str(msg or "")
@@ -4006,6 +4070,7 @@ class PLCManager:
             try:
                 app_store.append_historian_rows(cycle_rows)
                 written_cycles += 1
+                self._mark_historian_commit(len(cycle_rows or []))
             except Exception as exc:
                 # Re-buffer this cycle and everything after it. Order
                 # preserved.

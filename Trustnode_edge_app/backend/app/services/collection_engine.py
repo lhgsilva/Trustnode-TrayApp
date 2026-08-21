@@ -211,6 +211,12 @@ class StorageWriterV2(threading.Thread):
 
     MAX_QUEUE_CYCLES = 4096          # bounded: ~68 min of 1 s cycles
     MAX_REBUFFER_ROWS = 50_000       # historian retry buffer bound
+    # Distribution supervision (2026-08-21). Observed live: the dist thread
+    # stopped 6 min after boot and nothing noticed for 5.6 h — cloud telemetry
+    # and every extra sink silently stopped, last_error stayed None, and the
+    # only trace was a "queue FULL" line once per 100 drops.
+    DIST_WARN_S = float(os.environ.get("TRUSTNODE_V2_DIST_WARN_S", "120") or 120)
+    DIST_RESTART_S = float(os.environ.get("TRUSTNODE_V2_DIST_RESTART_S", "300") or 300)
 
     def __init__(self) -> None:
         super().__init__(daemon=True, name="tn-v2-writer")
@@ -222,6 +228,11 @@ class StorageWriterV2(threading.Thread):
         self._hist_rebuffer: list[dict] = []
         self._last_bootstrap_refresh = 0.0
         self._distributor = DistributionV2()
+        self._dist_lock = threading.Lock()
+        self._dist_warn_mono = 0.0
+        self._dist_restarts = 0
+        self._dist_restart_times: list[float] = []
+        self._dist_giveup_logged = 0.0
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -304,6 +315,17 @@ class StorageWriterV2(threading.Thread):
                 type(exc).__name__, exc, len(keep),
                 f", DROPPED {lost} oldest" if lost > 0 else "",
             )
+            return
+        # Durable: the rows are committed to the local historian. Stamp each
+        # contributing worker HERE (2026-08-21). Before this, the only writer of
+        # db_write_count/db_last_write_utc was the distribution thread, so a
+        # wedged distributor froze the gateway footer's "Database Writing
+        # Status" for hours while collection was perfectly healthy.
+        for b in batches:
+            try:
+                b.worker._mark_historian_commit(len(b.readings or []))
+            except Exception:
+                pass
 
     def run(self) -> None:
         flush_s = _flush_interval_s()
@@ -327,12 +349,108 @@ class StorageWriterV2(threading.Thread):
             # the NEXT historian commit.
             for b in batches:
                 self._distributor.submit(b)
+            self._supervise_distribution()
             if hist_ms > 2000:
                 _LOG.warning(
                     "v2-writer slow HISTORIAN flush: %d cycle(s) in %.0f ms "
                     "(local DB lagging)", len(batches), hist_ms,
                 )
         _LOG.info("v2-writer exited")
+
+    # -- distribution supervision -------------------------------------------
+    def distribution_health(self) -> Dict[str, Any]:
+        with self._dist_lock:
+            d = self._distributor
+        h = d.health()
+        h["restarts"] = self._dist_restarts
+        return h
+
+    MAX_DIST_RESTARTS_PER_HOUR = 5
+
+    def _dist_restart_budget_left(self) -> bool:
+        """Bound the self-heal: if a replacement wedges too, restarting every
+        DIST_RESTART_S would leak one blocked thread per attempt for as long as
+        the downstream stays stuck. After the budget is spent we keep the
+        gateway collecting and keep shouting, but stop spawning threads."""
+        now = time.monotonic()
+        self._dist_restart_times = [t for t in self._dist_restart_times if now - t < 3600.0]
+        return len(self._dist_restart_times) < self.MAX_DIST_RESTARTS_PER_HOUR
+
+    def _replace_distributor(self, reason: str) -> None:
+        if not self._dist_restart_budget_left():
+            now = time.monotonic()
+            if now - self._dist_giveup_logged > 600.0:
+                self._dist_giveup_logged = now
+                msg = (f"distribution is still stuck after "
+                       f"{self.MAX_DIST_RESTARTS_PER_HOUR} restarts in the last hour "
+                       f"({reason}) — no further automatic restarts; collection and the "
+                       f"local historian keep running, cloud/extra sinks need attention")
+                _LOG.error("v2-dist %s", msg)
+                self._customer_log("error", msg)
+            return
+        self._dist_restart_times.append(time.monotonic())
+        with self._dist_lock:
+            old = self._distributor
+            new = DistributionV2()
+            self._distributor = new
+        try:
+            old.abandon()
+        except Exception:
+            pass
+        new.start()
+        self._dist_restarts += 1
+        self._dist_warn_mono = 0.0
+        msg = (f"distribution worker replaced ({reason}); cloud records and "
+               f"extra database sinks resume now. The local historian was "
+               f"never affected and the store-forward outbox re-syncs the gap.")
+        _LOG.error("v2-dist %s", msg)
+        self._customer_log("warning", msg)
+
+    @staticmethod
+    def _customer_log(level: str, message: str) -> None:
+        """Best-effort line in the customer log so this is visible in the app,
+        not only in backend.log."""
+        try:
+            from app.state import app_store
+            app_store.append_log_rows([{
+                "level": level, "category": "engine",
+                "message": f"Collection distribution: {message}",
+            }])
+        except Exception:
+            pass
+
+    def _supervise_distribution(self) -> None:
+        if self._stop_evt.is_set():
+            return
+        with self._dist_lock:
+            d = self._distributor
+        try:
+            h = d.health()
+        except Exception:
+            return
+        if not h.get("alive"):
+            self._replace_distributor("thread is dead")
+            return
+        stalled = float(h.get("stalled_s") or 0.0)
+        if stalled <= 0:
+            self._dist_warn_mono = 0.0
+            return
+        if stalled >= self.DIST_RESTART_S:
+            self._replace_distributor(
+                f"no progress for {stalled:.0f}s while blocked in stage "
+                f"'{h.get('stage')}' ({h.get('stage_age_s')}s), "
+                f"{h.get('queue')} cycle(s) waiting, {h.get('dropped')} dropped"
+            )
+            return
+        now = time.monotonic()
+        if stalled >= self.DIST_WARN_S and (now - self._dist_warn_mono) > 60.0:
+            self._dist_warn_mono = now
+            msg = (f"STALLED {stalled:.0f}s in stage '{h.get('stage')}' "
+                   f"(queue={h.get('queue')}, dropped={h.get('dropped')}) — "
+                   f"cloud records and extra sinks are NOT being written; the "
+                   f"local historian is unaffected")
+            _LOG.error("v2-dist %s", msg)
+            self._customer_log("error", msg)
 
 
 class DistributionV2(threading.Thread):
@@ -356,10 +474,52 @@ class DistributionV2(threading.Thread):
         self.dropped = 0
         self._last_bootstrap_refresh = 0.0
         self._slow_log_mono = 0.0
+        # -- wedge detection (2026-08-21). A blocked stage cannot be
+        # interrupted, so the supervisor needs to know WHICH stage is stuck and
+        # for how long; `abandoned` lets a replacement take over while the old
+        # thread waits for its I/O to return.
+        self._last_progress_mono = time.monotonic()
+        self._stage = "starting"
+        self._stage_started_mono = time.monotonic()
+        self._abandoned = threading.Event()
+        self.started_utc_mono = time.monotonic()
 
     def stop(self) -> None:
         self._stop_evt.set()
         self._wake.set()
+
+    def abandon(self) -> None:
+        """Retire a wedged distributor. It exits at the next stage boundary;
+        the stage it is blocked in cannot be interrupted, so the thread may
+        linger until that I/O returns (at most one already-started cycle is
+        completed by it — a duplicate telemetry record is possible and is the
+        deliberate trade for restoring distribution)."""
+        self._abandoned.set()
+        self._stop_evt.set()
+        self._wake.set()
+
+    def _set_stage(self, name: str) -> None:
+        self._stage = name
+        self._stage_started_mono = time.monotonic()
+
+    def health(self) -> Dict[str, Any]:
+        """Lock-free snapshot for the supervisor and the status API.
+
+        `stalled_s` is only non-zero when there is work WAITING: an idle
+        distributor with an empty queue is not stalled, it has nothing to do."""
+        now = time.monotonic()
+        with self._lock:
+            q = len(self._queue)
+        idle = now - self._last_progress_mono
+        return {
+            "alive": self.is_alive(),
+            "queue": q,
+            "dropped": self.dropped,
+            "stage": self._stage,
+            "stage_age_s": round(now - self._stage_started_mono, 1),
+            "stalled_s": round(idle, 1) if q > 0 else 0.0,
+            "idle_s": round(idle, 1),
+        }
 
     def submit(self, batch: _CycleBatch) -> None:
         with self._lock:
@@ -385,6 +545,7 @@ class DistributionV2(threading.Thread):
         boot_ms = tel_ms = sink_ms = 0.0
         t = time.monotonic()
         if t - self._last_bootstrap_refresh >= 10.0:
+            self._set_stage("bootstrap")
             self._last_bootstrap_refresh = t
             try:
                 bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
@@ -393,6 +554,7 @@ class DistributionV2(threading.Thread):
                 pass
             boot_ms = (time.monotonic() - t) * 1000.0
         t = time.monotonic()
+        self._set_stage("telemetry")
         try:
             ok, err, _rec_id = telemetry_service.record_collection_cycle(
                 gateway_id=batch.gateway_id,
@@ -414,6 +576,7 @@ class DistributionV2(threading.Thread):
             w.last_error = f"Cloud-record write error: {exc}"
         tel_ms = (time.monotonic() - t) * 1000.0
         t = time.monotonic()
+        self._set_stage("sinks")
         try:
             w._persist_readings(batch.readings)
         except Exception as exc:
@@ -436,9 +599,14 @@ class DistributionV2(threading.Thread):
 
     def run(self) -> None:
         _LOG.info("v2-dist started (queue cap=%d cycles)", self.MAX_QUEUE_CYCLES)
+        self._last_progress_mono = time.monotonic()
+        self._set_stage("idle")
         while not self._stop_evt.is_set():
             self._wake.wait(timeout=0.5)
             self._wake.clear()
+            # An idle-but-alive distributor is making progress: without this the
+            # stall clock would keep running through quiet periods.
+            self._last_progress_mono = time.monotonic()
             while not self._stop_evt.is_set():
                 with self._lock:
                     batch = self._queue.popleft() if self._queue else None
@@ -449,7 +617,10 @@ class DistributionV2(threading.Thread):
                 except Exception as exc:
                     _LOG.warning("v2-dist cycle failed: %s: %s",
                                  type(exc).__name__, exc)
-        _LOG.info("v2-dist exited")
+                self._last_progress_mono = time.monotonic()
+                self._set_stage("idle")
+        self._set_stage("exited")
+        _LOG.info("v2-dist exited%s", " (abandoned)" if self._abandoned.is_set() else "")
 
 
 class CollectionEngineV2:
@@ -473,6 +644,19 @@ class CollectionEngineV2:
     def queue_stats(self) -> tuple[int, int]:
         w = self._writer
         return w.queue_stats() if w else (0, 0)
+
+    def distribution_health(self) -> Dict[str, Any]:
+        """Health of the distribution stage (telemetry + cloud + extra sinks).
+        Surfaced per gateway in /api/plc/gateways/status so the UI can tell
+        "nothing is being distributed" from "nothing is being collected"."""
+        w = self._writer
+        if w is None:
+            return {"alive": False, "queue": 0, "dropped": 0, "stage": "",
+                    "stage_age_s": 0.0, "stalled_s": 0.0, "restarts": 0}
+        try:
+            return w.distribution_health()
+        except Exception:
+            return {}
 
     def start_reader(self, worker, manager) -> None:
         self._ensure_writer()

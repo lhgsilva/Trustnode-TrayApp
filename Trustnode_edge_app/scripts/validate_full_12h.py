@@ -143,6 +143,7 @@ res_samples: list = []    # (epoch, cpu, rss_mb, threads, conns)
 outbox_depths: list = []  # (epoch, pending)
 module_checks: list = []  # (epoch, dict)
 log_events: list = []     # (epoch, category, line)
+dist_samples: list = []   # (epoch, stalled_s, stage, restarts, hist_lag_s|None, running)
 
 
 
@@ -231,6 +232,54 @@ async def db_task(stop_at: float) -> None:
         except Exception as exc:
             emit({"t": "db_err", "err": str(exc)[:90]})
         await asyncio.sleep(2.0)
+
+
+def _gateway_rows() -> list:
+    """Blocking — always called via asyncio.to_thread. api_get() only returns a
+    status + rtt, so this reads the body itself."""
+    import json as _j
+    import urllib.request
+    hdrs = {}
+    tok = get_token()
+    if tok:
+        hdrs["Authorization"] = f"Bearer {tok}"
+    try:
+        req = urllib.request.Request(f"{API}/api/plc/gateways/status", headers=hdrs)
+        with urllib.request.urlopen(req, timeout=8.0) as r:
+            rows = _j.loads(r.read().decode() or "[]")
+    except Exception:
+        return []
+    return rows if isinstance(rows, list) else [rows]
+
+
+async def distribution_task(stop_at: float) -> None:
+    """Watch the DISTRIBUTION stage and the DURABLE write stamp per gateway.
+
+    2026-08-21: a wedged distribution thread is invisible to every other probe
+    here — the reader, the WS feed and the historian all stay green while cloud
+    records and extra sinks silently stop. `distribution_stalled_s` and
+    `historian_last_write_utc` are the two signals that expose it."""
+    while time.time() < stop_at:
+        try:
+            for row in await asyncio.to_thread(_gateway_rows):
+                if not isinstance(row, dict):
+                    continue
+                hist_ts = parse_ts(str(row.get("historian_last_write_utc") or ""))
+                hist_lag = (time.time() - hist_ts.timestamp()) if hist_ts else None
+                sample = (
+                    time.time(),
+                    float(row.get("distribution_stalled_s") or 0.0),
+                    str(row.get("distribution_stage") or ""),
+                    int((row.get("distribution_restarts") or 0)),
+                    hist_lag,
+                    bool(row.get("running")),
+                )
+                dist_samples.append(sample)
+                emit({"t": "dist", "stalled_s": sample[1], "stage": sample[2],
+                      "hist_lag": None if hist_lag is None else round(hist_lag, 1)})
+        except Exception as exc:
+            emit({"t": "dist_err", "err": str(exc)[:90]})
+        await sleep_bounded(15.0, stop_at)
 
 
 async def api_task(stop_at: float) -> None:
@@ -537,6 +586,23 @@ def build_summary(t0: float, final: bool) -> str:
     except Exception as exc:
         A(f"[DB TRUTH] query failed: {exc}")
 
+    # distribution: the stage that can wedge without any other probe noticing
+    if dist_samples:
+        stalls = [d[1] for d in dist_samples]
+        hist_lags = [d[4] for d in dist_samples if d[4] is not None]
+        stages = sorted({d[2] for d in dist_samples if d[2]})
+        restarts = max((d[3] for d in dist_samples), default=0)
+        A("\n[DISTRIBUTION] telemetry + cloud record + extra sinks "
+          "(a wedge here is invisible to the WS and historian probes)")
+        A(f"  stall max={max(stalls):.0f}s  restarts={restarts}  stages seen={stages or ['-']}")
+        if hist_lags:
+            A(f"  durable write stamp age: p50={pct(hist_lags, .5):.1f}s max={max(hist_lags):.1f}s "
+              f"({len(hist_lags)} samples)")
+        else:
+            A("  durable write stamp: not reported by this build (pre-2026-08-21 backend)")
+    else:
+        A("\n[DISTRIBUTION] no samples")
+
     # databases: outbox + cloud
     if outbox_depths:
         ds = [d for _, d in outbox_depths]
@@ -650,6 +716,17 @@ def build_summary(t0: float, final: bool) -> str:
     _sm = surface_result.get("metrics") or {}
     A(f"  surfaces + access policy   : {'PASS' if _s_ok else 'FAIL'} ({_sm.get('checks', 0) - _sm.get('failed', 0)}/{_sm.get('checks', 0)} checks)")
     ok &= bool(_s_ok)
+    if dist_samples:
+        stall_max = max(d[1] for d in dist_samples)
+        A(f"  distribution not stalled : {'PASS' if stall_max < 120 else 'FAIL'} (max {stall_max:.0f}s)")
+        ok &= stall_max < 120
+        _hl = [d[4] for d in dist_samples if d[4] is not None]
+        if _hl and any(d[5] for d in dist_samples):
+            # The durable stamp must keep moving while a gateway runs — it is
+            # what the gateway footer shows, and it sat 5.6 h stale on
+            # 2026-08-21 while every other probe in this suite stayed green.
+            A(f"  durable write stamp fresh: {'PASS' if max(_hl) < 60 else 'FAIL'} (max {max(_hl):.0f}s)")
+            ok &= max(_hl) < 60
     boot_fail_n = cats.get("boot_fail", 0)
     A(f"  zero boot failures in run : {'PASS' if boot_fail_n == 0 else f'FAIL ({boot_fail_n})'}")
     ok &= boot_fail_n == 0
@@ -712,7 +789,7 @@ async def main() -> int:
         ws_task(stop_at), db_task(stop_at), api_task(stop_at),
         cloud_task(stop_at), resources_task(stop_at), outbox_task(stop_at),
         modules_task(stop_at), log_task(stop_at), retention_task(stop_at),
-        partial_task(t0, stop_at),
+        distribution_task(stop_at), partial_task(t0, stop_at),
     )
     report = build_summary(t0, final=True)
     with open(REPORT, "w", encoding="utf-8") as f:

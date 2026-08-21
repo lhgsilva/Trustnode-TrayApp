@@ -198,12 +198,15 @@ def audit(action: str, *, outcome: str, request: Any = None, payload: Optional[D
         try:
             from app.state import app_store
             level = "warning" if outcome in ("denied", "would_deny") else "info"
-            app_store.append_log(
-                level=level, category="access",
-                message=f"{action} {outcome}: user={user or '-'} role={role or '-'} "
-                        f"{det.get('method', '')} {det.get('path', '')} ip={det.get('ip', '')}"
-                        + (f" reason={det.get('reason')}" if det.get("reason") else ""),
-            )
+            # AppStore exposes append_log_rows(rows) — the singular append_log
+            # this used to call does not exist, so every audit line was being
+            # swallowed by the except below (found 2026-08-21).
+            app_store.append_log_rows([{
+                "level": level, "category": "access",
+                "message": f"{action} {outcome}: user={user or '-'} role={role or '-'} "
+                           f"{det.get('method', '')} {det.get('path', '')} ip={det.get('ip', '')}"
+                           + (f" reason={det.get('reason')}" if det.get("reason") else ""),
+            }])
         except Exception:
             logger.info("access %s %s user=%s role=%s %s", action, outcome, user, role, det)
     except Exception:

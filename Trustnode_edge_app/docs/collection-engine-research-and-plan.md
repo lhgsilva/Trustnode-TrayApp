@@ -158,3 +158,28 @@ Phase 2 (next): a data-source selector on the table widget adding
     query-result CSV export from the widget.
 Each source keeps the same filter/sort/limit chrome; historian remains the
 default source so existing widgets are untouched.
+
+---
+
+## 2026-08-21 — the distribution wedge, and why the UI lied about it
+
+**What happened on a live build.** Six minutes after boot the `tn-v2-dist` thread stopped making progress. For the next 5.6 hours:
+
+- the reader kept reading (WS chart feed 98.8% delivery, cadence p95 1.018 s),
+- `StorageWriterV2` kept committing to the historian (`historian_readings` +48 rows/s the whole time),
+- **nothing** was distributed: no telemetry/cloud record, no extra sinks, `sync_outbox` frozen at the same minute,
+- `running` stayed `true`, `last_error` and `db_last_error` stayed `None`,
+- the only symptom was `v2-dist queue FULL — dropped N cycle(s)` once per 100 drops, and the drop count tracked elapsed seconds exactly (the bounded deque had filled ~2.3 h after the wedge).
+
+**Why the UI reported "no writes".** `db_write_count` / `db_last_write_utc` were stamped *only* by `PLCWorker._mark_db_write_success`, reachable only from `_persist_readings`, called only from `DistributionV2._distribute_one`. So the two fields the gateway footer, `getGatewayHealth` and every freshness rule depend on measured the *lossy* path, not the durable one. The footer showed `Local SQLite | —` on a gateway that was storing 48 rows/s.
+
+**Changes.**
+
+1. `StorageWriterV2._write_historian` stamps `PLCWorker._mark_historian_commit(n)` for each contributing batch after a successful `append_historian_rows`, and returns early (no stamp) when the commit fails. The legacy historian flush in `plc_manager` stamps the same way. New status fields: `historian_write_count`, `historian_last_write_utc` (durable truth — what the UI shows), `sink_write_count` / `sink_last_write_utc` (the old `db_*` numbers under an honest name; `db_*` is unchanged for existing consumers).
+2. `DistributionV2` tracks its current stage (`bootstrap` / `telemetry` / `sinks` / `idle`), the time it entered it, and its last progress. `health()` reports `stalled_s` **only when work is waiting** — an idle distributor with an empty queue is not stalled. `abandon()` retires a wedged instance; it exits at the next stage boundary (its blocked call cannot be interrupted, so at most one already-started cycle is completed by it — a possible duplicate telemetry record is the deliberate trade).
+3. `StorageWriterV2._supervise_distribution()` runs on every flush tick: an ERROR in `backend.log` **and the customer log** after `TRUSTNODE_V2_DIST_WARN_S` (120 s) naming the blocked stage, automatic replacement after `TRUSTNODE_V2_DIST_RESTART_S` (300 s) or immediately if the thread is dead, capped at `MAX_DIST_RESTARTS_PER_HOUR = 5` — beyond that it keeps collecting and keeps shouting rather than leaking one blocked thread per attempt.
+4. `distribution_stalled_s` / `distribution_stage` ride along in `/api/plc/gateways/status` so the UI can distinguish "nothing is being distributed" from "nothing is being collected".
+
+**Still open:** the first-principles cause of *that* wedge is unattributed — the packaged service runs elevated, so `py-spy dump --pid <service>` needs an elevated shell. The instrumentation now names the stage the next time it happens.
+
+**Rule for diagnosing "is it collecting":** row growth in `historian_readings` (tenant + gateway predicate) or the `/ws/stream` feed. Frozen write counters + a growing historian = wedged distribution, not a collection stall.

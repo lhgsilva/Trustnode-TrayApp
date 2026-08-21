@@ -285,3 +285,11 @@ Reverse-proxy mode (customer nginx/IIS in front, `X-Forwarded-*` trust), SSO (LD
 | 5 — optional | not started (reverse proxy mode, SSO, per-IP allow-lists) | — |
 
 Verification: `scripts/validate_surfaces.py` (32 checks: listeners, certificate, static guard, RBAC from a LAN IP, lockout, revocation, master-default block) + `--boot-probe` + the 10-minute release gate on the running build.
+
+## 9. Post-implementation fixes (2026-08-21, same branch)
+
+Found while checking the built EXE against the running system:
+
+1. **LAN listener port leak** — `lan_socket.stop()` relied on uvicorn's graceful shutdown, which waits for open connections; a browser keep-alive kept the old port bound, so `sync_with_settings` restarts walked the candidate ladder (8443 and 8444 both listening at once). The listener now binds its own socket and hands it to uvicorn (`serve(sockets=[sock])`), sets `force_exit`, and closes the socket if the thread has not exited within 5 s. Proven with a test that holds a keep-alive connection open across `stop()` and re-binds the same port immediately.
+2. **Gate blind spot** — `scripts/validate_surfaces.py` only knew the HTTP port, so an HTTPS-only site skipped the whole remote half and still reported PASS. It now runs the remote checks over whichever transport is enabled, and fails outright when Remote Access is on with no listener bound.
+3. **Audit customer-log line never landed** — `access_policy.audit()` called `app_store.append_log(...)`, which does not exist (`append_log_rows` does); the `except` swallowed it, so refusals reached `cp_security_audit_log` but never the customer log. Fixed.

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import threading
 from typing import Any, Dict, Optional
 
@@ -117,13 +118,33 @@ def _serve_in_thread(scheme: str, host: str, port: int, ssl_cert: str = "", ssl_
         kwargs.update(ssl_certfile=ssl_cert, ssl_keyfile=ssl_key)
     config = uvicorn.Config(**kwargs)
     server = uvicorn.Server(config)
+    # Bind the socket OURSELVES and hand it to uvicorn (2026-08-21). uvicorn's
+    # graceful shutdown waits for open connections, so a plain should_exit could
+    # leave the port bound long after stop() returned — the next start() then
+    # picked the following candidate port and both listeners answered. Owning
+    # the socket lets stop() close it and free the port deterministically.
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind((host, int(port)))
+        sock.listen(2048)
+        sock.setblocking(False)
+    except OSError as exc:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        _lan_last_error = f"{scheme} bind failed on port {port}: {exc.errno} {exc.strerror or exc}"
+        logger.warning("LAN server %s", _lan_last_error)
+        return
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     with _lan_lock:
         entry = _listeners.setdefault(scheme, {})
-        entry.update(server=server, loop=loop, port=int(port))
+        entry.update(server=server, loop=loop, port=int(port), socket=sock)
     try:
-        loop.run_until_complete(server.serve())
+        loop.run_until_complete(server.serve(sockets=[sock]))
     except OSError as exc:
         _lan_last_error = f"{scheme} bind failed on port {port}: {exc.errno} {exc.strerror or exc}"
         logger.warning("LAN server %s", _lan_last_error)
@@ -135,9 +156,13 @@ def _serve_in_thread(scheme: str, host: str, port: int, ssl_cert: str = "", ssl_
             loop.close()
         except Exception:
             pass
+        try:
+            sock.close()
+        except Exception:
+            pass
         with _lan_lock:
             entry = _listeners.get(scheme) or {}
-            entry.update(server=None, loop=None)
+            entry.update(server=None, loop=None, socket=None)
 
 
 def _pick_port(candidates, primary_port: int, host: str) -> tuple[int, list]:
@@ -159,7 +184,8 @@ def _start_listener(scheme: str, host: str, port: int, ssl_cert: str = "", ssl_k
             return True
         th = threading.Thread(target=_serve_in_thread, args=(scheme, host, port, ssl_cert, ssl_key),
                               daemon=True, name=f"tn-lan-{scheme}")
-        _listeners[scheme] = {"server": None, "thread": th, "loop": None, "port": int(port)}
+        _listeners[scheme] = {"server": None, "thread": th, "loop": None,
+                              "port": int(port), "socket": None}
         th.start()
     for _ in range(40):
         _t.sleep(0.05)
@@ -240,15 +266,32 @@ def stop() -> dict:
         return {"ok": True, "running": False, "note": "already stopped"}
     for scheme, e in entries.items():
         server, loop, thread = e.get("server"), e.get("loop"), e.get("thread")
+        sock, port = e.get("socket"), int(e.get("port") or 0)
         if server is not None:
             server.should_exit = True
+            # Do not wait for in-flight connections: a browser holding a
+            # keep-alive socket must never keep the old port bound.
+            server.force_exit = True
         if loop is not None:
             try:
                 loop.call_soon_threadsafe(lambda: None)  # nudge the loop
             except Exception:
                 pass
         if thread is not None:
-            thread.join(timeout=3.0)
+            thread.join(timeout=5.0)
+        if thread is not None and thread.is_alive():
+            # Last resort: release the port ourselves so the next start() binds
+            # the SAME port instead of climbing the candidate ladder.
+            try:
+                if sock is not None:
+                    sock.close()
+                logger.warning(
+                    "LAN %s listener did not exit in 5s — closed its socket to "
+                    "release port %d", scheme, port,
+                )
+            except Exception as exc:
+                logger.warning("LAN %s listener socket close failed on port %d: %s",
+                               scheme, port, exc)
     with _lan_lock:
         _listeners.clear()
     return {"ok": True, "running": False}

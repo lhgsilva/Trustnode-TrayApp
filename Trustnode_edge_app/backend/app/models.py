@@ -83,3 +83,17 @@ class GatewayStatus(BaseModel):
     db_pending_count: int = 0
     collection_blocked: bool = False
     collection_block_reason: str | None = None
+    # 2026-08-21 (footer truth): db_write_count/db_last_write_utc above are
+    # stamped by the DISTRIBUTION path (extra sinks, cloud record, outbox).
+    # When that path wedges they freeze while the local historian keeps
+    # committing — the UI then reports "no DB writes" for hours on a perfectly
+    # healthy gateway. historian_* is the durable local truth (what the UI
+    # should show), sink_* is the same number db_* carries under a name that
+    # says what it measures, and distribution_* exposes the wedge itself.
+    historian_write_count: int = 0
+    historian_last_write_utc: str | None = None
+    sink_write_count: int = 0
+    sink_last_write_utc: str | None = None
+    distribution_stalled_s: float = 0.0
+    distribution_stage: str | None = None
+    distribution_restarts: int = 0

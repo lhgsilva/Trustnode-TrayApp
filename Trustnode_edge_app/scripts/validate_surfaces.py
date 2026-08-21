@@ -10,8 +10,10 @@ and the access policy around them behave:
       (= the UI bundles made it into the build and the static guard is on)
     * GET /api/lan-sharing/status 200 (admin) with the Remote Access fields
     * /api/lite-local/bootstrap + /reports 200 for an admin
-  remote (only when Remote Access is ON and a LAN IP is known):
-    * HTTP and, when available, HTTPS listeners answer /api/health
+    * the Backup & Retention page's API (status/options/policies/runs)
+  remote (only when Remote Access is ON and a LAN IP is known; the checks
+  run over HTTP, or over HTTPS when the site is HTTPS-only):
+    * every enabled listener answers /api/health
     * the certificate download works
     * admin from the LAN: full bundle 200, config PUT allowed
     * a temporary viewer from the LAN: GET allowed, mutation 403, full
@@ -119,6 +121,34 @@ def run(remote: bool = True) -> tuple[bool, list[str], dict]:
     st, b, _ = _call("GET", f"{API}/api/lan-sharing/status")
     chk("tray loopback status without token", st == 200, f"status={st}")
 
+    # Backup & Retention page (2026-08-21): every call the page makes on load.
+    # The page died on a legacy-shaped run row, and the API prefix is
+    # /api/app-store/retention/v2 — probing /api/retention/v2 404s and looks
+    # like the feature is gone.
+    RET = f"{API}/api/app-store/retention/v2"
+    _t0 = time.time()
+    st, rs, _ = _call("GET", f"{RET}/status", token=admin)
+    _ret_ms = (time.time() - _t0) * 1000.0
+    chk("retention status (admin)",
+        st == 200 and isinstance(rs, dict) and isinstance(rs.get("status"), dict),
+        f"status={st}")
+    # The page fetches this on load with a 12 s client timeout; at 9 M rows the
+    # unoptimised version took 6.5 s and lost the race, rendering 0 B / 0
+    # readings. Keep it well inside the budget.
+    chk("retention status answers < 5s", _ret_ms < 5000, f"{_ret_ms:.0f}ms")
+    metrics["retention_status_ms"] = round(_ret_ms)
+    if st == 200:
+        eng = (rs.get("status") or {}).get("engine") or {}
+        chk("retention engine thread running", bool(eng.get("running")), eng)
+    st, ro, _ = _call("GET", f"{RET}/options", token=admin)
+    chk("retention options (admin)", st == 200 and bool((ro or {}).get("resolutions")), f"status={st}")
+    st, rp, _ = _call("GET", f"{RET}/policies", token=admin)
+    chk("retention policies (admin)", st == 200 and "policies" in (rp or {}), f"status={st}")
+    st, rr, _ = _call("GET", f"{RET}/runs?limit=5", token=admin)
+    chk("retention runs history (admin)", st == 200 and "runs" in (rr or {}), f"status={st}")
+    st, bk, _ = _call("GET", f"{API}/api/app-store/backups/v2", token=admin)
+    chk("backups list (admin)", st in (200, 404), f"status={st}")
+
     if not remote or not isinstance(status, dict) or not status.get("running"):
         L.append("  (remote checks skipped: Remote Access is OFF)")
         return ok_all, L, metrics
@@ -127,17 +157,31 @@ def run(remote: bool = True) -> tuple[bool, list[str], dict]:
     https_port = int(status.get("https_port") or 0)
     metrics.update(lan_ip=ips[0] if ips else "", http_port=http_port, https_port=https_port,
                    licensed=status.get("licensed"), rbac_mode=status.get("rbac_mode"))
-    if not ips or not http_port:
-        L.append("  (remote checks skipped: no LAN IP / HTTP port)")
+    if not ips:
+        L.append("  (remote checks skipped: no LAN IP on this machine)")
         return ok_all, L, metrics
-    LAN = f"http://{ips[0]}:{http_port}"
+    if not http_port and not https_port:
+        # Remote Access is ON but neither listener bound: that is a failure, not
+        # something to skip over (2026-08-21: the HTTPS-only site silently
+        # skipped every remote check because this only looked at the HTTP port).
+        chk("a LAN listener is bound", False, "no HTTP and no HTTPS port")
+        return ok_all, L, metrics
+    # Run the remote half over whichever transport the operator left enabled;
+    # an HTTPS-only site must be exercised exactly like an HTTP one.
+    LAN = (f"http://{ips[0]}:{http_port}" if http_port
+           else f"https://{ips[0]}:{https_port}")
+    L.append(f"  (remote checks over {LAN})")
+    metrics["remote_base"] = LAN
     st, pem, _ = _call("GET", f"{API}/api/lan-sharing/certificate", raw=True)
     chk("certificate download", st == 200 and b"BEGIN CERTIFICATE" in pem, f"status={st}")
     if https_port:
         st, _, _ = _call("GET", f"https://{ips[0]}:{https_port}/api/health")
         chk("https listener /api/health", st == 200, f"status={st}")
-    st, _, _ = _call("GET", f"{LAN}/api/health")
-    chk("http LAN listener /api/health", st == 200, f"status={st}")
+    if http_port:
+        st, _, _ = _call("GET", f"http://{ips[0]}:{http_port}/api/health")
+        chk("http LAN listener /api/health", st == 200, f"status={st}")
+    else:
+        L.append("  (HTTP listener intentionally off: HTTPS-only mode)")
 
     st, admin_r, body, _ = _login(LAN, LOGIN["username"], LOGIN["password"])
     chk("admin login from LAN", st == 200 and bool(admin_r), f"status={st}")

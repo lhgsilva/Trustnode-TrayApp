@@ -96,3 +96,15 @@ reports / alarms / triggers snapshots, resource trends, and the log census
 Only commit the version when the gate prints `OVERALL: PASS`. For deep soak
 certification (overnight), run the same suite at full length:
 `python scripts/validate_full_12h.py` (12 h default).
+
+### Distribution watch (added 2026-08-21)
+
+The gate now samples `/api/plc/gateways/status` every 15 s for `distribution_stalled_s`
+and `historian_last_write_utc`, reports them under `[DISTRIBUTION]`, and fails the run when
+the distribution stage stalls for 120 s+ or the durable write stamp of a running gateway goes
+older than 60 s.
+
+Why: on 2026-08-21 the `tn-v2-dist` thread wedged 6 minutes after boot and a full 10-minute
+gate run still passed — the WS feed and the historian were healthy (they are fed by other
+threads) and outbox depth read 0, which a wedge produces exactly like an idle healthy system.
+Cloud records and every extra database sink were dead for 5.6 h with `last_error = None`.

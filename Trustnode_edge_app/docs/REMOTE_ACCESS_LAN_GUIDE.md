@@ -80,3 +80,8 @@ Environment variables (set in `%LOCALAPPDATA%\TrustNode\.env`):
 - `TRUSTNODE_MASTER_ADMIN_PASSWORD` — required for the master account to be usable remotely
 
 Every refusal (role, licence, surface) is written to `cp_security_audit_log` and to the customer log (category `access`).
+
+## 8. 2026-08-21 fixes in this area
+
+- Switching **HTTPS only** on or off now reuses the same ports. Previously the outgoing listener could keep its socket while a browser held a connection open, so the new listener climbed one port (8443 → 8444) on every toggle and both answered. `stop()` now force-closes the socket it owns and logs when it has to.
+- The release gate's surface checks run over HTTPS when a site is HTTPS-only. Before, they keyed off the HTTP port and silently skipped every remote check (reporting a green 16/16 instead of the full 33).
