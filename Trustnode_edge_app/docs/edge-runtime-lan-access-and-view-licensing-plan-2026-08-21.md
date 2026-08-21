@@ -1,7 +1,9 @@
 # TrustNode — Product Surfaces, LAN Runtime Access & View Licensing
 
 **Research report + target architecture + rollout plan**
-Date: 2026-08-21 · Status: PROPOSAL (no code changed) · Scope: edge backend (`backend/app`), Electron shell (`desktop/`), React app (`frontend/`), LAN-served static UIs (`backend/static/*`), cloud read-only view (`web_cloud_readonly/`, VPS), portal contract, release gate.
+Date: 2026-08-21 · Status: APPROVED DIRECTION — decisions resolved by the owner on 2026-08-21 (see §7); no code changed yet · Scope: edge backend (`backend/app`), Electron shell (`desktop/`), React app (`frontend/`), LAN-served static UIs (`backend/static/*`), cloud read-only view (`web_cloud_readonly/`, VPS), portal contract, release gate.
+
+> **Owner decisions (2026-08-21):** product names **TrustNode Edge / Local View / Cloud View**; **admin + engineer** may configure from the LAN; remote access must **work on any company network with zero friction** (so HTTPS is offered, not forced — §3.4); **Local View requires login**, no-login share links are a **licence option**; the **React client view becomes the single read-only UI**; **LAN-with-admin-login is the scope** (no portal-initiated remote admin for now).
 
 > Companion to `docs/LICENSE_PACKAGES.md`, `docs/PORTAL_PACKAGE_EDITOR_SPEC.md`, `docs/CUSTOMER_PORTAL_MULTI_TENANT_PLAN_2026-04-24.md` and `docs/historian-retention-and-forwarding-architecture-2026-08-21.md`. Same method as the collection-engine and retention plans: read the running system first, name every gap with a `file:line`, then change the app in gated phases that never put the collection runtime at risk.
 
@@ -40,9 +42,9 @@ Per-user access flags (`access_full`, `access_lite`, `access_client` — "LAN We
 
 | Commercial name | What the user gets | Licence modules (live catalog) | Network |
 |---|---|---|---|
-| **TrustNode Edge** (runtime + admin) | collection engine, full configuration, dashboards, reports — on the desktop **and**, with the LAN permission, from any PC on the LAN with an admin/engineer login | `gateway_runtime_control`, `gateway_configuration`, `tags`, `users_and_access_control`, … (today's set) + `lan_access` + **`remote_admin_lan`** (new) | loopback always; LAN when `remote_admin_lan` |
-| **TrustNode View** (local read-only) | dashboards + reports in the browser on the LAN (web/mobile), reading the locally configured database | `lan_access` + `local_web_app` (+ optional `view_share_links`, new) | LAN |
-| **TrustNode Cloud View** (cloud read-only) | dashboards + reports over the internet, reading the cloud database | `cloud_database` + `cloud_lite_access` (+ `cloud_client_view`) | internet (VPS) |
+| **TrustNode Edge** (runtime + admin) — `package_key: edge` | collection engine, full configuration, dashboards, reports — on the desktop **and**, with the LAN permission, from any PC on the LAN with an **admin or engineer** login | `gateway_runtime_control`, `gateway_configuration`, `tags`, `users_and_access_control`, … (today's set) + `lan_access` + **`remote_admin_lan`** (new) | loopback always; LAN when `remote_admin_lan` |
+| **TrustNode Local View** (read-only, LAN) — `package_key: local_view` | dashboards + reports in the browser on the LAN (web/mobile), **login required**, reading the locally configured database | `lan_access` + `local_web_app` (+ licence option **`view_share_links`** for no-login links) | LAN |
+| **TrustNode Cloud View** (read-only, internet) — `package_key: cloud_view` | dashboards + reports over the internet, reading the cloud database | `cloud_database` + `cloud_lite_access` (+ `cloud_client_view`) | internet (VPS) |
 
 ---
 
@@ -113,10 +115,10 @@ Keep **`MODULE_CATALOG` (code) as the authority** — it is what the portal edit
 
 - **Reuse** the dead keys: `local_web_app` → *TrustNode View (LAN)*; `cloud_lite_access` → *Cloud View (Lite)*; `cloud_client_view` → *Cloud View (React client view)*; `lan_access` → *LAN listener may bind*.
 - **Add one key:** `remote_admin_lan` — *"Full runtime reachable from a non-loopback address with an admin/engineer login"*. Without it the full surface is loopback-only even when LAN sharing is ON. This is the single genuinely missing permission in requirement 2.
-- **Optionally add** `view_share_links` — *"no-login view-link tokens allowed"* (a different security posture from "must log in"; keep it separately sellable).
+- **Add** `view_share_links` — *"no-login view-link tokens allowed"*. Owner decision: **Local View always requires a login**; share links exist only when this option is licensed (a different security posture, separately sellable). Until it is licensed, `/api/lite-view/resolve/` and the raw `?token=` branch return 404.
 - Provide an **alias map** in `license_inspect._normalize_module_key` so portal-issued `view.lan` ⇄ `local_web_app`, `view.web` ⇄ `cloud_lite_access`, `studio.*` ⇄ the existing studio keys resolve to the same flags; update `LICENSE_PACKAGES.md` to state the live names (it mandates same-commit updates and was never followed).
 - Replace the staleness heuristic with a `license.updated_utc`/`version` comparison **before** any new key ships.
-- `package_key` stays informational: `edge`, `view_lan`, `view_cloud`, `operations`, `enterprise` drive only the portal dropdown and the banner.
+- `package_key` stays informational: **`edge`, `local_view`, `cloud_view`** (owner-approved names; plus `operations`, `enterprise` as bundles) drive only the portal dropdown and the banner. Banner/labels read "TrustNode Edge", "TrustNode Local View", "TrustNode Cloud View".
 
 ### 3.2 Access matrix (what is allowed where)
 
@@ -124,8 +126,8 @@ Keep **`MODULE_CATALOG` (code) as the authority** — it is what the portal edit
 |---|---|---|---|---|---|
 | Desktop (loopback) | login page | read + operate (per role) | — | configure (no users/licence) | everything |
 | `/trustnode/full/app/` from LAN | **login page only** (bundle not served) | **403** unless `access_full` **and** role ≥ engineer **and** `remote_admin_lan` | never | configure, if `remote_admin_lan` | everything, if `remote_admin_lan` |
-| `/trustnode/client/app/` from LAN | login | read-only, if `local_web_app` + `access_client` | read-only, if `view_share_links` | same as viewer | same |
-| `/trustnode/lite/app/` from LAN | login | read-only, if `local_web_app` + `access_lite` | read-only, if `view_share_links` | same | same |
+| `/trustnode/client/app/` from LAN (**Local View**) | login page only | read-only, if `local_web_app` + `access_client` | read-only **only if `view_share_links` is licensed** (else 404) | same as viewer | same |
+| `/trustnode/lite/app/` from LAN (frozen Lite, until Phase 4) | login page only | read-only, if `local_web_app` + `access_lite` | read-only **only if `view_share_links` is licensed** (else 404) | same | same |
 | Cloud View (VPS) | Supabase Auth | read-only, if `cloud_lite_access`/`cloud_client_view` | — | — | portal admin |
 | Mutating `/api/*` from LAN | 401 | **403** (read-only) | **403** | allowed for configuration prefixes when `remote_admin_lan` | allowed when `remote_admin_lan` |
 | `/api/lan-sharing/*`, `/api/connections/*` | 401 | 403 | 403 | 403 | allowed (loopback or LAN) |
@@ -148,7 +150,8 @@ One module `backend/app/access_policy.py` used by the auth middleware and as rou
 
 ### 3.4 Transport security & network posture
 
-- **TLS on the LAN listener**: generate a per-install self-signed certificate + key at first enable (stored in the data dir, CN = hostname, SANs = all LAN IPs, 10-year validity), serve `https://<ip>:8443` (uvicorn `ssl_certfile/ssl_keyfile`; `LAN_PORT_CANDIDATES` → configurable `lan_port`, default 8443 for TLS, 8088 legacy HTTP kept behind `lan_http_enabled=false`). Offer **"Download certificate"** + a one-page trust instruction (Windows/Android/iOS) on the Remote Access page; allow uploading an enterprise cert/key for sites with their own CA. TLS also restores secure-context APIs (clipboard, service worker).
+- **TLS offered, never forced (owner decision: "has to work always on any company network").** A self-signed certificate produces browser warnings and phone-by-phone trust steps that many sites will not accept, so the listener is **dual-stack by default**: `http://<ip>:8088` (works everywhere, zero friction) **and** `https://<ip>:8443` with a per-install self-signed certificate generated at first enable (data dir, CN = hostname, SANs = all LAN IPs, 10-year validity; uvicorn `ssl_certfile/ssl_keyfile`). The Remote Access page shows both URLs, recommends HTTPS, offers **"Download certificate"** + a one-page trust guide (Windows/Android/iOS), accepts an enterprise cert/key for sites with their own CA, and has an **"HTTPS only"** switch the site admin can turn on. Compensating controls on plain HTTP: per-account lockout, shorter LAN session TTL (4 h), tokens never placed in URLs except the WebSocket handshake (moved to a short-lived one-time ticket), clipboard/service-worker fallbacks for non-secure origins, and an explicit warning banner on the Remote Access page when HTTP is active.
+- **Discoverability on any network:** URLs shown per IP **and** as `http://<hostname>:8088/…` (Windows resolves LAN hostnames via LLMNR/NetBIOS on the same subnet; mDNS `<hostname>.local` for phones), each with a QR code; the edge logs a warning when no non-loopback IPv4 is found or when the port had to fall back.
 - Firewall rule `profile=private,domain` (not `any`); `bind_host` configurable (single NIC) — `lan_socket.py:97`.
 - Session hardening for a LAN-exposed login: per-account lockout (5 failures → 15 min, persisted, admin-unlockable) in addition to the per-IP limiter; mandatory password change for the default master-admin; password policy (12+ chars) for admin/engineer; shorter JWT for LAN origins (4 h) with silent refresh; `Secure`/`HttpOnly` session cookie when TLS is on.
 - Audit: every LAN login, denial, licence-gate hit and configuration mutation from a non-loopback origin → `cp_security_audit_log` (table exists) with user, role, IP, path.
@@ -238,14 +241,18 @@ Reverse-proxy mode (customer nginx/IIS in front, `X-Forwarded-*` trust), SSO (LD
 
 ---
 
-## 7. Decisions needed from the owner
+## 7. Decisions — resolved by the owner (2026-08-21)
 
-1. **Tier naming in the portal**: `edge`, `view_lan`, `view_cloud` (+ `operations`, `enterprise`) as `package_key` values — OK?
-2. **Which roles may configure from the LAN**: admin only, or admin + engineer (proposed)? Which operator actions are allowed remotely (alarm ack, batch start/stop, report run)?
-3. **TLS default**: HTTPS-only on the LAN after Phase 2 (HTTP kept as an explicit legacy toggle)?
-4. **Share links**: keep no-login view links as a separately licensed option (`view_share_links`), or require login always for TrustNode View?
-5. **Read-only UI of record**: consolidate on the React client view for both LAN and cloud (recommended), retiring the vanilla Lite after verification?
-6. **Remote management of locked-down sites** (`view.lan_only` in the old spec): is portal-initiated remote admin (cloud relay) in scope, or is LAN-with-admin-login sufficient for now? (This plan assumes the latter.)
+| # | Question | Decision | Consequence in this plan |
+|---|---|---|---|
+| 1 | Tier naming | **Edge, Local View, Cloud View** | `package_key` = `edge` / `local_view` / `cloud_view`; labels "TrustNode Edge / Local View / Cloud View" in portal, banner, Remote Access page (§0, §3.1) |
+| 2 | Who configures from the LAN | **admin + engineer** | role policy: `engineer` may use every configuration prefix remotely except users/licence/LAN/connection management (`admin`/`super`); operator remote actions (alarm ack, batch scan/start/stop, report run) confirmed from the Phase-1 denial log (§3.3) |
+| 3 | TLS | **not sure — must always work on any company network** | dual-stack HTTP + HTTPS by default, HTTPS recommended and optional "HTTPS only" per site, hostname + QR discoverability, compensating controls on HTTP (§3.4) |
+| 4 | Share links | **licence option; login required for View** | Local View = login always; `view_share_links` gates the no-login path (404 when not licensed) (§3.1, §3.2) |
+| 5 | Read-only UI of record | **yes — consolidate** | React client view becomes Local View and Cloud View; vanilla Lite frozen, retired after VPS verification (§3.6, Phase 4) |
+| 6 | Remote admin via portal | **LAN with admin login is enough for now** | cloud-relay remote admin out of scope; `view.lan_only`-style locked sites handled by `access_*` flags + `remote_admin_lan` (§3.2) |
+
+**Next step:** start Phase 0 (restore the cloud Lite bundle to git, surface checks in the release gate, fix the two landmines + the LAN-page auth/logo/clipboard issues, renew the dev licence). Phase 0 changes nothing for the desktop user and is fully covered by the existing release gate plus the new surface checks.
 
 ---
 
