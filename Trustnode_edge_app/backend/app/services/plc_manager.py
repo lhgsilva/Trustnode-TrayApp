@@ -6,7 +6,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote_plus
 
 # Operator 2026-06-23: dedicated logger for the gateway worker so every
@@ -2035,6 +2035,52 @@ class GatewayWorker:
     def _default_data_file(self, filename: str) -> str:
         return os.path.join(self._default_data_dir(), filename)
 
+    def _is_builtin_local_sqlite_sink(self, sink: Optional[Dict[str, Any]]) -> bool:
+        """True when `sink` is the stock "Local SQLite" connection pointing at the
+        data-dir default file (./data/trustnode_edge.db).
+
+        Operator 2026-08-21 (retention research, design item D10): every reading
+        is ALREADY persisted once by app_store.append_historian_rows — the store
+        that feeds charts, batches, reports and the AI tools. Writing it a second
+        time into trustnode_edge.db (with a raw_payload JSON copy, in rollback-
+        journal mode) cost 1.4–6 s per 1 s cycle once that file reached 4.3 GB and
+        starved the V2 distribution queue (backlog 6 -> 314 in the 10-min release
+        gate of 2026-08-21). The built-in local sink is therefore an ALIAS of the
+        historian: db_write_count / db_last_write_utc still advance, but no
+        duplicate file write happens. A sqlite sink pointed at ANY other path
+        (USB / NAS export) still gets the physical write. Escape hatch for a
+        rollback without rebuild: TRUSTNODE_LOCAL_SQLITE_SINK_DEDUP=0.
+        """
+        try:
+            if not isinstance(sink, dict):
+                return False
+            if str(sink.get("engine") or "").strip().lower() != "sqlite":
+                return False
+            if os.environ.get("TRUSTNODE_LOCAL_SQLITE_SINK_DEDUP", "1").strip() == "0":
+                return False
+            configured = str(sink.get("sqlite_path") or "").strip() or "./data/trustnode_edge.db"
+            if configured == ":memory:":
+                return False
+            resolved = self._sqlite_url_from_path(configured).split(":///", 1)[-1]
+            default = self._default_data_file("trustnode_edge.db").replace("\\", "/")
+            return os.path.normcase(os.path.abspath(resolved)) == os.path.normcase(os.path.abspath(default))
+        except Exception:
+            return False
+
+    def _note_builtin_sink_dedup_once(self, label: str) -> None:
+        if getattr(self, "_builtin_sink_dedup_noted", False):
+            return
+        self._builtin_sink_dedup_noted = True
+        try:
+            _GW_LOG.info(
+                "gateway=%s sink '%s' is the built-in Local SQLite (data-dir trustnode_edge.db): "
+                "rows are already in the historian, duplicate file write skipped "
+                "(set TRUSTNODE_LOCAL_SQLITE_SINK_DEDUP=0 to restore the copy)",
+                getattr(self, "gateway_id", "?"), label,
+            )
+        except Exception:
+            pass
+
     def _ensure_buffer_engine(self):
         from sqlalchemy import create_engine, event, text
 
@@ -2288,13 +2334,20 @@ class GatewayWorker:
             except Exception as exc:
                 self._mark_db_write_error(f"Store-forward pipeline error: {exc}")
         elif engine == "sqlite":
-            # Matches the 0.0.0.1000 reference: write to the user-configured
-            # SQLite file. The earlier no-op shortcut broke `db_write_count`
-            # accounting AND left users without their explicit "Local SQLite"
-            # export, which is the only thing visible in the Database page's
-            # row counter. _broadcast still writes to app_store.historian_readings
-            # (the chart-feeding store) independently — both happen.
-            self._persist_sqlite(readings)
+            # History: an earlier no-op shortcut broke `db_write_count` accounting,
+            # so the sqlite sink was made a real write-through to the configured
+            # file. Operator 2026-08-21: the STOCK "Local SQLite" sink points at the
+            # data-dir trustnode_edge.db — a byte-for-byte duplicate of what
+            # _broadcast / StorageWriterV2 already commit to
+            # app_store.historian_readings. That second write became the slowest
+            # stage of every cycle (see _is_builtin_local_sqlite_sink), so the
+            # built-in sink now only ACCOUNTS the write (counters, footer, status)
+            # and skips the copy. Any other sqlite path is still written for real.
+            if self._is_builtin_local_sqlite_sink(self.db_sink):
+                self._mark_db_write_success(len(readings))
+                self._note_builtin_sink_dedup_once(str(self.db_sink.get("name") or self.db_sink.get("id") or "sqlite"))
+            else:
+                self._persist_sqlite(readings)
             self.db_pending_count = 0
         elif engine == "csv_file":
             self._persist_csv_file(readings)
@@ -2353,7 +2406,12 @@ class GatewayWorker:
                 elif sink_engine == "txt_file":
                     self._persist_txt_file_for_sink(sink, readings)
                 elif sink_engine == "sqlite":
-                    self._persist_sqlite_for_sink(sink, readings)
+                    if self._is_builtin_local_sqlite_sink(sink):
+                        # Same rule as the primary path: the built-in Local SQLite
+                        # sink is an alias of the historian — no duplicate write.
+                        self._note_builtin_sink_dedup_once(sink_label)
+                    else:
+                        self._persist_sqlite_for_sink(sink, readings)
                 elif sink_engine == "postgresql":
                     # Operator 2026-06-17 (M4): parallel Postgres sinks
                     # are now writable via the shared sinks_sql helper.
