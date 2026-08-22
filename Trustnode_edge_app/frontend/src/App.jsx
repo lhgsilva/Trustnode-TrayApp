@@ -146,6 +146,7 @@ import {
   getAIEndpointConfig,
   setAIEndpointConfig,
   getLicenseSeats,
+  getPermissionCatalog,
   sendUserAccessEmail,
   getControlPlaneUsers,
   upsertControlPlaneUser,
@@ -4446,6 +4447,14 @@ function AppShell() {
   });
   const [licenseSeats, setLicenseSeats] = useState(null);
   const [licenseSeatsLoading, setLicenseSeatsLoading] = useState(false);
+  // Permission catalogue (Phase C R3 2026-08-22): fetched once from the
+  // backend /api/control-plane/permission-catalog endpoint.  Falls back to
+  // null so the Users editor reverts to the local PERMISSION_GROUPS constant.
+  const [permissionCatalog, setPermissionCatalog] = useState(null);
+  // Create-user modal (replaces the inline form so the page stays compact).
+  const [showCreateUserModal, setShowCreateUserModal] = useState(false);
+  // Per-editor collapsed state for permission groups {groupName: bool}.
+  const [userEditorCollapsed, setUserEditorCollapsed] = useState({});
   const [showAccessEmailModal, setShowAccessEmailModal] = useState(false);
   const [accessEmailUsername, setAccessEmailUsername] = useState("");
   const [accessEmailResult, setAccessEmailResult] = useState(null);
@@ -10808,6 +10817,12 @@ function AppShell() {
   // app flickering. Stable identities break that loop; behavior is unchanged.
   const canEditPage = useCallback((page) => {
     if (isReadonlyCloudMode) return false;
+    // Phase C C.7 2026-08-22: viewer / client roles and read-only LAN
+    // surfaces never have edit rights.  canOpenPage has its own special-cases
+    // for every page a viewer IS allowed to see read-only (dashboard, tags,
+    // alarms, historian, reporting, generated_reports) so they are not blocked
+    // from NAVIGATING — only from performing write actions.
+    if (isReadOnlySession()) return false;
     if (!currentUser) return false;
     if (currentUser.role === "admin") return true;
     const mapped =
@@ -19349,6 +19364,7 @@ const getGatewayHealth = (gateway) => {
           );
         }
         setError("");
+        setShowCreateUserModal(false);
         setNewUserForm({
           username: "",
           password: "",
@@ -19837,6 +19853,25 @@ const getGatewayHealth = (gateway) => {
     currentUser.permissions?.users_and_access_control
   );
 
+  // Phase C R3 2026-08-22: effective permission groups for the user editor.
+  // When the backend returns a catalogue, use its groups/features directly.
+  // Falls back to PERMISSION_GROUPS (local constant) so the UI always works.
+  const effectiveCatalogGroups = useMemo(() => {
+    if (permissionCatalog?.groups && permissionCatalog.groups.length) {
+      return permissionCatalog.groups;
+    }
+    return PERMISSION_GROUPS.map((g) => ({
+      group: g.title,
+      features: g.items.map((k) => ({
+        key: k,
+        label: PERMISSION_LABELS[k] || k.replace(/_/g, " "),
+        licensed: true,
+        admin_only: false,
+        pages: [],
+      })),
+    }));
+  }, [permissionCatalog]);
+
   // Master / developer admin: role=admin AND tenant=default. This mirrors
   // the backend's _is_global_admin helper. Master admin can see every
   // customer and every user across the platform. Regular tenant admins
@@ -19859,14 +19894,26 @@ const getGatewayHealth = (gateway) => {
     if (first) setCpCustomerFilter(first);
   }, [isMasterAdmin, cpCustomers, cpCustomerFilter]);
 
-  // Reload the seat ledger whenever the admin navigates to the Users and
-  // Access Control page (and on initial login once canManageUsers is true).
+  // Reload the seat ledger and permission catalogue whenever the admin
+  // navigates to the Users and Access Control page (and on initial login).
+  // Prefetch the permission catalogue once the session exists, so the editor
+  // never opens against the stale fallback list while the request is in flight.
   useEffect(() => {
-    if (activePage === "users_and_access_control" && canManageUsers) {
-      refreshLicenseSeats();
-    }
+    if (!currentUser) return;
+    refreshPermissionCatalog();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePage, canManageUsers]);
+  }, [currentUser?.username]);
+
+  useEffect(() => {
+    if (activePage !== "users_and_access_control") return;
+    // Both are READS and the server enforces its own admin rule, so they are
+    // not gated on canManageUsers: that flag depends on a permission that is
+    // itself being edited on this page, and gating on it meant the catalogue
+    // silently never loaded and the page fell back to the old hard-coded list.
+    refreshLicenseSeats();
+    refreshPermissionCatalog();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePage]);
 
   // Load the seat ledger from the backend. Called when navigating to the
   // users page and after any user save that may change seat counts.
@@ -19881,6 +19928,17 @@ const getGatewayHealth = (gateway) => {
       // Non-fatal: seat ledger is informational; leave existing state.
     } finally {
       setLicenseSeatsLoading(false);
+    }
+  };
+
+  // Fetch the permission catalogue (Phase C R3 2026-08-22).
+  // Falls back silently on 404 so older backends keep working.
+  const refreshPermissionCatalog = async () => {
+    try {
+      const data = await getPermissionCatalog();
+      if (data && Array.isArray(data.groups)) setPermissionCatalog(data);
+    } catch {
+      // Non-fatal — PERMISSION_GROUPS fallback is used when null.
     }
   };
 
@@ -25392,206 +25450,115 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "users_and_access_control" ? (
             <div className="users-access-page">
+              {/* Compact seat ledger strip — one line per product */}
               {licenseSeats ? (
-                <section className="card">
-                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 8 }}>
-                    <h4 style={{ margin: 0 }}>Seat Ledger</h4>
-                    <button className="btn btn-secondary btn-sm" onClick={refreshLicenseSeats} disabled={licenseSeatsLoading}>
-                      {licenseSeatsLoading ? "Loading..." : "Refresh"}
+                <section className="card seat-ledger-card">
+                  <div className="seat-ledger-header">
+                    <span className="seat-ledger-title">Seat Ledger</span>
+                    {!licenseSeats.enforced ? (
+                      <span className="hint" style={{ fontSize: "0.8em" }}>{licenseSeats.note || "Informational only — seat counts are not enforced on this licence."}</span>
+                    ) : null}
+                    <button className="btn btn-secondary btn-sm" onClick={refreshLicenseSeats} disabled={licenseSeatsLoading} style={{ marginLeft: "auto" }}>
+                      {licenseSeatsLoading ? "..." : "Refresh"}
                     </button>
                   </div>
-                  {!licenseSeats.enforced ? (
-                    <p className="hint" style={{ marginBottom: 8 }}>{licenseSeats.note || "Seat counts are informational only on this licence — assignment is not enforced."}</p>
-                  ) : null}
-                  <div className="table-scroll">
-                    <div className="table">
-                      <div className="thead">
-                        <span>Product</span>
-                        <span>Licensed</span>
-                        <span>Assigned</span>
-                        <span>Free</span>
-                        <span>Users</span>
+                  <div className="seat-ledger-strip">
+                    {(licenseSeats.seats || []).map((row) => (
+                      <div key={row.product} className={`seat-ledger-item${row.over_assigned ? " seat-over" : ""}${!row.module_licensed ? " seat-unlicensed" : ""}`}>
+                        <span className="seat-product-name">{row.label}</span>
+                        <span className="seat-counts">
+                          <span className={row.over_assigned ? "seat-count-danger" : ""}>{row.assigned}</span>
+                          <span className="seat-slash">/</span>
+                          <span>{row.licensed === 0 ? "∞" : row.licensed}</span>
+                        </span>
+                        {row.over_assigned ? <span className="seat-badge seat-badge-danger">over limit</span> : null}
+                        {!row.module_licensed ? <span className="seat-badge seat-badge-muted">not licensed</span> : null}
                       </div>
-                      {(licenseSeats.seats || []).map((row) => (
-                        <div key={row.product} className="trow">
-                          <span>
-                            {row.label}
-                            {!row.module_licensed ? (
-                              <span className="status-pill" style={{ marginLeft: 6, background: "var(--ink-muted, #8a98ab)" }}>Not in licence</span>
-                            ) : null}
-                          </span>
-                          <span>{row.licensed === 0 ? "Unlimited" : row.licensed}</span>
-                          <span>
-                            {row.over_assigned ? (
-                              <span style={{ color: "var(--danger, #e05)" }} title="Over-assigned after a licence downgrade. Free a seat to restore enforcement.">{row.assigned} (over limit)</span>
-                            ) : row.assigned}
-                          </span>
-                          <span>{row.free === null ? "Unlimited" : row.free}</span>
-                          <span style={{ fontSize: "0.85em" }}>
-                            {(row.holders || []).map((h) => h.username).join(", ") || "-"}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
+                    ))}
                   </div>
                 </section>
               ) : null}
+
+              {/* Users table — compact, shows email + seat chips */}
               <section className="card">
+                <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <h4 style={{ margin: 0 }}>Users</h4>
+                  {canManageUsers ? (
+                    <button
+                      className="btn btn-primary btn-sm"
+                      onClick={() => {
+                        setNewUserForm({ username: "", password: "", role: "viewer", email: "", seats: [], view_ui: "app_readonly", permissions: buildRolePermissions("viewer") });
+                        setUserEditorCollapsed({});
+                        setShowCreateUserModal(true);
+                      }}
+                    >
+                      Add User
+                    </button>
+                  ) : null}
+                </div>
                 <div className="table-scroll users-table-scroll">
-                  <div className="table users-table users-table--lite-access">
+                  <div className="table users-table-v2">
                     <div className="thead">
-                      <span>User</span><span>Role</span><span>Client Modules</span><span>Gateway Config</span><span>Gateway Start/Stop</span><span>Database</span><span>User Admin</span><span title="Per-user remote access link (admin-only): TrustNode Edge / Local View / Lite over the LAN">Remote Access</span><span>Actions</span>
+                      <span>User</span>
+                      <span>Email</span>
+                      <span>Role</span>
+                      <span>Seats / Access</span>
+                      <span>Permissions</span>
+                      <span>Actions</span>
                     </div>
-                    {users.map((u) => (
-                      <div key={u.username} className="trow">
-                        <span>{u.username}</span>
-                        <span>{u.role}</span>
-                        <span>{visibleClientModuleLabels(u).join(", ") || "-"}</span>
-                        <span>{u.permissions?.gateway_configuration ? "Yes" : "No"}</span>
-                        <span>{u.permissions?.gateway_runtime_control ? "Yes" : "No"}</span>
-                        <span>{u.permissions?.database ? "Yes" : "No"}</span>
-                        <span>{u.permissions?.users_and_access_control ? "Yes" : "No"}</span>
-                        <span>
-                          <UserClientViewCell
-                            row={u}
-                            tenantScope=""
-                            edgeId={String(edgeProfile?.edge_id || "")}
-                            isAdminViewer={canManageUsers}
-                          />
-                        </span>
-                        <span className="row-actions">
-                          <button className="icon-btn table-action-btn" onClick={() => handleSendAccessEmail(u.username)} disabled={!canManageUsers || accessEmailBusy} title="Send access email">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 4h16v16H4z" /><polyline points="4,4 12,13 20,4" /></svg>
-                          </button>
-                          <button className="icon-btn table-action-btn" onClick={() => openEditUser(u)} disabled={!canManageUsers} title="Edit user">
-                            <EditIcon />
-                          </button>
-                          <button className="icon-btn table-action-btn danger" onClick={() => deleteUser(u.username)} disabled={!canManageUsers || String(u.username) === "admin"} title="Delete user">
-                            <DeleteIcon />
-                          </button>
-                        </span>
-                      </div>
-                    ))}
+                    {users.map((u) => {
+                      const activeSeats = (u.seats || []);
+                      const surfacePerms = [
+                        u.permissions?.access_full && "Edge",
+                        u.permissions?.access_client && "Local View",
+                        u.permissions?.access_lite && "Lite",
+                      ].filter(Boolean);
+                      const visibleMods = visibleClientModuleLabels(u);
+                      return (
+                        <div key={u.username} className="trow">
+                          <span style={{ fontWeight: 500 }}>{u.username}</span>
+                          <span style={{ fontSize: "0.82em", color: "var(--muted)" }}>{u.email || "-"}</span>
+                          <span>
+                            <span className="role-badge">{u.role}</span>
+                          </span>
+                          <span>
+                            {activeSeats.map((s) => (
+                              <span key={s} className="seat-chip">{s.replace(/_/g, " ")}</span>
+                            ))}
+                            {surfacePerms.map((s) => (
+                              <span key={s} className="seat-chip seat-chip-surface">{s}</span>
+                            ))}
+                            {!activeSeats.length && !surfacePerms.length ? (
+                              <UserClientViewCell
+                                row={u}
+                                tenantScope=""
+                                edgeId={String(edgeProfile?.edge_id || "")}
+                                isAdminViewer={canManageUsers}
+                              />
+                            ) : null}
+                          </span>
+                          <span style={{ fontSize: "0.8em", color: "var(--muted)" }}>{visibleMods.slice(0, 4).join(", ") || "-"}{visibleMods.length > 4 ? ` +${visibleMods.length - 4}` : ""}</span>
+                          <span className="row-actions">
+                            <button className="icon-btn table-action-btn" onClick={() => handleSendAccessEmail(u.username)} disabled={!canManageUsers || accessEmailBusy} title="Send access email">
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 4h16v16H4z" /><polyline points="4,4 12,13 20,4" /></svg>
+                            </button>
+                            <button className="icon-btn table-action-btn" onClick={() => { setUserEditorCollapsed({}); openEditUser(u); }} disabled={!canManageUsers} title="Edit user">
+                              <EditIcon />
+                            </button>
+                            <button className="icon-btn table-action-btn danger" onClick={() => deleteUser(u.username)} disabled={!canManageUsers || String(u.username) === "admin"} title="Delete user">
+                              <DeleteIcon />
+                            </button>
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </section>
 
-              {canManageUsers ? (
-                <section className="card">
-                  <h4>Create User</h4>
-                  <div className="users-create-grid">
-                    <label>
-                      Username
-                      <input value={newUserForm.username} onChange={(e) => setNewUserForm({ ...newUserForm, username: e.target.value })} />
-                    </label>
-                    <label>
-                      Password
-                      <input type="password" value={newUserForm.password} onChange={(e) => setNewUserForm({ ...newUserForm, password: e.target.value })} />
-                    </label>
-                    <label>
-                      Role
-                      <select
-                        value={newUserForm.role}
-                        onChange={(e) => {
-                          const role = e.target.value;
-                          setNewUserForm({
-                            ...newUserForm,
-                            role,
-                            permissions: buildRolePermissions(role)
-                          });
-                        }}
-                      >
-                        <option value="admin">admin</option>
-                        <option value="engineer">engineer</option>
-                        <option value="operator">operator</option>
-                        <option value="viewer">viewer</option>
-                        <option value="client">client</option>
-                      </select>
-                    </label>
-                    <label>
-                      Email (login and access delivery)
-                      <input
-                        type="email"
-                        value={newUserForm.email}
-                        onChange={(e) => setNewUserForm({ ...newUserForm, email: e.target.value })}
-                        placeholder="user@example.com"
-                      />
-                    </label>
-                  </div>
-                  {licenseSeats ? (
-                    <div className="perm-group-card" style={{ marginTop: 12 }}>
-                      <div className="perm-group-title">Seat Assignment</div>
-                      <div className="perm-group-items">
-                        {(licenseSeats.seats || []).filter((s) => s.product !== "edge_runtime").map((s) => {
-                          const checked = (newUserForm.seats || []).includes(s.product);
-                          const atCap = !checked && !s.module_licensed;
-                          const overCap = !checked && s.free !== null && s.free !== undefined && s.free <= 0;
-                          const disabledReason = !s.module_licensed ? "Not in licence" : (overCap ? "No free seats" : "");
-                          return (
-                            <label key={s.product} className="perm-item" title={disabledReason}>
-                              <input
-                                type="checkbox"
-                                checked={checked}
-                                disabled={!checked && (atCap || overCap)}
-                                onChange={(e) => {
-                                  const cur = Array.isArray(newUserForm.seats) ? newUserForm.seats : [];
-                                  setNewUserForm({
-                                    ...newUserForm,
-                                    seats: e.target.checked ? [...cur, s.product] : cur.filter((p) => p !== s.product),
-                                  });
-                                }}
-                              />
-                              <span>{s.label}{disabledReason ? <span className="hint" style={{ marginLeft: 4 }}>({disabledReason})</span> : null}</span>
-                            </label>
-                          );
-                        })}
-                        {(newUserForm.seats || []).includes("view_lan") ? (
-                          <label className="perm-item" style={{ marginTop: 4 }}>
-                            <span style={{ minWidth: 100 }}>LAN view interface</span>
-                            <select
-                              value={newUserForm.view_ui}
-                              onChange={(e) => setNewUserForm({ ...newUserForm, view_ui: e.target.value })}
-                              style={{ marginLeft: 8 }}
-                            >
-                              <option value="app_readonly">TrustNode app (read-only)</option>
-                              <option value="lite">Lite (legacy)</option>
-                            </select>
-                          </label>
-                        ) : null}
-                      </div>
-                    </div>
-                  ) : null}
-                  <div className="users-perm-groups">
-                    {PERMISSION_GROUPS.map((group) => (
-                      <div key={group.title} className="perm-group-card">
-                        <div className="perm-group-title">{group.title}</div>
-                        <div className="perm-group-items">
-                          {group.items.map((perm) => (
-                            <label key={perm} className="perm-item">
-                              <input
-                                type="checkbox"
-                                checked={Boolean(newUserForm.permissions[perm])}
-                                onChange={(e) =>
-                                  setNewUserForm({
-                                    ...newUserForm,
-                                    permissions: { ...newUserForm.permissions, [perm]: e.target.checked }
-                                  })
-                                }
-                              />
-                              <span>{PERMISSION_LABELS[perm] || perm.replace(/_/g, " ")}</span>
-                            </label>
-                          ))}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="row">
-                    <button className="btn btn-primary" onClick={createUser}>Create User</button>
-                  </div>
-                </section>
-              ) : (
-                <div className="lock-note">LOCK: only admin/admin can create users and edit permissions.</div>
-              )}
+              {!canManageUsers ? (
+                <div className="lock-note">LOCK: only admin users with Users and Access Control permission can manage users.</div>
+              ) : null}
             </div>
           ) : null}
 
@@ -29665,11 +29632,167 @@ const getGatewayHealth = (gateway) => {
           </div>
         </div>
       ) : null}
+      {/* ── Create User modal ─────────────────────────────────── */}
+      {showCreateUserModal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card user-editor-modal">
+            <h3>Add User</h3>
+            {/* Identity */}
+            <div className="user-editor-identity">
+              <label>
+                Username
+                <input
+                  value={newUserForm.username}
+                  onChange={(e) => setNewUserForm({ ...newUserForm, username: e.target.value })}
+                  placeholder="username"
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  value={newUserForm.password}
+                  onChange={(e) => setNewUserForm({ ...newUserForm, password: e.target.value })}
+                  placeholder="initial password"
+                />
+              </label>
+              <label>
+                Role
+                <select
+                  value={newUserForm.role}
+                  onChange={(e) => {
+                    const role = e.target.value;
+                    setNewUserForm({ ...newUserForm, role, permissions: buildRolePermissions(role) });
+                  }}
+                >
+                  <option value="viewer">viewer</option>
+                  <option value="operator">operator</option>
+                  <option value="engineer">engineer</option>
+                  <option value="client">client</option>
+                  <option value="admin">admin</option>
+                </select>
+              </label>
+              <label>
+                Email
+                <input
+                  type="email"
+                  value={newUserForm.email}
+                  onChange={(e) => setNewUserForm({ ...newUserForm, email: e.target.value })}
+                  placeholder="user@example.com"
+                />
+              </label>
+            </div>
+            {/* Seats */}
+            {licenseSeats ? (
+              <div className="user-editor-section">
+                <div className="user-editor-section-title">Seats</div>
+                <div className="perm-catalog-group-items">
+                  {(licenseSeats.seats || []).filter((s) => s.product !== "edge_runtime").map((s) => {
+                    const checked = (newUserForm.seats || []).includes(s.product);
+                    const atCap = !checked && !s.module_licensed;
+                    const overCap = !checked && s.free !== null && s.free !== undefined && s.free <= 0;
+                    const disabledReason = !s.module_licensed ? "Not in licence" : (overCap ? "No free seats" : "");
+                    return (
+                      <label key={s.product} className={`perm-item${!s.module_licensed ? " perm-unlicensed" : ""}`} title={disabledReason}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          disabled={!checked && (atCap || overCap)}
+                          onChange={(e) => {
+                            const cur = Array.isArray(newUserForm.seats) ? newUserForm.seats : [];
+                            setNewUserForm({ ...newUserForm, seats: e.target.checked ? [...cur, s.product] : cur.filter((p) => p !== s.product) });
+                          }}
+                        />
+                        <span>{s.label}{disabledReason ? <span className="perm-hint-badge">{disabledReason}</span> : null}</span>
+                      </label>
+                    );
+                  })}
+                  {(newUserForm.seats || []).includes("view_lan") ? (
+                    <label className="perm-item" style={{ marginTop: 4 }}>
+                      <span style={{ minWidth: 120, flexShrink: 0 }}>LAN view interface</span>
+                      <select value={newUserForm.view_ui} onChange={(e) => setNewUserForm({ ...newUserForm, view_ui: e.target.value })} style={{ marginLeft: 8 }}>
+                        <option value="app_readonly">TrustNode app (read-only)</option>
+                        <option value="lite">Lite (legacy)</option>
+                      </select>
+                    </label>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+            {/* Feature permissions — catalogue-driven */}
+            <div className="user-editor-section">
+              <div className="user-editor-section-title">Feature Permissions</div>
+              <div className="perm-catalog-sections">
+                {effectiveCatalogGroups.map((grp) => {
+                  const isCollapsed = Boolean(userEditorCollapsed["create:" + grp.group]);
+                  const isNewAdmin = newUserForm.role === "admin" || newUserForm.role === "super";
+                  const allOn = grp.features.every((f) => Boolean(newUserForm.permissions[f.key]));
+                  const allOff = grp.features.every((f) => !Boolean(newUserForm.permissions[f.key]));
+                  return (
+                    <div key={grp.group} className="perm-catalog-group">
+                      <div className="perm-catalog-group-header">
+                        <button
+                          type="button"
+                          className="perm-catalog-collapse-btn"
+                          onClick={() => setUserEditorCollapsed((p) => ({ ...p, ["create:" + grp.group]: !p["create:" + grp.group] }))}
+                        >
+                          <span className="perm-collapse-icon">{isCollapsed ? "+" : "-"}</span>
+                          {grp.group}
+                        </button>
+                        {!isCollapsed ? (
+                          <span className="perm-catalog-group-actions">
+                            <button type="button" className="btn-link" disabled={allOn} onClick={() => {
+                              const patch = {};
+                              grp.features.forEach((f) => { patch[f.key] = true; });
+                              setNewUserForm((p) => ({ ...p, permissions: { ...p.permissions, ...patch } }));
+                            }}>All</button>
+                            <button type="button" className="btn-link" disabled={allOff} onClick={() => {
+                              const patch = {};
+                              grp.features.forEach((f) => { patch[f.key] = false; });
+                              setNewUserForm((p) => ({ ...p, permissions: { ...p.permissions, ...patch } }));
+                            }}>None</button>
+                          </span>
+                        ) : null}
+                      </div>
+                      {!isCollapsed ? (
+                        <div className="perm-catalog-group-items">
+                          {grp.features.map((feat) => {
+                            const isAdminBlock = feat.admin_only && !isNewAdmin;
+                            const isUnlicensed = !feat.licensed;
+                            return (
+                              <label key={feat.key} className={`perm-item${isUnlicensed ? " perm-unlicensed" : ""}${isAdminBlock ? " perm-admin-only" : ""}`} title={`${feat.label}${isAdminBlock ? " — admin role required" : isUnlicensed ? " — not in this licence" : ""}`}>
+                                <input
+                                  type="checkbox"
+                                  checked={Boolean(newUserForm.permissions[feat.key])}
+                                  disabled={isAdminBlock}
+                                  onChange={(e) => setNewUserForm((p) => ({ ...p, permissions: { ...p.permissions, [feat.key]: e.target.checked } }))}
+                                />
+                                <span>{feat.label}</span>
+                                {isUnlicensed ? <span className="perm-hint-badge">not licensed</span> : null}
+                              </label>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="row modal-actions">
+              <button className="btn btn-primary" onClick={createUser}>Create User</button>
+              <button className="btn btn-danger" onClick={() => setShowCreateUserModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {/* ── Edit User modal ────────────────────────────────────── */}
       {showEditUserModal ? (
         <div className="modal-backdrop">
-          <div className="modal-card edit-user-modal">
-            <h3>Edit User</h3>
-            <div className="trigger-form-grid">
+          <div className="modal-card user-editor-modal">
+            <h3>Edit User — {editingUsername}</h3>
+            {/* Identity */}
+            <div className="user-editor-identity">
               <label>
                 Username
                 <input value={editingUsername} disabled />
@@ -29690,11 +29813,7 @@ const getGatewayHealth = (gateway) => {
                   value={editUserForm.role}
                   onChange={(e) => {
                     const role = e.target.value;
-                    setEditUserForm({
-                      ...editUserForm,
-                      role,
-                      permissions: normalizePermissions(editUserForm.permissions, role)
-                    });
+                    setEditUserForm({ ...editUserForm, role, permissions: normalizePermissions(editUserForm.permissions, role) });
                   }}
                   disabled={!canManageUsers}
                 >
@@ -29706,7 +29825,7 @@ const getGatewayHealth = (gateway) => {
                 </select>
               </label>
               <label>
-                Email (login and access delivery)
+                Email
                 <input
                   type="email"
                   value={editUserForm.email}
@@ -29716,23 +29835,17 @@ const getGatewayHealth = (gateway) => {
                 />
               </label>
             </div>
+            {/* Seats */}
             {licenseSeats ? (
-              <div className="perm-group-card" style={{ marginTop: 8 }}>
-                <div className="perm-group-title">Seat Assignment</div>
+              <div className="user-editor-section">
+                <div className="user-editor-section-title">Seats</div>
                 {editUserForm.seats === null ? (
-                  <p className="hint" style={{ margin: "4px 0 8px" }}>
-                    No seats configured yet.
-                    <button
-                      className="btn btn-secondary btn-sm"
-                      style={{ marginLeft: 8 }}
-                      onClick={() => setEditUserForm({ ...editUserForm, seats: [] })}
-                      disabled={!canManageUsers}
-                    >
-                      Configure seats
-                    </button>
-                  </p>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+                    <span className="hint">No seats configured.</span>
+                    <button className="btn btn-secondary btn-sm" onClick={() => setEditUserForm({ ...editUserForm, seats: [] })} disabled={!canManageUsers}>Configure seats</button>
+                  </div>
                 ) : (
-                  <div className="perm-group-items">
+                  <div className="perm-catalog-group-items">
                     {(licenseSeats.seats || []).filter((s) => s.product !== "edge_runtime").map((s) => {
                       const editSeats = Array.isArray(editUserForm.seats) ? editUserForm.seats : [];
                       const checked = editSeats.includes(s.product);
@@ -29740,32 +29853,24 @@ const getGatewayHealth = (gateway) => {
                       const overCap = !checked && s.free !== null && s.free !== undefined && s.free <= 0;
                       const disabledReason = !s.module_licensed ? "Not in licence" : (overCap ? "No free seats" : "");
                       return (
-                        <label key={`edit-seat-${s.product}`} className="perm-item" title={disabledReason}>
+                        <label key={`edit-seat-${s.product}`} className={`perm-item${!s.module_licensed ? " perm-unlicensed" : ""}`} title={disabledReason}>
                           <input
                             type="checkbox"
                             checked={checked}
                             disabled={!canManageUsers || (!checked && (atCap || overCap))}
                             onChange={(e) => {
                               const cur = Array.isArray(editUserForm.seats) ? editUserForm.seats : [];
-                              setEditUserForm({
-                                ...editUserForm,
-                                seats: e.target.checked ? [...cur, s.product] : cur.filter((p) => p !== s.product),
-                              });
+                              setEditUserForm({ ...editUserForm, seats: e.target.checked ? [...cur, s.product] : cur.filter((p) => p !== s.product) });
                             }}
                           />
-                          <span>{s.label}{disabledReason ? <span className="hint" style={{ marginLeft: 4 }}>({disabledReason})</span> : null}</span>
+                          <span>{s.label}{disabledReason ? <span className="perm-hint-badge">{disabledReason}</span> : null}</span>
                         </label>
                       );
                     })}
                     {(Array.isArray(editUserForm.seats) && editUserForm.seats.includes("view_lan")) ? (
                       <label className="perm-item" style={{ marginTop: 4 }}>
-                        <span style={{ minWidth: 120 }}>LAN view interface</span>
-                        <select
-                          value={editUserForm.view_ui || "app_readonly"}
-                          onChange={(e) => setEditUserForm({ ...editUserForm, view_ui: e.target.value })}
-                          disabled={!canManageUsers}
-                          style={{ marginLeft: 8 }}
-                        >
+                        <span style={{ minWidth: 120, flexShrink: 0 }}>LAN view interface</span>
+                        <select value={editUserForm.view_ui || "app_readonly"} onChange={(e) => setEditUserForm({ ...editUserForm, view_ui: e.target.value })} disabled={!canManageUsers} style={{ marginLeft: 8 }}>
                           <option value="app_readonly">TrustNode app (read-only)</option>
                           <option value="lite">Lite (legacy)</option>
                         </select>
@@ -29775,30 +29880,65 @@ const getGatewayHealth = (gateway) => {
                 )}
               </div>
             ) : null}
-            <div className="users-perm-groups" style={{ marginTop: 8 }}>
-              {PERMISSION_GROUPS.map((group) => (
-                <div key={`edit-${group.title}`} className="perm-group-card">
-                  <div className="perm-group-title">{group.title}</div>
-                  <div className="perm-group-items">
-                    {group.items.map((perm) => (
-                      <label key={`edit-${perm}`} className="perm-item">
-                        <input
-                          type="checkbox"
-                          checked={Boolean(editUserForm.permissions[perm])}
-                          onChange={(e) =>
-                            setEditUserForm({
-                              ...editUserForm,
-                              permissions: { ...editUserForm.permissions, [perm]: e.target.checked }
-                            })
-                          }
-                          disabled={!canManageUsers}
-                        />
-                        <span>{PERMISSION_LABELS[perm] || perm.replace(/_/g, " ")}</span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
-              ))}
+            {/* Feature permissions — catalogue-driven, 3-column grid per group */}
+            <div className="user-editor-section">
+              <div className="user-editor-section-title">Feature Permissions</div>
+              <div className="perm-catalog-sections">
+                {effectiveCatalogGroups.map((grp) => {
+                  const isCollapsed = Boolean(userEditorCollapsed["edit:" + grp.group]);
+                  const isEditingAdmin = editUserForm.role === "admin" || editUserForm.role === "super";
+                  const allOn = grp.features.every((f) => Boolean(editUserForm.permissions[f.key]));
+                  const allOff = grp.features.every((f) => !Boolean(editUserForm.permissions[f.key]));
+                  return (
+                    <div key={grp.group} className="perm-catalog-group">
+                      <div className="perm-catalog-group-header">
+                        <button
+                          type="button"
+                          className="perm-catalog-collapse-btn"
+                          onClick={() => setUserEditorCollapsed((p) => ({ ...p, ["edit:" + grp.group]: !p["edit:" + grp.group] }))}
+                        >
+                          <span className="perm-collapse-icon">{isCollapsed ? "+" : "-"}</span>
+                          {grp.group}
+                        </button>
+                        {!isCollapsed && canManageUsers ? (
+                          <span className="perm-catalog-group-actions">
+                            <button type="button" className="btn-link" disabled={allOn} onClick={() => {
+                              const patch = {};
+                              grp.features.forEach((f) => { patch[f.key] = true; });
+                              setEditUserForm((p) => ({ ...p, permissions: { ...p.permissions, ...patch } }));
+                            }}>All</button>
+                            <button type="button" className="btn-link" disabled={allOff} onClick={() => {
+                              const patch = {};
+                              grp.features.forEach((f) => { patch[f.key] = false; });
+                              setEditUserForm((p) => ({ ...p, permissions: { ...p.permissions, ...patch } }));
+                            }}>None</button>
+                          </span>
+                        ) : null}
+                      </div>
+                      {!isCollapsed ? (
+                        <div className="perm-catalog-group-items">
+                          {grp.features.map((feat) => {
+                            const isAdminBlock = feat.admin_only && !isEditingAdmin;
+                            const isUnlicensed = !feat.licensed;
+                            return (
+                              <label key={feat.key} className={`perm-item${isUnlicensed ? " perm-unlicensed" : ""}${isAdminBlock ? " perm-admin-only" : ""}`} title={`${feat.label}${isAdminBlock ? " — admin role required" : isUnlicensed ? " — not in this licence" : ""}`}>
+                                <input
+                                  type="checkbox"
+                                  checked={Boolean(editUserForm.permissions[feat.key])}
+                                  disabled={!canManageUsers || isAdminBlock}
+                                  onChange={(e) => setEditUserForm((p) => ({ ...p, permissions: { ...p.permissions, [feat.key]: e.target.checked } }))}
+                                />
+                                <span>{feat.label}</span>
+                                {isUnlicensed ? <span className="perm-hint-badge">not licensed</span> : null}
+                              </label>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
             <div className="row modal-actions">
               <button className="btn btn-primary" onClick={saveEditedUser} disabled={!canManageUsers}>Save</button>

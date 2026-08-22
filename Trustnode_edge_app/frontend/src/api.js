@@ -2507,6 +2507,17 @@ export async function getLicenseSeats() {
   return res.json();
 }
 
+// Permission catalogue (Phase C R3 2026-08-22).
+// Returns the full catalogue of licensable features grouped for the Users
+// editor UI.  Each feature carries { key, label, licensed, admin_only, pages }.
+// Returns null on 404 so callers fall back to the local PERMISSION_GROUPS.
+export async function getPermissionCatalog() {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/control-plane/permission-catalog`, {}, 8000);
+  if (res.status === 404) return null;
+  await ensureOk(res, "Permission catalog fetch failed");
+  return res.json();
+}
+
 // Send (or render without sending) the per-user access invitation e-mail.
 // body: { username, temp_password, send }
 // Returns the rendered text and metadata even when SMTP is not configured.

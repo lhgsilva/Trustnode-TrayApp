@@ -2975,6 +2975,298 @@ body {
   gap: 8px;
 }
 
+/* ── Phase D Users page redesign 2026-08-22 ────────────────────────────── */
+
+/* Compact seat ledger strip */
+.seat-ledger-card {
+  padding: 8px 12px;
+}
+.seat-ledger-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.seat-ledger-title {
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.2px;
+  flex-shrink: 0;
+}
+.seat-ledger-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.seat-ledger-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  font-size: 12px;
+  background: color-mix(in srgb, var(--card) 92%, var(--bg) 8%);
+}
+.seat-ledger-item.seat-over {
+  border-color: var(--danger, #e05);
+}
+.seat-ledger-item.seat-unlicensed {
+  opacity: 0.55;
+}
+.seat-product-name {
+  font-weight: 500;
+}
+.seat-counts {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  font-variant-numeric: tabular-nums;
+}
+.seat-count-danger {
+  color: var(--danger, #e05);
+  font-weight: 600;
+}
+.seat-slash {
+  color: var(--muted);
+}
+.seat-badge {
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  text-transform: uppercase;
+}
+.seat-badge-danger {
+  background: color-mix(in srgb, var(--danger, #e05) 15%, transparent);
+  color: var(--danger, #e05);
+}
+.seat-badge-muted {
+  background: color-mix(in srgb, var(--muted, #8a98ab) 15%, transparent);
+  color: var(--muted, #8a98ab);
+}
+
+/* Compact seat/surface chips in the users table */
+.seat-chip {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  background: color-mix(in srgb, var(--teal, #16bfbf) 12%, transparent);
+  color: var(--teal-text, var(--teal, #16bfbf));
+  border: 1px solid color-mix(in srgb, var(--teal, #16bfbf) 30%, transparent);
+  margin: 1px 2px;
+}
+.seat-chip-surface {
+  background: color-mix(in srgb, var(--accent, #6c7fe8) 12%, transparent);
+  color: var(--accent, #6c7fe8);
+  border-color: color-mix(in srgb, var(--accent, #6c7fe8) 30%, transparent);
+}
+
+/* Role badge */
+.role-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--muted, #8a98ab) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--muted, #8a98ab) 25%, transparent);
+}
+
+/* Redesigned users table — 6 columns */
+.users-table-v2 {
+  min-width: 780px;
+}
+.users-table-v2 .thead,
+.users-table-v2 .trow {
+  grid-template-columns: 1.2fr 1.6fr 0.8fr 1.4fr 1.6fr 100px;
+}
+.users-table-v2 .trow {
+  min-height: 34px;
+  align-items: center;
+}
+
+/* User editor modal — wider, with sections */
+.user-editor-modal {
+  width: min(860px, 96vw);
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+/* 2-column identity grid */
+.user-editor-identity {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px 14px;
+  margin-bottom: 12px;
+}
+
+/* Section wrapper: title bar + content */
+.user-editor-section {
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+.user-editor-section-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+/* Catalogue permission groups container */
+.perm-catalog-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Individual group */
+.perm-catalog-group {
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/* Group header row */
+.perm-catalog-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: color-mix(in srgb, var(--card) 80%, var(--bg) 20%);
+  padding: 4px 8px;
+}
+
+/* Collapse toggle button */
+.perm-catalog-collapse-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--text);
+  cursor: pointer;
+  flex: 1;
+  text-align: left;
+  line-height: 1;
+  height: 26px;
+}
+.perm-catalog-collapse-btn:hover {
+  color: var(--teal, #16bfbf);
+}
+.perm-collapse-icon {
+  display: inline-block;
+  width: 12px;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+/* Select all / none links */
+.perm-catalog-group-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.btn-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 11px;
+  color: var(--teal, #16bfbf);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.btn-link:hover {
+  opacity: 0.8;
+}
+.btn-link:disabled {
+  opacity: 0.35;
+  cursor: default;
+  text-decoration: none;
+}
+
+/* 3-column grid for feature checkboxes inside a group */
+.perm-catalog-group-items {
+  display: grid;
+  /* Responsive rather than a fixed 3: at any modal width the columns size to
+     the labels instead of truncating them. */
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1px 8px;
+  padding: 6px 10px;
+  background: color-mix(in srgb, var(--card) 95%, transparent);
+}
+
+/* Single permission row: checkbox + label on ONE line, ~32 px tall.
+   The global `label { display: grid }` rule (and several container rules) would
+   otherwise stack the control above its text — which is exactly what the
+   operator asked us to stop doing — so the direction is pinned here, for every
+   permission row wherever it is rendered, not only inside the catalogue grid. */
+.perm-item,
+.perm-group-items .perm-item,
+.perm-catalog-group-items .perm-item {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  min-height: 28px;
+  padding: 2px 0;
+  text-align: left;
+}
+
+/* The label may shrink and ellipsize, but never wrap under the checkbox; the
+   full text is always available via the row's title attribute. */
+.perm-item > input[type="checkbox"] {
+  flex: 0 0 auto;
+}
+.perm-item > span,
+.perm-item > .perm-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Unlicensed / admin-only dimming */
+.perm-unlicensed {
+  opacity: 0.5;
+}
+.perm-admin-only {
+  opacity: 0.45;
+}
+
+/* Small "not licensed" badge inline with the label */
+.perm-hint-badge {
+  display: inline-block;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  background: color-mix(in srgb, var(--muted, #8a98ab) 12%, transparent);
+  color: var(--muted, #8a98ab);
+  border: 1px solid color-mix(in srgb, var(--muted, #8a98ab) 25%, transparent);
+  flex-shrink: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────── */
+
 label {
   display: grid;
   gap: 6px;
@@ -3358,6 +3650,18 @@ input[type="checkbox"] {
 .modal-card.modal-card-wide,
 .modal-card-wide {
   width: min(980px, 96vw);
+}
+
+/* The user editor carries the whole permission catalogue, so it needs the wide
+   treatment. Declared here, AFTER .modal-card, and with two classes so the base
+   430 px rule cannot win on source order — that is what was clipping the right
+   column of every permission group. */
+.modal-card.user-editor-modal,
+.user-editor-modal {
+  width: min(980px, 96vw);
+  max-height: 92vh;
+  max-height: 92dvh;
+  overflow-y: auto;
 }
 
 /* The Edit User modal carries many permission groups + module checkboxes;
