@@ -3557,6 +3557,10 @@ function AppShell() {
   // WebSocket event arrives. Until then the footer FAB and status pills show "Checking…"
   // rather than a false "Stopped" state.
   const [gatewayRuntimeReady, setGatewayRuntimeReady] = useState(false);
+  // 2026-08-22: the workspace this backend is actually serving. When a data-dir
+  // override points the app at an EMPTY store, every page is legitimately empty
+  // and it reads as "the software deleted my data". The banner says otherwise.
+  const [workspaceWarning, setWorkspaceWarning] = useState(null);
   const [gatewayRuntimeTransitions, setGatewayRuntimeTransitions] = useState({});
   const [config, setConfig] = useState(null);
   const [error, setError] = useState("");
@@ -4576,6 +4580,23 @@ function AppShell() {
     equipment: "",
     status: "inactive",
   });
+  useEffect(() => {
+    let stopped = false;
+    (async () => {
+      try {
+        const h = await getHealth();
+        if (stopped) return;
+        const ws = h && typeof h.workspace === "object" ? h.workspace : null;
+        // Only when the backend is certain: a substitute workspace with no data
+        // while the machine's usual one has some. Anything else stays silent.
+        setWorkspaceWarning(ws && ws.hiding_real_data ? ws : null);
+      } catch {
+        // A health probe that fails is not evidence of a workspace problem.
+      }
+    })();
+    return () => { stopped = true; };
+  }, []);
+
   const [cpLicenseForm, setCpLicenseForm] = useState({
     license_id: "",
     customer_id: "",
@@ -20749,6 +20770,19 @@ const getGatewayHealth = (gateway) => {
 
         <main className="content">
           <div className="content-scroll" style={{ paddingBottom: `${contentBottomPad}px` }}>
+          {workspaceWarning ? (
+            <div className="error workspace-warning" role="alert">
+              <strong>You are looking at a different workspace — no data has been lost.</strong>
+              <div style={{ marginTop: 6 }}>{workspaceWarning.warning}</div>
+              <div style={{ marginTop: 6, fontSize: "0.9em", opacity: 0.9 }}>
+                Serving: <code>{workspaceWarning.data_dir}</code>
+                {workspaceWarning.override_source
+                  ? <> (forced by <code>{workspaceWarning.override_source}</code>)</> : null}
+                <br />
+                Your data: <code>{workspaceWarning.default_data_dir}</code>
+              </div>
+            </div>
+          ) : null}
           {!isPortalOnly && error ? <div className="error">{error}</div> : null}
           {/* Zombie-gateway banner. Operator request 2026-06-12:
               "the gateway stops, but still says it is running". We

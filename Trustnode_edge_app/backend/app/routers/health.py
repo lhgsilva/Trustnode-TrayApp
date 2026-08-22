@@ -50,6 +50,15 @@ _REFRESHER_STARTED = False
 _FIRST_SERVED = {"mono": None, "age_s": None}
 
 
+def _workspace_summary() -> dict:
+    """Never let a workspace probe break the health endpoint."""
+    try:
+        from app.services import workspace_identity
+        return workspace_identity.summary()
+    except Exception:
+        return {}
+
+
 def _refresh_once() -> None:
     global _SNAPSHOT
     routing = _collect_routing()
@@ -158,6 +167,13 @@ async def health() -> dict:
         "integrity": integrity,
         "historian_read_routing": snap["routing"],
         "license_summary": snap["license"],
+        # 2026-08-22: which workspace this process is actually serving. When a
+        # data-dir override points the app at an EMPTY store while the machine's
+        # usual workspace holds data, an operator sees "all my data is gone".
+        # Publishing it lets the UI say what actually happened. Computed once
+        # per process (workspace_identity.summary), so the health path stays
+        # lock-free and database-free.
+        "workspace": _workspace_summary(),
         "health_snapshot": {
             "state": snap["state"],
             "age_s": (round(_time.monotonic() - snap["at"], 1) if snap["at"] else None),
