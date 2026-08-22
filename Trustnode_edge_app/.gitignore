@@ -43,3 +43,6 @@ Trustnode_edge_app/frontend/.env.local
 
 # UI smoke-test screenshots
 ui_smoke*.png
+
+# browser-harness screenshots (scripts/run_lite_tabs.py, run_portal_ui.py)
+scripts/lite_shots/
