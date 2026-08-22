@@ -4672,6 +4672,10 @@ function AppShell() {
   const appStorePersistInFlightRef = useRef(false);
   const appStoreLastPersistSignatureRef = useRef("");
   const dashboardDomainSaveTimerRef = useRef(null);
+  // Set when the OPERATOR empties the dashboard (removing the last widget).
+  // Only then may an empty widget list be persisted; the server refuses every
+  // other empty write so a bad render can never clear a saved dashboard.
+  const dashboardUserEmptiedRef = useRef(false);
   const dashboardDomainPersistInFlightRef = useRef(false);
   const dashboardDomainLastPersistSignatureRef = useRef("");
   // Dedicated debounce refs for alarms_setup and triggers_limits. The
@@ -6824,10 +6828,20 @@ function AppShell() {
       // would otherwise clobber the customer's saved widgets).
       if ((!Array.isArray(payload.widgets) || payload.widgets.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === dashboardDomainLastPersistSignatureRef.current) return;
+      // An empty widget list is only persisted when the operator actually
+      // emptied it (removeDashboardWidget / clear). Any other route to an empty
+      // list — a render that produced nothing, a filtered normalisation — is
+      // refused by the server, which keeps the saved dashboard intact.
+      const emptyIsIntentional =
+        Array.isArray(payload.widgets) && payload.widgets.length === 0
+          ? dashboardUserEmptiedRef.current === true
+          : false;
       dashboardDomainPersistInFlightRef.current = true;
       try {
-        await saveAppStoreDomain("dashboard_configurations", payload, currentUser?.username || "system");
+        await saveAppStoreDomain("dashboard_configurations", payload, currentUser?.username || "system",
+                                 { allowEmpty: emptyIsIntentional });
         dashboardDomainLastPersistSignatureRef.current = signature;
+        if (emptyIsIntentional) dashboardUserEmptiedRef.current = false;
       } catch (_) {
         // Keep UI responsive; bootstrap save loop remains fallback persistence path.
       } finally {
@@ -13965,7 +13979,13 @@ const getGatewayHealth = (gateway) => {
   const removeDashboardWidget = (itemId) => {
     if (!canEditPage("dashboard")) return;
     withConfirm("Delete Dashboard Item", "Remove this dashboard item?", () => {
-      setDashboardWidgets((prev) => prev.filter((w) => w.id !== itemId));
+      setDashboardWidgets((prev) => {
+        const next = prev.filter((w) => w.id !== itemId);
+        // Removing the LAST widget is a real, intended empty dashboard — mark it
+        // so the save is allowed through the server's blank-write guard.
+        if (next.length === 0) dashboardUserEmptiedRef.current = true;
+        return next;
+      });
     });
   };
 

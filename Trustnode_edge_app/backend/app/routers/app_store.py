@@ -186,6 +186,10 @@ class DomainSaveRequest(BaseModel):
     domain: str
     payload: Any
     actor: str = "system"
+    # 2026-08-22: set ONLY by a deliberate operator action that empties a
+    # collection (deleting the last widget, clearing a dashboard). Without it
+    # the server refuses to blank a saved collection — see _guard_not_blanking.
+    allow_empty: bool = False
 
 
 class BootstrapSaveRequest(BaseModel):
@@ -393,6 +397,67 @@ def save_bootstrap(payload: BootstrapSaveRequest, request: Request) -> dict:
     }
 
 
+# Domains whose payload holds a collection the operator built by hand, and the
+# key that carries it. Losing one of these is losing work, so an empty write over
+# a non-empty stored value is refused unless it is explicitly intended.
+_PROTECTED_COLLECTIONS = {
+    "dashboard_configurations": "widgets",
+    "alarms_setup": "alarms",
+    "triggers_limits": "triggers",
+    "gateway_configurations": None,        # payload IS the list
+    "database_configurations": None,
+    "report_templates": None,
+    "devices": None,
+    "tags": None,
+}
+
+
+def _collection_len(domain: str, payload: Any) -> int | None:
+    """Size of the protected collection in `payload`, or None when this domain
+    is not protected / the payload has no such collection."""
+    if domain not in _PROTECTED_COLLECTIONS:
+        return None
+    key = _PROTECTED_COLLECTIONS[domain]
+    if key is None:
+        return len(payload) if isinstance(payload, list) else None
+    if isinstance(payload, dict) and isinstance(payload.get(key), list):
+        return len(payload[key])
+    return None
+
+
+def _guard_not_blanking(scope_key: str, domain: str, payload: Any, actor: str, allow_empty: bool) -> None:
+    """Refuse to replace a non-empty saved collection with an empty one.
+
+    The frontend has its own guard, but it can only cover the cases it knows
+    about; on 2026-08-22 a hydrated session with zero rendered widgets wrote
+    `widgets: []` over three saved widgets. This check is the backstop for every
+    client, present and future."""
+    incoming = _collection_len(domain, payload)
+    if incoming is None or incoming > 0 or allow_empty:
+        return
+    try:
+        if scope_key:
+            stored = (app_store.get_bootstrap_scoped(scope_key, prefer_cloud_reads=False) or {}).get(domain)
+        else:
+            stored = (app_store.get_bootstrap(prefer_cloud_reads=False) or {}).get(domain)
+    except Exception:
+        return                      # never block a save because the check failed
+    existing = _collection_len(domain, stored)
+    if not existing:
+        return
+    msg = (f"Refused to clear {existing} saved item(s) in '{domain}': the request "
+           f"carried an empty list. If this was intended, repeat the action from "
+           f"the page that owns it (which sends allow_empty).")
+    try:
+        app_store.append_log_rows([{
+            "level": "warning", "category": "config",
+            "message": f"{msg} (actor={actor}, scope={scope_key or 'unscoped'})",
+        }])
+    except Exception:
+        pass
+    raise _HTTPException_rs(status_code=409, detail=msg)
+
+
 @router.put("/domain")
 def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     # Shared domains (gateway_configurations, database_configurations,
@@ -400,6 +465,8 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     # on the same physical edge shares the company assets. Personal
     # domains (dashboards, app_settings) keep the per-user scope.
     scope_key = _build_scope_key(request, domain=payload.domain)
+    _guard_not_blanking(scope_key, str(payload.domain or "").strip(), payload.payload,
+                        str(payload.actor or ""), bool(payload.allow_empty))
     result = (
         app_store.upsert_domain_scoped(scope_key, payload.domain, payload.payload, actor=payload.actor)
         if scope_key

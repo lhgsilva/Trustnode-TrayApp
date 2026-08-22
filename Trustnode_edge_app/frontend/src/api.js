@@ -921,11 +921,15 @@ export async function saveAppStoreBootstrap(data, actor = "system") {
   return res.json();
 }
 
-export async function saveAppStoreDomain(domain, payload, actor = "system") {
+export async function saveAppStoreDomain(domain, payload, actor = "system", options = {}) {
+  // `allowEmpty` must be set ONLY by a deliberate operator action that empties a
+  // collection (removing the last widget, clearing a dashboard). The server
+  // refuses to blank a saved collection otherwise — on 2026-08-22 a session that
+  // rendered no widgets persisted an empty list over three saved ones.
   const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store/domain`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ domain, payload, actor })
+    body: JSON.stringify({ domain, payload, actor, allow_empty: Boolean(options.allowEmpty) })
   });
   if (!res.ok) {
     let detail = "";
