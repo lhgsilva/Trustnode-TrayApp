@@ -428,6 +428,29 @@ def count_configured_admin_users() -> int:
     return n
 
 
+_SECRET_CONFIG_KEYS = ("auth_token", "token", "api_key", "apikey", "key",
+                       "secret", "password", "passwd", "credential")
+
+
+def _redact_module_configs(configs: dict[str, Any]) -> dict[str, Any]:
+    """Copy of the per-module config with every credential-looking value
+    replaced by a presence marker. Never mutates the cached original."""
+    out: dict[str, Any] = {}
+    for module_key, cfg in (configs or {}).items():
+        if not isinstance(cfg, dict):
+            out[module_key] = cfg
+            continue
+        safe: dict[str, Any] = {}
+        for field, value in cfg.items():
+            lowered = str(field).lower()
+            if any(marker in lowered for marker in _SECRET_CONFIG_KEYS) and value:
+                safe[field] = "__set__"      # presence, never the value
+            else:
+                safe[field] = value
+        out[module_key] = safe
+    return out
+
+
 def get_license_summary() -> dict[str, Any]:
     """Returns the dict /api/health embeds so the frontend can render
     the License Details / package banner without a second roundtrip."""
@@ -445,7 +468,13 @@ def get_license_summary() -> dict[str, Any]:
         "modules": sorted(c.get("modules", set())),
         "grandfathered": sorted(c.get("grandfathered", set())),
         "limits": dict(c.get("limits") or {}),
-        "module_configs": dict(c.get("module_configs") or {}),
+        # 2026-08-22 SECURITY: module_configs carries per-module credentials
+        # (e.g. trustnode_intelligence.auth_token — a live OpenAI key). This
+        # summary is returned by /api/health, which is a PUBLIC path and is also
+        # served on the LAN listeners, so an unauthenticated caller on the plant
+        # network could read the key. Secrets are redacted here; the modules that
+        # need the real value read it from license_inspect directly, in-process.
+        "module_configs": _redact_module_configs(c.get("module_configs") or {}),
         "usage": {
             "tags": count_configured_tags(),
             "gateways": count_configured_gateways(),
