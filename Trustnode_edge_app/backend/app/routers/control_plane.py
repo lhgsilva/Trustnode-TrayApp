@@ -219,6 +219,17 @@ def _seat_preserve(payload) -> None:
     payload.permissions = perms
 
 
+@router.get("/permission-catalog")
+def permission_catalog_endpoint(request: Request) -> dict:
+    """Licence module -> feature -> per-user permission -> pages.
+
+    The Users and Access Control page renders itself from this, so a licence
+    module can no longer exist without a way to grant it (2026-08-22: 17 of 34
+    modules had no per-user control at all)."""
+    from app.services import permission_catalog as _pc
+    return _pc.catalog()
+
+
 @router.get("/license/seats")
 def license_seats(request: Request) -> dict:
     """Seat ledger for the Users and Access Control page: what the licence

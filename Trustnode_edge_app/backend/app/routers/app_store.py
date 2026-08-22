@@ -95,8 +95,9 @@ def _resolve_prefer_cloud_reads(request: Request, prefer_cloud: str = "") -> boo
 # meters, reports, alarm rules, etc.
 #
 # Per-user domains (NOT in this set) keep the full
-# `tenant|customer|edge|username` key — dashboards, app_settings, the
-# user's personal preferences.
+# `tenant|customer|edge|username` key — app_settings and the user's personal
+# preferences. NOTE: dashboards are NOT per-user; dashboard_configurations is in
+# the shared set below so every operator on the edge sees the same dashboards.
 _SHARED_EDGE_DOMAINS = frozenset({
     "gateway_configurations",   # physical PLC/OPC gateways
     "database_configurations",  # DB sinks for historian writes
@@ -359,8 +360,10 @@ def save_bootstrap(payload: BootstrapSaveRequest, request: Request) -> dict:
     # Split the bootstrap payload by scope: shared-edge domains go to the
     # per-edge scope key, personal domains to the per-user scope key. This
     # is what lets every operator on the same edge see the same gateways,
-    # databases, alarm rules, etc., while keeping each user's dashboard
-    # layout private to them.
+    # databases, alarm rules and DASHBOARDS. (Dashboards were per-user long ago;
+    # they have been in _SHARED_EDGE_DOMAINS since the operator asked for one
+    # shared set per edge. Only app_settings — theme, last-selected profile —
+    # stays per user.)
     user_scope = _build_scope_key(request, payload.data if isinstance(payload.data, dict) else None)
     shared_scope = _build_scope_key(
         request, payload.data if isinstance(payload.data, dict) else None,
@@ -505,9 +508,10 @@ def _guard_not_blanking(scope_key: str, domain: str, payload: Any, actor: str, a
 @router.put("/domain")
 def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     # Shared domains (gateway_configurations, database_configurations,
-    # power_management_config, …) use a per-edge scope so every operator
-    # on the same physical edge shares the company assets. Personal
-    # domains (dashboards, app_settings) keep the per-user scope.
+    # power_management_config, dashboard_configurations, …) use a per-edge scope
+    # so every operator on the same physical edge shares the company assets.
+    # Personal domains (app_settings: theme, last-selected profile) keep the
+    # per-user scope. See _SHARED_EDGE_DOMAINS for the authoritative list.
     _guard_admin_only_domain(request, str(payload.domain or "").strip(), payload.payload)
     scope_key = _build_scope_key(request, domain=payload.domain)
     _guard_not_blanking(scope_key, str(payload.domain or "").strip(), payload.payload,

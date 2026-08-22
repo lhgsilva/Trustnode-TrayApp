@@ -32,7 +32,8 @@ from __future__ import annotations
 import base64
 import io
 import re
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, List
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -328,6 +329,92 @@ def reference_template() -> StreamingResponse:
         "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }
     return StreamingResponse(iter([bio.read()]), media_type=headers_resp["Content-Type"], headers=headers_resp)
+
+
+class ExportRangeRequest(BaseModel):
+    """Server-side export: the caller says WHICH data, never carries it."""
+    from_utc: str = ""
+    to_utc: str = ""
+    gateway: str = ""
+    device: str = ""
+    tag: str = ""
+    edge_id: str = ""
+    columns: List[str] = []
+    max_rows: int = 0          # 0 = no ceiling other than the range itself
+    chunk_rows: int = 5000     # rows per store query
+
+
+_EXPORT_DEFAULT_COLUMNS = [
+    "ts_utc", "gateway_name", "device_name", "plc_ip", "database_name",
+    "tag_name", "value", "value_text", "data_type", "quality_label",
+]
+
+
+def _csv_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    if any(ch in text for ch in (",", '"', "\n", "\r")):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def _stream_export_csv(req: "ExportRangeRequest"):
+    """Yield CSV bytes, paging the historian in bounded chunks.
+
+    Peak memory is one chunk, not one export — which is the whole point: the
+    previous route held every row twice (once in the browser, once in the
+    server's workbook) and fell over on a large range."""
+    from app.state import app_store
+
+    columns = [str(c).strip() for c in (req.columns or []) if str(c).strip()] or _EXPORT_DEFAULT_COLUMNS
+    chunk = max(500, min(int(req.chunk_rows or 5000), 20000))
+    ceiling = max(0, int(req.max_rows or 0))
+
+    yield (",".join(_csv_cell(c) for c in columns) + "\r\n").encode("utf-8")
+
+    sent = 0
+    offset = 0
+    while True:
+        want = chunk if ceiling <= 0 else min(chunk, ceiling - sent)
+        if want <= 0:
+            break
+        try:
+            rows = app_store.get_historian_rows_range(
+                from_utc=req.from_utc, to_utc=req.to_utc,
+                limit=want, offset=offset, prefer_cloud_reads=False,
+                gateway=req.gateway, device=req.device, tag=req.tag,
+                edge_id=req.edge_id,
+            ) or []
+        except Exception as exc:
+            # Surface the failure inside the file rather than truncating in
+            # silence — an operator must never get a short export that looks whole.
+            yield (f"# export interrupted after {sent} rows: "
+                   f"{type(exc).__name__}: {exc}\r\n").encode("utf-8")
+            return
+        if not rows:
+            break
+        buf = []
+        for row in rows:
+            buf.append(",".join(_csv_cell(row.get(c)) for c in columns))
+        yield ("\r\n".join(buf) + "\r\n").encode("utf-8")
+        sent += len(rows)
+        offset += len(rows)
+        if len(rows) < want:
+            break
+
+
+@router.post("/export")
+def export_range(payload: ExportRangeRequest) -> StreamingResponse:
+    """Stream a historian export for a RANGE, without the rows ever passing
+    through the browser (2026-08-22, item 12)."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"historian_{stamp}.csv"
+    return StreamingResponse(
+        _stream_export_csv(payload),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/export-xlsx")
