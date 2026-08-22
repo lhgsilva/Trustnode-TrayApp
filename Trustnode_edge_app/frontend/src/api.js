@@ -152,6 +152,31 @@ export function isClientViewMode() {
   return FORCE_CLIENT_VIEW;
 }
 
+// Phase B 2026-08-22: module-level role cache so isReadOnlySession() can be
+// called from effects in App.jsx without threading currentUser down.
+// App.jsx calls setSessionRole() in a useEffect whenever currentUser changes.
+let _sessionRole = null;
+export function setSessionRole(role) {
+  _sessionRole = role ? String(role).toLowerCase() : null;
+}
+
+// True when the current session must not fire any mutating API call.
+// Two orthogonal conditions trigger this:
+//   1. Surface: the bundle is running on a read-only LAN or cloud surface.
+//   2. Role: the signed-in user is a viewer or client (read-only roles).
+// Either condition alone is sufficient — an admin on a lan_client surface
+// must still see read-only, and a viewer on lan_full must also be blocked
+// from write effects.
+// Safe to call at module level (does not read React state).
+export function isReadOnlySession() {
+  const surface = getRuntimeSurface();
+  if (["lan_client", "lan_lite", "cloud"].includes(surface)) return true;
+  if (isClientViewMode()) return true;
+  const role = _sessionRole || "";
+  if (role === "viewer" || role === "client") return true;
+  return false;
+}
+
 export function getWsStreamUrl() {
   const apiBase = getApiBase();
   const token = getAuthToken();
@@ -2047,23 +2072,51 @@ export async function revokeEdgeUserViewLink(edgeId, userId, tenantId = "") {
   return res.json();
 }
 
-// LOCAL-LITE URL: the per-user token is meant for the LAN /lite/?token=...
-// landing page (not the cloud /lite/view/<token> deep link). We fetch the
-// LAN port from /api/lan-sharing/status and build URLs for each IP; if the
-// LAN socket isn't running, we fall back to the loopback URL the admin can
-// share by pasting the token straight into the Lite page.
+// Phase E 2026-08-22: URL builder reads the full lan-sharing/status shape.
+// Backend surface keys: "full" → /trustnode/full/,
+//                       "view" → /trustnode/client/,
+//                       "lite" → /trustnode/lite/
+// Priority per surface (highest first):
+//   https.hostname_urls → https.urls → hostname_urls (http) → *_urls (http IPs)
+// Returns both the legacy `urls` list (backwards compat) and a `byVariant`
+// map that `copyWithVariant` uses to pick a surface-specific HTTPS URL.
+// Never returns a bare token — callers that find no URL must surface an error.
 export async function getLiteLocalShareTargets() {
   try {
     const res = await fetchWithTimeout(`${getApiBase()}/api/lan-sharing/status`);
-    if (!res.ok) return { urls: [], port: 0, running: false };
+    if (!res.ok) return { urls: [], byVariant: {}, port: 0, running: false };
     const body = await res.json();
+    // Nested HTTPS section (lan_sharing.py:154-155)
+    const httpsSection = body?.https || {};
+    const hostnameUrlsHttps = httpsSection?.hostname_urls || {};  // {full:[],view:[],lite:[]}
+    const urlsHttps = httpsSection?.urls || {};                   // {full:[],view:[],lite:[]}
+    // Top-level HTTP-only section (legacy, also present in lan_sharing.py:149)
+    const hostnameUrlsHttp = body?.hostname_urls || {};           // {full:[],view:[],lite:[]}
+    // Map: frontend variant → backend surface key ("view" = /trustnode/client/)
+    const variantToKey = { full: "full", client: "view", lite: "lite" };
+    const byVariant = {};
+    for (const [variant, key] of Object.entries(variantToKey)) {
+      // Legacy per-surface list: body.full_urls, body.view_urls, body.lite_urls
+      const legacyIpUrls = Array.isArray(body?.[`${key}_urls`]) ? body[`${key}_urls`] : [];
+      byVariant[variant] = [
+        ...(hostnameUrlsHttps[key] || []),  // https + hostname (best)
+        ...(urlsHttps[key] || []),          // https + IP
+        ...(hostnameUrlsHttp[key] || []),   // http + hostname
+        ...legacyIpUrls,                    // http + IP (legacy)
+      ].filter(Boolean);
+    }
+    // Legacy `urls` field: prefer lite, then client, then full (old callers)
+    const legacyUrls = byVariant.lite.length ? byVariant.lite
+      : byVariant.client.length ? byVariant.client
+      : byVariant.full.length ? byVariant.full : [];
     return {
-      urls: Array.isArray(body?.lite_urls) ? body.lite_urls : [],
+      urls: legacyUrls,
+      byVariant,
       port: Number(body?.lan_port || body?.port || 0),
       running: !!body?.running,
     };
   } catch (_) {
-    return { urls: [], port: 0, running: false };
+    return { urls: [], byVariant: {}, port: 0, running: false };
   }
 }
 

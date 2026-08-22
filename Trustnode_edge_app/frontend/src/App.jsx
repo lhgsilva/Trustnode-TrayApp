@@ -85,6 +85,8 @@ import {
   clearAuthToken,
   isForcedReadonlyCloudMode,
   isClientViewMode,
+  setSessionRole,
+  isReadOnlySession,
   setBackendTarget,
   testNotificationEmail,
   startGatewayInstance,
@@ -331,6 +333,19 @@ const gatewayOptions = [
   { value: "siemens_opcua", label: "Siemens OPC-UA" },
   { value: "boston", label: "Boston" }
 ];
+
+// 2026-08-22: ONE resolution for the feature pairs that exist twice in saved
+// user documents (`alarms` + `client_module_alarms`, and the same for reporting
+// and interface). Real installs carry BOTH keys, and they disagree — e.g. a
+// stored operator with alarms:false, client_module_alarms:true. Any `??` order
+// silently picks a winner and contradicts the checkbox the admin ticked, so the
+// rule is: granted when EITHER key is true. This matches
+// deriveModuleKeysFromPermissions, which has always used OR — the two helpers
+// disagreeing is what made the bug invisible from the admin side.
+function resolveFeaturePermission(perms, canonicalKey, legacyKey) {
+  const p = perms || {};
+  return Boolean(p[canonicalKey] || p[legacyKey]);
+}
 
 function pageId(label) {
   if (label.toLowerCase() === "database overview") return "database";
@@ -1952,9 +1967,11 @@ const PERMISSION_LABELS = {
   dashboard: "Dashboard",
   power_overview: "Power Management Overview",
   historian: "Historian",
-  client_module_alarms: "Alarms Module",
-  client_module_reporting: "Reporting Module",
-  client_module_interface: "Interface Module",
+  // Phase C R2 2026-08-22: legacy aliases kept for display only; canonical
+  // keys below (alarms/reporting/interface) are the write targets.
+  client_module_alarms: "Alarms Module (legacy alias)",
+  client_module_reporting: "Reporting Module (legacy alias)",
+  client_module_interface: "Interface Module (legacy alias)",
   interface: "Interface",
   devices: "Devices",
   tags: "Tags",
@@ -1973,6 +1990,7 @@ const PERMISSION_LABELS = {
   email_and_notifications: "Email and Notifications",
   scheduled_reports: "Scheduled Reports",
   users_and_access_control: "Users and Access",
+  trustnode_intelligence: "TrustNode Intelligence",
   access_full: "TrustNode Edge (full app over LAN)",
   access_client: "TrustNode Local View (read-only over LAN)",
   access_lite: "Lite (legacy read-only)",
@@ -2004,15 +2022,21 @@ function productName(key) {
   return `TrustNode ${k.charAt(0).toUpperCase()}${k.slice(1).replace(/_/g, " ")}`;
 }
 
+// Phase C R2 2026-08-22: ONE canonical key per feature in the checkbox list.
+// client_module_alarms/reporting/interface are read-aliases for migration; they
+// are NOT shown as separate checkboxes because the admin ticks the canonical
+// alarms/reporting/interface entries in their respective groups instead.
 const PERMISSION_GROUPS = [
-  // Operator-facing module visibility — these toggles control which
-  // top-level menu sections appear for the user. Edit/write permissions
-  // for each module live in the groups below.
-  { title: "Module Visibility", items: ["dashboard", "power_overview", "historian", "client_module_alarms", "client_module_reporting", "client_module_interface"] },
+  // Module Visibility: which top-level sections appear for the user.
+  // ONLY the canonical display-only entries; alarms/reporting/interface
+  // are controlled by their per-feature checkboxes in the groups below.
+  { title: "Module Visibility", items: ["dashboard", "power_overview", "historian"] },
   { title: "Gateway and Edge Control", items: ["devices", "tags", "triggers_and_limits", "gateway_configuration", "gateway_runtime_control"] },
   { title: "Reporting", items: ["reporting", "scheduled_reports"] },
   { title: "Notifications", items: ["alarms", "email_and_notifications"] },
   { title: "Administration", items: ["interface", "database", "backup_and_retention", "control_plane", "users_and_access_control", "data_log"] },
+  // Phase C C.6 2026-08-22: per-user AI access.
+  { title: "AI Features", items: ["trustnode_intelligence"] },
   // Operator 2026-06-18: per-user LAN-served UI access.
   // - access_full   → /trustnode/full/app/   (TrustNode Edge — full admin/editor React)
   // - access_client → /trustnode/client/app/ (TrustNode Local View — read-only React)
@@ -2169,6 +2193,7 @@ function buildRolePermissions(role) {
       gateway_configuration: true,
       gateway_runtime_control: true,
       interface: true,
+      trustnode_intelligence: true,
       database: true,
       database_overview: true,
       database_inspector: true,
@@ -2198,6 +2223,7 @@ function buildRolePermissions(role) {
       gateway_configuration: true,
       gateway_runtime_control: true,
       interface: true,
+      trustnode_intelligence: true,
       database: false,
       database_overview: false,
       database_inspector: false,
@@ -2227,6 +2253,7 @@ function buildRolePermissions(role) {
       gateway_configuration: false,
       gateway_runtime_control: true,
       interface: true,
+      trustnode_intelligence: true,
       database: false,
       database_overview: false,
       database_inspector: false,
@@ -2256,6 +2283,7 @@ function buildRolePermissions(role) {
       gateway_configuration: false,
       gateway_runtime_control: false,
       interface: true,
+      trustnode_intelligence: false,
       database: false,
       database_overview: false,
       database_inspector: false,
@@ -2268,13 +2296,17 @@ function buildRolePermissions(role) {
       users_and_access_control: false
     };
   }
+  // Phase C R2 2026-08-22: viewer default — canonical keys only.
+  // The legacy client_module_alarms/reporting/interface keys are NOT written
+  // here so the `??` fallback in hasClientModuleAccess (canonical-first) is
+  // reachable. An admin who ticks `alarms: true` for a viewer no longer gets
+  // that value shadowed by an explicit client_module_alarms: false default.
   return {
     dashboard: true,
     power_overview: false,
     historian: true,
-    client_module_alarms: false,
-    client_module_reporting: false,
-    client_module_interface: false,
+    // client_module_alarms/reporting/interface intentionally omitted —
+    // read via the canonical alarms/reporting/interface keys below.
     devices: false,
     tags: false,
     triggers_and_limits: false,
@@ -2284,6 +2316,7 @@ function buildRolePermissions(role) {
     gateway_configuration: false,
     gateway_runtime_control: false,
     interface: false,
+    trustnode_intelligence: false,
     database: false,
     database_overview: false,
     database_inspector: false,
@@ -2571,7 +2604,7 @@ function UserClientViewCell({ row, tenantScope, edgeId, isAdminViewer }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [justCopied, setJustCopied] = useState(false);
-  const [lanTargets, setLanTargets] = useState({ urls: [], running: false });
+  const [lanTargets, setLanTargets] = useState({ urls: [], byVariant: {}, running: false });
 
   useEffect(() => {
     let cancelled = false;
@@ -2609,20 +2642,35 @@ function UserClientViewCell({ row, tenantScope, edgeId, isAdminViewer }) {
     }
   };
 
-  // Operator 2026-06-18: per-user LAN URL respects the user's
+  // Phase E 2026-08-22: per-user LAN URL respects the user's
   // access_full / access_lite / access_client permission flags. If the
   // admin clicked plain Copy, we pick the highest variant the user is
   // allowed to open. The three explicit copy buttons below force a
   // specific variant (only enabled when the user has that access).
+  //
+  // URL selection order (per R4 fix): https.hostname_urls → https.urls →
+  // hostname_urls (http) → *_urls (http IPs) — from getLiteLocalShareTargets()
+  // byVariant map. Never copy a bare token; show an error if no URL exists.
   const copyWithVariant = async (forced) => {
     const lk = await ensureLink();
     if (!lk?.token) return;
     const perms = row?.permissions || {};
     const variant = forced || pickLanVariantForUser(perms) || "lite";
-    let textToCopy = lk.token;
-    if (lanTargets?.urls?.length) {
-      textToCopy = buildLanUrlForVariant(lanTargets.urls[0], lk.token, variant);
+    // Use the per-variant URL list from the new byVariant map (Phase E).
+    // Fall back to the legacy urls list (old servers / HTTP-only installs).
+    const variantUrls = lanTargets?.byVariant?.[variant] || lanTargets?.urls || [];
+    if (!variantUrls.length) {
+      // No URL available — Remote Access is off or the surface has no listener.
+      setError("Remote Access is off — no URL available for this surface. Enable LAN Sharing and ensure the listener is running.");
+      return;
     }
+    // The URLs from byVariant already point to the correct surface
+    // (e.g. https://DESKTOP-OP6ED6R:8443/trustnode/client/), so just
+    // append the token. Fall back to buildLanUrlForVariant for legacy HTTP lists.
+    const baseUrl = variantUrls[0];
+    const textToCopy = baseUrl.includes("/trustnode/")
+      ? `${baseUrl.replace(/\/?$/, "")}?token=${encodeURIComponent(lk.token)}`
+      : buildLanUrlForVariant(baseUrl, lk.token, variant);
     try {
       await navigator.clipboard.writeText(textToCopy);
       setJustCopied(true);
@@ -4361,6 +4409,12 @@ function AppShell() {
       }
     } catch (_) {}
   }, [currentUser?.username, currentUser?.role]);
+  // Phase B 2026-08-22: keep api.js isReadOnlySession() in sync with the
+  // signed-in user's role so autosave effects can call it without needing
+  // currentUser threaded through as a prop.
+  useEffect(() => {
+    setSessionRole(currentUser?.role || null);
+  }, [currentUser?.role]);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(getFullscreenState);
   const [edgeLinked, setEdgeLinked] = useState(() => {
@@ -5928,7 +5982,8 @@ function AppShell() {
     // Mirror the active email transport into the backend so the report
     // scheduler daemon can deliver PDFs without waiting for the UI to be
     // open. Debounced to avoid spamming the endpoint while the user types.
-    if (isHostedWebClient) return () => {};
+    // Phase B 2026-08-22: read-only sessions must not mutate the backend.
+    if (isHostedWebClient || isReadOnlySession()) return () => {};
     const handle = setTimeout(() => {
       try {
         const transport = emailSettings?.transport === "php_http" ? "php_http" : "smtp";
@@ -6554,6 +6609,11 @@ function AppShell() {
 
   useEffect(() => {
     if (!appStoreHydrated) return;
+    // Phase B 2026-08-22: DB recovery repair is a mutating operation.
+    // Viewers / LAN-client sessions must not trigger it; the retry-forever
+    // loop (dbRecoveryLastSignatureRef never updates on 403) was the main
+    // source of rbac-denied storms in the audit log.
+    if (isReadOnlySession()) return;
     const conns = buildDbRecoveryConnections();
     if (!conns.length) return;
     const signature = JSON.stringify(
@@ -6731,6 +6791,10 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
+    // Phase B 2026-08-22: read-only session (viewer role / LAN client surface)
+    // must not write the bootstrap; every PUT 403s and the retry storm
+    // starves all other HTTP connections on the origin.
+    if (isReadOnlySession()) return;
     if (appStoreSaveTimerRef.current) clearTimeout(appStoreSaveTimerRef.current);
     appStoreSaveTimerRef.current = setTimeout(async () => {
       if (appStorePersistInFlightRef.current) return;
@@ -6800,6 +6864,7 @@ function AppShell() {
 
   useEffect(() => {
     if (!appStoreHydrated) return;
+    if (isReadOnlySession()) return; // Phase B 2026-08-22: never write for viewer/client sessions
     if (dashboardDomainSaveTimerRef.current) {
       clearTimeout(dashboardDomainSaveTimerRef.current);
       dashboardDomainSaveTimerRef.current = null;
@@ -6865,6 +6930,7 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
+    if (isReadOnlySession()) return; // Phase B 2026-08-22
     if (alarmsDomainSaveTimerRef.current) {
       clearTimeout(alarmsDomainSaveTimerRef.current);
       alarmsDomainSaveTimerRef.current = null;
@@ -6901,6 +6967,7 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
+    if (isReadOnlySession()) return; // Phase B 2026-08-22
     if (triggersDomainSaveTimerRef.current) {
       clearTimeout(triggersDomainSaveTimerRef.current);
       triggersDomainSaveTimerRef.current = null;
@@ -6958,6 +7025,7 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
+    if (isReadOnlySession()) return; // Phase B 2026-08-22
     if (gatewayConfigsSaveTimerRef.current) clearTimeout(gatewayConfigsSaveTimerRef.current);
     gatewayConfigsSaveTimerRef.current = setTimeout(async () => {
       if (gatewayConfigsPersistInFlightRef.current) return;
@@ -6997,6 +7065,7 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
+    if (isReadOnlySession()) return; // Phase B 2026-08-22
     if (devicesSaveTimerRef.current) clearTimeout(devicesSaveTimerRef.current);
     devicesSaveTimerRef.current = setTimeout(async () => {
       if (devicesPersistInFlightRef.current) return;
@@ -7025,6 +7094,7 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
+    if (isReadOnlySession()) return; // Phase B 2026-08-22
     if (dbConnectionsSaveTimerRef.current) clearTimeout(dbConnectionsSaveTimerRef.current);
     dbConnectionsSaveTimerRef.current = setTimeout(async () => {
       if (dbConnectionsPersistInFlightRef.current) return;
@@ -7055,6 +7125,7 @@ function AppShell() {
   useEffect(() => {
     if (!appStoreHydrated) return;
     if (isHostedWebClient) return;
+    if (isReadOnlySession()) return; // Phase B 2026-08-22
     if (powerConfigSaveTimerRef.current) clearTimeout(powerConfigSaveTimerRef.current);
     powerConfigSaveTimerRef.current = setTimeout(async () => {
       if (powerConfigPersistInFlightRef.current) return;
@@ -10711,9 +10782,17 @@ function AppShell() {
       if (page === "dashboard") return Boolean(perms.dashboard ?? perms.data_log ?? true);
       if (page === "power_overview") return Boolean(perms.power_overview ?? perms.database ?? false);
       if (page === "historian") return Boolean(perms.historian ?? perms.data_log ?? true);
-      if (page === "alarms") return Boolean(perms.client_module_alarms ?? perms.alarms ?? false);
-      if (page === "reporting" || page === "generated_reports") return Boolean(perms.client_module_reporting ?? perms.reporting ?? false);
-      if (page === "interface") return Boolean(perms.client_module_interface ?? perms.interface ?? false);
+      // Phase C R2 2026-08-22: the legacy-first order below works correctly now
+      // because buildRolePermissions(viewer) no longer writes an explicit `false`
+      // for client_module_alarms/reporting/interface. Before this fix, the viewer
+      // default wrote client_module_alarms:false, making `??` never reach perms.alarms.
+      // Now: new users have alarms:true / no client_module_alarms key →
+      //   client_module_alarms(undefined) ?? alarms(true) = true  ✓
+      // Legacy users have client_module_alarms:true / alarms:false (role default) →
+      //   client_module_alarms(true) ?? alarms(false) = true  ✓
+      if (page === "alarms") return resolveFeaturePermission(perms, "alarms", "client_module_alarms");
+      if (page === "reporting" || page === "generated_reports") return resolveFeaturePermission(perms, "reporting", "client_module_reporting");
+      if (page === "interface") return resolveFeaturePermission(perms, "interface", "client_module_interface");
       return false;
     },
     [currentUser, isPageLicensed]
@@ -10871,6 +10950,25 @@ function AppShell() {
       const anyStudioKeyPresent = (licensedModuleKeys || []).some((k) => String(k).startsWith("studio."));
       if (anyStudioKeyPresent && !hasLicenseModule(studioKey)) return false;
     }
+    // Phase C C.8 2026-08-22: Data History / Logs is admin-only.
+    // The viewer role historically inherited historian: true which mapped
+    // to the Logs page — every viewer saw the raw app log, which is an
+    // admin-only view.
+    if (page === "data_log" || page === "logs") {
+      return isAdmin;
+    }
+    // Phase C C.5 2026-08-22: Tags reachable on read-only surfaces (viewer
+    // role on LAN, lan_client / lan_lite surface). Gated by the `tags`
+    // permission; the page itself must render read-only for these roles.
+    if (page === "tags" && isReadOnlySession()) {
+      return Boolean(currentUser?.permissions?.tags);
+    }
+    // Phase C C.6 2026-08-22: TrustNode Intelligence per-user gate.
+    // The IntelligenceMenu already gates on its own licence probe; this adds
+    // a per-user permission so an admin can block specific users.
+    if (page === "trustnode_intelligence") {
+      return Boolean(currentUser?.permissions?.trustnode_intelligence);
+    }
     return canEditPage(page);
   }, [currentUser, isPortalOnly, isClientView, isPageLicensed, canEditPage, hasLicenseModule, licensedModuleKeys]);
 
@@ -10881,9 +10979,11 @@ function AppShell() {
         if (!userHasModuleForPage(user, m.page)) return false;
         const key = CLIENT_MODULE_PERMISSION_BY_PAGE[m.page];
         if (!key) return false;
-        if (m.page === "alarms") return Boolean(perms.client_module_alarms ?? perms.alarms);
-        if (m.page === "reporting") return Boolean(perms.client_module_reporting ?? perms.reporting);
-        if (m.page === "interface") return Boolean(perms.client_module_interface ?? perms.interface);
+        // Phase C R2 2026-08-22: same legacy-first resolution as hasClientModuleAccess.
+        // See comment there for the explanation of why this order is correct.
+        if (m.page === "alarms") return resolveFeaturePermission(perms, "alarms", "client_module_alarms");
+        if (m.page === "reporting") return resolveFeaturePermission(perms, "reporting", "client_module_reporting");
+        if (m.page === "interface") return resolveFeaturePermission(perms, "interface", "client_module_interface");
         if (m.page === "historian") return Boolean(perms.historian ?? perms.data_log);
         return Boolean(perms[key]);
       }).map((m) => m.label);
