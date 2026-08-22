@@ -350,6 +350,12 @@ def get_bootstrap(request: Request) -> dict:
 
 @router.put("/bootstrap")
 def save_bootstrap(payload: BootstrapSaveRequest, request: Request) -> dict:
+
+    # S2: the bootstrap save can carry users_access (it is mirrored into
+    # AuthStore a few lines below), so the same admin rule applies here.
+    if isinstance(payload.data, dict):
+        for _dom in payload.data.keys():
+            _guard_admin_only_domain(request, str(_dom), payload.data.get(_dom))
     # Split the bootstrap payload by scope: shared-edge domains go to the
     # per-edge scope key, personal domains to the per-user scope key. This
     # is what lets every operator on the same edge see the same gateways,
@@ -425,6 +431,44 @@ def _collection_len(domain: str, payload: Any) -> int | None:
     return None
 
 
+def _guard_admin_only_domain(request: Request, domain: str, payload: Any = None) -> None:
+    """Writing a domain that carries accounts/roles/permissions is admin-only.
+
+    2026-08-22 (S2): `users_access` reached this handler through PUT
+    /api/app-store/domain and PUT /api/app-store/bootstrap, neither of which is
+    under an admin-only URL prefix, so `_required_roles` classified it as
+    ordinary configuration — allowed for `engineer`. The handler then mirrors the
+    document into AuthStore, so a rewritten role took effect at the next login:
+    an engineer could make themselves admin. The check follows the DOMAIN so no
+    future endpoint can reopen it, and it applies on loopback too."""
+    from app.services import access_policy as _access
+
+    if not _access.admin_only_domain(domain):
+        return
+    payload_claims = {}
+    try:
+        token = _access.token_from_request(request)
+        if token:
+            from app.auth import decode_access_token
+            payload_claims = decode_access_token(token) or {}
+    except Exception:
+        payload_claims = {}
+    role = str(payload_claims.get("role") or "").strip().lower()
+    if role in _access.ADMIN_ROLES:
+        return
+    # No verified session at all: the tray/desktop calls this on loopback before
+    # a user signs in (activation, first-run restore). Allow only from loopback.
+    if not payload_claims and not _access.request_is_remote(request):
+        return
+    _access.audit("config.admin_domain", outcome="denied", request=request,
+                  payload=payload_claims, details={"domain": domain})
+    raise _HTTPException_rs(
+        status_code=403,
+        detail=(f"Only an administrator may change '{domain}' — it holds user "
+                f"accounts, roles and permissions."),
+    )
+
+
 def _guard_not_blanking(scope_key: str, domain: str, payload: Any, actor: str, allow_empty: bool) -> None:
     """Refuse to replace a non-empty saved collection with an empty one.
 
@@ -464,6 +508,7 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     # power_management_config, …) use a per-edge scope so every operator
     # on the same physical edge shares the company assets. Personal
     # domains (dashboards, app_settings) keep the per-user scope.
+    _guard_admin_only_domain(request, str(payload.domain or "").strip(), payload.payload)
     scope_key = _build_scope_key(request, domain=payload.domain)
     _guard_not_blanking(scope_key, str(payload.domain or "").strip(), payload.payload,
                         str(payload.actor or ""), bool(payload.allow_empty))

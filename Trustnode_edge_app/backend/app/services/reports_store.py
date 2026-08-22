@@ -32,6 +32,14 @@ def _new_id(prefix: str) -> str:
 
 
 def _resolve_db_path() -> Path:
+    # 2026-08-22: honour TRUSTNODE_APP_STORE_PATH first, exactly like AppStore
+    # does. Without it a deployment that pins the store file (the packaged
+    # --boot-probe, any test harness) had AppStore create report_templates in
+    # one file while this store read another, and every /api/reports/* call
+    # answered 500 with "no such table".
+    explicit = os.environ.get("TRUSTNODE_APP_STORE_PATH", "").strip()
+    if explicit:
+        return Path(explicit)
     base = os.environ.get("TRUSTNODE_DATA_DIR", "").strip()
     if base:
         return Path(base) / "trustnode_app_store.db"

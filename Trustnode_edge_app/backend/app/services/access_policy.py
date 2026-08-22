@@ -96,6 +96,36 @@ OPERATOR_ALLOW = (
 # Paths that are not "configuration" even though they are mutations — any
 # authenticated role may call them (telemetry ingest has its own auth, the
 # lite-local API has its own token checks, cloud-live is separate).
+# 2026-08-22 (S4): reads that are admin-only. `_required_roles` deliberately
+# leaves GET open for everything else — dashboards, historian and alarms are what
+# a View seat is sold for — but these expose other people's accounts, the
+# machine's own configuration, or the operator's audit trail, and were previously
+# protected by nothing but a hidden menu item.
+ADMIN_ONLY_READ_PREFIXES = (
+    "/api/control-plane/",          # users, licences, activation, tenants
+    "/api/database/",               # connection strings and credentials
+    "/api/customer-db/",
+    "/api/app-store/logs",          # the customer log / audit trail
+    "/api/app-store/retention",
+    "/api/app-store/backup",
+    "/api/ui-source/",
+    "/api/workspace/",
+    "/api/directories/",
+)
+
+# Config documents that carry accounts, roles or permissions. Writing one is an
+# administrative act no matter which endpoint carries it (S2).
+ADMIN_ONLY_DOMAINS = ("users_access",)
+
+# Exports: POST-shaped reads. A View seat is sold to look at data, and the CSV
+# path already ran entirely in the browser, so refusing the server-side export
+# only pushed people to the worse route.
+VIEWER_EXPORT_ALLOW = (
+    re.compile(r"^/api/historian/export-xlsx$"),
+    re.compile(r"^/api/reports/export/(csv|txt)$"),
+    re.compile(r"^/api/historian/export$"),
+)
+
 NEUTRAL_PREFIXES = (
     "/api/v1/",
     "/api/lite-local/",
@@ -141,6 +171,21 @@ def client_host(request: Any) -> str:
 
 def request_is_remote(request: Any) -> bool:
     return not is_loopback_host(client_host(request))
+
+
+def _effective_for_role(mode: str, remote: bool, role: str) -> str:
+    """Effective mode, taking the caller's role into account.
+
+    2026-08-22 (S3): mode "lan" means "enforce for remote clients, log-only on
+    loopback", which made the desktop a permission-free zone for EVERY role. The
+    desktop is now a multi-user surface (named seats, e-mail logins), so a
+    non-admin signed into it is held to the same rules as over the network.
+    admin/super keep log-only on loopback, so a misclassified path can never
+    lock the operator out of their own machine."""
+    eff = _effective(mode, remote)
+    if eff == "log" and not remote and str(role or "").strip().lower() not in ADMIN_ROLES:
+        return "enforce"
+    return eff
 
 
 def _effective(mode: str, remote: bool) -> str:
@@ -272,9 +317,23 @@ def require_module(key: str):
 def _required_roles(method: str, path: str) -> Optional[set]:
     """Return the role set allowed for this mutation, or None for 'any role'."""
     if method in READ_METHODS:
+        # Most reads stay open to any authenticated session — dashboards,
+        # historian and alarms are exactly what a View seat is sold for. A short
+        # list is not: other people's accounts, the machine's own configuration
+        # and the operator's audit trail were protected by nothing but a hidden
+        # menu item before 2026-08-22 (S4).
+        for p in ADMIN_ONLY_READ_PREFIXES:
+            if path.startswith(p):
+                return set(ADMIN_ROLES)
         return None
     for p in NEUTRAL_PREFIXES:
         if path.startswith(p):
+            return None
+    # Exports are a READ that happens to use POST (the row set / range goes in
+    # the body). Decision 2026-08-22: a person may export what they are allowed
+    # to see, so these are open to any authenticated role rather than operator+.
+    for pat in VIEWER_EXPORT_ALLOW:
+        if pat.search(path):
             return None
     for pat in OPERATOR_ALLOW:
         if pat.search(path):
@@ -286,6 +345,18 @@ def _required_roles(method: str, path: str) -> Optional[set]:
     return set(CONFIG_ROLES)
 
 
+def admin_only_domain(domain: str) -> bool:
+    """True when writing this config domain is an administrative act.
+
+    2026-08-22 (S2): `users_access` holds every account, role and permission on
+    the edge, and the domain-save handler mirrors it into AuthStore immediately.
+    It was reachable through PUT /api/app-store/domain and /bootstrap, neither of
+    which sits under an admin-only prefix, so an `engineer` could promote itself
+    to admin. The rule follows the DOMAIN, not the URL, so a future endpoint
+    cannot reopen the hole."""
+    return str(domain or "").strip().lower() in ADMIN_ONLY_DOMAINS
+
+
 def evaluate(request: Any, payload: Dict[str, Any]) -> Tuple[bool, str, str]:
     """(allowed, reason, effective_mode). Called by the auth middleware for
     every authenticated /api request. Never raises."""
@@ -294,7 +365,9 @@ def evaluate(request: Any, payload: Dict[str, Any]) -> Tuple[bool, str, str]:
         path = str(request.url.path or "")
         role = str(payload.get("role") or "viewer").strip().lower()
         remote = request_is_remote(request)
-        eff = _effective(rbac_mode(), remote)
+        # Role-aware: on loopback a non-admin is enforced, an admin is logged
+        # (S3). Remote clients are enforced for everyone, as before.
+        eff = _effective_for_role(rbac_mode(), remote, role)
         reason = ""
         required = _required_roles(method, path)
         if required is not None and role not in required:
