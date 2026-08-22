@@ -111,7 +111,12 @@ def preflight() -> tuple[bool, list[str]]:
         s, b = _call("GET", "/api/app-store/historian?limit=1", token)
         rows_ = (b or {}).get("rows") if isinstance(b, dict) else b
         if isinstance(rows_, list) and rows_:
-            return str((rows_[0] or {}).get("ts_utc") or "")
+            row = rows_[0] or {}
+            # This endpoint returns `ts`/`tag`; the store's own columns are
+            # `ts_utc`/`tag_name`. Accept both, because reading the wrong key
+            # yields an empty string that looks exactly like "not collecting"
+            # and would refuse a perfectly healthy soak.
+            return str(row.get("ts") or row.get("ts_utc") or "")
         return ""
 
     first = _latest()
@@ -147,7 +152,10 @@ def main() -> int:
     env = dict(os.environ)
     env["VAL_DURATION_S"] = str(SOAK_SECONDS)
     env.setdefault("PYTHONIOENCODING", "utf-8")
-    rc = subprocess.call([sys.executable, os.path.join(HERE, "validate_full_12h.py")], env=env)
+    # -u: an 8-hour run whose output is redirected to a file is invisible for
+    # eight hours if Python buffers it. Unbuffered costs nothing and lets the
+    # operator watch progress instead of waiting for the verdict.
+    rc = subprocess.call([sys.executable, "-u", os.path.join(HERE, "validate_full_12h.py")], env=env)
 
     print()
     print("=" * 78)
