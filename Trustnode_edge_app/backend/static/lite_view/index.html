@@ -94,6 +94,55 @@ async function loadConfig() {
   } catch (_) {
     // Fail-OPEN — never let a license probe failure hide tabs.
   }
+
+  // 2026-08-22: the legacy block above only knew the `view.lan_*` spellings and
+  // showed every tab to everyone otherwise — Lite had no idea WHO was looking.
+  // /api/lite-local/capabilities answers with the licence AND this user's
+  // resolved permissions, one flag per feature, so Lite shows exactly what the
+  // person is entitled to. A failure here leaves the legacy behaviour intact.
+  try {
+    const headers = { "Cache-Control": "no-store" };
+    let jwt = null;
+    try { jwt = localStorage.getItem("trustnode_auth_token"); } catch (_) { jwt = null; }
+    if (jwt) headers["Authorization"] = `Bearer ${jwt}`;
+    let url = "/api/lite-local/capabilities";
+    const tok = _readViewTokenFromUrlOrSession();
+    if (!jwt && tok) url += `?token=${encodeURIComponent(tok)}`;
+    const cr = await fetch(url, { headers, cache: "no-store" });
+    if (cr.ok) {
+      const cj = await cr.json();
+      const cap = (cj && cj.capabilities) || null;
+      if (cap) {
+        cfg.capabilities = cap;
+        cfg.show_dashboard_tab = Boolean(cap.dashboard);
+        cfg.show_power_tab = Boolean(cap.power);
+        cfg.show_history_tab = Boolean(cap.historian);
+        cfg.show_reporting_tab = Boolean(cap.reporting);
+        cfg.show_alarms_tab = Boolean(cap.alarms);
+        cfg.show_tags_tab = Boolean(cap.tags);
+        cfg.show_batch_tab = Boolean(cap.batch);
+        cfg.show_intelligence = Boolean(cap.intelligence);
+        cfg.read_only = cap.read_only !== false;
+        cfg.is_admin = Boolean(cap.is_admin);
+      }
+    }
+  } catch (_) {
+    // Keep whatever the licence probe decided; never blank the menu on a
+    // transient failure.
+  }
+}
+
+// The view-link token, wherever it came from. Declared here because
+// loadConfig() runs before the session bootstrap.
+function _readViewTokenFromUrlOrSession() {
+  try {
+    const u = new URL(window.location.href);
+    const fromUrl = u.searchParams.get("token");
+    if (fromUrl) return fromUrl;
+    return sessionStorage.getItem("tn_lite_view_token") || "";
+  } catch (_) {
+    return "";
+  }
 }
 
 // ============================================================
@@ -2390,6 +2439,13 @@ const NAV_ITEMS = (cfgIn) => {
   if (cfgIn?.show_history_tab !== false) items.push(["history", icList, "Historian"]);
   if (cfgIn?.show_reporting_tab !== false) items.push(["reporting", icReport, "Reporting"]);
   if (cfgIn?.show_alarms_tab !== false) items.push(["alarms", icBell, "Alarms"]);
+  // 2026-08-22: every flag above now comes from /api/lite-local/capabilities —
+  // the licence module AND the signed-in person's permission — instead of the
+  // static config booleans Lite used to ship with.
+  // NOTE: Tags, Batch and the assistant are deliberately NOT listed here. Lite
+  // has no view for them, and a menu entry that leads nowhere is worse than an
+  // absent one; the capability flags are already delivered (cfg.show_tags_tab,
+  // cfg.show_batch_tab, cfg.show_intelligence) for when those views are built.
   return items;
 };
 

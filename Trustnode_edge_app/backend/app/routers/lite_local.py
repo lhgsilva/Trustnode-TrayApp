@@ -172,6 +172,11 @@ def _extract_session(request: Request, token_qs: Optional[str]) -> Dict[str, Any
                     "edge_id": str(s.get("edge_id") or ""),
                     "customer_id": str(jwt_body.get("customer_id") or s.get("customer_id") or ""),
                     "user_id": str(jwt_body.get("sub") or jwt_body.get("username") or ""),
+                    # 2026-08-22: identity travels with the session so the Lite
+                    # capability flags can be decided per person, not per install.
+                    "username": str(jwt_body.get("sub") or jwt_body.get("username") or ""),
+                    "role": str(jwt_body.get("role") or ""),
+                    "permissions": jwt_body.get("permissions") if isinstance(jwt_body.get("permissions"), dict) else {},
                     "scope_key": "",
                     "token_id": "auth-jwt",
                     "auth_source": "jwt",
@@ -358,6 +363,71 @@ def post_validate(payload: ValidateRequest, request: Request) -> dict:
     }
 
 
+def _lite_capabilities(session: Dict[str, Any]) -> Dict[str, Any]:
+    """What THIS person may see in Lite.
+
+    Lite used to build its tabs from static config flags (`show_power_tab` and
+    friends), so it showed the same menu to everyone regardless of the licence or
+    the user's permissions — and it had no way to offer Batch or the assistant at
+    all. It now receives the same truth the React surfaces use: the licence
+    modules and the user's resolved permissions, one flag per feature.
+    """
+    from app.services import permission_catalog as _pc
+    from app.services import access_policy as _access
+
+    username = str(session.get("username") or "")
+    role = str(session.get("role") or "").strip().lower()
+    perms: Dict[str, Any] = {}
+    if isinstance(session.get("permissions"), dict):
+        perms = dict(session["permissions"])
+    if not perms and username:
+        try:
+            from app.state import auth_store as _as
+            rec = _as.get_user(username) or {}
+            if isinstance(rec.get("permissions"), dict):
+                perms = dict(rec["permissions"])
+        except Exception:
+            perms = {}
+
+    is_admin = role in ("admin", "super")
+    # A no-login share link has no user behind it. It gets the surface's
+    # baseline — dashboards and historian — and never the admin bypass.
+    anonymous_link = not username and str(session.get("auth_source") or "") != "jwt"
+
+    def _allowed(key: str, module: str = "") -> bool:
+        if module and not _access.has_module(module):
+            return False          # the site does not have the feature at all
+        if is_admin:
+            return True
+        if anonymous_link:
+            return key in ("dashboard", "historian")
+        return _pc.resolve(perms, key)
+
+    return {
+        "role": role,
+        "is_admin": is_admin,
+        # one flag per Lite tab; the client renders only what is true
+        "dashboard": _allowed("dashboard", "dashboard"),
+        "power": _allowed("power_overview", "power_overview"),
+        "historian": _allowed("historian", "historian"),
+        "reporting": _allowed("reporting", "reporting"),
+        "alarms": _allowed("alarms", "alarms"),
+        "tags": _allowed("tags", "tags"),
+        "batch": _allowed("batch_management", "batch_management"),
+        "intelligence": _allowed("trustnode_intelligence", "trustnode_intelligence"),
+        # Lite is a read-only surface: never offer an action it cannot perform.
+        "read_only": True,
+    }
+
+
+@router.get("/capabilities")
+def get_capabilities(request: Request, token: str = "") -> dict:
+    """Feature flags for the Lite surface, derived from the licence and the
+    signed-in user's permissions."""
+    session = _extract_session(request, token)
+    return {"ok": True, "capabilities": _lite_capabilities(session), "session": session}
+
+
 @router.get("/bootstrap")
 def get_bootstrap(request: Request, token: str = "") -> dict:
     session = _extract_session(request, token)
@@ -382,7 +452,8 @@ def get_bootstrap(request: Request, token: str = "") -> dict:
                         bootstrap[str(r[0])] = json.loads(r[1]) if isinstance(r[1], (str, bytes)) else r[1]
                     except Exception:
                         bootstrap[str(r[0])] = None
-                return {"ok": True, "source": "customer_sql", "data": bootstrap, "session": session}
+                return {"ok": True, "source": "customer_sql", "data": bootstrap, "session": session,
+                        "capabilities": _lite_capabilities(session)}
             except Exception as exc:
                 logger.warning("lite-local bootstrap from customer DB failed: %s", exc)
     # Fallback: the local SQLite bootstrap (no customer DB or read failed).
@@ -390,7 +461,8 @@ def get_bootstrap(request: Request, token: str = "") -> dict:
         bootstrap = app_store.get_bootstrap() or {}
     except Exception:
         bootstrap = {}
-    return {"ok": True, "source": "local_sqlite", "data": bootstrap, "session": session}
+    return {"ok": True, "source": "local_sqlite", "data": bootstrap, "session": session,
+            "capabilities": _lite_capabilities(session)}
 
 
 @router.get("/live")

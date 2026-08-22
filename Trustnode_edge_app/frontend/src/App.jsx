@@ -10942,10 +10942,20 @@ function AppShell() {
     // active so the menu stays clean (we don't want an empty group).
     if (["batch_overview", "batch_definitions", "batch_analysis"].includes(page)) {
       if (!hasLicenseModule("batch_management")) return false;
-      // batch_definitions is configuration (Process Engineer / admin). The other
-      // two are operational and follow the normal per-user permission check.
-      if (page === "batch_definitions") return isAdmin || canEditPage("batch_definitions");
-      return isAdmin || canEditPage("batch_overview") || canEditPage("batches");
+      const perms = currentUser?.permissions || {};
+      // 2026-08-22: batch was admin-only in practice because the permission keys
+      // it checked (`batch_overview` / `batches`) had no checkbox anywhere, so
+      // they were always undefined. The permission catalogue now defines
+      // `batch_management` (operational pages) and `batch_definitions`
+      // (configuration), and a viewer holding them sees the pages read-only on
+      // every surface.
+      if (page === "batch_definitions") {
+        return isAdmin || Boolean(perms.batch_definitions);
+      }
+      return isAdmin
+        || Boolean(perms.batch_management)
+        || Boolean(perms.batch_overview)   // legacy spellings, still honoured
+        || Boolean(perms.batches);
     }
     // Operator 2026-06-23: studio.* license-module gating.
     // Fail-OPEN by design — only enforced when at least one studio.*
@@ -20612,7 +20622,10 @@ const getGatewayHealth = (gateway) => {
           {/* Intelligence menu: self-hides when /api/intelligence/status
               returns 404 (module not loaded or license missing). Sits
               above the user/login footer. Independent of other menus. */}
-          <IntelligenceMenu activePage={activePage} onNavigate={setActivePage} sidebarCollapsed={sidebarCollapsed} />
+          {(currentUser?.role === "admin" || currentUser?.role === "super"
+            || Boolean(currentUser?.permissions?.trustnode_intelligence)) ? (
+            <IntelligenceMenu activePage={activePage} onNavigate={setActivePage} sidebarCollapsed={sidebarCollapsed} />
+          ) : null}
 
           <div className="sidebar-footer">
             <div className="user-menu-wrap" ref={userMenuRef}>
