@@ -1193,11 +1193,13 @@ class RetentionEngine:
         # ~1.3 s at 9 M rows, so it is measured off the request path and served
         # from this snapshot (same pattern as the lock-free /api/health one).
         self._db_stats: Dict[str, Any] = {}
+        self._row_costs_cache: Dict[str, Any] = {}
         self._db_stats_lock = threading.Lock()
         self._db_stats_thread: Optional[threading.Thread] = None
 
     # -- row census (off the request path) --------------------------------
     DB_STATS_TTL_S = 60.0
+    ROW_COSTS_TTL_S = 300.0
 
     def _refresh_db_stats(self) -> None:
         try:
@@ -1242,6 +1244,18 @@ class RetentionEngine:
         self.store.ensure_schema()
         self._thread = threading.Thread(target=self._loop, name="tn-retention-engine", daemon=True)
         self._thread.start()
+        # Warm the row census off the request path (2026-08-22). Without this the
+        # FIRST /retention/v2/status after a restart pays for the COUNT(*) and
+        # the cold page cache — measured 5.3 s on a 9 M-row store, which is what
+        # the operator sees when they open Backup & Retention right after boot.
+        def _warm() -> None:
+            self._refresh_db_stats()
+            try:
+                self.measured_row_costs()
+            except Exception:
+                pass
+
+        threading.Thread(target=_warm, name="tn-retention-census-warm", daemon=True).start()
         log.info("retention engine armed (first pass in %ds)", RETENTION_BOOT_DELAY_S)
 
     def stop(self) -> None:
@@ -1974,7 +1988,25 @@ class RetentionEngine:
 
     # -- status -----------------------------------------------------------
     def measured_row_costs(self) -> Dict[str, float]:
-        """Bytes/row measured on THIS database, so estimates match reality."""
+        """Bytes/row measured on THIS database, so estimates match reality.
+
+        2026-08-22: this used to run two COUNT(*)s on every call to status(),
+        which the Backup & Retention page polls — 2-3 s per request on a 9 M-row
+        store, and invisible in the page because it happens after the response
+        body's other fields are built. Bytes-per-row is a slowly-moving number,
+        so it is cached like the row census and refreshed off the request path."""
+        now = time.monotonic()
+        with self._db_stats_lock:
+            cached = dict(self._row_costs_cache or {})
+        if cached and (now - float(cached.get("measured_mono") or 0)) < self.ROW_COSTS_TTL_S:
+            return {"bytes_per_raw_row": cached["bytes_per_raw_row"],
+                    "bytes_per_rollup_row": cached["bytes_per_rollup_row"]}
+        costs = self._measure_row_costs_now()
+        with self._db_stats_lock:
+            self._row_costs_cache = dict(costs, measured_mono=now)
+        return costs
+
+    def _measure_row_costs_now(self) -> Dict[str, float]:
         raw_bytes, rollup_bytes = 1000.0, 190.0
         try:
             conn = self.store.connect(readonly=True)
@@ -1983,11 +2015,16 @@ class RetentionEngine:
                 pages = int(conn.execute("PRAGMA page_count").fetchone()[0] or 0)
                 free = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
                 used = max(0, pages - free) * page
-                raw_rows = int(conn.execute("SELECT COUNT(*) FROM historian_readings").fetchone()[0] or 0)
+                # Reuse the cached census instead of counting again; fall back to
+                # a real count only when the census has not measured yet.
+                census = self._db_stats_cached()
+                raw_rows = census.get("raw_rows")
+                if raw_rows is None:
+                    raw_rows = int(conn.execute("SELECT COUNT(*) FROM historian_readings").fetchone()[0] or 0)
                 roll_rows = int(conn.execute("SELECT COUNT(*) FROM historian_rollup").fetchone()[0] or 0)
-                if raw_rows > 50000:
+                if int(raw_rows) > 50000:
                     # Rollups and config are a small share while raw dominates.
-                    raw_bytes = max(80.0, min(3000.0, used / float(raw_rows + roll_rows * 0.2)))
+                    raw_bytes = max(80.0, min(3000.0, used / float(int(raw_rows) + roll_rows * 0.2)))
             finally:
                 conn.close()
         except Exception:
@@ -1995,8 +2032,22 @@ class RetentionEngine:
         return {"bytes_per_raw_row": raw_bytes, "bytes_per_rollup_row": rollup_bytes}
 
     def status(self) -> Dict[str, Any]:
+        # Per-stage timing: this endpoint is polled by the Backup & Retention
+        # page and has twice been the reason the page rendered nothing. When it
+        # is slow, the log must name WHICH stage (2026-08-22).
+        _t = time.monotonic()
+        _stage_ms: Dict[str, float] = {}
+
+        def _mark(name: str) -> None:
+            nonlocal _t
+            now = time.monotonic()
+            _stage_ms[name] = round((now - _t) * 1000.0, 1)
+            _t = now
+
         self.store.ensure_schema()
+        _mark("schema")
         policy = self.store.get_active_policy()
+        _mark("policy")
         out: Dict[str, Any] = {
             "engine": {
                 "running": bool(self._thread and self._thread.is_alive()),
@@ -2033,7 +2084,9 @@ class RetentionEngine:
             db_size = os.path.getsize(self.store.db_path)
         except Exception:
             db_size = 0
+        _mark("prelude")
         conn = self.store.connect(readonly=True)
+        _mark("connect")
         try:
             page = int(conn.execute("PRAGMA page_size").fetchone()[0] or 4096)
             free = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
@@ -2088,10 +2141,13 @@ class RetentionEngine:
             out["database"]["error"] = str(exc)
         finally:
             conn.close()
+        _mark("db")
 
         costs = self.measured_row_costs()
+        _mark("row_costs")
         out["row_costs"] = costs
         tags = self._tag_stats()
+        _mark("tag_stats")
         out["collection"] = tags
         if policy:
             out["estimate"] = estimate_policy_size(
@@ -2111,6 +2167,11 @@ class RetentionEngine:
             out["days_until_full"] = round(free_bytes / float(per_day), 1)
         else:
             out["days_until_full"] = None
+        _mark("estimate")
+        total = sum(_stage_ms.values())
+        out["timing_ms"] = dict(_stage_ms, total=round(total, 1))
+        if total > 2000:
+            log.warning("retention status slow: %.0f ms %s", total, _stage_ms)
         return out
 
     def _tag_stats(self) -> Dict[str, Any]:

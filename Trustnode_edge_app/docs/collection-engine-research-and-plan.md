@@ -183,3 +183,42 @@ default source so existing widgets are untouched.
 **Still open:** the first-principles cause of *that* wedge is unattributed — the packaged service runs elevated, so `py-spy dump --pid <service>` needs an elevated shell. The instrumentation now names the stage the next time it happens.
 
 **Rule for diagnosing "is it collecting":** row growth in `historian_readings` (tenant + gateway predicate) or the `/ws/stream` feed. Frozen write counters + a growing historian = wedged distribution, not a collection stall.
+
+### 2026-08-22 — the wedge attributed: parallel Postgres sinks write inline
+
+The first gate run with the new instrumentation **failed on purpose**:
+`distribution not stalled : FAIL (max 200s)`, everything else PASS (boot 6.4 s,
+surfaces 39/39, delivery 97.0%, historian p95 1.0 s, durable stamp max 4 s).
+
+The stage log named the culprit within one run:
+
+```
+15:23:49 ERROR v2-dist STALLED 120s in stage 'sinks' (queue=121, dropped=0)
+15:24:50 ERROR v2-dist STALLED 181s in stage 'sinks' (queue=182, dropped=0)
+15:25:51 ERROR v2-dist STALLED 242s in stage 'sinks' (queue=243, dropped=0)
+15:26:49 ERROR v2-dist distribution worker replaced (no progress for 300s while
+         blocked in stage 'sinks' (300.2s), 301 cycle(s) waiting, 0 dropped)
+```
+
+**Cause.** This edge has the Supabase connection saved with `use_gateway=True`,
+so it is a *parallel sink* of the gateway. `_persist_readings` fans out to it on
+every cycle and `_persist_postgres_parallel` does two synchronous WAN
+round-trips — `write_historian_batch` + `upsert_live_latest` — **on the shared
+v2 distribution thread**. `statement_timeout=8000` bounds a query that is
+*running*; it does nothing for a socket that stops answering, so a bad cloud
+path parks distribution for every gateway on the box. This is the same failure
+the V2.0 split fixed for the primary path (store-forward outbox + background
+flush) and which was never applied to parallel sinks.
+
+**Fix.** `_run_sink_with_deadline()` gives every parallel network sink write a
+hard ceiling (`TRUSTNODE_SINK_WRITE_DEADLINE_S`, default 20 s). On timeout the
+call is abandoned on its own daemon thread, the sink's circuit breaker is
+tripped (so the next cycles skip it during the cooldown instead of hanging
+again) and the operator gets a specific error. Nothing is lost: rows are written
+to the per-sink outbox *before* the network write, and the flush worker
+re-sends them.
+
+**Note for this install:** the Supabase parallel sink duplicates work the cloud
+sync worker already does (19.5 M historian rows pushed). Clearing "feed from
+gateways" on that connection removes two WAN writes per second from the
+collection path entirely — a configuration decision for the operator.

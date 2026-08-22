@@ -125,6 +125,262 @@ class UserUpsertRequest(BaseModel):
     mfa_enabled: bool = False
     modules: list[str] = Field(default_factory=list)
     permissions: dict[str, Any] = Field(default_factory=dict)
+    # 2026-08-22 named licence seats. A field left absent (None) means "this
+    # caller does not manage seats": every stored seat and access flag is left
+    # exactly as it is, which is what keeps the pre-seat admin flows working.
+    seats: list[str] | None = None
+    view_ui: str | None = None
+
+
+def _seat_apply(request, payload, assigned_tenant: str) -> None:
+    """Normalise the requested seats, enforce the licence cap, and derive the
+    legacy access flags. Raises HTTPException(409) when the licence is full."""
+    from app.services import license_inspect as _li
+
+    valid = set(_li.SEAT_PRODUCTS)
+    seats = []
+    for raw_seat in (payload.seats or []):
+        key = str(raw_seat or "").strip().lower()
+        if key and key in valid and key not in seats:
+            seats.append(key)
+    view_ui = str(payload.view_ui or "").strip().lower()
+    if view_ui not in ("lite", "app_readonly"):
+        view_ui = "app_readonly"      # default per plan decision 3
+
+    # Cap check — only when the portal issued real seat counts. A licence that
+    # predates seats keeps the old concurrent-session model untouched.
+    if _li.seats_are_explicit():
+        try:
+            from app.services import seats as _seats
+            from app.state import auth_store as _as
+            # Census spans BOTH user stores (AuthStore + cp_users); counting one
+            # of them would under-count and leak the cap.
+            assigned = _seats.census()
+            existing = (_as.get_user(payload.username) or {})
+            held = _seats.seats_of_user(existing)
+        except Exception:
+            assigned, held = {}, []
+        for seat in seats:
+            if seat in held:
+                continue                      # already counted for this user
+            licensed = int(_li.seat_limit(seat) or 0)
+            if licensed <= 0:
+                continue                      # 0 = unlimited, same as limits
+            if int(assigned.get(seat, 0)) >= licensed:
+                label = _li.SEAT_LABELS.get(seat, seat)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"All {licensed} {label} seat(s) in this licence are "
+                            f"assigned. Free a seat from another user, or add seats "
+                            f"to the licence in the portal."),
+                )
+
+    perms = dict(payload.permissions or {})
+    perms["seats"] = seats
+    perms["view_ui"] = view_ui
+    # Derived, never authoritative: these are what the static surface guard reads.
+    perms["access_full"] = "studio" in seats
+    perms["access_client"] = ("view_lan" in seats) and view_ui != "lite"
+    perms["access_lite"] = ("view_lan" in seats) and view_ui == "lite"
+    payload.permissions = perms
+
+
+def _seat_preserve(payload) -> None:
+    """Carry an existing seat assignment through a save that does not manage
+    seats. Without this, any older admin flow that posts a user with an empty
+    `permissions` dict would silently strip the person's licensed access."""
+    try:
+        from app.services import seats as _seats
+        from app.state import auth_store as _as
+    except Exception:
+        return
+    stored = {}
+    try:
+        stored = _as.get_user(payload.username) or {}
+    except Exception:
+        stored = {}
+    if not stored:
+        try:
+            rows = control_plane_store.list_users(tenant_id=_seats._current_tenant()) or []
+            stored = next((r for r in rows
+                           if str(r.get("username") or "").lower() == str(payload.username or "").lower()), {})
+        except Exception:
+            stored = {}
+    held = _seats.seats_of_user(stored)
+    if not held:
+        return
+    perms = dict(payload.permissions or {})
+    perms.setdefault("seats", held)
+    perms.setdefault("view_ui", _seats.view_ui_of_user(stored))
+    stored_perms = stored.get("permissions") if isinstance(stored.get("permissions"), dict) else {}
+    for flag in ("access_full", "access_client", "access_lite"):
+        if flag not in perms and flag in stored_perms:
+            perms[flag] = stored_perms[flag]
+    payload.permissions = perms
+
+
+@router.get("/license/seats")
+def license_seats(request: Request) -> dict:
+    """Seat ledger for the Users and Access Control page: what the licence
+    grants, what is assigned and what is left. /api/control-plane/* is
+    admin-only via access_policy.ADMIN_ONLY_PREFIXES."""
+    from app.services import seats as _seats
+    return _seats.ledger()
+
+
+class UserAccessEmailRequest(BaseModel):
+    username: str
+    temp_password: str = ""          # optional; included in the message when set
+    send: bool = True                # False = render only ("Copy invitation")
+
+
+def _access_invitation(username: str, temp_password: str = "") -> dict:
+    """Render the access invitation for a user from their seats + the live
+    Remote Access URLs. Returns {to, subject, text, urls, seats, warnings}."""
+    from app.services import seats as _seats
+    from app.services import lan_socket as _lan
+
+    record = {}
+    try:
+        from app.state import auth_store as _as
+        record = _as.get_user(username) or {}
+    except Exception:
+        record = {}
+    if not record:
+        try:
+            from app.tenant import normalize_tenant_id, get_current_tenant
+            rows = control_plane_store.list_users(
+                tenant_id=normalize_tenant_id(get_current_tenant())) or []
+            record = next((r for r in rows
+                           if str(r.get("username") or "").lower() == username.lower()), {})
+        except Exception:
+            record = {}
+
+    held = _seats.seats_of_user(record)
+    view_ui = _seats.view_ui_of_user(record)
+    email_to = str(record.get("email") or "").strip()
+    warnings = []
+    if not email_to:
+        warnings.append("This user has no e-mail address, so the invitation cannot be sent.")
+    if not held:
+        warnings.append("This user holds no licence seat, so there is nothing to give access to.")
+
+    # Live URLs from the Remote Access service; hostname form first because it
+    # keeps working when DHCP moves the machine.
+    host_urls, ip_urls, https_on = [], [], False
+    try:
+        running = _lan.is_running()
+        http_port, https_port = _lan.current_port(), _lan.current_https_port()
+        https_on = bool(https_port)
+        import socket as _socket
+        hostname = _socket.gethostname()
+        addrs = []
+        try:
+            addrs = [ai[4][0] for ai in _socket.getaddrinfo(hostname, None, _socket.AF_INET)]
+        except Exception:
+            addrs = []
+        def _mk(base_host, port, scheme, path):
+            return f"{scheme}://{base_host}:{port}{path}"
+        if running:
+            for seat in held:
+                if seat == "studio":
+                    path = "/trustnode/full/"
+                elif seat == "view_lan":
+                    path = "/trustnode/lite/" if view_ui == "lite" else "/trustnode/client/"
+                else:
+                    continue
+                if https_port:
+                    host_urls.append(_mk(hostname, https_port, "https", path))
+                    ip_urls += [_mk(a, https_port, "https", path) for a in addrs[:2]]
+                if http_port:
+                    host_urls.append(_mk(hostname, http_port, "http", path))
+                    ip_urls += [_mk(a, http_port, "http", path) for a in addrs[:2]]
+        elif any(x in held for x in ("studio", "view_lan")):
+            warnings.append("Remote Access is currently OFF, so no LAN address can be offered yet.")
+    except Exception as exc:
+        warnings.append(f"Could not read the Remote Access URLs: {exc}")
+
+    cloud_url = ""
+    if "cloud_view" in held:
+        try:
+            bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+            st = bootstrap.get("app_settings") or {}
+            cloud_url = str(st.get("tenant_web_client_url") or st.get("cloud_url") or "").strip()
+        except Exception:
+            cloud_url = ""
+        if not cloud_url:
+            warnings.append("No cloud portal URL is configured for Cloud View.")
+
+    from app.services import license_inspect as _li
+    lines = [
+        f"Hello {record.get('username') or username},",
+        "",
+        "You have been given access to TrustNode. Your licence covers:",
+    ]
+    for seat in held:
+        lines.append(f"  - {_li.SEAT_LABELS.get(seat, seat)}")
+    lines.append("")
+    lines.append(f"Sign in with your e-mail address: {email_to or '(no e-mail set)'}")
+    if temp_password:
+        lines += [f"Temporary password: {temp_password}",
+                  "You will be asked to choose your own password at first sign-in."]
+    if host_urls or ip_urls:
+        lines += ["", "On the plant network, open:"]
+        lines += [f"  {u}" for u in host_urls]
+        if ip_urls:
+            lines += ["", "If the name does not resolve on your device, use:"]
+            lines += [f"  {u}" for u in dict.fromkeys(ip_urls)]
+        if https_on:
+            lines += ["", "The https address uses this site's own certificate; your browser "
+                          "may warn once until it is installed."]
+    if cloud_url:
+        lines += ["", f"Over the internet (Cloud View): {cloud_url}"]
+    text = "\n".join(lines)
+    return {
+        "to": email_to,
+        "subject": "Your TrustNode access",
+        "text": text,
+        "urls": {"lan": list(dict.fromkeys(host_urls + ip_urls)), "cloud": cloud_url},
+        "seats": held,
+        "view_ui": view_ui,
+        "warnings": warnings,
+    }
+
+
+@router.post("/users/access-email")
+def send_user_access_email(payload: UserAccessEmailRequest, request: Request) -> dict:
+    """Render (and optionally send) a user's access invitation.
+
+    The rendered text comes back either way, so an admin on a site without
+    e-mail configured can copy it into their own mail client."""
+    username = str(payload.username or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="username is required")
+    invite = _access_invitation(username, str(payload.temp_password or ""))
+    sent, error = False, ""
+    if payload.send and invite["to"] and not invite["warnings"][:1]:
+        try:
+            from app.routers.notifications import EmailRequest, send_email_request
+            bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+            settings_doc = (bootstrap.get("app_settings") or {}).get("email") or {}
+            if not settings_doc:
+                settings_doc = bootstrap.get("email_settings") or {}
+            req = EmailRequest(
+                transport=str(settings_doc.get("transport") or "smtp"),
+                smtp=settings_doc.get("smtp") or settings_doc,
+                php_mail=settings_doc.get("php_mail"),
+                to=[invite["to"]],
+                subject=invite["subject"],
+                text_body=invite["text"],
+            )
+            result = send_email_request(req)
+            sent = bool(getattr(result, "ok", False))
+            error = str(getattr(result, "error", "") or "")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+    _audit(request, tenant_id="", action="user.access_email", outcome="ok" if sent else "rendered",
+           details={"username": username, "sent": sent, "seats": invite["seats"]})
+    return {"ok": True, "sent": sent, "error": error, **invite}
 
 
 class UserSetPasswordRequest(BaseModel):
@@ -1093,6 +1349,16 @@ def upsert_user(payload: UserUpsertRequest, request: Request, tenant_id: str | N
     assigned_tenant = (
         _customer_tenant_id(payload.customer_id) if str(payload.customer_id or "").strip() else caller_tid
     )
+    # 2026-08-22 (named seats): validate + apply the seat assignment before the
+    # save. Seats travel inside `permissions` so they reach the JWT claim, the
+    # users_access doc and both user stores without new plumbing; the legacy
+    # access_* flags are derived from them so the static surface guard is
+    # untouched. Only runs when the caller actually manages seats.
+    if payload.seats is not None:
+        _seat_apply(request, payload, assigned_tenant)
+    else:
+        _seat_preserve(payload)
+
     # Operator 2026-08-21 (Phase 3): enforce max_studio_admins on user creation.
     try:
         from app.services import license_inspect as _li

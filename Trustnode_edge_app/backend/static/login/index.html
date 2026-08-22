@@ -238,11 +238,18 @@ async function checkAccess(variant) {
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
       body: JSON.stringify({ variant }),
     });
+    let body = {}; try { body = await res.json(); } catch (_) {}
     if (!res.ok) {
-      let body = {}; try { body = await res.json(); } catch (_) {}
+      // 2026-08-22: when the requested view is not this person's, but their
+      // licence seat entitles them to exactly one other, send them there
+      // instead of dead-ending on "no access".
+      const entitled = Array.isArray(body.entitled) ? body.entitled : [];
+      if (entitled.length === 1 && entitled[0] !== variant) {
+        return { ok: false, error: body.detail || `HTTP ${res.status}`, redirectTo: entitled[0] };
+      }
       return { ok: false, error: body.detail || `HTTP ${res.status}` };
     }
-    return { ok: true };
+    return { ok: true, entitled: Array.isArray(body.entitled) ? body.entitled : [] };
   } catch (e) { return { ok: false, error: String(e?.message || e) }; }
 }
 
@@ -312,6 +319,11 @@ function render(state) {
       // Server-side variant gate.
       const gate = await checkAccess(variant);
       if (!gate.ok) {
+        if (gate.redirectTo) {
+          // Their licence seat is for a different view — take them to it.
+          window.location.replace(defaultReturnFor(gate.redirectTo));
+          return;
+        }
         render({ error: `Account does not have access to ${variantLabel(variant)}: ${gate.error || "denied"}` });
         return;
       }
@@ -333,6 +345,9 @@ function render(state) {
         // before sending the browser to the protected bundle.
         await ensureSessionCookie(existing);
         window.location.replace(safeReturn(ret, variant));
+      } else if (gate.redirectTo) {
+        await ensureSessionCookie(existing);
+        window.location.replace(defaultReturnFor(gate.redirectTo));
       } else {
         render({});
       }

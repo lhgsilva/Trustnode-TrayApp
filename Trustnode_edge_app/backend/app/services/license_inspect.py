@@ -155,6 +155,8 @@ def _evaluate() -> dict[str, Any]:
             "limits": {},
             "package_key": "",
             "grandfathered": set(),
+            "seats": {},
+            "seats_explicit": False,
         }
     license_obj = s.get("license") if isinstance(s.get("license"), dict) else {}
 
@@ -213,13 +215,44 @@ def _evaluate() -> dict[str, Any]:
             if isinstance(v, dict):
                 module_configs[_normalize_module_key(k)] = dict(v)
 
+    seats, seats_explicit = _parse_seats(license_obj, limits)
+
     return {
         "modules": enabled_modules,
         "limits": limits,
         "package_key": pkg or "edge",  # legacy installs report as "edge" for the banner
         "grandfathered": grandfathered,
         "module_configs": module_configs,
+        "seats": seats,
+        "seats_explicit": seats_explicit,
     }
+
+
+def _parse_seats(license_obj: dict[str, Any], limits: dict[str, int]) -> tuple[dict[str, int], bool]:
+    """Read the licence's `seats` block, or derive it from the existing limits.
+
+    Derivation keeps a pre-seat licence behaving exactly as it does today:
+      studio      <- max_studio_admins
+      view_lan    <- max_view_users   (still enforced as CONCURRENT sessions)
+      cloud_view  <- max_view_users
+      edge_runtime<- 1
+    """
+    raw_seats = license_obj.get("seats")
+    if isinstance(raw_seats, dict) and raw_seats:
+        out: dict[str, int] = {}
+        for product in SEAT_PRODUCTS:
+            try:
+                out[product] = max(0, int(raw_seats.get(product) or 0))
+            except Exception:
+                out[product] = 0
+        return out, True
+    derived = {
+        "edge_runtime": 1,
+        "studio": int(limits.get("max_studio_admins") or 0),
+        "view_lan": int(limits.get("max_view_users") or 0),
+        "cloud_view": int(limits.get("max_view_users") or 0),
+    }
+    return derived, False
 
 
 def _refresh_if_stale() -> dict[str, Any]:
@@ -246,6 +279,53 @@ def has_module(key: str) -> bool:
     if k in c.get("grandfathered", set()):
         return True
     return k in c.get("modules", set())
+
+
+# --------------------------------------------------------------------------
+# Licence seats (2026-08-22)
+# --------------------------------------------------------------------------
+# The four products a customer buys. `edge_runtime` and `studio` are the
+# machine + the admin interface; `view_lan` and `cloud_view` are per-user
+# read-only access. See docs/licensing-seats-and-remote-access-plan-2026-08-22.md
+SEAT_PRODUCTS = ("edge_runtime", "studio", "view_lan", "cloud_view")
+
+SEAT_LABELS = {
+    "edge_runtime": "TrustNode Edge",
+    "studio": "TrustNode Studio",
+    "view_lan": "TrustNode View LAN",
+    "cloud_view": "TrustNode Cloud View",
+}
+
+# A seat is only usable when the licence also carries the module that serves it.
+SEAT_MODULE = {
+    "edge_runtime": "gateway_runtime_control",
+    "studio": "remote_admin_lan",
+    "view_lan": "local_web_app",
+    "cloud_view": "cloud_lite_access",
+}
+
+
+def seats_are_explicit() -> bool:
+    """True when the portal issued this licence with a real `seats` block.
+
+    When False the edge keeps its pre-2026-08-22 behaviour exactly: seats are
+    derived from the numeric limits and the concurrent-session cap in
+    view_sessions stays authoritative. This is the guard that stops a licence
+    that has not been reissued from changing behaviour on a working site."""
+    return bool(_refresh_if_stale().get("seats_explicit"))
+
+
+def get_seats() -> dict[str, int]:
+    """Seats per product; 0 = unlimited, mirroring the limits convention."""
+    return dict(_refresh_if_stale().get("seats") or {})
+
+
+def seat_limit(product: str) -> int:
+    key = str(product or "").strip().lower()
+    try:
+        return int((_refresh_if_stale().get("seats") or {}).get(key) or 0)
+    except Exception:
+        return 0
 
 
 def get_limit(key: str) -> int:
@@ -286,7 +366,8 @@ def invalidate_cache() -> None:
     """Force a re-read on the next call. Use after license-check
     completes successfully."""
     global _cache
-    _cache = {"checked_at": 0.0, "modules": set(), "limits": {}, "package_key": "", "grandfathered": set()}
+    _cache = {"checked_at": 0.0, "modules": set(), "limits": {}, "package_key": "",
+              "grandfathered": set(), "seats": {}, "seats_explicit": False}
 
 
 # ---- usage counters ---------------------------------------------------

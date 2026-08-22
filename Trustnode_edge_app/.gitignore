@@ -40,3 +40,6 @@ backend/keys/*.private.pem
 
 # Local dev env (never shipped)
 Trustnode_edge_app/frontend/.env.local
+
+# UI smoke-test screenshots
+ui_smoke*.png

@@ -108,3 +108,17 @@ Why: on 2026-08-21 the `tn-v2-dist` thread wedged 6 minutes after boot and a ful
 gate run still passed — the WS feed and the historian were healthy (they are fed by other
 threads) and outbox depth read 0, which a wedge produces exactly like an idle healthy system.
 Cloud records and every extra database sink were dead for 5.6 h with `last_error = None`.
+
+### UI smoke test (added 2026-08-22, MANDATORY before packaging)
+
+`node scripts/ui_smoke.js` (needs Playwright: `NODE_PATH` pointing at any install,
+e.g. the npx cache) logs in, loads the built bundle from a running backend and
+walks Dashboard → Database Overview → Backup and Retention → Gateway
+Configuration → Historian → Remote Access, failing on ANY page error or the
+"Frontend Error Recovered" boundary.
+
+Why: a build shipped with `page is not defined` — a plain undefined identifier in
+App.jsx. Vite does not type-check or lint, there is no ESLint config in
+`frontend/`, and every backend/API check still passed because the failure was
+purely in the browser. Nothing in the pipeline looked at a rendered page.
+**Never package a build without this passing.**

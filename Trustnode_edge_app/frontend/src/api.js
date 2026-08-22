@@ -2440,6 +2440,43 @@ export async function deleteControlPlaneUser(username, tenantId = "") {
   return res.json();
 }
 
+// Licence seat ledger (plan 2026-08-22, Phase 1).
+// Returns null when the backend does not yet expose the endpoint (404) so the
+// UI degrades gracefully on older builds.
+export async function getLicenseSeats() {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/control-plane/license/seats`, {}, 8000);
+  if (res.status === 404) return null;
+  await ensureOk(res, "License seats fetch failed");
+  return res.json();
+}
+
+// Send (or render without sending) the per-user access invitation e-mail.
+// body: { username, temp_password, send }
+// Returns the rendered text and metadata even when SMTP is not configured.
+// Non-ok responses throw with the backend detail verbatim.
+export async function sendUserAccessEmail({ username, tempPassword = "", send = true } = {}) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/control-plane/users/access-email`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: String(username || ""),
+      temp_password: String(tempPassword || ""),
+      send: Boolean(send),
+    }),
+  }, 15000);
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = String(body?.detail || body?.error || "").trim();
+    } catch {
+      try { detail = (await res.text()).trim(); } catch { detail = ""; }
+    }
+    throw new Error(detail || `Send access email failed (HTTP ${res.status})`);
+  }
+  return res.json();
+}
+
 export async function issueControlPlaneActivationCode(payload, tenantId = "") {
   const params = new URLSearchParams();
   if (tenantId) params.set("tenant_id", String(tenantId));

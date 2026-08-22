@@ -184,6 +184,11 @@ class AuthStore:
                     # (bumped on revoke -> every older JWT is rejected) and
                     # per-account lockout state for LAN-exposed logins.
                     "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0",
+                    # 2026-08-22 (named licence seats): which products this user
+                    # consumes, and which UI a View LAN seat is served.
+                    "ALTER TABLE users ADD COLUMN seats_json TEXT NOT NULL DEFAULT '[]'",
+                    "ALTER TABLE users ADD COLUMN view_ui TEXT NOT NULL DEFAULT ''",
+                    "CREATE INDEX IF NOT EXISTS ix_users_email ON users(LOWER(email))",
                     "CREATE TABLE IF NOT EXISTS login_lockouts (username TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0, first_failure_utc TEXT, locked_until_utc TEXT, updated_utc TEXT)",
                     "CREATE TABLE IF NOT EXISTS token_versions (username TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0, updated_utc TEXT)",
                 ):
@@ -233,9 +238,16 @@ class AuthStore:
             modules = json.loads(row["modules_json"] or "[]")
         except Exception:
             modules = []
+        try:
+            seats = json.loads((row["seats_json"] if "seats_json" in row.keys() else "[]") or "[]")
+        except Exception:
+            seats = []
         return {
             "username": str(row["username"]),
             "password_hash": str(row["password_hash"]),
+            "email": str((row["email"] if "email" in row.keys() else "") or ""),
+            "seats": [str(x) for x in seats] if isinstance(seats, list) else [],
+            "view_ui": str((row["view_ui"] if "view_ui" in row.keys() else "") or ""),
             "role": str(row["role"] or "viewer"),
             "permissions": permissions if isinstance(permissions, dict) else {},
             "modules": modules if isinstance(modules, list) else [],
@@ -259,6 +271,56 @@ class AuthStore:
                 return None
             return self._row_to_user(row)
 
+    def find_by_login(self, identifier: str) -> Optional[Dict[str, Any]]:
+        """Resolve a login identifier: username first, then e-mail.
+
+        2026-08-22: licensed seats are handed to people by e-mail, so the
+        address has to work as a login. Username is tried first so an existing
+        account can never be shadowed by someone else's e-mail, and the internal
+        identity (JWT `sub`, audit, revocation) remains the username."""
+        ident = str(identifier or "").strip()
+        if not ident:
+            return None
+        hit = self.get_user(ident)
+        if hit:
+            return hit
+        if "@" not in ident:
+            return None
+        with self._connect(read_only=True) as conn:
+            rows = conn.execute(
+                "SELECT * FROM users WHERE email IS NOT NULL AND LOWER(email) = LOWER(?) "
+                "ORDER BY username LIMIT 2",
+                (ident,),
+            ).fetchall()
+        if len(rows) != 1:
+            # 0 = unknown; >1 = ambiguous, which must never authenticate.
+            return None
+        return self._row_to_user(rows[0])
+
+    def email_owner(self, email: str) -> str:
+        """Username that already owns this e-mail ('' when free)."""
+        addr = str(email or "").strip()
+        if not addr:
+            return ""
+        with self._connect(read_only=True) as conn:
+            row = conn.execute(
+                "SELECT username FROM users WHERE email IS NOT NULL AND LOWER(email) = LOWER(?) LIMIT 1",
+                (addr,),
+            ).fetchone()
+        return str(row["username"]) if row else ""
+
+    def count_seat_assignments(self) -> Dict[str, int]:
+        """How many ACTIVE users hold each seat product."""
+        out: Dict[str, int] = {}
+        for u in self.list_users():
+            if str(u.get("status") or "active").lower() != "active":
+                continue
+            for seat in (u.get("seats") or []):
+                key = str(seat or "").strip().lower()
+                if key:
+                    out[key] = out.get(key, 0) + 1
+        return out
+
     def list_users(self) -> List[Dict[str, Any]]:
         with self._connect(read_only=True) as conn:
             return [self._row_to_user(r) for r in conn.execute("SELECT * FROM users ORDER BY username").fetchall()]
@@ -279,6 +341,9 @@ class AuthStore:
         tenant_id: str = "default",
         status: str = "active",
         must_change_password: bool = False,
+        email: Optional[str] = None,
+        seats: Optional[List[Any]] = None,
+        view_ui: Optional[str] = None,
     ) -> Dict[str, Any]:
         uname = str(username or "").strip()
         if not uname:
@@ -288,6 +353,16 @@ class AuthStore:
         now = _utc_now()
         perms_json = json.dumps(permissions or {}, ensure_ascii=False)
         mods_json = json.dumps(modules or [], ensure_ascii=False)
+        # None = "leave whatever is stored" so existing callers are untouched.
+        email_txt = None if email is None else str(email or "").strip()
+        seats_json = None if seats is None else json.dumps(
+            [str(x).strip().lower() for x in (seats or []) if str(x).strip()], ensure_ascii=False)
+        view_ui_txt = None if view_ui is None else str(view_ui or "").strip().lower()
+        if email_txt:
+            owner = self.email_owner(email_txt)
+            if owner and owner.lower() != uname.lower():
+                raise ValueError(
+                    f"that e-mail address is already the login of user '{owner}'")
         with self._write_lock:
             with self._connect() as conn:
                 conn.execute(
@@ -320,6 +395,18 @@ class AuthStore:
                         now,
                     ),
                 )
+                # Seat / e-mail fields are written separately and only when the
+                # caller supplied them, so every pre-2026-08-22 call site keeps
+                # its exact behaviour (None = leave stored value alone).
+                if email_txt is not None:
+                    conn.execute("UPDATE users SET email=?, updated_utc=? WHERE username=?",
+                                 (email_txt, now, uname))
+                if seats_json is not None:
+                    conn.execute("UPDATE users SET seats_json=?, updated_utc=? WHERE username=?",
+                                 (seats_json, now, uname))
+                if view_ui_txt is not None:
+                    conn.execute("UPDATE users SET view_ui=?, updated_utc=? WHERE username=?",
+                                 (view_ui_txt, now, uname))
                 conn.commit()
         return self.get_user(uname) or {}
 

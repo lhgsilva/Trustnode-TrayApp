@@ -60,6 +60,7 @@ import {
   getAppStoreLogs,
   getAppStoreInspector,
   getCloudSyncStatus,
+  listRetentionPolicies,
   getEdgeIngestDiagnostics,
   repairDatabaseRecovery,
   getRetentionPolicy,
@@ -142,6 +143,8 @@ import {
   setControlPlaneLicenseModules,
   getAIEndpointConfig,
   setAIEndpointConfig,
+  getLicenseSeats,
+  sendUserAccessEmail,
   getControlPlaneUsers,
   upsertControlPlaneUser,
   deleteControlPlaneUser,
@@ -1277,7 +1280,11 @@ function formatBytes(value) {
   if (!Number.isFinite(n) || n <= 0) return "0 B";
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+  // 2026-08-22: this used to stop at MB, so an 8.54 GB historian rendered as
+  // "8729.65 MB" — technically right, unreadable in a size column.
+  if (n < 1024 * 1024 * 1024 * 1024) return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  return `${(n / (1024 * 1024 * 1024 * 1024)).toFixed(2)} TB`;
 }
 
 function parseSemicolonTags(raw) {
@@ -3816,6 +3823,8 @@ function AppShell() {
   // Cloud sync status: polled every 2s, drives the new sync status card and
   // the "big backlog detected" popup.
   const [cloudSyncStatus, setCloudSyncStatus] = useState(null);
+  // undefined = not fetched yet, null = fetched and there is no active policy
+  const [retentionV2Active, setRetentionV2Active] = useState(undefined);
   const [cloudSyncStatusError, setCloudSyncStatusError] = useState("");
   // Backlog popup gate. Once the user picks an option we remember the
   // decision for the session so we don't pester them again on each poll.
@@ -4366,6 +4375,9 @@ function AppShell() {
     username: "",
     password: "",
     role: "viewer",
+    email: "",
+    seats: [],
+    view_ui: "app_readonly",
     permissions: buildRolePermissions("viewer")
   });
   const [showEditUserModal, setShowEditUserModal] = useState(false);
@@ -4373,8 +4385,17 @@ function AppShell() {
   const [editUserForm, setEditUserForm] = useState({
     password: "",
     role: "viewer",
+    email: "",
+    seats: null,
+    view_ui: "app_readonly",
     permissions: buildRolePermissions("viewer")
   });
+  const [licenseSeats, setLicenseSeats] = useState(null);
+  const [licenseSeatsLoading, setLicenseSeatsLoading] = useState(false);
+  const [showAccessEmailModal, setShowAccessEmailModal] = useState(false);
+  const [accessEmailUsername, setAccessEmailUsername] = useState("");
+  const [accessEmailResult, setAccessEmailResult] = useState(null);
+  const [accessEmailBusy, setAccessEmailBusy] = useState(false);
   const [cpBusy, setCpBusy] = useState(false);
   const [cpResult, setCpResult] = useState("");
   const [cpSummary, setCpSummary] = useState(null);
@@ -5432,6 +5453,22 @@ function AppShell() {
       document.removeEventListener("webkitfullscreenchange", onFullscreenChange);
     };
   }, []);
+
+  // Database Overview / Backup & Retention: read the ACTIVE v2 policy so the
+  // Retention column states what really happens to old data. Cheap call (the
+  // heavy /status is not needed here); refreshed while the page is open.
+  useEffect(() => {
+    if (activePage !== "database" && activePage !== "backup_and_retention") return undefined;
+    let cancelled = false;
+    const load = () => {
+      listRetentionPolicies()
+        .then((r) => { if (!cancelled) setRetentionV2Active(r?.active || null); })
+        .catch(() => { if (!cancelled) setRetentionV2Active(null); });
+    };
+    load();
+    const timer = setInterval(load, 30000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [activePage]);
 
   useEffect(() => {
     if (!showUserMenu) return;
@@ -12230,6 +12267,19 @@ const getGatewayHealth = (gateway) => {
     return `${String(dbConn.host || "-")}:${String(dbConn.port || "-")}`;
   };
 
+  // The built-in "Local SQLite" row is the edge historian, which lives in the
+  // app-store database — NOT the ./data/trustnode_edge.db sink path the
+  // connection record carries (that file has not been written since the sink
+  // de-dup). Show the file whose size the row reports, so path and size agree.
+  const getLocalDbPathLabel = (dbConn) => {
+    const isBuiltIn =
+      String(dbConn?.id || "") === "local-sqlite-default" ||
+      String(dbConn?.id || "") === MAIN_LOCAL_SQLITE_FALLBACK_ID;
+    const inspectorPath = String(databaseInspector?.db_path || "");
+    if (isBuiltIn && inspectorPath) return inspectorPath;
+    return getDbEndpointLabel(dbConn);
+  };
+
   const getDbRoleLabel = (dbConn) => {
     const roles = [];
     if (dbConn?.use_gateway) roles.push("Gateway");
@@ -12241,14 +12291,37 @@ const getGatewayHealth = (gateway) => {
   const isAdminDatabaseUser = Boolean(!isReadonlyCloudMode && currentUser?.role === "admin");
 
   const localDbUsage = useMemo(() => {
+    // 2026-08-22: this used to compare the database size against a hard-coded
+    // 300 MB "baseline" and clamp at 1, so every real install permanently read
+    // "High 100%" — an alarm bell that meant nothing. Report the DISK instead,
+    // which is what "am I going to run out of room" actually depends on.
     const sizeBytes = Number(databaseInspector?.db_size_bytes || 0);
-    const baseline = 1024 * 1024 * 300; // 300 MB baseline
-    const ratio = Math.max(0, Math.min(1, baseline > 0 ? sizeBytes / baseline : 0));
-    const percent = Math.round(ratio * 100);
-    if (ratio < 0.35) return { sizeBytes, percent, level: "low", label: "Low" };
-    if (ratio < 0.75) return { sizeBytes, percent, level: "medium", label: "Medium" };
-    return { sizeBytes, percent, level: "high", label: "High" };
+    const diskTotal = Number(databaseInspector?.disk_total_bytes || 0);
+    const diskFree = Number(databaseInspector?.disk_free_bytes || 0);
+    if (!diskTotal) {
+      return { sizeBytes, diskFree: 0, diskTotal: 0, percent: null, level: "unknown", label: "" };
+    }
+    const usedPct = Math.round(((diskTotal - diskFree) / diskTotal) * 100);
+    const freePct = 100 - usedPct;
+    const level = freePct < 5 ? "high" : freePct < 15 ? "medium" : "low";
+    const label = freePct < 5 ? "Disk critical" : freePct < 15 ? "Disk low" : "Disk OK";
+    return { sizeBytes, diskFree, diskTotal, percent: usedPct, level, label };
   }, [databaseInspector]);
+
+  // Active tiered-retention policy (v2 engine). The Retention column used to
+  // print a hard-coded UI default plus the LEGACY policy's schedule, which has
+  // been disabled since 2026-08-21 — it claimed data was pruned weekly while
+  // nothing was ever deleted.
+  const retentionSummaryLabel = useMemo(() => {
+    if (retentionV2Active === undefined) return "…";
+    const pol = retentionV2Active;
+    if (!pol) return "No policy — keeps everything";
+    const raw = pol?.raw?.keep ? `raw ${pol.raw.keep}` : "raw kept";
+    const tiers = (pol.tiers || [])
+      .map((t) => `${t.resolution} ${t.keep}`)
+      .join(" → ");
+    return tiers ? `${raw} → ${tiers}` : raw;
+  }, [retentionV2Active]);
 
   const cloudProviderCandidates = useMemo(() => {
     const rows = (dbConnections || [])
@@ -19130,22 +19203,23 @@ const getGatewayHealth = (gateway) => {
     const nextUsers = [...users, newUser];
     const actor = currentUser?.username || "system";
     const tenantScope = getControlPlaneTenantScope();
-    upsertControlPlaneUser(
-      {
-        username: newUser.username,
-        password: newUser.password,
-        role: newUser.role,
-        status: "active",
-        email: "",
-        mfa_enabled: false,
-        modules: newUser.modules,
-        permissions: newUser.permissions,
-      },
-      tenantScope
-    )
+    const newUserPayload = {
+      username: newUser.username,
+      password: newUser.password,
+      role: newUser.role,
+      status: "active",
+      email: String(newUserForm.email || ""),
+      mfa_enabled: false,
+      modules: newUser.modules,
+      permissions: newUser.permissions,
+      seats: Array.isArray(newUserForm.seats) ? newUserForm.seats : [],
+      view_ui: String(newUserForm.view_ui || "app_readonly"),
+    };
+    upsertControlPlaneUser(newUserPayload, tenantScope)
       .then(async () => {
         await refreshControlPlaneUsers(tenantScope);
         await refreshControlPlaneData(tenantScope);
+        await refreshLicenseSeats();
         // Local desktop only: keep users_access mirror for bootstrap compatibility.
         if (!isHostedWebClient) {
           await saveAppStoreDomain(
@@ -19159,6 +19233,9 @@ const getGatewayHealth = (gateway) => {
           username: "",
           password: "",
           role: "viewer",
+          email: "",
+          seats: [],
+          view_ui: "app_readonly",
           permissions: buildRolePermissions("viewer")
         });
         if (!isHostedWebClient) {
@@ -19662,13 +19739,59 @@ const getGatewayHealth = (gateway) => {
     if (first) setCpCustomerFilter(first);
   }, [isMasterAdmin, cpCustomers, cpCustomerFilter]);
 
+  // Reload the seat ledger whenever the admin navigates to the Users and
+  // Access Control page (and on initial login once canManageUsers is true).
+  useEffect(() => {
+    if (activePage === "users_and_access_control" && canManageUsers) {
+      refreshLicenseSeats();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePage, canManageUsers]);
+
+  // Load the seat ledger from the backend. Called when navigating to the
+  // users page and after any user save that may change seat counts.
+  // Returns silently on 404 (older backends without seat support).
+  const refreshLicenseSeats = async () => {
+    if (licenseSeatsLoading) return;
+    setLicenseSeatsLoading(true);
+    try {
+      const data = await getLicenseSeats();
+      setLicenseSeats(data);
+    } catch {
+      // Non-fatal: seat ledger is informational; leave existing state.
+    } finally {
+      setLicenseSeatsLoading(false);
+    }
+  };
+
+  // Send the access invitation e-mail for a user. Opens the result modal
+  // regardless of send success so the admin can copy the invitation text.
+  const handleSendAccessEmail = async (username) => {
+    if (!canManageUsers || !username) return;
+    setAccessEmailUsername(String(username));
+    setAccessEmailResult(null);
+    setAccessEmailBusy(true);
+    setShowAccessEmailModal(true);
+    try {
+      const result = await sendUserAccessEmail({ username, tempPassword: "", send: true });
+      setAccessEmailResult(result);
+    } catch (err) {
+      setAccessEmailResult({ ok: false, sent: false, error: String(err?.message || err), text: "", warnings: [] });
+    } finally {
+      setAccessEmailBusy(false);
+    }
+  };
+
   const openEditUser = (user) => {
     if (!canManageUsers || !user) return;
     setEditingUsername(String(user.username || ""));
     setEditUserForm({
-      password: String(user.password || ""),
+      password: "",
       role: String(user.role || "viewer"),
-      permissions: normalizePermissions(user.permissions, user.role || "viewer")
+      email: String(user.email || ""),
+      seats: Array.isArray(user.seats) ? [...user.seats] : null,
+      view_ui: String(user.view_ui || "app_readonly"),
+      permissions: normalizePermissions(user.permissions, user.role || "viewer"),
     });
     setShowEditUserModal(true);
   };
@@ -19692,22 +19815,29 @@ const getGatewayHealth = (gateway) => {
     });
     const actor = currentUser?.username || "system";
     const tenantScope = getControlPlaneTenantScope();
-    upsertControlPlaneUser(
-      {
-        username: editingUsername,
-        password: String(editUserForm.password || "").trim() ? String(editUserForm.password || "") : null,
-        role: String(editUserForm.role || "viewer"),
-        status: "active",
-        email: "",
-        mfa_enabled: false,
-        modules: deriveModuleKeysFromPermissions(normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")),
-        permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer"),
-      },
-      tenantScope
-    )
+    const seatsPayload = Array.isArray(editUserForm.seats) ? editUserForm.seats : undefined;
+    const upsertPayload = {
+      username: editingUsername,
+      password: String(editUserForm.password || "").trim() ? String(editUserForm.password || "") : null,
+      role: String(editUserForm.role || "viewer"),
+      status: "active",
+      email: String(editUserForm.email || ""),
+      mfa_enabled: false,
+      modules: deriveModuleKeysFromPermissions(normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer")),
+      permissions: normalizePermissions(editUserForm.permissions, editUserForm.role || "viewer"),
+    };
+    // Only include seats when the admin has explicitly configured them.
+    // Omitting the field leaves existing seat assignments and surface flags
+    // untouched (backend contract: null = no-op on seat storage).
+    if (seatsPayload !== undefined) {
+      upsertPayload.seats = seatsPayload;
+      upsertPayload.view_ui = String(editUserForm.view_ui || "app_readonly");
+    }
+    upsertControlPlaneUser(upsertPayload, tenantScope)
       .then(async () => {
         await refreshControlPlaneUsers(tenantScope);
         await refreshControlPlaneData(tenantScope);
+        await refreshLicenseSeats();
         if (!isHostedWebClient) {
           await saveAppStoreDomain(
             "users_access",
@@ -22264,9 +22394,18 @@ const getGatewayHealth = (gateway) => {
                     >
                       <span className="db-cell">{c.name}</span>
                       <span className="db-cell">{String(c.engine || "").toUpperCase()}</span>
-                      <span className="db-cell db-url-cell" title={getDbEndpointLabel(c)}>{getDbEndpointLabel(c)}</span>
-                      <span className="db-cell">{`Last ${retentionPresetKey} | ${Number(retentionPolicy.schedule_minutes || 60)}m`}</span>
-                      <span className="db-cell">{`${formatBytes(localDbUsage.sizeBytes)} | ${localDbUsage.label} ${localDbUsage.percent}%`}</span>
+                      <span className="db-cell db-url-cell" title={getLocalDbPathLabel(c)}>{getLocalDbPathLabel(c)}</span>
+                      <span className="db-cell" title={retentionSummaryLabel}>{retentionSummaryLabel}</span>
+                      <span
+                        className="db-cell"
+                        title={localDbUsage.diskTotal
+                          ? `Database file ${formatBytes(localDbUsage.sizeBytes)} · disk ${formatBytes(localDbUsage.diskFree)} free of ${formatBytes(localDbUsage.diskTotal)}`
+                          : `Database file ${formatBytes(localDbUsage.sizeBytes)}`}
+                      >
+                        {localDbUsage.percent === null
+                          ? formatBytes(localDbUsage.sizeBytes)
+                          : `${formatBytes(localDbUsage.sizeBytes)} | disk ${localDbUsage.percent}% used`}
+                      </span>
                       <span className="db-cell">
                         {(() => { const _s = dbStatusInfo(c); return (
                         <span className={`status-pill ${_s.cls}`}>{_s.label}</span>
@@ -25133,6 +25272,50 @@ const getGatewayHealth = (gateway) => {
 
           {activePage === "users_and_access_control" ? (
             <div className="users-access-page">
+              {licenseSeats ? (
+                <section className="card">
+                  <div className="row" style={{ justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 8 }}>
+                    <h4 style={{ margin: 0 }}>Seat Ledger</h4>
+                    <button className="btn btn-secondary btn-sm" onClick={refreshLicenseSeats} disabled={licenseSeatsLoading}>
+                      {licenseSeatsLoading ? "Loading..." : "Refresh"}
+                    </button>
+                  </div>
+                  {!licenseSeats.enforced ? (
+                    <p className="hint" style={{ marginBottom: 8 }}>{licenseSeats.note || "Seat counts are informational only on this licence — assignment is not enforced."}</p>
+                  ) : null}
+                  <div className="table-scroll">
+                    <div className="table">
+                      <div className="thead">
+                        <span>Product</span>
+                        <span>Licensed</span>
+                        <span>Assigned</span>
+                        <span>Free</span>
+                        <span>Users</span>
+                      </div>
+                      {(licenseSeats.seats || []).map((row) => (
+                        <div key={row.product} className="trow">
+                          <span>
+                            {row.label}
+                            {!row.module_licensed ? (
+                              <span className="status-pill" style={{ marginLeft: 6, background: "var(--ink-muted, #8a98ab)" }}>Not in licence</span>
+                            ) : null}
+                          </span>
+                          <span>{row.licensed === 0 ? "Unlimited" : row.licensed}</span>
+                          <span>
+                            {row.over_assigned ? (
+                              <span style={{ color: "var(--danger, #e05)" }} title="Over-assigned after a licence downgrade. Free a seat to restore enforcement.">{row.assigned} (over limit)</span>
+                            ) : row.assigned}
+                          </span>
+                          <span>{row.free === null ? "Unlimited" : row.free}</span>
+                          <span style={{ fontSize: "0.85em" }}>
+                            {(row.holders || []).map((h) => h.username).join(", ") || "-"}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+              ) : null}
               <section className="card">
                 <div className="table-scroll users-table-scroll">
                   <div className="table users-table users-table--lite-access">
@@ -25157,6 +25340,9 @@ const getGatewayHealth = (gateway) => {
                           />
                         </span>
                         <span className="row-actions">
+                          <button className="icon-btn table-action-btn" onClick={() => handleSendAccessEmail(u.username)} disabled={!canManageUsers || accessEmailBusy} title="Send access email">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 4h16v16H4z" /><polyline points="4,4 12,13 20,4" /></svg>
+                          </button>
                           <button className="icon-btn table-action-btn" onClick={() => openEditUser(u)} disabled={!canManageUsers} title="Edit user">
                             <EditIcon />
                           </button>
@@ -25202,7 +25388,59 @@ const getGatewayHealth = (gateway) => {
                         <option value="client">client</option>
                       </select>
                     </label>
+                    <label>
+                      Email (login and access delivery)
+                      <input
+                        type="email"
+                        value={newUserForm.email}
+                        onChange={(e) => setNewUserForm({ ...newUserForm, email: e.target.value })}
+                        placeholder="user@example.com"
+                      />
+                    </label>
                   </div>
+                  {licenseSeats ? (
+                    <div className="perm-group-card" style={{ marginTop: 12 }}>
+                      <div className="perm-group-title">Seat Assignment</div>
+                      <div className="perm-group-items">
+                        {(licenseSeats.seats || []).filter((s) => s.product !== "edge_runtime").map((s) => {
+                          const checked = (newUserForm.seats || []).includes(s.product);
+                          const atCap = !checked && !s.module_licensed;
+                          const overCap = !checked && s.free !== null && s.free !== undefined && s.free <= 0;
+                          const disabledReason = !s.module_licensed ? "Not in licence" : (overCap ? "No free seats" : "");
+                          return (
+                            <label key={s.product} className="perm-item" title={disabledReason}>
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                disabled={!checked && (atCap || overCap)}
+                                onChange={(e) => {
+                                  const cur = Array.isArray(newUserForm.seats) ? newUserForm.seats : [];
+                                  setNewUserForm({
+                                    ...newUserForm,
+                                    seats: e.target.checked ? [...cur, s.product] : cur.filter((p) => p !== s.product),
+                                  });
+                                }}
+                              />
+                              <span>{s.label}{disabledReason ? <span className="hint" style={{ marginLeft: 4 }}>({disabledReason})</span> : null}</span>
+                            </label>
+                          );
+                        })}
+                        {(newUserForm.seats || []).includes("view_lan") ? (
+                          <label className="perm-item" style={{ marginTop: 4 }}>
+                            <span style={{ minWidth: 100 }}>LAN view interface</span>
+                            <select
+                              value={newUserForm.view_ui}
+                              onChange={(e) => setNewUserForm({ ...newUserForm, view_ui: e.target.value })}
+                              style={{ marginLeft: 8 }}
+                            >
+                              <option value="app_readonly">TrustNode app (read-only)</option>
+                              <option value="lite">Lite (legacy)</option>
+                            </select>
+                          </label>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : null}
                   <div className="users-perm-groups">
                     {PERMISSION_GROUPS.map((group) => (
                       <div key={group.title} className="perm-group-card">
@@ -29323,6 +29561,7 @@ const getGatewayHealth = (gateway) => {
                   value={editUserForm.password}
                   onChange={(e) => setEditUserForm({ ...editUserForm, password: e.target.value })}
                   disabled={!canManageUsers}
+                  placeholder="Leave blank to keep current"
                 />
               </label>
               <label>
@@ -29346,7 +29585,76 @@ const getGatewayHealth = (gateway) => {
                   <option value="admin">admin</option>
                 </select>
               </label>
+              <label>
+                Email (login and access delivery)
+                <input
+                  type="email"
+                  value={editUserForm.email}
+                  onChange={(e) => setEditUserForm({ ...editUserForm, email: e.target.value })}
+                  disabled={!canManageUsers}
+                  placeholder="user@example.com"
+                />
+              </label>
             </div>
+            {licenseSeats ? (
+              <div className="perm-group-card" style={{ marginTop: 8 }}>
+                <div className="perm-group-title">Seat Assignment</div>
+                {editUserForm.seats === null ? (
+                  <p className="hint" style={{ margin: "4px 0 8px" }}>
+                    No seats configured yet.
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      style={{ marginLeft: 8 }}
+                      onClick={() => setEditUserForm({ ...editUserForm, seats: [] })}
+                      disabled={!canManageUsers}
+                    >
+                      Configure seats
+                    </button>
+                  </p>
+                ) : (
+                  <div className="perm-group-items">
+                    {(licenseSeats.seats || []).filter((s) => s.product !== "edge_runtime").map((s) => {
+                      const editSeats = Array.isArray(editUserForm.seats) ? editUserForm.seats : [];
+                      const checked = editSeats.includes(s.product);
+                      const atCap = !checked && !s.module_licensed;
+                      const overCap = !checked && s.free !== null && s.free !== undefined && s.free <= 0;
+                      const disabledReason = !s.module_licensed ? "Not in licence" : (overCap ? "No free seats" : "");
+                      return (
+                        <label key={`edit-seat-${s.product}`} className="perm-item" title={disabledReason}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={!canManageUsers || (!checked && (atCap || overCap))}
+                            onChange={(e) => {
+                              const cur = Array.isArray(editUserForm.seats) ? editUserForm.seats : [];
+                              setEditUserForm({
+                                ...editUserForm,
+                                seats: e.target.checked ? [...cur, s.product] : cur.filter((p) => p !== s.product),
+                              });
+                            }}
+                          />
+                          <span>{s.label}{disabledReason ? <span className="hint" style={{ marginLeft: 4 }}>({disabledReason})</span> : null}</span>
+                        </label>
+                      );
+                    })}
+                    {(Array.isArray(editUserForm.seats) && editUserForm.seats.includes("view_lan")) ? (
+                      <label className="perm-item" style={{ marginTop: 4 }}>
+                        <span style={{ minWidth: 120 }}>LAN view interface</span>
+                        <select
+                          value={editUserForm.view_ui || "app_readonly"}
+                          onChange={(e) => setEditUserForm({ ...editUserForm, view_ui: e.target.value })}
+                          disabled={!canManageUsers}
+                          style={{ marginLeft: 8 }}
+                        >
+                          <option value="app_readonly">TrustNode app (read-only)</option>
+                          <option value="lite">Lite (legacy)</option>
+                        </select>
+                      </label>
+                    ) : null}
+                  </div>
+                )}
+              </div>
+            ) : null}
             <div className="users-perm-groups" style={{ marginTop: 8 }}>
               {PERMISSION_GROUPS.map((group) => (
                 <div key={`edit-${group.title}`} className="perm-group-card">
@@ -29374,7 +29682,60 @@ const getGatewayHealth = (gateway) => {
             </div>
             <div className="row modal-actions">
               <button className="btn btn-primary" onClick={saveEditedUser} disabled={!canManageUsers}>Save</button>
+              <button className="btn btn-secondary" onClick={() => { setShowEditUserModal(false); handleSendAccessEmail(editingUsername); }} disabled={!canManageUsers || accessEmailBusy}>Send Access Email</button>
               <button className="btn btn-danger" onClick={() => setShowEditUserModal(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showAccessEmailModal ? (
+        <div className="modal-backdrop">
+          <div className="modal-card" style={{ maxWidth: 540 }}>
+            <h3>Access Email — {accessEmailUsername}</h3>
+            {accessEmailBusy ? (
+              <p className="hint">Sending...</p>
+            ) : accessEmailResult ? (
+              <>
+                {accessEmailResult.sent ? (
+                  <div className="info-note" style={{ marginBottom: 8 }}>
+                    Sent to {accessEmailResult.to || accessEmailUsername}
+                  </div>
+                ) : (
+                  <div className={accessEmailResult.error ? "error" : "info-note"} style={{ marginBottom: 8 }}>
+                    {accessEmailResult.error
+                      ? `Not sent: ${accessEmailResult.error}`
+                      : "Email not sent (SMTP not configured). Copy the invitation text below."}
+                  </div>
+                )}
+                {(accessEmailResult.warnings || []).length > 0 ? (
+                  <ul style={{ margin: "0 0 8px", paddingLeft: 18, color: "var(--warning, #f90)" }}>
+                    {accessEmailResult.warnings.map((w, i) => <li key={i}>{w}</li>)}
+                  </ul>
+                ) : null}
+                {accessEmailResult.text ? (
+                  <>
+                    <label style={{ display: "block", marginBottom: 4, fontWeight: 600 }}>Invitation text</label>
+                    <textarea
+                      readOnly
+                      rows={10}
+                      style={{ width: "100%", resize: "vertical", fontFamily: "monospace", fontSize: "0.82em", boxSizing: "border-box" }}
+                      value={accessEmailResult.text}
+                    />
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      style={{ marginTop: 6 }}
+                      onClick={() => {
+                        try { navigator.clipboard.writeText(accessEmailResult.text); } catch { /* ignore */ }
+                      }}
+                    >
+                      Copy text
+                    </button>
+                  </>
+                ) : null}
+              </>
+            ) : null}
+            <div className="row modal-actions" style={{ marginTop: 12 }}>
+              <button className="btn btn-primary" onClick={() => setShowAccessEmailModal(false)}>Close</button>
             </div>
           </div>
         </div>

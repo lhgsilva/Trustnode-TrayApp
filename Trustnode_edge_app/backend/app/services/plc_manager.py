@@ -2482,7 +2482,23 @@ class GatewayWorker:
                     # Schema is bootstrapped on first contact and the
                     # writer uses the same row shape as the primary
                     # historian sink. legacy_http is still unsupported.
-                    self._persist_postgres_parallel(sink, sink_label, readings)
+                    #
+                    # 2026-08-22: bounded. This runs on the shared v2
+                    # distribution thread; an unbounded WAN write here stops
+                    # distribution for EVERY gateway (observed: 300 s blocked
+                    # in stage 'sinks', worker replaced by the supervisor).
+                    _deadline = self._sink_write_deadline_s()
+                    if not self._run_sink_with_deadline(
+                        lambda: self._persist_postgres_parallel(sink, sink_label, readings),
+                        _deadline, sink_label,
+                    ):
+                        self._mark_db_write_error(
+                            f"Parallel sink '{sink_label}' exceeded the "
+                            f"{_deadline:.0f}s write deadline — rows stay buffered in "
+                            f"the outbox and the sink is skipped while it recovers"
+                        )
+                        self._sink_breaker_record_failure(sink_id, sink_label)
+                        continue
                 elif sink_engine == "legacy_http":
                     self._mark_db_write_error(
                         f"Parallel sink '{sink_label}' (engine legacy_http) "
@@ -3046,6 +3062,41 @@ class GatewayWorker:
                 {"su": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
             )
         return len(ids)
+
+    def _sink_write_deadline_s(self) -> float:
+        try:
+            return max(2.0, float(os.environ.get("TRUSTNODE_SINK_WRITE_DEADLINE_S", "20") or 20))
+        except Exception:
+            return 20.0
+
+    def _run_sink_with_deadline(self, fn, deadline_s: float, label: str) -> bool:
+        """Run a network sink write with a HARD ceiling.
+
+        Returns True if it finished inside the deadline (exceptions propagate to
+        the caller's handler), False if it did not. On False the call is
+        abandoned on its own daemon thread — it cannot be interrupted, but it can
+        no longer hold the distribution pipeline. Rows are already in the per-sink
+        outbox, so nothing is lost: the flush worker re-sends them.
+        """
+        done = threading.Event()
+        box: Dict[str, BaseException] = {}
+
+        def _runner() -> None:
+            try:
+                fn()
+            except BaseException as exc:      # noqa: BLE001 - re-raised below
+                box["exc"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=_runner, daemon=True,
+                         name=f"tn-sink-{str(label)[:24]}").start()
+        if not done.wait(max(2.0, float(deadline_s))):
+            return False
+        exc = box.get("exc")
+        if exc is not None:
+            raise exc
+        return True
 
     def _persist_postgres_parallel(
         self,

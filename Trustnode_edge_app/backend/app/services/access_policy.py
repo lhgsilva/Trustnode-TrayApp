@@ -324,6 +324,41 @@ def evaluate(request: Any, payload: Dict[str, Any]) -> Tuple[bool, str, str]:
 # --------------------------------------------------------------------------
 # static-surface guard (/trustnode/{full|client|lite}/app/)
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Licence seats (2026-08-22)
+# --------------------------------------------------------------------------
+# Which seat product entitles a person to each browser surface. Cloud View is
+# absent on purpose: it is served by the hosted Lite app, not by this edge.
+SURFACE_SEAT = {"full": "studio", "client": "view_lan", "lite": "view_lan"}
+
+
+def user_seats(payload: Dict[str, Any]) -> list:
+    """Seats carried by a verified session.
+
+    Token claim first, then the stored user record - the same precedence the
+    access_* flags already use, so a freshly issued token wins and an older one
+    still resolves correctly."""
+    perms = payload.get("permissions") if isinstance(payload.get("permissions"), dict) else None
+    if isinstance(perms, dict) and isinstance(perms.get("seats"), list):
+        return [str(x).strip().lower() for x in perms.get("seats") or [] if str(x).strip()]
+    try:
+        from app.state import auth_store as _as
+        rec = _as.get_user(str(payload.get("sub") or "")) or {}
+        seats = rec.get("seats")
+        if isinstance(seats, list) and seats:
+            return [str(x).strip().lower() for x in seats if str(x).strip()]
+        rec_perms = rec.get("permissions") if isinstance(rec.get("permissions"), dict) else {}
+        if isinstance(rec_perms.get("seats"), list):
+            return [str(x).strip().lower() for x in rec_perms.get("seats") or [] if str(x).strip()]
+    except Exception:
+        pass
+    return []
+
+
+def seat_required_for_surface(surface: str) -> str:
+    return SURFACE_SEAT.get(str(surface or "").strip().lower(), "")
+
+
 SURFACE_RE = re.compile(r"^/trustnode/(full|client|lite)/app/")
 SURFACE_FLAG = {"full": "access_full", "client": "access_client", "lite": "access_lite"}
 SURFACE_MODULE = {"full": "remote_admin_lan", "client": "local_web_app", "lite": "local_web_app"}
@@ -362,6 +397,26 @@ def surface_access(surface: str, payload: Dict[str, Any], remote: bool) -> Tuple
     # full runtime from the LAN: admin or engineer only (owner decision 2026-08-21)
     if surface == "full" and remote and role not in CONFIG_ROLES:
         return False, "role"
+    # Named licence seats (2026-08-22). Only enforced for REMOTE clients and
+    # only when the portal issued a licence that actually carries seat counts —
+    # a licence predating seats keeps the previous behaviour untouched, and the
+    # desktop (loopback) is never gated on a seat.
+    if remote and lic_eff == "enforce":
+        try:
+            from app.services import license_inspect as _li
+            from app.services import seats as _seats
+            need = seat_required_for_surface(surface)
+            if need and _li.seats_are_explicit():
+                held = user_seats(payload)
+                if need not in held:
+                    return False, f"seat:{need}"
+                if surface in ("client", "lite"):
+                    # A View LAN seat is served ONE ui; the other is not theirs.
+                    want = "lite" if surface == "lite" else "app_readonly"
+                    if _seats.view_ui_of_user({"permissions": payload.get("permissions") or {}}) != want:
+                        return False, "seat:view_ui"
+        except Exception:
+            pass
     if role in ADMIN_ROLES:
         return True, "role"
     # per-user access flag: the token's permissions claim (issued at login from

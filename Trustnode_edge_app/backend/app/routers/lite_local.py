@@ -253,24 +253,32 @@ def post_check_access(payload: AccessCheckRequest, request: Request) -> dict:
         raise HTTPException(status_code=401, detail=f"invalid token: {exc}") from exc
     username = str(body.get("sub") or body.get("username") or "").strip()
     role = str(body.get("role") or "").strip().lower()
-    # Admin and super can access anything regardless of flag.
-    if role in ("admin", "super"):
-        return {"ok": True, "username": username, "variant": variant, "reason": "role"}
-    # Pull the latest permissions from app_store (not from the JWT — they
-    # may have been updated since the token was issued).
-    try:
-        bootstrap = app_store.get_bootstrap() or {}
-    except Exception:
-        bootstrap = {}
-    users_access = bootstrap.get("users_access") if isinstance(bootstrap.get("users_access"), dict) else {}
-    perms: Dict[str, Any] = {}
-    for u in (users_access.get("users") or []) if isinstance(users_access, dict) else []:
-        if str(u.get("username") or "") == username:
-            perms = u.get("permissions") or {}
-            break
-    if not bool(perms.get(flag)):
-        raise HTTPException(status_code=403, detail=f"user '{username}' lacks {flag}")
-    return {"ok": True, "username": username, "variant": variant, "reason": "permission"}
+    # 2026-08-22: delegate to access_policy.surface_access — the same decision
+    # the static surface guard makes when the bundle itself is fetched. Before
+    # this, the login gate read ONLY the users_access document, so it could wave
+    # a user through to a surface the guard then refused (or, with named licence
+    # seats, refuse one the guard would allow). One source of truth.
+    from app.services import access_policy as _access
+
+    remote = _access.request_is_remote(request)
+    allowed, reason = _access.surface_access(variant, body, remote)
+    # Which surfaces this session could open — lets the login page send someone
+    # straight to the one their seat entitles them to.
+    entitled = [
+        v for v in ("full", "client", "lite")
+        if _access.surface_access(v, body, remote)[0]
+    ]
+    if not allowed:
+        detail = f"user '{username}' has no access to {variant}"
+        if str(reason or "").startswith("seat:"):
+            detail = (f"user '{username}' does not hold a licence seat for this view"
+                      if reason != "seat:view_ui" else
+                      f"user '{username}' is licensed for the other view interface")
+        elif str(reason or "").startswith("licence:"):
+            detail = f"this licence does not include {variant} access"
+        raise HTTPException(status_code=403, detail=detail)
+    return {"ok": True, "username": username, "variant": variant,
+            "reason": reason or "permission", "entitled": entitled}
 
 
 class ValidateRequest(BaseModel):

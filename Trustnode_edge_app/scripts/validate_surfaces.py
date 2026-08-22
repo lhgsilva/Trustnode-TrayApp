@@ -11,6 +11,7 @@ and the access policy around them behave:
     * GET /api/lan-sharing/status 200 (admin) with the Remote Access fields
     * /api/lite-local/bootstrap + /reports 200 for an admin
     * the Backup & Retention page's API (status/options/policies/runs)
+    * the licence seat ledger and the seat-aware login gate
   remote (only when Remote Access is ON and a LAN IP is known; the checks
   run over HTTP, or over HTTPS when the site is HTTPS-only):
     * every enabled listener answers /api/health
@@ -148,6 +149,21 @@ def run(remote: bool = True) -> tuple[bool, list[str], dict]:
     chk("retention runs history (admin)", st == 200 and "runs" in (rr or {}), f"status={st}")
     st, bk, _ = _call("GET", f"{API}/api/app-store/backups/v2", token=admin)
     chk("backups list (admin)", st in (200, 404), f"status={st}")
+
+    # Named licence seats (2026-08-22). The ledger drives the Users and Access
+    # Control page; the login gate must agree with the static surface guard.
+    st, seats, _ = _call("GET", f"{API}/api/control-plane/license/seats", token=admin)
+    ok_seats = st == 200 and isinstance((seats or {}).get("seats"), list)
+    chk("seat ledger (admin)", ok_seats, f"status={st}")
+    if ok_seats:
+        products = {r.get("product") for r in seats["seats"]}
+        chk("ledger covers the four products",
+            products == {"edge_runtime", "studio", "view_lan", "cloud_view"}, sorted(products))
+        chk("ledger says whether seats are enforced",
+            "enforced" in seats and bool(seats.get("note")))
+    st, ca, _ = _call("POST", f"{API}/api/lite-local/check-access", token=admin, body={"variant": "client"})
+    chk("login gate agrees with the surface guard",
+        st == 200 and isinstance((ca or {}).get("entitled"), list), f"status={st}")
 
     if not remote or not isinstance(status, dict) or not status.get("running"):
         L.append("  (remote checks skipped: Remote Access is OFF)")

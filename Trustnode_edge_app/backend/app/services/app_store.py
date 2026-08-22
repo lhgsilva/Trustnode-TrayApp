@@ -6921,11 +6921,26 @@ class AppStore:
                 "tls": cloud.get("tls"),
             }
 
+        # Real disk figures for the Database Overview: the page used to derive
+        # "usage" from a hard-coded 300 MB baseline, so every install showed
+        # "High 100%" regardless of the actual free space (2026-08-22).
+        disk_total = disk_free = 0
+        try:
+            import shutil as _shutil
+            _usage = _shutil.disk_usage(os.path.dirname(self._db_path) or ".")
+            disk_total, disk_free = int(_usage.total), int(_usage.free)
+        except Exception:
+            pass
+
         return {
             "tenant_id": tenant_id,
             "db_path": self._db_path,
             "db_exists": db_exists,
             "db_size_bytes": int(db_size),
+            "disk_total_bytes": disk_total,
+            "disk_free_bytes": disk_free,
+            "disk_used_pct": (round((disk_total - disk_free) / disk_total * 100, 1)
+                              if disk_total else None),
             "table_count": len(tables),
             "tables": tables,
             "config_domains_preview": domains,

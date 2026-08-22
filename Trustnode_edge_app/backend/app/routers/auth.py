@@ -226,6 +226,21 @@ def login(payload: LoginRequest, request: Request, response: Response) -> Dict[s
 
     # 2. AuthStore — the dedicated, lock-free, offline-safe path. This is
     #    where 99% of customer logins resolve.
+    #
+    # 2026-08-22: a licensed seat is handed to a person by e-mail, so the
+    # address has to work as a login. resolve_login_identity() maps it to the
+    # internal username (username is tried first, so no existing account can be
+    # shadowed, and an ambiguous address never resolves). Everything downstream
+    # — the JWT `sub`, the audit trail, token revocation, view_sessions — keeps
+    # keying on the username exactly as before.
+    try:
+        from app.services import seats as _seats
+        resolved = _seats.resolve_login_identity(username)
+        if resolved and resolved != username:
+            logger.info("login: e-mail %s resolved to user %s", username, resolved)
+            username = resolved
+    except Exception:
+        pass
     hit: Dict[str, Any] | None = None
     try:
         u = auth_store.get_user(username)
