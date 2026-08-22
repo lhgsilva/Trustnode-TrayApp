@@ -3243,6 +3243,37 @@ body {
   white-space: nowrap;
 }
 
+/* The portal's licence-module list has the same shape as a permission row and
+   the same problem: the global `label { display: grid }` stacks the module name
+   under its checkbox. Pinned here so the licence editor reads like the Users
+   page — checkbox and text on one line (2026-08-22). */
+.modal-card .form-grid .remember-row,
+.modal-card .remember-row {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  min-height: 28px;
+  padding: 2px 0;
+  text-align: left;
+}
+.modal-card .remember-row > input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: auto;
+  height: auto;
+  margin: 0;
+}
+.modal-card .remember-row > .remember-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: none;
+}
+
 /* Unlicensed / admin-only dimming */
 .perm-unlicensed {
   opacity: 0.5;
@@ -3700,6 +3731,9 @@ input[type="checkbox"] {
 
 .trigger-modal-card {
   width: min(640px, 96vw);
+  /* Height is not capped here on purpose: .modal-card already caps every modal
+     at 92dvh and scrolls internally, which is what keeps the licence editor's
+     title on screen now that it carries Package + four seats + 34 modules. */
 }
 
 .tag-monitor-modal {

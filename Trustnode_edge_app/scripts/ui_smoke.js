@@ -12,6 +12,13 @@ const PAGES = [
   ["GATEWAY AND EDGE CONTROL", "gateway configuration"],
   ["DATA HISTORY", "historian"],
   ["CONNECTIONS", "remote access"],
+  // 2026-08-22: the pages this release actually rewrote. A page that is never
+  // opened is a page whose render errors ship.
+  ["SETTINGS", "users and access control"],
+  ["REPORTING", "reports"],
+  ["REPORTING", "scheduled reports"],
+  ["GATEWAY AND EDGE CONTROL", "tags"],
+  ["DATA HISTORY", "logs"],
 ];
 
 (async () => {

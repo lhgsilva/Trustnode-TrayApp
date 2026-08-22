@@ -1,7 +1,10 @@
 // Lite surface: do the new Tags / Batch / Assistant tabs actually render, and
 // are they ABSENT when the person is not entitled?
 // Runs against a THROWAWAY backend (API env), never the live install.
-const { chromium } = require("D:/Trustnode/Trustnode-AB/Tray_app/node_modules/playwright");
+// Playwright lives in the repo root's node_modules, not this folder; resolve it
+// from PLAYWRIGHT_MODULE when set so the harness is not tied to one machine.
+const { chromium } = require(process.env.PLAYWRIGHT_MODULE
+  || "D:/Trustnode/Trustnode-AB/Tray_app/node_modules/playwright");
 const API = process.env.API || "http://127.0.0.1:8049";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const fails = [];
