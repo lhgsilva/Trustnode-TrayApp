@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState, useRef } from "react";
 import {
   deleteGeneratedReport,
   deleteScheduledReport,
@@ -182,6 +182,15 @@ export function ScheduledReportsManager({
   const [anyGatewayRunning, setAnyGatewayRunning] = useState(true);
   const logoSrc = useMemo(resolveLogoSrc, []);
 
+  // Item 9 (2026-08-22): one dropped request used to raise a red banner and
+  // leave the page empty — which is what "reports not working in any version"
+  // looked like from a LAN client whose first poll landed mid-reconnect. A
+  // transient failure now retries quietly and only becomes visible after it
+  // stops being transient. Whatever loaded stays on screen throughout.
+  const [loadState, setLoadState] = useState({ failures: 0, message: "" });
+  const failuresRef = useRef(0);
+  const retryRef = useRef(null);
+
   const refresh = async () => {
     try {
       const [tplRes, schRes, genRes, statusRes] = await Promise.all([
@@ -196,15 +205,33 @@ export function ScheduledReportsManager({
       if (statusRes && typeof statusRes.any_gateway_running === "boolean") {
         setAnyGatewayRunning(statusRes.any_gateway_running);
       }
+      failuresRef.current = 0;
+      setLoadState((prev) => (prev.failures || prev.message ? { failures: 0, message: "" } : prev));
     } catch (e) {
-      onNotify({ type: "error", message: `Failed to load reports state: ${e?.message || e}` });
+      const n = failuresRef.current + 1;
+      failuresRef.current = n;
+      setLoadState({ failures: n, message: String(e?.message || e) });
+      // 2s, 4s, 8s … capped at 30s. The 15s poll below keeps running, so this
+      // only adds the fast early retries that ride out a brief hiccup.
+      if (n <= 5) {
+        const delay = Math.min(30000, 2000 * Math.pow(2, n - 1));
+        if (retryRef.current) clearTimeout(retryRef.current);
+        retryRef.current = setTimeout(() => { retryRef.current = null; refresh(); }, delay);
+      }
+      // Only shout once it is clearly not transient, and never more than once.
+      if (n === 4) {
+        onNotify({ type: "error", message: `Reports could not be loaded: ${e?.message || e}` });
+      }
     }
   };
 
   useEffect(() => {
     refresh();
     const timer = setInterval(refresh, 15000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      if (retryRef.current) clearTimeout(retryRef.current);
+    };
   }, []);
 
   const tagListForGateway = (gatewayId) => {
@@ -375,6 +402,13 @@ export function ScheduledReportsManager({
 
   return (
     <div className="scheduled-reports-page">
+      {loadState.failures > 0 ? (
+        <div className={`status ${loadState.failures >= 4 ? "error" : "warn"}`} style={{ marginBottom: 8 }}>
+          {loadState.failures >= 4
+            ? `Reports are not loading (${loadState.message}). Retrying every 15 seconds.`
+            : "Reconnecting to the reports service…"}
+        </div>
+      ) : null}
       {showSchedule && (
       <section className="tn-collapsible-card is-open scheduled-reports-card">
         <header className="tn-card-head">

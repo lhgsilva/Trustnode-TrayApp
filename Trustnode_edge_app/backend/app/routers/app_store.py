@@ -357,6 +357,7 @@ def save_bootstrap(payload: BootstrapSaveRequest, request: Request) -> dict:
     if isinstance(payload.data, dict):
         for _dom in payload.data.keys():
             _guard_admin_only_domain(request, str(_dom), payload.data.get(_dom))
+            _guard_shared_write_permission(request, str(_dom))
     # Split the bootstrap payload by scope: shared-edge domains go to the
     # per-edge scope key, personal domains to the per-user scope key. This
     # is what lets every operator on the same edge see the same gateways,
@@ -472,6 +473,65 @@ def _guard_admin_only_domain(request: Request, domain: str, payload: Any = None)
     )
 
 
+# Domain -> the permission a non-admin needs to CHANGE it. Reading is governed
+# separately (access_policy); this is only about writes to documents that every
+# user on the edge shares, where one person's edit rewrites everyone's view.
+_WRITE_PERMISSION_DOMAINS = {
+    "dashboard_configurations": "custom_dashboards",
+}
+
+
+def _guard_shared_write_permission(request: Request, domain: str) -> None:
+    """A shared document may only be rewritten by someone allowed to edit it.
+
+    2026-08-22 (item 10): dashboards live in _SHARED_EDGE_DOMAINS, so they are
+    one set per edge — which is what the operator wants, and also means any
+    signed-in user who could open the dashboard could rearrange the admin's.
+    Viewing follows `dashboard`; changing follows `custom_dashboards`.
+
+    A user document written before that permission existed has no opinion on it,
+    so the check falls back to `dashboard` and nobody silently loses editing —
+    exactly the rule the frontend's canEditPage uses.
+    """
+    from app.services import access_policy as _access
+
+    need = _WRITE_PERMISSION_DOMAINS.get(str(domain or "").strip().lower())
+    if not need:
+        return
+    claims = {}
+    try:
+        token = _access.token_from_request(request)
+        if token:
+            from app.auth import decode_access_token
+            claims = decode_access_token(token) or {}
+    except Exception:
+        claims = {}
+    role = str(claims.get("role") or "").strip().lower()
+    if role in _access.ADMIN_ROLES:
+        return
+    # No verified session: the tray writes on loopback during restore/first run.
+    if not claims and not _access.request_is_remote(request):
+        return
+    perms = claims.get("permissions") if isinstance(claims.get("permissions"), dict) else {}
+    if need in perms:
+        allowed = bool(perms.get(need))
+    else:
+        try:
+            from app.services import permission_catalog as _pc
+            allowed = _pc.resolve(perms, "dashboard")
+        except Exception:
+            allowed = bool(perms.get("dashboard"))
+    if allowed:
+        return
+    _access.audit("config.shared_write", outcome="denied", request=request,
+                  payload=claims, details={"domain": domain, "needs": need})
+    raise _HTTPException_rs(
+        status_code=403,
+        detail=("You can view the dashboards on this edge but not change them. "
+                "An administrator grants 'Edit dashboards'."),
+    )
+
+
 def _guard_not_blanking(scope_key: str, domain: str, payload: Any, actor: str, allow_empty: bool) -> None:
     """Refuse to replace a non-empty saved collection with an empty one.
 
@@ -513,6 +573,7 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     # Personal domains (app_settings: theme, last-selected profile) keep the
     # per-user scope. See _SHARED_EDGE_DOMAINS for the authoritative list.
     _guard_admin_only_domain(request, str(payload.domain or "").strip(), payload.payload)
+    _guard_shared_write_permission(request, str(payload.domain or "").strip())
     scope_key = _build_scope_key(request, domain=payload.domain)
     _guard_not_blanking(scope_key, str(payload.domain or "").strip(), payload.payload,
                         str(payload.actor or ""), bool(payload.allow_empty))

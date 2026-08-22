@@ -197,7 +197,46 @@ ai_token = (b_l or {}).get("token") if isinstance(b_l, dict) else None
 st_p, r_p = call("GET", "/api/intelligence/status", ai_token) if ai_token else (0, "no token")
 check("Intelligence opens for a viewer who HAS the permission", st_p == 200, f"status={st_p}")
 
-for name in ("eng-test", "view-test"):
+# --- item 10: a shared dashboard may be SEEN by all, CHANGED by few ---------
+# Dashboards are one set per edge, so "can open the dashboard" and "can
+# rearrange everyone's dashboard" must not be the same permission.
+DASH = {"profiles": [{"id": "p1", "name": "Line 1", "widgets": [{"id": "w1", "type": "value"}]}]}
+
+
+def _dash_user(name, perms):
+    call("DELETE", f"/api/control-plane/users/{name}", admin)
+    call("POST", "/api/control-plane/users", admin,
+         {"username": name, "password": "PhaseA-2026-xx", "role": "engineer",
+          "status": "active", "permissions": perms, "modules": []})
+    _st, _b = call("POST", "/api/auth/login", body={"username": name, "password": "PhaseA-2026-xx"})
+    return (_b or {}).get("token") if isinstance(_b, dict) else None
+
+
+tok = _dash_user("dash-no", {"dashboard": True, "custom_dashboards": False})
+st, r = call("PUT", "/api/app-store/domain", tok,
+             {"domain": "dashboard_configurations", "payload": DASH, "actor": "dash-no"})
+check("item10 dashboard EDIT denied without the permission", st == 403, f"status={st}")
+
+tok = _dash_user("dash-yes", {"dashboard": True, "custom_dashboards": True})
+st, r = call("PUT", "/api/app-store/domain", tok,
+             {"domain": "dashboard_configurations", "payload": DASH, "actor": "dash-yes"})
+check("item10 dashboard EDIT allowed with the permission", st == 200, f"status={st} {str(r)[:80]}")
+
+# a user document that predates the permission must not lose editing
+tok = _dash_user("dash-legacy", {"dashboard": True})
+st, r = call("PUT", "/api/app-store/domain", tok,
+             {"domain": "dashboard_configurations", "payload": DASH, "actor": "dash-legacy"})
+check("item10 a pre-permission user keeps editing", st == 200, f"status={st} {str(r)[:80]}")
+
+# and everyone can still READ the shared set
+for who, tk in (("engineer", eng), ("viewer", viewer)):
+    st, r = call("GET", "/api/app-store/bootstrap", tk)
+    # the bootstrap response nests every domain under `data`
+    _dom = (((r or {}).get("data") or {}).get("dashboard_configurations") or {}) if isinstance(r, dict) else {}
+    got = len(_dom.get("profiles") or []) if isinstance(_dom, dict) else -1
+    check(f"item10 {who} still SEES the shared dashboard", st == 200 and got >= 1, f"status={st} profiles={got}")
+
+for name in ("dash-no", "dash-yes", "dash-legacy", "eng-test", "view-test"):
     call("DELETE", f"/api/control-plane/users/{name}", admin)
 proc.terminate()
 try:

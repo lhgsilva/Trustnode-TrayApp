@@ -10925,6 +10925,18 @@ function AppShell() {
     if (mapped === "historian") {
       return Boolean(currentUser.permissions?.historian ?? currentUser.permissions?.data_log);
     }
+    // Item 10 (2026-08-22): dashboards are shared across everyone on this edge,
+    // so SEEING one and CHANGING one cannot be the same permission — otherwise
+    // anybody who may open the dashboard can rearrange the admin's. Editing
+    // follows `custom_dashboards`; viewing keeps following `dashboard`.
+    // The key being ABSENT (a user document written before this permission
+    // existed) falls back to `dashboard`, so nobody silently loses editing —
+    // an admin takes it away by unticking it, deliberately.
+    if (mapped === "dashboard") {
+      const perms = currentUser.permissions || {};
+      if (perms.custom_dashboards === undefined) return Boolean(perms.dashboard);
+      return Boolean(perms.custom_dashboards);
+    }
     return Boolean(currentUser.permissions?.[mapped]);
   }, [isReadonlyCloudMode, currentUser]);
 
