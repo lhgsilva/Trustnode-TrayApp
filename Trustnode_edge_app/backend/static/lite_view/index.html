@@ -271,6 +271,20 @@ function readTheme() {
   return "light";
 }
 
+// Auth-aware fetch for direct REST calls (batch, intelligence) that bypass
+// the supabase shim. Adds the JWT Bearer token when available, or the
+// view-link token as a query param. POST body must be pre-serialised JSON.
+function _apiFetch(path, opts = {}) {
+  let jwt = "";
+  try { jwt = localStorage.getItem("trustnode_auth_token") || ""; } catch (_) {}
+  const tok = _readViewTokenFromUrlOrSession();
+  const hdrs = { "Content-Type": "application/json", ...(opts.headers || {}) };
+  if (jwt) hdrs["Authorization"] = `Bearer ${jwt}`;
+  let url = path;
+  if (!jwt && tok) url += (url.includes("?") ? "&" : "?") + `token=${encodeURIComponent(tok)}`;
+  return fetch(url, { ...opts, headers: hdrs });
+}
+
 // ============================================================
 // Inline SVG icons (header / nav / login)
 // ============================================================
@@ -329,12 +343,25 @@ const icReport = () => SVG([h("path", { key: 1, d: "M14 2H6a2 2 0 0 0-2 2v16a2 2
                              h("polyline", { key: 2, points: "14 2 14 8 20 8" }),
                              h("line", { key: 3, x1: 16, y1: 13, x2: 8, y2: 13 }),
                              h("line", { key: 4, x1: 16, y1: 17, x2: 8, y2: 17 })], 14);
+// Tags tab icon (label / tag shape)
+const icTags = () => SVG([h("path", { key: 1, d: "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" }),
+                           h("line", { key: 2, x1: 7, y1: 7, x2: 7.01, y2: 7 })], 14);
+// Batch tab icon (layers / stack)
+const icBatch = () => SVG([h("polygon", { key: 1, points: "12 2 2 7 12 12 22 7 12 2" }),
+                            h("polyline", { key: 2, points: "2 17 12 22 22 17" }),
+                            h("polyline", { key: 3, points: "2 12 12 17 22 12" })], 14);
+// Assistant tab icon (message bubble)
+const icAssist = () => SVG([h("path", { key: 1, d: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" })], 14);
 
 // ============================================================
 // Data hooks
 // ============================================================
 function useLiveLatest(enabled = true) {
   const [rows, setRows] = useState([]);
+  // 2026-08-22: "not fetched yet" and "fetched, and there genuinely are none"
+  // look identical from `rows` alone, so a site with nothing collecting sat on a
+  // spinner for ever. This flips true once the first fetch resolves either way.
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState("");
   const [rtt, setRtt] = useState(null);
   const [transport, setTransport] = useState("polling");
@@ -374,7 +401,7 @@ function useLiveLatest(enabled = true) {
         .order("ts_utc", { ascending: false })
         .limit(LIVE_SEED_LIMIT);
       if (stopped) return;
-      if (e) { setError(e.message); return; }
+      if (e) { setError(e.message); setLoaded(true); return; }
       // Strict tenant gate on every row regardless of who the viewer is.
       // For a regular signed-in user effectiveTenantId is their own
       // tenant; for master with the picker it's the picked tenant; for a
@@ -394,6 +421,7 @@ function useLiveLatest(enabled = true) {
       });
       setRows(filtered);
       setError("");
+      setLoaded(true);
       setRtt(Math.round(performance.now() - t0));
     };
 
@@ -488,7 +516,7 @@ function useLiveLatest(enabled = true) {
     };
   }, [enabled, pickedTenantId, effectiveTenantId, pickedEdgeId]);
 
-  return { rows, error, rtt, transport };
+  return { rows, error, rtt, transport, loaded };
 }
 
 function useDashboardProfiles(enabled = true) {
@@ -2363,7 +2391,7 @@ function Header({ user, tenantLabel, theme, onToggleTheme, onSignOut, liveRows, 
       }, icMenu()),
       h("div", { className: "brand" },
         h("img", {
-          src: "/lite/trustnode_logo.png",
+          src: "./trustnode_logo.png",   // relative: Lite is mounted at /lite/ in the cloud and /trustnode/lite/app/ on the edge
           alt: "TrustNode",
           className: "brand-full-logo",
           onError: (e) => { e.target.style.display = "none"; },
@@ -2440,14 +2468,456 @@ const NAV_ITEMS = (cfgIn) => {
   if (cfgIn?.show_reporting_tab !== false) items.push(["reporting", icReport, "Reporting"]);
   if (cfgIn?.show_alarms_tab !== false) items.push(["alarms", icBell, "Alarms"]);
   // 2026-08-22: every flag above now comes from /api/lite-local/capabilities —
-  // the licence module AND the signed-in person's permission — instead of the
-  // static config booleans Lite used to ship with.
-  // NOTE: Tags, Batch and the assistant are deliberately NOT listed here. Lite
-  // has no view for them, and a menu entry that leads nowhere is worse than an
-  // absent one; the capability flags are already delivered (cfg.show_tags_tab,
-  // cfg.show_batch_tab, cfg.show_intelligence) for when those views are built.
+  // the licence module AND the signed-in person's permission.
+  // The three flags below are strictly positive-gated (undefined = hidden) so
+  // they only appear when the capability endpoint explicitly sets them true.
+  if (cfgIn?.show_tags_tab)       items.push(["tags",        icTags,   "Tags"]);
+  if (cfgIn?.show_batch_tab)      items.push(["batch",       icBatch,  "Batch"]);
+  if (cfgIn?.show_intelligence)   items.push(["assistant",   icAssist, "Assistant"]);
   return items;
 };
+
+// ============================================================
+// Tags view — read-only table of configured tags with live values
+// ============================================================
+function TagsView({ liveRows, liveLoaded }) {
+  const [filter, setFilter] = useState("");
+
+  const sorted = useMemo(() => {
+    const needle = filter.trim().toLowerCase();
+    const base = needle
+      ? liveRows.filter((r) => {
+          const tag = String(r.tag_name || "").toLowerCase();
+          const gw  = String(r.gateway_name || r.gateway_id || "").toLowerCase();
+          const dev = String(r.device_name || "").toLowerCase();
+          return tag.includes(needle) || gw.includes(needle) || dev.includes(needle);
+        })
+      : liveRows;
+    return base
+      .filter((r) => r && r.tag_name && !SKIPPED_TYPES.has(String(r.tag_name || "").split(".")[0]))
+      .slice()
+      .sort((a, b) => String(a.tag_name || "").localeCompare(String(b.tag_name || "")));
+  }, [liveRows, filter]);
+
+  return h("div", null,
+    h("div", { className: "section" }, h("h2", null, "Tags")),
+    h("div", { className: "hist-filters" },
+      h("input", {
+        className: "hist-filter-input", type: "text",
+        placeholder: "Filter by tag, gateway or device…",
+        value: filter,
+        onChange: (e) => setFilter(e.target.value),
+      }),
+      filter ? h("button", {
+        className: "btn-ghost hist-filter-clear",
+        onClick: () => setFilter(""),
+      }, "Clear") : null,
+    ),
+    !liveRows.length
+      ? (liveLoaded
+          ? h("div", { className: "empty" }, "No tags are being collected on this edge yet.")
+          : h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…"))
+      : !sorted.length
+        ? h("div", { className: "empty" }, "no tags match the filter")
+        : h("div", { className: "hist-table-wrap" },
+            h("table", { className: "hist-table" },
+              h("thead", null,
+                h("tr", null,
+                  h("th", null, "Tag"),
+                  h("th", null, "Gateway / Device"),
+                  h("th", null, "Value"),
+                  h("th", null, "Quality"),
+                  h("th", null, "Last Update"),
+                )
+              ),
+              h("tbody", null,
+                ...sorted.map((r, i) =>
+                  h("tr", { key: i },
+                    h("td", { "data-label": "Tag" }, r.tag_name || "—"),
+                    h("td", { "data-label": "Gateway / Device" },
+                      [r.gateway_name || r.gateway_id, r.device_name]
+                        .filter(Boolean).join(" / ") || "—"),
+                    h("td", { "data-label": "Value", className: "num" }, fmtVal(r.value)),
+                    h("td", { "data-label": "Quality" },
+                      r.quality_label || (r.quality != null ? String(r.quality) : "")),
+                    h("td", {
+                      "data-label": "Last Update",
+                      title: fmtTs(r.ts_utc),
+                      style: { color: freshnessClass(r.ts_utc) === "fresh" ? "var(--status-online, #22c55e)"
+                                     : freshnessClass(r.ts_utc) === "stale" ? "var(--status-warn, #f59e0b)"
+                                     : "var(--status-offline, #ef4444)" },
+                    }, fmtAge(r.ts_utc)),
+                  )
+                )
+              )
+            )
+          )
+  );
+}
+
+// ============================================================
+// Batch view — read-only list of recent batches with detail panel
+// ============================================================
+function BatchView() {
+  const [batches, setBatches]           = useState(null);   // null = loading
+  const [error, setError]               = useState("");
+  const [hidden, setHidden]             = useState(false);   // true = 403/404
+  const [filter, setFilter]             = useState("");
+  const [selectedId, setSelectedId]     = useState(null);
+  const [detail, setDetail]             = useState(null);    // {row, kpis}
+  const [detailBusy, setDetailBusy]     = useState(false);
+
+  // List poller (15 s refresh)
+  useEffect(() => {
+    let stopped = false;
+    const load = async () => {
+      try {
+        const r = await _apiFetch("/api/batch-management/v2/batches?limit=100");
+        if (r.status === 403 || r.status === 404) { if (!stopped) setHidden(true); return; }
+        if (!r.ok) { if (!stopped) setError(`${r.status} ${r.statusText}`); return; }
+        const j = await r.json();
+        if (!stopped) { setBatches(Array.isArray(j.rows) ? j.rows : []); setError(""); }
+      } catch (e) {
+        if (!stopped) setError(String(e?.message || e));
+      }
+    };
+    load();
+    const t = setInterval(load, 15000);
+    return () => { stopped = true; clearInterval(t); };
+  }, []);
+
+  // Detail loader when a row is selected
+  useEffect(() => {
+    if (!selectedId) { setDetail(null); return; }
+    let stopped = false;
+    setDetailBusy(true);
+    (async () => {
+      try {
+        const r = await _apiFetch(`/api/batch-management/v2/batches/${selectedId}`);
+        if (!r.ok) { if (!stopped) { setDetail(null); setDetailBusy(false); } return; }
+        const j = await r.json();
+        let kpis = [];
+        try {
+          const kr = await _apiFetch(`/api/batch-management/v2/batches/${selectedId}/kpis`);
+          if (kr.ok) { const kj = await kr.json(); kpis = Array.isArray(kj.kpis) ? kj.kpis : []; }
+        } catch (_) {}
+        if (!stopped) { setDetail({ row: j.row || {}, kpis }); setDetailBusy(false); }
+      } catch (_) {
+        if (!stopped) setDetailBusy(false);
+      }
+    })();
+    return () => { stopped = true; };
+  }, [selectedId]);
+
+  if (hidden) return null;
+
+  const statusPill = (s) => {
+    const k = String(s || "").toLowerCase();
+    const cls = k === "running" ? "status-online"
+              : k === "completed" ? ""
+              : k === "aborted"   ? "status-offline"
+              : k === "held"      ? "status-warning"
+              : "status-muted";
+    return h("span", { className: `status-pill ${cls}` },
+      h("span", { className: "pill-dot" }),
+      h("span", null, (s || "—").toUpperCase()));
+  };
+
+  const needle = filter.trim().toLowerCase();
+  const visible = (batches || []).filter((b) => {
+    if (!needle) return true;
+    return [b.reference, b.name, b.status, b.definition_name]
+      .some((v) => String(v || "").toLowerCase().includes(needle));
+  });
+
+  return h("div", null,
+    h("div", { className: "section" }, h("h2", null, "Batch")),
+    error ? h("div", { className: "banner" }, error) : null,
+    h("div", { className: "hist-filters" },
+      h("input", {
+        className: "hist-filter-input", type: "text",
+        placeholder: "Filter by reference, name or status…",
+        value: filter,
+        onChange: (e) => setFilter(e.target.value),
+      }),
+      filter ? h("button", {
+        className: "btn-ghost hist-filter-clear",
+        onClick: () => setFilter(""),
+      }, "Clear") : null,
+    ),
+    batches === null
+      ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading…")
+      : !visible.length
+        ? h("div", { className: "empty" }, needle ? "no batches match the filter" : "no batches found")
+        : h("div", { className: "hist-table-wrap" },
+            h("table", { className: "hist-table" },
+              h("thead", null,
+                h("tr", null,
+                  h("th", null, "Reference"),
+                  h("th", null, "Status"),
+                  h("th", null, "Started"),
+                  h("th", null, "Ended"),
+                  h("th", null, "Definition"),
+                )
+              ),
+              h("tbody", null,
+                ...visible.map((b) =>
+                  h("tr", {
+                    key: b.id,
+                    style: {
+                      cursor: "pointer",
+                      background: selectedId === b.id
+                        ? "var(--nav-active-bg, rgba(99,102,241,.12))" : "",
+                    },
+                    onClick: () => setSelectedId(selectedId === b.id ? null : b.id),
+                  },
+                    h("td", { "data-label": "Reference" }, b.reference || b.id || "—"),
+                    h("td", { "data-label": "Status" }, statusPill(b.status)),
+                    h("td", { "data-label": "Started" }, fmtTs(b.started_at)),
+                    h("td", { "data-label": "Ended" }, fmtTs(b.ended_at)),
+                    h("td", { "data-label": "Definition" }, b.definition_name || "—"),
+                  )
+                )
+              )
+            )
+        ),
+    selectedId
+      ? h("div", { className: "card", style: { margin: "12px 0" } },
+          detailBusy
+            ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " loading detail…")
+            : detail
+              ? h("div", null,
+                  h("div", { style: { fontWeight: 600, marginBottom: 8 } },
+                    detail.row.reference || detail.row.id || "Batch detail"),
+                  h("div", { style: { display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 8 } },
+                    h("span", null, h("strong", null, "Status: "), statusPill(detail.row.status)),
+                    detail.row.started_at
+                      ? h("span", null, h("strong", null, "Started: "), fmtTs(detail.row.started_at)) : null,
+                    detail.row.ended_at
+                      ? h("span", null, h("strong", null, "Ended: "), fmtTs(detail.row.ended_at)) : null,
+                    detail.row.equipment_id
+                      ? h("span", null, h("strong", null, "Equipment: "), detail.row.equipment_id) : null,
+                  ),
+                  detail.kpis && detail.kpis.length
+                    ? h("div", null,
+                        h("div", { style: { fontWeight: 600, marginBottom: 4, marginTop: 8 } }, "Key Values"),
+                        h("div", { className: "hist-table-wrap" },
+                          h("table", { className: "hist-table" },
+                            h("thead", null,
+                              h("tr", null,
+                                h("th", null, "Tag"),
+                                h("th", null, "Value"),
+                                h("th", null, "Unit"),
+                                h("th", null, "Status"),
+                              )
+                            ),
+                            h("tbody", null,
+                              ...detail.kpis.map((k, i) =>
+                                h("tr", { key: i },
+                                  h("td", null, k.display_name || k.tag_name || "—"),
+                                  h("td", { className: "num" }, fmtVal(k.value ?? k.mean ?? null)),
+                                  h("td", null, k.engineering_unit || ""),
+                                  h("td", null, k.quality_status || ""),
+                                )
+                              )
+                            )
+                          )
+                        )
+                      )
+                    : h("div", { className: "empty", style: { fontSize: "0.85em" } },
+                        "no key values computed yet")
+                )
+              : null
+        )
+      : null
+  );
+}
+
+// ============================================================
+// Assistant view — minimal read-first AI chat panel
+// ============================================================
+function AssistantView() {
+  const [hidden, setHidden]     = useState(false);
+  const [chatId, setChatId]     = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [input, setInput]       = useState("");
+  const [busy, setBusy]         = useState(false);
+  const [error, setError]       = useState("");
+  const [initDone, setInitDone] = useState(false);
+  const scrollRef               = useRef(null);
+
+  // On mount: GET the existing chat list; load the most recent one.
+  // No POSTs on mount — a new-chat button lets the user initiate.
+  useEffect(() => {
+    let stopped = false;
+    (async () => {
+      try {
+        const r = await _apiFetch("/api/intelligence/chats");
+        if (r.status === 403 || r.status === 404) { if (!stopped) setHidden(true); return; }
+        if (!r.ok) { if (!stopped) setError(`${r.status} ${r.statusText}`); return; }
+        const j = await r.json();
+        const chats = Array.isArray(j.chats) ? j.chats : [];
+        if (chats.length) {
+          const latest = chats[0];
+          const cr = await _apiFetch(`/api/intelligence/chats/${latest.id}`);
+          if (!stopped && cr.ok) {
+            const cj = await cr.json();
+            setChatId(latest.id);
+            setMessages(Array.isArray(cj.chat?.messages) ? cj.chat.messages : []);
+          }
+        }
+        if (!stopped) setInitDone(true);
+      } catch (e) {
+        if (!stopped) setError(String(e?.message || e));
+      }
+    })();
+    return () => { stopped = true; };
+  }, []);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [messages, busy]);
+
+  // Create a new chat (user-initiated, single POST)
+  const newChat = async () => {
+    if (busy) return;
+    setBusy(true); setError("");
+    try {
+      const r = await _apiFetch("/api/intelligence/chats", {
+        method: "POST",
+        body: JSON.stringify({ title: "Lite chat", data_source: "local" }),
+      });
+      if (!r.ok) { const ej = await r.json().catch(() => ({})); setError(ej.detail || `${r.status}`); return; }
+      const j = await r.json();
+      setChatId(j.id);
+      setMessages([]);
+    } catch (e) { setError(String(e?.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  // Send a message (user-initiated POST)
+  const send = async () => {
+    const text = input.trim();
+    if (!text || busy || !chatId) return;
+    setInput(""); setBusy(true); setError("");
+    // Optimistic user bubble
+    setMessages((prev) => [...prev, { role: "user", content: text }]);
+    try {
+      const r = await _apiFetch(`/api/intelligence/chats/${chatId}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ chat_id: chatId, message: text, mode: "turbo" }),
+      });
+      if (!r.ok) {
+        const ej = await r.json().catch(() => ({}));
+        setError(ej.detail || `${r.status} ${r.statusText}`);
+      } else {
+        // Re-fetch all messages so the assistant reply appears
+        const cr = await _apiFetch(`/api/intelligence/chats/${chatId}`);
+        if (cr.ok) {
+          const cj = await cr.json();
+          setMessages(Array.isArray(cj.chat?.messages) ? cj.chat.messages : []);
+        }
+      }
+    } catch (e) { setError(String(e?.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  if (hidden) return null;
+
+  const bubbleStyle = (role) => ({
+    maxWidth: "80%",
+    padding: "8px 12px",
+    borderRadius: 8,
+    background: role === "user"
+      ? "var(--accent, #4f46e5)"
+      : "var(--card-bg, var(--bg2, #1e293b))",
+    color: role === "user" ? "#fff" : "inherit",
+    fontSize: "0.9em",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+  });
+
+  return h("div", {
+    style: {
+      display: "flex", flexDirection: "column",
+      height: "calc(100vh - 140px)", minHeight: 300,
+    }
+  },
+    h("div", { className: "section" },
+      h("h2", null, "Assistant"),
+      chatId
+        ? h("button", {
+            className: "btn-ghost",
+            style: { marginLeft: "auto", fontSize: "0.8em" },
+            disabled: busy,
+            onClick: newChat,
+          }, "+ New chat")
+        : null,
+    ),
+    error ? h("div", { className: "banner" }, error) : null,
+    !initDone
+      ? h("div", { className: "empty" }, h("div", { className: "spinner" }), " connecting…")
+      : !chatId
+        ? h("div", { className: "empty" },
+            h("div", null, "No previous chats."),
+            h("button", {
+              className: "seg-btn active",
+              style: { marginTop: 12 },
+              disabled: busy,
+              onClick: newChat,
+            }, busy ? "…" : "Start a conversation")
+          )
+        : h("div", { style: { display: "flex", flexDirection: "column", flex: 1, minHeight: 0 } },
+            h("div", {
+              ref: scrollRef,
+              style: {
+                flex: 1, overflowY: "auto", padding: "8px 0",
+                display: "flex", flexDirection: "column", gap: 8,
+              },
+            },
+              !messages.length
+                ? h("div", { className: "empty" }, "Send a message to get started.")
+                : messages.map((m, i) =>
+                    h("div", {
+                      key: i,
+                      style: {
+                        display: "flex",
+                        justifyContent: m.role === "user" ? "flex-end" : "flex-start",
+                      },
+                    },
+                      h("div", { style: bubbleStyle(m.role) }, m.content || "")
+                    )
+                  ),
+              busy
+                ? h("div", { style: { display: "flex", justifyContent: "flex-start" } },
+                    h("div", { style: bubbleStyle("assistant") },
+                      h("div", { className: "spinner", style: { display: "inline-block" } }),
+                      " thinking…"))
+                : null,
+            ),
+            h("div", { style: { display: "flex", gap: 8, padding: "8px 0", flexShrink: 0 } },
+              h("input", {
+                type: "text",
+                className: "hist-filter-input",
+                style: { flex: 1 },
+                placeholder: "Ask anything about your process…",
+                value: input,
+                disabled: busy,
+                onChange: (e) => setInput(e.target.value),
+                onKeyDown: (e) => {
+                  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+                },
+              }),
+              h("button", {
+                className: "seg-btn active",
+                style: { flexShrink: 0 },
+                disabled: busy || !input.trim(),
+                onClick: send,
+              }, busy ? "…" : "Send"),
+            )
+          )
+  );
+}
 
 function Sidebar({ tab, setTab, user, tenantLabel }) {
   const items = NAV_ITEMS(cfg);
@@ -4258,7 +4728,7 @@ function LoginCard({ theme, onToggleTheme, onSignedIn }) {
         onClick: onToggleTheme,
       }, theme === "dark" ? icSun() : icMoon()),
       h("div", { className: "auth-brand" },
-        h("img", { src: "/lite/trustnode_login_logo.png", alt: "TrustNode", className: "auth-logo",
+        h("img", { src: "./trustnode_login_logo.png", alt: "TrustNode", className: "auth-logo",
                     onError: (e) => { e.target.style.display = "none"; } })
       ),
       h("div", { className: "auth-subtitle" }, "Sign in to view your edge data"),
@@ -4543,7 +5013,7 @@ function App({ viewLink = null }) {
   // cheap no-op that returns empty state. In view-link mode we enable
   // them too — the anon RLS policies grant read access for tenants
   // that have an active cp_edge_view_links row.
-  const { rows: liveRows, transport } = useLiveLatest(!!session || isViewLinkMode);
+  const { rows: liveRows, transport, loaded: liveLoaded } = useLiveLatest(!!session || isViewLinkMode);
   // In view-link mode there's no Supabase Auth session, but the anon
   // RLS policy on dashboard_configurations grants read access for any
   // tenant that has an active cp_edge_view_links row — so the dashboard
@@ -4599,6 +5069,9 @@ function App({ viewLink = null }) {
   else if (tab === "alarms") content = h(AlarmsView, { liveRows });
   else if (tab === "power") content = h(PowerView, { liveRows });
   else if (tab === "reporting") content = h(ReportingView, null);
+  else if (tab === "tags") content = h(TagsView, { liveRows, liveLoaded });
+  else if (tab === "batch") content = h(BatchView, null);
+  else if (tab === "assistant") content = h(AssistantView, null);
   else content = h("div", { className: "empty" }, "Unknown tab");
 
   const user = session?.user?.email || "";

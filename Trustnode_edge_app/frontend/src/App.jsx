@@ -235,6 +235,59 @@ function getUiStorageScope() {
 // surfaces (LAN / cloud) we show this note instead of alert()/silent no-ops
 // (plan 2026-08-21 §3.5). Returns true when the bridge is missing AND we are
 // not on the desktop (the dev server keeps its legacy fallbacks).
+// --------------------------------------------------------------------------
+// Licence seats (portal editor, 2026-08-22)
+// --------------------------------------------------------------------------
+// The four products a customer buys. The portal issues them; the edge reads
+// them from license.seats (backend/app/services/license_inspect.py). 0 means
+// unlimited, and an ALL-ZERO block is sent as no block at all so a licence that
+// was never given seats keeps behaving exactly as it does today.
+const CP_SEAT_PRODUCTS = [
+  { key: "edge_runtime", field: "seat_edge_runtime", label: "TrustNode Edge", hint: "Gateway machines that may collect" },
+  { key: "studio", field: "seat_studio", label: "TrustNode Studio", hint: "Admins with the full app" },
+  { key: "view_lan", field: "seat_view_lan", label: "TrustNode View LAN", hint: "Read-only users on the local network" },
+  { key: "cloud_view", field: "seat_cloud_view", label: "TrustNode Cloud View", hint: "Read-only users over the internet" },
+];
+
+function cpSeatsFromRow(row) {
+  // The row carries seats_json (the stored column) or seats (an already-parsed
+  // bundle); accept either so the editor round-trips both shapes.
+  let parsed = {};
+  try {
+    const raw = row?.seats ?? row?.seats_json;
+    parsed = typeof raw === "string" ? (JSON.parse(raw || "{}") || {}) : (raw || {});
+  } catch {
+    parsed = {};
+  }
+  const out = {};
+  CP_SEAT_PRODUCTS.forEach((p) => {
+    out[p.field] = Math.max(0, Number(parsed?.[p.key] || 0));
+  });
+  return out;
+}
+
+function cpSeatSummary(row) {
+  // Compact "who may sign in" line for the licences table. Empty when the
+  // licence carries no seat block, so pre-seat licences read exactly as before.
+  const seats = cpSeatsFromRow(row);
+  const parts = CP_SEAT_PRODUCTS
+    .filter((p) => Number(seats[p.field] || 0) > 0)
+    .map((p) => `${p.label.replace("TrustNode ", "")} ${seats[p.field]}`);
+  return parts.join(" - ");
+}
+
+function cpSeatsPayload(form) {
+  const seats = {};
+  let any = false;
+  CP_SEAT_PRODUCTS.forEach((p) => {
+    const n = Math.max(0, Number(form?.[p.field] || 0));
+    seats[p.key] = n;
+    if (n > 0) any = true;
+  });
+  // null, not {} — an empty object would still read as "seats were issued".
+  return any ? seats : null;
+}
+
 const DESKTOP_ONLY_NOTE = "Available on the edge desktop app";
 function isDesktopBridgeMissing(bridge) {
   return !bridge && getRuntimeSurface() !== "desktop";
@@ -4532,6 +4585,11 @@ function AppShell() {
     end_utc: "",
     max_edges: 3,
     max_users: 10,
+    package_key: "",
+    seat_edge_runtime: 0,
+    seat_studio: 0,
+    seat_view_lan: 0,
+    seat_cloud_view: 0,
   });
   const [cpSelectedLicenseId, setCpSelectedLicenseId] = useState("");
   const [cpLicenseModulesText, setCpLicenseModulesText] = useState("");
@@ -18653,6 +18711,8 @@ const getGatewayHealth = (gateway) => {
         max_edges: Math.max(1, Number(cpLicenseForm.max_edges || 1)),
         max_users: Math.max(1, Number(cpLicenseForm.max_users || 1)),
         metadata: {},
+        package_key: String(cpLicenseForm.package_key || "").trim(),
+        seats: cpSeatsPayload(cpLicenseForm),
       };
       const scopedTenant = getControlPlaneTenantScope();
       await upsertControlPlaneLicense(payload, scopedTenant);
@@ -18788,6 +18848,14 @@ const getGatewayHealth = (gateway) => {
       end_utc: "",
       max_edges: 3,
       max_users: 10,
+      package_key: "",
+      // 0 = unlimited, matching the limits convention the edge already uses.
+      // All-zero means "no seat block issued", which keeps the edge on its
+      // pre-seat behaviour (license_inspect.seats_are_explicit()).
+      seat_edge_runtime: 0,
+      seat_studio: 0,
+      seat_view_lan: 0,
+      seat_cloud_view: 0,
     });
     setCpLicenseModalModules(cpModuleCatalog.map((m) => ({
       module_key: String(m?.module_key || m?.key || ""),
@@ -18808,6 +18876,8 @@ const getGatewayHealth = (gateway) => {
       end_utc: toDateInputValue(String(row?.end_utc || "")),
       max_edges: Math.max(1, Number(row?.max_edges || 1)),
       max_users: Math.max(1, Number(row?.max_users || 1)),
+      package_key: String(row?.package_key || ""),
+      ...cpSeatsFromRow(row),
     });
     setCpBusy(true);
     try {
@@ -18890,6 +18960,8 @@ const getGatewayHealth = (gateway) => {
         max_edges: Math.max(1, Number(cpLicenseForm.max_edges || 1)),
         max_users: Math.max(1, Number(cpLicenseForm.max_users || 1)),
         metadata: {},
+        package_key: String(cpLicenseForm.package_key || "").trim(),
+        seats: cpSeatsPayload(cpLicenseForm),
       };
       const scopedTenant = getControlPlaneTenantScope();
       const res = await upsertControlPlaneLicense(payload, scopedTenant);
@@ -25489,6 +25561,22 @@ const getGatewayHealth = (gateway) => {
                       </div>
                     ))}
                   </div>
+                  {/* 2026-08-22: the moment a licence carries seats, remote access
+                      needs a NAMED seat and the access_* flag alone stops being
+                      enough. Name the people this affects here rather than letting
+                      an admin find out from a support call. */}
+                  {Array.isArray(licenseSeats.stranded) && licenseSeats.stranded.length ? (
+                    <div className={`status ${licenseSeats.enforced ? "error" : "warn"}`} style={{ marginTop: 8 }}>
+                      <div>{licenseSeats.stranded_note}</div>
+                      <div style={{ marginTop: 4 }}>
+                        {licenseSeats.stranded.map((u) => (
+                          <span key={`stranded-${u.username}`} className="seat-badge seat-badge-danger" style={{ marginRight: 6 }}>
+                            {u.username} needs {(u.needs || []).join(", ")}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                 </section>
               ) : null}
 
@@ -26005,7 +26093,10 @@ const getGatewayHealth = (gateway) => {
                               <span>{String(row?.license_id || "-")}</span>
                               <span>{String(row?.customer_id || "-")}</span>
                               <span>{String(row?.plan_code || "-")}</span>
-                              <span>{`${Number(row?.max_edges || 0)} / ${Number(row?.max_users || 0)}`}</span>
+                              <span title={cpSeatSummary(row) || "No seat block issued"}>
+                                {`${Number(row?.max_edges || 0)} / ${Number(row?.max_users || 0)}`}
+                                {cpSeatSummary(row) ? <small className="hint" style={{ display: "block" }}>{cpSeatSummary(row)}</small> : null}
+                              </span>
                               <span>{`${fmtDateDdMmYyyy(row?.start_utc || "") || "-"} -> ${fmtDateDdMmYyyy(row?.end_utc || "") || "-"}`}</span>
                               <span>{String(row?.status || "-")}</span>
                               <span className="row-actions">
@@ -30152,6 +30243,33 @@ const getGatewayHealth = (gateway) => {
                 Max Users
                 <input type="number" min="1" value={cpLicenseForm.max_users} onChange={(e) => setCpLicenseForm((p) => ({ ...p, max_users: Number(e.target.value || 1) }))} />
               </label>
+              <label>
+                Package
+                <input value={cpLicenseForm.package_key} onChange={(e) => setCpLicenseForm((p) => ({ ...p, package_key: e.target.value }))} placeholder="edge / studio / enterprise" />
+                <small className="hint">Blank keeps the legacy permissive module reading.</small>
+              </label>
+            </div>
+            <div style={{ marginTop: 8 }}>
+              <div style={{ marginBottom: 6, fontWeight: 600 }}>Seats</div>
+              <div className="hint" style={{ marginBottom: 6 }}>
+                How many of each product this customer bought. 0 = unlimited. Leave every
+                seat at 0 to issue the licence without a seat block, which keeps the edge
+                on its previous behaviour.
+              </div>
+              <div className="trigger-form-grid">
+                {CP_SEAT_PRODUCTS.map((p) => (
+                  <label key={`cp-seat-${p.key}`}>
+                    {p.label}
+                    <input
+                      type="number"
+                      min="0"
+                      value={cpLicenseForm[p.field] ?? 0}
+                      onChange={(e) => setCpLicenseForm((prev) => ({ ...prev, [p.field]: Math.max(0, Number(e.target.value || 0)) }))}
+                    />
+                    <small className="hint">{p.hint}</small>
+                  </label>
+                ))}
+              </div>
             </div>
             <div style={{ marginTop: 8 }}>
               <div style={{ marginBottom: 6, fontWeight: 600 }}>Modules</div>

@@ -16,6 +16,44 @@ from app.tenant import normalize_tenant_id
 logger = logging.getLogger(__name__)
 
 
+SEAT_PRODUCT_KEYS = ("edge_runtime", "studio", "view_lan", "cloud_view")
+
+
+def _normalize_seats(seats: "dict[str, Any] | None") -> "dict[str, int]":
+    """Seat counts, clamped to the known products. 0 = unlimited, matching the
+    `limits` convention the edge already uses."""
+    out: "dict[str, int]" = {}
+    for product in SEAT_PRODUCT_KEYS:
+        try:
+            out[product] = max(0, int((seats or {}).get(product) or 0))
+        except Exception:
+            out[product] = 0
+    return out
+
+
+def _with_tier_fields(bundle: "dict[str, Any]", lic_row: "dict[str, Any]") -> "dict[str, Any]":
+    """Add package_key / seats / limits to a licence bundle when the row carries
+    them. Omitted entirely when they were never set, so an edge on a pre-seat
+    licence keeps its previous behaviour (license_inspect.seats_are_explicit()).
+    """
+    import json as _json
+
+    pkg = str(lic_row.get("package_key") or "").strip()
+    if pkg:
+        bundle["package_key"] = pkg
+    for field, key in (("seats_json", "seats"), ("limits_json", "limits")):
+        raw_value = lic_row.get(field)
+        if not raw_value:
+            continue
+        try:
+            parsed = _json.loads(raw_value) if isinstance(raw_value, (str, bytes)) else dict(raw_value)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and any(v for v in parsed.values()):
+            bundle[key] = parsed
+    return bundle
+
+
 class ControlPlaneStore:
     MODULE_CATALOG: list[dict[str, Any]] = [
         # --- Existing modules (kept defaults) -----------------------------
@@ -131,6 +169,12 @@ class ControlPlaneStore:
                 conn.execute("ALTER TABLE cp_licenses ADD COLUMN package_key TEXT")
             if "limits_json" not in lic_cols:
                 conn.execute("ALTER TABLE cp_licenses ADD COLUMN limits_json TEXT NOT NULL DEFAULT '{}'")
+            # 2026-08-22 (Phase G): named seats per product, issued by the portal.
+            # An empty value keeps the edge on its pre-seat behaviour, which is
+            # what every licence issued before today has -- see
+            # license_inspect.seats_are_explicit().
+            if "seats_json" not in lic_cols:
+                conn.execute("ALTER TABLE cp_licenses ADD COLUMN seats_json TEXT NOT NULL DEFAULT '{}'")
             conn.commit()
         except Exception:
             pass
@@ -1219,7 +1263,10 @@ class ControlPlaneStore:
                 row = conn.execute("SELECT * FROM cp_edges WHERE tenant_id=? AND edge_id=?", (tid, str(edge_id or ""))).fetchone()
         return dict(row) if row else {}
 
-    def upsert_license(self, *, tenant_id: str, license_id: str, customer_id: str = "", plan_code: str = "standard", status: str = "active", start_utc: str = "", end_utc: str = "", max_edges: int = 3, max_users: int = 10, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    def upsert_license(self, *, tenant_id: str, license_id: str, customer_id: str = "", plan_code: str = "standard", status: str = "active", start_utc: str = "", end_utc: str = "", max_edges: int = 3, max_users: int = 10, metadata: dict[str, Any] | None = None, package_key: str = "", seats: dict[str, Any] | None = None, limits: dict[str, Any] | None = None) -> dict[str, Any]:
+        # 2026-08-22 (Phase G): package_key/seats/limits are OPTIONAL and are
+        # only written when supplied, so a caller that does not manage the tier
+        # (the cloud mirror, older portal flows) never clears it.
         tid = normalize_tenant_id(tenant_id)
         lid = str(license_id or "").strip() or f"lic-{secrets.token_hex(4)}"
         now = self._utc_now()
@@ -1244,6 +1291,18 @@ class ControlPlaneStore:
                     """,
                     (lid, tid, str(customer_id or ""), str(plan_code or "standard"), str(status or "active"), str(start_utc or ""), str(end_utc or ""), int(max_edges or 0), int(max_users or 0), payload, now, now),
                 )
+                # 2026-08-22 (Phase G): the tier columns are written separately so
+                # a caller that does not manage them (older portal flows, the
+                # cloud mirror) leaves whatever is already stored untouched.
+                if package_key:
+                    conn.execute("UPDATE cp_licenses SET package_key=? WHERE license_id=?",
+                                 (str(package_key), lid))
+                if seats is not None:
+                    conn.execute("UPDATE cp_licenses SET seats_json=? WHERE license_id=?",
+                                 (json.dumps(_normalize_seats(seats), separators=(",", ":"), sort_keys=True), lid))
+                if limits is not None:
+                    conn.execute("UPDATE cp_licenses SET limits_json=? WHERE license_id=?",
+                                 (json.dumps(limits or {}, separators=(",", ":"), sort_keys=True), lid))
                 conn.commit()
                 row = conn.execute("SELECT * FROM cp_licenses WHERE license_id=?", (lid,)).fetchone()
         return dict(row) if row else {}
@@ -2103,7 +2162,7 @@ class ControlPlaneStore:
             "primary_domain": str((tenant or {}).get("primary_domain") or ""),
             "timezone": str((tenant or {}).get("timezone") or "UTC"),
             "cloud_api_url": str(cloud_url or "").strip().rstrip("/"),
-            "license": {
+            "license": _with_tier_fields({
                 "license_id": lic_id,
                 "plan_code": str(lic.get("plan_code") or ""),
                 "start_utc": str(lic.get("start_utc") or ""),
@@ -2112,7 +2171,7 @@ class ControlPlaneStore:
                 "max_users": int(lic.get("max_users") or 0),
                 "status": str(lic.get("status") or ""),
                 "modules": modules,
-            },
+            }, lic),
             "app_settings_patch": {
                 "tenant_login_realm": tenant_id,
                 "tenant_id": tenant_id,
@@ -2444,6 +2503,10 @@ class ControlPlaneStore:
                 lic = dict(lic)
                 lid = str(lic.get("license_id") or "").strip()
                 lic["modules"] = self.list_license_modules(license_id=lid) if lid else []
+                # 2026-08-22 (Phase G): the licence row stores the tier as JSON
+                # columns; the edge's license_inspect wants parsed dicts. Decorate
+                # here so BOTH the ok and the expired/inactive replies carry it.
+                lic = _with_tier_fields(lic, lic)
                 status = str(lic.get("status") or "").strip().lower()
                 if status != "active":
                     return {"ok": False, "reason": "license_inactive", "edge": edge_row, "license": lic, "resolved_tenant_id": tid}

@@ -56,8 +56,65 @@ from .license import (
 )
 
 
+def require_intelligence_permission(request: Request) -> None:
+    """Per-user gate for the assistant (2026-08-22).
+
+    Before this the module had NO per-user control at all, front or back: if the
+    licence carried `trustnode_intelligence`, every signed-in person could use
+    the assistant — including a read-only View seat. The licence still decides
+    whether the site has the feature; this decides who may use it.
+    """
+    try:
+        from app.services import access_policy as _access
+    except Exception:
+        return                              # never brick the module on an import error
+    try:
+        token = _access.token_from_request(request)
+        if not token:
+            # Loopback tray/desktop calls without a session keep working.
+            if not _access.request_is_remote(request):
+                return
+            raise HTTPException(status_code=401, detail="sign in to use TrustNode Intelligence")
+        from app.auth import decode_access_token
+        claims = decode_access_token(token) or {}
+    except HTTPException:
+        raise
+    except Exception:
+        return
+    role = str(claims.get("role") or "").strip().lower()
+    if role in ("admin", "super"):
+        return
+    perms = claims.get("permissions") if isinstance(claims.get("permissions"), dict) else None
+    if perms is None:
+        # A token issued before permissions travelled in the claim. Read the
+        # stored record rather than refusing someone who is in fact allowed.
+        try:
+            from app.state import auth_store as _as
+            rec = _as.get_user(str(claims.get("sub") or "")) or {}
+            perms = rec.get("permissions") if isinstance(rec.get("permissions"), dict) else {}
+        except Exception:
+            perms = {}
+    try:
+        from app.services import permission_catalog as _pc
+        allowed = _pc.resolve(perms or {}, "trustnode_intelligence")
+    except Exception:
+        allowed = bool((perms or {}).get("trustnode_intelligence"))
+    if allowed:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail="TrustNode Intelligence is not enabled for this user.",
+    )
+
+
 router = APIRouter(prefix="/api/intelligence", tags=["intelligence"],
-                   dependencies=[Depends(require_intelligence_license)])
+                   dependencies=[Depends(require_intelligence_license),
+                                 # 2026-08-22: the licence says the SITE has the
+                                 # assistant; this says WHO may use it.
+                                 # NOT a lambda: an unannotated `request`
+                                 # parameter reads as a required QUERY param and
+                                 # turns every endpoint into a 422.
+                                 Depends(require_intelligence_permission)])
 
 # Kick the insight scheduler on first import. Idempotent + daemon thread,
 # so this is safe even if router.py is imported multiple times.

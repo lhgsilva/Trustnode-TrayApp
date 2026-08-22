@@ -2677,6 +2677,12 @@ export async function registerControlPlaneEdgeLink(payload) {
         license_max_edges: Number(lic?.max_edges || 0),
         license_max_users: Number(lic?.max_users || 0),
         license_modules: Array.isArray(lic?.modules) ? lic.modules : [],
+        // 2026-08-22 (Phase G): forward the tier the portal issued. Undefined
+        // when the portal did not send one, which keeps this edge on its
+        // previous (pre-seat) behaviour.
+        license_package_key: String(lic?.package_key || ""),
+        license_seats: (lic && typeof lic.seats === "object" && lic.seats) ? lic.seats : null,
+        license_limits: (lic && typeof lic.limits === "object" && lic.limits) ? lic.limits : null,
         cloud_api_url: String(dataLike?.cloud_api_url || row?.cloud_api_url || sourceBase || ""),
         primary_domain: String(dataLike?.primary_domain || row?.primary_domain || ""),
         admin_username: String(payload?.admin_username || "admin"),
@@ -2797,6 +2803,12 @@ export async function registerControlPlaneEdgeLinkLogin(payload) {
         license_max_edges: Number(lic?.max_edges || 0),
         license_max_users: Number(lic?.max_users || 0),
         license_modules: Array.isArray(lic?.modules) ? lic.modules : [],
+        // 2026-08-22 (Phase G): forward the tier the portal issued. Undefined
+        // when the portal did not send one, which keeps this edge on its
+        // previous (pre-seat) behaviour.
+        license_package_key: String(lic?.package_key || ""),
+        license_seats: (lic && typeof lic.seats === "object" && lic.seats) ? lic.seats : null,
+        license_limits: (lic && typeof lic.limits === "object" && lic.limits) ? lic.limits : null,
         cloud_api_url: String(dataLike?.cloud_api_url || row?.cloud_api_url || sourceBase || ""),
         primary_domain: String(dataLike?.primary_domain || row?.primary_domain || ""),
         admin_username: String(payload?.admin_username || "admin"),

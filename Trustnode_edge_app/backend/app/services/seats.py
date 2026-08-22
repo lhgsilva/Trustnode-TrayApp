@@ -25,6 +25,7 @@ from app.services import license_inspect
 
 __all__ = [
     "seats_of_user",
+    "stranded_users",
     "view_ui_of_user",
     "census",
     "holders",
@@ -190,6 +191,47 @@ def resolve_login_identity(identifier: str) -> str:
     return ident
 
 
+# Which seat a per-user remote-access flag needs once seats are enforced.
+# Mirrors access_policy.SURFACE_SEAT; kept here so the ledger can warn BEFORE a
+# person is turned away at the door.
+_ACCESS_FLAG_SEAT = {
+    "access_full": "studio",
+    "access_client": "view_lan",
+    "access_lite": "view_lan",
+}
+
+
+def stranded_users() -> List[Dict[str, Any]]:
+    """Active users who are allowed onto a remote surface but hold no seat for it.
+
+    The moment the portal issues a licence WITH seats, remote access stops being
+    governed by the access_* flag alone and starts requiring a named seat
+    (access_policy.surface_access). Anyone in this list can sign in today and
+    would be refused after that switch, so the Users page shows it as a warning
+    rather than letting an admin discover it from a support call.
+    """
+    out: List[Dict[str, Any]] = []
+    for row in _all_users():
+        role = str(row.get("role") or "").strip().lower()
+        if role in ("admin", "super"):
+            continue                      # admins are admitted on their role
+        held = seats_of_user(row)
+        perms = row.get("permissions") if isinstance(row.get("permissions"), dict) else {}
+        missing = []
+        for flag, seat in _ACCESS_FLAG_SEAT.items():
+            if bool(row.get(flag) or perms.get(flag)) and seat not in held:
+                if seat not in missing:
+                    missing.append(seat)
+        if missing:
+            out.append({
+                "username": str(row.get("username") or ""),
+                "email": str(row.get("email") or ""),
+                "needs": missing,
+            })
+    out.sort(key=lambda r: r["username"].lower())
+    return out
+
+
 def ledger() -> Dict[str, Any]:
     """Everything the Users and Access Control page needs to render the seat
     table: what the licence grants, what is assigned, what is left."""
@@ -216,9 +258,18 @@ def ledger() -> Dict[str, Any]:
             "holders": held.get(product, []),
         })
     explicit = license_inspect.seats_are_explicit()
+    stranded = stranded_users()
     return {
         "ok": True,
         "enforced": explicit,
+        "stranded": stranded,
+        "stranded_note": (
+            ""
+            if not stranded else
+            (f"{len(stranded)} user(s) are allowed onto a remote surface but hold no seat "
+             f"for it, so they {'are being' if explicit else 'would be'} refused. "
+             f"Give them a seat below, or clear their remote access.")
+        ),
         "note": (
             "Seat counts come from the licence."
             if explicit else

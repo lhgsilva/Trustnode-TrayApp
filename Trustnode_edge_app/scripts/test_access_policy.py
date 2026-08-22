@@ -57,6 +57,30 @@ tmp = tempfile.mkdtemp(prefix="tn-phasea-")
 env = dict(os.environ, TRUSTNODE_SKIP_DOTENV="1", TRUSTNODE_DATA_DIR=tmp,
            TRUSTNODE_APP_STORE_PATH=os.path.join(tmp, "s.db"),
            TRUSTNODE_BOOT_INTEGRITY_CHECK="never", TRUSTNODE_PORT=PORT)
+# 2026-08-22: seed a licence carrying every module BEFORE boot. Without it every
+# module-gated endpoint answers 404 "not licensed" and a per-user permission gate
+# can be completely broken while the test still reads green — which is exactly how
+# a 422 on every /api/intelligence route survived a passing run.
+_seed = os.path.join(tmp, "seed_license.py")
+_SEED_SRC = """
+import os, sys
+sys.path.insert(0, BACKEND)
+from app.state import app_store
+from app.services.control_plane_store import ControlPlaneStore
+mods = [{'key': m['key'], 'enabled': True} for m in ControlPlaneStore.MODULE_CATALOG]
+bs = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+s = dict(bs.get('app_settings') or {})
+s['license'] = {'license_id': 'lic-test', 'status': 'active',
+                'start_utc': '2026-01-01 00:00:00', 'end_utc': '2030-01-01 00:00:00',
+                'modules': mods}
+app_store.upsert_domain('app_settings', s, actor='access-policy-test')
+print('seeded', len(mods))
+"""
+with open(_seed, "w", encoding="utf-8") as _fh:
+    _fh.write(_SEED_SRC.replace("BACKEND", repr(os.path.join(ROOT, "backend"))))
+subprocess.run([sys.executable, _seed], cwd=os.path.join(ROOT, "backend"), env=env,
+               capture_output=True, text=True)
+
 proc = subprocess.Popen([sys.executable, "-m", "app"], cwd=os.path.join(ROOT, "backend"),
                         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 for _ in range(50):
@@ -155,8 +179,23 @@ check("viewer may export (decision 2026-08-22)", st == 200, f"status={st} {str(r
 st_v, r_v = call("GET", "/api/intelligence/status", viewer)
 st_a, _ = call("GET", "/api/intelligence/status", admin)
 check("Intelligence refused for a viewer without the permission",
-      st_v in (403, 404), f"viewer={st_v}")
-check("Intelligence still reachable for an admin", st_a in (200, 404), f"admin={st_a}")
+      st_v == 403, f"viewer={st_v} {str(r_v)[:80]}")
+check("Intelligence still reachable for an admin", st_a == 200, f"admin={st_a}")
+# The gate is a router-level dependency. If it is declared with an unannotated
+# parameter FastAPI reads it as a required QUERY param and EVERY route answers
+# 422 — a break that a 403/404-tolerant assertion cannot see.
+st_c, r_c = call("GET", "/api/intelligence/chats", admin)
+check("Intelligence routes are not 422 (dependency is well-formed)",
+      st_c != 422, f"admin={st_c} {str(r_c)[:90]}")
+# and the permission the admin ticks actually opens it for a non-admin
+call("PUT", "/api/app-store/domain", admin, {"domain": "users_access", "payload": {"users": [
+    {"username": "ai-test", "password": "AiTest2026*", "role": "viewer", "status": "active",
+     "permissions": {"trustnode_intelligence": True}},
+]}, "actor": "access-policy-test"})
+st_l, b_l = call("POST", "/api/auth/login", body={"username": "ai-test", "password": "AiTest2026*"})
+ai_token = (b_l or {}).get("token") if isinstance(b_l, dict) else None
+st_p, r_p = call("GET", "/api/intelligence/status", ai_token) if ai_token else (0, "no token")
+check("Intelligence opens for a viewer who HAS the permission", st_p == 200, f"status={st_p}")
 
 for name in ("eng-test", "view-test"):
     call("DELETE", f"/api/control-plane/users/{name}", admin)

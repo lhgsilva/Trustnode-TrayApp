@@ -109,6 +109,12 @@ class LicenseUpsertRequest(BaseModel):
     max_edges: int = 3
     max_users: int = 10
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # 2026-08-22 (Phase G): the tier a customer bought. `seats` is what turns the
+    # edge's named-seat enforcement ON; leaving it out keeps that edge on the
+    # pre-seat behaviour, which is how every existing licence keeps working.
+    package_key: str = ""
+    seats: dict[str, Any] | None = None
+    limits: dict[str, Any] | None = None
 
 
 class LicenseModulesRequest(BaseModel):
@@ -454,6 +460,11 @@ class EdgeLocalFinalizeRequest(BaseModel):
     license_max_edges: int = 0
     license_max_users: int = 0
     license_modules: list[dict[str, Any]] = Field(default_factory=list)
+    # 2026-08-22 (Phase G): the tier the portal issued. Absent keeps this edge on
+    # its pre-seat behaviour, so an activation against an older portal is unchanged.
+    license_package_key: str = ""
+    license_seats: dict[str, Any] | None = None
+    license_limits: dict[str, Any] | None = None
     cloud_api_url: str = ""
     primary_domain: str = ""
     # 2026-07-15: deployment endpoints delivered via the activation code
@@ -1270,6 +1281,9 @@ def upsert_license(payload: LicenseUpsertRequest, request: Request, tenant_id: s
         max_edges=payload.max_edges,
         max_users=payload.max_users,
         metadata=payload.metadata,
+        package_key=payload.package_key,
+        seats=payload.seats,
+        limits=payload.limits,
     )
     _audit(
         request,
@@ -2583,6 +2597,9 @@ def edge_link_local_finalize(payload: EdgeLocalFinalizeRequest, request: Request
                 max_edges=max(0, int(payload.license_max_edges or 0)),
                 max_users=max(0, int(payload.license_max_users or 0)),
                 metadata={"source": "edge_local_finalize"},
+                package_key=str(payload.license_package_key or ""),
+                seats=payload.license_seats,
+                limits=payload.license_limits,
             )
             if payload.license_modules:
                 step = "set_license_modules"
