@@ -134,7 +134,8 @@ def preflight() -> tuple[bool, list[str]]:
 def main() -> int:
     started = time.strftime("%Y-%m-%d %H:%M:%S")
     print("=" * 78)
-    print(f"TRUSTNODE 8-HOUR SOAK GATE   start={started}   duration={SOAK_SECONDS}s")
+    hours = SOAK_SECONDS / 3600.0
+    print(f"TRUSTNODE SOAK GATE   {hours:g}-HOUR RUN   start={started}   duration={SOAK_SECONDS}s")
     print("=" * 78)
     print("\n[PREFLIGHT] proving there is something real to measure")
     good, notes = preflight()
@@ -160,9 +161,9 @@ def main() -> int:
     print()
     print("=" * 78)
     if rc == 0:
-        print(f"8-HOUR SOAK: PASS  (started {started}, ended {time.strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"{hours:g}-HOUR SOAK: PASS  (started {started}, ended {time.strftime('%Y-%m-%d %H:%M:%S')})")
     else:
-        print(f"8-HOUR SOAK: FAIL (rc={rc}) — read scripts/validation_out/validation_report.txt")
+        print(f"{hours:g}-HOUR SOAK: FAIL (rc={rc}) — read scripts/validation_out/validation_report.txt")
     print("=" * 78)
     return 0 if rc == 0 else 2
 

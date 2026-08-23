@@ -1,0 +1,117 @@
+============================================================================
+TrustNode FULL VALIDATION FINAL REPORT  window=8.00h  gateway=gw-1781903248499  interval=1.0s
+generated 2026-08-23T05:59:15Z
+============================================================================
+
+[COLLECTION + CHARTS]  ws events=28769 expected~28800 delivery=99.9%
+  cadence: p50=1.001s p95=1.017s max=45.8s  holes>3s=14
+  chart-feed latency: p50=20ms p95=35ms max=44.86s
+  tags/event: min=48 avg=48.0; multi-stamp events=0
+    HOLE 46s ending 22:29:16Z
+    HOLE 3s ending 22:30:02Z
+    HOLE 4s ending 23:00:01Z
+    HOLE 3s ending 00:00:07Z
+    HOLE 4s ending 01:00:12Z
+    HOLE 4s ending 01:30:15Z
+    HOLE 3s ending 02:00:18Z
+    HOLE 3s ending 02:30:21Z
+    HOLE 4s ending 03:00:24Z
+    HOLE 4s ending 03:30:27Z
+    HOLE 4s ending 04:00:30Z
+    HOLE 4s ending 04:30:33Z
+
+[HISTORIAN] freshness p50=0.54s p95=0.98s max=1s  samples>10s-stale=0/14340 (0.0%)
+[DB TRUTH] stamps committed=28804 expected~28800 (100.0%)  rows=1382592
+
+[DISTRIBUTION] telemetry + cloud record + extra sinks (a wedge here is invisible to the WS and historian probes)
+  stall max=0s  restarts=0  stages seen=['bootstrap', 'idle', 'sinks', 'telemetry']
+  durable write stamp age: p50=0.6s max=1.2s (1914 samples)
+
+[DATABASES] outbox pending: start=0 end=0 max=0 (rising forever = cloud sync broken)
+  cloud PG lag: checks=87 ok=87 p50=32s max=38s
+
+[API LATENCY / MODULES]
+  /api/health                      ok=479/479 fail=0 rtt p50=2ms p95=20ms
+  /api/intelligence/status         ok=479/479 fail=0 rtt p50=12ms p95=30ms
+  /api/plc/gateways/status         ok=479/479 fail=0 rtt p50=24ms p95=48ms
+
+[BATCHES / REPORTS / ALARMS+TRIGGERS]  (first -> last snapshot)
+  batches_total          0 -> 0
+  batches_open           0 -> 0
+  batch_events_newest    n/a -> n/a
+  reports_generated      3287 -> 3287
+  reports_newest         2026-08-21 08:00:27.190 -> 2026-08-21 08:00:27.190
+  reports_scheduled      2 -> 2
+  alarms_setup           6 -> 6
+  triggers_limits        7 -> 7
+
+[RESOURCES] cpu p50=28% max=175%  rss start=225MB end=231MB max=268MB  threads start=30 end=39 max=40
+
+[RECOVERY / LOG] events by category: none
+
+[BOOT HEALTH] (last boot block of backend.log)
+  boot started 2026-08-22T21:51:48Z  uvicorn up +4.82s  health 200 at 5350 ms since spawn  gateways resumed=1  deferred done +4.2s  exits=0
+  integrity: skipped ? last OK check 38.4h ago (weekly policy)
+
+[SURFACES / ACCESS POLICY]
+  admin login (loopback)                      : PASS (status=200)
+  login sets session cookie                   : PASS
+  /trustnode/login/ public 200                : PASS (status=200)
+  /trustnode/full/ public 200                 : PASS (status=200)
+  /trustnode/client/ public 200               : PASS (status=200)
+  /trustnode/lite/ public 200                 : PASS (status=200)
+  /trustnode/full/app/ no session -> 302 login: PASS (status=302)
+  /trustnode/full/app/ admin cookie -> 200    : PASS (status=200)
+  /trustnode/client/app/ no session -> 302 login: PASS (status=302)
+  /trustnode/client/app/ admin cookie -> 200  : PASS (status=200)
+  /trustnode/lite/app/ no session -> 302 login: PASS (status=302)
+  /trustnode/lite/app/ admin cookie -> 200    : PASS (status=200)
+  lan-sharing status (admin)                  : PASS (status=200)
+  lite-local bootstrap (admin)                : PASS (status=200)
+  lite-local reports (admin)                  : PASS (status=200)
+  tray loopback status without token          : PASS (status=200)
+  retention status (admin)                    : PASS (status=200)
+  retention status answers < 5s               : PASS (55ms)
+  retention engine thread running             : PASS ({'running': True, 'uptime_s': 441.7, 'first_pass_in_s': 0, 'batch_size': 5000, 'busy': False})
+  retention options (admin)                   : PASS (status=200)
+  retention policies (admin)                  : PASS (status=200)
+  retention runs history (admin)              : PASS (status=200)
+  backups list (admin)                        : PASS (status=200)
+  seat ledger (admin)                         : PASS (status=200)
+  ledger covers the four products             : PASS (['cloud_view', 'edge_runtime', 'studio', 'view_lan'])
+  ledger says whether seats are enforced      : PASS
+  login gate agrees with the surface guard    : PASS (status=200)
+  (remote checks over https://10.5.0.2:8443)
+  certificate download                        : PASS (status=200)
+  https listener /api/health                  : PASS (status=200)
+  (HTTP listener intentionally off: HTTPS-only mode)
+  admin login from LAN                        : PASS (status=200)
+  LAN session TTL 4h                          : PASS (ttl=14400)
+  LAN admin loads full bundle                 : PASS (status=200)
+  LAN admin configuration allowed             : PASS (status=200 )
+  temp viewer created                         : PASS (status=200)
+  viewer login from LAN                       : PASS (status=200)
+  viewer read allowed                         : PASS (status=200)
+  viewer mutation refused (403)               : PASS (status=403)
+  viewer full bundle refused (403)            : PASS (status=403)
+  viewer Local View bundle (access_client)    : PASS (status=200)
+  revoke viewer                               : PASS (status=200)
+  revoked token refused (401)                 : PASS (status=401)
+  lockout after repeated failures (423)       : PASS (last=423)
+  master default password blocked from LAN    : PASS (status=403)
+
+[VERDICT vs SLOs]
+  boot health <= 15s          : PASS (5.3s spawn->first 200)
+  backend boot instrumentation : PASS (first /api/health +4.16s, snapshot ready +3.69s)
+  no splash boot failure       : PASS
+  no boot-health watchdog dump : PASS
+  surfaces + access policy   : PASS (43/43 checks)
+  distribution not stalled : PASS (max 0s)
+  durable write stamp fresh: PASS (max 1s)
+  zero boot failures in run : PASS
+  delivery >=95%           : PASS (99.9%)
+  historian p95 <5s        : PASS (1.0s)
+  zero stall/wedge events  : PASS
+  cloud lag p95 <120s      : PASS
+
+  OVERALL: PASS
