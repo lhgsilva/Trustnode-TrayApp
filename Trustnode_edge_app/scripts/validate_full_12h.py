@@ -758,8 +758,16 @@ async def partial_task(t0: float, stop_at: float) -> None:
         if time.time() >= stop_at:
             break
         try:
+            # 2026-08-23: build_summary() sorts and percentiles every sample
+            # collected so far. Run on the event loop it blocked the WS reader
+            # for seconds, and the gate then recorded a cadence "hole" that
+            # never happened in the product — every 30 minutes, drifting by the
+            # work duration. The historian sampler (a separate task) showed the
+            # data was fresh throughout, which is how we know the holes were
+            # ours. Off the loop, the socket keeps draining while we report.
+            summary = await asyncio.to_thread(build_summary, t0, False)
             with open(PARTIAL, "w", encoding="utf-8") as f:
-                f.write(build_summary(t0, final=False))
+                f.write(summary)
             print(f"[{datetime.now(timezone.utc).strftime('%H:%M')}Z] partial summary refreshed "
                   f"(ws={len(ws_events)} stalls={sum(1 for e in log_events if e[1]=='stall')})",
                   flush=True)

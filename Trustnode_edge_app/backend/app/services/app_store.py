@@ -5427,6 +5427,40 @@ class AppStore:
         from app.services.retention_engine import _sql_ts_to_ms
         return _sql_ts_to_ms(str(ts[0]))
 
+    def config_fingerprint(self) -> str:
+        """A cheap, LOCK-FREE token that changes whenever unscoped config changes.
+
+        2026-08-23: the v2 distribution thread called get_bootstrap() every 10 s
+        purely to hand app_settings to telemetry_service.configure_from_bootstrap().
+        That is only ~6 ms of work — but it takes the GLOBAL store lock, and on a
+        live edge the wait behind the historian writer committing a batch is what
+        produced "v2-dist slow cycle total=1391ms (bootstrap=1360)". The cost was
+        never the reading; it was queueing behind the writer, on the same thread
+        that then has to write cloud records and sinks.
+
+        So this deliberately does NOT take self._lock. It opens its own read-only
+        connection with a short busy_timeout — the same shape as
+        _checkpoint_wal_passive — because WAL mode lets readers run concurrently
+        with the writer. Three aggregates over a 13-row table, no payload read,
+        no JSON. Callers compare the token and only pay for the full locked read
+        when something actually changed.
+        """
+        try:
+            con = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True, timeout=2.0)
+            try:
+                con.execute("PRAGMA busy_timeout=1500")
+                row = con.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(version),0), "
+                    "COALESCE(MAX(updated_utc),'') FROM config_documents"
+                ).fetchone()
+            finally:
+                con.close()
+            return f"{row[0]}:{row[1]}:{row[2]}" if row else ""
+        except Exception:
+            # Unknown -> a unique value, so the caller refreshes through the
+            # normal locked path rather than trusting a stale config.
+            return f"unknown:{time.time()}"
+
     def _checkpoint_wal_passive(self) -> None:
         """PRAGMA wal_checkpoint(PASSIVE) — reclaim WAL frames without ever
         blocking a concurrent writer. Best-effort + short timeout."""

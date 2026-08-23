@@ -473,6 +473,9 @@ class DistributionV2(threading.Thread):
         self._stop_evt = threading.Event()
         self.dropped = 0
         self._last_bootstrap_refresh = 0.0
+        # Config-change detector for the bootstrap refresh above (2026-08-23).
+        self._last_config_fingerprint = ""
+        self._config_applied = False
         self._slow_log_mono = 0.0
         # -- wedge detection (2026-08-21). A blocked stage cannot be
         # interrupted, so the supervisor needs to know WHICH stage is stuck and
@@ -547,11 +550,27 @@ class DistributionV2(threading.Thread):
         if t - self._last_bootstrap_refresh >= 10.0:
             self._set_stage("bootstrap")
             self._last_bootstrap_refresh = t
+            # 2026-08-23: this used to re-read and re-parse EVERY config document
+            # every 10 s, on the thread that also writes cloud records and sinks,
+            # to hand telemetry a dict it only reads app_settings from. On a real
+            # install that is ~1.5 s of JSON parsing under the store lock — the
+            # "v2-dist slow cycle (bootstrap=1360ms)" warnings. Ask the cheap
+            # question first; the full read still happens on every real change,
+            # and on the first cycle, so telemetry is never configured from
+            # stale config.
             try:
-                bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
-                telemetry_service.configure_from_bootstrap(bootstrap)
+                fingerprint = app_store.config_fingerprint()
             except Exception:
-                pass
+                fingerprint = ""
+            if fingerprint != self._last_config_fingerprint or not self._config_applied:
+                try:
+                    bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+                    telemetry_service.configure_from_bootstrap(bootstrap)
+                    self._last_config_fingerprint = fingerprint
+                    self._config_applied = True
+                except Exception:
+                    # Leave the fingerprint unchanged so the next tick retries.
+                    pass
             boot_ms = (time.monotonic() - t) * 1000.0
         t = time.monotonic()
         self._set_stage("telemetry")
