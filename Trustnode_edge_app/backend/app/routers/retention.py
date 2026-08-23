@@ -59,6 +59,10 @@ class PolicyIn(BaseModel):
 class RunIn(BaseModel):
     dry_run: bool = True
     force: bool = False
+    # 2026-08-23: the UI starts long passes in the background and polls
+    # status.engine.busy. Default stays synchronous so existing callers
+    # (scripts, the tray) behave exactly as before.
+    background: bool = False
 
 
 class BackupCreateIn(BaseModel):
@@ -179,6 +183,12 @@ def estimate(payload: PolicyIn, request: Request) -> Dict[str, Any]:
 def run_now(payload: RunIn, request: Request) -> Dict[str, Any]:
     actor = _require_admin(request)
     eng = _engine()
+    if payload.background:
+        started = eng.run_in_background(reason=f"manual:{actor}", dry_run=payload.dry_run,
+                                        force=payload.force)
+        # started=False means a pass is already running; either way the caller
+        # polls status.engine.busy and then reads /retention/v2/runs.
+        return {"ok": True, "background": True, "started": started, "busy": True}
     summary = eng.run_once(reason=f"manual:{actor}", dry_run=payload.dry_run, force=payload.force)
     return {"ok": True, "summary": summary}
 

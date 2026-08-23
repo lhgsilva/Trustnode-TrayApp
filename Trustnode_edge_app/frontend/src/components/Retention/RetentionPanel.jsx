@@ -90,6 +90,21 @@ function blankPolicy() {
   };
 }
 
+/** A policy in one sentence: what is kept in full, what replaces it, and for how
+    long. The tier list is the part operators consistently read as jargon. */
+function describePolicyPlain(policy) {
+  const rawKeep = policy?.raw?.keep || "";
+  const tiers = Array.isArray(policy?.tiers) ? policy.tiers : [];
+  if (!rawKeep && !tiers.length) return "";
+  const parts = [];
+  if (rawKeep) parts.push(`every reading for ${rawKeep}`);
+  tiers.forEach((t) => {
+    if (!t?.keep) return;
+    parts.push(`then one ${t.aggregate || "avg"} per ${t.resolution || "1m"} for ${t.keep}`);
+  });
+  return `Keeps ${parts.join(", ")}. Anything older is removed.`;
+}
+
 /* ------------------------------------------------------------------ panel */
 export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
   const editable = Boolean(canEdit && isAdmin);
@@ -196,6 +211,48 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
     }
   }, [refresh, flash]);
 
+  /* A maintenance pass on a real historian takes minutes. Start it in the
+     background, then follow status.engine.busy until it lands and report what
+     the run actually did. Previously this blocked one HTTP request for the
+     whole pass, which the browser aborted at 12 s — the work carried on and the
+     operator was told nothing had happened. */
+  const runMaintenance = useCallback(async (dryRun) => {
+    const label = dryRun ? "dry" : "run";
+    setBusy(label);
+    try {
+      const kick = await runRetentionV2(dryRun, true, true);
+      // The engine runs one pass at a time. When its own scheduled pass is
+      // already in flight, ours is not queued — say so instead of implying the
+      // click did nothing, then follow the pass that IS running.
+      if (kick && kick.started === false) {
+        flash("ok", "A maintenance pass was already running — following it.");
+      }
+      const startedAt = Date.now();
+      // Poll for up to 60 minutes; the engine caps its own pass well below this.
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 2000));
+        if (!mounted.current) return;
+        let st = null;
+        try { st = await getRetentionStatus(); } catch { /* keep waiting */ }
+        if (st?.status) setStatus(st.status);
+        const stillBusy = Boolean(st?.status?.engine?.busy);
+        if (!stillBusy && Date.now() - startedAt > 3000) break;
+        if (Date.now() - startedAt > 3600000) break;
+      }
+      const r = await getRetentionRunsV2(15).catch(() => null);
+      if (mounted.current && r?.runs) setRuns(r.runs);
+      const latest = (r?.runs || [])[0];
+      await refresh();
+      flash("ok", dryRun
+        ? `Preview complete — ${describeSummary(latest?.details)}`
+        : `Maintenance complete — ${describeSummary(latest?.details)}`);
+    } catch (err) {
+      flash("error", String(err?.message || err));
+    } finally {
+      if (mounted.current) setBusy("");
+    }
+  }, [refresh, flash]);
+
   const savePolicy = useCallback(async (activateAfter) => {
     if (!editor) return;
     const res = await act("save", () => saveRetentionPolicyV2({ ...editor, activate: activateAfter }),
@@ -221,13 +278,15 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
           <h3 className="card-title">Storage</h3>
           <div className="row">
             <button className="btn btn-secondary btn-sm" disabled={!!busy}
-              onClick={() => act("dry", () => runRetentionV2(true, true),
-                (r) => `Dry run complete — ${describeSummary(r?.summary)}`)}>
+              title="Show what maintenance would remove, without changing anything"
+              onClick={() => runMaintenance(true)}>
               {busy === "dry" ? "Checking…" : "Preview"}
             </button>
             <button className="btn btn-primary btn-sm" disabled={!editable || !!busy}
-              onClick={() => act("run", () => runRetentionV2(false, true),
-                (r) => `Maintenance complete — ${describeSummary(r?.summary)}`)}>
+              title={noPolicy
+                ? "Activate a retention policy first — with none, there is nothing to remove"
+                : "Apply the active policy now: roll up and remove data past its keep window"}
+              onClick={() => runMaintenance(false)}>
               {busy === "run" ? "Running…" : "Run maintenance now"}
             </button>
           </div>
@@ -360,7 +419,8 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
           stays available for trends and reports — at a resolution you choose — for up to five years.
         </p>
 
-        <div className="table backup-files-table">
+        <div className="backup-files-table-wrap">
+        <div className="table backup-files-table has-row-actions">
           <div className="thead">
             <span>Policy</span><span>Full detail</span><span>Then</span><span>Status</span><span>Actions</span>
           </div>
@@ -409,18 +469,30 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
             </div>
           ) : null}
         </div>
+        </div>
 
         {options?.presets?.length ? (
           <div style={{ marginTop: 12 }}>
             <div className="muted" style={{ marginBottom: 6 }}>Start from a preset:</div>
-            <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+            <div className="retention-preset-grid">
               {options.presets.map((preset) => (
-                <button key={preset.id} className="btn btn-secondary btn-sm" disabled={!editable}
-                  title={preset.description}
-                  onClick={() => openEditor({ ...preset, id: "" })}>
-                  {preset.name}
-                </button>
+                <div key={preset.id} className="retention-preset">
+                  <button className="btn btn-secondary btn-sm" disabled={!editable}
+                    onClick={() => openEditor({ ...preset, id: "" })}>
+                    {preset.name}
+                  </button>
+                  {preset.description ? (
+                    <div className="muted retention-preset-desc">{preset.description}</div>
+                  ) : null}
+                  <div className="muted retention-preset-desc">
+                    {describePolicyPlain(preset)}
+                  </div>
+                </div>
               ))}
+            </div>
+            <div className="muted" style={{ marginTop: 8 }}>
+              A preset only fills in the form — nothing changes until you review it and
+              choose <strong>Save and activate</strong>.
             </div>
           </div>
         ) : null}
@@ -473,7 +545,8 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
           </div>
         ) : null}
 
-        <div className="table backup-files-table">
+        <div className="backup-files-table-wrap">
+        <div className="table backup-files-table has-row-actions">
           <div className="thead">
             <span>Created</span><span>Type</span><span>File</span><span>Size</span><span>Actions</span>
           </div>
@@ -511,6 +584,7 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
               <span className="db-cell">—</span><span className="db-cell">—</span>
             </div>
           ) : null}
+        </div>
         </div>
       </section>
 
@@ -664,6 +738,13 @@ function PolicyEditor({ draft, options, estimate, estimateError, busy, onPatch, 
 
         <div className="muted" style={{ margin: "12px 0 6px" }}>
           How long to keep every single reading, and what to store once that window passes.
+        </div>
+        <div className="muted retention-editor-help">
+          Data moves down this list as it ages. The first row is full detail — every
+          reading exactly as collected. Each row below replaces it with one value per
+          interval (an average, minimum, maximum…), which is far smaller but still
+          charts and reports correctly. Data older than the last row is deleted.
+          Change any number and the estimated size updates as you type.
         </div>
 
         <div className="table backup-files-table">

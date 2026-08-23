@@ -1614,6 +1614,31 @@ body {
   grid-template-columns: .6fr 1.2fr 2.1fr 1fr 120px;
 }
 
+/* 2026-08-23: this class is shared by four tables on the Backup and Retention
+   page. Two of them end in an ACTIONS column holding three controls (Download,
+   Restore…, Delete) which did not fit the 120px the shared rule gives, so the
+   last buttons were clipped off the right edge of the card. Only those two get
+   the wider, content-sized column. */
+.backup-files-table.has-row-actions .thead,
+.backup-files-table.has-row-actions .trow {
+  grid-template-columns: .8fr .6fr minmax(0, 1.6fr) .6fr minmax(280px, max-content);
+}
+
+.backup-files-table.has-row-actions .db-actions-cell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-start;
+  align-items: center;
+  min-width: 0;
+}
+
+/* A narrow window scrolls the table inside its card instead of spilling. */
+.backup-files-table-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
 .email-profiles-table .thead,
 .email-profiles-table .trow {
   grid-template-columns: 1.2fr 1.8fr 1.1fr .9fr 120px;
@@ -1621,7 +1646,12 @@ body {
 
 .retention-runs-table .thead,
 .retention-runs-table .trow {
-  grid-template-columns: 1.2fr .8fr .9fr 1.8fr .8fr;
+  grid-template-columns: 1.2fr .8fr .9fr minmax(0, 1.8fr) .8fr;
+}
+
+/* A long "what happened" line must ellipsize, never widen the grid. */
+.retention-runs-table .db-cell {
+  min-width: 0;
 }
 
 .db-scope-grid {
@@ -6621,3 +6651,27 @@ textarea {
   flex-direction: column;
 }
 .content:has(.dashboard-virtual-grid) .page-title-row { flex: 0 0 auto; }
+
+/* Retention presets: the name alone never said what a preset would do, so each
+   now carries its plain-language effect (2026-08-23). */
+.retention-preset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  align-items: start;
+}
+.retention-preset {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.retention-preset-desc {
+  font-size: 12px;
+  line-height: 1.35;
+}
+.retention-editor-help {
+  font-size: 12px;
+  line-height: 1.45;
+  margin-bottom: 10px;
+}

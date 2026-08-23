@@ -1492,13 +1492,32 @@ export async function getRetentionRuns(limit = 20) {
    architecture-2026-08-21.md. All mutating calls are admin-only on the server
    and return 403 for anyone else, so the UI must gate its controls too.
    --------------------------------------------------------------------------- */
-async function _retentionCall(path, { method = "GET", body } = {}) {
-  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store${path}`, {
-    method,
-    ...(body !== undefined
-      ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
-      : {}),
-  });
+async function _retentionCall(path, { method = "GET", body, timeoutMs } = {}) {
+  // 2026-08-23: these all used the default 12 s timeout. Maintenance, VACUUM,
+  // full backup and restore each take MINUTES on a real historian, so the
+  // browser aborted every one of them and reported "signal is aborted without
+  // reason" — which read as "delete data manually is not working" while the
+  // server was in fact still doing the work. Long operations are started in the
+  // background now; the generous timeout here covers the START call only.
+  let res;
+  try {
+    res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store${path}`, {
+      method,
+      ...(body !== undefined
+        ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+        : {}),
+    }, timeoutMs || 12000);
+  } catch (err) {
+    // An AbortError's message is "signal is aborted without reason", which tells
+    // an operator nothing. Say what actually happened.
+    if (err && (err.name === "AbortError" || /aborted/i.test(String(err.message || "")))) {
+      throw new Error(
+        `The edge did not answer within ${(timeoutMs || 12000) / 1000}s. On a large ` +
+        `database this work continues in the background — reopen this page in a ` +
+        `moment to see the result.`);
+    }
+    throw err;
+  }
   if (!res.ok) {
     // The server sends an operator-readable sentence in `detail` for both the
     // 422 validation errors and the 403 admin gate — surface it verbatim.
@@ -1534,16 +1553,20 @@ export async function deleteRetentionPolicy(policyId) {
   return _retentionCall(`/retention/v2/policies/${encodeURIComponent(policyId)}`, { method: "DELETE" });
 }
 export async function estimateRetentionPolicy(policy) {
-  return _retentionCall("/retention/v2/estimate", { method: "POST", body: policy });
+  return _retentionCall("/retention/v2/estimate", { method: "POST", body: policy, timeoutMs: 60000 });
 }
-export async function runRetentionV2(dryRun = true, force = false) {
-  return _retentionCall("/retention/v2/run", { method: "POST", body: { dry_run: dryRun, force } });
+export async function runRetentionV2(dryRun = true, force = false, background = false) {
+  return _retentionCall("/retention/v2/run", {
+    method: "POST",
+    body: { dry_run: dryRun, force, background },
+    timeoutMs: 60000,
+  });
 }
 export async function getRetentionRunsV2(limit = 25) {
   return _retentionCall(`/retention/v2/runs?limit=${encodeURIComponent(String(limit))}`);
 }
 export async function compactDatabase() {
-  return _retentionCall("/retention/v2/compact", { method: "POST" });
+  return _retentionCall("/retention/v2/compact", { method: "POST", timeoutMs: 120000 });
 }
 export async function cancelDatabaseCompaction() {
   return _retentionCall("/retention/v2/compact/cancel", { method: "POST" });
@@ -1552,10 +1575,10 @@ export async function listBackupsV2(limit = 200) {
   return _retentionCall(`/backups/v2?limit=${encodeURIComponent(String(limit))}`);
 }
 export async function createBackupV2(kind = "config", label = "") {
-  return _retentionCall("/backups/v2/create", { method: "POST", body: { kind, label } });
+  return _retentionCall("/backups/v2/create", { method: "POST", body: { kind, label }, timeoutMs: 600000 });
 }
 export async function restoreBackupV2(filename) {
-  return _retentionCall("/backups/v2/restore", { method: "POST", body: { filename } });
+  return _retentionCall("/backups/v2/restore", { method: "POST", body: { filename }, timeoutMs: 600000 });
 }
 export async function cancelBackupRestore() {
   return _retentionCall("/backups/v2/restore/cancel", { method: "POST" });

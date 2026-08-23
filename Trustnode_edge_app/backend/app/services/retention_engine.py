@@ -1340,6 +1340,32 @@ class RetentionEngine:
             del self._activity[: len(self._activity) - 200]
 
     # -- the tick ---------------------------------------------------------
+    def run_in_background(self, *, reason: str = "manual", dry_run: bool = False,
+                          force: bool = False) -> bool:
+        """Start a maintenance pass on its own thread and return immediately.
+
+        2026-08-23: run_once() holds the HTTP request for the whole pass. That is
+        fine on a small store and impossible on a real one — a 13 GB historian
+        takes many minutes, while the browser gives up after 12 s and shows
+        "signal is aborted without reason". The work had actually started and
+        kept going; only the answer was lost, so "delete data manually" looked
+        broken while it was in fact running.
+
+        Returns False when a pass is already in flight (the caller should poll
+        status.engine.busy rather than queue a second one).
+        """
+        if self._run_lock.locked():
+            return False
+
+        def _worker() -> None:
+            try:
+                self.run_once(reason=reason, dry_run=dry_run, force=force)
+            except Exception:
+                log.exception("retention: background run failed (%s)", reason)
+
+        threading.Thread(target=_worker, name="tn-retention-manual", daemon=True).start()
+        return True
+
     def run_once(self, *, reason: str = "manual", dry_run: bool = False,
                  force: bool = False) -> Dict[str, Any]:
         """One full maintenance pass. Safe to call from an API handler."""
