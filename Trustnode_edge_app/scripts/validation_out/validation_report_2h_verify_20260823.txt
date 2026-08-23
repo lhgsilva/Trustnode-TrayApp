@@ -1,0 +1,105 @@
+============================================================================
+TrustNode FULL VALIDATION FINAL REPORT  window=2.00h  gateway=gw-1781903248499  interval=1.0s
+generated 2026-08-23T18:46:31Z
+============================================================================
+
+[COLLECTION + CHARTS]  ws events=7189 expected~7200 delivery=99.8%
+  cadence: p50=1.001s p95=1.012s max=1.1s  holes>3s=0
+  chart-feed latency: p50=21ms p95=27ms max=0.90s
+  tags/event: min=48 avg=48.0; multi-stamp events=0
+
+[HISTORIAN] freshness p50=0.89s p95=1.03s max=2s  samples>10s-stale=0/3589 (0.0%)
+[DB TRUTH] stamps committed=7201 expected~7200 (100.0%)  rows=345648
+
+[DISTRIBUTION] telemetry + cloud record + extra sinks (a wedge here is invisible to the WS and historian probes)
+  stall max=0s  restarts=0  stages seen=['bootstrap', 'idle', 'sinks', 'telemetry']
+  durable write stamp age: p50=0.6s max=3.7s (477 samples)
+
+[DATABASES] outbox pending: start=0 end=0 max=0 (rising forever = cloud sync broken)
+  cloud PG lag: checks=22 ok=22 p50=38s max=38s
+
+[API LATENCY / MODULES]
+  /api/health                      ok=121/121 fail=0 rtt p50=2ms p95=76ms
+  /api/intelligence/status         ok=121/121 fail=0 rtt p50=21ms p95=65ms
+  /api/plc/gateways/status         ok=121/121 fail=0 rtt p50=46ms p95=225ms
+
+[BATCHES / REPORTS / ALARMS+TRIGGERS]  (first -> last snapshot)
+  batches_total          0 -> 0
+  batches_open           0 -> 0
+  batch_events_newest    n/a -> n/a
+  reports_generated      3288 -> 3288
+  reports_newest         2026-08-23 08:02:21.490 -> 2026-08-23 08:02:21.490
+  reports_scheduled      2 -> 2
+  alarms_setup           6 -> 6
+  triggers_limits        7 -> 7
+
+[RESOURCES] cpu p50=166% max=266%  rss start=204MB end=264MB max=264MB  threads start=38 end=45 max=47
+
+[RECOVERY / LOG] events by category: {'engine': 1}
+
+[BOOT HEALTH] (last boot block of backend.log)
+  boot started 2026-08-23T16:45:01Z  uvicorn up +5.24s  health 200 at 5689 ms since spawn  gateways resumed=1  deferred done +4.3s  exits=0
+  integrity: skipped ? last OK check 57.3h ago (weekly policy)
+
+[SURFACES / ACCESS POLICY]
+  admin login (loopback)                      : PASS (status=200)
+  login sets session cookie                   : PASS
+  /trustnode/login/ public 200                : PASS (status=200)
+  /trustnode/full/ public 200                 : PASS (status=200)
+  /trustnode/client/ public 200               : PASS (status=200)
+  /trustnode/lite/ public 200                 : PASS (status=200)
+  /trustnode/full/app/ no session -> 302 login: PASS (status=302)
+  /trustnode/full/app/ admin cookie -> 200    : PASS (status=200)
+  /trustnode/client/app/ no session -> 302 login: PASS (status=302)
+  /trustnode/client/app/ admin cookie -> 200  : PASS (status=200)
+  /trustnode/lite/app/ no session -> 302 login: PASS (status=302)
+  /trustnode/lite/app/ admin cookie -> 200    : PASS (status=200)
+  lan-sharing status (admin)                  : PASS (status=200)
+  lite-local bootstrap (admin)                : PASS (status=200)
+  lite-local reports (admin)                  : PASS (status=200)
+  tray loopback status without token          : PASS (status=200)
+  retention status (admin)                    : PASS (status=200)
+  retention status answers < 5s               : PASS (59ms)
+  retention engine thread running             : PASS ({'running': True, 'uptime_s': 89.8, 'first_pass_in_s': 210.0, 'batch_size': 5000, 'busy': False})
+  retention options (admin)                   : PASS (status=200)
+  retention policies (admin)                  : PASS (status=200)
+  retention runs history (admin)              : PASS (status=200)
+  backups list (admin)                        : PASS (status=200)
+  seat ledger (admin)                         : PASS (status=200)
+  ledger covers the four products             : PASS (['cloud_view', 'edge_runtime', 'studio', 'view_lan'])
+  ledger says whether seats are enforced      : PASS
+  login gate agrees with the surface guard    : PASS (status=200)
+  (remote checks over https://10.5.0.2:8443)
+  certificate download                        : PASS (status=200)
+  https listener /api/health                  : PASS (status=200)
+  (HTTP listener intentionally off: HTTPS-only mode)
+  admin login from LAN                        : PASS (status=200)
+  LAN session TTL 4h                          : PASS (ttl=14400)
+  LAN admin loads full bundle                 : PASS (status=200)
+  LAN admin configuration allowed             : PASS (status=200 )
+  temp viewer created                         : PASS (status=200)
+  viewer login from LAN                       : PASS (status=200)
+  viewer read allowed                         : PASS (status=200)
+  viewer mutation refused (403)               : PASS (status=403)
+  viewer full bundle refused (403)            : PASS (status=403)
+  viewer Local View bundle (access_client)    : PASS (status=200)
+  revoke viewer                               : PASS (status=200)
+  revoked token refused (401)                 : PASS (status=401)
+  lockout after repeated failures (423)       : PASS (last=423)
+  master default password blocked from LAN    : PASS (status=403)
+
+[VERDICT vs SLOs]
+  boot health <= 15s          : PASS (5.7s spawn->first 200)
+  backend boot instrumentation : PASS (first /api/health +3.88s, snapshot ready +3.86s)
+  no splash boot failure       : PASS
+  no boot-health watchdog dump : PASS
+  surfaces + access policy   : PASS (43/43 checks)
+  distribution not stalled : PASS (max 0s)
+  durable write stamp fresh: PASS (max 4s)
+  zero boot failures in run : PASS
+  delivery >=95%           : PASS (99.8%)
+  historian p95 <5s        : PASS (1.0s)
+  zero stall/wedge events  : PASS
+  cloud lag p95 <120s      : PASS
+
+  OVERALL: PASS
