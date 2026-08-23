@@ -172,6 +172,61 @@ def _build_scope_key(request: Request, bootstrap_hint: Dict[str, Any] | None = N
     return f"{tenant_id}|{customer_id or '-'}|{edge_id}|{username}"
 
 
+def shared_edge_scope_key() -> str:
+    """The per-edge scope key, resolved WITHOUT a request.
+
+    2026-08-23: the Lite surface served its bootstrap straight from
+    app_store.get_bootstrap() — the UNSCOPED documents. Dashboards (and every
+    other _SHARED_EDGE_DOMAINS entry) are stored per EDGE, so Lite read the
+    empty unscoped row and showed a dashboard with no widgets while the full app
+    showed three. Any surface that cannot build a user scope still needs this
+    one, so it lives here rather than being reconstructed per caller.
+
+    Returns "" when the edge has no identity yet, which callers treat as
+    "nothing to overlay".
+    """
+    try:
+        bootstrap = app_store.get_bootstrap(prefer_cloud_reads=False) or {}
+    except Exception:
+        return ""
+    settings = bootstrap.get("app_settings") if isinstance(bootstrap.get("app_settings"), dict) else {}
+    profile = settings.get("edge_profile") if isinstance(settings.get("edge_profile"), dict) else {}
+    edge_id = (str(profile.get("edge_id") or "").strip().lower()
+               or str(settings.get("edge_id") or "").strip().lower())
+    if not edge_id:
+        try:
+            edge_id = str(getattr(app_store, "_local_edge_id", "") or "").strip().lower()
+        except Exception:
+            edge_id = ""
+    if not edge_id:
+        return ""
+    customer_id = (str(profile.get("linked_customer_id") or "").strip().lower()
+                   or str(settings.get("customer_id") or "").strip().lower())
+    tenant_id = str(settings.get("tenant_id") or get_current_tenant() or "default").strip().lower()
+    return f"{tenant_id}|{customer_id or '-'}|{edge_id}"
+
+
+def overlay_shared_edge_domains(bootstrap: Dict[str, Any]) -> Dict[str, Any]:
+    """Overlay the per-edge shared documents onto an unscoped bootstrap.
+
+    Read-only and best-effort: a surface that cannot resolve the scope keeps
+    exactly what it already had.
+    """
+    if not isinstance(bootstrap, dict):
+        return bootstrap
+    key = shared_edge_scope_key()
+    if not key:
+        return bootstrap
+    try:
+        shared = app_store.get_bootstrap_scoped(key, prefer_cloud_reads=False) or {}
+    except Exception:
+        return bootstrap
+    for domain in _SHARED_EDGE_DOMAINS:
+        if domain in shared:
+            bootstrap[domain] = shared[domain]
+    return bootstrap
+
+
 def _require_admin(request: Request) -> str:
     """Operator 2026-08-21: these routes could delete the entire historian, and
     were gated in the BROWSER only — any authenticated viewer could call them
@@ -381,9 +436,11 @@ def save_bootstrap(payload: BootstrapSaveRequest, request: Request) -> dict:
         if not isinstance(domain, str) or not domain.strip():
             continue
         if domain.strip().lower() in _SHARED_EDGE_DOMAINS:
-            shared_payload[domain] = value
+            # Same carry-forward as the single-domain save: a bootstrap write
+            # that omits `profiles` must not wipe them (2026-08-23).
+            shared_payload[domain] = _preserve_omitted_keys(shared_scope, domain, value)
         else:
-            user_payload[domain] = value
+            user_payload[domain] = _preserve_omitted_keys(user_scope, domain, value)
     if user_payload and user_scope:
         versions.update(app_store.save_bootstrap_scoped(user_scope, user_payload, actor=payload.actor))
     if shared_payload and shared_scope:
@@ -532,6 +589,46 @@ def _guard_shared_write_permission(request: Request, domain: str) -> None:
     )
 
 
+# Keys a write may OMIT without meaning "delete this". The whole document is
+# replaced on every save, so a client that does not know about a key would
+# otherwise silently destroy it — which is how dashboards lost their saved
+# layouts the moment any surface running an older bundle saved a widget.
+# Only an EXPLICIT empty value clears these.
+_PRESERVE_ON_OMIT = {
+    "dashboard_configurations": ("profiles",),
+}
+
+
+def _preserve_omitted_keys(scope_key: str, domain: str, payload: Any) -> Any:
+    """Carry forward keys the incoming write did not mention (2026-08-23).
+
+    `profiles` is sent by the current app but not by an older bundle, the Local
+    View or Lite. Without this, one save from any of them wipes every saved
+    dashboard layout on the edge. Sending `profiles: []` still clears them,
+    because that is an explicit instruction rather than an omission.
+    """
+    keys = _PRESERVE_ON_OMIT.get(str(domain or "").strip().lower())
+    if not keys or not isinstance(payload, dict):
+        return payload
+    missing = [k for k in keys if k not in payload]
+    if not missing:
+        return payload
+    try:
+        if scope_key:
+            stored = (app_store.get_bootstrap_scoped(scope_key, prefer_cloud_reads=False) or {}).get(domain)
+        else:
+            stored = (app_store.get_bootstrap(prefer_cloud_reads=False) or {}).get(domain)
+    except Exception:
+        return payload          # never block a save because the lookup failed
+    if not isinstance(stored, dict):
+        return payload
+    merged = dict(payload)
+    for k in missing:
+        if k in stored:
+            merged[k] = stored[k]
+    return merged
+
+
 def _guard_not_blanking(scope_key: str, domain: str, payload: Any, actor: str, allow_empty: bool) -> None:
     """Refuse to replace a non-empty saved collection with an empty one.
 
@@ -577,6 +674,7 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     scope_key = _build_scope_key(request, domain=payload.domain)
     _guard_not_blanking(scope_key, str(payload.domain or "").strip(), payload.payload,
                         str(payload.actor or ""), bool(payload.allow_empty))
+    payload.payload = _preserve_omitted_keys(scope_key, str(payload.domain or "").strip(), payload.payload)
     result = (
         app_store.upsert_domain_scoped(scope_key, payload.domain, payload.payload, actor=payload.actor)
         if scope_key

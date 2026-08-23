@@ -3557,6 +3557,12 @@ function AppShell() {
   // WebSocket event arrives. Until then the footer FAB and status pills show "Checking…"
   // rather than a false "Stopped" state.
   const [gatewayRuntimeReady, setGatewayRuntimeReady] = useState(false);
+  // 2026-08-23: dashboard profiles used to live ONLY in localStorage, so they
+  // vanished whenever the browser storage did and no other surface (Local View,
+  // Lite) could ever see them. They now travel in the shared
+  // dashboard_configurations document, like the widgets they describe.
+  const [dashboardProfiles, setDashboardProfiles] = useState([]);
+  const dashboardProfilesHydratedRef = useRef(false);
   // 2026-08-22: the workspace this backend is actually serving. When a data-dir
   // override points the app at an EMPTY store, every page is legitimately empty
   // and it reads as "the software deleted my data". The banner says otherwise.
@@ -5230,6 +5236,15 @@ function AppShell() {
     if (Array.isArray(triggers.trigger_rules)) setTriggerRules(triggers.trigger_rules);
     if (Array.isArray(alarmsSetup.alarms)) setAlarms(alarmsSetup.alarms);
     if (Array.isArray(dashboard.widgets)) setDashboardWidgets(dashboard.widgets);
+    // Profiles come from the server when it has them. When it does not — an
+    // edge that predates this — whatever the browser still holds is kept and
+    // gets written up on the next save, so nobody loses profiles in the upgrade.
+    if (Array.isArray(dashboard.profiles)) {
+      setDashboardProfiles(dashboard.profiles);
+      dashboardProfilesHydratedRef.current = true;
+    } else if (!dashboardProfilesHydratedRef.current) {
+      dashboardProfilesHydratedRef.current = true;
+    }
     if (dashboard.mode === "chart" || dashboard.mode === "kpi") setDashboardMode(dashboard.mode);
     if (Number.isFinite(Number(dashboard.per_row))) {
       setDashboardPerRow(Math.min(4, Math.max(1, Number(dashboard.per_row))));
@@ -6967,6 +6982,8 @@ function AppShell() {
           dashboardTagColors && typeof dashboardTagColors === "object" && !Array.isArray(dashboardTagColors)
             ? dashboardTagColors
             : {},
+        // Saved layouts travel with the dashboard they belong to.
+        profiles: Array.isArray(dashboardProfiles) ? dashboardProfiles : [],
       };
       const signature = JSON.stringify(payload);
       // Always save on the first run (previously this branch returned
@@ -7007,7 +7024,8 @@ function AppShell() {
         dashboardDomainSaveTimerRef.current = null;
       }
     };
-  }, [appStoreHydrated, currentUser, dashboardWidgets, dashboardMode, dashboardPerRow, dashboardTagColors]);
+  }, [appStoreHydrated, currentUser, dashboardWidgets, dashboardMode, dashboardPerRow, dashboardTagColors,
+      dashboardProfiles]);
 
   // Dedicated alarms_setup persistence. The bootstrap-wide debounce
   // could not keep up because alarms churn every few seconds and the
@@ -20965,6 +20983,8 @@ const getGatewayHealth = (gateway) => {
             <DashboardDesigner
               triggerRules={triggerRules}
               canEdit={canEditPage("dashboard")}
+              serverProfiles={dashboardProfiles}
+              onProfilesChange={setDashboardProfiles}
               widgets={dashboardWidgets}
               setWidgets={setDashboardWidgets}
               dashboardMode={dashboardMode}

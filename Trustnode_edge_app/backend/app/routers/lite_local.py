@@ -457,10 +457,20 @@ def get_bootstrap(request: Request, token: str = "") -> dict:
             except Exception as exc:
                 logger.warning("lite-local bootstrap from customer DB failed: %s", exc)
     # Fallback: the local SQLite bootstrap (no customer DB or read failed).
+    # 2026-08-23: this used to return ONLY the unscoped documents. Dashboards,
+    # gateways, tags and every other _SHARED_EDGE_DOMAINS entry are stored per
+    # EDGE, so Lite read the empty unscoped row and rendered a dashboard with no
+    # widgets while the full app showed three. Overlay the per-edge scope so
+    # every surface reads the same company assets.
     try:
         bootstrap = app_store.get_bootstrap() or {}
     except Exception:
         bootstrap = {}
+    try:
+        from app.routers.app_store import overlay_shared_edge_domains
+        bootstrap = overlay_shared_edge_domains(bootstrap)
+    except Exception:
+        pass          # a surface that cannot resolve the scope keeps what it had
     return {"ok": True, "source": "local_sqlite", "data": bootstrap, "session": session,
             "capabilities": _lite_capabilities(session)}
 

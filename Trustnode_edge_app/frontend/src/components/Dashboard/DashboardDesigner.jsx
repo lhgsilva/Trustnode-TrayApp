@@ -865,6 +865,10 @@ function buildDefaultForm(type = "line_chart") {
 export function DashboardDesigner({
   triggerRules = [],
   canEdit,
+  // Saved layouts, held in the shared dashboard document (2026-08-23).
+  // Defaults keep every existing caller working unchanged.
+  serverProfiles = [],
+  onProfilesChange = null,
   widgets,
   setWidgets,
   dashboardMode = "kpi",
@@ -925,7 +929,34 @@ export function DashboardDesigner({
   // they survive reloads and follow the user's machine. Each profile is
   // independent — switching profiles fully replaces the active dashboard.
   // ------------------------------------------------------------------------
-  const [profiles, setProfiles] = useState(() => loadProfilesFromStorage());
+  // 2026-08-23: profiles are held in the shared dashboard document and mirrored
+  // to localStorage. The server is the source of truth once it has them; the
+  // local copy is a cache that also carries an older install's profiles up on
+  // the first save, so an upgrade never loses a saved layout.
+  const [profiles, setProfiles] = useState(() => {
+    const fromServer = Array.isArray(serverProfiles) ? serverProfiles : [];
+    return fromServer.length ? fromServer : loadProfilesFromStorage();
+  });
+  // Adopt the server's list once it arrives (hydration lands after mount).
+  const serverProfilesSeenRef = useRef(false);
+  useEffect(() => {
+    if (!Array.isArray(serverProfiles) || serverProfilesSeenRef.current) return;
+    if (!serverProfiles.length) return;
+    serverProfilesSeenRef.current = true;
+    setProfiles(serverProfiles);
+    saveProfilesToStorage(serverProfiles);
+  }, [serverProfiles]);
+  // An install upgrading from localStorage-only profiles: push them up once so
+  // they start travelling with the dashboard.
+  const localMigratedRef = useRef(false);
+  useEffect(() => {
+    if (localMigratedRef.current) return;
+    if (!Array.isArray(serverProfiles) || serverProfiles.length) return;
+    const local = loadProfilesFromStorage();
+    if (!local.length) return;
+    localMigratedRef.current = true;
+    if (typeof onProfilesChange === "function") onProfilesChange(local);
+  }, [serverProfiles, onProfilesChange]);
   const [activeProfileName, setActiveProfileName] = useState(() => {
     try {
       return String(localStorage.getItem(DASHBOARD_ACTIVE_PROFILE_KEY) || "");
@@ -958,8 +989,10 @@ export function DashboardDesigner({
 
   const persistProfiles = useCallback((next) => {
     setProfiles(next);
-    saveProfilesToStorage(next);
-  }, []);
+    saveProfilesToStorage(next);          // local cache / offline fallback
+    // and up to the shared document, so a reopen — on any surface — finds them.
+    if (typeof onProfilesChange === "function") onProfilesChange(next);
+  }, [onProfilesChange]);
 
   const captureCurrentProfilePayload = useCallback((name) => ({
     name: String(name || "").trim(),
