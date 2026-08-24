@@ -1531,6 +1531,40 @@ async function _retentionCall(path, { method = "GET", body, timeoutMs } = {}) {
   return res.json();
 }
 
+// ----------------------------------------------------------- EtherNet/IP CIP
+// 2026-08-24: a generic EtherNet/IP adapter (IO-Link block, remote I/O, drive)
+// read by explicit CIP messaging. The EDS gives the assemblies; the preview
+// proves a byte map before it is saved.
+export async function parseEdsFile(edsText) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/eip/parse-eds`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ eds_text: String(edsText || "") }),
+  }, 20000);
+  await ensureOk(res, "EDS import failed");
+  return res.json();
+}
+
+export async function previewEipAssembly(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/eip/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  }, 20000);
+  await ensureOk(res, "Assembly read failed");
+  return res.json();
+}
+
+export async function identifyEipDevice(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/eip/identify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  }, 20000);
+  await ensureOk(res, "Device identify failed");
+  return res.json();
+}
+
 // --------------------------------------------------------------- IFM IO-Link
 // 2026-08-24: an ifm IO-Link master serves its data as JSON on its IoT port.
 // These two calls are what make the gateway dialog usable: one asks the block

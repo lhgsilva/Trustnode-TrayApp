@@ -97,6 +97,17 @@ check("config expands enabled ports only", len(built) == 2, names)
 check("explicit fields honour the prefix", "Tank_Level" in names, names)
 check("a disabled port contributes nothing", not any(f.port == 2 for f in built), names)
 
+# Two ports producing the same tag name would write two different values under
+# one name every cycle -- a trend sawtoothing between two sensors. Keep the first.
+dupe = fields_from_config([
+    {"port": 1, "enabled": True,
+     "fields": [{"name": "Temperature", "bit_offset": 0, "bit_length": 16}]},
+    {"port": 2, "enabled": True,
+     "fields": [{"name": "temperature", "bit_offset": 0, "bit_length": 16}]},
+])
+check("a duplicate tag name is dropped (first wins)",
+      len(dupe) == 1 and dupe[0].port == 1, [(f.name, f.port) for f in dupe])
+
 
 # ------------------------------------------------------------------- transport
 print("\n[TRANSPORT against a fake master]")

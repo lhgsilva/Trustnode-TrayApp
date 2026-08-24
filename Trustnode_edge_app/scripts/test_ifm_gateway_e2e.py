@@ -217,6 +217,76 @@ check("it keeps sampling on the gateway interval (trendable)", len(rows2) >= 2, 
 st, _ = call("POST", "/api/plc/gateways/stop", admin, {"gateway_id": "gw-ifm-test"})
 check("the gateway stops cleanly", st == 200, f"status={st}")
 
+# --- the generic EtherNet/IP path: EDS import ------------------------------
+# Same architecture, different transport: import the EDS, get the assemblies.
+EDS = '''
+[Device]
+    VendCode = 310;
+    VendName = "ifm electronic gmbh";
+    ProdCode = 4711;
+    ProdName = "AL1326";
+[Assembly]
+    Assem100 = "Output Data", , 32, 0x0000;
+    Assem101 = "Input Data", , 64, 0x0000;
+'''
+st, eds = call("POST", "/api/plc/eip/parse-eds", admin, {"eds_text": EDS})
+check("an EDS file is parsed", st == 200 and (eds or {}).get("ok"), f"status={st}")
+check("EDS reports the device", ((eds or {}).get("device") or {}).get("product_name") == "AL1326",
+      ((eds or {}).get("device") or {}).get("product_name"))
+check("EDS suggests the input assembly",
+      ((eds or {}).get("suggested") or {}).get("input_assembly") == 101,
+      (eds or {}).get("suggested"))
+st, bad = call("POST", "/api/plc/eip/parse-eds", admin, {"eds_text": "hello"})
+check("a non-EDS file is rejected with a reason",
+      st == 200 and not (bad or {}).get("ok") and bool((bad or {}).get("message")),
+      (bad or {}).get("message"))
+
+# an ethernet_ip gateway with no assembly set must refuse clearly, not crash
+st, r = call("POST", "/api/plc/gateways/start", admin, {
+    "gateway_id": "gw-eip-test",
+    "config": {"gateway_type": "ethernet_ip", "plc_ip": "10.255.255.2",
+               "tags": ["X"], "interval_ms": 1000}})
+check("an ethernet_ip gateway starts (errors surface per cycle)", st == 200, f"status={st}")
+call("POST", "/api/plc/gateways/stop", admin, {"gateway_id": "gw-eip-test"})
+
+# --- the block password must not be readable by a browser -----------------
+GW_DOC = [{"id": "gw-secret", "gateway_type": "ifm_iolink", "plc_ip": "10.0.0.9",
+           "ifm_username": "administrator", "ifm_password": "s3cret-block-pw",
+           "tags": [], "interval_ms": 1000}]
+st, _ = call("PUT", "/api/app-store/domain", admin,
+             {"domain": "gateway_configurations", "payload": GW_DOC, "actor": "t"})
+check("a gateway with credentials saves", st == 200, f"status={st}")
+
+st, bs = call("GET", "/api/app-store/bootstrap", admin)
+served = (((bs or {}).get("data") or {}).get("gateway_configurations") or [])
+row = next((g for g in served if g.get("id") == "gw-secret"), {})
+check("the password is NOT served to the browser",
+      row.get("ifm_password") != "s3cret-block-pw", row.get("ifm_password"))
+check("  it is replaced by a sentinel", row.get("ifm_password") == "__set__",
+      row.get("ifm_password"))
+check("  the username is still shown", row.get("ifm_username") == "administrator",
+      row.get("ifm_username"))
+
+# saving back the sentinel must not destroy the stored password
+st, _ = call("PUT", "/api/app-store/domain", admin,
+             {"domain": "gateway_configurations",
+              "payload": [{**row, "interval_ms": 2000}], "actor": "t"})
+check("re-saving with the sentinel is accepted", st == 200, f"status={st}")
+import sqlite3 as _sq
+_con = _sq.connect(f"file:{os.path.join(tmp, 's.db')}?mode=ro", uri=True, timeout=10)
+_rows = _con.execute(
+    "SELECT payload_json FROM config_documents_scoped WHERE domain='gateway_configurations' "
+    "UNION ALL SELECT payload_json FROM config_documents WHERE domain='gateway_configurations'"
+).fetchall()
+_con.close()
+_stored_pw = ""
+for _r in _rows:
+    for _g in (json.loads(_r[0] or "[]") or []):
+        if isinstance(_g, dict) and _g.get("id") == "gw-secret":
+            _stored_pw = str(_g.get("ifm_password") or "")
+check("the real password survived the round trip", _stored_pw == "s3cret-block-pw",
+      _stored_pw or "(empty)")
+
 # --- NOTHING ELSE MAY HAVE CHANGED ----------------------------------------
 print()
 print("  [no-regression]")

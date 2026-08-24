@@ -458,6 +458,11 @@ def fields_from_config(ifm_ports: List[Dict[str, Any]]) -> List[IfmField]:
 
     Accepts both shapes the UI can produce: a port carrying an explicit `fields`
     list, or a port naming a built-in `profile`.
+
+    Duplicate names are dropped, keeping the first. Two ports both producing
+    "Temperature" would otherwise write two different values under one tag name
+    every cycle — the historian would accept both and the trend would be a saw
+    tooth between two sensors, which is far worse than one missing tag.
     """
     out: List[IfmField] = []
     for entry in ifm_ports or []:
@@ -485,7 +490,16 @@ def fields_from_config(ifm_ports: List[Dict[str, Any]]) -> List[IfmField]:
         profile_id = str(entry.get("profile") or "").strip()
         if profile_id:
             out.extend(fields_from_profile(profile_id, port, prefix))
-    return out
+
+    deduped: List[IfmField] = []
+    seen: set = set()
+    for f in out:
+        key = f.name.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+    return deduped
 
 
 def ports_from_tree(tree: Dict[str, Any]) -> List[int]:

@@ -1005,6 +1005,8 @@ class GatewayWorker:
             readings = self._read_from_snap7()
         elif gateway_type == "ifm_iolink":
             readings = self._read_from_ifm_iolink()
+        elif gateway_type == "ethernet_ip":
+            readings = self._read_from_ethernet_ip()
         else:
             raise RuntimeError(f"Gateway type '{self.config.gateway_type}' is not implemented for real-time reads.")
         # AUTOMATED string identification (2026-07-26): when a driver didn't
@@ -1463,6 +1465,55 @@ class GatewayWorker:
             return (area_prefix, 0, byte_idx, "DWORD", 0)
         # Default M10/I0/Q4 as BYTE.
         return (area_prefix, 0, int(tag[1:]), "BYTE", 0)
+
+    def _read_from_ethernet_ip(self) -> List[GatewayReading]:
+        """One cycle against a generic EtherNet/IP adapter.
+
+        The protocol work is in app/drivers/ethernet_ip.py; this is only the
+        adapter to GatewayReading. ONE explicit CIP read returns the whole input
+        assembly, which is then sliced into every mapped signal — so tag count
+        does not change the network cost.
+        """
+        from app.drivers.ethernet_ip import EipDeviceClient, signals_from_config
+
+        host = (self.config.plc_ip or "").strip()
+        if not host:
+            raise RuntimeError("EtherNet/IP read failed: the device address is empty.")
+        instance = int(self.config.eip_input_assembly or 0)
+        if instance <= 0:
+            raise RuntimeError(
+                "EtherNet/IP read failed: no input assembly is set. Import the "
+                "device's EDS, or enter the assembly instance from its manual.")
+        signals = signals_from_config(list(self.config.eip_signals or []))
+        if not signals:
+            raise RuntimeError(
+                "EtherNet/IP read failed: no signals are mapped. Add the values "
+                "you want to collect from the assembly.")
+
+        interval_s = max(0.2, float(self.config.interval_ms or 1000) / 1000.0)
+        client = EipDeviceClient(host=host, slot=int(self.config.eip_slot or 0),
+                                 timeout_s=max(1.0, min(interval_s * 0.8, 10.0)))
+        wanted = set(self._get_read_tags() or [])
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        common = dict(source=self.config.gateway_type, site=self.config.site,
+                      area=self.config.area, equipment=self.config.equipment)
+        out: List[GatewayReading] = []
+        for row in client.read_signals(instance, signals):
+            name = str(row.get("name") or "")
+            if not name or (wanted and name not in wanted):
+                continue
+            if row.get("quality"):
+                out.append(GatewayReading(
+                    ts_utc=ts, tag_name=name, value=float(row.get("value") or 0.0),
+                    value_text=None,
+                    data_type="BOOL" if row.get("is_bool") else "REAL",
+                    quality=192, quality_label="GOOD", **common))
+            else:
+                out.append(GatewayReading(
+                    ts_utc=ts, tag_name=name, value=None,
+                    value_text=str(row.get("error") or "read failed"),
+                    data_type="", quality=0, quality_label="BAD", **common))
+        return out
 
     def _read_from_ifm_iolink(self) -> List[GatewayReading]:
         """One cycle against an IFM IO-Link master over its IoT Core.
@@ -4795,6 +4846,12 @@ class PLCManager:
                 ifm_password=str(gw.get("ifm_password") or ""),
                 ifm_port_count=int(gw.get("ifm_port_count") or 8),
                 ifm_ports=list(gw.get("ifm_ports") or []),
+                eip_input_assembly=int(gw.get("eip_input_assembly") or 0),
+                eip_output_assembly=int(gw.get("eip_output_assembly") or 0),
+                eip_config_assembly=int(gw.get("eip_config_assembly") or 0),
+                eip_slot=int(gw.get("eip_slot") or 0),
+                eip_signals=list(gw.get("eip_signals") or []),
+                eip_device_info=dict(gw.get("eip_device_info") or {}),
                 schedule_enabled=bool(gw.get("schedule_enabled")),
                 schedule_start=str(gw.get("schedule_start") or "08:00"),
                 schedule_stop=str(gw.get("schedule_stop") or "18:00"),

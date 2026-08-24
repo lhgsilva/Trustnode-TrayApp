@@ -6729,3 +6729,8 @@ textarea {
 .ifm-field-row { margin-bottom: 6px; }
 .ifm-field-row input,
 .ifm-field-row select { min-width: 0; width: 100%; }
+
+.eip-head,
+.eip-row {
+  grid-template-columns: minmax(150px, 1.6fr) 100px 110px 60px 90px 90px 90px 90px;
+}

@@ -362,6 +362,12 @@ def get_bootstrap(request: Request) -> dict:
     # only emit this when the decision is still pending — once the
     # operator has bridged / archived / discarded, app_settings stores
     # data_continuity.decision so the banner stays dismissed.
+    # 2026-08-24: never serve a stored credential. The collector reads it from
+    # the store directly; no browser needs it.
+    for _dom in _DOMAIN_SECRET_FIELDS:
+        if _dom in data:
+            data[_dom] = _redact_domain_secrets(_dom, data[_dom])
+
     data_continuity: Dict[str, Any] = {}
     try:
         current = get_current_tenant()
@@ -599,6 +605,69 @@ _PRESERVE_ON_OMIT = {
 }
 
 
+# Secrets that live inside a configuration document. They are stored so the
+# collector can use them, and REDACTED on the way out so a signed-in viewer
+# reading /api/app-store/bootstrap cannot harvest them (2026-08-24). The
+# sentinel is what the UI sends back when the operator did not retype it.
+_SECRET_SENTINEL = "__set__"
+_DOMAIN_SECRET_FIELDS = {
+    "gateway_configurations": ("ifm_password",),
+}
+
+
+def _redact_domain_secrets(domain: str, payload: Any) -> Any:
+    """Replace stored secrets with a sentinel before a document is served."""
+    fields = _DOMAIN_SECRET_FIELDS.get(str(domain or "").strip().lower())
+    if not fields or not isinstance(payload, list):
+        return payload
+    out = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            out.append(entry)
+            continue
+        item = dict(entry)
+        for key in fields:
+            if item.get(key):
+                item[key] = _SECRET_SENTINEL
+        out.append(item)
+    return out
+
+
+def _restore_domain_secrets(scope_key: str, domain: str, payload: Any) -> Any:
+    """Put the stored secret back when the client returned the sentinel.
+
+    Without this, saving a gateway from a UI that only ever saw "__set__" would
+    overwrite the real password with the sentinel and the block would stop
+    authenticating.
+    """
+    fields = _DOMAIN_SECRET_FIELDS.get(str(domain or "").strip().lower())
+    if not fields or not isinstance(payload, list):
+        return payload
+    try:
+        if scope_key:
+            stored = (app_store.get_bootstrap_scoped(scope_key, prefer_cloud_reads=False) or {}).get(domain)
+        else:
+            stored = (app_store.get_bootstrap(prefer_cloud_reads=False) or {}).get(domain)
+    except Exception:
+        return payload
+    by_id = {}
+    for entry in stored or []:
+        if isinstance(entry, dict) and entry.get("id"):
+            by_id[str(entry["id"])] = entry
+    out = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            out.append(entry)
+            continue
+        item = dict(entry)
+        prev = by_id.get(str(item.get("id") or ""), {})
+        for key in fields:
+            if item.get(key) == _SECRET_SENTINEL:
+                item[key] = prev.get(key, "")
+        out.append(item)
+    return out
+
+
 def _preserve_omitted_keys(scope_key: str, domain: str, payload: Any) -> Any:
     """Carry forward keys the incoming write did not mention (2026-08-23).
 
@@ -675,6 +744,7 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     _guard_not_blanking(scope_key, str(payload.domain or "").strip(), payload.payload,
                         str(payload.actor or ""), bool(payload.allow_empty))
     payload.payload = _preserve_omitted_keys(scope_key, str(payload.domain or "").strip(), payload.payload)
+    payload.payload = _restore_domain_secrets(scope_key, str(payload.domain or "").strip(), payload.payload)
     result = (
         app_store.upsert_domain_scoped(scope_key, payload.domain, payload.payload, actor=payload.actor)
         if scope_key

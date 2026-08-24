@@ -50,7 +50,7 @@ class GatewayRuntimeStopRequest(BaseModel):
 
 class TagDiscoveryRequest(BaseModel):
     gateway_type: Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston",
-                          "ifm_iolink"]
+                          "ifm_iolink", "ethernet_ip"]
     plc_ip: str
     opc_url: str = ""
     timeout_ms: int = 4000
@@ -909,6 +909,98 @@ def discover_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
         tags=[],
         message="Tag discovery is not supported for this gateway type in IP-only mode.",
     )
+
+
+class EdsImportRequest(BaseModel):
+    """An EDS file's TEXT, pasted or uploaded by the operator."""
+    eds_text: str = ""
+
+
+@router.post("/eip/parse-eds")
+def eip_parse_eds(payload: EdsImportRequest) -> dict:
+    """Read a device's EDS and report its identity and assemblies.
+
+    This is the CODESYS step an operator recognises: install the device
+    description, and the assemblies (with their sizes) come back so the input
+    instance does not have to be found in a PDF.
+    """
+    from app.drivers.ethernet_ip import EdsParseError, guess_assemblies, parse_eds
+    try:
+        parsed = parse_eds(payload.eds_text or "")
+    except EdsParseError as exc:
+        return {"ok": False, "message": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "message": f"Could not read the EDS: {exc}"}
+    guess = guess_assemblies(parsed)
+    return {"ok": True, "device": parsed, "suggested": guess,
+            "message": (f"{parsed.get('product_name') or 'Device'} — "
+                        f"{len(parsed.get('assemblies') or [])} assembly(ies) found.")}
+
+
+class EipProbeRequest(BaseModel):
+    plc_ip: str
+    instance: int = 0
+    slot: int = 0
+    timeout_ms: int = 4000
+    signals: list[dict] = Field(default_factory=list)
+
+
+@router.post("/eip/preview")
+def eip_preview(payload: EipProbeRequest) -> dict:
+    """Read the live assembly and decode it with a candidate signal map.
+
+    Byte offsets are the part an operator gets wrong, and a wrong offset yields
+    a plausible number rather than an error. Showing the raw bytes beside the
+    decoded values is what makes a map verifiable before it is saved.
+    """
+    from app.drivers.ethernet_ip import EipDeviceClient, EipSignal, decode_signal
+    if not (payload.plc_ip or "").strip():
+        return {"ok": False, "message": "The device address is required.", "values": []}
+    if int(payload.instance or 0) <= 0:
+        return {"ok": False, "message": "An input assembly instance is required.", "values": []}
+    client = EipDeviceClient(host=payload.plc_ip.strip(), slot=int(payload.slot or 0),
+                             timeout_s=max(1.0, float(payload.timeout_ms or 4000) / 1000.0))
+    try:
+        data = client.read_assembly(int(payload.instance))
+    except Exception as exc:
+        return {"ok": False, "values": [], "raw": "",
+                "message": f"Could not read assembly {payload.instance}: {exc}"}
+    values = []
+    for spec in payload.signals or []:
+        sig = EipSignal.from_dict(spec)
+        try:
+            values.append({"name": sig.name, "value": decode_signal(data, sig),
+                           "unit": sig.unit, "error": ""})
+        except Exception as exc:
+            values.append({"name": sig.name, "value": None, "unit": sig.unit,
+                           "error": str(exc)})
+    return {"ok": True, "raw": data.hex(), "size_bytes": len(data), "values": values,
+            "message": f"Assembly {payload.instance} returned {len(data)} bytes."}
+
+
+@router.post("/eip/identify")
+def eip_identify(payload: EipProbeRequest) -> dict:
+    """Who is actually at this address (CIP Identity object)."""
+    from app.drivers.ethernet_ip import EipDeviceClient
+    if not (payload.plc_ip or "").strip():
+        return {"ok": False, "message": "The device address is required."}
+    try:
+        info = EipDeviceClient(host=payload.plc_ip.strip(),
+                               slot=int(payload.slot or 0)).identify()
+    except Exception as exc:
+        return {"ok": False, "message": f"Could not reach the device: {exc}"}
+    return {"ok": bool(info), "device": info,
+            "message": (f"{info.get('product_name') or 'Device'} answered."
+                        if info else "The device did not answer a ListIdentity.")}
+
+
+@router.get("/eip/discover")
+def eip_discover() -> dict:
+    """EtherNet/IP adapters answering on this subnet."""
+    from app.drivers.ethernet_ip import discover_devices
+    devices = discover_devices()
+    return {"ok": True, "devices": devices,
+            "message": f"{len(devices)} EtherNet/IP device(s) answered."}
 
 
 class IfmScanRequest(BaseModel):

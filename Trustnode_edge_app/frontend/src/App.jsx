@@ -2,6 +2,7 @@ import { Component, useCallback, useEffect, useMemo, useRef, useState } from "re
 import { Login } from "./components/Login/Login";
 import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
 import IfmPortMapper from "./components/Gateways/IfmPortMapper";
+import EthernetIpMapper from "./components/Gateways/EthernetIpMapper";
 import { DASHBOARD_GRID_VERSION, migrateWidgetsToFinerGrid } from "./components/Dashboard/widgetRegistry";
 import { registerDeclaredTagTypes } from "./components/Dashboard/tagTypes";
 import { ReportTemplateDesigner } from "./components/Reports/ReportTemplateDesigner";
@@ -390,7 +391,10 @@ const gatewayOptions = [
   // 2026-08-24: an ifm IO-Link master (AL13xx) read over its IoT port. Its
   // sensors become ordinary tags, so everything downstream treats them the
   // same as a PLC tag.
-  { value: "ifm_iolink", label: "IFM IO-Link master" }
+  { value: "ifm_iolink", label: "IFM IO-Link master" },
+  // Any EtherNet/IP adapter, read by explicit CIP against its input assembly —
+  // the edge is the originator, so no PLC is needed in between.
+  { value: "ethernet_ip", label: "EtherNet/IP device (EDS)" }
 ];
 
 // 2026-08-22: ONE resolution for the feature pairs that exist twice in saved
@@ -3786,7 +3790,14 @@ function AppShell() {
     ifm_username: "",
     ifm_password: "",
     ifm_port_count: 8,
-    ifm_ports: []
+    ifm_ports: [],
+    // Generic EtherNet/IP (2026-08-24); ignored unless the type is ethernet_ip.
+    eip_input_assembly: 0,
+    eip_output_assembly: 0,
+    eip_config_assembly: 0,
+    eip_slot: 0,
+    eip_signals: [],
+    eip_device_info: {}
   });
   const [showDbModal, setShowDbModal] = useState(false);
   const [editingDbId, setEditingDbId] = useState(null);
@@ -15325,6 +15336,12 @@ const getGatewayHealth = (gateway) => {
       ifm_password: String(gatewayForm.ifm_password || ""),
       ifm_port_count: Number(gatewayForm.ifm_port_count || 8),
       ifm_ports: Array.isArray(gatewayForm.ifm_ports) ? gatewayForm.ifm_ports : [],
+      eip_input_assembly: Number(gatewayForm.eip_input_assembly || 0),
+      eip_output_assembly: Number(gatewayForm.eip_output_assembly || 0),
+      eip_config_assembly: Number(gatewayForm.eip_config_assembly || 0),
+      eip_slot: Number(gatewayForm.eip_slot || 0),
+      eip_signals: Array.isArray(gatewayForm.eip_signals) ? gatewayForm.eip_signals : [],
+      eip_device_info: gatewayForm.eip_device_info || {},
       // Operator 2026-06-21: opt-in auto-resume per gateway. Default
       // false — the worker only comes back after a backend restart if
       // the operator explicitly checked "Resume on restart" in Edit.
@@ -28437,6 +28454,13 @@ const getGatewayHealth = (gateway) => {
                   </small>
                 </span>
               </label>
+              {gatewayForm.gateway_type === "ethernet_ip" ? (
+                <EthernetIpMapper
+                  form={gatewayForm}
+                  disabled={!canEditPage("gateway_configuration")}
+                  onChange={(patch) => setGatewayForm((prev) => ({ ...prev, ...patch }))}
+                />
+              ) : null}
               {gatewayForm.gateway_type === "ifm_iolink" ? (
                 <IfmPortMapper
                   form={gatewayForm}

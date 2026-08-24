@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 # Core HTTP/JSON port. Widening this union cannot affect the existing four —
 # nothing dispatches on it until a gateway is actually saved with that type.
 GatewayType = Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston",
-                      "ifm_iolink"]
+                      "ifm_iolink", "ethernet_ip"]
 
 
 class GatewayConfig(BaseModel):
@@ -59,6 +59,18 @@ class GatewayConfig(BaseModel):
     ifm_password: str = ""
     ifm_port_count: int = 8
     ifm_ports: List[dict] = Field(default_factory=list)
+    # ------------------------------------------------- generic EtherNet/IP
+    # 2026-08-24: any EtherNet/IP adapter (IO-Link block, remote I/O, drive)
+    # read by explicit CIP messaging against its input assembly. Defaulted, so
+    # existing gateway documents are unaffected.
+    eip_input_assembly: int = 0
+    eip_output_assembly: int = 0
+    eip_config_assembly: int = 0
+    eip_slot: int = 0
+    eip_signals: List[dict] = Field(default_factory=list)
+    # What the imported EDS said, kept for display and for confirming the
+    # device on the wire is the one the map was written against.
+    eip_device_info: dict = Field(default_factory=dict)
 
 
 class GatewayReading(BaseModel):
