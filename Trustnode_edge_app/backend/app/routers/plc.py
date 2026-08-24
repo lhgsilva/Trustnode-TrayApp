@@ -49,7 +49,8 @@ class GatewayRuntimeStopRequest(BaseModel):
 
 
 class TagDiscoveryRequest(BaseModel):
-    gateway_type: Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston"]
+    gateway_type: Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston",
+                          "ifm_iolink"]
     plc_ip: str
     opc_url: str = ""
     timeout_ms: int = 4000
@@ -891,11 +892,125 @@ def discover_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
             ),
         )
 
+    if payload.gateway_type == "ifm_iolink":
+        return _discover_ifm_tags(payload)
+
     return TagDiscoveryResult(
         ok=False,
         tags=[],
         message="Tag discovery is not supported for this gateway type in IP-only mode.",
     )
+
+
+class IfmScanRequest(BaseModel):
+    """Scan an IFM IO-Link master's ports (2026-08-24).
+
+    The dialog calls this so the operator sees the hardware actually plugged in
+    instead of typing port numbers and hoping.
+    """
+    plc_ip: str
+    http_port: int = 80
+    use_https: bool = False
+    verify_tls: bool = False
+    username: str = ""
+    password: str = ""
+    port_count: int = 8
+    timeout_ms: int = 4000
+
+
+def _ifm_client(payload: "IfmScanRequest"):
+    from app.drivers.ifm_iolink import IfmMasterClient
+    return IfmMasterClient(
+        host=(payload.plc_ip or "").strip(),
+        port=int(payload.http_port or 80),
+        timeout_s=max(1.0, float(payload.timeout_ms or 4000) / 1000.0),
+        use_https=bool(payload.use_https),
+        username=str(payload.username or ""),
+        password=str(payload.password or ""),
+        verify_tls=bool(payload.verify_tls),
+    )
+
+
+@router.post("/ifm/scan-ports")
+def ifm_scan_ports(payload: IfmScanRequest) -> dict:
+    """What is connected to each port, plus the block's identity."""
+    if not (payload.plc_ip or "").strip():
+        return {"ok": False, "message": "The block address is required.", "ports": []}
+    try:
+        from app.drivers.ifm_iolink import BUILTIN_PROFILES
+        client = _ifm_client(payload)
+        ports = client.scan_ports(port_count=int(payload.port_count or 8))
+        info = client.identify()
+    except Exception as exc:
+        return {"ok": False, "ports": [],
+                "message": f"Could not reach the IFM block: {type(exc).__name__}: {exc}"}
+    connected = [p for p in ports if p.get("connected")]
+    return {
+        "ok": True,
+        "device": info,
+        "ports": ports,
+        "profiles": BUILTIN_PROFILES,
+        "message": (f"{len(connected)} of {len(ports)} ports have a device connected."
+                    if ports else "No ports reported."),
+    }
+
+
+class IfmPreviewRequest(IfmScanRequest):
+    """Decode one port's live process data with a candidate mapping, so the
+    operator can confirm a bit offset produces a sensible number BEFORE saving."""
+    port: int = 1
+    fields: list[dict] = Field(default_factory=list)
+
+
+@router.post("/ifm/preview")
+def ifm_preview(payload: IfmPreviewRequest) -> dict:
+    from app.drivers.ifm_iolink import IfmField, decode_field, port_pdin_adr
+    try:
+        client = _ifm_client(payload)
+        pdin = client.get_value(port_pdin_adr(int(payload.port or 1)))
+    except Exception as exc:
+        return {"ok": False, "raw": "", "values": [],
+                "message": f"Could not read port {payload.port}: {exc}"}
+    if pdin is None:
+        return {"ok": False, "raw": "", "values": [],
+                "message": f"Port {payload.port} returned no process data."}
+    values = []
+    for spec in payload.fields or []:
+        item = dict(spec); item["port"] = int(payload.port or 1)
+        fld = IfmField.from_dict(item)
+        try:
+            values.append({"name": fld.name, "value": decode_field(str(pdin), fld),
+                           "unit": fld.unit, "error": ""})
+        except Exception as exc:
+            values.append({"name": fld.name, "value": None, "unit": fld.unit,
+                           "error": str(exc)})
+    return {"ok": True, "raw": str(pdin), "values": values, "message": ""}
+
+
+def _discover_ifm_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
+    """Suggested tag names from whatever is plugged into the block."""
+    try:
+        from app.drivers.ifm_iolink import fields_from_profile
+        client = _ifm_client(IfmScanRequest(
+            plc_ip=payload.plc_ip, timeout_ms=payload.timeout_ms))
+        ports = client.scan_ports()
+    except Exception as exc:
+        return TagDiscoveryResult(ok=False, tags=[],
+                                  message=f"Could not reach the IFM block: {exc}")
+    tags: list[str] = []
+    for prt in ports:
+        if not prt.get("connected"):
+            continue
+        profile_id = str(prt.get("suggested_profile") or "")
+        if profile_id:
+            tags += [f.name for f in fields_from_profile(profile_id, int(prt["port"]))]
+        else:
+            tags.append(f"Port{int(prt['port'])}_Value")
+    return TagDiscoveryResult(
+        ok=bool(tags), tags=tags,
+        message=(f"Found {len(tags)} value(s) across the block's ports. Review the "
+                 f"port mapping to set units and scaling."
+                 if tags else "No IO-Link devices were found on the block's ports."))
 
 
 class NetworkScanRequest(BaseModel):

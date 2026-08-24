@@ -3,7 +3,11 @@ from typing import List, Literal
 from pydantic import BaseModel, Field
 
 
-GatewayType = Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston"]
+# 2026-08-24: "ifm_iolink" is an IFM IO-Link master (AL13xx) read over its IoT
+# Core HTTP/JSON port. Widening this union cannot affect the existing four —
+# nothing dispatches on it until a gateway is actually saved with that type.
+GatewayType = Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston",
+                      "ifm_iolink"]
 
 
 class GatewayConfig(BaseModel):
@@ -38,6 +42,23 @@ class GatewayConfig(BaseModel):
     # clicks are honored — they keep the gateway down regardless of
     # this flag, until the next Start click.
     auto_recover_enabled: bool = True
+    # ---------------------------------------------------------------- IFM
+    # 2026-08-24: only read when gateway_type == "ifm_iolink". Every field is
+    # defaulted, so an existing gateway document that has never heard of them
+    # constructs exactly as before.
+    #
+    # The block's address reuses `plc_ip`. `ifm_ports` carries the per-port tag
+    # mapping — which slice of a port's process data becomes which named tag —
+    # because `tags` is a flat List[str] and an IFM tag needs port + bit offset +
+    # length + scale behind its name. Keeping the NAME in `tags` is what makes an
+    # IFM tag indistinguishable from a PLC tag everywhere downstream.
+    ifm_http_port: int = 80
+    ifm_use_https: bool = False
+    ifm_verify_tls: bool = False        # self-signed certificates are normal here
+    ifm_username: str = ""
+    ifm_password: str = ""
+    ifm_port_count: int = 8
+    ifm_ports: List[dict] = Field(default_factory=list)
 
 
 class GatewayReading(BaseModel):

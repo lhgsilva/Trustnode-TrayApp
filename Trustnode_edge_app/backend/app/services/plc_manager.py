@@ -1003,6 +1003,8 @@ class GatewayWorker:
             readings = self._read_from_allen_bradley()
         elif gateway_type == "siemens_snap7":
             readings = self._read_from_snap7()
+        elif gateway_type == "ifm_iolink":
+            readings = self._read_from_ifm_iolink()
         else:
             raise RuntimeError(f"Gateway type '{self.config.gateway_type}' is not implemented for real-time reads.")
         # AUTOMATED string identification (2026-07-26): when a driver didn't
@@ -1461,6 +1463,77 @@ class GatewayWorker:
             return (area_prefix, 0, byte_idx, "DWORD", 0)
         # Default M10/I0/Q4 as BYTE.
         return (area_prefix, 0, int(tag[1:]), "BYTE", 0)
+
+    def _read_from_ifm_iolink(self) -> List[GatewayReading]:
+        """One cycle against an IFM IO-Link master over its IoT Core.
+
+        The protocol work lives in app/drivers/ifm_iolink.py, which knows nothing
+        about gateways; this method is only the adapter from decoded fields to
+        GatewayReading. A port that fails yields a BAD-quality reading for its own
+        tags and nothing else — one unplugged sensor must not take the block down.
+        """
+        from app.drivers.ifm_iolink import IfmMasterClient, fields_from_config
+
+        host = (self.config.plc_ip or "").strip()
+        if not host:
+            raise RuntimeError("IFM read failed: the block address is empty.")
+        fields = fields_from_config(list(self.config.ifm_ports or []))
+        if not fields:
+            raise RuntimeError(
+                "IFM read failed: no ports are mapped. Open the gateway, scan the "
+                "block's ports and choose which values to collect.")
+
+        # Keep the HTTP budget under the collection interval so a slow block
+        # delays a cycle rather than stacking them up.
+        interval_s = max(0.2, float(self.config.interval_ms or 1000) / 1000.0)
+        timeout_s = max(1.0, min(interval_s * 0.8, 10.0))
+
+        client = IfmMasterClient(
+            host=host,
+            port=int(self.config.ifm_http_port or 80),
+            timeout_s=timeout_s,
+            use_https=bool(self.config.ifm_use_https),
+            username=str(self.config.ifm_username or ""),
+            password=str(self.config.ifm_password or ""),
+            verify_tls=bool(self.config.ifm_verify_tls),
+        )
+        wanted = set(self._get_read_tags() or [])
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        out: List[GatewayReading] = []
+        for row in client.read_fields(fields):
+            name = str(row.get("name") or "")
+            if not name:
+                continue
+            # Honour the gateway's tag selection the same way every other driver
+            # does; an empty selection means "everything mapped".
+            if wanted and name not in wanted:
+                continue
+            # source/site/area/equipment are REQUIRED on GatewayReading and are
+            # what stamps a row with where it came from; every driver supplies
+            # them the same way.
+            common = dict(
+                source=self.config.gateway_type,
+                site=self.config.site,
+                area=self.config.area,
+                equipment=self.config.equipment,
+            )
+            if row.get("quality"):
+                out.append(GatewayReading(
+                    ts_utc=ts, tag_name=name,
+                    value=float(row.get("value") or 0.0),
+                    value_text=None,
+                    data_type="BOOL" if row.get("is_bool") else "REAL",
+                    quality=192, quality_label="GOOD", **common,
+                ))
+            else:
+                # NULL, never 0.0 — a failed read is the ABSENCE of data, and a
+                # fabricated zero would trend as a real flat line.
+                out.append(GatewayReading(
+                    ts_utc=ts, tag_name=name, value=None,
+                    value_text=str(row.get("error") or "read failed"),
+                    data_type="", quality=0, quality_label="BAD", **common,
+                ))
+        return out
 
     def _read_from_snap7(self) -> List[GatewayReading]:
         try:
@@ -4715,6 +4788,13 @@ class PLCManager:
                 equipment=str(gw.get("equipment") or ""),
                 collection_triggers=list(gw.get("collection_triggers") or []),
                 collection_trigger_mode=str(gw.get("collection_trigger_mode") or "any"),
+                ifm_http_port=int(gw.get("ifm_http_port") or 80),
+                ifm_use_https=bool(gw.get("ifm_use_https")),
+                ifm_verify_tls=bool(gw.get("ifm_verify_tls")),
+                ifm_username=str(gw.get("ifm_username") or ""),
+                ifm_password=str(gw.get("ifm_password") or ""),
+                ifm_port_count=int(gw.get("ifm_port_count") or 8),
+                ifm_ports=list(gw.get("ifm_ports") or []),
                 schedule_enabled=bool(gw.get("schedule_enabled")),
                 schedule_start=str(gw.get("schedule_start") or "08:00"),
                 schedule_stop=str(gw.get("schedule_stop") or "18:00"),
