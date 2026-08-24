@@ -331,7 +331,21 @@ class IfmMasterClient:
                 out[adr] = (None, _code_from_exception(exc))
         return out
 
-    # -- higher level ------------------------------------------------------
+    def get_tree(self) -> Dict[str, Any]:
+        """The block's ENTIRE device description as JSON.
+
+        ifm documents this as the first thing to do when talking to the IoT Core
+        programmatically, and it is what makes discovery plug-and-work: rather
+        than assuming port[1..8] exists and guessing what is on it, we ask the
+        block to describe itself. This is the IoT-Core equivalent of installing
+        a device's EDS in CODESYS and getting named I/O channels back.
+
+            {"code": "request", "cid": -1, "adr": "gettree"}
+        """
+        reply = self._post({"code": "request", "cid": -1, "adr": "gettree"})
+        data = reply.get("data")
+        return data if isinstance(data, dict) else {}
+
     def identify(self) -> Dict[str, Any]:
         """Block identity, for the dialog and for diagnostics."""
         info: Dict[str, Any] = {}
@@ -349,16 +363,23 @@ class IfmMasterClient:
 
         This is what the "Scan ports" button in the gateway dialog calls, so an
         operator sees their actual hardware instead of typing port numbers and
-        hoping.
+        hoping. `gettree` is asked first so the block declares its own ports —
+        a 4-port master is not probed as if it had 8.
         """
+        try:
+            declared = ports_from_tree(self.get_tree())
+        except Exception:
+            declared = []
+        port_list = declared or list(range(1, max(1, int(port_count)) + 1))
+
         adrs: List[str] = []
-        for p in range(1, max(1, int(port_count)) + 1):
+        for p in port_list:
             adrs += [port_productname_adr(p), port_vendorid_adr(p),
                      port_deviceid_adr(p), port_pdin_adr(p)]
         values = self.get_many(adrs)
 
         ports: List[Dict[str, Any]] = []
-        for p in range(1, max(1, int(port_count)) + 1):
+        for p in port_list:
             name, name_code = values.get(port_productname_adr(p), (None, 0))
             vendor, _ = values.get(port_vendorid_adr(p), (None, 0))
             device, _ = values.get(port_deviceid_adr(p), (None, 0))
@@ -465,3 +486,29 @@ def fields_from_config(ifm_ports: List[Dict[str, Any]]) -> List[IfmField]:
         if profile_id:
             out.extend(fields_from_profile(profile_id, port, prefix))
     return out
+
+
+def ports_from_tree(tree: Dict[str, Any]) -> List[int]:
+    """Port numbers the block itself declares, from a `gettree` reply.
+
+    Falls back to an empty list when the shape is unfamiliar; the caller then
+    uses the configured port count. Firmware differs in how deeply it nests
+    `iolinkmaster`, so this walks rather than assuming a fixed path.
+    """
+    found: set = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(key, str) and key.startswith("port["):
+                    try:
+                        found.add(int(key.split("[")[1].split("]")[0]))
+                    except Exception:
+                        pass
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(tree)
+    return sorted(found)

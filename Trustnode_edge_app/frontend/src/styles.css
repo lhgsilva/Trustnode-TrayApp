@@ -6675,3 +6675,57 @@ textarea {
   line-height: 1.45;
   margin-bottom: 10px;
 }
+
+/* IFM IO-Link mapper inside the gateway dialog (2026-08-24). Scoped to
+   .ifm-panel so it cannot touch any other gateway type's layout. */
+.ifm-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  margin-top: 8px;
+}
+.ifm-help { font-size: 12px; line-height: 1.45; max-width: 62ch; }
+.ifm-conn-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+.ifm-check {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+.ifm-check > input[type="checkbox"] { width: auto; min-width: auto; margin: 0; }
+.ifm-port-card {
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+.ifm-port-head { align-items: center; gap: 10px; flex-wrap: wrap; }
+.ifm-preview code { font-size: 12px; }
+.ifm-preview-val { margin-right: 10px; }
+.ifm-field-table { overflow-x: auto; }
+.ifm-field-head,
+.ifm-field-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.6fr) 90px 70px 120px 90px 90px 90px 90px;
+  gap: 6px;
+  align-items: center;
+}
+.ifm-field-head {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  opacity: .7;
+  margin-bottom: 4px;
+}
+.ifm-field-row { margin-bottom: 6px; }
+.ifm-field-row input,
+.ifm-field-row select { min-width: 0; width: 100%; }

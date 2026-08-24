@@ -1531,6 +1531,31 @@ async function _retentionCall(path, { method = "GET", body, timeoutMs } = {}) {
   return res.json();
 }
 
+// --------------------------------------------------------------- IFM IO-Link
+// 2026-08-24: an ifm IO-Link master serves its data as JSON on its IoT port.
+// These two calls are what make the gateway dialog usable: one asks the block
+// what is plugged in, the other decodes a LIVE value with a candidate bit
+// mapping so an operator can confirm it before saving.
+export async function scanIfmPorts(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/ifm/scan-ports`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  }, 30000);
+  await ensureOk(res, "IFM port scan failed");
+  return res.json();
+}
+
+export async function previewIfmPort(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/ifm/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  }, 20000);
+  await ensureOk(res, "IFM preview failed");
+  return res.json();
+}
+
 export async function getRetentionStatus() {
   return _retentionCall("/retention/v2/status");
 }

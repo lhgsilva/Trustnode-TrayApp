@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(ROOT, "backend"))
 
 from app.drivers.ifm_iolink import (  # noqa: E402
     DecodeError, IfmField, IfmMasterClient, decode_field, fields_from_config,
-    fields_from_profile, port_pdin_adr, profile_for,
+    fields_from_profile, port_pdin_adr, ports_from_tree, profile_for,
 )
 
 FAILS = []
@@ -101,7 +101,8 @@ check("a disabled port contributes nothing", not any(f.port == 2 for f in built)
 # ------------------------------------------------------------------- transport
 print("\n[TRANSPORT against a fake master]")
 
-STATE = {"multi_enabled": True, "multi_calls": 0, "get_calls": 0}
+STATE = {"multi_enabled": True, "multi_calls": 0, "get_calls": 0,
+         "tree_enabled": True, "tree_calls": 0}
 PDIN = {1: "03C9", 3: "04D2", 5: "00FF"}
 
 
@@ -146,6 +147,21 @@ class FakeMaster(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length).decode() or "{}")
+        if body.get("adr") == "gettree":
+            if not STATE.get("tree_enabled", True):
+                self._send({"cid": -1, "code": 400}, status=400)
+                return
+            STATE["tree_calls"] = STATE.get("tree_calls", 0) + 1
+            self._send({"cid": -1, "code": 200, "data": {
+                "identifier": "iolinkmaster",
+                "subs": {"iolinkmaster": {
+                    "port[1]": {"identifier": "port"},
+                    "port[2]": {"identifier": "port"},
+                    "port[3]": {"identifier": "port"},
+                    "port[4]": {"identifier": "port"},
+                    "port[5]": {"identifier": "port"},
+                }}}})
+            return
         if body.get("adr") == "/getdatamulti":
             if not STATE["multi_enabled"]:
                 self._send({"cid": 1, "code": 400}, status=400)
@@ -170,7 +186,11 @@ info = client.identify()
 check("block identity read", info.get("product_code") == "AL1326", info)
 
 ports = client.scan_ports(port_count=8)
-check("scan reports all 8 ports", len(ports) == 8, len(ports))
+# the fake block declares FIVE ports via gettree, so a scan must probe five --
+# not the eight we would otherwise have assumed. This is what stops a 4-port
+# master being probed as if it had 8.
+check("gettree decides how many ports to probe", len(ports) == 5, len(ports))
+check("  and gettree was actually used", STATE.get("tree_calls", 0) >= 1, STATE.get("tree_calls"))
 connected = [p for p in ports if p["connected"]]
 check("scan finds the connected sensors", sorted(p["port"] for p in connected) == [1, 3, 5],
       [p["port"] for p in connected])
@@ -226,6 +246,20 @@ dead = IfmMasterClient(host="127.0.0.1", port=9, timeout_s=1.0)
 rows = dead.read_fields([IfmField("X", 1, 0, 16, "uint")])
 check("an unreachable master returns BAD quality quickly",
       len(rows) == 1 and rows[0]["quality"] == 0, rows)
+
+# a block whose firmware has no gettree still scans, using the configured count
+STATE["tree_enabled"] = False
+client3 = IfmMasterClient(host=host, port=port, timeout_s=5.0)
+ports3 = client3.scan_ports(port_count=8)
+check("without gettree it falls back to the configured port count",
+      len(ports3) == 8, len(ports3))
+check("  and still finds the sensors", len([p for p in ports3 if p["connected"]]) == 3,
+      [p["port"] for p in ports3 if p["connected"]])
+STATE["tree_enabled"] = True
+
+check("ports_from_tree reads a nested tree",
+      ports_from_tree({"subs": {"iolinkmaster": {"port[1]": {}, "port[4]": {}}}}) == [1, 4])
+check("ports_from_tree survives an unfamiliar shape", ports_from_tree({"nope": 1}) == [])
 
 srv.shutdown()
 print()

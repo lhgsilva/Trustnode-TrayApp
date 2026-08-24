@@ -1,6 +1,7 @@
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Login } from "./components/Login/Login";
 import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
+import IfmPortMapper from "./components/Gateways/IfmPortMapper";
 import { DASHBOARD_GRID_VERSION, migrateWidgetsToFinerGrid } from "./components/Dashboard/widgetRegistry";
 import { registerDeclaredTagTypes } from "./components/Dashboard/tagTypes";
 import { ReportTemplateDesigner } from "./components/Reports/ReportTemplateDesigner";
@@ -385,7 +386,11 @@ const gatewayOptions = [
   { value: "allen_bradley", label: "Allen-Bradley" },
   { value: "siemens_snap7", label: "Siemens Snap7" },
   { value: "siemens_opcua", label: "Siemens OPC-UA" },
-  { value: "boston", label: "Boston" }
+  { value: "boston", label: "Boston" },
+  // 2026-08-24: an ifm IO-Link master (AL13xx) read over its IoT port. Its
+  // sensors become ordinary tags, so everything downstream treats them the
+  // same as a PLC tag.
+  { value: "ifm_iolink", label: "IFM IO-Link master" }
 ];
 
 // 2026-08-22: ONE resolution for the feature pairs that exist twice in saved
@@ -3772,7 +3777,16 @@ function AppShell() {
     // Default ON — baseline policy is "restore gateways that were
     // running". Operator can flip OFF per-gateway to disable it.
     auto_recover_enabled: true,
-    tags_text: ""
+    tags_text: "",
+    // IFM IO-Link (2026-08-24). Ignored entirely unless gateway_type is
+    // "ifm_iolink"; defaults keep every existing gateway form unchanged.
+    ifm_http_port: 80,
+    ifm_use_https: false,
+    ifm_verify_tls: false,
+    ifm_username: "",
+    ifm_password: "",
+    ifm_port_count: 8,
+    ifm_ports: []
   });
   const [showDbModal, setShowDbModal] = useState(false);
   const [editingDbId, setEditingDbId] = useState(null);
@@ -15302,6 +15316,15 @@ const getGatewayHealth = (gateway) => {
       // SQLite + customer SQLite + WebSocket broadcast) saturates a single
       // worker thread. The new floor lets the loop hit the target.
       interval_ms: Math.max(200, Number(gatewayForm.interval_ms || 1000)),
+      // IFM IO-Link mapping (2026-08-24). Saved for every gateway so the shape
+      // is stable, but only read by the backend when the type is ifm_iolink.
+      ifm_http_port: Number(gatewayForm.ifm_http_port || 80),
+      ifm_use_https: Boolean(gatewayForm.ifm_use_https),
+      ifm_verify_tls: Boolean(gatewayForm.ifm_verify_tls),
+      ifm_username: String(gatewayForm.ifm_username || ""),
+      ifm_password: String(gatewayForm.ifm_password || ""),
+      ifm_port_count: Number(gatewayForm.ifm_port_count || 8),
+      ifm_ports: Array.isArray(gatewayForm.ifm_ports) ? gatewayForm.ifm_ports : [],
       // Operator 2026-06-21: opt-in auto-resume per gateway. Default
       // false — the worker only comes back after a backend restart if
       // the operator explicitly checked "Resume on restart" in Edit.
@@ -28406,6 +28429,13 @@ const getGatewayHealth = (gateway) => {
                   </small>
                 </span>
               </label>
+              {gatewayForm.gateway_type === "ifm_iolink" ? (
+                <IfmPortMapper
+                  form={gatewayForm}
+                  disabled={!canEditPage("gateway_configuration")}
+                  onChange={(patch) => setGatewayForm((prev) => ({ ...prev, ...patch }))}
+                />
+              ) : null}
               {/* Operator request 2026-06-12 (re-rev): "we don't need
                   the field where the tags are separated by ';', we
                   have already the selected tags field now, the
