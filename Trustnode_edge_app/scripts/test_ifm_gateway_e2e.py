@@ -149,6 +149,18 @@ check("preview decodes it to 24.2 degC",
       abs(((prev or {}).get("values") or [{}])[0].get("value", 0) - 24.2) < 1e-9,
       (prev or {}).get("values"))
 
+# --- "Search Available Tags" must reach the same block ---------------------
+# It shares the discovery endpoint with every other gateway type, so it has to
+# carry the IFM connection details or a block on a non-default IoT port is
+# reachable from "Scan ports" and invisible here.
+st, disc = call("POST", "/api/plc/discover-tags", admin, {
+    "gateway_type": "ifm_iolink", "plc_ip": BLOCK_HOST,
+    "ifm_http_port": BLOCK_PORT, "ifm_port_count": 8})
+check("tag discovery reaches a block on a non-default port",
+      st == 200 and bool((disc or {}).get("ok")), f"status={st} {str(disc)[:110]}")
+check("it suggests searchable tag names",
+      len((disc or {}).get("tags") or []) >= 2, (disc or {}).get("tags"))
+
 # --- configure and START a real gateway -----------------------------------
 IFM_PORTS = [
     {"port": 1, "enabled": True, "prefix": "",

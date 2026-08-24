@@ -15389,7 +15389,15 @@ const getGatewayHealth = (gateway) => {
         plc_ip: gatewayForm.plc_ip.trim(),
         opc_url: gatewayForm.opc_url.trim(),
         timeout_ms: 6000,
-        max_tags: 5000
+        max_tags: 5000,
+        // So an IFM block on a non-default IoT port or behind HTTPS is reachable
+        // from "Search Available Tags", not only from "Scan ports".
+        ifm_http_port: Number(gatewayForm.ifm_http_port || 80),
+        ifm_use_https: Boolean(gatewayForm.ifm_use_https),
+        ifm_verify_tls: Boolean(gatewayForm.ifm_verify_tls),
+        ifm_username: String(gatewayForm.ifm_username || ""),
+        ifm_password: String(gatewayForm.ifm_password || ""),
+        ifm_port_count: Number(gatewayForm.ifm_port_count || 8)
       });
       const tags = Array.isArray(res.tags) ? res.tags : [];
       // Remember the controller's DECLARED data types so the dashboard widget

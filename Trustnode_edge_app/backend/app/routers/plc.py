@@ -55,6 +55,15 @@ class TagDiscoveryRequest(BaseModel):
     opc_url: str = ""
     timeout_ms: int = 4000
     max_tags: int = 500
+    # 2026-08-24: IFM connection details, so "Search Available Tags" reaches a
+    # block on a non-default IoT port or behind HTTPS exactly like "Scan ports"
+    # does. Ignored by every other gateway type.
+    ifm_http_port: int = 80
+    ifm_use_https: bool = False
+    ifm_verify_tls: bool = False
+    ifm_username: str = ""
+    ifm_password: str = ""
+    ifm_port_count: int = 8
 
 
 class TagDiscoveryResult(BaseModel):
@@ -992,8 +1001,14 @@ def _discover_ifm_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
     try:
         from app.drivers.ifm_iolink import fields_from_profile
         client = _ifm_client(IfmScanRequest(
-            plc_ip=payload.plc_ip, timeout_ms=payload.timeout_ms))
-        ports = client.scan_ports()
+            plc_ip=payload.plc_ip, timeout_ms=payload.timeout_ms,
+            http_port=int(payload.ifm_http_port or 80),
+            use_https=bool(payload.ifm_use_https),
+            verify_tls=bool(payload.ifm_verify_tls),
+            username=str(payload.ifm_username or ""),
+            password=str(payload.ifm_password or ""),
+            port_count=int(payload.ifm_port_count or 8)))
+        ports = client.scan_ports(port_count=int(payload.ifm_port_count or 8))
     except Exception as exc:
         return TagDiscoveryResult(ok=False, tags=[],
                                   message=f"Could not reach the IFM block: {exc}")
