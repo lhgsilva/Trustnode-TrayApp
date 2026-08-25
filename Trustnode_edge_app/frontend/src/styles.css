@@ -6746,3 +6746,96 @@ textarea {
   white-space: nowrap;
   min-width: 0;
 }
+
+/* ---------------------------------------------------------------------------
+ * Gateway dialog — density and alignment (2026-08-25)
+ *
+ * Reported: "fields are not aligned, too much space vertically and do not fit
+ * in the computer page". The dialog had grown protocol sections (schedule,
+ * auto-recover, IFM, EtherNet/IP) each with its own generous block spacing, so
+ * on a 1080p screen the Save row fell below the fold. These rules tighten the
+ * dialog ONLY — scoped to .gateway-modal-card, so no other modal changes.
+ * --------------------------------------------------------------------------- */
+.gateway-modal-card {
+  /* Taller usable area, and dvh so a browser's chrome does not steal the
+     bottom of the dialog on the LAN surfaces. */
+  max-height: 92vh;
+  max-height: 92dvh;
+}
+
+.gateway-modal-card .gateway-form-grid {
+  gap: 8px 14px;
+  align-items: start;
+}
+
+/* Every field is a label + control stack of the SAME height, so the two
+   columns line up instead of drifting apart when one has a hint under it. */
+.gateway-modal-card .gateway-form-grid > label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  min-width: 0;
+}
+
+.gateway-modal-card .gateway-form-grid > label > input,
+.gateway-modal-card .gateway-form-grid > label > select {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+}
+
+.gateway-modal-card .gateway-form-grid > label > small,
+.gateway-modal-card .hint {
+  font-size: 11px;
+  line-height: 1.3;
+  margin: 0;
+  opacity: .75;
+}
+
+/* The toggle blocks (schedule, auto-recover) carried a full paragraph of
+   explanation each. Keep the text — an operator needs it — but stop it
+   setting the dialog's height. */
+.gateway-modal-card .gateway-span-2 > .info-note,
+.gateway-modal-card .gateway-span-2 > p,
+.gateway-modal-card .gateway-span-2 small {
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.gateway-modal-card section,
+.gateway-modal-card .ifm-panel {
+  padding: 10px 12px;
+  margin-top: 6px;
+}
+
+.gateway-modal-card .ifm-panel {
+  gap: 8px;
+}
+
+.gateway-modal-card h3 {
+  margin: 0 0 8px;
+}
+
+/* The action row stays reachable: it sticks to the bottom of the scrolling
+   dialog rather than living at the end of a long page. */
+.gateway-modal-card .modal-actions {
+  position: sticky;
+  bottom: 0;
+  background: var(--card);
+  padding: 10px 0 2px;
+  margin-top: 10px;
+  border-top: 1px solid var(--stroke);
+  z-index: 2;
+}
+
+/* One column on a short or narrow window, so nothing is clipped sideways. */
+@media (max-height: 800px) {
+  .gateway-modal-card .ifm-panel .ifm-help {
+    display: none;              /* guidance, not needed once configured */
+  }
+  .gateway-modal-card section,
+  .gateway-modal-card .ifm-panel {
+    padding: 8px 10px;
+  }
+}

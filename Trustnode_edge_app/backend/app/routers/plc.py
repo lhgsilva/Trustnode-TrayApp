@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from app.models import GatewayConfig, GatewayReading, GatewayStatus
+from app.models import GatewayConfig, GatewayReading, GatewayStatus, GatewayType
 from app.opcua_utils import resolve_requested_nodes, split_requested_identifiers
 from app.state import app_store, plc_manager
 
@@ -19,12 +19,19 @@ router = APIRouter(prefix="/api/plc", tags=["plc"])
 
 
 class DeviceConnectionTestRequest(BaseModel):
-    gateway_type: Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston"]
+    # 2026-08-25: this used to repeat the gateway-type union by hand, so every
+    # new device type made Test Connection answer 422 "[object Object]" while
+    # the gateway itself worked. Use the ONE canonical union from models.
+    gateway_type: GatewayType
     plc_ip: str
     opc_url: str = ""
     opc_node_id: str = ""
     opc_node_ids: list[str] = Field(default_factory=list)
     timeout_ms: int = 2000
+    # ifm blocks: the IoT Core port is configurable, so the reachability test
+    # must probe the port the operator actually set.
+    ifm_http_port: int = 0
+    ifm_use_https: bool = False
 
 
 class DeviceConnectionTestResult(BaseModel):
@@ -49,8 +56,7 @@ class GatewayRuntimeStopRequest(BaseModel):
 
 
 class TagDiscoveryRequest(BaseModel):
-    gateway_type: Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston",
-                          "ifm_iolink", "ethernet_ip"]
+    gateway_type: GatewayType
     plc_ip: str
     opc_url: str = ""
     timeout_ms: int = 4000
@@ -136,7 +142,9 @@ def _gateway_port(gateway_type: str) -> int:
         "allen_bradley": 44818,  # EtherNet/IP
         "siemens_snap7": 102,    # ISO-on-TCP (S7Comm)
         "siemens_opcua": 4840,   # OPC-UA
-        "boston": 502            # Modbus TCP (fallback for custom connector)
+        "boston": 502,           # Modbus TCP (fallback for custom connector)
+        "ifm_iolink": 80,        # ifm IoT Core, HTTP/JSON
+        "ethernet_ip": 44818,    # generic EtherNet/IP adapter
     }
     return ports.get(gateway_type, 0)
 
@@ -185,6 +193,11 @@ def _check_tcp_port(host: str, port: int, timeout_ms: int) -> tuple[bool, str]:
 def _resolve_host_port(payload: DeviceConnectionTestRequest) -> tuple[str, int]:
     default_port = _gateway_port(payload.gateway_type)
     ip = payload.plc_ip.strip()
+    if payload.gateway_type == "ifm_iolink":
+        # The IoT Core is usually on 80 but can be moved, and HTTPS builds use
+        # 443. Honour whatever the dialog is configured with.
+        port = int(payload.ifm_http_port or 0) or (443 if payload.ifm_use_https else 80)
+        return ip, port
     if payload.gateway_type != "siemens_opcua":
         return ip, default_port
     opc_url = (payload.opc_url or "").strip()
@@ -1153,7 +1166,7 @@ class NetworkScanRequest(BaseModel):
     # IPs ("192.168.1.10,192.168.1.50") we restrict the probe to those
     # hosts only.
     scan_range: str = ""
-    gateway_type: Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston"] = "allen_bradley"
+    gateway_type: GatewayType = "allen_bradley"
     timeout_ms: int = 4000
     include_tcp_probe: bool = True
     # Operator 2026-06-12: "we should scan for any TCP/IP devices,

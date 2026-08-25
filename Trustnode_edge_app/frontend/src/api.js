@@ -203,6 +203,32 @@ export function getCloudWsStreamUrl() {
   return `${wsBase}/ws/cloud-live${token ? `?token=${encodeURIComponent(token)}` : ""}`;
 }
 
+/** A readable sentence from any FastAPI error body.
+ *
+ * 2026-08-25: callers did `body?.detail || JSON.stringify(body)`. A 422 returns
+ * detail as an ARRAY of validation errors, which a template literal renders as
+ * "[object Object]" — the operator saw that instead of "gateway_type: input
+ * should be 'allen_bradley', ...", which is the one thing that would have told
+ * them what was wrong.
+ */
+export function describeApiError(body) {
+  if (body == null) return "";
+  if (typeof body === "string") return body;
+  const detail = body.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((d) => {
+        const where = Array.isArray(d?.loc) ? d.loc.filter((x) => x !== "body").join(".") : "";
+        const msg = d?.msg || d?.type || JSON.stringify(d);
+        return where ? `${where}: ${msg}` : String(msg);
+      })
+      .join("; ");
+  }
+  if (detail && typeof detail === "object") return JSON.stringify(detail);
+  try { return JSON.stringify(body); } catch { return String(body); }
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -297,7 +323,7 @@ export async function loginAuth(payloadOrUsername, maybePassword) {
     let detail = "";
     try {
       const body = await res.json();
-      detail = body?.detail || JSON.stringify(body);
+      detail = describeApiError(body);
     } catch {
       detail = await res.text();
     }
@@ -549,7 +575,7 @@ export async function testPlcConnection(payload) {
     let detail = "";
     try {
       const body = await res.json();
-      detail = body?.detail || JSON.stringify(body);
+      detail = describeApiError(body);
     } catch {
       try {
         detail = await res.text();
@@ -587,7 +613,7 @@ export async function discoverPlcTags(payload) {
     let detail = "";
     try {
       const body = await res.json();
-      detail = body?.detail || JSON.stringify(body);
+      detail = describeApiError(body);
     } catch {
       try {
         detail = await res.text();
@@ -655,7 +681,7 @@ export async function discoverPlcNetwork(payload) {
     let detail = "";
     try {
       const body = await res.json();
-      detail = body?.detail || JSON.stringify(body);
+      detail = describeApiError(body);
     } catch {
       try { detail = await res.text(); } catch { detail = ""; }
     }
@@ -701,7 +727,7 @@ export async function browseOpcUaNodes(payload) {
     let detail = "";
     try {
       const body = await res.json();
-      detail = body?.detail || JSON.stringify(body);
+      detail = describeApiError(body);
     } catch {
       try {
         detail = await res.text();
@@ -787,7 +813,7 @@ export async function provisionDatabaseObjects(payload) {
     let detail = "";
     try {
       const body = await res.json();
-      detail = body?.detail || JSON.stringify(body);
+      detail = describeApiError(body);
     } catch {
       try {
         detail = await res.text();
@@ -810,7 +836,7 @@ export async function activateDatabaseSink(payload) {
     let detail = "";
     try {
       const body = await res.json();
-      detail = body?.detail || JSON.stringify(body);
+      detail = describeApiError(body);
     } catch {
       try {
         detail = await res.text();
@@ -960,7 +986,7 @@ export async function saveAppStoreDomain(domain, payload, actor = "system", opti
     let detail = "";
     try {
       const body = await res.json();
-      detail = body?.detail || JSON.stringify(body);
+      detail = describeApiError(body);
     } catch {
       try {
         detail = await res.text();

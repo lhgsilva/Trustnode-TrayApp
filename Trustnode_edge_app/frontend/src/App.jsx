@@ -12686,7 +12686,25 @@ const getGatewayHealth = (gateway) => {
   const getGatewayFooterAddress = (gateway) => {
     if (!gateway) return "-";
     if (gateway.gateway_type === "siemens_opcua" && gateway.opc_url) return gateway.opc_url;
-    return gateway.plc_ip || "-";
+    // 2026-08-25: the footer must describe EVERY gateway kind — PLCs, power
+    // meters, ifm blocks, EtherNet/IP devices — not just the ones it was
+    // written for. Show the port whenever it is not the protocol default,
+    // because "192.168.1.250" alone does not tell an operator which service
+    // this gateway is actually talking to.
+    const ip = gateway.plc_ip || "";
+    if (!ip) return "-";
+    const type = String(gateway.gateway_type || "");
+    if (type === "ifm_iolink") {
+      const port = Number(gateway.ifm_http_port || 80);
+      const scheme = gateway.ifm_use_https ? "https" : "http";
+      const isDefault = (scheme === "https" && port === 443) || (scheme === "http" && port === 80);
+      return isDefault ? ip : `${ip}:${port}`;
+    }
+    if (type === "ethernet_ip") {
+      const asm = Number(gateway.eip_input_assembly || 0);
+      return asm ? `${ip} (asm ${asm})` : ip;
+    }
+    return ip;
   };
 
   // Resolve the PLC endpoint (the address that uniquely identifies the
@@ -15242,7 +15260,26 @@ const getGatewayHealth = (gateway) => {
       // Undefined => default ON (baseline restore policy). Only an
       // explicit `false` in the saved config keeps it off.
       auto_recover_enabled: gateway.auto_recover_enabled !== false,
-      tags_text: (gateway.tags || []).join(";")
+      tags_text: (gateway.tags || []).join(";"),
+      // 2026-08-25: these were NOT restored when reopening a saved gateway, so
+      // the mapping the operator had just scanned and ticked came back empty and
+      // was written back empty on the next save — the tags "did not stay".
+      // Every protocol-specific field a gateway can carry belongs here.
+      ifm_http_port: Number(gateway.ifm_http_port || 80),
+      ifm_use_https: Boolean(gateway.ifm_use_https),
+      ifm_verify_tls: Boolean(gateway.ifm_verify_tls),
+      ifm_username: String(gateway.ifm_username || ""),
+      ifm_password: String(gateway.ifm_password || ""),
+      ifm_port_count: Number(gateway.ifm_port_count || 8),
+      ifm_ports: Array.isArray(gateway.ifm_ports) ? gateway.ifm_ports : [],
+      ifm_variant: String(gateway.ifm_variant || "auto"),
+      ifm_datapoints: Array.isArray(gateway.ifm_datapoints) ? gateway.ifm_datapoints : [],
+      eip_input_assembly: Number(gateway.eip_input_assembly || 0),
+      eip_output_assembly: Number(gateway.eip_output_assembly || 0),
+      eip_config_assembly: Number(gateway.eip_config_assembly || 0),
+      eip_slot: Number(gateway.eip_slot || 0),
+      eip_signals: Array.isArray(gateway.eip_signals) ? gateway.eip_signals : [],
+      eip_device_info: gateway.eip_device_info || {}
     });
     setShowGatewayModal(true);
   };
@@ -15258,6 +15295,12 @@ const getGatewayHealth = (gateway) => {
       device_id: deviceId,
       gateway_type: device.gateway_type,
       plc_ip: device.plc_ip || "",
+      // Carry the device's own connection settings into the gateway, the same
+      // way plc_ip is carried — otherwise an ifm block added on a non-default
+      // IoT port loses it the moment it is linked to a gateway.
+      ifm_http_port: Number(device.ifm_http_port || prev.ifm_http_port || 80),
+      ifm_use_https: device.ifm_use_https ?? prev.ifm_use_https,
+      ifm_variant: String(device.ifm_variant || prev.ifm_variant || "auto"),
       opc_url:
         device.gateway_type === "siemens_opcua"
           ? device.opc_url || buildOpcUrlFromIp(device.plc_ip)
