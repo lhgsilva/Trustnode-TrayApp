@@ -11,8 +11,20 @@ const FORCE_CLOUD_URL =
 // resolves same-origin (hosted portal / cloud web client) or, on a file:// edge,
 // the URL delivered by the activation code + persisted server-side. An empty
 // fallback here is handled by the `if (CONTROL_PLANE_FALLBACK_URL)` guards below.
+// The portal an activation code is checked against, when the machine does not
+// already know one.
+//
+// 2026-08-25: this was env-var-only, and the variable was declared in no
+// committed file — every .env* is gitignored because they hold credentials. So
+// it built as "", and a BRAND-NEW computer (nothing in localStorage either) had
+// no address to activate against: the request was never sent and the operator
+// saw an unexplained "activation failed". A default in code is what makes a
+// clean clone build a working installer. It is a public HTTPS endpoint, not a
+// secret, and it is overridable two ways: VITE_TRUSTNODE_CONTROL_PLANE_URL at
+// build time, or the Portal address field on the activation screen at run time.
+const DEFAULT_CONTROL_PLANE_URL = "https://trustnode.lsapps.app";
 const CONTROL_PLANE_FALLBACK_URL = normalizeBaseUrl(
-  import.meta.env.VITE_TRUSTNODE_CONTROL_PLANE_URL || ""
+  import.meta.env.VITE_TRUSTNODE_CONTROL_PLANE_URL || DEFAULT_CONTROL_PLANE_URL
 );
 const FORCE_READONLY = String(import.meta.env.VITE_TRUSTNODE_READONLY || "").toLowerCase() === "true";
 const FORCE_CLIENT_VIEW = String(import.meta.env.VITE_TRUSTNODE_CLIENT_VIEW || "").toLowerCase() === "true";
@@ -2891,13 +2903,26 @@ export async function registerControlPlaneEdgeLinkLogin(payload) {
   };
   const primaryBase = normalizeBaseUrl(getApiBase());
   const storedCloud = normalizeBaseUrl(localStorage.getItem(STORAGE_CLOUD_URL_KEY) || "");
+  // 2026-08-25: a BRAND-NEW machine has nothing in localStorage, and
+  // VITE_TRUSTNODE_CONTROL_PLANE_URL is not set in every build — so this list
+  // could come out EMPTY. The loop below then never ran, lastErr stayed null,
+  // and the operator got the bare "Control-plane edge-link login activation
+  // failed" with no clue that the app simply had nowhere to send the request.
+  // An explicit portal URL on the activation form is honoured first.
+  const explicitCloud = normalizeBaseUrl(payload?.control_plane_url || "");
   const cloudBases = Array.from(
     new Set(
-      [storedCloud, CONTROL_PLANE_FALLBACK_URL]
+      [explicitCloud, storedCloud, CONTROL_PLANE_FALLBACK_URL]
         .map((v) => normalizeBaseUrl(v || ""))
         .filter(Boolean)
     )
   );
+  if (!cloudBases.length) {
+    throw new Error(
+      "No TrustNode portal address is configured on this computer, so the " +
+      "activation code has nowhere to go. Enter your portal URL (for example " +
+      "https://portal.example.com) in the Portal address field and try again.");
+  }
   const cloudFirst = cloudBases[0] || CONTROL_PLANE_FALLBACK_URL;
 
   const tryLocalFinalize = async (sourceBase, dataLike) => {
@@ -2987,6 +3012,9 @@ export async function registerControlPlaneEdgeLinkLogin(payload) {
       if (registerRes.ok) {
         const scopedData = await ensureActivationScope(base, registerData);
         await tryLocalFinalize(base, scopedData);
+        // Remember the portal that worked: a re-activation on this machine, or
+        // a licence re-check, then needs no typing.
+        try { localStorage.setItem(STORAGE_CLOUD_URL_KEY, base); } catch { /* non-fatal */ }
         return scopedData;
       }
       const detail = String(registerData?.detail || registerData?.error || "").toLowerCase();

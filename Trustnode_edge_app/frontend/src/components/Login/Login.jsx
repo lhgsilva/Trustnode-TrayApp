@@ -42,11 +42,19 @@ export const Login = ({
     new_password: "",
   });
   const [forgotBusy, setForgotBusy] = useState(false);
-  const [edgeRegisterForm, setEdgeRegisterForm] = useState({
-    activation_code: "",
-    admin_username: "admin",
-    admin_password: "",
-    confirm_password: "",
+  const [edgeRegisterForm, setEdgeRegisterForm] = useState(() => {
+    // 2026-08-25: a fresh computer knows no portal address, which used to make
+    // activation fail with an unexplained error. Pre-fill whatever this machine
+    // already knows; the operator can correct it.
+    let known = "";
+    try { known = localStorage.getItem("trustnode_backend_cloud_url") || ""; } catch { known = ""; }
+    return {
+      activation_code: "",
+      control_plane_url: known,
+      admin_username: "admin",
+      admin_password: "",
+      confirm_password: "",
+    };
   });
   const [edgeRegisterResult, setEdgeRegisterResult] = useState("");
   const [edgeRegisterBusy, setEdgeRegisterBusy] = useState(false);
@@ -249,6 +257,7 @@ export const Login = ({
     try {
       const payload = {
         activation_code: activationCode,
+        control_plane_url: String(edgeRegisterForm.control_plane_url || "").trim(),
         // Edge identity is resolved from the activation code binding in control-plane.
         edge_id: "",
         edge_name: "",
@@ -395,6 +404,36 @@ export const Login = ({
               </div>
               <div className="auth-field-help">
                 A single string provided with your Edge license.
+              </div>
+            </label>
+
+            {/* 2026-08-25: a brand-new computer knows no portal address. Without
+                one the activation code has nowhere to go, and the failure used
+                to be reported as an unexplained "activation failed". Pre-filled
+                from whatever this machine already knows. */}
+            <label className="auth-field">
+              <span>Portal address</span>
+              <div className="input-wrapper">
+                <div className="field-icon">
+                  <svg viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="9" />
+                    <path d="M3 12h18M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18" />
+                  </svg>
+                </div>
+                <input
+                  placeholder="https://your-portal.example.com"
+                  value={edgeRegisterForm.control_plane_url}
+                  onChange={(e) =>
+                    setEdgeRegisterForm((p) => ({
+                      ...p,
+                      control_plane_url: e.target.value,
+                    }))
+                  }
+                />
+              </div>
+              <div className="auth-field-help">
+                Where your activation code is checked. Leave as-is if it is already
+                filled in; on a new computer, enter the TrustNode portal URL.
               </div>
             </label>
 
