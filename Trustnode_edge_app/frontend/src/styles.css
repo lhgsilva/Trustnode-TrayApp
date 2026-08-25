@@ -6734,3 +6734,15 @@ textarea {
 .eip-row {
   grid-template-columns: minmax(150px, 1.6fr) 100px 110px 60px 90px 90px 90px 90px;
 }
+
+.ifm-dp-head,
+.ifm-dp-row {
+  grid-template-columns: 70px minmax(150px, 1.4fr) minmax(0, 2fr) 90px 90px;
+}
+.ifm-dp-adr {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}

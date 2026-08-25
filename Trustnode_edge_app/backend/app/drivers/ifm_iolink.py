@@ -221,6 +221,113 @@ def fields_from_profile(profile_id: str, port: int, prefix: str = "") -> List[If
 
 
 # ---------------------------------------------------------------------------
+# Device variants
+# ---------------------------------------------------------------------------
+# An ifm block's address layout depends on what KIND of device it is. Rather
+# than a new gateway type per part number, a variant is data: how to find the
+# readable values, and how to turn one into a number.
+#
+#   iolink_master : AL13xx/AL14xx. Values live inside a port's `pdin` HEX string
+#                   and need bit extraction against the sensor's IODD.
+#   io_module     : AL40xx. Each input is its OWN datapoint holding a ready
+#                   integer (0/1) -- no decoding at all.
+#
+# Adding the next device is a new entry here plus, if needed, a decoder.
+VARIANT_IOLINK_MASTER = "iolink_master"
+VARIANT_IO_MODULE = "io_module"
+VARIANT_AUTO = "auto"
+
+VARIANTS: List[Dict[str, Any]] = [
+    {"id": VARIANT_AUTO, "label": "Detect automatically",
+     "description": "Ask the block what it is (gettree), then use the right layout."},
+    {"id": VARIANT_IOLINK_MASTER, "label": "IO-Link master (AL13xx / AL14xx)",
+     "description": "Sensors on IO-Link ports; values are decoded from each port's process data."},
+    {"id": VARIANT_IO_MODULE, "label": "I/O module (AL40xx, e.g. AL4022)",
+     "description": "Digital inputs and counters, each already a ready-to-use value."},
+]
+
+
+@dataclass
+class IfmDatapoint:
+    """One value to collect, addressed directly in the block's own tree.
+
+    This is the UNIFIED model across every ifm device. `adr` is whatever the
+    block calls the value. When `bit_length` is set the datapoint is a slice of
+    a HEX process-data string (an IO-Link port's pdin); otherwise the value the
+    block returns IS the value, which is the case for every AL40xx input.
+    """
+    name: str
+    adr: str
+    kind: str = "direct"          # direct | uint | int | bool | float32
+    bit_offset: int = 0
+    bit_length: int = 0           # 0 = take the value as-is
+    scale: float = 1.0
+    offset: float = 0.0
+    unit: str = ""
+
+    @staticmethod
+    def from_dict(raw: Dict[str, Any]) -> "IfmDatapoint":
+        return IfmDatapoint(
+            name=str(raw.get("name") or "").strip(),
+            adr=str(raw.get("adr") or "").strip(),
+            kind=str(raw.get("kind") or "direct").strip().lower(),
+            bit_offset=max(0, int(raw.get("bit_offset") or 0)),
+            bit_length=max(0, int(raw.get("bit_length") or 0)),
+            scale=float(raw.get("scale") if raw.get("scale") is not None else 1.0),
+            offset=float(raw.get("offset") or 0.0),
+            unit=str(raw.get("unit") or ""),
+        )
+
+
+def datapoints_from_config(raw_points: List[Dict[str, Any]]) -> List[IfmDatapoint]:
+    """Saved datapoints -> readable list, duplicates dropped (first wins)."""
+    out: List[IfmDatapoint] = []
+    seen: set = set()
+    for item in raw_points or []:
+        if not isinstance(item, dict):
+            continue
+        if not bool(item.get("enabled", True)):
+            continue
+        dp = IfmDatapoint.from_dict(item)
+        if not dp.name or not dp.adr:
+            continue
+        key = dp.name.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dp)
+    return out
+
+
+def value_of_datapoint(raw_value: Any, dp: IfmDatapoint) -> float | bool:
+    """Turn one raw reply into an engineering value.
+
+    Two shapes, one function: a hex process-data string that needs a bit slice,
+    or a value the block already computed. The AL4022 is entirely the second
+    kind, which is why it needs no IODD.
+    """
+    if dp.bit_length > 0:
+        fld = IfmField(name=dp.name, port=0, bit_offset=dp.bit_offset,
+                       bit_length=dp.bit_length, kind=(dp.kind if dp.kind != "direct" else "uint"),
+                       scale=dp.scale, offset=dp.offset, unit=dp.unit)
+        return decode_field(str(raw_value), fld)
+
+    if raw_value is None:
+        raise DecodeError("no value returned")
+    if isinstance(raw_value, bool):
+        return raw_value
+    if dp.kind == "bool":
+        return bool(int(raw_value))
+    try:
+        number = float(raw_value)
+    except (TypeError, ValueError):
+        # Some datapoints are strings (product names, tags). Numeric consumers
+        # cannot use them, so say so rather than inventing a number.
+        raise DecodeError(f"'{raw_value}' is not numeric") from None
+    return number * dp.scale + dp.offset
+
+
+# ---------------------------------------------------------------------------
 # Transport
 # ---------------------------------------------------------------------------
 @dataclass
@@ -346,6 +453,128 @@ class IfmMasterClient:
         data = reply.get("data")
         return data if isinstance(data, dict) else {}
 
+    def query_profile(self, profile: str = "processdata") -> List[str]:
+        """Every datapoint the block tags with a profile, via `querytree`.
+
+        This is the device telling us what is worth reading. For an AL4022 the
+        "processdata" profile returns each digital input and each counter, which
+        is exactly the list an operator wants to tick.
+        """
+        try:
+            reply = self._post({"code": "request", "cid": -1, "adr": "querytree",
+                                "data": {"profile": str(profile or "processdata")}})
+        except Exception:
+            return []
+        data = reply.get("data")
+        found: List[str] = []
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                adr = node.get("adr") or node.get("identifier")
+                if isinstance(adr, str) and adr.startswith("/"):
+                    found.append(adr)
+                for value in node.values():
+                    _walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk(item)
+
+        _walk(data)
+        return sorted(set(found))
+
+    def detect_variant(self) -> str:
+        """Ask the block what shape it is, from its own tree."""
+        try:
+            tree = self.get_tree()
+        except Exception:
+            return VARIANT_IOLINK_MASTER
+        text = json.dumps(tree)
+        if '"iolinkmaster"' in text:
+            return VARIANT_IOLINK_MASTER
+        if '"io"' in text and "digital_input" in text:
+            return VARIANT_IO_MODULE
+        return VARIANT_IOLINK_MASTER
+
+    def discover_datapoints(self, variant: str = VARIANT_AUTO,
+                            port_count: int = DEFAULT_PORT_COUNT) -> Dict[str, Any]:
+        """Everything this block offers to collect, whatever kind it is.
+
+        Returns {variant, datapoints[], message}. Each datapoint is ready to be
+        ticked and saved — name, address, and how to read it — so the dialog
+        never asks an operator to type an address.
+        """
+        resolved = variant if variant in (VARIANT_IOLINK_MASTER, VARIANT_IO_MODULE)             else self.detect_variant()
+
+        if resolved == VARIANT_IO_MODULE:
+            points = self._discover_io_module()
+            return {"variant": resolved, "datapoints": points,
+                    "message": f"{len(points)} input(s) found on this I/O module."}
+
+        ports = self.scan_ports(port_count=port_count)
+        points = []
+        for prt in ports:
+            if not prt.get("connected"):
+                continue
+            port_no = int(prt["port"])
+            profile_id = str(prt.get("suggested_profile") or "")
+            adr = port_pdin_adr(port_no)
+            if profile_id:
+                for fld in fields_from_profile(profile_id, port_no):
+                    points.append({
+                        "name": fld.name, "adr": adr, "kind": fld.kind,
+                        "bit_offset": fld.bit_offset, "bit_length": fld.bit_length,
+                        "scale": fld.scale, "offset": fld.offset, "unit": fld.unit,
+                        "source": prt.get("product_name") or f"port {port_no}",
+                        "enabled": True,
+                    })
+            else:
+                points.append({
+                    "name": f"Port{port_no}_Value", "adr": adr, "kind": "uint",
+                    "bit_offset": 0, "bit_length": 16, "scale": 1.0, "offset": 0.0,
+                    "unit": "", "source": prt.get("product_name") or f"port {port_no}",
+                    "enabled": True,
+                })
+        return {"variant": resolved, "datapoints": points, "ports": ports,
+                "message": f"{len(points)} value(s) across the block's IO-Link ports."}
+
+    def _discover_io_module(self) -> List[Dict[str, Any]]:
+        """Datapoints of an AL40xx-style I/O module.
+
+        Prefers `querytree` — the block listing its own process data. Falls back
+        to walking the tree for `digital_input` leaves when the firmware has no
+        querytree, so a module still configures itself either way.
+        """
+        points: List[Dict[str, Any]] = []
+        for adr in self.query_profile("processdata"):
+            points.append(_io_point_from_adr(adr))
+        if points:
+            return points
+
+        try:
+            tree = self.get_tree()
+        except Exception:
+            return []
+        found: List[str] = []
+
+        def _walk(node: Any, path: str) -> None:
+            if isinstance(node, dict):
+                ident = str(node.get("identifier") or "")
+                here = f"{path}/{ident}" if ident else path
+                if node.get("type") == "data" and "processdata" in (node.get("profiles") or []):
+                    found.append(here)
+                for sub in node.get("subs") or []:
+                    _walk(sub, here)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk(item, path)
+
+        _walk(tree, "")
+        for adr in sorted(set(found)):
+            # the walker builds "/io/port[1]/pin2/digital_input"; the service is
+            # appended when it is read.
+            points.append(_io_point_from_adr(adr))
+        return points
+
     def identify(self) -> Dict[str, Any]:
         """Block identity, for the dialog and for diagnostics."""
         info: Dict[str, Any] = {}
@@ -398,6 +627,39 @@ class IfmMasterClient:
                 "suggested_profile_label": (prof or {}).get("label", ""),
             })
         return ports
+
+    def read_datapoints(self, points: List[IfmDatapoint]) -> List[Dict[str, Any]]:
+        """Read every configured datapoint in ONE cycle.
+
+        Distinct addresses are fetched once via getdatamulti even when several
+        datapoints slice the same one (two bit fields inside one IO-Link port's
+        process data cost one read, not two). A datapoint that fails marks only
+        itself bad, so one dead input never blanks the block.
+        """
+        if not points:
+            return []
+        adrs = sorted({dp.adr for dp in points if dp.adr})
+        values = self.get_many(adrs)
+
+        out: List[Dict[str, Any]] = []
+        for dp in points:
+            raw_value, code = values.get(dp.adr, (None, 0))
+            if raw_value is None or int(code or 0) >= 400:
+                out.append({"name": dp.name, "value": None, "unit": dp.unit,
+                            "quality": 0, "raw": "",
+                            "error": f"{dp.adr} returned diagnostic code {code or 'no data'}"})
+                continue
+            try:
+                value = value_of_datapoint(raw_value, dp)
+            except DecodeError as exc:
+                out.append({"name": dp.name, "value": None, "unit": dp.unit,
+                            "quality": 0, "raw": str(raw_value), "error": str(exc)})
+                continue
+            out.append({"name": dp.name,
+                        "value": float(value) if not isinstance(value, bool) else float(value),
+                        "unit": dp.unit, "quality": 192, "raw": str(raw_value),
+                        "error": "", "is_bool": isinstance(value, bool)})
+        return out
 
     def read_fields(self, fields: List[IfmField]) -> List[Dict[str, Any]]:
         """Read every mapped field in ONE cycle.
@@ -526,3 +788,42 @@ def ports_from_tree(tree: Dict[str, Any]) -> List[int]:
 
     _walk(tree)
     return sorted(found)
+
+
+def _io_point_from_adr(adr: str) -> Dict[str, Any]:
+    """A readable datapoint from an I/O module address.
+
+    "/io/port[3]/pin4/digital_input" becomes the tag "Port3_Pin4", which is what
+    an electrician reading the block's own labelling would expect to see on a
+    chart. Counters and anything else keep their own leaf name.
+    """
+    clean = str(adr or "").strip()
+    if clean.endswith("/getdata"):
+        clean = clean[: -len("/getdata")]
+    parts = [p for p in clean.split("/") if p]
+    leaf = parts[-1] if parts else "value"
+
+    port = ""
+    pin = ""
+    for part in parts:
+        if part.startswith("port[") and part.endswith("]"):
+            port = part[5:-1]
+        elif part.startswith("pin"):
+            pin = part[3:]
+
+    if leaf == "digital_input" and port and pin:
+        name = f"Port{port}_Pin{pin}"
+        kind = "bool"
+    elif port and pin:
+        name = f"Port{port}_Pin{pin}_{leaf}"
+        kind = "direct"
+    elif port:
+        name = f"Port{port}_{leaf}"
+        kind = "direct"
+    else:
+        name = leaf.replace(".", "_")
+        kind = "direct"
+
+    return {"name": name, "adr": clean + "/getdata", "kind": kind,
+            "bit_offset": 0, "bit_length": 0, "scale": 1.0, "offset": 0.0,
+            "unit": "", "source": leaf, "enabled": True}

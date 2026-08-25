@@ -1580,6 +1580,16 @@ export async function scanIfmPorts(payload) {
   return res.json();
 }
 
+export async function readIfmDatapoints(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/ifm/read`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  }, 20000);
+  await ensureOk(res, "IFM read failed");
+  return res.json();
+}
+
 export async function previewIfmPort(payload) {
   const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/ifm/preview`, {
     method: "POST",

@@ -59,6 +59,15 @@ class GatewayConfig(BaseModel):
     ifm_password: str = ""
     ifm_port_count: int = 8
     ifm_ports: List[dict] = Field(default_factory=list)
+    # 2026-08-25: which KIND of ifm block this is. An IO-Link master hides its
+    # values inside a port's hex process data; an I/O module (AL4022) exposes
+    # each input as its own ready value. "auto" asks the block. Adding the next
+    # device family is a new variant, not a new gateway type.
+    ifm_variant: str = "auto"
+    # The unified list of values to collect, addressed in the block's own tree.
+    # When present it supersedes ifm_ports, which stays for gateways configured
+    # before this existed.
+    ifm_datapoints: List[dict] = Field(default_factory=list)
     # ------------------------------------------------- generic EtherNet/IP
     # 2026-08-24: any EtherNet/IP adapter (IO-Link block, remote I/O, drive)
     # read by explicit CIP messaging against its input assembly. Defaulted, so

@@ -1523,16 +1523,20 @@ class GatewayWorker:
         GatewayReading. A port that fails yields a BAD-quality reading for its own
         tags and nothing else — one unplugged sensor must not take the block down.
         """
-        from app.drivers.ifm_iolink import IfmMasterClient, fields_from_config
+        from app.drivers.ifm_iolink import (
+            IfmMasterClient, datapoints_from_config, fields_from_config)
 
         host = (self.config.plc_ip or "").strip()
         if not host:
             raise RuntimeError("IFM read failed: the block address is empty.")
-        fields = fields_from_config(list(self.config.ifm_ports or []))
-        if not fields:
+        # The unified datapoint list covers every ifm device kind. ifm_ports is
+        # the older IO-Link-master-only shape and still works untouched.
+        datapoints = datapoints_from_config(list(self.config.ifm_datapoints or []))
+        fields = [] if datapoints else fields_from_config(list(self.config.ifm_ports or []))
+        if not datapoints and not fields:
             raise RuntimeError(
-                "IFM read failed: no ports are mapped. Open the gateway, scan the "
-                "block's ports and choose which values to collect.")
+                "IFM read failed: nothing is selected to collect. Open the gateway, "
+                "scan the block and tick the values you want.")
 
         # Keep the HTTP budget under the collection interval so a slow block
         # delays a cycle rather than stacking them up.
@@ -1551,7 +1555,8 @@ class GatewayWorker:
         wanted = set(self._get_read_tags() or [])
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         out: List[GatewayReading] = []
-        for row in client.read_fields(fields):
+        rows = client.read_datapoints(datapoints) if datapoints else client.read_fields(fields)
+        for row in rows:
             name = str(row.get("name") or "")
             if not name:
                 continue
@@ -4846,6 +4851,8 @@ class PLCManager:
                 ifm_password=str(gw.get("ifm_password") or ""),
                 ifm_port_count=int(gw.get("ifm_port_count") or 8),
                 ifm_ports=list(gw.get("ifm_ports") or []),
+                ifm_variant=str(gw.get("ifm_variant") or "auto"),
+                ifm_datapoints=list(gw.get("ifm_datapoints") or []),
                 eip_input_assembly=int(gw.get("eip_input_assembly") or 0),
                 eip_output_assembly=int(gw.get("eip_output_assembly") or 0),
                 eip_config_assembly=int(gw.get("eip_config_assembly") or 0),

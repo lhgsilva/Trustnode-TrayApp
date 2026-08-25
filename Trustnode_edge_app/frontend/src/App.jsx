@@ -3791,6 +3791,8 @@ function AppShell() {
     ifm_password: "",
     ifm_port_count: 8,
     ifm_ports: [],
+    ifm_variant: "auto",
+    ifm_datapoints: [],
     // Generic EtherNet/IP (2026-08-24); ignored unless the type is ethernet_ip.
     eip_input_assembly: 0,
     eip_output_assembly: 0,
@@ -15336,6 +15338,8 @@ const getGatewayHealth = (gateway) => {
       ifm_password: String(gatewayForm.ifm_password || ""),
       ifm_port_count: Number(gatewayForm.ifm_port_count || 8),
       ifm_ports: Array.isArray(gatewayForm.ifm_ports) ? gatewayForm.ifm_ports : [],
+      ifm_variant: String(gatewayForm.ifm_variant || "auto"),
+      ifm_datapoints: Array.isArray(gatewayForm.ifm_datapoints) ? gatewayForm.ifm_datapoints : [],
       eip_input_assembly: Number(gatewayForm.eip_input_assembly || 0),
       eip_output_assembly: Number(gatewayForm.eip_output_assembly || 0),
       eip_config_assembly: Number(gatewayForm.eip_config_assembly || 0),

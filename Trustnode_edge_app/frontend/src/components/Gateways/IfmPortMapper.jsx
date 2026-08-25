@@ -15,7 +15,7 @@
    resulting tag names back to the dialog, which saves them like any other
    gateway field. */
 import { useCallback, useMemo, useState } from "react";
-import { scanIfmPorts, previewIfmPort } from "../../api";
+import { scanIfmPorts, previewIfmPort, readIfmDatapoints } from "../../api";
 
 const KINDS = [
   { value: "uint", label: "Unsigned" },
@@ -34,6 +34,16 @@ function blankField(port, index) {
     offset: 0,
     unit: "",
   };
+}
+
+/** Tag names from the unified datapoint list (every ifm device kind). */
+export function ifmDatapointNames(datapoints) {
+  return Array.from(new Set(
+    (datapoints || [])
+      .filter((d) => d && d.enabled !== false)
+      .map((d) => String(d.name || "").trim())
+      .filter(Boolean)
+  ));
 }
 
 /** Every tag name this mapping will produce — what the dialog stores in `tags`. */
@@ -84,9 +94,22 @@ export default function IfmPortMapper({
     setScanning(true);
     setNote("");
     try {
-      const res = await scanIfmPorts(connection);
+      const res = await scanIfmPorts({ ...connection, variant: form.ifm_variant || "auto" });
       setScan(res);
       setNote(res?.message || "");
+      if (res?.ok) {
+        // The unified datapoint list covers every ifm device kind — an I/O
+        // module's digital inputs and an IO-Link master's decoded values arrive
+        // in the same shape, so the operator sees one table either way.
+        // Anything already ticked keeps its settings.
+        const previous = new Map((form.ifm_datapoints || []).map((d) => [String(d.name), d]));
+        const merged = (res.datapoints || []).map((d) => previous.get(String(d.name)) || d);
+        onChange({
+          ifm_variant: res.variant || form.ifm_variant || "auto",
+          ifm_datapoints: merged,
+          tags_text: ifmDatapointNames(merged).join(";"),
+        });
+      }
       if (res?.ok) {
         // Pre-fill a row for every port that has something connected, using the
         // suggested profile where the sensor is recognised. Ports the operator
@@ -125,6 +148,29 @@ export default function IfmPortMapper({
     }
   }, [connection, ports]);
 
+  const datapoints = Array.isArray(form.ifm_datapoints) ? form.ifm_datapoints : [];
+
+  const patchDatapoints = useCallback((next) => {
+    onChange({ ifm_datapoints: next, tags_text: ifmDatapointNames(next).join(";") });
+  }, [onChange]);
+
+  const patchPoint = (idx, patch) =>
+    patchDatapoints(datapoints.map((d, i) => (i === idx ? { ...d, ...patch } : d)));
+
+  const [liveValues, setLiveValues] = useState(null);
+  const readLive = useCallback(async () => {
+    try {
+      const res = await readIfmDatapoints({
+        ...connection,
+        datapoints: datapoints.filter((d) => d.enabled !== false),
+      });
+      setLiveValues(res);
+      if (!res?.ok) setNote(res?.message || "Read failed.");
+    } catch (err) {
+      setNote(String(err?.message || err));
+    }
+  }, [connection, datapoints]);
+
   const patchField = (portNo, idx, patch) => {
     patchPorts(ports.map((p) => (Number(p.port) !== Number(portNo) ? p : {
       ...p,
@@ -139,14 +185,31 @@ export default function IfmPortMapper({
     <div className="gateway-span-2 ifm-panel">
       <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-end", gap: 12 }}>
         <div className="muted ifm-help">
-          This block serves its data as JSON on its <strong>IoT port</strong> — no PLC and no
-          EtherNet/IP configuration needed. Scan it, choose which values to collect, and they
-          become ordinary tags: they trend, chart, report and alarm like any PLC tag.
+          This block serves its data as JSON over HTTP — no PLC and no EtherNet/IP
+          configuration needed, and no EDS file. Scan it, tick the values you want, and
+          they become ordinary tags: they trend, chart, report and alarm like any PLC tag.
         </div>
         <button type="button" className="btn btn-primary btn-sm" disabled={disabled || scanning}
           onClick={doScan}>
-          {scanning ? "Scanning…" : "Scan ports"}
+          {scanning ? "Scanning…" : "Scan block"}
         </button>
+      </div>
+
+      <div className="ifm-conn-grid">
+        <label>
+          Device kind
+          <select value={form.ifm_variant || "auto"} disabled={disabled}
+            onChange={(e) => onChange({ ifm_variant: e.target.value })}>
+            {(scan?.variants || [
+              { id: "auto", label: "Detect automatically" },
+              { id: "iolink_master", label: "IO-Link master (AL13xx / AL14xx)" },
+              { id: "io_module", label: "I/O module (AL40xx, e.g. AL4022)" },
+            ]).map((v) => <option key={v.id} value={v.id}>{v.label}</option>)}
+          </select>
+          <small className="hint">
+            Leave on Detect — the block is asked what it is when you scan.
+          </small>
+        </label>
       </div>
 
       <div className="ifm-conn-grid">
@@ -192,7 +255,55 @@ export default function IfmPortMapper({
         </div>
       ) : null}
 
-      {ports.length ? ports.map((p) => {
+      {datapoints.length ? (
+        <div className="ifm-port-card">
+          <div className="row ifm-port-head">
+            <strong>Values to collect</strong>
+            <span className="muted" style={{ fontSize: 12 }}>
+              {datapoints.filter((d) => d.enabled !== false).length} of {datapoints.length} ticked
+            </span>
+            <button type="button" className="btn btn-secondary btn-sm" disabled={disabled}
+              style={{ marginLeft: "auto" }} onClick={readLive}>
+              Read live values
+            </button>
+          </div>
+
+          {liveValues?.values ? (
+            <div className="info-note ifm-preview">
+              {liveValues.values.map((v, i) => (
+                <span key={i} className="ifm-preview-val">
+                  <strong>{v.name}</strong>{" = "}
+                  {v.error ? <em>{v.error}</em> : `${v.value}${v.unit ? " " + v.unit : ""}`}
+                </span>
+              ))}
+            </div>
+          ) : null}
+
+          <div className="ifm-field-table">
+            <div className="ifm-field-head ifm-dp-head">
+              <span>Collect</span><span>Tag name</span><span>Source</span>
+              <span>Scale</span><span>Unit</span>
+            </div>
+            {datapoints.map((d, idx) => (
+              <div className="ifm-field-row ifm-dp-row" key={`dp-${d.name}-${idx}`}>
+                <label className="ifm-check">
+                  <input type="checkbox" checked={d.enabled !== false} disabled={disabled}
+                    onChange={(e) => patchPoint(idx, { enabled: e.target.checked })} />
+                </label>
+                <input value={d.name || ""} disabled={disabled}
+                  onChange={(e) => patchPoint(idx, { name: e.target.value })} />
+                <span className="muted ifm-dp-adr" title={d.adr}>{d.adr}</span>
+                <input type="number" step="any" value={d.scale ?? 1} disabled={disabled}
+                  onChange={(e) => patchPoint(idx, { scale: Number(e.target.value || 1) })} />
+                <input value={d.unit || ""} disabled={disabled} placeholder=""
+                  onChange={(e) => patchPoint(idx, { unit: e.target.value })} />
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {ports.length && !datapoints.length ? ports.map((p) => {
         const found = scannedFor(p.port);
         const pv = preview[p.port];
         return (
@@ -268,12 +379,15 @@ export default function IfmPortMapper({
             </div>
           </div>
         );
-      }) : (
+      }) : null}
+
+      {!datapoints.length && !ports.length ? (
         <div className="info-note" style={{ marginTop: 8 }}>
-          No ports mapped yet. Enter the block's IoT address above and click
-          <strong> Scan ports</strong> — recognised sensors are filled in for you.
+          Nothing selected yet. Enter the block's address above and click
+          <strong> Scan block</strong> — it will report what it can measure and tick
+          everything for you.
         </div>
-      )}
+      ) : null}
     </div>
   );
 }
