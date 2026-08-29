@@ -945,9 +945,209 @@ def eip_parse_eds(payload: EdsImportRequest) -> dict:
     except Exception as exc:
         return {"ok": False, "message": f"Could not read the EDS: {exc}"}
     guess = guess_assemblies(parsed)
+    # 2026-08-28: the EDS says WHICH assembly and HOW BIG, never what a bit
+    # means. For a device family whose layout we know, combine the two so the
+    # operator gets tags from one upload instead of hand-mapping 16 byte/bit
+    # pairs. For anything else we say plainly that the EDS cannot supply them.
+    from app.drivers.ethernet_ip import signals_from_eds
+    layout = signals_from_eds(parsed)
+    if layout.get("input_assembly"):
+        guess = dict(guess or {})
+        guess["input_assembly"] = layout["input_assembly"]
+    message = (f"{parsed.get('product_name') or 'Device'} — "
+               f"{len(parsed.get('assemblies') or [])} assembly(ies) found.")
+    if layout.get("ok"):
+        message += " " + layout["message"]
     return {"ok": True, "device": parsed, "suggested": guess,
-            "message": (f"{parsed.get('product_name') or 'Device'} — "
-                        f"{len(parsed.get('assemblies') or [])} assembly(ies) found.")}
+            "layout": layout, "signals": layout.get("signals") or [],
+            "message": message}
+
+
+class IfmPinMapRequest(BaseModel):
+    """Build (and optionally verify) the pin map of an ifm block on fieldbus."""
+    plc_ip: str = ""
+    instance: int = 0
+    slot: int = 0
+    port_count: int = 8
+    pin4_byte: int = 0
+    pin2_byte: int = 1
+    verify: bool = True
+
+
+class IfmFieldbusAutoRequest(BaseModel):
+    """Configure an ifm block that is wired to its FIELDBUS port."""
+    plc_ip: str = ""
+    slot: int = 0
+    port_count: int = 8
+
+
+# Assembly instances an ifm master publishes. 100 is the documented input
+# assembly on the DL/AL families; the rest are probed so an unfamiliar model
+# still configures itself instead of asking the operator for a number they do
+# not have.
+IFM_ASSEMBLY_CANDIDATES = (100, 101, 102, 103, 104, 150, 151, 152, 199)
+
+
+@router.post("/eip/ifm-fieldbus-autoconfig")
+def eip_ifm_fieldbus_autoconfig(payload: IfmFieldbusAutoRequest) -> dict:
+    """One call: identify the block, find its input assembly, build the tags.
+
+    An ifm block wired to its fieldbus port has no IoT Core to scan, so the
+    "Scan block" flow cannot help and the operator is left to find an assembly
+    instance and 16 byte/bit pairs by hand. This does the whole thing: CIP
+    identity, assembly probe, pin map, and a live verification - and hands back
+    a gateway configuration ready to save.
+    """
+    from app.drivers.ethernet_ip import (
+        EipDeviceClient, EipSignal, decode_signal, ifm_pin_signals)
+
+    host = (payload.plc_ip or "").strip()
+    if not host:
+        return {"ok": False, "message": "The block address is required."}
+
+    client = EipDeviceClient(host=host, slot=int(payload.slot or 0), timeout_s=4.0)
+    try:
+        info = client.identify() or {}
+    except Exception as exc:
+        return {"ok": False, "message":
+                f"No EtherNet/IP device answered at {host}:44818 ({exc}). "
+                f"Check the block is on its fieldbus port and reachable."}
+
+    vendor = str(info.get("vendor") or "")
+    if vendor and "ifm" not in vendor.lower():
+        # Not fatal - the pin map may still be wanted - but say so plainly.
+        note = (f"This device reports as '{vendor}', not ifm. The ifm pin map "
+                f"below may not match it; check the byte offsets against its "
+                f"manual before saving.")
+    else:
+        note = ""
+
+    # Probe for a readable input assembly. The biggest one is the full input
+    # image; the tiny ones are status/diagnostic assemblies.
+    found: list[dict] = []
+    for inst in IFM_ASSEMBLY_CANDIDATES:
+        try:
+            data = client.read_assembly(inst)
+        except Exception:
+            continue
+        if data:
+            found.append({"instance": inst, "size_bytes": len(data),
+                          "first_bytes": data[:8].hex()})
+    if not found:
+        return {"ok": False, "device": info, "assemblies": [],
+                "message": f"{info.get('product_name') or 'The device'} answered, "
+                           f"but none of the usual input assemblies could be read. "
+                           f"Import its EDS file to find the right instance."}
+
+    # 100 when it is there (documented), else the largest readable one.
+    chosen = next((f for f in found if f["instance"] == 100), None) or max(
+        found, key=lambda f: f["size_bytes"])
+    instance = int(chosen["instance"])
+
+    signals = ifm_pin_signals(port_count=int(payload.port_count or 8))
+    values = []
+    try:
+        data = client.read_assembly(instance)
+        for spec in signals:
+            sig = EipSignal.from_dict(spec)
+            try:
+                values.append({"name": sig.name,
+                               "value": decode_signal(data, sig),
+                               "channel": spec.get("channel", "")})
+            except Exception as exc:
+                values.append({"name": sig.name, "value": None,
+                               "error": str(exc)})
+    except Exception:
+        pass
+
+    high = [v["name"] for v in values if v.get("value")]
+    message = (f"{info.get('product_name') or 'ifm block'} found on fieldbus. "
+               f"Input assembly {instance} ({chosen['size_bytes']} bytes), "
+               f"{len(signals)} pin tag(s). "
+               + (f"Currently high: {', '.join(high)}." if high
+                  else "No input is currently high."))
+    if note:
+        message = note + " " + message
+
+    return {
+        "ok": True,
+        "device": info,
+        "assemblies": found,
+        "config": {
+            "gateway_type": "ethernet_ip",
+            "plc_ip": host,
+            "eip_slot": int(payload.slot or 0),
+            "eip_input_assembly": instance,
+            "eip_signals": signals,
+            "eip_device_info": info,
+            "tags": [s["name"] for s in signals],
+        },
+        "values": values,
+        "message": message,
+    }
+
+
+@router.post("/eip/ifm-pin-map")
+def eip_ifm_pin_map(payload: IfmPinMapRequest) -> dict:
+    """The standard ifm digital-input map, ready to save.
+
+    An EDS says which assembly to read and how big it is; it does NOT say what
+    any single bit means. For an ifm IO-Link master the digital input image is
+    the first two bytes of the input assembly - byte 0 is pin 4 and byte 1 is
+    pin 2, bit N-1 being port N - and hand-typing 16 byte/bit pairs is exactly
+    where an operator makes a mistake that yields a plausible wrong value
+    rather than an error.
+
+    The names produced here are the SAME ones the IoT Core path discovers, so a
+    trend built against a block on one transport keeps working on the other.
+
+    With `verify` the assembly is read live and the decoded values come back
+    beside the raw bytes, which is what makes the map checkable before saving.
+    """
+    from app.drivers.ethernet_ip import (
+        EipDeviceClient, EipSignal, decode_signal, ifm_pin_signals)
+
+    signals = ifm_pin_signals(port_count=int(payload.port_count or 8),
+                              pin4_byte=int(payload.pin4_byte or 0),
+                              pin2_byte=int(payload.pin2_byte if payload.pin2_byte is not None else 1))
+    result = {"ok": True, "signals": signals, "values": [], "raw": "",
+              "message": f"{len(signals)} pin signal(s) for a "
+                         f"{int(payload.port_count or 8)}-port ifm block."}
+    if not payload.verify or not (payload.plc_ip or "").strip():
+        return result
+    if int(payload.instance or 0) <= 0:
+        result["message"] += " Give an input assembly instance to verify it live."
+        return result
+
+    client = EipDeviceClient(host=payload.plc_ip.strip(), slot=int(payload.slot or 0),
+                             timeout_s=4.0)
+    try:
+        data = client.read_assembly(int(payload.instance))
+    except Exception as exc:
+        # The map is still valid and still worth returning - only the live
+        # check failed, and saying so beats returning nothing.
+        result["message"] += f" Could not verify against the device: {exc}"
+        return result
+
+    values = []
+    for spec in signals:
+        sig = EipSignal.from_dict(spec)
+        try:
+            values.append({"name": sig.name, "value": decode_signal(data, sig),
+                           "channel": spec.get("channel", ""), "error": ""})
+        except Exception as exc:
+            values.append({"name": sig.name, "value": None,
+                           "channel": spec.get("channel", ""), "error": str(exc)})
+    high = [v["name"] for v in values if v.get("value")]
+    result["raw"] = data.hex()
+    result["size_bytes"] = len(data)
+    result["values"] = values
+    result["message"] = (
+        f"{len(signals)} pin signal(s) verified against assembly "
+        f"{payload.instance} ({len(data)} bytes). "
+        + (f"Currently high: {', '.join(high)}." if high
+           else "No input is currently high."))
+    return result
 
 
 class EipProbeRequest(BaseModel):
@@ -956,6 +1156,132 @@ class EipProbeRequest(BaseModel):
     slot: int = 0
     timeout_ms: int = 4000
     signals: list[dict] = Field(default_factory=list)
+
+
+class ModbusPreviewRequest(BaseModel):
+    plc_ip: str
+    port: int = 502
+    unit_id: int = 1
+    registers: list[dict] = Field(default_factory=list)
+    timeout_ms: int = 4000
+
+
+@router.get("/device-profiles")
+def list_device_profiles(protocol: str = "") -> dict:
+    """The device catalogue, optionally narrowed to one protocol.
+
+    The same idea as an Ignition driver list or a Studio 5000 AOP: pick the
+    device you have, get its tags, then confirm them against the hardware.
+    """
+    from app.services import device_profiles
+    return {"ok": True, "profiles": device_profiles.list_profiles(protocol)}
+
+
+class CipParamScanRequest(BaseModel):
+    plc_ip: str
+    slot: int = 0
+    first: int = 1
+    last: int = 40
+    kind: str = "INT"
+    timeout_ms: int = 20000
+
+
+@router.post("/eip/scan-parameters")
+def scan_cip_parameters(payload: CipParamScanRequest) -> dict:
+    """Read a RANGE of CIP parameters from a drive and report what answers.
+
+    Parameter numbering differs between drive families and firmware revisions,
+    and a wrong number returns a plausible value rather than an error. So the
+    operator reads the range, puts it beside the drive's own display, and keeps
+    what matches - instead of trusting a table typed from a manual.
+    """
+    from app.drivers.ethernet_ip import EipDeviceClient
+
+    host = (payload.plc_ip or "").strip()
+    if not host:
+        return {"ok": False, "message": "The device address is empty.", "values": []}
+    first = max(1, int(payload.first or 1))
+    last = max(first, min(int(payload.last or 40), first + 199))   # bounded
+    try:
+        client = EipDeviceClient(host=host, slot=int(payload.slot or 0), timeout_s=3.0)
+        rows = client.scan_parameters(
+            first=first, last=last, kind=str(payload.kind or "INT"),
+            deadline_s=max(2.0, float(payload.timeout_ms or 20000) / 1000.0))
+    except Exception as exc:
+        return {"ok": False, "message": f"Parameter scan failed: {exc}", "values": []}
+    answered = [r for r in rows if r.get("ok")]
+    return {
+        "ok": True,
+        "message": (f"{len(answered)} of {len(rows)} parameter(s) in {first}-{last} "
+                    f"answered. Compare them with the drive's own display before "
+                    f"trusting any of them."),
+        "values": rows,
+    }
+
+
+class CipParamPreviewRequest(BaseModel):
+    plc_ip: str
+    slot: int = 0
+    parameters: list[dict] = Field(default_factory=list)
+    timeout_ms: int = 8000
+
+
+@router.post("/eip/preview-parameters")
+def preview_cip_parameters(payload: CipParamPreviewRequest) -> dict:
+    """Read the mapped parameters once, with their scaling applied."""
+    from app.drivers.ethernet_ip import EipDeviceClient, parameters_from_config
+
+    host = (payload.plc_ip or "").strip()
+    if not host:
+        return {"ok": False, "message": "The device address is empty.", "values": []}
+    rows = [dict(r, enabled=True) for r in (payload.parameters or []) if isinstance(r, dict)]
+    params = parameters_from_config(rows)
+    if not params:
+        return {"ok": False, "message": "No parameters are mapped yet.", "values": []}
+    try:
+        client = EipDeviceClient(host=host, slot=int(payload.slot or 0), timeout_s=3.0)
+        values = client.read_parameters(
+            params, deadline_s=max(2.0, float(payload.timeout_ms or 8000) / 1000.0))
+    except Exception as exc:
+        return {"ok": False, "message": f"Parameter read failed: {exc}", "values": []}
+    ok_count = sum(1 for v in values if v.get("quality"))
+    return {"ok": True,
+            "message": f"{ok_count} of {len(values)} parameter(s) read.",
+            "values": values}
+
+
+@router.post("/modbus/preview")
+def preview_modbus_registers(payload: ModbusPreviewRequest) -> dict:
+    """Read a Modbus device once, decoded values AND raw registers.
+
+    A wrong address, format or word order returns a plausible number rather
+    than an error, so the operator must be able to compare the two before
+    saving. Same reasoning as /eip/preview.
+    """
+    from app.drivers.modbus_tcp import points_from_config, read_once, ModbusReadError
+
+    host = (payload.plc_ip or "").strip()
+    if not host:
+        return {"ok": False, "message": "The device address is empty.", "values": []}
+    # Preview everything that is mapped, ticked or not - the operator is
+    # deciding WHICH to tick, so showing only the ticked ones is backwards.
+    rows = [dict(r, enabled=True) for r in (payload.registers or []) if isinstance(r, dict)]
+    points = points_from_config(rows)
+    if not points:
+        return {"ok": False, "message": "No registers are mapped yet.", "values": []}
+    try:
+        values = read_once(host, int(payload.port or 502), int(payload.unit_id or 1),
+                           points, timeout_s=max(1.0, float(payload.timeout_ms or 4000) / 1000.0))
+    except ModbusReadError as exc:
+        return {"ok": False, "message": str(exc), "values": []}
+    except Exception as exc:
+        return {"ok": False, "message": f"Modbus read failed: {exc}", "values": []}
+    ok_count = sum(1 for v in values if v.get("quality"))
+    return {
+        "ok": True,
+        "message": f"{ok_count} of {len(values)} register(s) read.",
+        "values": values,
+    }
 
 
 @router.post("/eip/preview")
@@ -1060,11 +1386,19 @@ def ifm_scan_ports(payload: IfmScanRequest) -> dict:
         return {"ok": False, "message": "The block address is required.", "ports": [],
                 "datapoints": []}
     try:
-        from app.drivers.ifm_iolink import BUILTIN_PROFILES, VARIANTS
+        from app.drivers.ifm_iolink import (
+            BUILTIN_PROFILES, VARIANTS, IfmTransportError)
         client = _ifm_client(payload)
+        # BEFORE identify(): pointed at a fieldbus port, identify's own requests
+        # hang, so the preflight has to run first or it never runs at all.
+        client.preflight()
         info = client.identify()
         found = client.discover_datapoints(variant=str(payload.variant or "auto"),
                                            port_count=int(payload.port_count or 8))
+    except IfmTransportError as exc:
+        # Already an operator-facing sentence naming the fix - do not bury it
+        # under "Could not reach", which describes the wrong problem.
+        return {"ok": False, "ports": [], "datapoints": [], "message": str(exc)}
     except Exception as exc:
         return {"ok": False, "ports": [], "datapoints": [],
                 "message": f"Could not reach the IFM block: {type(exc).__name__}: {exc}"}
@@ -1149,6 +1483,14 @@ def _discover_ifm_tags(payload: TagDiscoveryRequest) -> TagDiscoveryResult:
             port_count=int(payload.ifm_port_count or 8)))
         found = client.discover_datapoints(port_count=int(payload.ifm_port_count or 8))
     except Exception as exc:
+        # "Search Available Tags" is the other way into the same driver, and it
+        # is where a wrong port showed as a "Searching..." button that never
+        # came back. discover_datapoints preflights and is deadline-bounded, so
+        # this now returns promptly; pass the driver's own sentence through
+        # when it has one rather than prefixing it with the wrong diagnosis.
+        from app.drivers.ifm_iolink import IfmTransportError
+        if isinstance(exc, IfmTransportError):
+            return TagDiscoveryResult(ok=False, tags=[], message=str(exc))
         return TagDiscoveryResult(ok=False, tags=[],
                                   message=f"Could not reach the IFM block: {exc}")
     tags = [str(p.get("name") or "") for p in (found.get("datapoints") or []) if p.get("name")]
@@ -1188,13 +1530,137 @@ class NetworkScanDevice(BaseModel):
     device_type: str = ""
     revision: str = ""
     serial: str = ""
-    source: str = ""  # "pylogix_discover" | "tcp_probe"
+    source: str = ""  # "pylogix_discover" | "tcp_probe" | "identified"
+    # 2026-08-27: a port number is not an identity. An ifm IO-Link master on
+    # 44818 was reported as "EtherNet/IP (Allen-Bradley)" purely because that
+    # is Rockwell's port, which is how a block ends up configured against the
+    # wrong driver. These carry what the DEVICE says about itself.
+    transports: list[str] = Field(default_factory=list)   # e.g. ["ethernet_ip", "ifm_iot"]
+    suggested_protocol: str = ""                          # gateway_type to preselect
+    identity_note: str = ""                               # one line for the operator
 
 
 class NetworkScanResult(BaseModel):
     ok: bool
     devices: list[NetworkScanDevice] = Field(default_factory=list)
     message: str = ""
+
+
+# ifm electronic's CIP vendor id. A block that answers ListIdentity with this
+# is an ifm device whatever port it was found on.
+IFM_CIP_VENDOR_ID = 310
+
+
+def _probe_ifm_iot(host: str, timeout: float = 2.0) -> dict:
+    """Does an ifm IoT Core live here, and what does it call itself?
+
+    One GET. A device that answers with a productcode is an ifm block serving
+    JSON, which is the `ifm_iolink` driver's transport.
+    """
+    import json as _json
+    import urllib.request as _rq
+    out: dict = {}
+    try:
+        req = _rq.Request("http://%s/deviceinfo/productcode/getdata" % host, method="GET")
+        with _rq.urlopen(req, timeout=timeout) as resp:
+            payload = _json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        value = ((payload.get("data") or {}) or {}).get("value")
+        if value:
+            out["product_code"] = str(value)
+    except Exception:
+        return {}
+    try:
+        req = _rq.Request("http://%s/deviceinfo/serialnumber/getdata" % host, method="GET")
+        with _rq.urlopen(req, timeout=timeout) as resp:
+            payload = _json.loads(resp.read().decode("utf-8", "replace") or "{}")
+        serial = ((payload.get("data") or {}) or {}).get("value")
+        if serial:
+            out["serial"] = str(serial)
+    except Exception:
+        pass
+    return out
+
+
+def _probe_cip_identity(host: str, timeout: float = 2.5) -> dict:
+    """CIP Identity object — vendor, product name, revision, serial.
+
+    Every EtherNet/IP device answers this, and it is the difference between
+    "something is listening on 44818" and "ifm electronic gmbh, IO-Link
+    Master DL EIP 8P IP67".
+    """
+    try:
+        from app.drivers.ethernet_ip import EipDeviceClient
+        info = EipDeviceClient(host=host, slot=0, timeout_s=timeout).identify()
+        return info if isinstance(info, dict) else {}
+    except Exception:
+        return {}
+
+
+def _identify_scanned_device(host: str, port: int) -> dict:
+    """Ask the device what it is, instead of guessing from its port number.
+
+    Returns the fields to put on a NetworkScanDevice. Both probes are cheap and
+    read-only; whichever answer arrives is used, and a device that answers BOTH
+    (ifm blocks commonly do) reports both transports so the operator can see
+    the choice rather than discover it by trial.
+    """
+    result: dict = {"transports": [], "suggested_protocol": "", "identity_note": ""}
+
+    cip = _probe_cip_identity(host) if int(port) == 44818 else {}
+    if not cip and int(port) in (80, 443, 8080):
+        # An ifm block found on its web port may still speak EtherNet/IP.
+        cip = _probe_cip_identity(host, timeout=1.5)
+
+    iot = {}
+    if int(port) in (80, 8080) or cip.get("vendor_id") == IFM_CIP_VENDOR_ID \
+            or "ifm" in str(cip.get("vendor") or "").lower():
+        iot = _probe_ifm_iot(host)
+
+    if cip:
+        result["vendor"] = str(cip.get("vendor") or "")
+        result["product_name"] = str(cip.get("product_name") or "")
+        rev = cip.get("revision") or {}
+        if isinstance(rev, dict) and rev:
+            result["revision"] = "%s.%s" % (rev.get("major"), rev.get("minor"))
+        result["serial"] = str(cip.get("serial") or "")
+        result["device_type"] = str(cip.get("product_type") or "")
+        result["transports"].append("ethernet_ip")
+
+    if iot:
+        if not result.get("product_name"):
+            result["product_name"] = str(iot.get("product_code") or "")
+        if not result.get("vendor"):
+            result["vendor"] = "ifm electronic"
+        if not result.get("serial"):
+            result["serial"] = str(iot.get("serial") or "")
+        result["transports"].append("ifm_iot")
+
+    vendor_l = str(result.get("vendor") or "").lower()
+    is_ifm = "ifm" in vendor_l or bool(iot)
+
+    if is_ifm:
+        # An ifm block that speaks EtherNet/IP should be collected over it.
+        # Measured on an "IO-Link Master DL EIP 8P IP67" (2026-08-27): the
+        # fieldbus read is one 3 ms request for every pin at 100% success,
+        # while its IoT Core refused ~75% of a 1 Hz poll with HTTP 503. The
+        # IoT path stays available and is the right choice on a block with no
+        # fieldbus, but it must not be the silent default on one that has it.
+        if "ethernet_ip" in result["transports"]:
+            result["suggested_protocol"] = "ethernet_ip"
+            if "ifm_iot" in result["transports"]:
+                result["identity_note"] = (
+                    "ifm block — speaks EtherNet/IP and IoT Core. EtherNet/IP "
+                    "reads every pin in one request; prefer it unless you need "
+                    "IO-Link process data only the IoT Core exposes.")
+            else:
+                result["identity_note"] = (
+                    "ifm block on EtherNet/IP. No IoT Core answered on port 80.")
+        else:
+            result["suggested_protocol"] = "ifm_iolink"
+            result["identity_note"] = "ifm block serving IoT Core over HTTP."
+    elif "allen" in vendor_l or "rockwell" in vendor_l:
+        result["suggested_protocol"] = "allen_bradley"
+    return result
 
 
 def _pylogix_discover() -> list[NetworkScanDevice]:
@@ -1513,15 +1979,40 @@ def discover_network(payload: NetworkScanRequest) -> NetworkScanResult:
                 23: "Telnet",
                 21: "FTP",
             }
+            # Ask each responder what it IS before falling back to the port
+            # name. Concurrent and bounded: identification must not turn a
+            # 30-host scan into a minute of waiting.
+            identities: dict[str, dict] = {}
+            to_identify = [(h, p) for h, p in host_best_port.items() if h not in found]
+            if to_identify:
+                with ThreadPoolExecutor(max_workers=min(12, len(to_identify))) as pool:
+                    jobs = {pool.submit(_identify_scanned_device, h, p): h
+                            for h, p in to_identify}
+                    for fut in as_completed(jobs):
+                        h = jobs[fut]
+                        try:
+                            identities[h] = fut.result() or {}
+                        except Exception:
+                            identities[h] = {}
+
             for h, port in host_best_port.items():
                 if h in found:
                     continue
                 hint = port_hints.get(int(port), f"port {port}")
+                ident = identities.get(h) or {}
+                # A real product name always beats a port label.
+                label = str(ident.get("product_name") or "").strip() or hint
                 found[h] = NetworkScanDevice(
                     ip=h,
-                    product_name=hint,
-                    device_type=f"tcp/{port}",
-                    source="tcp_probe",
+                    product_name=label,
+                    vendor=str(ident.get("vendor") or ""),
+                    revision=str(ident.get("revision") or ""),
+                    serial=str(ident.get("serial") or ""),
+                    device_type=str(ident.get("device_type") or "") or f"tcp/{port}",
+                    transports=list(ident.get("transports") or []),
+                    suggested_protocol=str(ident.get("suggested_protocol") or ""),
+                    identity_note=str(ident.get("identity_note") or ""),
+                    source="identified" if ident.get("product_name") else "tcp_probe",
                 )
 
     devices = sorted(found.values(), key=lambda d: tuple(int(p) for p in d.ip.split(".") if p.isdigit()))
@@ -1676,7 +2167,7 @@ def list_gateway_runtime_status(request: Request) -> list[dict]:
             from app.routers.app_store import _build_scope_key, _SHARED_EDGE_DOMAINS  # type: ignore
             scope_key = _build_scope_key(request, domain="gateway_configurations")
             if scope_key:
-                scoped = app_store.get_bootstrap_scoped(scope_key, prefer_cloud_reads=False) or {}
+                scoped = app_store.get_bootstrap_scoped_or_shout(scope_key, prefer_cloud_reads=False) or {}
                 cand = scoped.get("gateway_configurations") if isinstance(scoped, dict) else None
                 if isinstance(cand, list):
                     cfg_rows = cand

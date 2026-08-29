@@ -1593,6 +1593,34 @@ export async function previewEipAssembly(payload) {
   return res.json();
 }
 
+// 2026-08-27: an EDS says WHICH assembly to read and how big it is, never what
+// an individual bit means. For an ifm block the digital input image is the
+// first two bytes of the input assembly, and hand-typing 16 byte/bit pairs is
+// where an operator makes a mistake that yields a plausible wrong value rather
+// than an error. This builds the map and verifies it against the live device.
+// One call for an ifm block wired to its FIELDBUS port: identify it, find the
+// input assembly, and hand back a ready gateway configuration. Without this the
+// operator has to know an assembly instance and 16 byte/bit pairs.
+export async function ifmFieldbusAutoconfig(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/eip/ifm-fieldbus-autoconfig`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  }, 30000);
+  await ensureOk(res, "Fieldbus auto-configuration failed");
+  return res.json();
+}
+
+export async function generateIfmPinMap(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/eip/ifm-pin-map`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {}),
+  }, 20000);
+  await ensureOk(res, "Pin map failed");
+  return res.json();
+}
+
 export async function identifyEipDevice(payload) {
   const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/eip/identify`, {
     method: "POST",
@@ -1613,7 +1641,11 @@ export async function scanIfmPorts(payload) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload || {}),
-  }, 30000);
+    // 60s: the backend caps a whole scan at 45s (DISCOVERY_BUDGET_S). A shorter
+    // client timeout aborts BEFORE the server answers, so the operator gets a
+    // generic network error instead of the backend's actual diagnosis - which
+    // is the sentence that tells them the port is wrong.
+  }, 60000);
   await ensureOk(res, "IFM port scan failed");
   return res.json();
 }
@@ -1885,6 +1917,26 @@ export async function getPowerHistory(limit = 300, deviceId = "") {
   if (deviceId) params.set("device_id", String(deviceId));
   const res = await fetchWithTimeout(`${getApiBase()}/api/power/history?${params.toString()}`);
   if (!res.ok) throw new Error("Power history fetch failed");
+  return res.json();
+}
+
+// The power manager measures why a meter misses its interval - poll duration,
+// skipped cycles, dropped writer batches. None of it reached the operator, so a
+// meter that fell to a 4 s cadence just looked like "gaps" (2026-08-26).
+/* Machine + TrustNode + data-path diagnostics.
+
+   getControlApiBase() rather than getApiBase(): these numbers describe the
+   EDGE this app is driving, so in cloud mode they must still come from the
+   local runtime rather than from the portal. */
+export async function getSystemDiagnostics() {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/diagnostics`, {}, 20000);
+  await ensureOk(res, "Could not load diagnostics");
+  return res.json();
+}
+
+export async function getPowerDiagnostics() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/power/diagnostics`, {}, 15000);
+  if (!res.ok) throw new Error("Power diagnostics fetch failed");
   return res.json();
 }
 
@@ -3005,17 +3057,41 @@ export async function registerControlPlaneEdgeLinkLogin(payload) {
   };
 
   let lastErr = null;
+  // 2026-08-25: once the PORTAL has accepted the code, trying the next portal
+  // cannot help - the code is spent. If the LOCAL half then fails we must stop
+  // and say so, because the alternative is what the operator actually hit: an
+  // edge that is activated in the portal, has no local admin, and reports
+  // nothing useful. `fatal` carries that out of the loop unmasked.
+  let fatal = null;
+  const finalizeOrExplain = async (base, scopedData) => {
+    try {
+      await tryLocalFinalize(base, scopedData);
+    } catch (err) {
+      const why = String(err?.message || err || "unknown error");
+      fatal = new Error(
+        "Your edge was activated in the portal, but the administrator account " +
+        "could not be created on THIS computer (" + why + "). Nothing was lost - " +
+        "use \"Recover local access\" on the sign-in screen to set an " +
+        "administrator, then sign in normally."
+      );
+      return false;
+    }
+    return true;
+  };
   for (const base of (cloudFirst ? [cloudFirst, ...cloudBases.filter((b) => b !== cloudFirst)] : cloudBases)) {
     try {
       const registerRes = await fetchWithTimeout(`${base}/api/control-plane/edge-link/register`, req, 20000);
       const registerData = await registerRes.json().catch(() => ({}));
       if (registerRes.ok) {
         const scopedData = await ensureActivationScope(base, registerData);
-        await tryLocalFinalize(base, scopedData);
+        if (!(await finalizeOrExplain(base, scopedData))) break;
         // Remember the portal that worked: a re-activation on this machine, or
         // a licence re-check, then needs no typing.
         try { localStorage.setItem(STORAGE_CLOUD_URL_KEY, base); } catch { /* non-fatal */ }
-        return scopedData;
+        // An explicit ok:true - the caller checks `result?.ok`, and the raw
+        // portal payload does not always carry one, so a perfectly good
+        // activation could be reported to the operator as a failure.
+        return { ...scopedData, ok: true };
       }
       const detail = String(registerData?.detail || registerData?.error || "").toLowerCase();
       if (detail.includes("activation_code_used")) {
@@ -3034,10 +3110,10 @@ export async function registerControlPlaneEdgeLinkLogin(payload) {
         await ensureOk(bootstrapRes, "Control-plane edge-link bootstrap failed");
         const bootstrapData = await bootstrapRes.json().catch(() => ({}));
         const scopedData = await ensureActivationScope(base, bootstrapData);
-        await tryLocalFinalize(base, scopedData);
+        if (!(await finalizeOrExplain(base, scopedData))) break;
         return {
-          ok: true,
           ...scopedData,
+          ok: true,
           recovered_from_used_code: true,
         };
       }
@@ -3046,7 +3122,39 @@ export async function registerControlPlaneEdgeLinkLogin(payload) {
       lastErr = err;
     }
   }
+  if (fatal) throw fatal;
   throw lastErr || new Error("Control-plane edge-link login activation failed");
+}
+
+// --- local account recovery -------------------------------------------------
+// For an edge nobody can sign in to: activation created no admin, or the
+// password is lost. Completing a recovery needs a one-time code the backend
+// writes into the data directory, so only someone AT the machine can do it.
+
+export async function getLocalRecoveryStatus() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/recovery-status`, {}, 15000);
+  await ensureOk(res, "Could not read the account status of this edge");
+  return res.json();
+}
+
+export async function requestLocalRecovery() {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/local-recovery/request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  }, 15000);
+  await ensureOk(res, "Could not start local recovery");
+  return res.json();
+}
+
+export async function completeLocalRecovery({ code, username, password }) {
+  const res = await fetchWithTimeout(`${getApiBase()}/api/auth/local-recovery/complete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code, username, password }),
+  }, 20000);
+  await ensureOk(res, "Local recovery failed");
+  return res.json();
 }
 
 export async function unlinkControlPlaneEdgeLink() {
@@ -3898,3 +4006,136 @@ export function bmv2NormalizeGatewayTags(gatewayConfigs = []) {
     tags: (g.tags || []).map(toTag).filter((t) => t.name),
   }));
 }
+
+// ------------------------------------------------------- power meter models
+// 2026-08-27: an EM122 configured with the EM525 map connected, polled and
+// returned 0.0000 for everything. These let the operator pick the real model,
+// or import the supplier's register table instead of retyping it.
+export async function powerMeterModels() {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/power/meter-models`, {}, 15000);
+  await ensureOk(res, "Could not load meter models");
+  return res.json();
+}
+
+/* Read a Modbus device now, and return the raw registers beside the decoded
+   values. A wrong format or word order produces a believable NUMBER rather
+   than an error, so the operator has to be able to see both before saving. */
+/* The device catalogue: known devices and their tag lists, per protocol. */
+export async function listDeviceProfiles(protocol = "") {
+  const q = protocol ? `?protocol=${encodeURIComponent(protocol)}` : "";
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/device-profiles${q}`, {}, 15000);
+  await ensureOk(res, "Could not load the device catalogue");
+  return res.json();
+}
+
+/* Read a RANGE of CIP parameters from a drive. Parameter numbering differs by
+   family and firmware, so this is how an operator maps a drive without
+   trusting a table typed from a manual. */
+export async function scanCipParameters(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/eip/scan-parameters`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  }, 40000);
+  await ensureOk(res, "Could not scan drive parameters");
+  return res.json();
+}
+
+export async function previewCipParameters(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/eip/preview-parameters`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  }, 20000);
+  await ensureOk(res, "Could not read drive parameters");
+  return res.json();
+}
+
+export async function previewModbusRegisters(payload) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/modbus/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload || {})
+  }, 20000);
+  await ensureOk(res, "Could not read the Modbus device");
+  return res.json();
+}
+
+export async function powerParseRegisterTable(text) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/power/parse-register-table`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: String(text || "") }),
+  }, 20000);
+  await ensureOk(res, "Could not read the register table");
+  return res.json();
+}
+
+export async function powerAddressHelp(address) {
+  const res = await fetchWithTimeout(
+    `${getControlApiBase()}/api/power/address-help?address=${encodeURIComponent(address)}`,
+    {}, 10000);
+  await ensureOk(res, "Address check failed");
+  return res.json();
+}
+
+// ---------------------------------------------------------------------- OEE
+// 2026-08-27: the OEE module. It consumes the EXISTING gateways, tags and
+// historian — these calls only read/write the oee_* tables and the derived
+// results, never a device.
+async function _oeeReq(path, { method = "GET", body } = {}) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/oee${path}`, {
+    method,
+    // fetchWithTimeout injects the bearer token itself (see its body), so
+    // there is nothing to add here beyond the content type.
+    headers: { "Content-Type": "application/json" },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  }, 30000);
+  await ensureOk(res, "OEE request failed");
+  return res.json();
+}
+
+export async function oeeMeta() { return _oeeReq("/meta"); }
+export async function oeeHealth() { return _oeeReq("/health"); }
+
+export async function oeeList(kind, machineId = "") {
+  const q = machineId ? `?machine_id=${encodeURIComponent(machineId)}` : "";
+  return _oeeReq(`/config/${encodeURIComponent(kind)}${q}`);
+}
+export async function oeeSave(kind, payload) {
+  return _oeeReq(`/config/${encodeURIComponent(kind)}`, { method: "POST", body: payload || {} });
+}
+export async function oeeDelete(kind, id) {
+  return _oeeReq(`/config/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export async function oeeOverview(params = {}) {
+  const q = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== "") q.set(k, String(v));
+  });
+  return _oeeReq(`/overview${q.toString() ? `?${q}` : ""}`);
+}
+export async function oeeTrend(params = {}) {
+  const q = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== "") q.set(k, String(v));
+  });
+  return _oeeReq(`/trend${q.toString() ? `?${q}` : ""}`);
+}
+export async function oeeMachinesLive() { return _oeeReq("/machines/live"); }
+export async function oeeMachineResult(id, params = {}) {
+  const q = new URLSearchParams(params);
+  return _oeeReq(`/machines/${encodeURIComponent(id)}/result?${q}`);
+}
+export async function oeeMachineEvents(id, params = {}) {
+  const q = new URLSearchParams(params);
+  return _oeeReq(`/machines/${encodeURIComponent(id)}/events?${q}`);
+}
+
+export async function oeeCycleStart(payload) { return _oeeReq("/operator/cycle/start", { method: "POST", body: payload }); }
+export async function oeeCycleStop(payload) { return _oeeReq("/operator/cycle/stop", { method: "POST", body: payload }); }
+export async function oeeAddCount(payload) { return _oeeReq("/operator/count", { method: "POST", body: payload }); }
+export async function oeeAddQuality(payload) { return _oeeReq("/operator/quality", { method: "POST", body: payload }); }
+export async function oeeConfirmDowntime(payload) { return _oeeReq("/operator/downtime", { method: "POST", body: payload }); }
+export async function oeeSetState(payload) { return _oeeReq("/operator/state", { method: "POST", body: payload }); }

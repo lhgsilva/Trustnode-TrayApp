@@ -1,0 +1,27 @@
+# TrustNode — where a finished build gets copied
+# ---------------------------------------------------------------------------
+# One destination FOLDER per line. After `npm run dist` the installer and the
+# portable exe are copied into every folder listed here. Folders are created if
+# they do not exist.
+#
+# Edit this file to add, change or remove destinations — nothing else needs
+# touching, and no rebuild is required for a path change to take effect.
+#
+# Blank lines and lines starting with # are ignored.
+#
+# Tokens (replaced at copy time, all from the moment the copy runs):
+#   {DDMMYY-HHMM}   260826-1923   day+month+year, dash, hour+minute   <- default
+#   {DDMMYY}        260826
+#   {HHMM}          1923
+#   {YYYYMMDD}      20260826
+#   {YYYY} {MM} {DD} {HH} {mm}    individual parts
+#   {VERSION}       0.1.0         from desktop/package.json
+#
+# A trailing backslash is optional. Windows and UNC paths both work, e.g.
+#   \\fileserver\builds\trustnode\{DDMMYY-HHMM}
+#
+# If a destination is unreachable (network share down, OneDrive signed out) the
+# copy is SKIPPED WITH A WARNING — a build is never failed over a copy target.
+# ---------------------------------------------------------------------------
+
+C:\Users\User\OneDrive\Trustnode\{DDMMYY-HHMM}

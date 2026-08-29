@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 # Core HTTP/JSON port. Widening this union cannot affect the existing four —
 # nothing dispatches on it until a gateway is actually saved with that type.
 GatewayType = Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston",
-                      "ifm_iolink", "ethernet_ip"]
+                      "ifm_iolink", "ethernet_ip", "modbus_tcp"]
 
 
 class GatewayConfig(BaseModel):
@@ -72,11 +72,29 @@ class GatewayConfig(BaseModel):
     # 2026-08-24: any EtherNet/IP adapter (IO-Link block, remote I/O, drive)
     # read by explicit CIP messaging against its input assembly. Defaulted, so
     # existing gateway documents are unaffected.
+    # --------------------------------------------------- generic Modbus TCP
+    # 2026-08-28: Modbus TCP was already in the product but reachable only by
+    # power meters. As a gateway type it covers the widest device population in
+    # industry - VSDs, transmitters, weighing controllers, and the gateway boxes
+    # that front every other fieldbus. Defaulted, so existing gateway documents
+    # construct exactly as before.
+    #
+    # The address map lives in `modbus_registers`; `tags` carries the NAMES, the
+    # same arrangement ifm and EtherNet/IP use, which is what makes a Modbus tag
+    # indistinguishable from a PLC tag everywhere downstream.
+    modbus_port: int = 502
+    modbus_unit_id: int = 1
+    modbus_registers: List[dict] = Field(default_factory=list)
     eip_input_assembly: int = 0
     eip_output_assembly: int = 0
     eip_config_assembly: int = 0
     eip_slot: int = 0
     eip_signals: List[dict] = Field(default_factory=list)
+    # 2026-08-28: drives (PowerFlex, Kinetix) expose named parameters through
+    # the CIP Parameter Object rather than an IO assembly. A gateway may use
+    # either or both: assembly for fast bulk process data, parameters for the
+    # values the drive's own display names.
+    eip_parameters: List[dict] = Field(default_factory=list)
     # What the imported EDS said, kept for display and for confirming the
     # device on the wire is the one the map was written against.
     eip_device_info: dict = Field(default_factory=dict)

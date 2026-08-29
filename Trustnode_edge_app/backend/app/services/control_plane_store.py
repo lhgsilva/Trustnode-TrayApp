@@ -100,6 +100,11 @@ class ControlPlaneStore:
         # when MODULE_CATALOG is re-seeded; admins opt-in per-license via
         # the portal License Editor checkbox.
         {"key": "batch_management", "label": "Batch Management & Traceability", "default_enabled": False, "group": "Applications"},
+        # Opt-in, like every other Applications module: a new licence gets OEE
+        # only when an admin ticks it in the portal License Editor, so it is
+        # sellable as an add-on. (Existing licences are never re-seeded either
+        # way - defaults apply only when a licence is created.)
+        {"key": "oee", "label": "OEE (Overall Equipment Effectiveness)", "default_enabled": False, "group": "Applications"},
         {"key": "trustnode_intelligence", "label": "TrustNode Intelligence (AI assistant)", "default_enabled": False, "group": "AI"},
     ]
 

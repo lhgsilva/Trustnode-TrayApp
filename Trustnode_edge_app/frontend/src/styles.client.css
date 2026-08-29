@@ -259,3 +259,244 @@ body:not(.client-view-mobile) .cmn-sheet,
 body:not(.client-view-mobile) .cmn-sheet-scrim {
   display: none !important;
 }
+
+/* ===========================================================================
+ * PHONE LAYOUT — Power, Reports, Batch Management            2026-08-27
+ *
+ * Everything here is scoped to `.surface-client.client-view-mobile`, so the
+ * desktop edge UI and the LAN client on a laptop are untouched.
+ *
+ * The app has no shared Table component - every table is hand-rolled .thead +
+ * .trow divs with a fixed grid-template-columns. On a ~390 px screen that is a
+ * 6-10 column grid in 390 px, which is why these pages were unreadable. A
+ * runtime pass copies each header's text onto its cell as data-label (see
+ * App.jsx) and the rules below restack rows into cards using it.
+ * ======================================================================== */
+
+/* --- 1. every data table becomes a list of cards ------------------------ */
+.surface-client.client-view-mobile .table > .thead {
+  display: none;                    /* the labels move onto the cells */
+}
+
+.surface-client.client-view-mobile .table {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-x: visible;              /* no sideways scrolling on a phone */
+  min-width: 0;
+}
+
+.surface-client.client-view-mobile .table > .trow {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: var(--card);
+  font-size: 13px;
+}
+
+.surface-client.client-view-mobile .table > .trow > * {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 3px 0;
+  text-align: right;
+  word-break: break-word;
+}
+
+/* the column name, now a row label */
+.surface-client.client-view-mobile .table > .trow > *[data-label]::before {
+  content: attr(data-label);
+  flex: 0 0 auto;
+  max-width: 45%;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* The first cell is the row's identity - give it the weight of a card title
+   and drop its label, which would just repeat "Name". */
+.surface-client.client-view-mobile .table > .trow > *:first-child {
+  justify-content: flex-start;
+  text-align: left;
+  font-weight: 700;
+  font-size: 14px;
+  padding-bottom: 6px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--stroke);
+}
+
+.surface-client.client-view-mobile .table > .trow > *:first-child::before {
+  display: none;
+}
+
+/* A cell with nothing in it is noise on a phone. */
+.surface-client.client-view-mobile .table > .trow > *:empty {
+  display: none;
+}
+
+/* Actions go full width at the bottom, with real tap targets. */
+.surface-client.client-view-mobile .table > .trow .row-actions,
+.surface-client.client-view-mobile .table > .trow > *:last-child:has(button) {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 8px;
+  margin-top: 4px;
+  border-top: 1px solid var(--stroke);
+}
+
+.surface-client.client-view-mobile .table > .trow .btn,
+.surface-client.client-view-mobile .table > .trow .icon-btn {
+  min-height: 34px;
+  min-width: 34px;
+}
+
+/* --- 2. Power Overview -------------------------------------------------- */
+/* The KPI strip is a fixed 8-column grid with a 140 px minimum - 1120 px of
+   content behind a horizontal scrollbar on a 390 px screen. Two up, and the
+   numbers big enough to read at arm's length. */
+.surface-client.client-view-mobile .power-kpi-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  overflow-x: visible;
+  min-height: 0;
+}
+
+.surface-client.client-view-mobile .power-kpi-grid .stat-card {
+  min-width: 0;
+  padding: 10px;
+}
+
+.surface-client.client-view-mobile .power-kpi-grid .stat-title {
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+}
+
+.surface-client.client-view-mobile .power-kpi-grid .stat-value,
+.surface-client.client-view-mobile .power-kpi-grid .stat-card strong {
+  font-size: 20px;
+  line-height: 1.15;
+}
+
+/* the vertical group label costs width and says little on a phone */
+.surface-client.client-view-mobile .pwr-insight-group-label {
+  display: none;
+}
+
+/* charts: full width, tall enough to read, no side-by-side */
+.surface-client.client-view-mobile .power-main-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.surface-client.client-view-mobile .power-main-grid > * {
+  min-width: 0;
+}
+
+.surface-client.client-view-mobile .recharts-responsive-container {
+  min-height: 220px;
+}
+
+/* the period/metric toggles wrap instead of scrolling off */
+.surface-client.client-view-mobile .power-chart-type-toggle,
+.surface-client.client-view-mobile .power-period-toggle {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* --- 3. Reports --------------------------------------------------------- */
+/* Scheduled + generated reports are wide tables; as cards the useful bits are
+   the name, when it ran, and the download. */
+.surface-client.client-view-mobile .reporting-docs-table > .trow,
+.surface-client.client-view-mobile .scheduled-table > .trow {
+  padding: 12px;
+}
+
+.surface-client.client-view-mobile .reporting-docs-table > .trow .btn,
+.surface-client.client-view-mobile .scheduled-table > .trow .btn {
+  flex: 1 1 auto;
+  min-height: 36px;
+}
+
+.surface-client.client-view-mobile .generated-reports-filter {
+  width: 100%;
+}
+
+.surface-client.client-view-mobile .generated-reports-filter select {
+  width: 100%;
+  min-width: 0;
+}
+
+/* --- 4. Batch Management ------------------------------------------------ */
+/* Batch rows carry a status pill that must stay legible, and the batch name
+   is the thing you scan for. */
+.surface-client.client-view-mobile .bm-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.surface-client.client-view-mobile .status-pill,
+.surface-client.client-view-mobile .pill {
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
+/* Batch pages put filters in a row of selects; stack them. */
+.surface-client.client-view-mobile .bm-filters,
+.surface-client.client-view-mobile .bm-toolbar {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.surface-client.client-view-mobile .bm-filters > *,
+.surface-client.client-view-mobile .bm-toolbar > * {
+  width: 100%;
+  min-width: 0;
+}
+
+/* --- 5. shared page furniture ------------------------------------------ */
+.surface-client.client-view-mobile .card {
+  padding: 12px;
+}
+
+.surface-client.client-view-mobile .db-simple-head,
+.surface-client.client-view-mobile .db-head-title-wrap {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.surface-client.client-view-mobile .db-card-top-actions {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.surface-client.client-view-mobile h3 {
+  font-size: 15px;
+}
+
+/* A page-level button row on a phone should be reachable with one thumb. */
+.surface-client.client-view-mobile .page-title-row {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Wide fixed-width tables elsewhere in the app must not force the page to
+   scroll sideways on a phone. */
+.surface-client.client-view-mobile .table > .thead,
+.surface-client.client-view-mobile .table > .trow {
+  min-width: 0 !important;
+}

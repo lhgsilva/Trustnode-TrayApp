@@ -299,25 +299,108 @@ label {
   font-size: var(--auth-font-main);
 }
 
+/* Activation carries more fields than sign-in (code, portal, admin, password,
+   confirm) and it is the FIRST screen on a new machine - so it is the one that
+   must not run off the bottom. 2026-08-25: the old rule set gap:12px AND
+   label{margin-bottom:12px}, which stacked to 24px between every field and
+   pushed the Activate button off screen on a laptop. Spacing now comes from
+   the flex gap alone, and the control metrics are overridden as variables so
+   only this card shrinks - the sign-in screen is untouched. */
 .auth-card.activate-mode {
-  gap: 12px;
+  gap: 8px;
+  padding: 18px 22px;
+  --auth-control-h: 36px;
+  --auth-space-logo-after: 8px;
+  --auth-space-tabs-after: 10px;
+  --auth-space-password-after: 8px;
+  --auth-space-before-submit: 8px;
+  /* Whatever else happens, the operator can always reach the button. */
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
 }
 
 .auth-card.activate-mode label {
-  margin-bottom: 12px;
+  margin-bottom: 0;
+}
+
+.auth-card.activate-mode label > div {
+  margin-top: 4px;
 }
 
 .auth-card.activate-mode > h3 {
-  margin-bottom: 6px;
+  margin-bottom: 2px;
 }
 
 .auth-card.activate-mode > p {
-  margin-bottom: 10px !important;
+  margin-bottom: 4px !important;
 }
 
 .auth-card.activate-mode > div {
   margin-top: 0;
   margin-bottom: 0;
+}
+
+.auth-card.activate-mode .auth-submit {
+  margin-top: 4px;
+}
+
+/* A 1366x768 laptop, the common panel PC, and any window that is not
+   full height: shed the last few pixels and let the card start at the top
+   instead of being centred (centring clips the TOP of a tall card). */
+@media (max-height: 820px) {
+  .login-container {
+    align-items: flex-start;
+    padding: 12px 16px;
+  }
+  .auth-card.activate-mode {
+    gap: 6px;
+    padding: 14px 18px;
+    --auth-control-h: 32px;
+    --auth-font-main: 14px;
+  }
+  .auth-card.activate-mode label span {
+    font-size: 11px;
+  }
+  .auth-card.activate-mode > p {
+    display: none;
+  }
+}
+
+/* The portal address is pre-filled and almost never changed, so it hides
+   behind a link rather than costing a permanent row. */
+.activate-advanced-toggle {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent, #14b8a6);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+/* The recovery panel sits under the sign-in button on the local edge only.
+   It is a rescue path, so it is visually quiet until it is opened. */
+.auth-recovery-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 12px;
+  border: 1px solid var(--bg-card-edge);
+  border-radius: 12px;
+  background: var(--bg-page);
+}
+
+.auth-recovery-panel label {
+  margin-bottom: 0;
+}
+
+.activate-recovery-note {
+  font-size: 12px;
+  line-height: 1.45;
+  margin-top: 2px;
 }
 
 label span {

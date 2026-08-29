@@ -3,6 +3,8 @@ import { Login } from "./components/Login/Login";
 import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
 import IfmPortMapper from "./components/Gateways/IfmPortMapper";
 import EthernetIpMapper from "./components/Gateways/EthernetIpMapper";
+import ModbusMapper, { modbusTagNames } from "./components/Gateways/ModbusMapper";
+import DiagnosticsPage from "./components/Diagnostics/DiagnosticsPage";
 import { DASHBOARD_GRID_VERSION, migrateWidgetsToFinerGrid } from "./components/Dashboard/widgetRegistry";
 import { registerDeclaredTagTypes } from "./components/Dashboard/tagTypes";
 import { ReportTemplateDesigner } from "./components/Reports/ReportTemplateDesigner";
@@ -10,6 +12,9 @@ import { ScheduledReportsManager } from "./components/Reports/ScheduledReportsMa
 // Batch Management module pages. Self-contained file; license gating in
 // canOpenPage hides the menu when batch_management is not licensed.
 import { BatchesPage, BatchTypesPage, BatchAuditPage } from "./components/BatchManagement/BatchManagementPages";
+import OeeOverviewPage from "./components/OEE/OeeOverview";
+import OeeOperatorPage from "./components/OEE/OeeOperator";
+import OeeConfigurationPage from "./components/OEE/OeeConfiguration";
 // Batch Management v2 (clean rebuild) — spec-named pages. These replace the
 // three legacy menu items. Guide: docs/BATCH_MANAGEMENT_REDESIGN_2026-07-14.md
 import { BatchOverviewV2Page, BatchDefinitionsV2Page, BatchAnalysisV2Page } from "./components/BatchManagement/BatchManagementV2";
@@ -31,6 +36,8 @@ import {
   getUiSourceConfig,
   getGatewayInstanceStatuses,
   discoverPlcTags,
+  powerMeterModels,
+  powerParseRegisterTable,
   discoverPlcNetwork,
   exportHistorianXlsx,
   downloadHistorianXlsxReferenceTemplate,
@@ -101,6 +108,7 @@ import {
   getPowerStatus,
   getPowerLatest,
   getPowerHistory,
+  getPowerDiagnostics,
   startPowerDevice,
   stopPowerDevice,
   getControlPlaneRuntimeContext,
@@ -347,6 +355,15 @@ const NAV_SECTIONS = [
     title: "Power Management",
     items: ["Power Overview", "Power Configuration"]
   },
+  // OEE module (2026-08-27). Sits next to Power Management because the two
+  // read the same meters; the items are permission-gated through canOpenPage
+  // exactly like Batch Management, so the group renders nothing for a user
+  // without access.
+  {
+    id: "oee",
+    title: "OEE",
+    items: ["OEE Overview", "Operator Screen", "OEE Configuration"]
+  },
   {
     id: "collection_monitoring",
     title: "Gateway and Edge Control",
@@ -379,7 +396,10 @@ const NAV_SECTIONS = [
   {
     id: "administration",
     title: "Settings",
-    items: ["Edge", "Interface", "Directories", "Users and Access Control"]
+    // 2026-08-28: Diagnostics - machine CPU/memory/network, how much of it is
+    // TrustNode, and the state of the collect -> store -> forward path. Admin
+    // only (see canOpenPage): it exposes process and host internals.
+    items: ["Edge", "Interface", "Diagnostics", "Directories", "Users and Access Control"]
   }
 ];
 
@@ -394,7 +414,11 @@ const gatewayOptions = [
   { value: "ifm_iolink", label: "IFM IO-Link master" },
   // Any EtherNet/IP adapter, read by explicit CIP against its input assembly —
   // the edge is the originator, so no PLC is needed in between.
-  { value: "ethernet_ip", label: "EtherNet/IP device (EDS)" }
+  { value: "ethernet_ip", label: "EtherNet/IP device (EDS)" },
+  // 2026-08-28: the widest-reach protocol in industry. VSDs, transmitters,
+  // weighing controllers, and the gateway boxes that front every other
+  // fieldbus all speak Modbus TCP.
+  { value: "modbus_tcp", label: "Modbus TCP device" }
 ];
 
 // 2026-08-22: ONE resolution for the feature pairs that exist twice in saved
@@ -415,6 +439,11 @@ function pageId(label) {
   if (label.toLowerCase() === "historian") return "historian";
   if (label.toLowerCase() === "logs") return "logs";
   if (label.toLowerCase() === "reports") return "reporting";
+  // OEE module pages. Explicit keys so the labels can be reworded without
+  // breaking MODULE_KEY_BY_PAGE, canOpenPage or the render switch.
+  if (label.toLowerCase() === "oee overview") return "oee_overview";
+  if (label.toLowerCase() === "operator screen") return "oee_operator";
+  if (label.toLowerCase() === "oee configuration") return "oee_configuration";
   // Batch Management module pages (v2 clean rebuild)
   if (label.toLowerCase() === "batch overview") return "batch_overview";
   if (label.toLowerCase() === "batch definitions") return "batch_definitions";
@@ -2158,6 +2187,9 @@ const MODULE_KEY_BY_PAGE = {
   // - lan_access → gates LAN sharing toggle + per-user LAN web access
   // - opcua      → gates the OPC UA server toggle on Connections page
   // - mqtt       → gates the MQTT broker toggle on Connections page
+  oee_overview: "oee",
+  oee_operator: "oee",
+  oee_configuration: "oee",
   connections_overview: "lan_access",
   lan_sharing: "lan_access",
   opc_ua: "opcua",
@@ -3550,6 +3582,7 @@ function AppShell() {
       body.classList.remove("client-view-mobile");
     };
   }, [isClientView, useMobileLayout]);
+
   const isElectronRuntime = /electron/i.test(String(window.navigator?.userAgent || ""));
   // Single source of truth for "where does this bundle run" lives in api.js
   // (getRuntimeSurface → desktop | lan_full | lan_client | lan_lite | cloud).
@@ -3585,6 +3618,9 @@ function AppShell() {
   const [tagMonitorChartType, setTagMonitorChartType] = useState("line");
   const [wsState, setWsState] = useState("connecting");
   const [cloudStreamConnected, setCloudStreamConnected] = useState(false);
+  // Newest timestamp seen in the cloud data set, as STATE so it can be
+  // rendered. The ref alone cannot drive a banner.
+  const [cloudNewestTsMs, setCloudNewestTsMs] = useState(0);
   const [bootState, setBootState] = useState("initializing");
   const [endpointMode, setEndpointMode] = useState("local");
   const [cloudUrl, setCloudUrl] = useState("");
@@ -3607,6 +3643,68 @@ function AppShell() {
     return "dashboard";
   });
   const pageBootstrapGuardRef = useRef(true);
+
+  // NOTE: this must stay BELOW the activePage declaration. It sat above it
+  // and the dependency array - evaluated during render - hit activePage in
+  // its temporal dead zone, so the whole app died on load with "Cannot
+  // access 'Ue' before initialization" (minified). 2026-08-27.
+  // --- phone: turn data tables into readable cards -------------------------
+  // 2026-08-27. Every table in this app is hand-rolled as .thead + .trow divs
+  // (there is no shared Table component), so a phone got a 6-10 column grid
+  // squeezed into ~390 px - the Power, Reports and Batch pages were unusable.
+  //
+  // Rather than edit dozens of call sites, copy each header's text onto the
+  // matching cell as data-label and let CSS restack them. One pass covers
+  // every table on every page, including ones added later. Attributes only -
+  // no nodes are created, moved or removed, so React's DOM stays intact.
+  useEffect(() => {
+    if (!useMobileLayout) return undefined;
+    if (typeof document === "undefined") return undefined;
+
+    const label = () => {
+      const tables = document.querySelectorAll(".table");
+      for (const table of tables) {
+        const head = table.querySelector(":scope > .thead");
+        if (!head) continue;
+        const titles = Array.from(head.children).map((c) =>
+          String(c.textContent || "").trim()
+        );
+        if (!titles.length) continue;
+        const rows = table.querySelectorAll(":scope > .trow");
+        for (const row of rows) {
+          const cells = row.children;
+          for (let i = 0; i < cells.length; i += 1) {
+            const title = titles[i] || "";
+            // Only write when it changed: attribute writes are cheap but a
+            // 1 Hz live table would otherwise churn on every tick.
+            if (title && cells[i].getAttribute("data-label") !== title) {
+              cells[i].setAttribute("data-label", title);
+            }
+          }
+        }
+      }
+    };
+
+    label();
+    // Rows arrive with live data, so re-label as the DOM changes. Debounced,
+    // and attribute-only mutations are ignored so our own writes cannot
+    // retrigger the observer.
+    let pending = null;
+    const observer = new MutationObserver(() => {
+      if (pending) return;
+      pending = window.setTimeout(() => {
+        pending = null;
+        label();
+      }, 250);
+    });
+    const root = document.querySelector(".content-scroll") || document.body;
+    observer.observe(root, { childList: true, subtree: true });
+    return () => {
+      observer.disconnect();
+      if (pending) window.clearTimeout(pending);
+    };
+  }, [useMobileLayout, activePage]);
+
   const [expandedSections, setExpandedSections] = useState({
     overview: false,
     power_management: false,
@@ -3735,6 +3833,11 @@ function AppShell() {
   const [dbConnections, setDbConnections] = useState([]);
   const [gatewayConfigs, setGatewayConfigs] = useState([]);
   const [selectedGatewayId, setSelectedGatewayId] = useState("");
+  // 2026-08-27: the gateway table printed EVERY tag name into its Tags cell.
+  // A 49-tag PLC made one row a thousand pixels tall and the page unusable.
+  // The cell now shows a count and opens this viewer instead.
+  const [tagListModal, setTagListModal] = useState(null);  // {title, subtitle, tags[]}
+  const [tagListFilter, setTagListFilter] = useState("");
   const [showGatewayModal, setShowGatewayModal] = useState(false);
   const [editingGatewayId, setEditingGatewayId] = useState(null);
   const [gatewayDiscoverBusy, setGatewayDiscoverBusy] = useState(false);
@@ -3799,8 +3902,34 @@ function AppShell() {
     eip_config_assembly: 0,
     eip_slot: 0,
     eip_signals: [],
-    eip_device_info: {}
+    eip_parameters: [],
+    eip_device_info: {},
+    // Generic Modbus TCP (2026-08-28); ignored unless the type is modbus_tcp.
+    modbus_port: 502,
+    modbus_unit_id: 1,
+    modbus_registers: []
   });
+  // 2026-08-27: "it is show too many times the list of tags — we should have
+  // one". Configuring an ifm block showed the SAME 28 values three times:
+  // the mapper's "Values to collect", the generic "Selected Tags" grid, and
+  // the "Discovered Tags" browse panel.
+  //
+  // Once a block has been scanned, its mapper IS the tag list — it carries the
+  // address, channel type, scale and unit that a bare name does not. So the
+  // generic grid and the browse panel step aside. Before a scan they remain,
+  // because they are the other way to build a gateway: type or import the
+  // names and let the block resolve them at start-up. One list either way.
+  const gatewayMapperOwnsTags = useMemo(() => {
+    const t = String(gatewayForm.gateway_type || "");
+    if (t === "ifm_iolink") return (gatewayForm.ifm_datapoints || []).length > 0;
+    if (t === "ethernet_ip") {
+      return (gatewayForm.eip_signals || []).length > 0
+        || (gatewayForm.eip_parameters || []).length > 0;
+    }
+    if (t === "modbus_tcp") return (gatewayForm.modbus_registers || []).length > 0;
+    return false;
+  }, [gatewayForm.gateway_type, gatewayForm.ifm_datapoints, gatewayForm.eip_signals,
+      gatewayForm.eip_parameters, gatewayForm.modbus_registers]);
   const [showDbModal, setShowDbModal] = useState(false);
   const [editingDbId, setEditingDbId] = useState(null);
   const [dbModalPresetScope, setDbModalPresetScope] = useState("gateway");
@@ -4125,6 +4254,28 @@ function AppShell() {
     profiles: {},
     mode_defaults: POWER_PROFILE_DEFAULTS,
   });
+  // Per-meter cadence health from /api/power/diagnostics, keyed by device id.
+  const [powerMeterHealth, setPowerMeterHealth] = useState({});
+
+  // Diagnostics only - polled slowly and on its own, so it can never affect the
+  // meter data path. Cleared when the page is not open.
+  useEffect(() => {
+    if (activePage !== "power_overview") return undefined;
+    let alive = true;
+    const pull = async () => {
+      try {
+        const res = await getPowerDiagnostics();
+        const d = (res && res.diagnostics) || {};
+        const m = d.devices_metrics || d.metrics_by_device || {};
+        if (alive) setPowerMeterHealth(m && typeof m === "object" ? m : {});
+      } catch {
+        if (alive) setPowerMeterHealth({});
+      }
+    };
+    pull();
+    const id = setInterval(pull, 5000);
+    return () => { alive = false; clearInterval(id); };
+  }, [activePage]);
   const [powerStatus, setPowerStatus] = useState({
     connected: false,
     last_error: "",
@@ -4312,6 +4463,18 @@ function AppShell() {
       energy_delivered_total_wh: 1,
     },
   });
+  // Register assistant (2026-08-27). Adding an EM122 with the EM525 map read
+  // 0.0000 for every value, and retyping 33 datasheet rows by hand is where
+  // wrong addresses come from. Two ways in: pick a known model, or paste the
+  // supplier's own table.
+  const [regAssistantOpen, setRegAssistantOpen] = useState(false);
+  const [regAssistantTab, setRegAssistantTab] = useState("model");
+  const [regAssistantModels, setRegAssistantModels] = useState([]);
+  const [regAssistantModelId, setRegAssistantModelId] = useState("");
+  const [regAssistantText, setRegAssistantText] = useState("");
+  const [regAssistantParsed, setRegAssistantParsed] = useState(null);
+  const [regAssistantBusy, setRegAssistantBusy] = useState(false);
+  const [regAssistantNote, setRegAssistantNote] = useState("");
   const [newPowerRegisterKey, setNewPowerRegisterKey] = useState("");
   const [newPowerRegisterAddress, setNewPowerRegisterAddress] = useState("");
   // Per-register edit modal (operator 2026-06-15: each register row
@@ -4767,6 +4930,11 @@ function AppShell() {
     opc_url: "",
     opc_node_id: DEFAULT_OPC_NODE_ID,
     opc_node_ids_text: DEFAULT_OPC_NODE_ID,
+    // An ifm block serves IoT Core on 80 by default, but it is configurable on
+    // the block. The gateway form already inherits device.ifm_http_port, so the
+    // device is where it has to be captured - otherwise Test Connection probes
+    // 80, reports FAIL, and saving is blocked for a block that works fine.
+    ifm_http_port: 80,
     notes: ""
   });
   const [deviceTestBusy, setDeviceTestBusy] = useState(false);
@@ -5193,7 +5361,6 @@ function AppShell() {
     // setGatewayConfigs() but before the new value was readable from the
     // ref, and end up writing [gw-primary] back over the real list.
     gatewayBootstrapAppliedRef.current = true;
-    gatewaySeedAttemptedRef.current = true;
     if (Array.isArray(data.database_configurations) && data.database_configurations.length > 0) {
       // Operator 2026-06-24: pre-seed connection_ok for trivially-
       // healthy engines so the first paint never shows CHECKING /
@@ -8105,6 +8272,7 @@ function AppShell() {
             }
             if (newestLiveMs > cloudNewestLiveTsMsRef.current) {
               cloudNewestLiveTsMsRef.current = newestLiveMs;
+            setCloudNewestTsMs(newestLiveMs);
             }
             const dbMetaByName = new Map();
             for (const db of dbConnectionsRef.current || []) {
@@ -8419,6 +8587,60 @@ function AppShell() {
     };
   }, [endpointMode, endpointVersion, currentUser, isHostedWebClient]);
 
+  // Desktop / LAN: seed last-known values from the server's latest-per-tag
+  // cache. Without this the Tags page and the dashboard show "-" for any
+  // gateway that is not currently streaming, even though its rows are in the
+  // historian - the WS stream only carries what is being collected RIGHT NOW,
+  // and the dataLog slice is dominated by the busiest gateway.
+  useEffect(() => {
+    if (endpointMode === "cloud") return undefined;
+    if (!currentUser) return undefined;
+    let stopped = false;
+    const tick = async () => {
+      try {
+        const res = await getAppStoreLive(2000, null);
+        if (stopped || !res?.ok || !Array.isArray(res.rows)) return;
+        const seed = {};
+        for (const row of res.rows) {
+          const tag = normalizeTagName(String(row?.tag || row?.tag_name || ""));
+          if (!tag) continue;
+          const entry = {
+            value: row?.value,
+            value_text: row?.value_text ?? null,
+            ts: String(row?.ts || row?.ts_utc || ""),
+            quality: row?.quality,
+            quality_label: row?.quality_label,
+          };
+          const gid = String(row?.gateway_id || "").trim();
+          if (gid) seed[`${gid}::${tag}`] = entry;
+          const ip = String(row?.plc_ip || "").trim();
+          if (ip) seed[`ENDPOINT::${ip}::${tag}`] = entry;
+        }
+        if (!Object.keys(seed).length) return;
+        setLiveTagValues((prev) => {
+          const next = { ...(prev || {}) };
+          for (const [key, entry] of Object.entries(seed)) {
+            const cur = next[key];
+            if (!cur) { next[key] = entry; continue; }
+            // Keep whichever is NEWER: the stream is fresher while a gateway
+            // is running, this snapshot is all there is once it stops.
+            const curMs = parseTimestampMs(String(cur.ts || ""));
+            const newMs = parseTimestampMs(String(entry.ts || ""));
+            if (Number.isFinite(newMs) && (!Number.isFinite(curMs) || newMs > curMs)) {
+              next[key] = entry;
+            }
+          }
+          return next;
+        });
+      } catch {
+        /* a failed seed must never disturb the page - the stream still works */
+      }
+    };
+    tick();
+    const id = setInterval(tick, 10000);
+    return () => { stopped = true; clearInterval(id); };
+  }, [endpointMode, currentUser]);
+
   useEffect(() => {
     if (endpointMode !== "cloud") return;
     if (!currentUser) return;
@@ -8483,6 +8705,7 @@ function AppShell() {
           }
           if (!isDuplicatePollFrame && newestLiveMs > cloudNewestLiveTsMsRef.current) {
             cloudNewestLiveTsMsRef.current = newestLiveMs;
+            setCloudNewestTsMs(newestLiveMs);
           }
           const dbMetaByName = new Map();
           for (const db of dbConnectionsRef.current || []) {
@@ -8711,13 +8934,43 @@ function AppShell() {
       }
     };
 
+    // 2026-08-26: a phone on the cloud build refetched the live set every
+    // second whether or not anything had changed. When the edge is not pushing
+    // (forwarding paused, no cloud target) that is a 1 Hz download of identical
+    // rows over mobile data - the app felt like it was "always loading the
+    // charts again". Back off while the newest timestamp stands still, and
+    // snap straight back to 1 s the moment real data arrives, so a live edge
+    // is exactly as live as before.
+    let liveTimer = null;
+    let idleRounds = 0;
+    const nextLiveDelay = () => {
+      if (idleRounds < 3) return CLOUD_LIVE_POLL_MS;          // 1s
+      if (idleRounds < 8) return CLOUD_LIVE_POLL_MS * 3;      // 3s
+      if (idleRounds < 20) return CLOUD_LIVE_POLL_MS * 8;     // 8s
+      return CLOUD_LIVE_POLL_MS * 20;                         // 20s
+    };
+    const scheduleLive = () => {
+      if (stopped) return;
+      liveTimer = setTimeout(async () => {
+        const before = Number(cloudNewestLiveTsMsRef.current || 0);
+        try {
+          await pollCloudLive();
+        } finally {
+          const after = Number(cloudNewestLiveTsMsRef.current || 0);
+          // advanced => real new data => poll hard again
+          idleRounds = after > before ? 0 : idleRounds + 1;
+          scheduleLive();
+        }
+      }, nextLiveDelay());
+    };
+
     pollCloudLive();
     pollCloudAux();
-    const liveTimer = setInterval(pollCloudLive, CLOUD_LIVE_POLL_MS);
+    scheduleLive();
     const auxTimer = setInterval(pollCloudAux, CLOUD_AUX_POLL_MS);
     return () => {
       stopped = true;
-      clearInterval(liveTimer);
+      if (liveTimer) clearTimeout(liveTimer);
       clearInterval(auxTimer);
     };
   }, [endpointMode, endpointVersion, currentUser, cloudStreamConnected, filterCloudRowsMonotonic, activePage, cloudEdgeApiFilter]);
@@ -9227,9 +9480,41 @@ function AppShell() {
     return { ...profileMap, ...customMap };
   }, [selectedPowerDevice, powerProfiles]);
 
+  // How much of this meter's map is actually being polled. Reads the rendered
+  // map, not `device.registers`, so a profile-backed meter counts correctly.
+  const powerRegisterTickCount = useMemo(() => {
+    const keys = Object.keys(selectedPowerRegisterMap || {});
+    const off = selectedPowerDevice?.register_enabled || {};
+    return { total: keys.length, on: keys.filter((k) => off[k] !== false).length };
+  }, [selectedPowerRegisterMap, selectedPowerDevice]);
+
   const selectedPowerLatestByTag = useMemo(() => {
     const did = String(powerConfig?.selected_device_id || "");
     if (!did) return { values: {}, values_raw: {}, ts: "" };
+
+    // 2026-08-26: prefer the LIVE sample from /api/power/latest.
+    //
+    // This used to be derived purely from powerHistoryRows, which is fetched
+    // for the CHART - and for any window wider than 15 minutes that fetch is
+    // narrowed to the selected chart metric plus insight.* tags. Voltage and
+    // current are not in that set, so every register read "-" even though the
+    // meter was polling perfectly and writing rows. The Registers table is a
+    // live view of the meter; it should not depend on the chart's window or
+    // its tag filter. History stays as the fallback for a meter that has
+    // stopped (its last sample is gone but its rows are not).
+    const live = powerSample && typeof powerSample === "object" ? powerSample : null;
+    if (live && String(live.device || did) === did) {
+      const lv = (live.values_scaled && typeof live.values_scaled === "object")
+        ? live.values_scaled
+        : (live.values && typeof live.values === "object" ? live.values : null);
+      if (lv && Object.keys(lv).length) {
+        const rawv = (live.values_raw && typeof live.values_raw === "object")
+          ? live.values_raw
+          : {};
+        return { values: { ...lv }, values_raw: { ...rawv }, ts: String(live.ts || "") };
+      }
+    }
+
     let latestTsMs = -1;
     let latestTs = "";
     const values = {};
@@ -9254,7 +9539,7 @@ function AppShell() {
       }
     }
     return { values, values_raw: valuesRaw, ts: latestTs };
-  }, [powerHistoryRows, powerConfig]);
+  }, [powerHistoryRows, powerConfig, powerSample]);
 
   const selectedPowerRegisterTestResult = useMemo(() => {
     const did = String(powerConfig?.selected_device_id || "");
@@ -10436,6 +10721,30 @@ function AppShell() {
     });
   };
 
+  /* Persist a change to the selected meter's register maps.
+
+     Every other edit on this page (tariffs, downtime rules) builds the next
+     config explicitly and passes it to savePowerConfigPayload. Register edits
+     did not, so they lived in React state only and the poller kept the old
+     map. `mutate` receives the device and returns the changed copy. */
+  const persistPowerDeviceRegisters = async (mutate, message) => {
+    const selectedId = String(powerConfig?.selected_device_id || "");
+    if (!selectedId) return;
+    const devices = (Array.isArray(powerConfig?.devices) ? powerConfig.devices : [])
+      .map((d) => (String(d?.id || "") !== selectedId ? d : mutate(d)));
+    const nextConfig = { ...(powerConfig || {}), devices };
+    setPowerConfig(nextConfig);
+    try {
+      setPowerBusy(true);
+      await savePowerConfigPayload(nextConfig);
+      if (message) setPowerResult(message);
+    } catch (err) {
+      setPowerResult(`Register change NOT saved: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
+  };
+
   const setPowerDeviceRegisterField = (key, value) => {
     const selectedId = String(powerConfig?.selected_device_id || "");
     setPowerConfig((prev) => {
@@ -10471,6 +10780,79 @@ function AppShell() {
     });
   };
 
+  const openRegisterAssistant = async () => {
+    setRegAssistantOpen(true);
+    setRegAssistantNote("");
+    setRegAssistantParsed(null);
+    if (regAssistantModels.length === 0) {
+      try {
+        const res = await powerMeterModels();
+        setRegAssistantModels(res.models || []);
+      } catch (e) {
+        setRegAssistantNote(String(e?.message || e));
+      }
+    }
+  };
+
+  const applyRegisterMap = async (registers, label) => {
+    // REPLACES the map rather than merging: a meter has one register layout,
+    // and merging an EM122 map into leftover EM525 rows is exactly the
+    // half-configured state that reads zeros.
+    //
+    // 2026-08-28: this used to call setPowerDeviceField() and stop there, which
+    // only updates React state. The table then showed the EM122 addresses while
+    // the SAVED config still held the old EM525 map, and the poller went on
+    // reading 19000-range registers — every row displayed "-" and the map
+    // looked applied when it was not. Build the config explicitly and PERSIST
+    // it, the same way every other power edit on this page does.
+    const selectedId = String(powerConfig?.selected_device_id || "");
+    const next = {};
+    const scales = {};
+    Object.entries(registers || {}).forEach(([k, v]) => {
+      next[k] = Number(v);
+      scales[k] = Number((selectedPowerDevice?.register_scales || {})[k] || 1) || 1;
+    });
+
+    const devices = (Array.isArray(powerConfig?.devices) ? powerConfig.devices : [])
+      .map((d) => (String(d?.id || "") !== selectedId ? d : {
+        ...d,
+        // Tell the backend this map is the operator's, so it is not replaced
+        // by the profile's default map on the next load.
+        use_custom_registers: true,
+        registers: next,
+        register_scales: scales,
+      }));
+    const nextConfig = { ...(powerConfig || {}), devices };
+    setPowerConfig(nextConfig);
+    setRegAssistantOpen(false);
+
+    try {
+      setPowerBusy(true);
+      await savePowerConfigPayload(nextConfig);
+      setPowerResult(`${label} applied and saved — ${Object.keys(next).length} register(s). `
+        + `Datasheet addresses (30001…) are converted to Modbus offsets automatically. `
+        + `The poll loop re-reads the config each cycle, so this takes effect on the next poll.`);
+    } catch (err) {
+      setPowerResult(`Register map NOT saved: ${String(err?.message || err)}`);
+    } finally {
+      setPowerBusy(false);
+    }
+  };
+
+  const parseRegisterTable = async () => {
+    setRegAssistantBusy(true);
+    setRegAssistantNote("");
+    try {
+      const res = await powerParseRegisterTable(regAssistantText);
+      setRegAssistantParsed(res);
+      if (!res.ok) setRegAssistantNote(res.message || "Nothing could be read.");
+    } catch (e) {
+      setRegAssistantNote(String(e?.message || e));
+    } finally {
+      setRegAssistantBusy(false);
+    }
+  };
+
   const addPowerRegisterRow = () => {
     const key = String(newPowerRegisterKey || "").trim();
     if (!key) {
@@ -10482,7 +10864,13 @@ function AppShell() {
       setPowerResult("Register address must be zero or greater.");
       return;
     }
-    setPowerDeviceRegisterField(key, Math.floor(addr));
+    persistPowerDeviceRegisters((d) => ({
+      ...d,
+      use_custom_registers: true,
+      registers: { ...(d.registers || {}), [key]: Math.floor(addr) },
+      register_scales: { ...(d.register_scales || {}),
+                         [key]: Number(d?.register_scales?.[key] || 1) || 1 },
+    }), `Register "${key}" added at ${Math.floor(addr)}.`);
     setNewPowerRegisterKey("");
     setNewPowerRegisterAddress("");
   };
@@ -10687,24 +11075,45 @@ function AppShell() {
     }
   };
 
+  // 2026-08-28: "we might not need all the values to be collected and send to
+  // the database". A meter's map can be 87 registers; unticking one stops it
+  // being polled and stored while KEEPING its address, scale and description,
+  // so re-ticking needs no supplier table. Only OFF keys are recorded - an
+  // absent key is on, which leaves every existing meter collecting as before.
+  const setPowerRegisterEnabled = (key, on) => {
+    const regKey = String(key || "").trim();
+    if (!regKey) return;
+    persistPowerDeviceRegisters((d) => {
+      const next = { ...(d.register_enabled || {}) };
+      if (on) delete next[regKey];
+      else next[regKey] = false;
+      return { ...d, register_enabled: next };
+    }, on ? `Collecting "${regKey}".` : `Stopped collecting "${regKey}".`);
+  };
+
+  const setAllPowerRegistersEnabled = (on) => {
+    persistPowerDeviceRegisters((d) => {
+      if (on) return { ...d, register_enabled: {} };
+      const next = {};
+      for (const k of Object.keys(d.registers || {})) next[k] = false;
+      return { ...d, register_enabled: next };
+    }, on ? "Collecting every register." : "Stopped collecting every register.");
+  };
+
   const removePowerRegisterRow = (key) => {
     const selectedId = String(powerConfig?.selected_device_id || "");
     const regKey = String(key || "").trim();
     if (!selectedId || !regKey) return;
-    setPowerConfig((prev) => {
-      const prevDevices = Array.isArray(prev?.devices) ? prev.devices : [];
-      const devices = prevDevices.map((d) => {
-        if (String(d?.id || "") !== selectedId) return d;
-        const nextRegs = { ...(d.registers || {}) };
-        const nextScales = { ...(d.register_scales || {}) };
-        const nextDescs = { ...(d.register_descriptions || {}) };
-        delete nextRegs[regKey];
-        delete nextScales[regKey];
-        delete nextDescs[regKey];
-        return { ...d, use_custom_registers: true, registers: nextRegs, register_scales: nextScales, register_descriptions: nextDescs };
-      });
-      return { ...(prev || {}), devices };
-    });
+    persistPowerDeviceRegisters((d) => {
+      const nextRegs = { ...(d.registers || {}) };
+      const nextScales = { ...(d.register_scales || {}) };
+      const nextDescs = { ...(d.register_descriptions || {}) };
+      delete nextRegs[regKey];
+      delete nextScales[regKey];
+      delete nextDescs[regKey];
+      return { ...d, use_custom_registers: true, registers: nextRegs,
+               register_scales: nextScales, register_descriptions: nextDescs };
+    }, `Register "${regKey}" removed.`);
   };
 
   const setPowerDeviceRunning = async (deviceId, shouldRun) => {
@@ -11118,6 +11527,9 @@ function AppShell() {
     if (page === "data_log" || page === "logs") {
       return isAdmin;
     }
+    // Diagnostics exposes host process names, pids and memory. Same bar as the
+    // raw log: admin only.
+    if (page === "diagnostics") return isAdmin;
     // Phase C C.5 2026-08-22: Tags reachable on read-only surfaces (viewer
     // role on LAN, lan_client / lan_lite surface). Gated by the `tags`
     // permission; the page itself must render read-only for these roles.
@@ -14404,21 +14816,59 @@ const getGatewayHealth = (gateway) => {
         interval_ms: Number(gateway.interval_ms || 1000),
         equipment: db.equipment || "",
         site: db.site || "",
-        area: db.area || ""
+        area: db.area || "",
+
+        // PROTOCOL-SPECIFIC FIELDS. Without these the backend receives a
+        // gateway with no assembly and no signals and fails with "no input
+        // assembly is set" - which is exactly what Start did for every
+        // EtherNet/IP gateway until 2026-08-28.
+        //
+        // Anything added to a protocol later must be added HERE too, or Start
+        // will quietly ignore it while Save appears to work. Spreading the
+        // whole gateway is not an option: the backend model rejects unknown
+        // keys, and the sink/trigger fields above are deliberately reshaped.
+
+        // --- generic EtherNet/IP (CIP explicit) ---
+        eip_input_assembly: Number(gateway.eip_input_assembly || 0),
+        eip_output_assembly: Number(gateway.eip_output_assembly || 0),
+        eip_config_assembly: Number(gateway.eip_config_assembly || 0),
+        eip_slot: Number(gateway.eip_slot || 0),
+        eip_signals: Array.isArray(gateway.eip_signals) ? gateway.eip_signals : [],
+        eip_parameters: Array.isArray(gateway.eip_parameters) ? gateway.eip_parameters : [],
+        eip_device_info: gateway.eip_device_info || {},
+
+        // --- generic Modbus TCP ---
+        modbus_port: Number(gateway.modbus_port || 502),
+        modbus_unit_id: Number(gateway.modbus_unit_id || 1),
+        modbus_registers: Array.isArray(gateway.modbus_registers) ? gateway.modbus_registers : [],
+
+        // --- ifm IO-Link master over its IoT Core ---
+        ifm_http_port: Number(gateway.ifm_http_port || 80),
+        ifm_use_https: Boolean(gateway.ifm_use_https),
+        ifm_verify_tls: Boolean(gateway.ifm_verify_tls),
+        ifm_username: String(gateway.ifm_username || ""),
+        ifm_password: String(gateway.ifm_password || ""),
+        ifm_port_count: Number(gateway.ifm_port_count || 8),
+        ifm_variant: String(gateway.ifm_variant || "auto"),
+        ifm_ports: Array.isArray(gateway.ifm_ports) ? gateway.ifm_ports : [],
+        ifm_datapoints: Array.isArray(gateway.ifm_datapoints) ? gateway.ifm_datapoints : []
       },
       db_sink: primarySink,
       db_sinks: [primarySink, ...parallelSinks]
     };
   };
 
-  const startGatewayProfile = async (gateway) => {
+  const startGatewayProfile = async (gateway, opts = {}) => {
     if (!canControlGateways) return;
     if (!gateway) {
       setError("Select a gateway configuration first.");
       return;
     }
     const gid = String(gateway.id || "");
-    if (isGatewayRunning(gateway)) {
+    // `force` is for the restart-after-save path: the backend worker has just
+    // been stopped, but the LOCAL running flag has not caught up yet, so this
+    // guard would swallow the start and leave the gateway down for good.
+    if (!opts.force && isGatewayRunning(gateway)) {
       setError("");
       return;
     }
@@ -15224,7 +15674,16 @@ const getGatewayHealth = (gateway) => {
       schedule_stop: "18:00",
       // Default ON — see useState default above.
       auto_recover_enabled: true,
-      tags_text: Array.isArray(config?.tags) ? config.tags.join(";") : ""
+      // 2026-08-27: this used to seed the NEW gateway with `config.tags` —
+      // the legacy primary gateway's tag list. Adding an ifm block therefore
+      // opened with 49 Allen-Bradley PLC tags already ticked, which is not a
+      // convenience but a wrong configuration: a tag name from one device
+      // means nothing on another. A new gateway starts empty and gets its
+      // tags from its OWN device.
+      tags_text: "",
+      ifm_datapoints: [],
+      eip_signals: [],
+      ifm_ports: [],
     });
     setShowGatewayModal(true);
   };
@@ -15274,11 +15733,15 @@ const getGatewayHealth = (gateway) => {
       ifm_ports: Array.isArray(gateway.ifm_ports) ? gateway.ifm_ports : [],
       ifm_variant: String(gateway.ifm_variant || "auto"),
       ifm_datapoints: Array.isArray(gateway.ifm_datapoints) ? gateway.ifm_datapoints : [],
+      modbus_port: Number(gateway.modbus_port || 502),
+      modbus_unit_id: Number(gateway.modbus_unit_id || 1),
+      modbus_registers: Array.isArray(gateway.modbus_registers) ? gateway.modbus_registers : [],
       eip_input_assembly: Number(gateway.eip_input_assembly || 0),
       eip_output_assembly: Number(gateway.eip_output_assembly || 0),
       eip_config_assembly: Number(gateway.eip_config_assembly || 0),
       eip_slot: Number(gateway.eip_slot || 0),
       eip_signals: Array.isArray(gateway.eip_signals) ? gateway.eip_signals : [],
+      eip_parameters: Array.isArray(gateway.eip_parameters) ? gateway.eip_parameters : [],
       eip_device_info: gateway.eip_device_info || {}
     });
     setShowGatewayModal(true);
@@ -15333,6 +15796,60 @@ const getGatewayHealth = (gateway) => {
     }
   };
 
+  // What else points at these tags? Used before a save stops collecting them.
+  // Deep-walks each widget config because every widget type names its tags
+  // differently (`tag_name`, `tags[]`, `compute_rules[].tag_name`, series...);
+  // a fixed list of shapes would go stale with the next widget type.
+  const tagReferences = useCallback((gatewayId, tagNames) => {
+    const wanted = new Set((tagNames || []).map((t) => String(t)));
+    if (!wanted.size) return [];
+    const out = [];
+
+    const walkForTags = (node, hits) => {
+      if (!node || typeof node !== "object") return;
+      if (Array.isArray(node)) { node.forEach((x) => walkForTags(x, hits)); return; }
+      for (const [key, val] of Object.entries(node)) {
+        const k = key.toLowerCase();
+        if (typeof val === "string" && (k === "tag" || k === "tag_name") && wanted.has(val)) {
+          hits.add(val);
+        } else if (Array.isArray(val) && k === "tags") {
+          val.forEach((x) => { if (typeof x === "string" && wanted.has(x)) hits.add(x); });
+          val.forEach((x) => walkForTags(x, hits));
+        } else if (val && typeof val === "object") {
+          walkForTags(val, hits);
+        }
+      }
+    };
+
+    for (const w of (Array.isArray(dashboardWidgets) ? dashboardWidgets : [])) {
+      const cfg = w?.config || w || {};
+      // A widget bound to a DIFFERENT gateway that happens to share a tag name
+      // is not affected by this change.
+      const wGw = String(cfg?.gateway_id || w?.gateway_id || "").trim();
+      if (wGw && wGw !== String(gatewayId)) continue;
+      const hits = new Set();
+      walkForTags(cfg, hits);
+      if (hits.size) {
+        const title = String(w?.title || cfg?.title || w?.type || "widget");
+        out.push(`Dashboard widget "${title}" (${Array.from(hits).join(", ")})`);
+      }
+    }
+
+    for (const r of (Array.isArray(triggerRules) ? triggerRules : [])) {
+      if (String(r?.gateway_id || "") === String(gatewayId) && wanted.has(String(r?.tag_name || ""))) {
+        out.push(`Limit rule on ${r.tag_name}`);
+      }
+    }
+
+    for (const t of (Array.isArray(collectionTriggers) ? collectionTriggers : [])) {
+      if (String(t?.gateway_id || "") === String(gatewayId) && wanted.has(String(t?.tag_name || ""))) {
+        out.push(`Collection trigger on ${t.tag_name}`);
+      }
+    }
+
+    return out;
+  }, [dashboardWidgets, triggerRules, collectionTriggers]);
+
   const saveGatewayConfig = () => {
     if (!canEditPage("gateway_configuration")) return;
     const name = gatewayForm.name.trim();
@@ -15342,6 +15859,39 @@ const getGatewayHealth = (gateway) => {
       setError("Gateway name and PLC IP are required.");
       return;
     }
+    // 2026-08-28: unticking every value leaves `tags` empty, and an empty tag
+    // list means "no filter" to the backend - which then collects EVERY mapped
+    // value. The operator's intent was the opposite, so refuse the save rather
+    // than silently doing the inverse of what was asked.
+    if (gatewayMapperOwnsTags && !tags.length) {
+      setError(
+        "Tick at least one value to collect. A gateway saved with nothing ticked "
+        + "collects every mapped value instead of none."
+      );
+      return;
+    }
+
+    // Dropping a tag is allowed and safe for the gateway - but a dashboard
+    // widget, alarm or trigger pointed at it will simply stop updating, with no
+    // error anywhere. Name them before it happens.
+    if (editingGatewayId) {
+      const before = (gatewayConfigs.find((g) => g.id === editingGatewayId)?.tags) || [];
+      const dropped = before.filter((t) => !tags.includes(t));
+      if (dropped.length) {
+        const users = tagReferences(editingGatewayId, dropped);
+        if (users.length) {
+          const list = users.slice(0, 12).map((u) => `  • ${u}`).join("\n");
+          const more = users.length > 12 ? `\n  …and ${users.length - 12} more` : "";
+          if (!window.confirm(
+            `Stop collecting ${dropped.length} value(s)?\n\n`
+            + `${dropped.slice(0, 12).join(", ")}${dropped.length > 12 ? ", …" : ""}\n\n`
+            + `These will stop updating:\n${list}${more}\n\n`
+            + `History already recorded is kept. Tick the value again to resume.`
+          )) return;
+        }
+      }
+    }
+
     if (gatewayForm.gateway_type === "siemens_opcua") {
       const nodeIds = parseOpcNodeIds(gatewayForm.tags_text);
       if (!nodeIds.length) {
@@ -15383,11 +15933,15 @@ const getGatewayHealth = (gateway) => {
       ifm_ports: Array.isArray(gatewayForm.ifm_ports) ? gatewayForm.ifm_ports : [],
       ifm_variant: String(gatewayForm.ifm_variant || "auto"),
       ifm_datapoints: Array.isArray(gatewayForm.ifm_datapoints) ? gatewayForm.ifm_datapoints : [],
+      modbus_port: Number(gatewayForm.modbus_port || 502),
+      modbus_unit_id: Number(gatewayForm.modbus_unit_id || 1),
+      modbus_registers: Array.isArray(gatewayForm.modbus_registers) ? gatewayForm.modbus_registers : [],
       eip_input_assembly: Number(gatewayForm.eip_input_assembly || 0),
       eip_output_assembly: Number(gatewayForm.eip_output_assembly || 0),
       eip_config_assembly: Number(gatewayForm.eip_config_assembly || 0),
       eip_slot: Number(gatewayForm.eip_slot || 0),
       eip_signals: Array.isArray(gatewayForm.eip_signals) ? gatewayForm.eip_signals : [],
+      eip_parameters: Array.isArray(gatewayForm.eip_parameters) ? gatewayForm.eip_parameters : [],
       eip_device_info: gatewayForm.eip_device_info || {},
       // Operator 2026-06-21: opt-in auto-resume per gateway. Default
       // false — the worker only comes back after a backend restart if
@@ -15406,6 +15960,37 @@ const getGatewayHealth = (gateway) => {
     setSelectedGatewayId(next.id);
     setShowGatewayModal(false);
     setError("");
+
+    // A worker holds the configuration it was STARTED with. Saving a change to
+    // a gateway that is already running therefore did nothing to it: the store
+    // had the new input assembly while the worker kept failing on the old
+    // config, the row still said RUNNING, and nothing collected. Restart it so
+    // the change is real. A stopped gateway is left stopped - saving is not a
+    // reason to start collecting.
+    const wasRunning = editingGatewayId
+      ? Boolean(isGatewayRunning(gatewayConfigs.find((g) => g.id === editingGatewayId)))
+      : false;
+    if (wasRunning) {
+      (async () => {
+        try {
+          await stopGatewayInstance(next.id);
+          // The worker is down now; say so locally BEFORE starting, or the
+          // start guard sees a stale "running" and does nothing.
+          markGatewayRunningState([next.id], false);
+          await startGatewayProfile(next, { force: true });
+          setGatewayDiscoverResult(
+            `"${next.name}" restarted so the saved changes take effect.`);
+        } catch (err) {
+          // Leaving it stopped after an explicit stop is the worst outcome:
+          // auto-recover does not rescue an explicit stop, so it would stay
+          // down silently. Say exactly what to do.
+          markGatewayRunningState([next.id], false);
+          setError(`Saved, but "${next.name}" could not be restarted: `
+            + `${String(err?.message || err)}. Press Start on that gateway to `
+            + `apply the change.`);
+        }
+      })();
+    }
   };
 
   const runGatewayTagDiscovery = async () => {
@@ -15638,6 +16223,7 @@ const getGatewayHealth = (gateway) => {
       opc_url: "",
       opc_node_id: DEFAULT_OPC_NODE_ID,
       opc_node_ids_text: DEFAULT_OPC_NODE_ID,
+      ifm_http_port: Number(config?.ifm_http_port || 80),
       notes: ""
     });
     setDeviceTestResult(null);
@@ -15657,6 +16243,7 @@ const getGatewayHealth = (gateway) => {
         Array.isArray(device.opc_node_ids) && device.opc_node_ids.length
           ? device.opc_node_ids.join(";")
           : device.opc_node_ids_text || device.opc_node_id || DEFAULT_OPC_NODE_ID,
+      ifm_http_port: Number(device.ifm_http_port || 80),
       notes: device.notes || ""
     });
     setDeviceTestResult(
@@ -15985,6 +16572,7 @@ const getGatewayHealth = (gateway) => {
       const res = await testPlcConnection({
         gateway_type: deviceForm.gateway_type,
         plc_ip: deviceForm.plc_ip.trim(),
+        ifm_http_port: Number(deviceForm.ifm_http_port || 80),
         opc_url: deviceForm.opc_url.trim(),
         opc_node_id: deviceForm.opc_node_id.trim(),
         opc_node_ids: parseOpcNodeIds(deviceForm.opc_node_ids_text),
@@ -16000,7 +16588,7 @@ const getGatewayHealth = (gateway) => {
       const nodeListKey = parseOpcNodeIds(deviceForm.opc_node_ids_text).join(";");
       setDeviceTestResult({
         ...normalized,
-        tested_for: `${deviceForm.gateway_type}|${deviceForm.plc_ip.trim()}|${deviceForm.opc_url.trim()}|${nodeListKey}`
+        tested_for: `${deviceForm.gateway_type}|${deviceForm.plc_ip.trim()}|${deviceForm.opc_url.trim()}|${nodeListKey}|${Number(deviceForm.ifm_http_port || 80)}`
       });
     } catch (err) {
       setDeviceTestResult({ ok: false, message: String(err?.message || err || "Connection test failed") });
@@ -16017,7 +16605,7 @@ const getGatewayHealth = (gateway) => {
       setDeviceTestResult({ ok: false, message: "Name and PLC IP are required." });
       return;
     }
-    const testedKey = `${deviceForm.gateway_type}|${ip}|${deviceForm.opc_url.trim()}|${parseOpcNodeIds(deviceForm.opc_node_ids_text).join(";")}`;
+    const testedKey = `${deviceForm.gateway_type}|${ip}|${deviceForm.opc_url.trim()}|${parseOpcNodeIds(deviceForm.opc_node_ids_text).join(";")}|${Number(deviceForm.ifm_http_port || 80)}`;
     if (!deviceTestResult?.ok || deviceTestResult?.tested_for !== testedKey) {
       setDeviceTestResult({
         ok: false,
@@ -16035,6 +16623,7 @@ const getGatewayHealth = (gateway) => {
       opc_node_id: (opcNodes[0] || deviceForm.opc_node_id || DEFAULT_OPC_NODE_ID).trim(),
       opc_node_ids: opcNodes,
       opc_node_ids_text: deviceForm.opc_node_ids_text.trim(),
+      ifm_http_port: Number(deviceForm.ifm_http_port || 80),
       notes: deviceForm.notes.trim(),
       connection_ok: true,
       ping_ok: Boolean(deviceTestResult.ping_ok),
@@ -17515,7 +18104,7 @@ const getGatewayHealth = (gateway) => {
     if (Object.keys(entry).length === 0) delete next[k]; else next[k] = entry;
     setTagPublishFlags(next);
     try {
-      const data = await getBootstrap();
+      const data = await getAppStoreBootstrap();
       const s = (data?.app_settings && typeof data.app_settings === "object") ? data.app_settings : {};
       await saveAppStoreDomain("app_settings", { ...s, tag_publish_flags: next }, currentUser?.username || "system");
     } catch (e) {
@@ -20906,6 +21495,30 @@ const getGatewayHealth = (gateway) => {
               first runtime poll hadn't landed yet so last_check_utc
               was still empty). gatewayRunningSinceRef stamps when a
               gateway first goes running so we can do that grace. */}
+          {/* 2026-08-26: on the cloud build the app showed whatever the cloud
+              database held, with nothing to say how old it was. When the edge
+              stops forwarding - no cloud target configured, forwarding paused -
+              the phone kept displaying months-old numbers as if they were live.
+              Say it plainly instead. */}
+          {endpointMode === "cloud" && cloudNewestTsMs > 0 ? (() => {
+            const ageMs = Date.now() - cloudNewestTsMs;
+            if (ageMs < 120000) return null;
+            const mins = Math.floor(ageMs / 60000);
+            const age = mins < 60
+              ? `${mins} minute${mins === 1 ? "" : "s"}`
+              : (mins < 1440
+                  ? `${Math.floor(mins / 60)} hour${Math.floor(mins / 60) === 1 ? "" : "s"}`
+                  : `${Math.floor(mins / 1440)} day${Math.floor(mins / 1440) === 1 ? "" : "s"}`);
+            return (
+              <div className="error" style={{ marginBottom: 10 }}>
+                <strong>This data is {age} old.</strong> It is the newest the cloud
+                database holds — the edge is not forwarding right now, so nothing
+                on this screen is live. Check Database &amp; Backup on the edge:
+                a cloud target must be configured and enabled before data reaches
+                the cloud.
+              </div>
+            );
+          })() : null}
           {!isPortalOnly && Array.isArray(gatewayConfigsView) && gatewayConfigsView.length > 0 ? (() => {
             const nowMs = Date.now();
             const GRACE_AFTER_START_MS = 30000;
@@ -22241,8 +22854,15 @@ const getGatewayHealth = (gateway) => {
                         const lastErr = String(st.last_error || "").toLowerCase();
                         const dbFault = /(sink|writer|historian).*(fail|error)|database.*(write|insert).*fail/.test(lastErr);
                         const enabledByOp = d.enabled !== false;
+                        // Before the first poll completes the meter is
+                        // STARTING, not failing - it used to read "Device
+                        // Fails" the moment it was enabled, before a single
+                        // Modbus request had gone out (2026-08-26).
+                        const starting = enabledByOp && !st.connected && Boolean(st.starting);
                         const label = !enabledByOp
                           ? "Stopped"
+                          : starting
+                          ? "Starting..."
                           : st.connected
                             ? (dbFault ? "DB Fails" : "Running")
                             : dbFault
@@ -22287,6 +22907,59 @@ const getGatewayHealth = (gateway) => {
                       })}
                     </div>
                     )}
+                    {/* Meter health (2026-08-26). The manager already measured
+                        all of this; none of it reached the operator, so a meter
+                        that had quietly fallen to a 4 s cadence looked like
+                        unexplained "gaps" in the historian. Measured interval
+                        is the honest number - it is what actually lands in the
+                        historian, not what was configured. */}
+                    {Object.keys(powerMeterHealth || {}).length ? (
+                      <div className="power-health-panel">
+                        <div className="power-health-head">
+                          <strong>Meter health</strong>
+                          <span className="muted">measured from the last poll of each meter</span>
+                        </div>
+                        <div className="table db-table power-health-table">
+                          <div className="thead">
+                            <span>Meter</span><span>Configured</span><span>Measured</span>
+                            <span>Poll time</span><span>Skipped</span><span>Dropped</span>
+                          </div>
+                          {(powerConfig.devices || []).map((d) => {
+                            const h = (powerMeterHealth || {})[String(d.id || "")] || {};
+                            const cfgMs = Number(d.poll_interval_ms || 1000);
+                            const effMs = Number(h.effective_interval_ms || 0);
+                            const pollMs = Number(h.poll_duration_ms || 0);
+                            const skipped = Number(h.skipped_cycles || 0);
+                            const dropped = Number(h.writer_dropped_rows || 0);
+                            // >1.5x the configured interval is a real gap, not jitter
+                            const slow = effMs > 0 && effMs > cfgMs * 1.5;
+                            const tight = pollMs > 0 && pollMs > cfgMs * 0.8;
+                            return (
+                              <div className="trow" key={`pm-health-${d.id}`}>
+                                <span>{d.name || d.id}</span>
+                                <span>{cfgMs} ms</span>
+                                <span className={slow ? "power-health-bad" : ""}>
+                                  {effMs ? `${Math.round(effMs)} ms` : "-"}
+                                  {slow ? " ← slower than configured" : ""}
+                                </span>
+                                <span className={tight ? "power-health-warn" : ""}>
+                                  {pollMs ? `${Math.round(pollMs)} ms` : "-"}
+                                </span>
+                                <span className={skipped ? "power-health-bad" : ""}>{skipped}</span>
+                                <span className={dropped ? "power-health-bad" : ""}>{dropped}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div className="muted power-health-hint">
+                          A measured interval longer than the configured one means the
+                          meter could not be read in time — the poll time column says
+                          whether the meter or the network is the limit. Dropped rows
+                          mean the historian writer fell behind. Both show up as gaps
+                          in trends.
+                        </div>
+                      </div>
+                    ) : null}
                   </>
                 ) : null}
               </section>
@@ -22302,6 +22975,33 @@ const getGatewayHealth = (gateway) => {
                     <h3 style={{ margin: 0 }}>Registers — {selectedPowerDevice.name || selectedPowerDevice.id}</h3>
                   </div>
                   <div className="db-card-top-actions">
+                    <span className="muted" style={{ fontSize: 12, marginRight: 8 }}>
+                      {powerRegisterTickCount.on} of {powerRegisterTickCount.total} collected
+                    </span>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => setAllPowerRegistersEnabled(true)}
+                      disabled={!canEditPage("power_configuration")}
+                      title="Collect every register in the map"
+                    >
+                      All
+                    </button>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => setAllPowerRegistersEnabled(false)}
+                      disabled={!canEditPage("power_configuration")}
+                      title="Stop collecting every register — the map is kept"
+                    >
+                      None
+                    </button>
+                    <button
+                      className="btn btn-primary btn-sm icon-text-btn"
+                      onClick={openRegisterAssistant}
+                      disabled={!canEditPage("power_configuration")}
+                      title="Pick a meter model, or import the supplier's register table"
+                    >
+                      <span>Register assistant</span>
+                    </button>
                     <button
                       className="btn btn-sm card-collapse-btn pwr-card-collapse-btn"
                       onClick={() =>
@@ -22316,14 +23016,22 @@ const getGatewayHealth = (gateway) => {
                 {!powerCardsCollapsed.registers ? (
                   <>
                     <div className="table db-table power-register-table power-register-compact" style={{ marginTop: 12 }}>
-                      <div className="thead"><span>Tag Key</span><span>Register Address</span><span>Scale</span><span>Description</span><span>Last Raw</span><span>Last Scaled</span><span>Tested</span><span style={{ textAlign: "right" }}>Actions</span></div>
+                      <div className="thead"><span>Collect</span><span>Tag Key</span><span>Register Address</span><span>Scale</span><span>Description</span><span>Last Raw</span><span>Last Scaled</span><span>Tested</span><span style={{ textAlign: "right" }}>Actions</span></div>
                       {Object.entries(selectedPowerRegisterMap || {}).map(([regKey, regVal]) => {
                         const desc =
                           (selectedPowerDevice?.register_descriptions || {})[regKey] ||
                           POWER_REGISTER_HINTS[regKey] ||
                           regKey.replaceAll("_", " ");
+                        const regOn = (selectedPowerDevice?.register_enabled || {})[regKey] !== false;
                         return (
-                        <div key={`pwr-reg-${regKey}`} className="trow">
+                        <div key={`pwr-reg-${regKey}`} className={`trow ${regOn ? "" : "pwr-reg-off"}`}>
+                          <span>
+                            <input type="checkbox" checked={regOn}
+                              disabled={!canEditPage("power_configuration")}
+                              title={regOn ? "Collected — untick to stop polling and storing it"
+                                           : "Not collected — the address is kept"}
+                              onChange={(e) => setPowerRegisterEnabled(regKey, e.target.checked)} />
+                          </span>
                           <span>{regKey}</span>
                           <span>{Number(regVal || 0)}</span>
                           <span>{Number(selectedPowerDevice?.register_scales?.[regKey] || 1)}</span>
@@ -22369,6 +23077,7 @@ const getGatewayHealth = (gateway) => {
                         );
                       })}
                       <div className="trow">
+                        <span />
                         <span>
                           <input
                             placeholder="e.g. voltage_v"
@@ -22385,7 +23094,24 @@ const getGatewayHealth = (gateway) => {
                           />
                         </span>
                         <span>1</span>
-                        <span>Add custom or manual register from supplier map</span>
+                        <span>
+                          {(() => {
+                            // Show the datasheet-to-offset conversion inline.
+                            // A supplier table prints 30001/40001; those are
+                            // 1-based references, not wire offsets, and typing
+                            // one literally used to read a register that does
+                            // not exist (the row then sat at "-" for ever).
+                            const n = Number(newPowerRegisterAddress || 0);
+                            if (!n) return "Add custom or manual register from supplier map";
+                            if (n >= 30001 && n <= 39999) {
+                              return `Input register, offset ${n - 30001} (function 04)`;
+                            }
+                            if (n >= 40001 && n <= 49999) {
+                              return `Holding register, offset ${n - 40001} (function 03)`;
+                            }
+                            return `Offset ${n} (function 04)`;
+                          })()}
+                        </span>
                         <span>-</span>
                         <span>-</span>
                         <span>-</span>
@@ -22628,8 +23354,27 @@ const getGatewayHealth = (gateway) => {
                           <div className={`status-pill status-${statusKey}`}>{statusText}</div>
                           <div className="muted status-sub">{String(st?.last_error || "").slice(0, 40)}</div>
                         </span>
-                        <span className="tags-stack">
-                          {tags.length ? tags.map((tag) => <div key={`gw-power-tag-${did}-${tag}`}>{tag}</div>) : <div>-</div>}
+                        <span className="tags-cell">
+                          {tags.length ? (
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm tags-cell-btn"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setTagListFilter("");
+                                setTagListModal({
+                                  title: `${d?.name || "Power meter"} — tags`,
+                                  subtitle: `${tags.length} tag(s) · power meter · ${d?.host || d?.ip || ""}`,
+                                  tags,
+                                });
+                              }}
+                              title="Show every tag this meter collects"
+                            >
+                              {tags.length} tag{tags.length === 1 ? "" : "s"}
+                            </button>
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
                         </span>
                         <span className="row-actions">
                           <button
@@ -22705,9 +23450,40 @@ const getGatewayHealth = (gateway) => {
                             {" "}
                             <span>P:{pending}</span>
                           </div>
+                          {/* 2026-08-27: the row said RUNNING and nothing else
+                              while the block was refusing three quarters of
+                              every read. The reason was already on the status
+                              object — it just was not being shown here. */}
+                          {String(runtimeStatus?.last_error || "").trim() ? (
+                            <div
+                              className="gw-row-error"
+                              title={String(runtimeStatus.last_error)}
+                            >
+                              {String(runtimeStatus.last_error)}
+                            </div>
+                          ) : null}
                         </span>
-                        <span className="tags-stack">
-                          {(g.tags || []).length ? (g.tags || []).map((tag) => <div key={`${g.id}-${tag}`}>{tag}</div>) : <div>-</div>}
+                        <span className="tags-cell">
+                          {(g.tags || []).length ? (
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm tags-cell-btn"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setTagListFilter("");
+                                setTagListModal({
+                                  title: `${g.name || "Gateway"} — tags`,
+                                  subtitle: `${(g.tags || []).length} tag(s) · ${g.gateway_type || ""} · ${g.plc_ip || ""}`,
+                                  tags: g.tags || [],
+                                });
+                              }}
+                              title="Show every tag this gateway collects"
+                            >
+                              {(g.tags || []).length} tag{(g.tags || []).length === 1 ? "" : "s"}
+                            </button>
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
                         </span>
                         <span className="row-actions">
                           <button
@@ -24164,6 +24940,10 @@ const getGatewayHealth = (gateway) => {
             <DirectoriesPage canEdit={String(currentUser?.role || "").toLowerCase() === "admin"} />
           ) : null}
 
+          {activePage === "diagnostics" ? (
+            <DiagnosticsPage canRefresh={String(currentUser?.role || "").toLowerCase() === "admin"} />
+          ) : null}
+
           {activePage === "data_continuity" ? (
             <DataContinuityPage
               currentTenantId={currentTenantId}
@@ -24180,6 +24960,23 @@ const getGatewayHealth = (gateway) => {
               gating is handled in canOpenPage; if we got here the user
               has access. Pages live in their own component file under
               components/BatchManagement/ to keep this file manageable. */}
+          {/* OEE module pages. Gateways and devices are handed down so the
+              configuration screens can offer the EXISTING collection records
+              rather than inventing their own. */}
+          {activePage === "oee_overview" ? (
+            <OeeOverviewPage canEdit={canEditPage("oee_configuration") || currentUser?.role === "admin"} />
+          ) : null}
+          {activePage === "oee_operator" ? (
+            <OeeOperatorPage canEdit={canEditPage("oee") || canEditPage("oee_configuration") || currentUser?.role === "admin"} />
+          ) : null}
+          {activePage === "oee_configuration" ? (
+            <OeeConfigurationPage
+              canEdit={canEditPage("oee_configuration") || currentUser?.role === "admin"}
+              gatewayConfigs={gatewayConfigsView}
+              devices={devicesView}
+            />
+          ) : null}
+
           {activePage === "batch_overview" ? (
             <BatchOverviewV2Page canEdit={canEditPage("batch_overview") || canEditPage("batches") || currentUser?.role === "admin"} gatewayConfigs={gatewayConfigs} />
           ) : null}
@@ -24417,7 +25214,7 @@ const getGatewayHealth = (gateway) => {
                     <span>Add Meter Gateway</span>
                   </button>
                 </div>
-                <div className="table gateway-table">
+                <div className="table gateway-table gateway-table-power">
                   <div className="thead">
                     <span>Name</span><span>Meter</span><span>Protocol</span><span>Address</span><span>Interval</span><span>Status</span><span>Tags</span><span>Actions</span>
                   </div>
@@ -24441,8 +25238,27 @@ const getGatewayHealth = (gateway) => {
                             {String(st?.last_error || "").trim() || "-"}
                           </div>
                         </span>
-                        <span className="tags-stack">
-                          {tags.length ? tags.map((tag) => <div key={`gw-pwr-tag-${did}-${tag}`}>{tag}</div>) : <div>-</div>}
+                        <span className="tags-cell">
+                          {tags.length ? (
+                            <button
+                              type="button"
+                              className="btn btn-secondary btn-sm tags-cell-btn"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setTagListFilter("");
+                                setTagListModal({
+                                  title: `${d?.name || "Power meter"} — tags`,
+                                  subtitle: `${tags.length} tag(s) · power meter · ${d?.host || d?.ip || ""}`,
+                                  tags,
+                                });
+                              }}
+                              title="Show every tag this meter collects"
+                            >
+                              {tags.length} tag{tags.length === 1 ? "" : "s"}
+                            </button>
+                          ) : (
+                            <span className="muted">—</span>
+                          )}
                         </span>
                         <span className="row-actions">
                           <button
@@ -27845,7 +28661,7 @@ const getGatewayHealth = (gateway) => {
               if (!looksExpired) return null;
               if (state === "exhausted") {
                 return (
-                  <div className="license-guard-trial" style={{ marginTop: 12, padding: 10, background: "rgba(220,38,38,0.08)", border: "1px solid rgba(220,38,38,0.4)", borderRadius: 8 }}>
+                  <div className="license-guard-trial" style={{ marginTop: 8, padding: 8, background: "rgba(220,38,38,0.08)", border: "1px solid rgba(220,38,38,0.4)", borderRadius: 8 }}>
                     <strong style={{ display: "block", marginBottom: 4 }}>Trials exhausted</strong>
                     <span className="muted" style={{ fontSize: 12 }}>
                       Both the 2-hour and the 1-hour renewal trials have been used on this edge. Contact TrustNode admin to issue a new license.
@@ -27857,7 +28673,7 @@ const getGatewayHealth = (gateway) => {
                 const lbl = edgeTrialActive?.label || "Trial active";
                 const exp = edgeTrialActive?.expires_utc ? fmtTs(edgeTrialActive.expires_utc) : "";
                 return (
-                  <div className="license-guard-trial" style={{ marginTop: 12, padding: 10, background: "rgba(245,158,11,0.10)", border: "1px solid rgba(245,158,11,0.45)", borderRadius: 8 }}>
+                  <div className="license-guard-trial" style={{ marginTop: 8, padding: 8, background: "rgba(245,158,11,0.10)", border: "1px solid rgba(245,158,11,0.45)", borderRadius: 8 }}>
                     <strong style={{ display: "block", marginBottom: 4 }}>{lbl}</strong>
                     <span className="muted" style={{ fontSize: 12 }}>
                       Expires {exp}. Activate a valid license before this window closes — the next available action is{" "}
@@ -27869,7 +28685,7 @@ const getGatewayHealth = (gateway) => {
               if (nextKind !== "trial_2h" && nextKind !== "trial_renew_1h") return null;
               const buttonLabel = nextKind === "trial_2h" ? "Start 2-Hour Trial" : "Renew (1 Hour)";
               return (
-                <div className="license-guard-trial" style={{ marginTop: 12, padding: 10, background: "rgba(20,168,154,0.08)", border: "1px solid rgba(20,168,154,0.35)", borderRadius: 8 }}>
+                <div className="license-guard-trial" style={{ marginTop: 8, padding: 8, background: "rgba(20,168,154,0.08)", border: "1px solid rgba(20,168,154,0.35)", borderRadius: 8 }}>
                   <strong style={{ display: "block", marginBottom: 6 }}>Emergency trial available</strong>
                   <span className="muted" style={{ fontSize: 12, display: "block", marginBottom: 8 }}>
                     Keep the edge running while procurement renews the license. {nextKind === "trial_2h" ? "First emergency window: 2 hours." : "Final emergency window: 1 hour (renew)."}
@@ -27952,7 +28768,7 @@ const getGatewayHealth = (gateway) => {
               accepting it. The backlog is now large enough that we should ask
               you what to do:
             </p>
-            <div className="info-note" style={{ marginBottom: 12 }}>
+            <div className="info-note" style={{ marginBottom: 8 }}>
               <div>
                 <b>Pending historian rows:</b>{" "}
                 {Number(cloudSyncStatus?.historian_backlog || 0).toLocaleString()}
@@ -27973,7 +28789,7 @@ const getGatewayHealth = (gateway) => {
               ) : null}
             </div>
             <p>What would you like to do?</p>
-            <ul style={{ marginTop: 0, fontSize: 14 }}>
+            <ul style={{ marginTop: 0, fontSize: 13 }}>
               <li>
                 <b>Push to cloud</b> — flush the backlog over the next few
                 minutes. Live data continues in parallel; you won't lose
@@ -27990,7 +28806,7 @@ const getGatewayHealth = (gateway) => {
                 still large.
               </li>
             </ul>
-            <div className="row" style={{ marginTop: 16, justifyContent: "flex-end", gap: 8 }}>
+            <div className="row modal-actions">
               <button
                 className="btn btn-secondary"
                 onClick={handleBacklogDecideLater}
@@ -28181,9 +28997,223 @@ const getGatewayHealth = (gateway) => {
           </div>
         </div>
       ) : null}
+      {/* Tag viewer — opened from a gateway row's tag count. The table used to
+          print every tag inline, which made a 49-tag row taller than the
+          screen; this gives them room, in columns that reflow to the width
+          available, with a filter for the long lists. */}
+      {/* Register assistant. Two ways to get a correct register map, because
+          the two failures we saw were "wrong model" and "retyped the datasheet
+          by hand". Both end in the same place: a register map whose addresses
+          are the supplier's own numbering. */}
+      {regAssistantOpen ? (
+        <div className="modal-backdrop" onClick={() => setRegAssistantOpen(false)}>
+          <div className="modal-card modal-card-wide" onClick={(e) => e.stopPropagation()}>
+            <h3>Register assistant — {selectedPowerDevice?.name || "meter"}</h3>
+
+            <div className="oee-op-buttons" style={{ marginBottom: 10 }}>
+              <button type="button"
+                className={`btn btn-sm ${regAssistantTab === "model" ? "btn-primary" : "btn-secondary"}`}
+                onClick={() => setRegAssistantTab("model")}>
+                Pick a meter model
+              </button>
+              <button type="button"
+                className={`btn btn-sm ${regAssistantTab === "import" ? "btn-primary" : "btn-secondary"}`}
+                onClick={() => setRegAssistantTab("import")}>
+                Import supplier table
+              </button>
+            </div>
+
+            {regAssistantNote ? <div className="error">{regAssistantNote}</div> : null}
+
+            {regAssistantTab === "model" ? (
+              <>
+                <div className="info-note" style={{ fontSize: 12 }}>
+                  Pick the meter you actually installed. A map from the wrong
+                  model connects and polls happily and returns 0.000 for every
+                  value, which is why this list exists.
+                </div>
+                <div className="pwr-model-list">
+                  {regAssistantModels.map((m) => (
+                    <label key={m.id}
+                      className={`pwr-model-item ${regAssistantModelId === m.id ? "active" : ""}`}>
+                      <input type="radio" name="pwr-model" value={m.id}
+                        checked={regAssistantModelId === m.id}
+                        onChange={() => setRegAssistantModelId(m.id)} />
+                      <span className="pwr-model-body">
+                        <strong>{m.vendor} {m.model}</strong>
+                        <span className="muted">{m.installation}</span>
+                        <span className="muted" style={{ fontSize: 11 }}>
+                          {m.register_count} register(s) · {m.notes}
+                        </span>
+                        {(m.preview || []).length ? (
+                          <span className="muted pwr-model-preview">
+                            {m.preview.map((r) => `${r.address} → ${r.label}`).join(" · ")}
+                          </span>
+                        ) : null}
+                      </span>
+                    </label>
+                  ))}
+                  {regAssistantModels.length === 0 ? (
+                    <div className="muted">Loading models…</div>
+                  ) : null}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="info-note" style={{ fontSize: 12 }}>
+                  Paste the register table from the supplier datasheet, or load
+                  a CSV. Keep the address column (30001, 30003, …) — those are
+                  converted to Modbus offsets for you.
+                </div>
+                <div className="row" style={{ gap: 8, marginBottom: 6 }}>
+                  <label className="btn btn-secondary btn-sm" style={{ margin: 0 }}>
+                    Load file
+                    <input type="file" accept=".csv,.tsv,.txt,text/plain"
+                      style={{ display: "none" }}
+                      onChange={(e) => {
+                        const f = e.target.files && e.target.files[0];
+                        if (!f) return;
+                        const reader = new FileReader();
+                        reader.onload = () => setRegAssistantText(String(reader.result || ""));
+                        reader.readAsText(f);
+                      }} />
+                  </label>
+                  <button type="button" className="btn btn-primary btn-sm"
+                    disabled={regAssistantBusy || !regAssistantText.trim()}
+                    onClick={parseRegisterTable}>
+                    {regAssistantBusy ? "Reading…" : "Read table"}
+                  </button>
+                </div>
+                <textarea
+                  className="pwr-import-text"
+                  rows={8}
+                  placeholder={"30001  Phase 1 line to neutral volts   4  Float  V\n30007  Phase 1 current   4  Float  A"}
+                  value={regAssistantText}
+                  onChange={(e) => setRegAssistantText(e.target.value)}
+                />
+                {regAssistantParsed?.rows?.length ? (
+                  <div className="pwr-import-preview">
+                    <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
+                      {regAssistantParsed.message}
+                    </div>
+                    <div className="oee-st-head" style={{ gridTemplateColumns: "1.6fr 90px 1fr" }}>
+                      <span>Tag key</span><span>Address</span><span>Reads as</span>
+                    </div>
+                    {regAssistantParsed.rows.slice(0, 40).map((r) => (
+                      <div key={r.key} className="oee-st-row"
+                        style={{ gridTemplateColumns: "1.6fr 90px 1fr" }}>
+                        <span><code>{r.key}</code></span>
+                        <span>{r.address}</span>
+                        <span className="muted" style={{ fontSize: 11 }}>{r.reads_as}</span>
+                      </div>
+                    ))}
+                    {regAssistantParsed.rows.length > 40 ? (
+                      <div className="muted" style={{ fontSize: 11 }}>
+                        …and {regAssistantParsed.rows.length - 40} more.
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+              </>
+            )}
+
+            <div className="modal-actions">
+              <button type="button" className="btn btn-secondary"
+                onClick={() => setRegAssistantOpen(false)}>
+                Cancel
+              </button>
+              <button type="button" className="btn btn-primary"
+                disabled={regAssistantTab === "model"
+                  ? !regAssistantModelId
+                  : !(regAssistantParsed && regAssistantParsed.ok)}
+                onClick={() => {
+                  if (regAssistantTab === "model") {
+                    const m = regAssistantModels.find((x) => x.id === regAssistantModelId);
+                    if (m) applyRegisterMap(m.registers, `${m.vendor} ${m.model} (${m.installation})`);
+                  } else if (regAssistantParsed?.ok) {
+                    applyRegisterMap(regAssistantParsed.registers, "Imported supplier table");
+                  }
+                }}>
+                Apply to this meter
+              </button>
+            </div>
+            <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+              Applying REPLACES this meter's register list. A meter has one
+              layout — merging two maps is what leaves half the rows reading zero.
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {tagListModal ? (
+        <div
+          className="modal-backdrop"
+          onClick={() => setTagListModal(null)}
+        >
+          <div
+            className="modal-card modal-card-wide tag-viewer-card"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3>{tagListModal.title}</h3>
+            <div className="tag-viewer-toolbar">
+              <span className="muted" style={{ fontSize: 12 }}>{tagListModal.subtitle}</span>
+              <input
+                className="gateway-browse-search tag-viewer-search"
+                placeholder="Filter tags…"
+                value={tagListFilter}
+                onChange={(e) => setTagListFilter(e.target.value)}
+                autoFocus
+              />
+            </div>
+            {(() => {
+              const needle = String(tagListFilter || "").trim().toLowerCase();
+              const shown = (tagListModal.tags || []).filter(
+                (t) => !needle || String(t).toLowerCase().includes(needle)
+              );
+              if (!shown.length) {
+                return (
+                  <div className="muted" style={{ padding: "16px 4px", fontSize: 13 }}>
+                    {needle ? `No tag matches “${tagListFilter}”.` : "This gateway has no tags."}
+                  </div>
+                );
+              }
+              return (
+                <>
+                  {needle ? (
+                    <div className="muted" style={{ fontSize: 11.5, marginBottom: 6 }}>
+                      {shown.length} of {(tagListModal.tags || []).length} shown
+                    </div>
+                  ) : null}
+                  <div className="tag-viewer-grid">
+                    {shown.map((t, i) => (
+                      <code className="tag-viewer-item" key={`tv-${t}-${i}`} title={t}>{t}</code>
+                    ))}
+                  </div>
+                </>
+              );
+            })()}
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={() => {
+                  try {
+                    navigator.clipboard?.writeText((tagListModal.tags || []).join("\n"));
+                  } catch (_) { /* clipboard blocked — not worth an error */ }
+                }}
+              >
+                Copy all
+              </button>
+              <button type="button" className="btn btn-primary" onClick={() => setTagListModal(null)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {showGatewayModal ? (
         <div className="modal-backdrop">
-          <div className="modal-card gateway-modal-card modal-card-wide">
+          <div className="modal-card gateway-modal-card modal-card-xwide">
             <h3>{editingGatewayId ? "Edit Gateway Configuration" : "Add Gateway Configuration"}</h3>
             <div className="gateway-form-grid">
               <label>
@@ -28213,11 +29243,30 @@ const getGatewayHealth = (gateway) => {
                   value={gatewayForm.gateway_type}
                   onChange={(e) => {
                     const nextType = e.target.value;
-                    setGatewayForm((prev) => ({
-                      ...prev,
-                      gateway_type: nextType,
-                      opc_url: nextType === "siemens_opcua" ? (prev.opc_url || buildOpcUrlFromIp(prev.plc_ip)) : ""
-                    }));
+                    setGatewayForm((prev) => {
+                      // Tags belong to a DEVICE, not to a form. Switching an
+                      // Allen-Bradley gateway to an ifm block used to keep the
+                      // PLC's tag list ticked, so the operator saved an ifm
+                      // gateway asking for BT_PVA_LEVEL. Clear anything the
+                      // previous protocol discovered; keep everything else.
+                      const changed = String(prev.gateway_type || "") !== String(nextType);
+                      return {
+                        ...prev,
+                        gateway_type: nextType,
+                        opc_url: nextType === "siemens_opcua" ? (prev.opc_url || buildOpcUrlFromIp(prev.plc_ip)) : "",
+                        ...(changed ? {
+                          tags_text: "",
+                          ifm_datapoints: [],
+                          eip_signals: [],
+                          ifm_ports: [],
+                        } : {}),
+                      };
+                    });
+                    if (String(gatewayForm.gateway_type || "") !== String(nextType)) {
+                      setGatewayDiscoveredTags([]);
+                      setGatewaySelectedTags([]);
+                      setGatewayDiscoverResult("");
+                    }
                   }}
                   disabled={!canEditPage("gateway_configuration")}
                 >
@@ -28361,148 +29410,97 @@ const getGatewayHealth = (gateway) => {
                   industrial deployments where the edge must keep
                   collecting through power events; for ops where you
                   want explicit control, leave it OFF. */}
-              <label className="gateway-span-2" style={{ display: "flex", alignItems: "center", gap: 10, paddingTop: 4 }}>
+              {/* One switch component for both toggles (2026-08-28): the
+                  checkbox-plus-paragraph version looked like a different
+                  control and its description filled a third of the dialog. */}
+              <label
+                className="gateway-span-2 tn-toggle-field tn-toggle-block"
+                aria-disabled={!canEditPage("gateway_configuration")}
+              >
+                <span className={`tn-switch-pill${gatewayForm.auto_resume ? " is-on" : ""}`}>
+                  <span className="tn-switch-knob" />
+                </span>
                 <input
                   type="checkbox"
+                  className="tn-switch-input"
                   checked={Boolean(gatewayForm.auto_resume)}
                   onChange={(e) => setGatewayForm({ ...gatewayForm, auto_resume: e.target.checked })}
                   disabled={!canEditPage("gateway_configuration")}
                 />
-                <span>
-                  Resume on backend restart
-                  <small className="muted" style={{ display: "block", marginTop: 2, fontSize: 11 }}>
-                    When ON, this gateway auto-starts after a backend restart, Windows reboot, or auto-update,
-                    if it was running when the backend went down. Default is OFF: the operator must click Start
-                    explicitly after any restart.
-                  </small>
+                <span className="tn-toggle-text">
+                  <span className="tn-toggle-title">Resume on backend restart</span>
+                  <small className="muted">Auto-start after a restart or reboot if it was running. Default off.</small>
                 </span>
               </label>
               {/* Operator 2026-06-25: Schedule — daily start/stop time window. */}
-              {/* Operator 2026-06-25: schedule controls — single
-                  centered row. Pill toggle + label + two large time
-                  inputs. No helper text; tooltip on the pill explains
-                  the feature for first-timers. */}
-              <div className="gateway-span-2" style={{
-                display: "flex",
-                flexWrap: "nowrap",
-                justifyContent: "center",
-                alignItems: "center",
-                gap: 18,
-                padding: "12px 16px",
-                background: "rgba(255,255,255,0.03)",
-                border: "1px solid rgba(255,255,255,0.06)",
-                borderRadius: 6,
-              }}>
+              {/* Operator 2026-06-25: schedule controls — single row.
+                  2026-08-26: the pill/labels/time inputs were built from inline
+                  styles carrying their own 12-16 px padding, which no
+                  stylesheet could compact. Now a class, so it shrinks with
+                  every other dialog control and again on short screens. */}
+              <div className="gateway-span-2 tn-schedule-row">
                 <label
-                  style={{ display: "flex", alignItems: "center", gap: 10, cursor: canEditPage("gateway_configuration") ? "pointer" : "not-allowed" }}
+                  className="tn-toggle-field"
+                  aria-disabled={!canEditPage("gateway_configuration")}
                   title="When ON, start at the first time and stop at the second every day (local time). Wraps midnight if stop < start."
                 >
-                  <span style={{
-                    position: "relative",
-                    display: "inline-block",
-                    width: 40,
-                    height: 20,
-                    borderRadius: 10,
-                    background: gatewayForm.schedule_enabled ? "#14a89a" : "rgba(255,255,255,0.15)",
-                    transition: "background 0.15s",
-                  }}>
-                    <span style={{
-                      position: "absolute",
-                      top: 2,
-                      left: gatewayForm.schedule_enabled ? 22 : 2,
-                      width: 16,
-                      height: 16,
-                      borderRadius: "50%",
-                      background: "#fff",
-                      transition: "left 0.15s",
-                    }} />
+                  <span className={`tn-switch-pill${gatewayForm.schedule_enabled ? " is-on" : ""}`}>
+                    <span className="tn-switch-knob" />
                   </span>
                   <input
                     type="checkbox"
-                    style={{ display: "none" }}
+                    className="tn-switch-input"
                     checked={Boolean(gatewayForm.schedule_enabled)}
                     onChange={(e) => setGatewayForm({ ...gatewayForm, schedule_enabled: e.target.checked })}
                     disabled={!canEditPage("gateway_configuration")}
                   />
-                  <span style={{ fontWeight: 600, letterSpacing: 0.3 }}>SCHEDULE</span>
+                  <span className="tn-toggle-title">SCHEDULE</span>
                 </label>
                 <input
                   type="time"
+                  className="tn-schedule-time"
                   value={String(gatewayForm.schedule_start || "08:00")}
                   onChange={(e) => setGatewayForm({ ...gatewayForm, schedule_start: e.target.value })}
                   disabled={!canEditPage("gateway_configuration") || !gatewayForm.schedule_enabled}
-                  style={{
-                    width: 170,
-                    padding: "8px 12px",
-                    fontSize: 15,
-                    textAlign: "center",
-                    opacity: gatewayForm.schedule_enabled ? 1 : 0.5,
-                  }}
                 />
-                <span style={{ opacity: 0.55, fontSize: 18 }}>→</span>
+                <span className="tn-schedule-arrow">→</span>
                 <input
                   type="time"
+                  className="tn-schedule-time"
                   value={String(gatewayForm.schedule_stop || "18:00")}
                   onChange={(e) => setGatewayForm({ ...gatewayForm, schedule_stop: e.target.value })}
                   disabled={!canEditPage("gateway_configuration") || !gatewayForm.schedule_enabled}
-                  style={{
-                    width: 170,
-                    padding: "8px 12px",
-                    fontSize: 15,
-                    textAlign: "center",
-                    opacity: gatewayForm.schedule_enabled ? 1 : 0.5,
-                  }}
                 />
               </div>
               {/* Operator 2026-06-25: Auto-recover — restart the gateway after unexpected stops. */}
-              <label className="gateway-span-2" style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 10,
-                padding: "10px 12px",
-                background: "rgba(255,255,255,0.03)",
-                border: "1px solid rgba(255,255,255,0.06)",
-                borderRadius: 6,
-                cursor: canEditPage("gateway_configuration") ? "pointer" : "not-allowed",
-              }}>
-                <span style={{
-                  position: "relative",
-                  display: "inline-block",
-                  width: 40,
-                  height: 20,
-                  borderRadius: 10,
-                  background: (gatewayForm.auto_recover_enabled !== false) ? "#14a89a" : "rgba(255,255,255,0.15)",
-                  transition: "background 0.15s",
-                }}>
-                  <span style={{
-                    position: "absolute",
-                    top: 2,
-                    left: (gatewayForm.auto_recover_enabled !== false) ? 22 : 2,
-                    width: 16,
-                    height: 16,
-                    borderRadius: "50%",
-                    background: "#fff",
-                    transition: "left 0.15s",
-                  }} />
+              <label
+                className="gateway-span-2 tn-toggle-field tn-toggle-block"
+                aria-disabled={!canEditPage("gateway_configuration")}
+              >
+                <span className={`tn-switch-pill${gatewayForm.auto_recover_enabled !== false ? " is-on" : ""}`}>
+                  <span className="tn-switch-knob" />
                 </span>
                 <input
                   type="checkbox"
-                  style={{ display: "none" }}
+                  className="tn-switch-input"
                   checked={gatewayForm.auto_recover_enabled !== false}
                   onChange={(e) => setGatewayForm({ ...gatewayForm, auto_recover_enabled: e.target.checked })}
                   disabled={!canEditPage("gateway_configuration")}
                 />
-                <span>
-                  <span style={{ fontWeight: 600 }}>Auto-recover</span>
-                  <small className="muted" style={{ display: "block", marginTop: 2, fontSize: 11 }}>
-                    When ON (default), restart this gateway automatically within ~30 s if it stops unexpectedly —
-                    PLC drop, DB error, watchdog give-up, backend restart. Explicit Stop button clicks are honored
-                    and the gateway stays down until you click Start again.
-                  </small>
+                <span className="tn-toggle-text">
+                  <span className="tn-toggle-title">Auto-recover</span>
+                  <small className="muted">Restart within ~30 s if it stops unexpectedly. An explicit Stop is always honoured.</small>
                 </span>
               </label>
               {gatewayForm.gateway_type === "ethernet_ip" ? (
                 <EthernetIpMapper
+                  form={gatewayForm}
+                  disabled={!canEditPage("gateway_configuration")}
+                  onChange={(patch) => setGatewayForm((prev) => ({ ...prev, ...patch }))}
+                />
+              ) : null}
+              {gatewayForm.gateway_type === "modbus_tcp" ? (
+                <ModbusMapper
                   form={gatewayForm}
                   disabled={!canEditPage("gateway_configuration")}
                   onChange={(patch) => setGatewayForm((prev) => ({ ...prev, ...patch }))}
@@ -28526,6 +29524,8 @@ const getGatewayHealth = (gateway) => {
                   no tags are selected yet we show a helper banner
                   pointing at Search Available Tags. */}
               {(() => {
+                // The mapper above is already showing these, with more detail.
+                if (gatewayMapperOwnsTags) return null;
                 const tagList = String(gatewayForm.tags_text || "")
                   .split(";")
                   .map((t) => t.trim())
@@ -28597,7 +29597,10 @@ const getGatewayHealth = (gateway) => {
                   (or clicking Add) appends to the selected-tags grid via
                   the same tags_text storage path. Accepts ; or newline
                   separators so a paste of multiple tags works too. */}
-              <label className="gateway-span-2">
+              <label
+                className="gateway-span-2"
+                style={gatewayMapperOwnsTags ? { display: "none" } : undefined}
+              >
                 Manual Tag Entry
                 <div className="row" style={{ gap: 8 }}>
                   <input
@@ -28631,7 +29634,10 @@ const getGatewayHealth = (gateway) => {
                   </button>
                 </div>
               </label>
-              <div className="gateway-span-2 row">
+              <div
+                className="gateway-span-2 row"
+                style={gatewayMapperOwnsTags ? { display: "none" } : undefined}
+              >
                 <button
                   type="button"
                   className="btn btn-success"
@@ -28655,11 +29661,6 @@ const getGatewayHealth = (gateway) => {
                   </button>
                 ) : null}
               </div>
-              {gatewayDiscoverResult ? (
-                <div className={`gateway-span-2 ${gatewayDiscoverResult.toLowerCase().includes("discovered") ? "info-note" : "error"}`}>
-                  {gatewayDiscoverResult}
-                </div>
-              ) : null}
               {gatewayForm.gateway_type === "siemens_opcua" && gatewayOpcValidationResult ? (
                 <div
                   className={`gateway-span-2 ${
@@ -28691,7 +29692,7 @@ const getGatewayHealth = (gateway) => {
                   </div>
                 </div>
               ) : null}
-              {gatewayDiscoveredTags.length ? (
+              {gatewayDiscoveredTags.length && !gatewayMapperOwnsTags ? (
                 <div className="gateway-span-2 discovered-tags-card">
                   <div className="discovered-tags-toolbar">
                     <strong>
@@ -28837,6 +29838,16 @@ const getGatewayHealth = (gateway) => {
                 />
               </label>
             </div>
+            {/* Messages live at the BOTTOM of the dialog (2026-08-28). Placed
+                mid-form they pushed the fields around as they appeared and
+                disappeared, and a scan result could scroll out of sight while
+                the operator was looking at the fields it referred to. Here it
+                is always next to the button they are about to press. */}
+            {gatewayDiscoverResult ? (
+              <div className={`gateway-modal-message ${gatewayDiscoverResult.toLowerCase().includes("discovered") ? "info-note" : "error"}`}>
+                {gatewayDiscoverResult}
+              </div>
+            ) : null}
             <div className="row modal-actions">
               <button className="btn btn-primary icon-text-btn" onClick={saveGatewayConfig} disabled={!canEditPage("gateway_configuration")}>
                 <SaveIcon />
@@ -28905,7 +29916,7 @@ const getGatewayHealth = (gateway) => {
                 <span className="slide-label">Pivot mode — one column per tag, one row per timestamp</span>
               </div>
             </div>
-            <fieldset className="card" style={{ marginTop: 12, padding: 12 }}>
+            <fieldset className="card" style={{ marginTop: 8, padding: 8 }}>
               <legend style={{ padding: "0 6px", fontSize: 12 }}>Columns (drag to reorder, untick to hide)</legend>
               <div style={{
                 display: "grid",
@@ -28962,7 +29973,7 @@ const getGatewayHealth = (gateway) => {
               </div>
             </fieldset>
             {historianExportFormat === "xlsx" ? (
-              <fieldset className="card" style={{ marginTop: 12, padding: 12 }}>
+              <fieldset className="card" style={{ marginTop: 8, padding: 8 }}>
                 <legend style={{ padding: "0 6px", fontSize: 12 }}>Excel template (optional)</legend>
                 <p className="muted" style={{ fontSize: 12 }}>
                   Upload a styled <code>.xlsx</code>. Cells containing{" "}
@@ -29153,6 +30164,25 @@ const getGatewayHealth = (gateway) => {
                   disabled={!canEditPage("devices")}
                 />
               </label>
+              {deviceForm.gateway_type === "ifm_iolink" ? (
+                <label>
+                  IoT Core Port
+                  <input
+                    type="number"
+                    min="1"
+                    max="65535"
+                    placeholder="80"
+                    value={deviceForm.ifm_http_port ?? 80}
+                    onChange={(e) =>
+                      setDeviceForm({ ...deviceForm, ifm_http_port: Number(e.target.value || 80) })
+                    }
+                    disabled={!canEditPage("devices")}
+                  />
+                  <small className="hint">
+                    The port the block serves IoT Core on. 80 unless it was changed on the block.
+                  </small>
+                </label>
+              ) : null}
               {(deviceScanBusy || deviceScanResults.length || deviceScanMessage) ? (
                 <div className="device-form-grid" style={{ gridColumn: "1 / -1", marginTop: -6 }}>
                   <div className="discovered-tags-card" style={{ gridColumn: "1 / -1" }}>
@@ -29230,7 +30260,17 @@ const getGatewayHealth = (gateway) => {
                             borderBottom: "1px solid var(--stroke)",
                           }}>
                             <code>{d.ip}</code>
-                            <span title={d.product_name}>{d.product_name || "—"}</span>
+                            <span title={d.product_name}>
+                              {d.product_name || "—"}
+                              {d.identity_note ? (
+                                <span
+                                  className="muted"
+                                  style={{ display: "block", fontSize: 10.5, lineHeight: 1.3, marginTop: 2 }}
+                                >
+                                  {d.identity_note}
+                                </span>
+                              ) : null}
+                            </span>
                             <span title={d.vendor}>{d.vendor || "—"}</span>
                             <span className="muted">{d.device_type || d.source || ""}</span>
                             <button
@@ -29240,7 +30280,12 @@ const getGatewayHealth = (gateway) => {
                                 setDeviceForm((prev) => ({
                                   ...prev,
                                   plc_ip: d.ip,
-                                  opc_url: prev.gateway_type === "siemens_opcua"
+                                  // The device told us what it is during the
+                                  // scan; preselect the driver that matches so
+                                  // an ifm block does not get configured as an
+                                  // Allen-Bradley PLC because both answer 44818.
+                                  gateway_type: d.suggested_protocol || prev.gateway_type,
+                                  opc_url: (d.suggested_protocol || prev.gateway_type) === "siemens_opcua"
                                     ? buildOpcUrlFromIp(d.ip)
                                     : prev.opc_url,
                                   // Auto-fill name only if empty so we don't

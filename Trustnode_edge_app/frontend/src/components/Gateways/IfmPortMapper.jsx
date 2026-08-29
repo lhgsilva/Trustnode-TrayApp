@@ -15,7 +15,7 @@
    resulting tag names back to the dialog, which saves them like any other
    gateway field. */
 import { useCallback, useMemo, useState } from "react";
-import { scanIfmPorts, previewIfmPort, readIfmDatapoints } from "../../api";
+import { scanIfmPorts, previewIfmPort, readIfmDatapoints, ifmFieldbusAutoconfig } from "../../api";
 
 const KINDS = [
   { value: "uint", label: "Unsigned" },
@@ -34,6 +34,28 @@ function blankField(port, index) {
     offset: 0,
     unit: "",
   };
+}
+
+/* Ports that are NOT an ifm IoT Core. Putting one of these in the IoT port
+   field is the most common ifm misconfiguration and it does not look like an
+   error: the TCP connect succeeds, so the block seems reachable, and then
+   nothing ever scans. Mirrors NON_IOT_PORTS in app/drivers/ifm_iolink.py. */
+const NON_IOT_PORTS = {
+  44818: "EtherNet/IP (CIP)",
+  2222: "EtherNet/IP implicit I/O",
+  502: "Modbus TCP",
+  102: "Siemens S7",
+  4840: "OPC UA",
+};
+
+export function ifmPortProblem(port) {
+  const n = Number(port || 0);
+  if (!n) return "";
+  const what = NON_IOT_PORTS[n];
+  if (!what) return "";
+  return `Port ${n} is the ${what} port, not the IoT Core port. The IoT Core `
+    + `serves JSON over HTTP — use 80, or switch this gateway's protocol to `
+    + `“EtherNet/IP device (EDS)” to read the block over fieldbus.`;
 }
 
 /** Tag names from the unified datapoint list (every ifm device kind). */
@@ -68,6 +90,8 @@ export default function IfmPortMapper({
   const [scan, setScan] = useState(null);
   const [note, setNote] = useState("");
   const [preview, setPreview] = useState({});      // { [port]: {raw, values} }
+  const [channelFilter, setChannelFilter] = useState("all");
+  const [fieldbusBusy, setFieldbusBusy] = useState(false);
 
   const ports = useMemo(
     () => (Array.isArray(form.ifm_ports) ? form.ifm_ports : []),
@@ -148,7 +172,49 @@ export default function IfmPortMapper({
     }
   }, [connection, ports]);
 
+  /* An ifm block wired to its FIELDBUS port has no IoT Core to scan. Rather
+     than tell the operator to change protocol and then find an assembly
+     instance and 16 byte/bit pairs themselves, do the whole thing: identify
+     the block over CIP, find its input assembly, build the pin tags, and hand
+     the finished configuration back to the gateway form. */
+  const useFieldbus = async () => {
+    setFieldbusBusy(true);
+    setNote("");
+    try {
+      const res = await ifmFieldbusAutoconfig({
+        plc_ip: String(form.plc_ip || "").trim(),
+        port_count: Number(form.ifm_port_count || 8),
+      });
+      setNote(res?.message || "");
+      if (res?.ok && res.config) {
+        onChange({
+          ...res.config,
+          // The IoT-only fields are meaningless on fieldbus; clear them so a
+          // saved gateway does not carry a port it never uses.
+          ifm_datapoints: [],
+          tags_text: (res.config.tags || []).join(";"),
+        });
+      }
+    } catch (e) {
+      setNote(String(e?.message || e));
+    } finally {
+      setFieldbusBusy(false);
+    }
+  };
+
   const datapoints = Array.isArray(form.ifm_datapoints) ? form.ifm_datapoints : [];
+
+  // A master with nothing plugged in still offers ~28 values (both pins of
+  // every port, plus the block's own current, voltage and temperature). That
+  // is a long list to read, so let the operator narrow it to the KIND of
+  // channel they came for - DI, DO, IO-Link, Current or Diagnostic.
+  const channelsPresent = Array.from(
+    new Set(datapoints.map((d) => String(d.channel || "").trim()).filter(Boolean))
+  );
+  const shownPoints = datapoints
+    .map((d, idx) => ({ d, idx }))
+    .filter(({ d }) => channelFilter === "all"
+      || String(d.channel || "") === channelFilter);
 
   const patchDatapoints = useCallback((next) => {
     onChange({ ifm_datapoints: next, tags_text: ifmDatapointNames(next).join(";") });
@@ -185,15 +251,33 @@ export default function IfmPortMapper({
     <div className="gateway-span-2 ifm-panel">
       <div className="row" style={{ justifyContent: "space-between", alignItems: "flex-end", gap: 12 }}>
         <div className="muted ifm-help">
-          This block serves its data as JSON over HTTP — no PLC and no EtherNet/IP
-          configuration needed, and no EDS file. Scan it, tick the values you want, and
-          they become ordinary tags: they trend, chart, report and alarm like any PLC tag.
+          Scan the block and tick the values you want — they become ordinary tags.
         </div>
-        <button type="button" className="btn btn-primary btn-sm" disabled={disabled || scanning}
-          onClick={doScan}>
-          {scanning ? "Scanning…" : "Scan block"}
-        </button>
+        <span className="row" style={{ gap: 6 }}>
+          <button type="button" className="btn btn-primary btn-sm"
+            disabled={disabled || scanning || Boolean(ifmPortProblem(form.ifm_http_port))}
+            onClick={doScan}>
+            {scanning ? "Scanning…" : "Scan block"}
+          </button>
+          <button type="button" className="btn btn-secondary btn-sm"
+            disabled={disabled || fieldbusBusy || !String(form.plc_ip || "").trim()}
+            onClick={useFieldbus}
+            title="The block is wired to its fieldbus port: identify it over EtherNet/IP and build the pin tags">
+            {fieldbusBusy ? "Reading…" : "On fieldbus? Configure over EtherNet/IP"}
+          </button>
+        </span>
       </div>
+
+      {ifmPortProblem(form.ifm_http_port) ? (
+        <div className="error ifm-port-warning">
+          {ifmPortProblem(form.ifm_http_port)}
+          <button type="button" className="btn btn-secondary btn-sm"
+            style={{ marginLeft: 8 }} disabled={disabled}
+            onClick={() => onChange({ ifm_http_port: 80 })}>
+            Use port 80
+          </button>
+        </div>
+      ) : null}
 
       <div className="ifm-conn-grid">
         <label>
@@ -216,6 +300,7 @@ export default function IfmPortMapper({
         <label>
           IoT port
           <input type="number" min="1" max="65535" value={form.ifm_http_port ?? 80}
+            className={ifmPortProblem(form.ifm_http_port) ? "ifm-port-bad" : ""}
             disabled={disabled}
             onChange={(e) => onChange({ ifm_http_port: Number(e.target.value || 80) })} />
         </label>
@@ -268,6 +353,23 @@ export default function IfmPortMapper({
             </button>
           </div>
 
+          {channelsPresent.length > 1 ? (
+            <div className="ifm-channel-filter">
+              <button type="button"
+                className={`btn btn-sm ${channelFilter === "all" ? "btn-primary" : "btn-secondary"}`}
+                onClick={() => setChannelFilter("all")}>
+                All ({datapoints.length})
+              </button>
+              {channelsPresent.map((c) => (
+                <button key={c} type="button"
+                  className={`btn btn-sm ${channelFilter === c ? "btn-primary" : "btn-secondary"}`}
+                  onClick={() => setChannelFilter(c)}>
+                  {c} ({datapoints.filter((d) => String(d.channel || "") === c).length})
+                </button>
+              ))}
+            </div>
+          ) : null}
+
           {liveValues?.values ? (
             <div className="info-note ifm-preview">
               {liveValues.values.map((v, i) => (
@@ -281,10 +383,10 @@ export default function IfmPortMapper({
 
           <div className="ifm-field-table">
             <div className="ifm-field-head ifm-dp-head">
-              <span>Collect</span><span>Tag name</span><span>Source</span>
+              <span>Collect</span><span>Tag name</span><span>Type</span><span>Source</span>
               <span>Scale</span><span>Unit</span>
             </div>
-            {datapoints.map((d, idx) => (
+            {shownPoints.map(({ d, idx }) => (
               <div className="ifm-field-row ifm-dp-row" key={`dp-${d.name}-${idx}`}>
                 <label className="ifm-check">
                   <input type="checkbox" checked={d.enabled !== false} disabled={disabled}
@@ -292,7 +394,12 @@ export default function IfmPortMapper({
                 </label>
                 <input value={d.name || ""} disabled={disabled}
                   onChange={(e) => patchPoint(idx, { name: e.target.value })} />
-                <span className="muted ifm-dp-adr" title={d.adr}>{d.adr}</span>
+                <span className={`ifm-dp-type ifm-dp-type-${String(d.channel || "none").toLowerCase().replace(/[^a-z]/g, "")}`}>
+                  {d.channel || "—"}
+                </span>
+                <span className="muted ifm-dp-adr" title={`${d.source || ""} ${d.adr}`}>
+                  {d.source || d.adr}
+                </span>
                 <input type="number" step="any" value={d.scale ?? 1} disabled={disabled}
                   onChange={(e) => patchPoint(idx, { scale: Number(e.target.value || 1) })} />
                 <input value={d.unit || ""} disabled={disabled} placeholder=""

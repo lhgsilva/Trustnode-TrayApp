@@ -19,6 +19,9 @@ const PAGES = [
   ["REPORTING", "scheduled reports"],
   ["GATEWAY AND EDGE CONTROL", "tags"],
   ["DATA HISTORY", "logs"],
+  // 2026-08-28: the new Diagnostics page. It renders psutil output and every
+  // gateway's stamps, so it has more shapes to get wrong than most.
+  ["SETTINGS", "diagnostics"],
 ];
 
 (async () => {

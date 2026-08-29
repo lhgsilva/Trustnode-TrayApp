@@ -61,6 +61,19 @@ Trustnode_edge_app/web_cloud_readonly/lite/config.json
 # from a single run should not be.
 Trustnode_edge_app/scripts/audit_historian_alignment_*.json
 
+# The release gate writes its per-run report and a JSONL event stream here.
+# events.jsonl is ~6 MB for a 4-hour run and is regenerated every time; the
+# report is a snapshot of one machine at one moment. Neither belongs in history.
+# ui_smoke.js writes a screenshot of the last page it walked; it is a debugging
+# aid regenerated on every run, not a fixture.
+ui_smoke.png
+Trustnode_edge_app/viewer_final.png
+
+Trustnode_edge_app/scripts/validation_out/
+# ...but keep the DATED archive reports. Those were retained deliberately as
+# evidence of a particular run; the un-suffixed ones are rewritten every gate.
+!Trustnode_edge_app/scripts/validation_out/validation_report_*_2026*.txt
+
 # --- Stray backup CSV next to electron-builder output ---
 # The `dist#trustnode_backup.csv` file is junk left over by an aborted
 # file move; ignore the pattern so it doesn't keep appearing in VS Code.

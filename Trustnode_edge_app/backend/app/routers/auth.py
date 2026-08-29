@@ -708,3 +708,300 @@ def unlock_account(request: Request, body: Dict[str, Any] = Body(default={})) ->
     auth_store.clear_failed_attempts(username)
     _access.audit("account.unlock", outcome="ok", request=request, payload=payload, details={"unlocked_user": username})
     return {"ok": True, "username": username}
+
+
+# ---------------------------------------------------------------------------
+# Local account recovery (2026-08-25)
+#
+# An operator activated a brand-new edge, the flow reported success, and the
+# admin it promised did not exist. There was then NO way back in: forgot-password
+# needs SMTP and an account that already carries an e-mail, and nothing could
+# create the first admin. The machine was simply unusable.
+#
+# Recovery is gated on PROOF OF LOCAL PRESENCE, never on a password: the caller
+# must read a one-time code we write into the data directory. Anyone who can
+# read that file already owns the machine, so this grants an attacker nothing
+# new - while a remote attacker on the LAN cannot use it at all. That is why
+# these routes are safe to expose unauthenticated, and why a plain "create the
+# first admin when none exists" route would NOT be.
+# ---------------------------------------------------------------------------
+_RECOVERY_FILE = "trustnode-recovery-code.txt"
+_RECOVERY_TTL_S = 900  # 15 minutes
+
+# Recovery gets its OWN budget. Sharing the login limiter meant an operator who
+# had just failed a few sign-ins - the exact person who needs recovery - was
+# rate-limited out of the only way back in. Brute force is not the threat here
+# (the code is 48 bits and single-use); a wedged operator is.
+_recovery_attempts: dict = defaultdict(list)
+_RECOVERY_MAX = 15
+_RECOVERY_WINDOW = 300  # seconds
+
+
+def _check_recovery_rate_limit(ip: str) -> None:
+    now = time.time()
+    _recovery_attempts[ip] = [t for t in _recovery_attempts[ip]
+                              if now - t < _RECOVERY_WINDOW]
+    if len(_recovery_attempts[ip]) >= _RECOVERY_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many recovery attempts. Wait 5 minutes and try again.")
+    _recovery_attempts[ip].append(now)
+
+
+def _recovery_dir() -> str:
+    import os
+    data_dir = str(os.environ.get("TRUSTNODE_DATA_DIR", "") or "").strip()
+    if not data_dir:
+        store = str(os.environ.get("TRUSTNODE_APP_STORE_PATH", "") or "").strip()
+        data_dir = os.path.dirname(store) if store else ""
+    if not data_dir:
+        data_dir = os.path.join(os.path.expanduser("~"), ".trustnode_edge", "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.abspath(data_dir)
+
+
+def _recovery_path() -> str:
+    import os
+    return os.path.join(_recovery_dir(), _RECOVERY_FILE)
+
+
+def _all_local_users() -> list:
+    """Every account login() could accept, from every store it consults.
+
+    There is more than one: AuthStore (step 2 of login) and the control-plane
+    SQLite mirror (step 3), and activation writes the admin into the LATTER.
+    Counting only AuthStore made this endpoint report "no admin" on an edge
+    that had a perfectly good one - the opposite of reassuring when you are
+    already locked out.
+    """
+    seen = {}
+    for loader in (
+        lambda: auth_store.list_users() or [],
+        # all_tenants: the edge binds to tenant-<customer>, so a default-scoped
+        # listing silently misses the very admin activation created. Only
+        # counts and an existence check leave this module - never the rows.
+        lambda: control_plane_store.list_users(all_tenants=True) or [],
+    ):
+        try:
+            rows = loader()
+        except Exception:
+            rows = []
+        for u in rows:
+            if not isinstance(u, dict):
+                continue
+            name = str(u.get("username") or "").strip()
+            if name and name not in seen:
+                seen[name] = u
+    return list(seen.values())
+
+
+def _admin_accounts() -> list:
+    out = []
+    for u in _all_local_users():
+        if str(u.get("role") or "").lower() not in ("admin", "super"):
+            continue
+        if str(u.get("status") or "active").lower() == "disabled":
+            continue
+        out.append(u)
+    return out
+
+
+@router.get("/recovery-status")
+def recovery_status(request: Request) -> Dict[str, Any]:
+    """Can anyone actually get into this edge? Public and deliberately dull:
+    counts and a file path, never a code, a name, or a hash."""
+    admins = _admin_accounts()
+    total = len(_all_local_users())
+    linked = False
+    try:
+        settings = ((app_store.get_bootstrap(prefer_cloud_reads=False) or {})
+                    .get("app_settings") or {})
+        linked = bool(settings.get("edge_linked"))
+    except Exception:
+        linked = False
+    return {
+        "ok": True,
+        "has_admin": bool(admins),
+        "admin_count": len(admins),
+        "user_count": int(total),
+        "edge_linked": linked,
+        "recovery_file": _recovery_path(),
+        # The break-glass admin works even with an empty store, but ONLY from
+        # the edge desktop itself while it still has its default password.
+        # An operator who is locked out has no way to know that exists.
+        "master_account_hint": _master_admin_credentials()[0],
+        "master_default_password": not bool(
+            str(__import__("os").environ.get("TRUSTNODE_MASTER_ADMIN_PASSWORD", "") or "").strip()),
+    }
+
+
+@router.post("/local-recovery/request")
+def local_recovery_request(request: Request) -> Dict[str, Any]:
+    """Write a fresh single-use code to disk. Returns WHERE it was written,
+    never what it says - reading it is the proof of physical access."""
+    import os
+    import secrets
+    client_host = str(getattr(request.client, "host", "") or "unknown")
+    if _client_is_remote(client_host):
+        raise HTTPException(
+            status_code=403,
+            detail="Account recovery can only be run from the edge computer itself.")
+    _check_recovery_rate_limit(client_host)
+    code = "-".join(secrets.token_hex(2).upper() for _ in range(3))
+    path = _recovery_path()
+    expires = time.time() + _RECOVERY_TTL_S
+    minutes = _RECOVERY_TTL_S // 60
+    body = (
+        "TrustNode Edge - local account recovery\n"
+        "=======================================\n\n"
+        "Recovery code: " + code + "\n\n"
+        "Valid for " + str(minutes) + " minutes from the moment it was issued.\n"
+        "Type this code into the Recover local access screen in the app to\n"
+        "create or reset the administrator account on THIS computer.\n\n"
+        "If you did not request this, delete this file. Anyone who can read it\n"
+        "can take over the local administrator account.\n"
+    )
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        try:
+            os.chmod(path, 0o600)  # best effort; a no-op on some Windows volumes
+        except Exception:
+            pass
+    except Exception as exc:
+        raise HTTPException(status_code=500,
+                            detail="Could not write the recovery file: " + str(exc))
+    # held in memory too, so a stale file alone can never authorise anything
+    request.app.state.tn_recovery = {"code": code, "expires": expires}
+    try:
+        auth_store.record_login("(recovery)", ok=False, remote_ip=client_host,
+                                detail="local_recovery_requested")
+    except Exception:
+        pass
+    return {"ok": True, "recovery_file": path, "expires_in_s": _RECOVERY_TTL_S}
+
+
+class _LocalRecoveryPayload(BaseModel):
+    code: str = ""
+    username: str = ""
+    password: str = ""
+
+
+@router.post("/local-recovery/complete")
+def local_recovery_complete(payload: _LocalRecoveryPayload,
+                            request: Request) -> Dict[str, Any]:
+    """Consume the code and create (or reset) a local administrator."""
+    import hmac
+    import os
+    from app.auth import hash_password
+    client_host = str(getattr(request.client, "host", "") or "unknown")
+    if _client_is_remote(client_host):
+        raise HTTPException(
+            status_code=403,
+            detail="Account recovery can only be run from the edge computer itself.")
+    _check_recovery_rate_limit(client_host)
+
+    issued = getattr(request.app.state, "tn_recovery", None) or {}
+    want = str(issued.get("code") or "")
+    if not want:
+        raise HTTPException(status_code=400,
+                            detail="No recovery is in progress. Choose Start recovery first.")
+    if time.time() > float(issued.get("expires") or 0):
+        request.app.state.tn_recovery = None
+        raise HTTPException(status_code=400,
+                            detail="That recovery code has expired. Start recovery again.")
+
+    got = str(payload.code or "").strip().upper().replace(" ", "")
+    if not hmac.compare_digest(got, want):
+        try:
+            auth_store.record_login("(recovery)", ok=False, remote_ip=client_host,
+                                    detail="local_recovery_bad_code")
+        except Exception:
+            pass
+        raise HTTPException(status_code=403, detail="That recovery code is not correct.")
+
+    username = str(payload.username or "").strip()
+    password = str(payload.password or "")
+    if not username:
+        raise HTTPException(status_code=400, detail="Choose an administrator name.")
+    policy = _password_policy_error(password, "admin")
+    if policy:
+        raise HTTPException(status_code=400, detail=policy)
+
+    # Keep the new admin in whatever tenant this edge is already bound to,
+    # otherwise the account exists but every scoped read comes back empty.
+    tenant_id = "default"
+    try:
+        settings = ((app_store.get_bootstrap(prefer_cloud_reads=False) or {})
+                    .get("app_settings") or {})
+        tenant_id = normalize_tenant_id(
+            str(settings.get("tenant_login_realm")
+                or settings.get("tenant_id") or "default"))
+    except Exception:
+        tenant_id = "default"
+
+    try:
+        existing = auth_store.get_user(username)
+    except Exception:
+        existing = None
+    if not existing:
+        # it may only exist in the control-plane mirror, which is where
+        # activation puts it - that is still a reset, not a creation
+        existing = next((u for u in _all_local_users()
+                         if str(u.get("username") or "") == username), None)
+    perms = (existing or {}).get("permissions")
+    mods = (existing or {}).get("modules")
+    auth_store.upsert_user(
+        username=username,
+        password_hash=hash_password(password),
+        role="admin",
+        permissions=perms if isinstance(perms, dict) else None,
+        modules=mods if isinstance(mods, list) else None,
+        tenant_id=tenant_id,
+        status="active",
+        must_change_password=False,
+    )
+    try:
+        auth_store.clear_failed_attempts(username)
+    except Exception:
+        pass
+
+    # A reset that leaves the OLD password working is not a reset. login()
+    # accepts an account from AuthStore *or* from the control-plane mirror, and
+    # activation writes the admin into the mirror - so updating only AuthStore
+    # left the previous credentials valid on step 3. Push the same new password
+    # into every tenant row that carries this name.
+    mirrored = 0
+    try:
+        tenants = list(control_plane_store.list_user_tenants(username=username) or [])
+    except Exception:
+        tenants = []
+    for tid in set(tenants + [tenant_id]):
+        try:
+            if control_plane_store.set_user_password(
+                    tenant_id=tid, username=username, password=password,
+                    must_change=False):
+                mirrored += 1
+        except Exception:
+            pass
+
+    # single use: burn the code and remove the file
+    request.app.state.tn_recovery = None
+    try:
+        os.remove(_recovery_path())
+    except Exception:
+        pass
+    try:
+        auth_store.record_login(username, ok=True, remote_ip=client_host,
+                                detail="local_recovery_completed")
+    except Exception:
+        pass
+    try:
+        _access.audit("account.local_recovery", outcome="ok", request=request,
+                      payload={"username": username},
+                      details={"recovered_user": username, "tenant_id": tenant_id,
+                               "was_reset": bool(existing)})
+    except Exception:
+        pass
+    return {"ok": True, "username": username, "tenant_id": tenant_id,
+            "reset": bool(existing), "mirrored_rows": mirrored}

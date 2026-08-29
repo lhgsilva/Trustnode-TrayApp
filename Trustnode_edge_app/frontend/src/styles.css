@@ -1021,6 +1021,8 @@ body {
   position: fixed;
   right: 14px;
   bottom: 12px;
+  /* Below modals (200): this pill used to sit on top of every dialog's
+     bottom-right corner, covering the OK/Cancel buttons. */
   z-index: 50;
   border: 1px solid var(--header-surface-border);
   background: var(--header);
@@ -1836,7 +1838,11 @@ body {
 
 .gateway-table .thead,
 .gateway-table .trow {
-  grid-template-columns: 1.2fr 1fr .9fr 1.4fr 1fr .8fr 1fr 1.4fr 180px;
+  /* Tags is a COUNT now, not a stack of names (2026-08-27), so it needs a
+     button's width instead of 1.4fr — the space goes back to Name, Address
+     and Database, which were being squeezed by a column of tag names. */
+  grid-template-columns: 1.3fr 1fr .95fr 1.4fr 1.1fr .8fr 1fr 88px 180px;
+  align-items: center;
 }
 
 .trigger-limit-table .thead,
@@ -2583,7 +2589,9 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 50;
+  /* Same ladder as .modal-backdrop — this is a dialog and must clear the
+     app header (60) and the header hot-zone (70). */
+  z-index: 200;
 }
 .portal-activation-edit-dialog {
   background: var(--card);
@@ -3607,7 +3615,8 @@ input[type="checkbox"] {
 }
 
 .license-guard-backdrop {
-  z-index: 110;
+  /* Above modals (200) — this one is a hard block, not a dialog. */
+  z-index: 300;
   background: rgba(0, 0, 0, 0.62);
 }
 
@@ -3676,14 +3685,39 @@ input[type="checkbox"] {
   white-space: nowrap;
 }
 
+/* ---------------------------------------------------------------------------
+ * Modal stacking order                                        2026-08-27
+ *
+ * Reported: "all the popup screens of the app are getting behind the top
+ * header". They were: .app-header sits at z-index 60, .app-header-hotzone at
+ * 70 and the footer FAB at 50, while the backdrop was 50 — so every dialog
+ * rendered UNDER the header and under the floating Running pill, and a dialog
+ * tall enough to reach the top of the screen had its title bar covered.
+ *
+ * One ladder now, written down so the next overlay does not have to guess:
+ *
+ *     20  gateway footer strip
+ *     50  footer FAB, page-level overlays
+ *     60  app header
+ *     70  header hot-zone (auto-hide trigger)
+ *    200  MODALS  <- always above the chrome
+ *    300  licence guard (must outrank a modal: it blocks the whole app)
+ *
+ * Centring: `place-items: center` keeps the card in the middle of the
+ * viewport whether or not the header is showing, and the padding guarantees
+ * breathing room at top and bottom so a tall dialog never touches the edges.
+ * --------------------------------------------------------------------------- */
 .modal-backdrop {
   position: fixed;
   inset: 0;
   background: rgba(15, 23, 42, 0.55);
   display: grid;
   place-items: center;
-  z-index: 50;
-  padding: 16px;
+  z-index: 200;
+  /* Never less than 16px, and ~3% of the viewport on a tall screen, so the
+     card is visibly inset from top and bottom rather than edge-to-edge. */
+  padding: max(16px, 3vh) max(12px, 2vw);
+  overflow-y: auto;
 }
 
 .modal-card {
@@ -3691,9 +3725,15 @@ input[type="checkbox"] {
   /* Cap the modal at the viewport so long forms (permission groups,
      temp-password reveal, etc.) become internally scrollable instead
      of bleeding off the bottom of the screen. */
-  max-height: 92vh;
-  max-height: 92dvh;
+  /* Fit inside the backdrop's padding, so the visible gap above and below is
+     real rather than the card being clipped by the viewport edge. */
+  max-height: calc(100vh - max(32px, 6vh));
+  max-height: calc(100dvh - max(32px, 6vh));
   overflow-y: auto;
+  /* A grid item defaults to min-height:auto and will refuse to shrink below
+     its content, which is how a long dialog escaped its own max-height and
+     ran off the bottom of the screen instead of scrolling internally. */
+  min-height: 0;
   background: var(--card);
   border: 1px solid var(--stroke);
   border-radius: 14px;
@@ -4951,8 +4991,11 @@ input[type="checkbox"] {
 
 .power-register-table .thead,
 .power-register-table .trow {
-  min-width: 1240px;
+  min-width: 1300px;
+  /* Collect | Tag Key | Address | Scale | Description | Last Raw |
+     Last Scaled | Tested | Actions */
   grid-template-columns:
+    64px
     minmax(150px, 1.25fr)
     minmax(110px, 0.9fr)
     minmax(90px, 0.75fr)
@@ -5013,6 +5056,48 @@ input[type="checkbox"] {
 .power-meters-table .trow {
   grid-template-columns: 1.2fr 0.8fr 0.9fr 1.4fr 1fr 160px;
 }
+/* Meter health strip (2026-08-26). The power manager already measured poll
+   duration, effective interval, skipped cycles and dropped writer rows; none
+   of it was shown, so a meter that had slipped to a 4 s cadence looked like
+   unexplained gaps in the historian. */
+.power-health-panel {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--bg-card-edge, rgba(148, 163, 184, 0.25));
+}
+
+.power-health-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.power-health-head .muted {
+  font-size: 12px;
+}
+
+.power-health-table .thead,
+.power-health-table .trow {
+  grid-template-columns: 1.4fr 0.8fr 1.6fr 0.9fr 0.7fr 0.8fr;
+}
+
+.power-health-bad {
+  color: var(--danger, #f87171);
+  font-weight: 600;
+}
+
+.power-health-warn {
+  color: var(--warning, #fbbf24);
+  font-weight: 600;
+}
+
+.power-health-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  margin-top: 8px;
+}
+
 .power-meters-table .row-actions {
   justify-content: flex-end;
   display: flex;
@@ -6730,14 +6815,48 @@ textarea {
 .ifm-field-row input,
 .ifm-field-row select { min-width: 0; width: 100%; }
 
+/* Collect | Tag name | Byte offset | Type | Bit | Scale | Offset | Unit | Remove */
 .eip-head,
 .eip-row {
-  grid-template-columns: minmax(150px, 1.6fr) 100px 110px 60px 90px 90px 90px 90px;
+  grid-template-columns: 62px minmax(150px, 1.6fr) 100px 110px 60px 90px 90px 90px 90px;
 }
+/* An unticked row keeps its mapping but is not collected - dim it so the two
+   states are distinguishable at a glance, not only by the checkbox. */
+.eip-row-off { opacity: .55; }
+.eip-none-ticked { color: var(--warn, #e0a458); font-weight: 700; }
 
 .ifm-dp-head,
 .ifm-dp-row {
-  grid-template-columns: 70px minmax(150px, 1.4fr) minmax(0, 2fr) 90px 90px;
+  grid-template-columns: 62px minmax(140px, 1.3fr) 74px minmax(0, 1.8fr) 80px 78px;
+}
+
+/* The channel type an operator sorts on: DI, DO, IO-Link, Current,
+   Diagnostic. Colour carries the same meaning as the label, never instead of
+   it - the text is always present for anyone who cannot separate the hues. */
+.ifm-dp-type {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--stroke);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ifm-dp-type-di { background: rgba(56, 189, 248, .14); border-color: rgba(56, 189, 248, .45); }
+.ifm-dp-type-do { background: rgba(251, 146, 60, .14); border-color: rgba(251, 146, 60, .45); }
+.ifm-dp-type-iolink { background: rgba(34, 197, 94, .14); border-color: rgba(34, 197, 94, .45); }
+.ifm-dp-type-current { background: rgba(168, 85, 247, .14); border-color: rgba(168, 85, 247, .45); }
+.ifm-dp-type-diagnostic { background: rgba(148, 163, 184, .14); }
+
+.ifm-channel-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 8px;
 }
 .ifm-dp-adr {
   font-size: 11px;
@@ -6838,4 +6957,1025 @@ textarea {
   .gateway-modal-card .ifm-panel {
     padding: 8px 10px;
   }
+}
+
+/* ===========================================================================
+ * DIALOG + SETTINGS DENSITY PASS — 2026-08-26
+ *
+ * Reported from the field: "some buttons and actions buttons are overflowing
+ * the layout... the content are not fitting in the screen... the check box,
+ * slider toggle in two different rows... we should have smaller fonts... where
+ * the modal is full we should have a scroll bar."
+ *
+ * Deliberately CSS-only and scoped to .modal-card. There are 46 dialogs in this
+ * app, all sharing that class, so fixing the shell once fixes every one of them
+ * without touching a line of behaviour. Anything that needed a JSX change was
+ * left alone on purpose.
+ *
+ * Appended LAST so it wins on source order over the older .modal-card blocks
+ * (there are three earlier ones) without an arms race of !important.
+ * ======================================================================== */
+
+/* --- 1. the shell ------------------------------------------------------- */
+/* A tall dialog used to scroll its title and its OK/Cancel row away with the
+   content, so on a laptop the operator scrolled a long form and could not see
+   what they were confirming, or find the button at all. Title pins to the top,
+   actions pin to the bottom, only the middle moves. .modal-card is itself the
+   scroll container, which is what makes position:sticky work here without
+   restructuring any dialog. */
+.modal-backdrop {
+  /* Real breathing room top and bottom (2026-08-27): 12px read as
+     edge-to-edge and left the card touching the screen edges. Never below
+     16px, ~3% of the viewport when there is room to spare. */
+  padding: max(16px, 3vh) max(12px, 2vw);
+  /* Centre normally, but start at the top once the dialog is taller than the
+     viewport — centring a too-tall card clips its HEAD, which is where the
+     title and the first fields live. */
+  align-items: start;
+  justify-items: center;
+}
+
+@media (min-height: 900px) {
+  .modal-backdrop {
+    align-items: center;
+  }
+}
+
+.modal-card {
+  /* Matches the backdrop padding above so the inset is real and the card
+     scrolls internally instead of running off the bottom of the screen. */
+  max-height: calc(100dvh - max(32px, 6vh));
+  min-height: 0;
+  padding: 14px 16px;
+  scrollbar-gutter: stable;
+}
+
+.modal-card > h3 {
+  position: sticky;
+  top: -14px;                 /* cancels the card's own top padding */
+  z-index: 3;
+  margin: -14px -16px 10px;
+  padding: 12px 16px 8px;
+  background: var(--card);
+  border-bottom: 1px solid var(--stroke);
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.modal-card > .modal-actions,
+.modal-card > .row.modal-actions {
+  position: sticky;
+  bottom: -14px;              /* cancels the card's own bottom padding */
+  z-index: 3;
+  margin: 12px -16px -14px;
+  padding: 10px 16px 12px;
+  background: var(--card);
+  border-top: 1px solid var(--stroke);
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+/* --- 2. density -------------------------------------------------------- */
+/* The single biggest space win: every field label was a grid with a 6 px gap
+   and a 14 px control. Across a 12-field dialog that alone is ~120 px. */
+.modal-card label {
+  gap: 4px;
+  font-size: 12px;
+}
+
+.modal-card input,
+.modal-card select,
+.modal-card textarea {
+  padding: 6px 9px;
+  font-size: 13px;
+  min-height: 30px;
+  border-radius: 8px;
+}
+
+.modal-card textarea {
+  min-height: 56px;
+}
+
+.modal-card .form-grid,
+.modal-card .device-form-grid,
+.modal-card .gateway-form-grid,
+.modal-card .trigger-form-grid,
+.modal-card .db-grid-2 {
+  gap: 8px;
+}
+
+.modal-card small,
+.modal-card .hint,
+.modal-card .muted,
+.modal-card .auth-field-help {
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* Section captions inside dialogs were full-size headings with generous
+   margins; they are signposts, not titles. */
+.modal-card .auth-section-label,
+.modal-card h4 {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  margin: 6px 0 2px;
+}
+
+.modal-card .info-note {
+  padding: 7px 9px;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+/* --- 3. a toggle belongs on ONE row with its label ---------------------- */
+/* Global `label { display: grid }` stacked a checkbox above its own text, so
+   every toggle cost two rows plus a gap. Dialogs that got this right did it
+   with inline styles, one at a time. :has() fixes the rest as a class of
+   problem (Chromium 105+, this app ships Electron 31 / Chromium 126). */
+.modal-card label:has(> input[type="checkbox"]),
+.modal-card label:has(> input[type="radio"]) {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  padding: 1px 0;
+}
+
+/* the control keeps its natural size; the text takes the rest and truncates
+   rather than forcing the dialog wider */
+.modal-card label:has(> input[type="checkbox"]) > input[type="checkbox"],
+.modal-card label:has(> input[type="radio"]) > input[type="radio"] {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+}
+
+.modal-card label:has(> input[type="checkbox"]) > span,
+.modal-card label:has(> input[type="radio"]) > span {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* A toggle whose description is a full sentence keeps the description on its
+   own line under the switch, but the SWITCH and its title stay on one row. */
+.modal-card label:has(> input[type="checkbox"]) small {
+  display: block;
+  margin-top: 1px;
+}
+
+/* --- 4. buttons -------------------------------------------------------- */
+/* .btn hard-codes height:36px, and .btn-sm only changed padding + font — so a
+   "small" button was still 36 px tall everywhere in the app. That is why
+   action clusters ran out of row. */
+.btn-sm {
+  height: 28px;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+}
+
+.modal-card .btn {
+  height: 32px;
+  min-height: 32px;
+  padding: 0 12px;
+  font-size: 12.5px;
+  border-radius: 8px;
+  /* a button label that wraps doubles the row height and pushes the next
+     control off the card */
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.modal-card .btn.btn-sm {
+  height: 26px;
+  min-height: 26px;
+  padding: 0 9px;
+  font-size: 11.5px;
+}
+
+/* --- 5. action clusters must wrap, never overflow ---------------------- */
+/* Rows of icon/label buttons on the right of a table or card head were fixed
+   flex rows: when the set grew they pushed past the card edge instead of
+   moving to a second line. */
+.row-actions,
+.db-card-top-actions,
+.modal-actions,
+.discovered-tags-toolbar,
+.report-designer-toolbar {
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.row-actions {
+  justify-content: flex-end;
+  row-gap: 4px;
+}
+
+/* Any flex child that holds text needs min-width:0 or it refuses to shrink
+   below its content and pushes the container wide. This is the single most
+   common cause of "it overflows the layout". */
+.row > *,
+.modal-actions > *,
+.row-actions > * {
+  min-width: 0;
+}
+
+/* --- 6. short screens -------------------------------------------------- */
+/* 1366x768 panel PCs and any non-maximised window. */
+@media (max-height: 820px) {
+  .modal-card {
+    max-height: calc(100dvh - 16px);
+    padding: 12px 14px;
+  }
+  .modal-card > h3 {
+    top: -12px;
+    margin: -12px -14px 8px;
+    padding: 9px 14px 7px;
+    font-size: 14px;
+  }
+  .modal-card > .modal-actions,
+  .modal-card > .row.modal-actions {
+    bottom: -12px;
+    margin: 10px -14px -12px;
+    padding: 8px 14px 10px;
+  }
+  .modal-card label {
+    gap: 3px;
+  }
+  .modal-card input,
+  .modal-card select,
+  .modal-card textarea {
+    min-height: 28px;
+    padding: 5px 8px;
+  }
+  .modal-card .form-grid,
+  .modal-card .device-form-grid,
+  .modal-card .gateway-form-grid,
+  .modal-card .trigger-form-grid,
+  .modal-card .db-grid-2 {
+    gap: 6px;
+  }
+  .modal-card .btn {
+    height: 30px;
+    min-height: 30px;
+  }
+}
+
+/* --- 7. narrow windows ------------------------------------------------- */
+@media (max-width: 720px) {
+  /* Two-column dialog grids do not fit; one column with the same density beats
+     a squeezed two-column that clips its own inputs. */
+  .modal-card .gateway-form-grid,
+  .modal-card .db-grid-2,
+  .modal-card .trigger-form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .modal-card .gateway-span-2 {
+    grid-column: span 1;
+  }
+  .modal-card > .modal-actions,
+  .modal-card > .row.modal-actions {
+    justify-content: stretch;
+  }
+  .modal-card > .modal-actions > .btn,
+  .modal-card > .row.modal-actions > .btn {
+    flex: 1 1 auto;
+  }
+}
+
+/* --- 8. a real toggle component ---------------------------------------- */
+/* These switches were built out of inline styles, one copy per dialog, each
+   carrying its own 10-12 px padding. Inline styles beat the stylesheet, so the
+   density pass above could not touch them - they were the single biggest
+   vertical cost in the gateway dialog. As a class they compact with everything
+   else, and short screens shrink them further. */
+.tn-toggle-field {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  min-height: 26px;
+  cursor: pointer;
+}
+
+.tn-toggle-field[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+/* the switch itself */
+.tn-switch-pill {
+  position: relative;
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 18px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.15);
+  transition: background 0.15s;
+}
+
+.tn-switch-pill.is-on {
+  background: var(--ok, #14a89a);
+}
+
+.tn-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: left 0.15s;
+}
+
+.tn-switch-pill.is-on > .tn-switch-knob {
+  left: 18px;
+}
+
+/* the real control stays in the DOM (label semantics, keyboard, forms) */
+.tn-switch-input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.tn-toggle-title {
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+/* title on the SWITCH row, description underneath - the switch and its label
+   never split across two rows, which is what was being reported */
+.tn-toggle-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.tn-toggle-text > small {
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* a toggle that carries a sentence of explanation gets a panel, but a compact
+   one - it used to be 10-12 px of padding plus a 6 px gap */
+.tn-toggle-block {
+  align-items: flex-start;
+  padding: 7px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+}
+
+.tn-toggle-block > .tn-switch-pill {
+  margin-top: 2px;
+}
+
+/* schedule: switch + label + both times on ONE row */
+.tn-schedule-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 7px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+}
+
+.tn-schedule-time {
+  width: 120px;
+  text-align: center;
+}
+
+.tn-schedule-time:disabled {
+  opacity: 0.5;
+}
+
+.tn-schedule-arrow {
+  opacity: 0.55;
+  font-size: 14px;
+}
+
+@media (max-height: 820px) {
+  .tn-toggle-block,
+  .tn-schedule-row {
+    padding: 5px 8px;
+  }
+  .tn-toggle-text > small {
+    font-size: 10.5px;
+  }
+  .tn-schedule-time {
+    width: 108px;
+  }
+}
+
+/* --- 9. wide data tables keep their Actions reachable ------------------- */
+/* 2026-08-26, reported: "the actions buttons of the registers on the page when
+   the menu is shown or hidden is overflow and not properly fitted."
+   The register table forced min-width:1240px, so with the sidebar expanded the
+   row was wider than the pane and the Actions column sat off-screen behind a
+   horizontal scrollbar - you had to scroll sideways to reach edit/delete.
+   Two fixes: the row needs less width to begin with, and the Actions column is
+   pinned to the right edge so it is reachable at ANY scroll position. */
+.power-register-table {
+  overflow-x: auto;
+  /* the sticky column below is positioned against THIS box */
+}
+
+.power-register-table .thead,
+.power-register-table .trow {
+  /* 1240 -> 980: Description and Tested each reserved 220px, and Tested holds
+     a date or a dash. The columns still grow with available width. */
+  min-width: 980px;
+  grid-template-columns:
+    minmax(140px, 1.2fr)    /* tag key      */
+    minmax(100px, 0.8fr)    /* register     */
+    minmax(70px, 0.6fr)     /* scale        */
+    minmax(150px, 1.4fr)    /* description  */
+    minmax(100px, 0.8fr)    /* last raw     */
+    minmax(100px, 0.8fr)    /* last scaled  */
+    minmax(120px, 1fr)      /* tested       */
+    88px;                   /* actions      */
+}
+
+/* Pinned so edit/delete are never scrolled out of reach. Needs an opaque
+   background or the scrolled cells show through underneath. */
+.power-register-table .thead > span:last-child,
+.power-register-table .trow > span:last-child {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  background: var(--card);
+  padding-left: 6px;
+  box-shadow: -8px 0 8px -8px rgba(0, 0, 0, 0.45);
+}
+
+/* the header sits above the rows when both are pinned */
+.power-register-table .thead > span:last-child {
+  z-index: 3;
+}
+
+.power-register-table .row-actions {
+  justify-content: flex-end;
+  flex-wrap: nowrap;      /* two icon buttons: wrapping them is worse */
+}
+
+/* Same treatment for the other wide tables that carry a right-hand action
+   column, so this class of fault does not come back one table at a time. */
+.power-meters-table .thead > span:last-child,
+.power-meters-table .trow > span:last-child,
+.power-health-table .thead > span:last-child,
+.power-health-table .trow > span:last-child {
+  min-width: 0;
+}
+
+@media (max-width: 1100px) {
+  /* Narrow panes: drop the two columns that are informational rather than
+     actionable, so the row fits without sideways scrolling at all. */
+  .power-register-table .thead > span:nth-child(7),
+  .power-register-table .trow > span:nth-child(7) {
+    display: none;
+  }
+  .power-register-table .thead,
+  .power-register-table .trow {
+    min-width: 860px;
+    grid-template-columns:
+      minmax(140px, 1.2fr)
+      minmax(100px, 0.8fr)
+      minmax(70px, 0.6fr)
+      minmax(150px, 1.4fr)
+      minmax(100px, 0.8fr)
+      minmax(100px, 0.8fr)
+      88px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Gateway tag cell + tag viewer                                   2026-08-27
+ *
+ * Reported: "on the gateway page when we have too many tags, the page is
+ * broken". The Tags cell rendered one <div> per tag, so a 49-tag gateway made
+ * its row ~1000 px tall and every other column floated in whitespace. The cell
+ * is now a count that opens the viewer below.
+ * --------------------------------------------------------------------------- */
+.tags-cell {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.tags-cell-btn {
+  white-space: nowrap;
+  padding: 2px 10px;
+}
+
+.tag-viewer-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.tag-viewer-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.tag-viewer-search {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+/* Columns that reflow to the width available, so names never overlap and a
+   long list uses the horizontal space instead of one endless column. */
+.tag-viewer-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 4px 10px;
+  align-content: start;
+  overflow-y: auto;
+  /* Leave room for the sticky title and the pinned actions row. */
+  max-height: calc(100dvh - max(32px, 6vh) - 150px);
+  padding: 2px;
+}
+
+.tag-viewer-item {
+  display: block;
+  min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--stroke);
+  border-radius: 6px;
+  background: var(--bg-soft, rgba(148, 163, 184, 0.08));
+  font-size: 11.5px;
+  line-height: 1.45;
+  /* A long Program:MainProgram.… name must not push the column wider. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A gateway that is RUNNING but not collecting must say why, in the row, not
+   only on the Tags page (2026-08-27). Clamped to two lines so one unhappy
+   gateway cannot stretch the table the way the tag stack used to. */
+.gw-row-error {
+  margin-top: 3px;
+  font-size: 10.5px;
+  line-height: 1.3;
+  color: var(--danger, #ef4444);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  cursor: help;
+}
+
+/* The power page's gateway table has EIGHT columns (no Database), but it
+   shared .gateway-table's nine-column grid — so every cell after Name landed
+   one column to the left of its heading and the last column sat empty. Its
+   own grid, matching its own header row. (2026-08-27) */
+.gateway-table.gateway-table-power .thead,
+.gateway-table.gateway-table-power .trow {
+  grid-template-columns: 1.3fr 1fr .95fr 1.4fr .8fr 1fr 88px 180px;
+}
+
+/* ===========================================================================
+ * OEE module                                                     2026-08-27
+ *
+ * Uses the app's existing tokens (--card, --stroke, --muted, --danger ...) so
+ * dark and light mode work with no second theme to maintain. The state hues
+ * are semantic and are ALWAYS shown beside the state's name - colour never
+ * carries the meaning on its own.
+ * ======================================================================== */
+.oee-page { display: flex; flex-direction: column; gap: 12px; }
+
+/* ------------------------------------------------------------ filters --- */
+.oee-filters { padding: 10px 14px; }
+.oee-filter-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.oee-filter-row label {
+  display: flex; flex-direction: column; gap: 3px;
+  font-size: 11px; color: var(--muted); min-width: 0;
+}
+.oee-filter-row select { min-width: 140px; }
+
+/* --------------------------------------------------------------- KPIs --- */
+.oee-kpi-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+.oee-kpi { min-width: 0; }
+.oee-kpi-sub { font-size: 10.5px; line-height: 1.3; margin-top: 2px; }
+/* A KPI with no value says so in words, smaller, so it reads as an
+   explanation rather than as a number. */
+.oee-kpi-empty { font-size: 13px; font-weight: 600; opacity: 0.75; }
+.oee-kpi-primary .stat-value { color: var(--accent, #22c55e); }
+.oee-kpi-warn .stat-value { color: var(--danger, #ef4444); }
+
+/* ------------------------------------------------------ machine cards --- */
+.oee-machine-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+.oee-machine-card {
+  border: 1px solid var(--stroke); border-left-width: 4px;
+  border-radius: 10px; padding: 10px 12px; background: var(--card);
+  display: flex; flex-direction: column; gap: 6px; min-width: 0;
+}
+.oee-mc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.oee-mc-line { font-size: 11.5px; }
+.oee-mc-conf { display: flex; align-items: center; gap: 8px; font-size: 11px; flex-wrap: wrap; }
+.oee-mc-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px 8px; margin-top: 2px;
+}
+.oee-mc-grid > div { display: flex; flex-direction: column; min-width: 0; }
+.oee-mc-grid span { font-size: 10px; text-transform: uppercase; letter-spacing: .03em; }
+.oee-mc-grid strong { font-size: 14px; }
+.oee-mc-foot { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; }
+.oee-mc-detail { font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.oee-mc-running { border-left-color: #22c55e; }
+.oee-mc-idle { border-left-color: #f59e0b; }
+.oee-mc-stopped { border-left-color: #ef4444; }
+.oee-mc-faulted { border-left-color: #dc2626; }
+.oee-mc-changeover { border-left-color: #a855f7; }
+.oee-mc-waiting_material, .oee-mc-waiting_operator { border-left-color: #eab308; }
+.oee-mc-planned_stop { border-left-color: #38bdf8; }
+.oee-mc-off { border-left-color: #64748b; }
+.oee-mc-unknown { border-left-color: #94a3b8; }
+
+.oee-state { font-size: 11px; white-space: nowrap; }
+.oee-state-running { background: rgba(34,197,94,.16); border-color: rgba(34,197,94,.5); }
+.oee-state-idle { background: rgba(245,158,11,.16); border-color: rgba(245,158,11,.5); }
+.oee-state-stopped, .oee-state-faulted { background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.5); }
+.oee-state-planned_stop { background: rgba(56,189,248,.16); border-color: rgba(56,189,248,.5); }
+.oee-state-changeover { background: rgba(168,85,247,.16); border-color: rgba(168,85,247,.5); }
+.oee-state-off, .oee-state-unknown { background: rgba(148,163,184,.16); border-color: rgba(148,163,184,.5); }
+
+.oee-conf {
+  font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--stroke); white-space: nowrap;
+}
+.oee-conf-high { background: rgba(34,197,94,.14); border-color: rgba(34,197,94,.45); }
+.oee-conf-medium { background: rgba(148,163,184,.14); }
+.oee-conf-low { background: rgba(245,158,11,.14); border-color: rgba(245,158,11,.45); }
+.oee-conf-conflict { background: rgba(239,68,68,.16); border-color: rgba(239,68,68,.5); }
+.oee-conf-missing { background: rgba(100,116,139,.16); }
+
+.oee-mc-flags { display: flex; flex-wrap: wrap; gap: 5px; }
+.oee-flag {
+  font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px;
+  border: 1px solid var(--stroke);
+}
+.oee-flag-energy_waste { background: rgba(245,158,11,.18); border-color: rgba(245,158,11,.5); }
+.oee-flag-blocked { background: rgba(168,85,247,.18); border-color: rgba(168,85,247,.5); }
+.oee-flag-conflict, .oee-flag-needs-reason { background: rgba(239,68,68,.18); border-color: rgba(239,68,68,.5); }
+
+/* ------------------------------------------------------------- charts --- */
+.oee-chart-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+}
+
+/* ----------------------------------------------------------- operator --- */
+.oee-op-picker { display: flex; flex-wrap: wrap; gap: 8px; }
+.oee-op-tab {
+  display: flex; flex-direction: column; gap: 4px; align-items: flex-start;
+  padding: 8px 12px; border-radius: 10px; cursor: pointer;
+  border: 1px solid var(--stroke); border-left-width: 4px; background: var(--card);
+  color: inherit; min-width: 150px;
+}
+.oee-op-tab.active { outline: 2px solid var(--accent, #22c55e); }
+.oee-op-tab-name { font-weight: 700; }
+.oee-op-status-main { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.oee-op-title { margin: 2px 0; font-size: 22px; }
+.oee-op-state { display: flex; flex-direction: column; gap: 5px; align-items: flex-end; }
+.oee-op-since { font-size: 18px; font-weight: 700; }
+.oee-op-metrics {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px; margin-top: 10px;
+}
+.oee-op-metrics > div { display: flex; flex-direction: column; }
+.oee-op-metrics span { font-size: 10px; text-transform: uppercase; }
+.oee-op-metrics strong { font-size: 16px; }
+/* Real tap targets: this screen is used standing at a machine. */
+.oee-op-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.btn.btn-lg { min-height: 46px; padding: 0 22px; font-size: 15px; }
+.oee-op-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.oee-op-fields label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+.oee-op-fields input, .oee-op-fields select { min-height: 34px; }
+
+.oee-dt-modal { width: min(620px, 96vw); }
+.oee-dt-facts {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 8px; margin-bottom: 10px;
+}
+.oee-dt-facts > div { display: flex; flex-direction: column; }
+.oee-dt-facts span { font-size: 10px; text-transform: uppercase; }
+.oee-dt-comment { display: flex; flex-direction: column; gap: 3px; font-size: 11px; margin-top: 8px; }
+.oee-dt-comment textarea { width: 100%; resize: vertical; }
+
+/* ------------------------------------------------------ configuration --- */
+.oee-section { padding: 0; }
+.oee-section-head {
+  display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer;
+  border-bottom: 1px solid transparent;
+}
+.oee-section-head:hover { background: rgba(148,163,184,.06); }
+.oee-caret { transition: transform .15s ease; display: inline-block; }
+.oee-caret.open { transform: rotate(90deg); }
+.oee-count {
+  font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 999px;
+  border: 1px solid var(--stroke); background: rgba(148,163,184,.12);
+}
+.oee-section-sub { font-size: 11px; }
+.oee-section-actions { margin-left: auto; display: flex; gap: 6px; }
+.oee-section-body { padding: 0 14px 14px; border-top: 1px solid var(--stroke); }
+.oee-subhead { margin: 12px 0 6px; font-size: 13px; }
+.oee-scope-note { font-size: 12px; }
+
+.oee-machine-editor { display: grid; grid-template-columns: 220px 1fr; gap: 12px; }
+.oee-machine-list { display: flex; flex-direction: column; gap: 4px; max-height: 420px; overflow-y: auto; }
+.oee-machine-item {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  padding: 7px 10px; border-radius: 8px; border: 1px solid var(--stroke);
+  background: var(--card); color: inherit; cursor: pointer; text-align: left;
+}
+.oee-machine-item.active { outline: 2px solid var(--accent, #22c55e); }
+.oee-off-badge {
+  font-size: 9.5px; font-weight: 700; padding: 0 5px; border-radius: 4px;
+  background: rgba(239,68,68,.18);
+}
+.oee-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+.oee-form-grid label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+.oee-span-2 { grid-column: span 2; }
+.oee-span-all { grid-column: 1 / -1; }
+/* Toggles on ONE row each, wrapping - the dialog density convention. */
+.oee-toggle-row {
+  display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 10px 0;
+  padding: 8px 10px; border: 1px solid var(--stroke); border-radius: 8px;
+}
+.oee-row-card {
+  border: 1px solid var(--stroke); border-radius: 8px; padding: 10px;
+  margin-bottom: 8px; display: flex; flex-direction: column; gap: 8px;
+}
+.oee-row-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.oee-row-head > select { min-width: 150px; }
+.oee-row-head > button { margin-left: auto; }
+.oee-tagpicker { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.oee-tagpicker label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+.oee-examples { font-size: 11px; line-height: 1.5; margin-top: 6px; }
+.oee-examples em { font-style: normal; font-weight: 700; }
+
+.oee-rule-row {
+  display: grid;
+  grid-template-columns: 34px minmax(120px, 1.4fr) 110px 80px 80px 80px 130px 62px 62px 34px;
+  gap: 6px; align-items: center; margin-bottom: 6px;
+}
+.oee-rule-row input, .oee-rule-row select { min-width: 0; }
+
+.oee-simple-table { overflow-x: auto; }
+.oee-st-head, .oee-st-row { display: grid; gap: 6px; align-items: center; }
+.oee-st-head {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .03em;
+  color: var(--muted); margin-bottom: 4px;
+}
+.oee-st-row { margin-bottom: 5px; }
+.oee-st-row input, .oee-st-row select { width: 100%; min-width: 0; }
+.oee-st-actions { display: flex; gap: 4px; }
+
+.oee-empty { padding: 18px 6px; display: flex; flex-direction: column; gap: 4px; }
+.oee-empty .muted { font-size: 12px; }
+
+/* Narrow screens: stack the machine editor and let the cards breathe. */
+@media (max-width: 900px) {
+  .oee-machine-editor { grid-template-columns: 1fr; }
+  .oee-machine-list { flex-direction: row; overflow-x: auto; max-height: none; }
+  .oee-rule-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .oee-chart-grid { grid-template-columns: 1fr; }
+}
+
+/* A fieldbus port typed into the ifm IoT port field (2026-08-27). The TCP
+   connect succeeds, so nothing looks wrong until the scan hangs — flag it at
+   the input instead. */
+.ifm-port-bad {
+  border-color: var(--danger, #ef4444) !important;
+  outline: 1px solid rgba(239, 68, 68, .45);
+}
+.ifm-port-warning {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  margin-bottom: 8px;
+}
+
+
+/* Power meter register assistant (2026-08-27). An EM122 configured with the
+   EM525 map read 0.000 for everything; picking the real model or importing the
+   supplier's own table is how that stops happening. */
+.pwr-model-list { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; }
+.pwr-model-item {
+  display: flex; gap: 10px; align-items: flex-start; padding: 9px 11px;
+  border: 1px solid var(--stroke); border-radius: 9px; cursor: pointer; background: var(--card);
+}
+.pwr-model-item.active { outline: 2px solid var(--accent, #22c55e); }
+.pwr-model-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pwr-model-preview {
+  font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pwr-import-text {
+  width: 100%; font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px; resize: vertical;
+}
+.pwr-import-preview { margin-top: 8px; max-height: 260px; overflow-y: auto; }
+
+
+/* ===========================================================================
+ * Gateway dialog, second pass                                    2026-08-28
+ *
+ * Reported: "make the screen width larger to fit more information in each row,
+ * remove big text descriptions, fix the toggle buttons (description on the
+ * right side and correct design), add the messages on the bottom".
+ * ======================================================================== */
+
+/* Wider than modal-card-wide (980px): the gateway form is two columns of
+   fields PLUS a protocol mapper, and at 980 the tag pickers and register rows
+   wrapped onto their own lines. */
+.modal-card.modal-card-xwide,
+.modal-card-xwide {
+  width: min(1240px, 97vw);
+}
+
+/* With the extra width the form can hold three columns of fields on a wide
+   screen instead of two, which is where the "fit more information in each
+   row" ask actually lands. */
+@media (min-width: 1180px) {
+  .gateway-modal-card .gateway-form-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .gateway-modal-card .gateway-span-2 {
+    grid-column: 1 / -1;
+  }
+}
+
+/* One switch design for every toggle in this dialog: the pill on the LEFT,
+   its label and one line of help on the RIGHT. The old mixture of a bare
+   checkbox with a paragraph beside it read as a different control. */
+.gateway-modal-card .tn-toggle-field.tn-toggle-block {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  margin: 2px 0;
+}
+.gateway-modal-card .tn-toggle-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.gateway-modal-card .tn-toggle-title {
+  font-weight: 700;
+  font-size: 12.5px;
+  /* The dialog upper-cases labels; a toggle title is a sentence, not a
+     heading, and ALL CAPS is what made these read as shouted paragraphs. */
+  text-transform: none;
+  letter-spacing: 0;
+}
+.gateway-modal-card .tn-toggle-text small {
+  font-size: 11px;
+  line-height: 1.35;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* Help text inside the dialog: one line, normal case, never a wall. */
+.gateway-modal-card .ifm-help,
+.gateway-modal-card .eip-help {
+  font-size: 11.5px;
+  line-height: 1.4;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* Messages sit at the bottom, above the pinned actions row. */
+.gateway-modal-card .gateway-modal-message {
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+
+/* A register that is mapped but not collected. The row stays - its address,
+   scale and description are what make re-ticking free - but it must not read
+   as live data. */
+.power-register-table .trow.pwr-reg-off { opacity: .5; }
+.power-register-table .trow.pwr-reg-off span:not(:first-child) { font-style: italic; }
+
+/* ---------------------------------------------------------------- Diagnostics
+   A page whose whole job is to be read at a glance during an incident: big
+   numbers, a bar for anything that has a ceiling, and the context under each
+   figure so a percentage is never shown without its denominator. */
+.diag-page { display: grid; gap: 14px; }
+.diag-head { align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.diag-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.diag-stat {
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 6px;
+  align-content: start;
+}
+.diag-stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  opacity: .7;
+}
+.diag-stat-value { font-size: 24px; font-weight: 700; line-height: 1.1; }
+.diag-stat-sub { font-size: 11.5px; opacity: .7; line-height: 1.35; }
+
+.diag-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--stroke);
+  overflow: hidden;
+}
+.diag-bar-fill {
+  height: 100%;
+  background: var(--accent, #14b8a6);
+  transition: width .4s ease;
+}
+/* Colour carries the same meaning as the number beside it, never instead of
+   it - the figure is always present for anyone who cannot separate the hues. */
+.diag-stat-value.warn, .diag-bar-fill.warn { color: #e0a458; background-color: #e0a458; }
+.diag-stat-value.warn { background: none; }
+.diag-stat-value.bad, .diag-bar-fill.bad { color: #ef4444; background-color: #ef4444; }
+.diag-stat-value.bad { background: none; }
+
+.diag-proc-table .thead, .diag-proc-table .trow {
+  grid-template-columns:
+    minmax(160px, 1.4fr) 70px minmax(110px, 1fr) 70px 90px 70px minmax(150px, 1fr);
+}
+.diag-gw-table .thead, .diag-gw-table .trow {
+  grid-template-columns:
+    minmax(150px, 1.4fr) minmax(110px, 1fr) 100px 90px 60px 90px 100px minmax(120px, 1fr);
+}
+.diag-meter-table .thead, .diag-meter-table .trow {
+  grid-template-columns:
+    minmax(150px, 1.3fr) 100px minmax(160px, 1.2fr) 90px 90px minmax(120px, 1fr);
+}
+
+/* Modbus register table: Collect | Tag | Address | Function | Format | Bit |
+   Scale | Offset | Unit | Swap | Remove */
+.modbus-head,
+.modbus-row {
+  grid-template-columns:
+    62px minmax(140px, 1.4fr) 100px 150px 100px 56px 80px 80px 70px 56px 90px;
+}
+
+/* Device catalogue picker, shared by every protocol mapper. */
+.device-catalogue {
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 4px;
+}
+.catalogue-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--stroke);
+  letter-spacing: .02em;
+}
+/* The label always states the fact; colour only reinforces it. */
+.catalogue-badge.ok { color: #16a34a; }
+.catalogue-badge.warn { color: #e0a458; }
+
+/* Drive parameters: Collect | Tag | Parameter | Type | Scale | Unit | Value | Remove */
+.cipparam-head,
+.cipparam-row {
+  grid-template-columns:
+    62px minmax(140px, 1.4fr) 90px 90px 80px 70px minmax(90px, 1fr) 90px;
 }

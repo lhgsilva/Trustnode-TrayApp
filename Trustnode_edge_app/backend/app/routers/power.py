@@ -56,7 +56,12 @@ def get_power_profiles() -> dict:
 @router.put("/config")
 def set_power_config(payload: PowerConfigPayload) -> dict:
     try:
-        cfg = power_manager.update_config(payload.model_dump(), actor="admin")
+        # exclude_unset: every field here has a default (devices -> []), so a
+        # plain model_dump() turns "save the tariffs" into "save a config with
+        # no meters" and the merge in update_config would have nothing to keep.
+        # Only what the client actually sent reaches the store (2026-08-26).
+        cfg = power_manager.update_config(
+            payload.model_dump(exclude_unset=True), actor="admin")
     except (ValueError, TypeError) as exc:
         # Field-level validation in power_manager (e.g. a non-numeric port or
         # register address) surfaces here. Return the *reason* so the UI can
@@ -67,6 +72,67 @@ def set_power_config(payload: PowerConfigPayload) -> dict:
         logger.error("Power config update crashed: %s\n%s", exc, traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Power configuration save failed: {exc}") from exc
     return {"ok": True, "config": cfg}
+
+
+@router.get("/meter-models")
+def list_meter_models() -> dict:
+    """Pre-loaded supplier register maps, so a known meter works out of the box.
+
+    Added 2026-08-27 after an EM122 was configured with the EM525 map: it
+    connected, polled, and returned 0.0000 for every value. A meter that reads
+    zeros is worse than one that errors, because nothing looks wrong.
+    """
+    from app.services.meter_registers import (
+        METER_MODELS, REGISTER_LABELS, describe_address)
+    models = []
+    for m in METER_MODELS:
+        regs = m.get("registers") or {}
+        models.append({
+            **{k: v for k, v in m.items() if k != "registers"},
+            "registers": dict(regs),
+            "register_count": len(regs),
+            "labels": {k: REGISTER_LABELS.get(k, k) for k in regs},
+            "preview": [
+                {"key": k, "address": a, "reads_as": describe_address(a),
+                 "label": REGISTER_LABELS.get(k, k)}
+                for k, a in list(regs.items())[:6]
+            ],
+        })
+    return {"ok": True, "models": models}
+
+
+class RegisterTableImport(BaseModel):
+    """A supplier register table, pasted or read from an uploaded file."""
+    text: str = ""
+
+
+@router.post("/parse-register-table")
+def parse_register_table(payload: RegisterTableImport) -> dict:
+    """Turn a supplier's register table into registers we can collect.
+
+    Retyping 33 rows out of a datasheet is where wrong addresses come from, so
+    the operator pastes the table instead. Tolerant of CSV, TSV and text copied
+    out of a PDF, and it reports what it could NOT read rather than silently
+    dropping rows.
+    """
+    from app.services.meter_registers import parse_supplier_table, describe_address
+    result = parse_supplier_table(payload.text or "")
+    for row in result.get("rows") or []:
+        row["reads_as"] = describe_address(row.get("address"))
+    return result
+
+
+@router.get("/address-help")
+def address_help(address: str = "") -> dict:
+    """How one address will actually be read - shown beside the input so the
+    datasheet-to-offset conversion is visible instead of surprising."""
+    from app.services.meter_registers import describe_address, normalize_register_address
+    try:
+        offset, function = normalize_register_address(address)
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
+    return {"ok": True, "offset": offset, "function": function,
+            "message": describe_address(address)}
 
 
 @router.post("/test-connection")

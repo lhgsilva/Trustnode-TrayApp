@@ -269,10 +269,14 @@ function makePresetTemplate(presetKey) {
             ...defaultSection("kpi_grid"),
             title: "Totals",
             columns: 3,
+            // Pre-bound to the tags the Power Management module writes, so
+            // the preset renders a real report immediately instead of three
+            // blank KPIs. gateway_id stays empty = "any meter"; an operator
+            // with several meters narrows it per item. Rename/repoint freely.
             items: [
-              { id: makeId("kpi"), label: "kWh consumed", gateway_id: "", tag_name: "", aggregation: "sum", operator: "any" },
-              { id: makeId("kpi"), label: "Avg load (kW)", gateway_id: "", tag_name: "", aggregation: "avg", operator: "any" },
-              { id: makeId("kpi"), label: "Peak load (kW)", gateway_id: "", tag_name: "", aggregation: "max", operator: "any" },
+              { id: makeId("kpi"), label: "kWh consumed", gateway_id: "", tag_name: "insight.total_kwh", aggregation: "max", operator: "any" },
+              { id: makeId("kpi"), label: "Avg load (kW)", gateway_id: "", tag_name: "insight.live_kw", aggregation: "avg", operator: "any" },
+              { id: makeId("kpi"), label: "Peak load (kW)", gateway_id: "", tag_name: "insight.peak_kw", aggregation: "max", operator: "any" },
             ],
           },
           {
@@ -284,8 +288,8 @@ function makePresetTemplate(presetKey) {
             y_axis_right_label: "Current",
             y_axis_right_unit: "A",
             series: [
-              { id: makeId("ser"), label: "Power", gateway_id: "", tag_name: "", color: "#3b82f6", axis: "left", chart_type: "line", unit: "kW", multiplier: 1, offset: 0 },
-              { id: makeId("ser"), label: "Current", gateway_id: "", tag_name: "", color: "#f97316", axis: "right", chart_type: "line", unit: "A", multiplier: 1, offset: 0 },
+              { id: makeId("ser"), label: "Power", gateway_id: "", tag_name: "insight.live_kw", color: "#3b82f6", axis: "left", chart_type: "line", unit: "kW", multiplier: 1, offset: 0 },
+              { id: makeId("ser"), label: "Current", gateway_id: "", tag_name: "insight.current_a", color: "#f97316", axis: "right", chart_type: "line", unit: "A", multiplier: 1, offset: 0 },
             ],
           },
         ],

@@ -243,6 +243,174 @@ def decode_signal(data: bytes, sig: EipSignal) -> float | bool:
     return float(value) * sig.scale + sig.offset
 
 
+# ---------------------------------------------------------------------------
+# ifm blocks over fieldbus — the same tags the IoT path produces
+# ---------------------------------------------------------------------------
+# An EDS tells you WHICH assembly to read and HOW BIG it is. It does not say
+# what any individual bit means - that is in the device manual, and it is where
+# an operator building a map by hand gets it wrong.
+#
+# For an ifm IO-Link master in EtherNet/IP mode the digital input image is the
+# first two bytes of the input assembly:
+#
+#     byte 0, bit N-1  ->  port N, pin 4
+#     byte 1, bit N-1  ->  port N, pin 2
+#
+# Verified against a real AL1326 on 2026-08-27 by reading assembly 100 over CIP
+# and comparing every bit with the same block's IoT Core values: all 8 ports
+# matched on both pins, with port 7 pin 4 and port 8 pin 2 high.
+#
+# The names generated here are IDENTICAL to the IoT path's, on purpose. A trend
+# or dashboard built against a block reached over IoT keeps working if the same
+# block is later collected over fieldbus, and vice versa.
+IFM_PIN4_BYTE = 0
+IFM_PIN2_BYTE = 1
+
+# Channel labels, matching app/drivers/ifm_iolink.py so both paths agree.
+CHANNEL_DI = "DI"
+CHANNEL_DO = "DO"
+
+
+def ifm_pin_signals(port_count: int = 8, pin4_byte: int = IFM_PIN4_BYTE,
+                    pin2_byte: int = IFM_PIN2_BYTE,
+                    channel: str = CHANNEL_DI) -> List[Dict[str, Any]]:
+    """The standard ifm digital-input map as ready-to-save signals.
+
+    Returns the same shape the gateway stores in eip_signals, so the result can
+    be shown, edited and saved without translation.
+    """
+    n = max(1, min(16, int(port_count or 8)))
+    out: List[Dict[str, Any]] = []
+    for port in range(1, n + 1):
+        bit = port - 1
+        byte4 = int(pin4_byte) + (bit // 8)
+        byte2 = int(pin2_byte) + (bit // 8)
+        out.append({
+            "name": "Port%d_Pin4" % port, "byte_offset": byte4, "bit": bit % 8,
+            "kind": "BOOL", "scale": 1.0, "offset": 0.0, "unit": "",
+            "channel": channel,
+            "source": "port %d pin 4 - digital input" % port,
+            "enabled": True,
+        })
+        out.append({
+            "name": "Port%d_Pin2" % port, "byte_offset": byte2, "bit": bit % 8,
+            "kind": "BOOL", "scale": 1.0, "offset": 0.0, "unit": "",
+            "channel": channel,
+            "source": "port %d pin 2 - digital input" % port,
+            "enabled": True,
+        })
+    out.sort(key=lambda sig: (int(sig["name"][4:sig["name"].index("_")]),
+                              sig["name"]))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Known device layouts - what an EDS cannot tell you
+# ---------------------------------------------------------------------------
+# An EDS describes an assembly's INSTANCE, SIZE and CIP PATH. It does not
+# describe what any individual bit means. Checked against ifm's own file for
+# the AL1326 (2026-08-28): assembly 100 is declared as 223 members of
+# "16,Param3", and Param3 is named simply "Input Data". Those 446 bytes carry
+# every port's pins, IO-Link process data and diagnostics, and the EDS says
+# none of that - it is in the device manual.
+#
+# So "upload the EDS and the tags appear" needs TWO things: the EDS (which
+# assembly, how big) and a layout for that device family (what the bits mean).
+# This table is the second half. Keyed on the CIP vendor id plus a product-name
+# pattern, so one entry covers a whole family rather than a part number.
+IFM_EIP_VENDOR_ID = 322     # ifm electronic, as printed in their EDS VendCode
+
+# Assembly 100 size -> port count, for the ifm EtherNet/IP IO-Link masters.
+# Verified across all 14 EDS files ifm ship in one bundle: every 8-port model
+# is 446 bytes and every 4-port model is 246.
+IFM_SIZE_TO_PORTS = {446: 8, 246: 4}
+
+
+def ifm_ports_from_eds(parsed: Dict[str, Any]) -> int:
+    """How many ports this ifm master has, from its own description."""
+    name = str(parsed.get("product_name") or "")
+    m = re.search(r"(\d+)\s*P\b", name)
+    if m:
+        try:
+            n = int(m.group(1))
+            if 1 <= n <= 16:
+                return n
+        except ValueError:
+            pass
+    for asm in parsed.get("assemblies") or []:
+        if int(asm.get("instance") or 0) == 100:
+            got = IFM_SIZE_TO_PORTS.get(int(asm.get("size_bytes") or 0))
+            if got:
+                return got
+    return 8
+
+
+def is_ifm_iolink_master(parsed: Dict[str, Any]) -> bool:
+    vendor_id = int(parsed.get("vendor_id") or 0)
+    name = str(parsed.get("product_name") or "").lower()
+    vendor = str(parsed.get("vendor_name") or "").lower()
+    if vendor_id == IFM_EIP_VENDOR_ID or "ifm" in vendor:
+        return "io-link" in name or "iolink" in name
+    return False
+
+
+def input_assembly_from_eds(parsed: Dict[str, Any]) -> int:
+    """The assembly that carries the data to READ.
+
+    ifm name theirs "Assembly 100 Input"; the rule generalises to any vendor
+    that labels direction in the assembly name, and falls back to the largest.
+    """
+    assemblies = parsed.get("assemblies") or []
+    inputs = [a for a in assemblies
+              if "input" in str(a.get("name") or "").lower()]
+    pool = inputs or [a for a in assemblies
+                      if "out" not in str(a.get("name") or "").lower()
+                      and "config" not in str(a.get("name") or "").lower()]
+    if not pool:
+        pool = assemblies
+    if not pool:
+        return 0
+    exact = next((a for a in pool if int(a.get("instance") or 0) == 100), None)
+    chosen = exact or max(pool, key=lambda a: int(a.get("size_bytes") or 0))
+    return int(chosen.get("instance") or 0)
+
+
+def signals_from_eds(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Ready-to-save signals for a device whose layout we know.
+
+    Returns {ok, signals, input_assembly, port_count, layout, message}. When the
+    device is NOT one we have a layout for, `signals` is empty and the message
+    says why - which is the honest answer, because the EDS alone cannot name a
+    single bit.
+    """
+    if not is_ifm_iolink_master(parsed):
+        return {
+            "ok": False, "signals": [], "layout": "",
+            "input_assembly": input_assembly_from_eds(parsed),
+            "port_count": 0,
+            "message": (
+                "The EDS gives this device's assemblies and their sizes, but an "
+                "EDS never describes what an individual bit means - that is in "
+                "the device manual. Pick the input assembly above and map the "
+                "bytes you need, or use Read live assembly to see the raw data."),
+        }
+    ports = ifm_ports_from_eds(parsed)
+    instance = input_assembly_from_eds(parsed) or 100
+    signals = ifm_pin_signals(port_count=ports)
+    return {
+        "ok": True,
+        "signals": signals,
+        "input_assembly": instance,
+        "port_count": ports,
+        "layout": "ifm_iolink_master_digital_inputs",
+        "message": (
+            f"{parsed.get('product_name') or 'ifm IO-Link master'}: input "
+            f"assembly {instance}, {ports} port(s). {len(signals)} digital-input "
+            f"tag(s) generated from the ifm pin layout (byte 0 = pin 4, byte 1 = "
+            f"pin 2, bit N-1 = port N). Verified against a real AL1326."),
+    }
+
+
 def signals_from_config(raw_signals: List[Dict[str, Any]]) -> List[EipSignal]:
     out: List[EipSignal] = []
     for item in raw_signals or []:
@@ -326,6 +494,84 @@ class EipDeviceClient:
                 info = None
         return dict(info or {})
 
+    def read_parameter(self, number: int, kind: str = "INT") -> float:
+        """One parameter, by the number the drive's own display shows."""
+        from pycomm3 import Services  # type: ignore
+        with self._driver() as drv:
+            reply = drv.generic_message(
+                service=Services.get_attribute_single,
+                class_code=PARAMETER_CLASS,
+                instance=int(number),
+                attribute=PARAMETER_VALUE_ATTRIBUTE,
+                connected=False,
+                name=f"param_{int(number)}",
+            )
+            if not reply:
+                raise RuntimeError(
+                    f"parameter {number} read failed: "
+                    f"{getattr(reply, 'error', 'no reply')}")
+            value = getattr(reply, "value", None)
+            if isinstance(value, (bytes, bytearray)):
+                return decode_parameter(value, kind)
+            if isinstance(value, (int, float)):
+                return float(value)
+            raise RuntimeError(f"parameter {number} returned {type(value).__name__}")
+
+    def read_parameters(self, params, deadline_s: float = 5.0):
+        """Read a list of parameters; one failing does not stop the rest.
+
+        Unlike an assembly - one request for the whole device - each parameter
+        is its own CIP request. That is the trade for addressing a drive the way
+        its manual does, and it is why the deadline matters: twenty parameters
+        on a slow drive can outlast a collection cycle.
+        """
+        import time as _time
+        started = _time.monotonic()
+        out = []
+        for p in params or []:
+            if _time.monotonic() - started > deadline_s:
+                out.append({"name": p["name"], "param": p["param"], "value": None,
+                            "unit": p.get("unit", ""), "quality": False,
+                            "error": f"the {deadline_s:.0f}s read budget ran out"})
+                continue
+            try:
+                raw = self.read_parameter(int(p["param"]), p.get("kind", "INT"))
+                out.append({
+                    "name": p["name"], "param": p["param"],
+                    "value": raw * float(p.get("scale", 1.0)) + float(p.get("offset", 0.0)),
+                    "raw": raw, "unit": p.get("unit", ""),
+                    "quality": True, "error": "",
+                })
+            except Exception as exc:
+                out.append({"name": p["name"], "param": p["param"], "value": None,
+                            "unit": p.get("unit", ""), "quality": False,
+                            "error": str(exc)[:140]})
+        return out
+
+    def scan_parameters(self, first: int = 1, last: int = 40, kind: str = "INT",
+                        deadline_s: float = 20.0):
+        """Read a RANGE of parameters and report whatever answers.
+
+        Parameter numbering differs between drive families and firmware, and a
+        wrong number returns a plausible value rather than an error. So instead
+        of trusting a table typed from a manual, read the range, put it beside
+        the drive's own display, and keep what matches.
+        """
+        import time as _time
+        started = _time.monotonic()
+        found = []
+        for number in range(max(1, int(first)), max(1, int(last)) + 1):
+            if _time.monotonic() - started > deadline_s:
+                break
+            try:
+                found.append({"param": number,
+                              "value": self.read_parameter(number, kind),
+                              "ok": True, "error": ""})
+            except Exception as exc:
+                found.append({"param": number, "value": None, "ok": False,
+                              "error": str(exc)[:80]})
+        return found
+
     def read_signals(self, instance: int, signals: List[EipSignal]) -> List[Dict[str, Any]]:
         """One assembly read, sliced into every mapped signal.
 
@@ -354,6 +600,69 @@ class EipDeviceClient:
                         "unit": sig.unit, "quality": 192, "raw": raw_hex,
                         "error": "", "is_bool": isinstance(value, bool)})
         return out
+
+
+# CIP Parameter Object. Instance = the parameter number as the drive's own
+# display shows it; attribute 1 is the value.
+PARAMETER_CLASS = 0x0F
+PARAMETER_VALUE_ATTRIBUTE = 1
+
+# How a parameter's raw bytes are interpreted. A drive returns the parameter in
+# its native width, so the profile has to say which.
+PARAM_KINDS = {
+    "INT": ("<h", 2), "UINT": ("<H", 2),
+    "DINT": ("<i", 4), "UDINT": ("<I", 4),
+    "REAL": ("<f", 4),
+    "SINT": ("<b", 1), "USINT": ("<B", 1),
+}
+
+
+def decode_parameter(raw: bytes, kind: str = "INT") -> float:
+    """Parameter bytes -> a number, little-endian as CIP specifies."""
+    fmt, width = PARAM_KINDS.get(str(kind or "INT").upper(), ("<h", 2))
+    if raw is None or len(raw) < width:
+        raise AssemblyDecodeError(
+            "parameter returned %d byte(s), need %d for %s"
+            % (0 if raw is None else len(raw), width, kind))
+    return float(struct.unpack(fmt, bytes(raw[:width]))[0])
+
+
+def parameters_from_config(raw_params):
+    """Config rows -> (name, number, kind, scale, offset, unit) tuples.
+
+    A malformed row is skipped rather than raising: one bad entry must not stop
+    a drive with twenty good ones from collecting.
+    """
+    out = []
+    for row in raw_params or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("enabled") is False:
+            continue
+        name = str(row.get("name") or "").strip()
+        try:
+            number = int(row.get("param") or row.get("number") or 0)
+        except Exception:
+            continue
+        if not name or number <= 0:
+            continue
+        kind = str(row.get("kind") or "INT").upper()
+        if kind not in PARAM_KINDS:
+            kind = "INT"
+        try:
+            scale = float(row.get("scale", 1.0) or 1.0)
+        except Exception:
+            scale = 1.0
+        try:
+            offset = float(row.get("offset", 0.0) or 0.0)
+        except Exception:
+            offset = 0.0
+        out.append({
+            "name": name, "param": number, "kind": kind,
+            "scale": scale, "offset": offset,
+            "unit": str(row.get("unit") or ""),
+        })
+    return out
 
 
 def discover_devices(broadcast: str = "255.255.255.255") -> List[Dict[str, Any]]:

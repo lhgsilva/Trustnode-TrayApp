@@ -1583,10 +1583,18 @@ function LiveTagChart({
   const xTickAngleRaw = Number(cfg.chart_x_tick_angle);
   const xTickAngle = Number.isFinite(xTickAngleRaw) ? xTickAngleRaw : 0;
   const labelFmt = (v) => {
-    if (typeof v === "number" && Number.isFinite(v)) return new Date(v).toLocaleString();
+    // The X value here is a row INDEX, not an epoch. Converting it directly
+    // rendered every tooltip as "1/1/1970, 1:00:00 AM" (2026-08-26): index 0
+    // IS the epoch. Resolve the row first and use ITS timestamp; only treat a
+    // bare number as milliseconds when it is far too large to be an index.
     const r = renderedData.rows.find((p) => p.idx === v);
-    if (!r) return String(v);
-    return new Date(r.tsMs).toLocaleString();
+    if (r && Number.isFinite(Number(r.tsMs))) {
+      return new Date(Number(r.tsMs)).toLocaleString();
+    }
+    if (typeof v === "number" && Number.isFinite(v) && v > 1e11) {
+      return new Date(v).toLocaleString();
+    }
+    return String(v);
   };
   const fmtVal = (v, name) => {
     if (v == null || !Number.isFinite(Number(v))) return ["—", name];
@@ -1742,7 +1750,7 @@ function LiveTagChart({
             />
             {(renderedData.axesUsed?.has("left2")) ? (
               <YAxis yAxisId="left2" orientation="left" domain={yDomainLeft2} ticks={manualYLeft2?.ticks}
-                allowDataOverflow={!!manualYLeft2} tickFormatter={axisTickFmt("left2")} fontSize={Math.max(7, Math.round(9 * fontScale("font_axis_scale")))} width={54}
+                allowDataOverflow={!!manualYLeft2} tickFormatter={axisTickFmt("left2")} fontSize={9} width={54}
                 label={left2AxisLabel ? { value: left2AxisLabel, angle: -90, position: "insideLeft", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
             ) : null}
             {(renderedData.hasRightAxis || renderedData.axesUsed?.has("right1")) ? (
@@ -1762,7 +1770,7 @@ function LiveTagChart({
             ) : null}
             {(renderedData.axesUsed?.has("right2")) ? (
               <YAxis yAxisId="right2" orientation="right" domain={yDomainRight2} ticks={manualYRight2?.ticks}
-                allowDataOverflow={!!manualYRight2} tickFormatter={axisTickFmt("right2")} fontSize={Math.max(7, Math.round(9 * fontScale("font_axis_scale")))} width={54}
+                allowDataOverflow={!!manualYRight2} tickFormatter={axisTickFmt("right2")} fontSize={9} width={54}
                 label={right2AxisLabel ? { value: right2AxisLabel, angle: 90, position: "insideRight", fill: "var(--ink-soft, #8a98ab)", fontSize: 10 } : undefined} />
             ) : null}
             <Tooltip labelFormatter={labelFmt} formatter={fmtVal} />
@@ -5097,7 +5105,7 @@ function EnergyTariffsWidgetImpl({ widget, tagRowsByGateway }) {
               ? [`€${Number(it.cost || 0).toFixed(2)} • ${Number(it.kwh || 0).toFixed(3)} kWh • ${pct.toFixed(1)}%`, it.name]
               : [`${Number(it.kwh || 0).toFixed(3)} kWh • €${Number(it.cost || 0).toFixed(2)} • ${pct.toFixed(1)}%`, it.name];
           }} />
-          <Legend verticalAlign="bottom" height={24} iconType="circle" wrapperStyle={{ fontSize: legendFontPx, paddingTop: 2 }} />
+          <Legend verticalAlign="bottom" height={24} iconType="circle" wrapperStyle={{ fontSize: 12, paddingTop: 2 }} />
         </PieChart>
       </ResponsiveContainer>
       <div style={{
@@ -5401,7 +5409,7 @@ function ReportHtmlPreview({ data }) {
                       <XAxis dataKey="ts" tickFormatter={(v) => String(v).slice(11, 19)} fontSize={10} padding={{ left: 12, right: 12 }} />
                       <YAxis fontSize={10} />
                       <Tooltip labelFormatter={(v) => String(v)} />
-                      <Legend wrapperStyle={{ fontSize: legendFontPx }} />
+                      <Legend wrapperStyle={{ fontSize: 12 }} />
                       {series.map((srs, sidx) => {
                         const color = srs.color || ["#14a89a", "#f97316", "#3b82f6", "#a855f7"][sidx % 4];
                         const props = {
@@ -5444,7 +5452,7 @@ function ReportHtmlPreview({ data }) {
                         ))}
                       </Pie>
                       <Tooltip />
-                      <Legend wrapperStyle={{ fontSize: legendFontPx }} />
+                      <Legend wrapperStyle={{ fontSize: 12 }} />
                     </PieChart>
                   </ResponsiveContainer>
                 </div>

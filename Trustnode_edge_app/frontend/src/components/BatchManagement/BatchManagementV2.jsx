@@ -100,13 +100,15 @@ if (typeof document !== "undefined" && !document.getElementById("bm-v2-style")) 
 
 function Modal({ onClose, children, width }) {
   const node = (
+    // 2026-08-26: this carried its own padding / maxHeight / centring inline,
+    // which outranks the stylesheet - so every batch dialog opted out of the
+    // app's density scale, its sticky title and its pinned action row. Only
+    // the things that are genuinely per-instance stay inline now.
     <div className="modal-backdrop" onClick={onClose}
-      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 10000,
-        display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      style={{ zIndex: 10000 }}>
       <div className="modal-card" onClick={(e) => e.stopPropagation()}
-        style={{ background: "var(--card)", color: "var(--text)", border: "1px solid var(--stroke)",
-          borderRadius: 10, width: "100%", maxWidth: width || 720, maxHeight: "92vh",
-          overflow: "auto", padding: 20, boxShadow: "0 12px 40px rgba(0,0,0,0.45)" }}>
+        style={{ width: "100%", maxWidth: width || 720,
+          boxShadow: "0 12px 40px rgba(0,0,0,0.45)" }}>
         {children}
       </div>
     </div>
@@ -128,11 +130,11 @@ function ConfirmDelete({ target, onCancel, onConfirm }) {
   return (
     <Modal onClose={busy ? () => {} : onCancel} width={460}>
       <h3 style={{ marginTop: 0 }}>Delete {target?.label}?</h3>
-      <div style={{ fontSize: 13, color: "var(--muted)", marginBottom: 12 }}>
+      <div style={{ fontSize: 13, color: "var(--muted)", marginBottom: 8 }}>
         {target?.warn || "This permanently removes it and its data. This cannot be undone."}
       </div>
       {err && <Banner tone="error">{err}</Banner>}
-      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+      <div className="row modal-actions">
         <button className="btn btn-ghost btn-sm" onClick={onCancel} disabled={busy}>Cancel</button>
         <button className="btn btn-danger btn-sm" onClick={go} disabled={busy}>{busy ? "Deleting…" : "Delete"}</button>
       </div>
@@ -227,14 +229,14 @@ function Card({ title, actions, children, style, collapsible = false, defaultCol
   const [open, setOpen] = useState(!defaultCollapsed);
   const showBody = !collapsible || open;
   return (
-    <section className="card" style={{ marginBottom: 14, ...(style || {}) }}>
+    <section className="card" style={{ marginBottom: 10, ...(style || {}) }}>
       {(title || actions) && (
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: showBody ? 10 : 0, gap: 8, flexWrap: "wrap" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
             {collapsible && (
               <button type="button" onClick={() => setOpen((v) => !v)}
                 aria-label={open ? "Collapse" : "Expand"} title={open ? "Collapse" : "Expand"}
-                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text)", fontSize: 14, lineHeight: 1, padding: 2, transform: open ? "rotate(90deg)" : "rotate(0deg)", transition: "transform .15s" }}>
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text)", fontSize: 13, lineHeight: 1, padding: 2, transform: open ? "rotate(90deg)" : "rotate(0deg)", transition: "transform .15s" }}>
                 ▶
               </button>
             )}
@@ -1010,7 +1012,7 @@ function CreateBatchModal({ defs, onClose, onCreated }) {
           </div>
         </div>
       )}
-      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 12 }}>
+      <div className="row modal-actions">
         <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
         <button className="btn btn-primary btn-sm" disabled={busy} onClick={save}>{busy ? "Creating…" : "Create"}</button>
       </div>
@@ -1043,7 +1045,7 @@ function CreateGroupModal({ defs, onClose, onCreated }) {
         <label>Reference (blank = auto)<input value={form.reference} onChange={(e) => setForm({ ...form, reference: e.target.value })} /></label>
         <label>Expected child count<input type="number" value={form.expected_child_count} onChange={(e) => setForm({ ...form, expected_child_count: e.target.value })} /></label>
       </div>
-      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+      <div className="row modal-actions">
         <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
         <button className="btn btn-primary btn-sm" disabled={busy} onClick={save}>{busy ? "Creating…" : "Create"}</button>
       </div>
@@ -1461,7 +1463,7 @@ function BatchDetailV2({ batchId, canEdit, onBack, onOpenGroup, gatewayConfigs =
         <Modal onClose={() => setConfirmAction(null)} width={420}>
           <h3 style={{ marginTop: 0 }}>Confirm {confirmAction}</h3>
           <p style={{ color: "var(--muted)", fontSize: 14 }}>This will {confirmAction} the batch. This cannot be undone.</p>
-          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <div className="row modal-actions">
             <button className="btn btn-ghost btn-sm" onClick={() => setConfirmAction(null)}>Cancel</button>
             <button className="btn btn-danger btn-sm" onClick={() => doAction(confirmAction)}>{confirmAction}</button>
           </div>
@@ -2015,7 +2017,7 @@ function PropertyModal({ draft, existingKeys, gateways, onCancel, onSave }) {
           </>
         )}
       </div>
-      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+      <div className="row modal-actions">
         <button className="btn btn-ghost btn-sm" onClick={onCancel}>Cancel</button>
         <button className="btn btn-primary btn-sm" disabled={!valid} onClick={save}>{draft.key ? "Save" : "Add"}</button>
       </div>
@@ -2257,7 +2259,7 @@ function AxisOptionsModal({ tag, onSave, onClose, readOnly }) {
           {numField("Max", "max", "auto")}
           {numField("Tick step", "tick", "auto")}
         </div>
-        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+        <div className="row modal-actions">
           <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
           {!readOnly && <button className="btn btn-primary btn-sm" onClick={() => onSave({ chart_axis: axis, axis_options: {
             ...opt,

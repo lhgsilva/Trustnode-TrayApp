@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   loginAuth,
   issuePublicPasswordReset,
@@ -8,6 +8,9 @@ import {
   registerControlPlaneEdgeLink,
   registerControlPlaneEdgeLinkLogin,
   getAuthMe,
+  getLocalRecoveryStatus,
+  requestLocalRecovery,
+  completeLocalRecovery,
 } from "../../api";
 import "./Login.css";
 import "./Login.local.css";
@@ -58,6 +61,18 @@ export const Login = ({
   });
   const [edgeRegisterResult, setEdgeRegisterResult] = useState("");
   const [edgeRegisterBusy, setEdgeRegisterBusy] = useState(false);
+  // Open only when there is nothing to pre-fill - that is the new-computer
+  // case where the address genuinely has to be typed.
+  const [showPortalField, setShowPortalField] = useState(() => {
+    try { return !(localStorage.getItem("trustnode_backend_cloud_url") || "").trim(); }
+    catch { return true; }
+  });
+  // Local account recovery, for an edge nobody can sign in to.
+  const [recovery, setRecovery] = useState(null);
+  const [recoveryForm, setRecoveryForm] = useState({ code: "", username: "admin", password: "" });
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const [recoveryOpen, setRecoveryOpen] = useState(false);
+  const [recoveryNote, setRecoveryNote] = useState("");
 
   const logoSrc = React.useMemo(() => {
     try {
@@ -180,7 +195,9 @@ export const Login = ({
       const tok = String(sp.get("reset_token") || "").trim();
       if (tok && !forgotForm.reset_token) {
         setForgotForm((p) => ({ ...p, reset_token: tok }));
-        setForgotMode(true);
+        // No `forgotMode` state exists - the reset box is revealed by
+        // forgotResult below. The old setForgotMode(true) call threw a
+        // ReferenceError here, so an emailed reset link never opened the form.
         setForgotResult("Reset link detected. Enter a new password and click Apply Reset.");
       }
     } catch { /* ignore */ }
@@ -270,12 +287,15 @@ export const Login = ({
       const result = await registerControlPlaneEdgeLinkLogin(payload);
       if (result?.ok) {
         setEdgeRegisterResult("Edge activated successfully. Admin user created for customer scope.");
-        setEdgeRegisterForm({
+        setEdgeRegisterForm((p) => ({
+          // keep the portal that just worked - dropping it made a second
+          // attempt post an empty address and fail with "no portal address"
+          control_plane_url: p.control_plane_url,
           activation_code: "",
           admin_username: "",
           admin_password: "",
           confirm_password: "",
-        });
+        }));
         setLoginForm((prev) => ({
           ...prev,
           username: String(payload.admin_username || prev.username || ""),
@@ -292,6 +312,69 @@ export const Login = ({
       );
     } finally {
       setEdgeRegisterBusy(false);
+    }
+  };
+
+  // --- local account recovery ---------------------------------------------
+  // An edge with no admin cannot be signed into at all, so this has to be
+  // reachable from the sign-in screen itself, before any authentication.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const st = await getLocalRecoveryStatus();
+        if (alive) setRecovery(st || null);
+      } catch {
+        if (alive) setRecovery(null);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const startRecovery = async () => {
+    setRecoveryBusy(true);
+    setRecoveryNote("");
+    try {
+      const res = await requestLocalRecovery();
+      setRecovery((p) => ({ ...(p || {}), recovery_file: res?.recovery_file || "", started: true }));
+      setRecoveryNote(
+        `A one-time code was written to:\n${String(res?.recovery_file || "")}\n` +
+        "Open that file on this computer, then type the code below. " +
+        "It expires in 15 minutes."
+      );
+    } catch (err) {
+      setRecoveryNote(String(err?.message || err));
+    } finally {
+      setRecoveryBusy(false);
+    }
+  };
+
+  const applyRecovery = async () => {
+    const username = String(recoveryForm.username || "").trim();
+    const password = String(recoveryForm.password || "");
+    const code = String(recoveryForm.code || "").trim();
+    if (!code) { setRecoveryNote("Enter the code from the file."); return; }
+    if (!username) { setRecoveryNote("Choose an administrator name."); return; }
+    if (password.length < 12 || !/[a-zA-Z]/.test(password) || !/[0-9]/.test(password)) {
+      setRecoveryNote("An administrator password needs at least 12 characters, with letters and digits.");
+      return;
+    }
+    setRecoveryBusy(true);
+    setRecoveryNote("");
+    try {
+      const res = await completeLocalRecovery({ code, username, password });
+      setRecoveryNote(
+        (res?.reset ? "Password reset for " : "Administrator created: ") + username +
+        ". You can sign in now."
+      );
+      setLoginForm((p) => ({ ...p, username }));
+      setRecoveryForm({ code: "", username, password: "" });
+      setLoginTab("login");
+      try { setRecovery(await getLocalRecoveryStatus()); } catch { /* non-fatal */ }
+    } catch (err) {
+      setRecoveryNote(String(err?.message || err));
+    } finally {
+      setRecoveryBusy(false);
     }
   };
 
@@ -410,7 +493,12 @@ export const Login = ({
             {/* 2026-08-25: a brand-new computer knows no portal address. Without
                 one the activation code has nowhere to go, and the failure used
                 to be reported as an unexplained "activation failed". Pre-filled
-                from whatever this machine already knows. */}
+                from whatever this machine already knows.
+
+                It is one field too many for the default view, so it collapses
+                behind a link - and opens by itself when there is nothing to
+                pre-fill, which is exactly the new-computer case that needs it. */}
+            {showPortalField ? (
             <label className="auth-field">
               <span>Portal address</span>
               <div className="input-wrapper">
@@ -436,6 +524,15 @@ export const Login = ({
                 filled in; on a new computer, enter the TrustNode portal URL.
               </div>
             </label>
+            ) : (
+              <button
+                type="button"
+                className="activate-advanced-toggle"
+                onClick={() => setShowPortalField(true)}
+              >
+                Change portal address
+              </button>
+            )}
 
             <div className="auth-section-label">
               CREATE ADMINISTRATOR ACCOUNT
@@ -725,12 +822,114 @@ export const Login = ({
             >
               {loginBusy ? "Signing in..." : String(loginActionLabel || "Sign in").replace(/[-–—>]+/g, " ").trim()}
             </button>
+
+            {/* 2026-08-25: an edge whose activation created no administrator
+                could not be signed into AT ALL, and nothing on this screen said
+                so or offered a way out. Only shown on the local edge surface -
+                the portal and client views have their own account systems. */}
+            {loginSurface === "local" && recovery && recovery.has_admin === false ? (
+              <div className="error activate-recovery-note">
+                <strong>This edge has no administrator account yet.</strong>
+                {recovery.master_account_hint ? (
+                  <> Sign in with <strong>{recovery.master_account_hint}</strong>
+                    {recovery.master_default_password
+                      ? " (the built-in account, from this computer only)"
+                      : ""}, or create one below.</>
+                ) : (
+                  <> Create one below.</>
+                )}
+              </div>
+            ) : null}
+
+            {loginSurface === "local" ? (
+              <button
+                type="button"
+                className="activate-advanced-toggle"
+                onClick={() => setRecoveryOpen((v) => !v)}
+              >
+                {recoveryOpen ? "Hide local access recovery" : "Recover local access"}
+              </button>
+            ) : null}
+
+            {loginSurface === "local" && recoveryOpen ? (
+              <div className="auth-recovery-panel">
+                <div className="activate-recovery-note">
+                  Creates or resets an administrator on THIS computer. To prove you
+                  are at the machine, the app writes a one-time code to a file that
+                  only someone with access to it can read.
+                </div>
+
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  onClick={startRecovery}
+                  disabled={recoveryBusy}
+                >
+                  {recoveryBusy ? "Working..." : "1. Write recovery code to disk"}
+                </button>
+
+                {recoveryNote ? (
+                  <div className="lock-note activate-recovery-note"
+                       style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>
+                    {recoveryNote}
+                  </div>
+                ) : null}
+
+                <label>
+                  <span>2. Recovery code from the file</span>
+                  <div className="input-wrapper">
+                    <input
+                      placeholder="XXXX-XXXX-XXXX"
+                      value={recoveryForm.code}
+                      onChange={(e) =>
+                        setRecoveryForm((p) => ({ ...p, code: e.target.value }))
+                      }
+                      style={{ paddingLeft: 14 }}
+                    />
+                  </div>
+                </label>
+
+                <label>
+                  <span>Administrator name</span>
+                  <div className="input-wrapper">
+                    <input
+                      placeholder="admin"
+                      value={recoveryForm.username}
+                      onChange={(e) =>
+                        setRecoveryForm((p) => ({ ...p, username: e.target.value }))
+                      }
+                      style={{ paddingLeft: 14 }}
+                    />
+                  </div>
+                </label>
+
+                <label>
+                  <span>New password (min 12 chars, letters and digits)</span>
+                  <div className="input-wrapper">
+                    <input
+                      type="password"
+                      value={recoveryForm.password}
+                      onChange={(e) =>
+                        setRecoveryForm((p) => ({ ...p, password: e.target.value }))
+                      }
+                      style={{ paddingLeft: 14 }}
+                    />
+                  </div>
+                </label>
+
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  onClick={applyRecovery}
+                  disabled={recoveryBusy}
+                >
+                  {recoveryBusy ? "Working..." : "3. Create / reset administrator"}
+                </button>
+              </div>
+            ) : null}
           </>
         )}
       </div>
     </div>
   );
 };
-
-
-

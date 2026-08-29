@@ -107,7 +107,13 @@ class FakeAL4022(BaseHTTPRequestHandler):
         if adr == "/getdatamulti":
             data = {}
             for a in (body.get("data") or {}).get("datatosend") or []:
-                value, code = self._value_for(a)
+                # The REAL block addresses the NODE here: an address that
+                # still ends in /getdata is not recognised and is simply
+                # OMITTED from the reply (verified on an AL1326,
+                # 2026-08-27). Mirror that, or this fake hides the bug.
+                if a.endswith("/getdata"):
+                    continue
+                value, code = self._value_for(a + "/getdata")
                 data[a] = {"data": value, "code": code}
             self._send({"cid": 1, "data": data, "code": 200})
             return
@@ -252,6 +258,49 @@ again = [x for x in ((hist2 or {}).get("rows") or []) if x.get("tag") == "Port1_
 check("it keeps sampling on the interval (trendable)", len(again) >= 2, len(again))
 
 call("POST", "/api/plc/gateways/stop", admin, {"gateway_id": "gw-al4022"})
+
+# --- the FAMILIAR flow: tag names only, no addresses ----------------------
+# An operator can also build a gateway with "Search Available Tags": tick names,
+# save. That fills `tags` and leaves ifm_datapoints EMPTY. The gateway then ran,
+# showed no error the operator could see, and collected nothing. The block is
+# the authority on where its values live, so the driver resolves the names.
+print()
+print("  [tags only, no saved addresses]")
+st, r = call("POST", "/api/plc/gateways/start", admin, {
+    "gateway_id": "gw-al4022-names",
+    "config": {"gateway_type": "ifm_iolink", "name": "AL4022 by name",
+               "plc_ip": BLOCK_HOST, "ifm_http_port": BLOCK_PORT,
+               "ifm_variant": "auto",
+               "ifm_datapoints": [],            # deliberately empty
+               "tags": ["Port1_Pin2", "Port3_Pin4"],
+               "interval_ms": 1000, "site": "L", "area": "A", "equipment": "E"}})
+check("a gateway with only tag NAMES starts", st == 200, f"status={st} {str(r)[:120]}")
+time.sleep(6)
+st, hist = call("GET", "/api/app-store/historian?limit=80", admin)
+rows2 = [x for x in (((hist or {}).get("rows")) or [])
+         if str(x.get("gateway_id")) == "gw-al4022-names"]
+check("  it resolves the names and COLLECTS", len(rows2) > 0, len(rows2))
+got2 = {str(x.get("tag")) for x in rows2}
+check("  exactly the ticked tags, nothing else", got2 == {"Port1_Pin2", "Port3_Pin4"},
+      sorted(got2))
+one2 = next((x for x in rows2 if x.get("tag") == "Port1_Pin2"), {})
+check("  with a real value", float(one2.get("value") or -1) == 1.0, one2.get("value"))
+call("POST", "/api/plc/gateways/stop", admin, {"gateway_id": "gw-al4022-names"})
+
+# and with NO tags either, it collects everything the block offers
+st, r = call("POST", "/api/plc/gateways/start", admin, {
+    "gateway_id": "gw-al4022-all",
+    "config": {"gateway_type": "ifm_iolink", "name": "AL4022 all",
+               "plc_ip": BLOCK_HOST, "ifm_http_port": BLOCK_PORT,
+               "ifm_variant": "auto", "ifm_datapoints": [], "tags": [],
+               "interval_ms": 1000, "site": "L", "area": "A", "equipment": "E"}})
+time.sleep(5)
+st, hist = call("GET", "/api/app-store/historian?limit=200", admin)
+rows3 = {str(x.get("tag")) for x in (((hist or {}).get("rows")) or [])
+         if str(x.get("gateway_id")) == "gw-al4022-all"}
+check("a gateway with no selection collects everything the block offers",
+      len(rows3) >= 16, len(rows3))
+call("POST", "/api/plc/gateways/stop", admin, {"gateway_id": "gw-al4022-all"})
 
 proc.terminate()
 try:

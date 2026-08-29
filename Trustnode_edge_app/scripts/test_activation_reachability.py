@@ -85,6 +85,42 @@ check_with("  and that default reached the bundle", bool(default_url and default
 check("the env var can still override it",
       "VITE_TRUSTNODE_CONTROL_PLANE_URL" in api_js, "override removed")
 
+# 6. 2026-08-25: activation on a new machine reported success while creating no
+#    local admin, and the operator was then locked out with no way back.
+print()
+check("a failed local finalize cannot be reported as success",
+      "could not be created on THIS computer" in bundle,
+      "the activation flow still masks a local-finalize failure")
+check("a successful activation returns an explicit ok flag",
+      "recovered_from_used_code" in bundle and "ok: true" in bundle.replace('"ok":true', "ok: true")
+      or "ok:!0" in bundle,
+      "result.ok may be undefined on success -> reported as a failure")
+check("the sign-in screen offers local account recovery",
+      "Recover local access" in bundle, "no recovery entry point shipped")
+check("  and says so when the edge has no administrator at all",
+      "has no administrator account yet" in bundle, "the locked-out case is silent")
+check("  and walks the operator through the code file",
+      "local-recovery/request" in bundle and "local-recovery/complete" in bundle,
+      "recovery endpoints are not called from the UI")
+check("the portal address no longer costs a permanent row",
+      "Change portal address" in bundle, "the extra field is always shown")
+
+# 7. the activation card has to fit on a laptop, button included
+css_files = [f for f in os.listdir(DIST) if f.endswith(".css")]
+css = "".join(open(os.path.join(DIST, f), encoding="utf-8", errors="replace").read()
+              for f in css_files)
+src_css = open(os.path.join(ROOT, "frontend", "src", "components", "Login", "Login.css"),
+               encoding="utf-8").read()
+check("the activation card is scrollable so the button is always reachable",
+      "max-height:calc(100vh - 24px)" in css.replace(" ", "").replace("calc(100vh-24px)", "calc(100vh - 24px)")
+      or "max-height: calc(100vh - 24px)" in src_css,
+      "a tall card can still hide the Activate button")
+check("  and it stops adding 12px on top of the 12px gap",
+      "activate-mode label" in src_css and "margin-bottom: 0;" in src_css,
+      "labels still double the spacing")
+check("  and short screens get a tighter layout",
+      "max-height: 820px" in src_css, "no short-viewport rule")
+
 print()
 print(f"RESULT: {'PASS' if not FAILS else 'FAIL - ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 2)

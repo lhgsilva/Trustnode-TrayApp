@@ -4014,7 +4014,7 @@ export function DashboardDesigner({
                     onChange={(e) => patchRow({ text_scale: e.target.value })} />
                 </label>
               </div>
-              <div className="row" style={{ justifyContent: "flex-end", marginTop: 10 }}>
+              <div className="row modal-actions">
                 <button type="button" className="btn btn-primary btn-sm" onClick={() => setSeriesValueCfgIdx(null)}>Done</button>
               </div>
             </div>

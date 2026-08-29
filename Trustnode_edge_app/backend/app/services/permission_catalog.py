@@ -83,6 +83,12 @@ FEATURES: List[Dict[str, Any]] = [
      "group": "Applications", "pages": ["batch_definitions"],
      "write_roles": ["admin", "super", "engineer"]},
 
+    {"key": "oee", "label": "OEE", "module": "oee", "group": "Applications",
+     "pages": ["oee_overview", "oee_operator"]},
+    {"key": "oee_configuration", "label": "OEE configuration", "module": "oee",
+     "group": "Applications", "pages": ["oee_configuration"],
+     "write_roles": ["admin", "super", "engineer"]},
+
     # ---------------------------------------------------------------------- AI
     {"key": "trustnode_intelligence", "label": "TrustNode Intelligence",
      "module": "trustnode_intelligence", "group": "AI", "pages": ["trustnode_intelligence"]},

@@ -180,7 +180,13 @@ class FakeMaster(BaseHTTPRequestHandler):
             STATE["multi_calls"] += 1
             data = {}
             for adr in (body.get("data") or {}).get("datatosend") or []:
-                value, code = self._value_for(adr)
+                # The REAL block addresses the NODE here: an address that
+                # still ends in /getdata is not recognised and is simply
+                # OMITTED from the reply (verified on an AL1326,
+                # 2026-08-27). Mirror that, or this fake hides the bug.
+                if adr.endswith("/getdata"):
+                    continue
+                value, code = self._value_for(adr + "/getdata")
                 data[adr] = {"data": value, "code": code}
             self._send({"cid": 1, "data": data, "code": 200})
             return

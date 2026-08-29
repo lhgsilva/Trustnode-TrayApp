@@ -1,0 +1,57 @@
+[BOOT HEALTH] PASS
+  boot health <= 15s          : PASS (5.3s spawn->first 200)
+  backend boot instrumentation : PASS (first /api/health +3.86s, snapshot ready +31.19s)
+  no splash boot failure       : PASS
+  no boot-health watchdog dump : PASS
+validation started 2026-08-21T08:58:39Z for 0.0h — gateway gw-1781903248499
+============================================================================
+TrustNode FULL VALIDATION FINAL REPORT  window=0.04h  gateway=gw-1781903248499  interval=1.0s
+generated 2026-08-21T09:01:10Z
+============================================================================
+
+[COLLECTION + CHARTS]  ws events=152 expected~150 delivery=101.3%
+  cadence: p50=1.001s p95=1.021s max=1.0s  holes>3s=0
+  chart-feed latency: p50=31ms p95=45ms max=0.46s
+  tags/event: min=48 avg=48.0; multi-stamp events=0
+
+[HISTORIAN] freshness p50=0.54s p95=0.56s max=1s  samples>10s-stale=0/75 (0.0%)
+[DB TRUTH] stamps committed=151 expected~150 (100.7%)  rows=7248
+
+[DATABASES] outbox pending: start=0 end=0 max=0 (rising forever = cloud sync broken)
+  cloud PG lag: checks=1 ok=1 p50=28s max=28s
+
+[API LATENCY / MODULES]
+  /api/health                      ok=3/3 fail=0 rtt p50=2ms p95=4ms
+  /api/intelligence/status         ok=3/3 fail=0 rtt p50=8ms p95=102ms
+  /api/plc/gateways/status         ok=3/3 fail=0 rtt p50=27ms p95=52ms
+
+[BATCHES / REPORTS / ALARMS+TRIGGERS]  (first -> last snapshot)
+  batches_total          0 -> 0
+  batches_open           0 -> 0
+  batch_events_newest    n/a -> n/a
+  reports_generated      3287 -> 3287
+  reports_newest         2026-08-21 08:00:27.190 -> 2026-08-21 08:00:27.190
+  reports_scheduled      2 -> 2
+  alarms_setup           6 -> 6
+  triggers_limits        7 -> 7
+
+[RESOURCES] cpu p50=28% max=47%  rss start=190MB end=120MB max=197MB  threads start=25 end=14 max=25
+
+[RECOVERY / LOG] events by category: none
+
+[BOOT HEALTH] (last boot block of backend.log)
+  boot started 2026-08-21T08:26:40Z  uvicorn up +5.05s  health 200 at 5300 ms since spawn  gateways resumed=1  deferred done +31.6s  exits=1
+  integrity: skipped ? last OK check 1.0h ago (weekly policy)
+
+[VERDICT vs SLOs]
+  boot health <= 15s          : PASS (5.3s spawn->first 200)
+  backend boot instrumentation : PASS (first /api/health +3.86s, snapshot ready +31.19s)
+  no splash boot failure       : PASS
+  no boot-health watchdog dump : PASS
+  zero boot failures in run : PASS
+  delivery >=95%           : PASS (101.3%)
+  historian p95 <5s        : PASS (0.6s)
+  zero stall/wedge events  : PASS
+  cloud lag p95 <120s      : PASS
+
+  OVERALL: PASS

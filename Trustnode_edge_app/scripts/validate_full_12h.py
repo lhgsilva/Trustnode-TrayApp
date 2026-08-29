@@ -62,9 +62,11 @@ LOG = os.path.expanduser(r"~\AppData\Roaming\trustnode-edge-desktop\backend.log"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import boot_log_check as _boot  # noqa: E402
 import validate_surfaces as _surf  # noqa: E402  (2026-08-21: LAN surfaces + access policy)
+import validate_licence_and_views as _lic  # noqa: E402  (2026-08-29: licensing, customers, Lite/web views)
 BOOT_MAX_HEALTH_MS = int(os.environ.get("VAL_BOOT_MAX_HEALTH_MS", "15000"))
 boot_metrics: dict = {}
 surface_result: dict = {"ok": None, "lines": [], "metrics": {}}
+licence_result: dict = {"ok": None}   # 2026-08-29: licensing / customers / views
 
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "validation_out")
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -498,6 +500,14 @@ async def log_task(stop_at: float) -> None:
     except Exception:
         return
     pats = [
+        # 2026-08-25: rows that are READ but never COMMITTED are the most
+        # expensive failure this product has - the gateway shows RUNNING
+        # with no last_error while the durable store stays empty. Twice a
+        # GatewayWorker method was called on PLCManager and a broad except
+        # swallowed it (2026-07-16 _run_collection_io, 2026-08-21
+        # _mark_historian_commit). The buffer warning is the one signal
+        # both incidents emitted from the very first cycle: hard FAIL.
+        ("dataloss", re.compile(rb"historian-write-fail|historian-buffer")),
         ("boot_fail", re.compile(rb"did not respond|health wait TIMED OUT|BOOT ABORTED|\[boot\]\[health-watchdog\]")),
         ("recovery", re.compile(rb"Splash window created|Backend exited|respawn|first-row|auto-resumed")),
         ("stall", re.compile(rb"stalled \d+s|read-timeout|persist-timeout|event loop stale|cooldown")),
@@ -716,6 +726,12 @@ def build_summary(t0: float, final: bool) -> str:
     _sm = surface_result.get("metrics") or {}
     A(f"  surfaces + access policy   : {'PASS' if _s_ok else 'FAIL'} ({_sm.get('checks', 0) - _sm.get('failed', 0)}/{_sm.get('checks', 0)} checks)")
     ok &= bool(_s_ok)
+    _l_ok = licence_result.get("ok")
+    if _l_ok is None:
+        A("  licence / customers / views: SKIPPED (not run)")
+    else:
+        A(f"  licence / customers / views: {'PASS' if _l_ok else 'FAIL'}")
+        ok &= bool(_l_ok)
     if dist_samples:
         stall_max = max(d[1] for d in dist_samples)
         A(f"  distribution not stalled : {'PASS' if stall_max < 120 else 'FAIL'} (max {stall_max:.0f}s)")
@@ -742,6 +758,12 @@ def build_summary(t0: float, final: bool) -> str:
         A(f"  retention healthy        : {'PASS' if ret_ok else 'FAIL'}"
           f"{(' (' + ret_note + ')') if ret_note else ''}")
         ok &= ret_ok
+    loss_n = cats.get("dataloss", 0)
+    A(f"  zero historian buffering : {'PASS' if loss_n == 0 else f'FAIL ({loss_n})'}")
+    if loss_n:
+        for _at, _cat, _txt in [e for e in log_events if e[1] == "dataloss"][:5]:
+            A(f"      {_txt[:170]}")
+    ok &= loss_n == 0
     stall_n = cats.get("stall", 0)
     A(f"  zero stall/wedge events  : {'PASS' if stall_n == 0 else f'FAIL ({stall_n})'}")
     ok &= stall_n == 0
@@ -793,6 +815,19 @@ async def main() -> int:
     surface_result.update(ok=_s_ok, lines=_s_lines, metrics=_s_metrics)
     emit({"t": "surfaces", "ok": _s_ok, **{k: v for k, v in (_s_metrics or {}).items() if k != "licensed"}})
     print("[SURFACES] " + ("PASS" if _s_ok else "FAIL") + "\n" + "\n".join(_s_lines), flush=True)
+
+    # Licensing, customer management and every customer-facing view. Separate
+    # from SURFACES: that one proves the bundles are SERVED and RBAC holds, this
+    # one proves the licence says something and each view can READ DATA.
+    print("[LICENCE / CUSTOMERS / VIEWS]", flush=True)
+    try:
+        _l_rc = await asyncio.to_thread(_lic.main)
+        _l_ok = (_l_rc == 0)
+    except Exception as exc:
+        _l_ok = False
+        print(f"  licence/views check crashed: {exc!r}", flush=True)
+    licence_result["ok"] = _l_ok
+    emit({"t": "licence_views", "ok": _l_ok})
     await asyncio.gather(
         ws_task(stop_at), db_task(stop_at), api_task(stop_at),
         cloud_task(stop_at), resources_task(stop_at), outbox_task(stop_at),

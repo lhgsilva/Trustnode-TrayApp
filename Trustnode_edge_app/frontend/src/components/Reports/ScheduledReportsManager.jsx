@@ -979,7 +979,7 @@ export function ScheduledReportsManager({
                 TXT
               </label>
             </div>
-            <div className="schedule-email-dialog-actions">
+            <div className="schedule-email-dialog-actions row modal-actions">
               <button
                 type="button"
                 className="btn btn-secondary"

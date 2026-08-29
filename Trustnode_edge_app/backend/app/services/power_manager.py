@@ -55,6 +55,23 @@ REGISTER_PROFILES: dict[str, dict[str, int]] = {
     },
 }
 
+# 2026-08-27: the app shipped EM525 maps only (19000-range). Pointed at a
+# Weidmuller EM122 they connect, poll and return 0.0000 for everything, which
+# is the failure mode nobody reports as a failure. The EM122 maps live in
+# app/services/meter_registers.py next to the address conversion they need.
+try:
+    from app.services.meter_registers import (
+        EM122_SINGLE_PHASE as _EM122_1P,
+        EM122_THREE_PHASE as _EM122_3P,
+        EM122_ALL as _EM122_ALL,
+    )
+    REGISTER_PROFILES["weidmuller_em122_single_phase"] = dict(_EM122_1P)
+    REGISTER_PROFILES["weidmuller_em122_three_phase"] = dict(_EM122_3P)
+    REGISTER_PROFILES["weidmuller_em122_all"] = dict(_EM122_ALL)
+except Exception:      # never let a profile import stop the power module
+    pass
+
+
 PROFILE_BY_MODE: dict[str, str] = {
     "single_phase": "weidmuller_em525_single_phase_basic",
     "three_phase": "weidmuller_em525_three_phase_basic",
@@ -87,6 +104,9 @@ DEFAULT_DEVICE: dict[str, Any] = {
     "vt_secondary": 230.0,
     "registers": DEFAULT_REGISTERS,
     "register_scales": {k: 1.0 for k in DEFAULT_REGISTERS.keys()},
+    # Which registers are actually collected. A key that is absent counts as
+    # enabled, so an existing meter keeps collecting its whole map.
+    "register_enabled": {},
     "include_raw_tags": False,
     # Optional database connection id — matches PLC gateway behaviour. The
     # local app-store historian is ALWAYS written (so the dashboard and
@@ -121,6 +141,22 @@ DEFAULT_POWER_CONFIG: dict[str, Any] = {
     # compute downtime energy cost.
     "downtime_rules": [],
 }
+
+
+def enabled_registers(device: dict) -> dict:
+    """The registers a meter should actually poll.
+
+    `registers` is the full address map and stays that way; `register_enabled`
+    records only the keys switched OFF. A key that is absent is ON, so a meter
+    configured before per-register selection existed keeps collecting its whole
+    map. Applied at poll time, not at config time, so unticking a value never
+    loses its address, scale or description.
+    """
+    registers = dict((device or {}).get("registers") or {})
+    off = (device or {}).get("register_enabled") or {}
+    if not isinstance(off, dict) or not off:
+        return registers
+    return {k: v for k, v in registers.items() if off.get(k, True)}
 
 
 class PowerManager:
@@ -164,24 +200,47 @@ class PowerManager:
         self._writer_thread.start()
 
     def _ensure_config_loaded(self) -> dict[str, Any]:
-        """Idempotent lazy loader. Safe to call from any thread. Returns
-        the loaded config. Falls back to DEFAULT_POWER_CONFIG if app_store
-        is still locked or unreachable — caller always gets a usable dict.
+        """Idempotent lazy loader. Safe to call from any thread.
+
+        2026-08-26 DATA LOSS FIX. This used to fall back to
+        DEFAULT_POWER_CONFIG whenever the read did not work - app_store
+        locked, a slow store, a scope mismatch - and then WRITE THAT FALLBACK
+        BACK to the store a few lines later. A transient read failure at boot
+        therefore destroyed the operator's configured meters permanently. An
+        operator restarted the app and their meter was simply gone.
+
+        The rule now: a read that did not succeed is NOT a configuration. We
+        keep the provisional default in memory so callers still get a usable
+        dict, but we do not mark it loaded and we never persist it - the next
+        call retries, and a later successful read repairs the in-memory state.
         """
         if self._config_loaded:
             return self._config
-        try:
-            cfg = self._load_config()
-        except Exception:
-            cfg = self._deep_copy(DEFAULT_POWER_CONFIG)
+
+        cfg, ok = self._load_config()
+        if not ok:
+            # Serve the provisional default, but do not latch it and do not
+            # write it. _config_loaded stays False so we try again.
+            logger.warning("power: config not readable yet - keeping the stored "
+                           "configuration and retrying (nothing was written)")
+            with self._lock:
+                return self._deep_copy(self._config)
+
         # Apply the manual-start-safety policy (same logic that used to
         # live in __init__). We only force-stop ONCE per process.
         if str(os.environ.get("TRUSTNODE_POWER_AUTO_START", "0") or "0").strip().lower() not in {"1", "true", "yes", "on"}:
-            cfg = self._force_stopped_config(cfg)
-            try:
-                self._app_store.upsert_domain("power_management_config", cfg, actor="system")
-            except Exception:
-                pass
+            stopped = self._force_stopped_config(cfg)
+            # Only write when the policy actually changed something. A boot
+            # that changes nothing has no business writing to the store at all.
+            if stopped != cfg:
+                cfg = stopped
+                try:
+                    self._app_store.upsert_domain(
+                        "power_management_config", cfg, actor="system")
+                except Exception as exc:
+                    logger.warning("power: could not persist the stopped state: %s", exc)
+            else:
+                cfg = stopped
         with self._lock:
             self._config = cfg
             self._config_loaded = True
@@ -190,6 +249,21 @@ class PowerManager:
     @staticmethod
     def _utc_now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _historian_ts() -> str:
+        """The timestamp format the historian is queried with.
+
+        Every other writer stores "YYYY-MM-DD HH:MM:SS.mmm"; power rows used
+        isoformat(), giving "YYYY-MM-DDTHH:MM:SS.ffffff+00:00". Range filters
+        compare ts_utc as TEXT, and 'T' sorts AFTER ' ', so a power row was
+        NEVER inside a window built the normal way - `ts <= to_utc` was false
+        for every one of them. That silently emptied every time-ranged read of
+        power data: report chart sections, dashboard range widgets, and the
+        bucketed reads behind the Power Overview. Status fields keep
+        isoformat(); only what lands in the historian is normalised.
+        """
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
     @staticmethod
     def _deep_copy(obj: Any) -> Any:
@@ -310,6 +384,18 @@ class PowerManager:
                 parsed = _to_float(raw_scales.get(k), 1.0)
                 scale_map[k] = parsed if parsed != 0 else 1.0
         base["register_scales"] = scale_map
+        # 2026-08-28: which of the mapped registers to actually collect. Stored
+        # SEPARATELY from `registers` so unticking a value keeps its address,
+        # scale and description - re-ticking it needs no re-configuration and
+        # no supplier table. Only keys that are OFF are recorded; anything
+        # absent is on, which is what makes every existing meter unchanged.
+        enabled_map: dict[str, bool] = {}
+        raw_enabled = raw.get("register_enabled") if isinstance(raw, dict) else None
+        if isinstance(raw_enabled, dict):
+            for k in resolved_registers.keys():
+                if k in raw_enabled and not bool(raw_enabled.get(k)):
+                    enabled_map[k] = False
+        base["register_enabled"] = enabled_map
         base["include_raw_tags"] = bool(raw.get("include_raw_tags", base.get("include_raw_tags", False)))
         # Operator-supplied register descriptions (added 2026-06-15).
         # Plain {register_key: text} map, persisted alongside the
@@ -447,16 +533,48 @@ class PowerManager:
         out["devices"] = devices
         return out
 
-    def _load_config(self) -> dict[str, Any]:
+    def _load_config(self) -> tuple[dict[str, Any], bool]:
+        """Returns (config, ok). `ok` is False when the store could not be read.
+
+        2026-08-26: this used to answer a read MISS by writing
+        DEFAULT_POWER_CONFIG over the stored domain, and answer an EXCEPTION by
+        returning the same empty default to a caller that then persisted it.
+        Either way a configured meter was destroyed by a read that failed. A
+        failed read now says so, and writes nothing.
+        """
+        # Fast path: read JUST this domain, off the global lock. Going through
+        # get_bootstrap() built every domain behind the same lock that deferred
+        # outbox init, cloud sync and the retention scheduler contend for at
+        # boot - the operator's meters sat in the database for MINUTES while the
+        # Power page showed "No power meters configured" (2026-08-26).
         try:
-            boot = self._app_store.get_bootstrap(prefer_cloud_reads=False) or {}
-            raw = boot.get("power_management_config")
-            if raw is None:
-                self._app_store.upsert_domain("power_management_config", DEFAULT_POWER_CONFIG, actor="system")
-                return self._deep_copy(DEFAULT_POWER_CONFIG)
-            return self._normalize_config(raw)
-        except Exception:
-            return self._deep_copy(DEFAULT_POWER_CONFIG)
+            fast = self._app_store.get_domain_fast("power_management_config")
+            if isinstance(fast, dict):
+                return self._normalize_config(fast), True
+        except Exception as exc:
+            logger.debug("power: fast domain read unavailable (%s)", exc)
+
+        try:
+            boot = self._app_store.get_bootstrap(prefer_cloud_reads=False)
+        except Exception as exc:
+            logger.warning("power: bootstrap read failed (%s) - configuration untouched", exc)
+            return self._deep_copy(DEFAULT_POWER_CONFIG), False
+        if not isinstance(boot, dict):
+            logger.warning("power: bootstrap unavailable - configuration untouched")
+            return self._deep_copy(DEFAULT_POWER_CONFIG), False
+        raw = boot.get("power_management_config")
+        if raw is None:
+            # Genuinely absent (a fresh install) is indistinguishable here from
+            # a partial bootstrap, so seed NOTHING. The domain is created by
+            # the first real save; an empty seed buys us nothing and an empty
+            # OVERWRITE costs an operator their meters.
+            return self._deep_copy(DEFAULT_POWER_CONFIG), True
+        try:
+            return self._normalize_config(raw), True
+        except Exception as exc:
+            logger.warning("power: stored configuration could not be parsed (%s) - "
+                           "leaving it in place", exc)
+            return self._deep_copy(DEFAULT_POWER_CONFIG), False
 
     def get_config(self) -> dict[str, Any]:
         # Lazy-load on first read so HTTP routes called before the
@@ -478,7 +596,30 @@ class PowerManager:
         }
 
     def update_config(self, payload: dict[str, Any], actor: str = "admin") -> dict[str, Any]:
-        cfg = self._normalize_config(payload or {})
+        """Persist a configuration change.
+
+        MERGES over the configuration already held, so a caller that sends only
+        the fields it changed cannot blank the rest. The request model gives
+        every field a default (devices -> []), so a save of, say, just the
+        tariffs used to arrive here as a complete config with an empty device
+        list and wipe every meter.
+        """
+        incoming = dict(payload or {})
+        current = self.get_config()
+        merged = {**current, **incoming}
+
+        # A background/system write must never be the thing that removes the
+        # last meter. An operator deleting their own meter is legitimate and
+        # still works; a boot-time or recovery path zeroing the list is always
+        # a bug, and it costs a site its configuration (2026-08-26).
+        had = len(current.get("devices") or [])
+        now_has = len(merged.get("devices") or [])
+        if had and not now_has and str(actor or "").strip().lower() == "system":
+            logger.error("power: refusing a system write that would delete all "
+                         "%d configured meter(s); keeping the stored configuration", had)
+            return current
+
+        cfg = self._normalize_config(merged)
         with self._lock:
             self._config = cfg
             valid_ids = {str(d.get("id")) for d in cfg.get("devices", [])}
@@ -643,10 +784,15 @@ class PowerManager:
     def _poll_device(self, device: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         device_id = str(device.get("id") or "")
         unit_id = int(device.get("unit_id") or 1)
-        registers = dict(device.get("registers") or {})
+        # Collect only what the operator ticked. Filtering HERE rather than in
+        # the config keeps the address map intact, and it is also where it pays:
+        # the block planner below merges contiguous addresses, so dropping
+        # registers means fewer and shorter Modbus reads per cycle, not merely
+        # fewer historian rows.
+        registers = enabled_registers(device)
         register_scales = dict(device.get("register_scales") or {})
         client = self._get_client(device)
-        now = self._utc_now()
+        now = self._historian_ts()
         try:
             is_connected = bool(getattr(client, "connected", False))
         except Exception:
@@ -664,8 +810,21 @@ class PowerManager:
         backed_off_keys: list[str] = []
         now_mono = time.monotonic()
         device_backoff = self._register_backoff_until.setdefault(device_id, {})
+        # 2026-08-27: a datasheet reference is not a wire offset. Weidmuller
+        # prints "30001, 30003, 30005..."; those are 1-based 3x references and
+        # the register actually carrying Phase 1 volts is offset 0. Typing
+        # 30005 read offset 30005, which does not exist, so the row sat at "-"
+        # for ever and "add custom register" looked broken. Proven on an EM122
+        # at 192.168.10.200: offset 0 = 239.24 V, offset 70 = 50.03 Hz.
+        #
+        # Plain offsets below the 3x range pass through unchanged, so every
+        # existing EM525 configuration (19000-range) keeps working.
+        from app.services.meter_registers import normalize_register_address
         for key, addr in registers.items():
-            addr_int = int(addr)
+            try:
+                addr_int, _func = normalize_register_address(addr)
+            except ValueError:
+                continue
             fail_until = float(device_backoff.get(addr_int, 0.0) or 0.0)
             if fail_until > now_mono:
                 backed_off_keys.append(str(key))
@@ -839,6 +998,16 @@ class PowerManager:
             "last_error": "",
             "last_poll_utc": now,
             "last_success_utc": now,
+            # 2026-08-26: which configured registers produced NO value this
+            # cycle, and how many did. A meter that implements only part of a
+            # profile - a single-phase unit carrying the three-phase map, say -
+            # used to render as a column of blank cells with nothing to explain
+            # them. Naming them turns "it is broken" into "this meter does not
+            # have those registers".
+            "registers_total": int(len(registers)),
+            "registers_read": int(len(values_scaled)),
+            "unreadable_registers": sorted(
+                str(k) for k in registers.keys() if str(k) not in values_scaled),
             "ip": str(device.get("ip") or ""),
             "port": int(device.get("port") or 502),
             "unit_id": int(device.get("unit_id") or 1),
@@ -950,18 +1119,41 @@ class PowerManager:
         device_id = str(device.get("id") or "")
         gw_name = str(device.get("name") or device_id)
         ip = str(device.get("ip") or "")
-        # Live kW prefers active_power_total_w/active_power_w; fall
-        # back to 0 so the tag still emits (otherwise dashboards lose
-        # the series during a brief read fault).
-        watts = None
-        for key in ("active_power_total_w", "active_power_w"):
+        # Live kW prefers a total the meter reports; failing that it is DERIVED
+        # from the per-phase registers.
+        #
+        # 2026-08-26: a site running the three-phase profile on a meter that
+        # does not implement the total registers (19026 active power total,
+        # 19060 total energy) got live_kw = 0 and a Power Overview of zeroes,
+        # while the per-phase registers were reading perfectly. Total active
+        # power IS the sum of the phases, so compute it rather than reporting
+        # nothing. Falling back to 0 stays as the last resort so the series
+        # never disappears during a brief read fault.
+        def _num(key):
             v = values.get(key)
-            if v is not None:
-                try:
-                    watts = float(v)
-                    break
-                except Exception:
-                    continue
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        def _total(exact_keys, phase_keys, combine="sum"):
+            for k in exact_keys:
+                v = _num(k)
+                if v is not None:
+                    return v
+            parts = [x for x in (_num(k) for k in phase_keys) if x is not None]
+            if not parts:
+                return None
+            if combine == "avg":
+                return sum(parts) / len(parts)
+            return sum(parts)
+
+        watts = _total(
+            ("active_power_total_w", "active_power_w"),
+            ("active_power_l1_w", "active_power_l2_w", "active_power_l3_w"),
+        )
         live_kw = (watts or 0.0) / 1000.0
 
         st = self._insight_state(device_id)
@@ -1040,7 +1232,11 @@ class PowerManager:
         # downtime; the strip also asks for Current (A), Active
         # Power (kW) and a "Power Usage (kWh)" alias for the
         # rolling-window kWh integral.
-        current_a = float(values.get("current_a") or values.get("current_l1_a") or 0.0)
+        # Current is NOT summed across phases - that has no physical meaning.
+        # Report the meter's own figure, else the average of the phases present.
+        current_a = _total(("current_a", "current_l1_a"),
+                           ("current_l1_a", "current_l2_a", "current_l3_a"),
+                           combine="avg") or 0.0
         # Operator 2026-06-16: every insight tag is written at the
         # gateway's configured poll interval. The previous fast/slow
         # split caused dashboard charts that included an "insight.*"
@@ -1071,6 +1267,55 @@ class PowerManager:
                 rows.append(_row(f"insight.tariff_{idx + 1}_kwh", kwh_i))
                 rows.append(_row(f"insight.tariff_{idx + 1}_cost_eur", cost_i))
         return rows
+
+    def _fanout_live(self, device_id: str, rows: list[dict[str, Any]]) -> None:
+        """Push this cycle's readings onto the live WebSocket stream.
+
+        2026-08-26: power meters wrote to the historian and nothing else, so a
+        dashboard chart bound to a meter tag had no live source at all - it
+        could only poll, which is why it lagged 3-6 s while PLC tags on the
+        same chart updated at their poll rate. The stream already carries a
+        generic {gateway_id, readings[]} message and the UI indexes whatever
+        arrives, so meters ride the same channel now.
+
+        Strictly best-effort: fanout is decoration, and a WebSocket problem
+        must never touch collection.
+        """
+        if not rows:
+            return
+        try:
+            from app.state import plc_manager
+            fan = getattr(plc_manager, "fanout_threadsafe", None)
+            if not callable(fan):
+                return
+            readings = [
+                {
+                    "ts_utc": str(r.get("ts_utc") or ""),
+                    "tag_name": str(r.get("tag_name") or ""),
+                    "value": r.get("value"),
+                    "value_text": None,
+                    "data_type": "REAL",
+                    "quality": r.get("quality", 192),
+                    "quality_label": str(r.get("quality_label") or "GOOD"),
+                    "source": str(r.get("source") or "power_modbus"),
+                    "site": "",
+                    "area": "",
+                    "equipment": "",
+                }
+                for r in rows
+                if str(r.get("tag_name") or "")
+            ]
+            if not readings:
+                return
+            fan({
+                "type": "reading",
+                "gateway_id": str(device_id or ""),
+                "collection_allowed": True,
+                "persisted_local": True,
+                "readings": readings,
+            })
+        except Exception:
+            pass
 
     def _enqueue_rows(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -1430,6 +1675,7 @@ class PowerManager:
             try:
                 sample, rows, status = self._poll_device(device)
                 self._enqueue_rows(rows)
+                self._fanout_live(device_id, rows)
                 with self._lock:
                     self._last_samples[device_id] = sample
                     self._status_by_device[device_id] = status
@@ -1439,7 +1685,12 @@ class PowerManager:
                     self._app_store.append_log_rows(
                         [
                             {
-                                "ts_utc": self._utc_now(),
+                                # Canonical stamp, NOT isoformat: ts_utc is
+                                # compared as TEXT and a 'T' sorts after a
+                                # space, so an ISO row lands outside every
+                                # time-range filter and at the wrong end of
+                                # the Logs page.
+                                "ts_utc": self._historian_ts(),
                                 "level": "warning",
                                 "category": "power_management",
                                 "message": f"Power meter {device_id} read failed: {str(exc)}",
@@ -1548,6 +1799,12 @@ class PowerManager:
                 # full poll cycle (~1 s) AND for as long as the loop is in
                 # the disabled-sleep state.
                 st["enabled"] = bool(d.get("enabled", True))
+                # A meter that has not completed its FIRST poll yet is
+                # starting, not failing. It used to report connected=False with
+                # no error, which the UI rendered as "Device Fails" the instant
+                # a gateway was enabled - before a single Modbus request had
+                # been sent (2026-08-26).
+                st["starting"] = not bool(str(st.get("last_poll_utc") or "").strip())
                 st.update(
                     {
                         "poll_duration_ms": metrics.get("poll_duration_ms"),
@@ -1637,7 +1894,13 @@ class PowerManager:
             values_raw: dict[str, float] = {}
             for key, addr in regs.items():
                 reg_key = str(key)
-                reg_addr = int(addr)
+                # Same conversion the poller uses, or "Test" would report a
+                # different value from the one being collected.
+                from app.services.meter_registers import normalize_register_address
+                try:
+                    reg_addr, _fn = normalize_register_address(addr)
+                except ValueError:
+                    continue
                 try:
                     res = client.read_input_registers(address=reg_addr, count=2, slave=unit_id)
                     if getattr(res, "isError", lambda: True)():

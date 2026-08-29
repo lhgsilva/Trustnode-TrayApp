@@ -1004,9 +1004,52 @@ class AppStore:
         os.makedirs(backup_dir, exist_ok=True)
         return backup_dir
 
+    # How much page cache each write connection gets, in KB. The default of
+    # 2 MB is a SQLite default, not a decision: with five indexes on
+    # `historian_readings` it means an INSERT re-reads from disk nearly every
+    # index page it touches. Raising it is pure performance - no durability
+    # meaning whatsoever.
+    # Read at connect time, not at class-definition time: main.py loads the
+    # operator's .env into os.environ before importing app.state today, but
+    # that is an import-ORDER dependency, and an ordering that has to stay
+    # right for a setting to work is one that will eventually be wrong. A
+    # dict lookup is nothing beside opening a SQLite connection.
+    _CACHE_KB_DEFAULT = 131072
+    # FULL (the SQLite default) fsyncs on every commit; at one commit per
+    # collection cycle that is a disk sync every second. NORMAL, in WAL mode,
+    # CANNOT corrupt the database - a power cut can lose only the most recent
+    # commits, which the store-and-forward outbox re-sends. Left at FULL because
+    # that is what this install has been running and losing data is the one
+    # thing the operator has ruled out; set TRUSTNODE_SQLITE_SYNCHRONOUS=NORMAL
+    # to take the measured speed-up.
+    _SYNCHRONOUS_DEFAULT = "FULL"
+
+    @classmethod
+    def _write_pragmas(cls) -> tuple[int, str]:
+        try:
+            cache_kb = max(2_000, int(
+                os.environ.get("TRUSTNODE_SQLITE_CACHE_KB") or cls._CACHE_KB_DEFAULT))
+        except Exception:
+            cache_kb = cls._CACHE_KB_DEFAULT
+        sync = str(os.environ.get("TRUSTNODE_SQLITE_SYNCHRONOUS")
+                   or cls._SYNCHRONOUS_DEFAULT).strip().upper()
+        if sync not in ("OFF", "NORMAL", "FULL", "EXTRA"):
+            sync = cls._SYNCHRONOUS_DEFAULT
+        return cache_kb, sync
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
+        # PER-CONNECTION pragmas. Setting these in the schema bootstrap looked
+        # like it configured the database; it configured one short-lived
+        # connection. Only `journal_mode` persists in the file.
+        try:
+            cache_kb, sync = self._write_pragmas()
+            conn.execute("PRAGMA cache_size=-%d" % cache_kb)
+            conn.execute("PRAGMA synchronous=%s" % sync)
+        except Exception:
+            # A pragma that will not apply is not a reason to fail the write.
+            pass
         return conn
 
     def _connect_readonly(self) -> sqlite3.Connection:
@@ -4207,6 +4250,16 @@ class AppStore:
     def _ensure_schema(self) -> None:
         with self._lock:
             with self._connect() as conn:
+                # OEE module tables (2026-08-27). Created in the SAME
+                # transaction as the rest of the schema so a boot can never
+                # leave the store half-migrated. The module owns its own DDL;
+                # this file just calls it. See app/modules/oee/schema.py.
+                try:
+                    from app.modules.oee.schema import ensure_oee_schema
+                    ensure_oee_schema(conn)
+                except Exception as _oee_exc:  # never brick boot on a module
+                    print("[trustnode][boot] OEE schema skipped: %r" % (_oee_exc,),
+                          flush=True)
                 # Pre-migrate columns that the executescript below references in
                 # its CREATE INDEX statements. CREATE TABLE IF NOT EXISTS skips
                 # column additions on pre-existing tables, so when an older DB
@@ -5122,13 +5175,31 @@ class AppStore:
                     conn.execute("ALTER TABLE generated_reports ADD COLUMN storage_path TEXT NULL")
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_hist_tenant_ts ON historian_readings(tenant_id, ts_utc DESC)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_hist_tenant_gwid_tag_ts ON historian_readings(tenant_id, gateway_id, tag_name, ts_utc DESC)')
-                conn.execute('CREATE INDEX IF NOT EXISTS idx_hist_tenant_gwname_tag_ts ON historian_readings(tenant_id, gateway_name, tag_name, ts_utc DESC)')
+                # idx_hist_tenant_gwname_tag_ts is NOT created any more - see the
+                # drop list below for why.
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_tenant_ts ON app_logs(tenant_id, ts_utc DESC)')
                 # 2026-05-18: drop the 4 redundant historian indexes on boot so
                 # upgrading installs don't keep paying for them. They were
                 # subsumed by the composites above. Idempotent — DROP IF EXISTS.
+                #
+                # 2026-08-28 adds idx_hist_tenant_gwname_tag_ts to that list.
+                # MEASURED on the live 13.4 GB store: no query plan selects it.
+                # It exists for gateway-NAME lookups, but the only query that
+                # wants one is written as
+                #     COALESCE(gateway_name,'')=? OR COALESCE(gateway_id,'')=?
+                # which SQLite cannot answer from an index - so it was pure
+                # write cost. Benchmark (scripts/bench_historian_write.py,
+                # 4M rows, live 152-tag shape): dropping this ONE index took the
+                # median flush from 54.7 ms to 8.6 ms. That was a bigger win
+                # than the connection and PRAGMA fixes combined.
+                #
+                # DROP INDEX is cheap - measured 0.2 s on a 3M-row index with a
+                # concurrent writer seeing a 239 ms worst commit and zero
+                # errors - and it is idempotent, so only the first boot after
+                # upgrading pays anything at all.
                 for _legacy_ix in (
                     "idx_hist_ts", "idx_hist_tag", "idx_hist_gateway", "idx_hist_tenant_gw_tag_ts",
+                    "idx_hist_tenant_gwname_tag_ts",
                 ):
                     try:
                         conn.execute(f'DROP INDEX IF EXISTS {_legacy_ix}')
@@ -6083,9 +6154,14 @@ class AppStore:
         # still overlays (wins) when it has its own value. Read-only; never
         # moves data. The requested scope is appended last inside the helper.
         try:
-            with self._lock:
-                with self._connect() as _c:
-                    widened = self._build_read_fallback_scope_keys(_c, skey)
+            # No global lock - that was the contention behind the 6 s p95 on
+            # /api/plc/gateways/status, and in WAL a reader needs no mutex.
+            # But a WRITE-CAPABLE connection, for its 10 s timeout: the
+            # read-only handle's 3 s bound is right for a historian page and
+            # wrong for a config read against a 13 GB store at boot. It timed
+            # out, and the caller turns any exception into "no gateways".
+            with self._connect() as _c:
+                widened = self._build_read_fallback_scope_keys(_c, skey)
             # `candidate_keys` is read in order; the LAST occurrence of skey
             # overlays (wins). Rebuild as: [all fallbacks..., skey] with skey
             # only at the end. widened already ends with skey.
@@ -6097,39 +6173,63 @@ class AppStore:
             candidate_keys = merged
         except Exception:
             pass
-        with self._lock:
-            with self._connect() as conn:
-                for k in candidate_keys:
-                    rows = conn.execute(
-                        "SELECT domain, payload_json FROM config_documents_scoped WHERE scope_key = ?",
-                        (k,),
-                    ).fetchall()
-                    for row in rows:
-                        domain = str(row["domain"] or "").strip()
-                        if not domain:
+        # Same again: no lock, but the write-capable connection's longer
+        # timeout. If this raises, the callers in routers/app_store.py turn it
+        # into a bootstrap with NO gateways and NO devices - silently - so a
+        # failure here has to be impossible to miss in the log.
+        with self._connect() as conn:
+            for k in candidate_keys:
+                rows = conn.execute(
+                    "SELECT domain, payload_json FROM config_documents_scoped WHERE scope_key = ?",
+                    (k,),
+                ).fetchall()
+                for row in rows:
+                    domain = str(row["domain"] or "").strip()
+                    if not domain:
+                        continue
+                    payload_text = str(row["payload_json"] or "null")
+                    try:
+                        parsed = json.loads(payload_text)
+                    except Exception:
+                        parsed = None
+                    # Operator 2026-07-03 (NEVER-LOSE-SCOPE): a later scope
+                    # normally overlays an earlier one. But an EMPTY value
+                    # (e.g. the current scope has database_configurations=[]
+                    # while a fallback scope holds the real Supabase config)
+                    # must NOT wipe a populated fallback. Only overwrite
+                    # when the new value is non-empty, OR nothing is set yet.
+                    prev = out.get(domain)
+                    def _empty(v):
+                        return v is None or v == [] or v == {} or v == ""
+                    if domain not in out or not _empty(parsed) or _empty(prev):
+                        if _empty(parsed) and not _empty(prev):
+                            # keep the populated fallback; skip the empty.
                             continue
-                        payload_text = str(row["payload_json"] or "null")
-                        try:
-                            parsed = json.loads(payload_text)
-                        except Exception:
-                            parsed = None
-                        # Operator 2026-07-03 (NEVER-LOSE-SCOPE): a later scope
-                        # normally overlays an earlier one. But an EMPTY value
-                        # (e.g. the current scope has database_configurations=[]
-                        # while a fallback scope holds the real Supabase config)
-                        # must NOT wipe a populated fallback. Only overwrite
-                        # when the new value is non-empty, OR nothing is set yet.
-                        prev = out.get(domain)
-                        def _empty(v):
-                            return v is None or v == [] or v == {} or v == ""
-                        if domain not in out or not _empty(parsed) or _empty(prev):
-                            if _empty(parsed) and not _empty(prev):
-                                # keep the populated fallback; skip the empty.
-                                continue
-                            out[domain] = parsed
+                        out[domain] = parsed
         if isinstance(out.get("metadata"), dict):
             out["metadata"]["scope_key"] = skey
         return out
+
+    def get_bootstrap_scoped_or_shout(self, scope_key: str,
+                                      prefer_cloud_reads: bool | None = None):
+        """`get_bootstrap_scoped`, but a failure is never mistaken for empty.
+
+        The callers wrap this read in `except Exception: pass`, which turns a
+        locked or slow database into "the operator has no gateways". That is
+        indistinguishable from a wiped config and it is how an hour was lost on
+        2026-08-28. The read still raises - the callers' fallback behaviour is
+        deliberate - but it can no longer do so quietly.
+        """
+        try:
+            return self.get_bootstrap_scoped(scope_key, prefer_cloud_reads=prefer_cloud_reads)
+        except Exception as exc:
+            try:
+                print("[trustnode][config] SCOPED CONFIG READ FAILED for scope %r: %r. "
+                      "Gateways and devices will appear EMPTY until this succeeds - "
+                      "nothing has been deleted." % (scope_key, exc), flush=True)
+            except Exception:
+                pass
+            raise
 
     def _apply_live_config_overrides(self, bootstrap: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(bootstrap or {})
@@ -6983,6 +7083,50 @@ class AppStore:
             "cloud_target": cloud,
             "sync_target": sync_target,
         }
+
+    def get_domain_fast(self, domain: str) -> Any:
+        """One config domain, read WITHOUT the global lock or a full bootstrap.
+
+        2026-08-26: the Power page came up empty for minutes after a restart.
+        The manager loaded its configuration through get_bootstrap(), which
+        builds EVERY domain (and can take a cloud path), behind the same
+        app_store lock that deferred outbox init, cloud sync and the retention
+        scheduler all contend for at boot. The meters were in the database the
+        whole time; nothing could read them.
+
+        A settings domain is one row. Read it on a private read-only connection
+        with a short busy timeout so start-up contention cannot delay it, and
+        so this can never block a writer.
+
+        Returns the decoded payload, or None when the domain does not exist or
+        cannot be read - the caller must treat None as "unknown", never as
+        "empty" (see config_wipe_on_failed_read).
+        """
+        name = str(domain or "").strip()
+        if not name:
+            return None
+        try:
+            conn = self._connect_readonly()
+        except Exception:
+            return None
+        try:
+            row = conn.execute(
+                "SELECT payload_json FROM config_documents WHERE domain = ?",
+                (name,),
+            ).fetchone()
+        except Exception:
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if not row or row["payload_json"] is None:
+            return None
+        try:
+            return json.loads(str(row["payload_json"] or "null"))
+        except Exception:
+            return None
 
     def upsert_domain(self, domain: str, payload: Any, actor: str = "system") -> Dict[str, Any]:
         now = self._utc_now()
@@ -8169,6 +8313,133 @@ class AppStore:
         out = self._filter_rows_by_edge(out, edge_filter)
         return out[:lim]
 
+    def bucket_raw_historian_rows(
+        self,
+        bucket: str = "minute",
+        from_utc: str = "",
+        to_utc: str = "",
+        gateway: str = "",
+        tag: str = "",
+        limit: int = 50000,
+        source: str = "",
+    ) -> list[dict[str, Any]]:
+        """Bucket RAW historian rows on the fly, in the agg tables' shape.
+
+        The pre-aggregated tables are built by the retention worker, and only
+        for the window it is about to delete from raw - everything NEWER than
+        the raw cutoff has no buckets at all, and an edge with no retention
+        policy has none whatsoever. So the Power Overview asking for "last 24
+        hours" got an empty agg result, fell back to a capped raw pull, and
+        showed a few minutes of data on a 24 hour axis (2026-08-26).
+
+        Grouping in SQL keeps this bounded no matter how dense the raw data is:
+        a day at 1 Hz is 1440 points per tag out, not 86 400.
+        """
+        fmt = {
+            "minute": "%Y-%m-%d %H:%M:00",
+            "hour": "%Y-%m-%d %H:00:00",
+            "day": "%Y-%m-%d 00:00:00",
+        }.get(str(bucket or "minute").strip().lower(), "%Y-%m-%d %H:%M:00")
+        lim = max(1, min(int(limit or 50000), 100000))
+        tenant_id = self._current_tenant_id()
+
+        # ts_utc is compared as TEXT, and the historian holds TWO encodings:
+        # "YYYY-MM-DD HH:MM:SS.mmm" from the PLC/meter writers and, historically,
+        # "YYYY-MM-DDTHH:MM:SS.ffffff+00:00" from the power manager. 'T' sorts
+        # after ' ', so a plain `ts_utc <= :to` excluded EVERY power row - which
+        # is why a power chart over any range came back empty. Compare on a
+        # normalised prefix instead, and keep a coarse date-level bound so the
+        # ts_utc index still does the heavy lifting on a multi-million row table.
+        norm = "replace(substr(ts_utc, 1, 19), 'T', ' ')"
+        where = "WHERE tenant_id = :tenant"
+        params: dict[str, Any] = {"lim": lim, "tenant": tenant_id, "fmt": fmt}
+
+        def _norm_bound(txt: str) -> str:
+            return str(txt or "").strip().replace("T", " ")[:19]
+
+        from_txt = str(from_utc or "").strip()
+        if from_txt:
+            fn = _norm_bound(from_txt)
+            where += f" AND {norm} >= :from_norm AND ts_utc >= :from_coarse"
+            params["from_norm"] = fn
+            params["from_coarse"] = fn[:10]      # same date text in both encodings
+        to_txt = str(to_utc or "").strip()
+        if to_txt:
+            tn = _norm_bound(to_txt)
+            where += f" AND {norm} <= :to_norm AND ts_utc < :to_coarse"
+            params["to_norm"] = tn
+            try:
+                from datetime import date as _date, timedelta as _td
+                nxt = _date.fromisoformat(tn[:10]) + _td(days=1)
+                params["to_coarse"] = nxt.isoformat()
+            except Exception:
+                params["to_coarse"] = "9999-12-31"
+        gw_txt = str(gateway or "").strip()
+        if gw_txt:
+            where += " AND gateway_id = :gateway"
+            params["gateway"] = gw_txt
+        tag_txt = str(tag or "").strip()
+        if tag_txt:
+            where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+            params["tag_like"] = f"%{tag_txt}%"
+        src_txt = str(source or "").strip()
+        if src_txt:
+            # raw DOES carry `source`, so this filters exactly rather than
+            # going through database_name the way the agg tables must.
+            srcs = [s.strip() for s in src_txt.split(",") if s.strip()]
+            if srcs:
+                keys = []
+                for i, s in enumerate(srcs):
+                    key = f"src{i}"
+                    keys.append(f":{key}")
+                    params[key] = s
+                where += f" AND COALESCE(source,'') IN ({', '.join(keys)})"
+
+        sql = f"""
+            SELECT strftime(:fmt, replace(substr(ts_utc, 1, 19), 'T', ' ')) AS bucket_utc,
+                   gateway_id, gateway_name, device_name, plc_ip,
+                   database_name, tag_name,
+                   AVG(value)  AS avg_value,
+                   MIN(value)  AS min_value,
+                   MAX(value)  AS max_value,
+                   COUNT(*)    AS sample_count,
+                   MIN(COALESCE(quality,0)) AS quality_min,
+                   MAX(COALESCE(quality,0)) AS quality_max
+            FROM historian_readings
+            {where} AND value IS NOT NULL
+            GROUP BY bucket_utc, gateway_id, database_name, tag_name
+            ORDER BY bucket_utc DESC
+            LIMIT :lim
+        """
+        with self._connect() as conn:
+            try:
+                rows = conn.execute(sql, params).fetchall()
+            except Exception as exc:
+                logger.warning("bucket_raw_historian_rows failed: %s", exc)
+                return []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "ts": r["bucket_utc"],
+                    "tenant_id": tenant_id,
+                    "source": "historian_agg_live",
+                    "gateway_id": r["gateway_id"] or "",
+                    "gateway_name": r["gateway_name"] or "",
+                    "device_name": r["device_name"] or "",
+                    "plc_ip": r["plc_ip"] or "",
+                    "database_name": r["database_name"] or "",
+                    "tag": r["tag_name"] or "",
+                    "value": r["avg_value"],
+                    "value_min": r["min_value"],
+                    "value_max": r["max_value"],
+                    "sample_count": int(r["sample_count"] or 0),
+                    "quality": r["quality_max"],
+                    "quality_label": "GOOD" if int(r["quality_max"] or 0) >= 192 else "",
+                }
+            )
+        return out
+
     def get_historian_agg_rows(
         self,
         bucket: str = "minute",
@@ -8237,6 +8508,15 @@ class AppStore:
             if any(s in {"power_modbus", "power_insight"} for s in srcs):
                 where += " AND database_name = :pm_db"
                 params["pm_db"] = "Power Management"
+            else:
+                # No column here can express this filter, so the agg tables
+                # would return rows from every source and quietly ignore what
+                # was asked. Raw DOES carry `source`, so serve the whole window
+                # from the live path instead of answering wrongly but fast.
+                return self.bucket_raw_historian_rows(
+                    bucket=bkt, from_utc=from_txt, to_utc=to_txt,
+                    gateway=gw_txt, tag=tag_txt, limit=lim, source=source_txt,
+                )
 
         with self._connect() as conn:
             try:
@@ -8280,6 +8560,35 @@ class AppStore:
                     "quality_label": "GOOD" if int(r["quality_max"] or 0) >= 192 else "",
                 }
             )
+
+        # The rollup only covers what retention has already aged out of raw, so
+        # the RECENT part of any window has no buckets - and an edge with no
+        # retention policy has none at all. Bucket the raw rows for whatever the
+        # rollup did NOT cover and merge. Without this a 24 h Power Overview
+        # rendered a few minutes of data on a 24 h axis.
+        #
+        # Scan only the UNCOVERED tail: on a multi-million-row historian,
+        # re-bucketing a week of raw on every chart refresh would be its own
+        # outage. When the rollup already reaches the end of the window there is
+        # nothing to do at all.
+        newest_agg = max((str(r.get("ts") or "") for r in out), default="")
+        live_from = from_txt
+        if newest_agg:
+            if not to_txt or newest_agg >= to_txt:
+                return out[:lim]
+            live_from = max(from_txt, newest_agg) if from_txt else newest_agg
+        live = self.bucket_raw_historian_rows(
+            bucket=bkt, from_utc=live_from, to_utc=to_txt, gateway=gw_txt,
+            tag=tag_txt, limit=lim, source=source_txt,
+        )
+        if live:
+            merged: dict[tuple, dict[str, Any]] = {}
+            for row in out:
+                merged[(row.get("ts"), row.get("gateway_id"), row.get("tag"))] = row
+            for row in live:
+                merged[(row.get("ts"), row.get("gateway_id"), row.get("tag"))] = row
+            out = sorted(merged.values(), key=lambda r: str(r.get("ts") or ""),
+                         reverse=True)[:lim]
         return out
 
     def get_historian_rows_range(
@@ -8336,16 +8645,19 @@ class AppStore:
         where_unscoped = "WHERE 1=1"
         params: dict[str, Any] = {**tenant_params, "lim": lim, "off": off}
         params_unscoped: dict[str, Any] = {"lim": lim, "off": off}
+        # 2026-08-28: ALWAYS ask for the id first. This used to branch on a
+        # "gw-" prefix, on the assumption that only those are ids - but a power
+        # meter's id is its name (`EM1`), so every meter chart took the OR
+        # branch, whose plan is
+        #     SEARCH historian_readings USING INDEX idx_hist_tenant_ts (tenant_id=?)
+        # i.e. a walk of the WHOLE tenant timeline, discarding every row that
+        # belongs to another gateway. The id form uses idx_hist_tenant_gw_ts.
+        # If the caller really passed a display name, the fallback below runs.
+        GW_CLAUSE_BY_ID = " AND gateway_id = :gateway"
+        GW_CLAUSE_BY_NAME = " AND (gateway_name = :gateway OR gateway_id = :gateway)"
         if gateway_txt:
-            # Index-friendly: direct equality on gateway_id when caller passes a
-            # canonical gw-* id (the only form widgets emit). Falls back to OR
-            # over gateway_id/gateway_name for legacy/non-canonical names.
-            if gateway_txt.lower().startswith("gw-"):
-                where += " AND gateway_id = :gateway"
-                where_unscoped += " AND gateway_id = :gateway"
-            else:
-                where += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
-                where_unscoped += " AND (COALESCE(gateway_name,'') = :gateway OR COALESCE(gateway_id,'') = :gateway)"
+            where += GW_CLAUSE_BY_ID
+            where_unscoped += GW_CLAUSE_BY_ID
             params["gateway"] = gateway_txt
             params_unscoped["gateway"] = gateway_txt
         if device_txt:
@@ -8403,17 +8715,22 @@ class AppStore:
             # (no temp B-tree). The trailing `id DESC` tie-breaker was only
             # meaningful for rows sharing an identical ts_utc — rare in
             # practice and visually identical on the chart.
-            rows = conn.execute(
-                f"""
+            _sql = f"""
                 SELECT id, tenant_id, ts_utc, source, gateway_id, gateway_name, device_name, plc_ip, database_name,
                        tag_name, value, value_text, data_type, quality, quality_label
                 FROM historian_readings
                 {where}
                 ORDER BY ts_utc DESC
                 LIMIT :lim OFFSET :off
-                """,
-                params,
-            ).fetchall()
+                """
+            rows = conn.execute(_sql, params).fetchall()
+            # The caller passed a display NAME rather than an id. Rare - every
+            # widget emits the id - so it costs a second query only when the
+            # indexed one legitimately found nothing, never on the hot path.
+            if not rows and gateway_txt and GW_CLAUSE_BY_ID in where:
+                rows = conn.execute(
+                    _sql.replace(GW_CLAUSE_BY_ID, GW_CLAUSE_BY_NAME, 1), params
+                ).fetchall()
             if not rows:
                 # Fallback for legacy/unscoped rows: keep dashboard queries resilient
                 # after tenant migrations or historical data imported without tenant tags.

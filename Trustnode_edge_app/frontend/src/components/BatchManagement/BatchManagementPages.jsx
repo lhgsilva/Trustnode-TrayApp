@@ -9,7 +9,7 @@
    Styling reuses the project-wide CSS (card, table, btn, etc.) so the
    look matches the rest of the app exactly. No new stylesheets.
 */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 
 /**
@@ -30,19 +30,16 @@ function Modal({ onClose, children, width }) {
     <div
       className="modal-backdrop"
       onClick={onClose}
-      style={{
-        position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", zIndex: 10000,
-        display: "flex", alignItems: "center", justifyContent: "center", padding: 16,
-      }}
+      style={{ zIndex: 10000 }}
     >
+      {/* 2026-08-26: padding / maxHeight / centring used to be inline here,
+          which outranks the stylesheet and opted every batch page dialog out
+          of the app's density scale, sticky title and pinned action row. */}
       <div
         className="modal-card"
         onClick={(e) => e.stopPropagation()}
         style={{
-          background: "var(--card)", color: "var(--text)",
-          border: "1px solid var(--stroke)", borderRadius: 10,
-          width: "100%", maxWidth: width || 720, maxHeight: "90vh",
-          overflow: "auto", padding: 20,
+          width: "100%", maxWidth: width || 720,
           boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
         }}
       >
@@ -379,7 +376,7 @@ export function BatchesPage({ currentUser, allGatewayOptions = [] }) {
                 />
               </label>
             </div>
-            <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <div className="row modal-actions">
               <button className="btn btn-secondary" onClick={() => setShowCreate(false)}>Cancel</button>
               <button className="btn btn-primary" onClick={handleCreate}>Create</button>
             </div>
@@ -1254,7 +1251,7 @@ export function BatchTypesPage() {
               </label>
             </div>
 
-            <div style={{ marginTop: 16, display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <div className="row modal-actions">
               <button className="btn btn-secondary" onClick={() => setEditing(null)}>Cancel</button>
               <button className="btn btn-primary" disabled={!!(editing._trigger_start_invalid || editing._trigger_stop_invalid)} onClick={save}>Save</button>
             </div>

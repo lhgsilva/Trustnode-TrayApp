@@ -139,6 +139,7 @@ from app.routers.ui_source import router as ui_source_router
 from app.routers.notifications import router as notifications_router
 from app.routers.telemetry_v1 import router as telemetry_v1_router
 from app.routers.power import router as power_router
+from app.routers.diagnostics import router as diagnostics_router
 from app.routers.control_plane import router as control_plane_router, resolve_edge_view_link_public
 from app.routers.customer_db import router as customer_db_router
 from app.routers.lan_sharing import router as lan_sharing_router
@@ -375,6 +376,7 @@ app.include_router(ui_source_router)
 app.include_router(notifications_router)
 app.include_router(telemetry_v1_router)
 app.include_router(power_router)
+app.include_router(diagnostics_router)
 app.include_router(control_plane_router)
 # Operator 2026-06-17 (M2): Customer DB mode + connectivity surface.
 app.include_router(customer_db_router)
@@ -488,6 +490,22 @@ except Exception as _exc:  # pragma: no cover - never block boot on it
 # require_batch_management_license(), so the module is invisible (404)
 # to customers without the license. Code lives at
 # app/modules/batch_management/* so it is easy to find and to detach.
+# OEE module (2026-08-27). Local-first: it consumes the existing gateways,
+# tags and historian and needs no cloud service. Permission-gated inside the
+# router; the `oee` licence module exists in MODULE_CATALOG so it CAN be gated
+# later without touching the module.
+try:
+    from app.modules.oee import oee_router  # noqa: E402
+    app.include_router(oee_router)
+    from app.state import app_store as _oee_app_store
+    from app.modules.oee.store import OeeStore as _OeeStore
+    from app.modules.oee.seed import seed_defaults as _oee_seed
+    _oee_added = _oee_seed(_OeeStore(_oee_app_store))
+    if any(_oee_added.values()):
+        print(f"[trustnode][boot] OEE: seeded {_oee_added}", flush=True)
+except Exception as _oee_exc:
+    print(f"[trustnode][boot] OEE module mount skipped: {_oee_exc!r}", flush=True)
+
 from app.modules.batch_management import batch_router  # noqa: E402
 app.include_router(batch_router)
 # 2026-07-14 CLEAN REBUILD: mount the v2 router (spec-named endpoints) alongside
@@ -1067,6 +1085,18 @@ async def startup_event() -> None:
         print("[trustnode][boot] duplicate startup_event suppressed", flush=True)
         return
     _STARTUP_RAN = True
+    # 2026-08-26: give the manager the running event loop so ANY thread can
+    # push to the live WebSocket stream. `_loop` used to be set only inside the
+    # V2 reader's start path, and V2 is off by default - so fanout_threadsafe()
+    # was a silent no-op on a normal install. That is why power-meter tags
+    # never streamed and a dashboard chart bound to one could only be fed by
+    # polling (3-6 s), while PLC tags updated live.
+    try:
+        import asyncio as _asyncio
+        from app.state import plc_manager as _pm
+        _pm._loop = _asyncio.get_running_loop()
+    except Exception as _loop_exc:
+        print(f"[trustnode][boot] WARN: live fanout loop not set: {_loop_exc!r}", flush=True)
     # Operator 2026-08-21 (NO-ORPHANS): exit with the desktop app. Armed only
     # when Electron passed TRUSTNODE_PARENT_PID (dev runs are unaffected).
     try:
@@ -1297,6 +1327,15 @@ PUBLIC_PATHS = {
     "/api/auth/me",
     "/api/auth/forgot-password",
     "/api/auth/reset-password",
+    # 2026-08-25: a locked-out edge must be recoverable BY SOMEONE AT THE
+    # MACHINE. These are unauthenticated by necessity - the operator has no
+    # account to authenticate with, which is the whole problem. They are safe
+    # because completing a recovery requires reading a one-time code out of a
+    # file in the data directory; that is proof of local access, and anyone
+    # holding it already owns the box. Status is counts only, never a name.
+    "/api/auth/recovery-status",
+    "/api/auth/local-recovery/request",
+    "/api/auth/local-recovery/complete",
     "/api/control-plane/portal-context",
     "/api/control-plane/activation-code/apply",
     "/api/control-plane/edge-link/bootstrap",

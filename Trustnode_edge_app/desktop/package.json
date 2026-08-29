@@ -16,9 +16,10 @@
     "build:ui": "npm --prefix ../frontend install && npm --prefix ../frontend run build && npm --prefix ../frontend run build:clientview",
     "build:backend": "powershell -ExecutionPolicy Bypass -File ..\\scripts\\build-backend.ps1",
     "build:prepare": "npm run build:ui && npm run build:backend",
-    "dist:installer": "npm run build:prepare && electron-builder --win nsis",
-    "dist:portable": "npm run build:prepare && electron-builder --win portable",
-    "dist": "npm run build:prepare && electron-builder --win nsis portable"
+    "dist:installer": "npm run build:prepare && electron-builder --win nsis && npm run copy:outputs",
+    "dist:portable": "npm run build:prepare && electron-builder --win portable && npm run copy:outputs",
+    "dist": "npm run build:prepare && electron-builder --win nsis portable && npm run copy:outputs",
+    "copy:outputs": "python ../scripts/copy_build_outputs.py"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",

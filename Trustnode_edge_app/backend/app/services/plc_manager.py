@@ -1005,6 +1005,8 @@ class GatewayWorker:
             readings = self._read_from_snap7()
         elif gateway_type == "ifm_iolink":
             readings = self._read_from_ifm_iolink()
+        elif gateway_type == "modbus_tcp":
+            readings = self._read_from_modbus_tcp()
         elif gateway_type == "ethernet_ip":
             readings = self._read_from_ethernet_ip()
         else:
@@ -1466,6 +1468,141 @@ class GatewayWorker:
         # Default M10/I0/Q4 as BYTE.
         return (area_prefix, 0, int(tag[1:]), "BYTE", 0)
 
+    def _ifm_autodiscover_datapoints(self, host: str) -> list:
+        """Resolve the gateway's tag NAMES to real block addresses.
+
+        Cached on the worker: the block's layout does not change between cycles,
+        so this costs one discovery per gateway start, not one per second.
+
+        Returns the cached datapoints when they are ready and an EMPTY list
+        while the background prime is still running - an empty read is a quiet
+        "not yet", where an exception would paint a failed gateway during the
+        first seconds of every start.
+        """
+        cached = getattr(self, "_ifm_discovered", None)
+        if cached:
+            return cached
+
+        # Discovery is SETUP, not a read, and it must not run inside the read
+        # cycle's wall-clock cap. Asking a real AL1326 what it offers takes
+        # ~11s the first time (the block spends ~9s serialising its 930-node
+        # gettree), which blew the 8s cap on the very first cycle: the loop
+        # orphaned its executor, logged "PLC read exceeded 8s - session reset",
+        # and the operator saw a failed gateway for the first few seconds of
+        # every start. Prime it on a background thread and let the early cycles
+        # return nothing instead of failing.
+        thread = getattr(self, "_ifm_discovery_thread", None)
+        if thread is not None and thread.is_alive():
+            self._last_partial_error = (
+                "Asking the block what it offers - collection starts in a moment.")
+            return []
+        # A FAILED discovery must not be cached forever. It used to be: a block
+        # that was briefly unreachable when the gateway started cached an empty
+        # list, and every later cycle short-circuited on it — the gateway stayed
+        # dead until someone stopped and started it by hand, long after the
+        # block was fine. Retry on a slow cadence instead of every cycle.
+        retry_at = getattr(self, "_ifm_discovery_retry_mono", 0.0)
+        if cached == [] and time.monotonic() < retry_at:
+            return []
+
+        wanted = {str(t).strip().lower() for t in (self.config.tags or []) if str(t).strip()}
+
+        def _discover() -> None:
+            self._ifm_run_discovery(host, wanted)
+
+        worker = threading.Thread(target=_discover, name="ifm-discover", daemon=True)
+        self._ifm_discovery_thread = worker
+        worker.start()
+        self._last_partial_error = (
+            "Asking the block what it offers - collection starts in a moment.")
+        return []
+
+    def _ifm_transport_advice(self, host: str, failed: int, total: int) -> str:
+        """When a block keeps refusing IoT reads, say what to do about it.
+
+        Some ifm masters are fieldbus devices whose IoT Core is a side door.
+        Measured on an "IO-Link Master DL EIP 8P IP67" (2026-08-27): it refused
+        about three quarters of a 1 Hz poll with HTTP 503, while the SAME block
+        answered every pin over EtherNet/IP in one 3 ms request. The gateway
+        reported RUNNING throughout, because reading badly is not the same as
+        failing - which is exactly why this has to be said out loud.
+
+        Only fires after a sustained run of bad cycles, and the EtherNet/IP
+        probe happens ONCE per gateway - a diagnostic must not become traffic.
+        """
+        if total <= 0:
+            return ""
+        ratio = float(failed) / float(total)
+        if ratio < 0.5:
+            self._ifm_bad_streak = 0
+            return ""
+        streak = int(getattr(self, "_ifm_bad_streak", 0) or 0) + 1
+        self._ifm_bad_streak = streak
+        if streak < 5:
+            return ""
+        cached = getattr(self, "_ifm_advice_cache", None)
+        if cached is not None:
+            return cached
+
+        advice = ""
+        try:
+            from app.drivers.ethernet_ip import EipDeviceClient
+            info = EipDeviceClient(host=host, slot=0, timeout_s=2.5).identify() or {}
+            vendor = str(info.get("vendor") or "")
+            if vendor:
+                advice = (
+                    f"This block ({info.get('product_name') or vendor}) also answers "
+                    f"EtherNet/IP on 44818, which reads every pin in ONE request. "
+                    f"Its IoT Core cannot keep up with this interval — switch the "
+                    f"protocol to EtherNet/IP, or raise the interval to 5000 ms "
+                    f"(measured: every value reads at 5 s, one in five at 1 s).")
+        except Exception:
+            advice = ""
+        if not advice:
+            advice = ("The block is refusing most requests on its IoT Core — "
+                      "raise the gateway interval (5000 ms is usually enough) "
+                      "or collect fewer values.")
+        self._ifm_advice_cache = advice
+        return advice
+
+    def _ifm_run_discovery(self, host: str, wanted: set) -> None:
+        """The actual discovery, run on a background thread by the caller."""
+        from app.drivers.ifm_iolink import (
+            IfmMasterClient, datapoints_from_config)
+        try:
+            client = IfmMasterClient(
+                host=host, port=int(self.config.ifm_http_port or 80), timeout_s=5.0,
+                use_https=bool(self.config.ifm_use_https),
+                username=str(self.config.ifm_username or ""),
+                password=str(self.config.ifm_password or ""),
+                verify_tls=bool(self.config.ifm_verify_tls))
+            found = client.discover_datapoints(
+                variant=str(self.config.ifm_variant or "auto"),
+                port_count=int(self.config.ifm_port_count or 8))
+            points = found.get("datapoints") or []
+        except Exception as exc:
+            _GW_LOG.warning("ifm: auto-discovery failed for %s: %s — retrying in 30s", host, exc)
+            self._ifm_discovered = []
+            self._ifm_discovery_retry_mono = time.monotonic() + 30.0
+            self._last_partial_error = (
+                f"Could not ask the block what it offers ({exc}). Retrying every 30s.")
+            return
+
+        # Honour the operator's selection when they made one; otherwise collect
+        # everything the block offers.
+        if wanted:
+            points = [p for p in points if str(p.get("name") or "").strip().lower() in wanted]
+        resolved = datapoints_from_config(points)
+        _GW_LOG.info("ifm: auto-discovered %d datapoint(s) for %s (%d tag(s) requested)",
+                  len(resolved), host, len(wanted))
+        self._ifm_discovered = resolved
+        if not resolved:
+            self._ifm_discovery_retry_mono = time.monotonic() + 30.0
+            self._last_partial_error = (
+                "The block offered no values matching the selected tags.")
+        else:
+            self._last_partial_error = ""
+
     def _read_from_ethernet_ip(self) -> List[GatewayReading]:
         """One cycle against a generic EtherNet/IP adapter.
 
@@ -1479,16 +1616,22 @@ class GatewayWorker:
         host = (self.config.plc_ip or "").strip()
         if not host:
             raise RuntimeError("EtherNet/IP read failed: the device address is empty.")
+        from app.drivers.ethernet_ip import parameters_from_config
+
         instance = int(self.config.eip_input_assembly or 0)
-        if instance <= 0:
+        signals = signals_from_config(list(self.config.eip_signals or []))
+        # A drive is configured by PARAMETER number, not by assembly offset, so
+        # an assembly is no longer required - only one of the two must exist.
+        params = parameters_from_config(list(self.config.eip_parameters or []))
+        if not signals and not params:
+            raise RuntimeError(
+                "EtherNet/IP read failed: nothing is mapped. Import the device's "
+                "EDS and map the assembly, or add the drive parameters you want "
+                "to collect.")
+        if signals and instance <= 0:
             raise RuntimeError(
                 "EtherNet/IP read failed: no input assembly is set. Import the "
                 "device's EDS, or enter the assembly instance from its manual.")
-        signals = signals_from_config(list(self.config.eip_signals or []))
-        if not signals:
-            raise RuntimeError(
-                "EtherNet/IP read failed: no signals are mapped. Add the values "
-                "you want to collect from the assembly.")
 
         interval_s = max(0.2, float(self.config.interval_ms or 1000) / 1000.0)
         client = EipDeviceClient(host=host, slot=int(self.config.eip_slot or 0),
@@ -1498,13 +1641,79 @@ class GatewayWorker:
         common = dict(source=self.config.gateway_type, site=self.config.site,
                       area=self.config.area, equipment=self.config.equipment)
         out: List[GatewayReading] = []
-        for row in client.read_signals(instance, signals):
+        rows = list(client.read_signals(instance, signals)) if signals else []
+        if params:
+            # Each parameter is its own CIP request, unlike the single request
+            # that fetches a whole assembly. Bound it so a slow drive cannot
+            # outlast the collection cycle.
+            budget = max(1.0, min(interval_s * 0.7, 6.0))
+            rows.extend(client.read_parameters(params, deadline_s=budget))
+        for row in rows:
             name = str(row.get("name") or "")
             if not name or (wanted and name not in wanted):
                 continue
             if row.get("quality"):
                 out.append(GatewayReading(
                     ts_utc=ts, tag_name=name, value=float(row.get("value") or 0.0),
+                    value_text=None,
+                    data_type="BOOL" if row.get("is_bool") else "REAL",
+                    quality=192, quality_label="GOOD", **common))
+            else:
+                out.append(GatewayReading(
+                    ts_utc=ts, tag_name=name, value=None,
+                    value_text=str(row.get("error") or "read failed"),
+                    data_type="", quality=0, quality_label="BAD", **common))
+        return out
+
+    def _read_from_modbus_tcp(self) -> List[GatewayReading]:
+        """One cycle against a generic Modbus TCP device.
+
+        The protocol work is in app/drivers/modbus_tcp.py; this is only the
+        adapter to GatewayReading. Registers are read in merged blocks, so tag
+        count costs far less than one request per tag.
+
+        A register that fails yields a BAD-quality reading for its own tag and
+        nothing else - one unreadable address must not take the device down.
+        """
+        from app.drivers.modbus_tcp import (
+            ModbusTcpClientWrapper, points_from_config)
+
+        host = (self.config.plc_ip or "").strip()
+        if not host:
+            raise RuntimeError("Modbus read failed: the device address is empty.")
+        points = points_from_config(list(self.config.modbus_registers or []))
+        if not points:
+            raise RuntimeError(
+                "Modbus read failed: no registers are mapped. Add the values "
+                "you want to collect, or import the supplier's register table.")
+
+        # Only what the operator ticked, exactly as the EtherNet/IP path does.
+        wanted = set(self._get_read_tags() or [])
+        if wanted:
+            points = [p for p in points if p.name in wanted] or points
+
+        interval_s = max(0.2, float(self.config.interval_ms or 1000) / 1000.0)
+        # Stay inside the loop's own 8 s cap: a driver that can overrun it sits
+        # at RUNNING with no error and no progress stamp.
+        deadline = max(1.0, min(interval_s * 0.8, 6.0))
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        common = dict(source=self.config.gateway_type, site=self.config.site,
+                      area=self.config.area, equipment=self.config.equipment)
+        out: List[GatewayReading] = []
+        with ModbusTcpClientWrapper(
+                host=host, port=int(self.config.modbus_port or 502),
+                unit_id=int(self.config.modbus_unit_id or 1),
+                timeout_s=deadline) as client:
+            rows = client.read_points(points, deadline_s=deadline)
+        for row in rows:
+            name = str(row.get("name") or "")
+            if not name:
+                continue
+            if row.get("quality"):
+                value = row.get("value")
+                out.append(GatewayReading(
+                    ts_utc=ts, tag_name=name,
+                    value=float(value) if not isinstance(value, bool) else float(bool(value)),
                     value_text=None,
                     data_type="BOOL" if row.get("is_bool") else "REAL",
                     quality=192, quality_label="GOOD", **common))
@@ -1531,31 +1740,104 @@ class GatewayWorker:
             raise RuntimeError("IFM read failed: the block address is empty.")
         # The unified datapoint list covers every ifm device kind. ifm_ports is
         # the older IO-Link-master-only shape and still works untouched.
-        datapoints = datapoints_from_config(list(self.config.ifm_datapoints or []))
+        # A datapoint the operator asked for by NAME must be collected even if
+        # discovery offered it switched off. Diagnostics (Port*_Mode,
+        # Master_SupervisionStatus) are offered unticked; ticking them in the
+        # tag list used to leave them stored as enabled=False, so they appeared
+        # on the Tags page and read "-" for ever. Honour the tag list.
+        _raw_points = list(self.config.ifm_datapoints or [])
+        _wanted_names = {str(t).strip().lower()
+                         for t in (self.config.tags or []) if str(t).strip()}
+        if _wanted_names:
+            _raw_points = [
+                (dict(pt, enabled=True)
+                 if isinstance(pt, dict)
+                 and str(pt.get("name") or "").strip().lower() in _wanted_names
+                 else pt)
+                for pt in _raw_points
+            ]
+        datapoints = datapoints_from_config(_raw_points)
         fields = [] if datapoints else fields_from_config(list(self.config.ifm_ports or []))
+
+        # 2026-08-25: a gateway can also be built the FAMILIAR way — "Search
+        # Available Tags", tick names, save — which fills `tags` with names and
+        # leaves no addresses behind. The block is the authority on where its
+        # values live, so ask it once and match the names the operator chose.
+        # Without this the gateway ran, reported no error the operator could
+        # see, and collected nothing.
         if not datapoints and not fields:
+            datapoints = self._ifm_autodiscover_datapoints(host)
+        if not datapoints and not fields:
+            thread = getattr(self, "_ifm_discovery_thread", None)
+            if thread is not None and thread.is_alive():
+                # Priming. Not an error - the next cycles will collect.
+                return []
             raise RuntimeError(
-                "IFM read failed: nothing is selected to collect. Open the gateway, "
-                "scan the block and tick the values you want.")
+                "IFM read failed: nothing to collect. The block reported no "
+                "readable values — open the gateway, press Scan block and tick "
+                "the values you want.")
 
-        # Keep the HTTP budget under the collection interval so a slow block
-        # delays a cycle rather than stacking them up.
+        # The whole read has to finish inside the collection loop's own cap
+        # (_read_timeout_s, 8s by default). When it does not, the loop raises
+        # TimeoutError, orphans the executor, and stamps NO progress - so the
+        # gateway sits at RUNNING / W:0 and the UI reports "no fresh sample in
+        # 90s" with nothing to act on. That is what a 28-tag block did here on
+        # 2026-08-26. Budget below BOTH the interval and that cap, and let the
+        # driver return partial results rather than overrun.
         interval_s = max(0.2, float(self.config.interval_ms or 1000) / 1000.0)
-        timeout_s = max(1.0, min(interval_s * 0.8, 10.0))
+        loop_cap = float(getattr(self, "_read_timeout_s", 8.0) or 8.0)
+        total_budget = min(interval_s * 0.9, (loop_cap * 0.75) if loop_cap > 0 else 6.0)
+        total_budget = max(0.5, total_budget)
+        # Per-request timeout: several requests must fit inside the total.
+        timeout_s = max(0.4, min(total_budget / 2.0, 5.0))
 
-        client = IfmMasterClient(
-            host=host,
-            port=int(self.config.ifm_http_port or 80),
-            timeout_s=timeout_s,
-            use_https=bool(self.config.ifm_use_https),
-            username=str(self.config.ifm_username or ""),
-            password=str(self.config.ifm_password or ""),
-            verify_tls=bool(self.config.ifm_verify_tls),
-        )
+        # Reused across cycles: the opener (and therefore the TCP connection)
+        # and the getdatamulti support flag both live on the client. Rebuilding
+        # it every cycle meant a fresh handshake per request, every second.
+        client = getattr(self, "_ifm_client", None)
+        want_key = (host, int(self.config.ifm_http_port or 80),
+                    bool(self.config.ifm_use_https))
+        if client is None or getattr(self, "_ifm_client_key", None) != want_key:
+            client = IfmMasterClient(
+                host=host,
+                port=int(self.config.ifm_http_port or 80),
+                timeout_s=timeout_s,
+                use_https=bool(self.config.ifm_use_https),
+                username=str(self.config.ifm_username or ""),
+                password=str(self.config.ifm_password or ""),
+                verify_tls=bool(self.config.ifm_verify_tls),
+            )
+            self._ifm_client = client
+            self._ifm_client_key = want_key
+        client.timeout_s = timeout_s
+
         wanted = set(self._get_read_tags() or [])
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         out: List[GatewayReading] = []
-        rows = client.read_datapoints(datapoints) if datapoints else client.read_fields(fields)
+        client.begin_read(total_budget)
+        try:
+            rows = client.read_datapoints(datapoints) if datapoints else client.read_fields(fields)
+        finally:
+            client.end_read()
+        # Tell the operator what happened. `_last_partial_error` is the channel
+        # the run loop copies into last_error every cycle (setting last_error
+        # here would just be overwritten), and it is what the gateway footer
+        # shows - so a block that half-works stops looking like silence.
+        note = str(getattr(client, "last_transport_note", "") or "")
+        failed = [r for r in (rows or []) if not r.get("quality")]
+        if note or failed:
+            detail = note
+            if failed and not detail:
+                names = ", ".join(str(r.get("name") or "?") for r in failed[:4])
+                detail = f"{len(failed)} of {len(rows)} value(s) unreadable: {names}"
+            advice = self._ifm_transport_advice(host, len(failed), len(rows or []))
+            if advice:
+                detail = f"{detail} {advice}"
+            self._last_partial_error = detail
+            _GW_LOG.warning("ifm gateway=%s %s", self.gateway_id, detail)
+        else:
+            self._ifm_bad_streak = 0
+            self._last_partial_error = ""
         for row in rows:
             name = str(row.get("name") or "")
             if not name:
@@ -4115,7 +4397,12 @@ class PLCManager:
                         continue
                     rows.append(
                         {
-                            "ts_utc": str(r.get("ts_utc") or datetime.now(timezone.utc).isoformat()),
+                            # Same canonical form as every other historian
+                            # writer - an isoformat fallback would put a 'T'
+                            # row into the middle of a space-formatted table.
+                            "ts_utc": str(r.get("ts_utc")
+                                          or datetime.now(timezone.utc)
+                                          .strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]),
                             "source": str(r.get("source") or ""),
                             "gateway_id": gateway_id,
                             "gateway_name": gateway_name,
@@ -4149,9 +4436,13 @@ class PLCManager:
                     # worker's dedicated collection executor (keeping the
                     # thread-pool isolation), falling back to a plain thread.
                     if worker is not None and hasattr(worker, "_run_collection_io"):
-                        await worker._run_collection_io(self._flush_historian_buffer_then_write, rows)
+                        await worker._run_collection_io(
+                            self._flush_historian_buffer_then_write, rows, worker
+                        )
                     else:
-                        await asyncio.to_thread(self._flush_historian_buffer_then_write, rows)
+                        await asyncio.to_thread(
+                            self._flush_historian_buffer_then_write, rows, worker
+                        )
         except Exception as exc:
             # We must NEVER drop rows silently here. If we reached this
             # point with a non-empty rows list it means the helper above
@@ -4217,7 +4508,11 @@ class PLCManager:
         except Exception:
             pass
 
-    def _flush_historian_buffer_then_write(self, current_rows: list[dict[str, Any]]) -> None:
+    def _flush_historian_buffer_then_write(
+        self,
+        current_rows: list[dict[str, Any]],
+        worker: Any = None,
+    ) -> None:
         """Drain the buffer in FIFO order, then write the current
         cycle. Runs on a worker thread (called via asyncio.to_thread)
         so it can block on SQLite without stalling the event loop.
@@ -4250,7 +4545,20 @@ class PLCManager:
             try:
                 app_store.append_historian_rows(cycle_rows)
                 written_cycles += 1
-                self._mark_historian_commit(len(cycle_rows or []))
+                # The durable write stamp is TELEMETRY. It lives on the
+                # GatewayWorker, not here — calling it on the manager raised
+                # AttributeError on every cycle, and because the raise landed
+                # inside the try below, rows that had ALREADY committed were
+                # re-buffered and retried forever. Gateways read fine, reported
+                # no error, and showed W:0 with every Last Value blank.
+                # A counter must never be able to fail a write again.
+                try:
+                    if worker is not None:
+                        stamp = getattr(worker, "_mark_historian_commit", None)
+                        if callable(stamp):
+                            stamp(len(cycle_rows or []))
+                except Exception:
+                    pass
             except Exception as exc:
                 # Re-buffer this cycle and everything after it. Order
                 # preserved.

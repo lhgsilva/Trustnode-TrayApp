@@ -414,6 +414,9 @@ def _lite_capabilities(session: Dict[str, Any]) -> Dict[str, Any]:
         "alarms": _allowed("alarms", "alarms"),
         "tags": _allowed("tags", "tags"),
         "batch": _allowed("batch_management", "batch_management"),
+        # Lite gets the OEE OVERVIEW only, read-only - see the deployment
+        # section of docs/OEE_MODULE_PLAN.md.
+        "oee": _allowed("oee", "oee"),
         "intelligence": _allowed("trustnode_intelligence", "trustnode_intelligence"),
         # Lite is a read-only surface: never offer an action it cannot perform.
         "read_only": True,

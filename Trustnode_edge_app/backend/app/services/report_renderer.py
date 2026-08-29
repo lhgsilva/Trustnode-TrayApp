@@ -482,6 +482,65 @@ def _apply_series_analytics(
     return out
 
 
+def _span_seconds(from_utc: str, to_utc: str) -> float:
+    """Length of a resolved report window, or 0 when it cannot be parsed."""
+    fmts = ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S")
+    def _p(txt: str):
+        clean = str(txt or "").replace("Z", "").split("+")[0].strip()
+        for f in fmts:
+            try:
+                return datetime.strptime(clean, f)
+            except Exception:
+                continue
+        return None
+    a, b = _p(from_utc), _p(to_utc)
+    if not a or not b:
+        return 0.0
+    return max(0.0, (b - a).total_seconds())
+
+
+def _bucketed_or_raw_rows(from_utc: str, to_utc: str, gateway: str, tag: str,
+                          limit: int) -> list[dict[str, Any]]:
+    """Rows for a chart series, bucketed when the window is wide.
+
+    get_historian_rows_range caps at 5 000 rows. At a 1 s cadence that is under
+    two hours, so a report section asking for 24 h got the newest ~1.4 h and
+    drew it across a 24 h axis — wrong, and wrong in a way that looks fine.
+
+    Past two hours we read the aggregate path instead (which buckets raw data
+    live when the rollup tables have not covered the window). Anything shorter
+    keeps the raw path exactly as it was.
+    """
+    span = _span_seconds(from_utc, to_utc)
+    if span > 2 * 3600:
+        bucket = "day" if span > 45 * 86400 else ("hour" if span > 3 * 86400 else "minute")
+        bucket_s = 86400 if bucket == "day" else (3600 if bucket == "hour" else 60)
+        # Size the read from the WINDOW, not from `limit` — that is a raw-row
+        # budget for the raw path, and using it here capped a 24 h minute-bucket
+        # section at 960 of the 1 440 buckets it needed, i.e. 16 h of a 24 h
+        # axis. One bucket per interval, plus headroom for partial edges.
+        need = int(span / bucket_s) + 2
+        try:
+            rows = _app_store().get_historian_agg_rows(
+                bucket=bucket, from_utc=from_utc, to_utc=to_utc,
+                gateway=gateway, tag=tag, limit=max(500, min(need * 2, 20000)),
+            )
+        except Exception:
+            rows = []
+        if rows:
+            return rows
+    return _app_store().get_historian_rows_range(
+        from_utc=from_utc,
+        to_utc=to_utc,
+        limit=limit,
+        offset=0,
+        gateway=gateway,
+        tag=tag,
+        prefer_cloud_reads=False,
+    )
+
+
 def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tuple[list[dict[str, Any]], list[list[tuple[str, float | None, str | None]]]]:
     """Fetch each series independently then align by index.
 
@@ -503,15 +562,12 @@ def _fetch_multi_series(section: dict[str, Any], default_limit: int = 240) -> tu
         if not tag:
             aligned.append([])
             continue
-        rows = _app_store().get_historian_rows_range(
-            from_utc=from_utc,
-            to_utc=to_utc,
-            limit=limit,
-            offset=0,
-            gateway=gw,
-            tag=tag,
-            prefer_cloud_reads=False,
-        )
+        # A raw range read is capped (5 000 rows), which at 1 Hz is under two
+        # hours — so a "24h trend" section silently rendered the first slice of
+        # the window and called it a day. Past a couple of hours, read
+        # PRE-BUCKETED rows instead: the whole window, at a density a PDF chart
+        # can actually draw. Short ranges keep the raw path unchanged.
+        rows = _bucketed_or_raw_rows(from_utc, to_utc, gw, tag, limit)
         rows = list(reversed(rows or []))
         mult = float(s.get("multiplier") or 1.0)
         off = float(s.get("offset") or 0.0)

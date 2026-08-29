@@ -5,10 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && npm run lint:undef && npm run smoke",
     "build:cloudro": "vite build --mode cloudro --outDir dist_cloud_readonly",
     "build:clientview": "vite build --mode clientview --outDir dist_client_view",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "smoke": "node smoke_frontend.mjs",
+    "lint:undef": "eslint -c eslint.undef.config.mjs --no-config-lookup src/"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -17,7 +19,10 @@
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.4.1",
+    "jsdom": "^29.1.1",
     "vite": "^5.4.19",
-    "vite-plugin-singlefile": "^2.0.3"
+    "vite-plugin-singlefile": "^2.0.3",
+    "eslint": "^10.9.1",
+    "globals": "^16.0.0"
   }
 }

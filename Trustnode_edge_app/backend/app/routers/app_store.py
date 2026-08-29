@@ -218,7 +218,7 @@ def overlay_shared_edge_domains(bootstrap: Dict[str, Any]) -> Dict[str, Any]:
     if not key:
         return bootstrap
     try:
-        shared = app_store.get_bootstrap_scoped(key, prefer_cloud_reads=False) or {}
+        shared = app_store.get_bootstrap_scoped_or_shout(key, prefer_cloud_reads=False) or {}
     except Exception:
         return bootstrap
     for domain in _SHARED_EDGE_DOMAINS:
@@ -344,12 +344,12 @@ def get_bootstrap(request: Request) -> dict:
     # bootstrap), then overlay the shared-edge scope so company assets
     # (gateways, DBs, alarm rules, …) are always the same for every user.
     if user_scope:
-        data = app_store.get_bootstrap_scoped(user_scope, prefer_cloud_reads=prefer_cloud_reads)
+        data = app_store.get_bootstrap_scoped_or_shout(user_scope, prefer_cloud_reads=prefer_cloud_reads)
     else:
         data = app_store.get_bootstrap(prefer_cloud_reads=prefer_cloud_reads)
     if shared_scope and shared_scope != user_scope:
         try:
-            shared = app_store.get_bootstrap_scoped(shared_scope, prefer_cloud_reads=prefer_cloud_reads)
+            shared = app_store.get_bootstrap_scoped_or_shout(shared_scope, prefer_cloud_reads=prefer_cloud_reads)
             for d in _SHARED_EDGE_DOMAINS:
                 if d in shared:
                     data[d] = shared[d]
@@ -645,7 +645,7 @@ def _restore_domain_secrets(scope_key: str, domain: str, payload: Any) -> Any:
         return payload
     try:
         if scope_key:
-            stored = (app_store.get_bootstrap_scoped(scope_key, prefer_cloud_reads=False) or {}).get(domain)
+            stored = (app_store.get_bootstrap_scoped_or_shout(scope_key, prefer_cloud_reads=False) or {}).get(domain)
         else:
             stored = (app_store.get_bootstrap(prefer_cloud_reads=False) or {}).get(domain)
     except Exception:
@@ -684,7 +684,7 @@ def _preserve_omitted_keys(scope_key: str, domain: str, payload: Any) -> Any:
         return payload
     try:
         if scope_key:
-            stored = (app_store.get_bootstrap_scoped(scope_key, prefer_cloud_reads=False) or {}).get(domain)
+            stored = (app_store.get_bootstrap_scoped_or_shout(scope_key, prefer_cloud_reads=False) or {}).get(domain)
         else:
             stored = (app_store.get_bootstrap(prefer_cloud_reads=False) or {}).get(domain)
     except Exception:
@@ -710,7 +710,7 @@ def _guard_not_blanking(scope_key: str, domain: str, payload: Any, actor: str, a
         return
     try:
         if scope_key:
-            stored = (app_store.get_bootstrap_scoped(scope_key, prefer_cloud_reads=False) or {}).get(domain)
+            stored = (app_store.get_bootstrap_scoped_or_shout(scope_key, prefer_cloud_reads=False) or {}).get(domain)
         else:
             stored = (app_store.get_bootstrap(prefer_cloud_reads=False) or {}).get(domain)
     except Exception:
@@ -916,7 +916,7 @@ def record_data_continuity_decision(payload: DataContinuityDecisionRequest, requ
     # path the rest of app_settings uses.
     scope = _build_scope_key(request, domain="app_settings")
     if scope:
-        current = app_store.get_bootstrap_scoped(scope) or {}
+        current = app_store.get_bootstrap_scoped_or_shout(scope) or {}
     else:
         current = app_store.get_bootstrap() or {}
     settings = dict(current.get("app_settings") or {})
