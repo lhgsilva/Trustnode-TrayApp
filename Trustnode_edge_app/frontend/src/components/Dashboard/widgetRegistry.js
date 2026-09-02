@@ -52,6 +52,43 @@ export const WIDGET_TYPES = [
   { key: "batch_kpi",       label: "Batch KPI",          group: "Batch", licenseModule: "batch_management", defaultSize: { w: 10, h: 6 } },
   { key: "batch_timeline",  label: "Batch Timeline",     group: "Batch", licenseModule: "batch_management", defaultSize: { w: 20, h: 6 } },
   { key: "batch_input",     label: "Batch ID Input",     group: "Batch", licenseModule: "batch_management", defaultSize: { w: 10, h: 4 } },
+
+  // ----- OEE module widgets (2026-08-29) -----
+  // Same contract as the Batch widgets: `licenseModule` hides them in the
+  // picker when the licence is off and renders an "unlicensed" placeholder on
+  // dashboards that already use them.
+  //
+  // Every one of these CONSUMES the OEE module's endpoints. None of them
+  // computes availability, performance, quality or their product: two
+  // implementations of the same formula will disagree, and the one on a
+  // dashboard is the one nobody can trace back to a number.
+  { key: "oee_kpi",               label: "OEE KPI",              group: "OEE", licenseModule: "oee", defaultSize: { w: 8,  h: 6 } },
+  { key: "oee_availability_kpi",  label: "Availability KPI",     group: "OEE", licenseModule: "oee", defaultSize: { w: 8,  h: 6 } },
+  { key: "oee_performance_kpi",   label: "Performance KPI",      group: "OEE", licenseModule: "oee", defaultSize: { w: 8,  h: 6 } },
+  { key: "oee_quality_kpi",       label: "Quality KPI",          group: "OEE", licenseModule: "oee", defaultSize: { w: 8,  h: 6 } },
+  { key: "oee_machine_card",      label: "Machine OEE Card",     group: "OEE", licenseModule: "oee", defaultSize: { w: 12, h: 12 } },
+  { key: "oee_machine_status",    label: "Machine Status",       group: "OEE", licenseModule: "oee", defaultSize: { w: 10, h: 6 } },
+  { key: "oee_trend",             label: "OEE Trend",            group: "OEE", licenseModule: "oee", defaultSize: { w: 16, h: 10 } },
+  { key: "oee_apq_trend",         label: "A / P / Q Trend",      group: "OEE", licenseModule: "oee", defaultSize: { w: 16, h: 10 } },
+  { key: "oee_downtime_pareto",   label: "Downtime Pareto",      group: "OEE", licenseModule: "oee", defaultSize: { w: 16, h: 10 } },
+  { key: "oee_status_timeline",   label: "Machine Status Timeline", group: "OEE", licenseModule: "oee", defaultSize: { w: 24, h: 10 } },
+  { key: "oee_runtime_downtime",  label: "Runtime vs Downtime",  group: "OEE", licenseModule: "oee", defaultSize: { w: 14, h: 9 } },
+  { key: "oee_energy_usage",      label: "OEE Energy Usage",     group: "OEE", licenseModule: "oee", defaultSize: { w: 14, h: 9 } },
+  { key: "oee_energy_waste",      label: "OEE Energy Waste",     group: "OEE", licenseModule: "oee", defaultSize: { w: 14, h: 9 } },
+  { key: "oee_production_count",  label: "Production Count",     group: "OEE", licenseModule: "oee", defaultSize: { w: 14, h: 9 } },
+  { key: "oee_shift_performance", label: "Shift Performance",    group: "OEE", licenseModule: "oee", defaultSize: { w: 14, h: 9 } },
+  { key: "oee_machine_comparison", label: "Machine Comparison",  group: "OEE", licenseModule: "oee", defaultSize: { w: 18, h: 10 } },
+  { key: "oee_data_quality",      label: "OEE Readiness / Data Quality", group: "OEE", licenseModule: "oee", defaultSize: { w: 14, h: 9 } },
+
+  // ----- I/O blocks (2026-08-29) -----
+  // An ifm IO-Link master (or any gateway publishing Port<N>_Pin<2|4>) as a
+  // single card: supply, block state, and every port's two pins. No licence
+  // module - reading a field device is core, not an add-on.
+  // Sized for the block face in full plus the first rows of the tag list.
+  // The face must never be clipped - it is the at-a-glance view, and on this
+  // block the only two pins that are ON are 7 and 8, at the very bottom of it.
+  // The LIST is what scrolls.
+  { key: "io_block_status", label: "I/O Block Status", group: "I/O", defaultSize: { w: 16, h: 28 } },
 ];
 
 // One-shot migration: walk a widget list and double every w/h/x/y if

@@ -376,6 +376,13 @@ app.include_router(ui_source_router)
 app.include_router(notifications_router)
 app.include_router(telemetry_v1_router)
 app.include_router(power_router)
+# The Data Export assistant: a read-only query surface, deliberately in its
+# own router so the historian read path stays as it is.
+try:
+    from app.routers.data_export import router as data_export_router
+    app.include_router(data_export_router)
+except Exception as _exc:  # noqa: BLE001 - never block boot on it
+    print("[trustnode][boot] data-export router unavailable: %r" % (_exc,), flush=True)
 app.include_router(diagnostics_router)
 app.include_router(control_plane_router)
 # Operator 2026-06-17 (M2): Customer DB mode + connectivity surface.
@@ -1128,6 +1135,14 @@ async def startup_event() -> None:
     print("[trustnode][boot] startup_event fired; scheduling deferred init", flush=True)
     import asyncio as _asyncio
     try:
+        # The app measures its own resource use into the historian, so a slow
+        # leak is visible as a chart line the day after rather than as a
+        # Task Manager screenshot during an outage.
+        try:
+            from app.services.app_metrics import sampler as _app_metrics
+            _app_metrics.start()
+        except Exception:
+            pass
         _asyncio.get_event_loop().create_task(_deferred_startup())
         print("[trustnode][boot] deferred init scheduled — uvicorn should now serve /api/health", flush=True)
     except Exception as exc:
@@ -1324,6 +1339,14 @@ PUBLIC_PATHS = {
     # gating in trustnode_intelligence/backend/license.py).
     "/api/intelligence/status",
     "/api/auth/login",
+    # 2026-09-02: renewal has to be reachable WITH an expired token - that is
+    # the entire point of it. The middleware rejects an expired token before
+    # the route runs, so a session that ran out could never renew and the
+    # screen simply stopped working. The endpoint is not unauthenticated: it
+    # verifies the signature itself, refuses anything outside a short grace
+    # window, and re-checks the token version so a revoked session stays
+    # revoked. Same reasoning as /api/auth/logout above.
+    "/api/auth/refresh",
     "/api/auth/me",
     "/api/auth/forgot-password",
     "/api/auth/reset-password",
@@ -1756,6 +1779,11 @@ async def on_shutdown() -> None:
     try:
         if _state.cp_users_puller is not None:
             _state.cp_users_puller.stop()
+    except Exception:
+        pass
+    try:
+        from app.services.app_metrics import sampler as _app_metrics
+        _app_metrics.stop()
     except Exception:
         pass
     telemetry_service.shutdown()

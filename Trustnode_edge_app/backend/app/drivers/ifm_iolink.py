@@ -1067,7 +1067,32 @@ class IfmMasterClient:
         # requests on addresses that can answer instead of on 404s.
         known = self._tree_adrs()
 
+        # ifm's DOCUMENTED per-port addresses. These are always probed, whether
+        # or not gettree mentions them.
+        #
+        # 2026-09-02, measured on a real AL1326 ("IO-Link Master DL EIP 8P"):
+        # querytree(processdata) returned ZERO addresses and the block's
+        # gettree is dominated by MQTT/configuration nodes - yet every one of
+        # these answered 200 in 14-31 ms when asked by name. Gating the probe
+        # on the tree therefore hid the port mode, the IO-Link device status
+        # and the process data on a block that serves all three, which is
+        # exactly the reported "it is not reading the IO-Link IO status".
+        #
+        # The tree is an OPTIMISATION - it keeps us from probing the dozen
+        # speculative current/voltage spellings on a block that has none. It
+        # is not an inventory, and it must not be treated as one. The block's
+        # own 200/404/503 is the authority.
+        _documented = set()
+        for _prt in ports:
+            _n = int(_prt["port"])
+            _documented.update({
+                port_mode_adr(_n), port_pin2in_adr(_n), port_pin4in_adr(_n),
+                port_pdin_adr(_n), port_pdout_adr(_n), port_status_adr(_n),
+            })
+
         def declared(adr: str) -> bool:
+            if adr in _documented:
+                return True
             return known is None or adr in known
 
         candidates: List[str] = []

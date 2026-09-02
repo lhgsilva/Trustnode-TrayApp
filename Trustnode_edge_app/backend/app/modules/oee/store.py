@@ -27,6 +27,9 @@ _CRUD_TABLES = {
     "orders": "oee_orders",
     "shifts": "oee_shifts",
     "planned_stops": "oee_planned_stops",
+    # 2026-08-29: the planning calendar. Registering it here is all it needs
+    # to get list/get/upsert/delete and the /config/{kind} routes.
+    "planned_events": "oee_planned_events",
     "downtime_reasons": "oee_downtime_reasons",
     "quality_reasons": "oee_quality_reasons",
 }
@@ -100,6 +103,8 @@ class OeeStore:
             return " ORDER BY priority, name"
         if table == "oee_signal_mappings":
             return " ORDER BY priority, oee_function"
+        if table == "oee_planned_events":
+            return " ORDER BY start_utc"
         if self._has_column(table, "name"):
             return " ORDER BY name"
         return " ORDER BY created_utc"
@@ -250,21 +255,45 @@ class OeeStore:
         with self._connect() as c:
             return [_row_to_dict(r) for r in c.execute(sql, args).fetchall()]
 
-    def confirm_downtime(self, event_id: str, reason_id: str = "",
-                         category: str = "", comment: str = "",
-                         actor: str = "") -> Dict[str, Any]:
+    def confirm_downtime(self, event_id: str, reason_id: Optional[str] = None,
+                         category: Optional[str] = None,
+                         comment: Optional[str] = None,
+                         actor: str = "",
+                         is_planned: Optional[bool] = None) -> Dict[str, Any]:
         """Attach an operator's reason to a stop.
 
         An unconfirmed stop keeps reason NULL and is reported as "Unknown" by
         the Pareto - deliberately visible rather than quietly dropped.
+
+        2026-08-31: every field is now tri-state. It used to write all four
+        columns on every call, so adding a comment to an already-classified
+        stop silently erased the reason and the category that somebody had
+        gone to the machine to establish. `None` means LEAVE ALONE; an empty
+        string means CLEAR. This is the same rule the rest of the app learned
+        the hard way - a partial payload must not blank what it does not
+        mention.
         """
+        sets: List[str] = []
+        vals: List[Any] = []
+        if reason_id is not None:
+            sets.append("downtime_reason_id = ?")
+            vals.append(str(reason_id) or None)
+        if category is not None:
+            sets.append("downtime_category = ?")
+            vals.append(str(category) or None)
+        if comment is not None:
+            sets.append("operator_comment = ?")
+            vals.append(str(comment) or None)
+        if is_planned is not None:
+            sets.append("is_planned = ?")
+            vals.append(1 if is_planned else 0)
+        # Who looked at it and when is always recorded: that IS the confirmation.
+        sets.extend(["confirmed_by = ?", "confirmed_utc = ?"])
+        vals.extend([actor or None, _now()])
+        vals.extend([event_id, self._tenant()])
         with self._connect() as c:
-            c.execute(
-                "UPDATE oee_machine_events SET downtime_reason_id = ?, "
-                "downtime_category = ?, operator_comment = ?, confirmed_by = ?, "
-                "confirmed_utc = ? WHERE id = ? AND tenant_id = ?",
-                (reason_id or None, category or None, comment or None,
-                 actor or None, _now(), event_id, self._tenant()))
+            c.execute("UPDATE oee_machine_events SET " + ", ".join(sets)
+                      + " WHERE id = ? AND tenant_id = ?", vals)
             c.commit()
         return self.get_event(event_id)
 

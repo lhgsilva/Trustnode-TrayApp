@@ -67,11 +67,31 @@ def main() -> int:
     print("  block: {0}".format(args.ifm))
     print()
 
-    try:
-        with socket.create_connection((args.ifm, 44818), timeout=2):
-            pass
-    except Exception as exc:
-        print("SKIP: no ifm block at {0}:44818 ({1})".format(args.ifm, exc))
+    def _open(port: int) -> bool:
+        try:
+            with socket.create_connection((args.ifm, port), timeout=2):
+                return True
+        except Exception:
+            return False
+
+    fieldbus = _open(44818)
+    iot = _open(80)
+    print("  EtherNet/IP :44818 : {0}".format("open" if fieldbus else "closed"))
+    print("  IoT Core    :80    : {0}".format("open" if iot else "closed"))
+    print()
+    if not fieldbus:
+        if iot:
+            # An AL1326 with the fieldbus disabled does this. Saying "no ifm
+            # block" about a block that is answering on port 80 sends whoever
+            # reads it to check cabling that is already fine.
+            print("SKIP: {0} serves IoT Core but not EtherNet/IP, and this "
+                  "suite exercises the fieldbus transport.".format(args.ifm))
+            print("      The IoT path has its own end-to-end coverage:")
+            print("      python scripts/test_ifm_real_block_e2e.py --host {0}"
+                  .format(args.ifm))
+        else:
+            print("SKIP: nothing is answering at {0} on 44818 or 80 - the "
+                  "block is unreachable.".format(args.ifm))
         return 0
 
     tmp = tempfile.mkdtemp(prefix="tn-smoke-ifm-")

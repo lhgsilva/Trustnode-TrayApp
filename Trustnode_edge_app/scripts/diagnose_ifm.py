@@ -134,6 +134,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=5.0)
     ap.add_argument("--max-reads", type=int, default=40,
                     help="how many datapoints to read individually")
+    ap.add_argument("--ports", type=int, default=8,
+                    help="how many IO-Link ports the block has")
     ap.add_argument("--json", default="", help="also write the raw findings here")
     args = ap.parse_args()
 
@@ -273,6 +275,68 @@ def main():
     report["steps"]["single_reads"] = {"tried": len(sample), "ok": ok_n,
                                        "slowest_ms": round(slowest * 1000),
                                        "results": results}
+
+    # -------------------------------------------- 5b. the addresses that matter
+    # 2026-09-02, from a real DL EIP 8P: querytree(processdata) returned ZERO
+    # addresses, and walking gettree for anything with a getdata service
+    # returned 850 - almost all of them MQTT and configuration nodes that
+    # answer 400/404/503. Neither tells us what we actually want to know.
+    #
+    # ifm documents the process-data addresses, so ask for THOSE by name. What
+    # answers 200 here is the real list of readable values on this block, and
+    # it is the list TrustNode should be offering.
+    _rule("5b. The documented ifm process-data addresses")
+    _say("   Probing the addresses ifm publish, rather than guessing from the")
+    _say("   tree. These are what a gateway should be collecting.")
+    _say()
+
+    def _probe(adr):
+        try:
+            payload, dt = probe.post({"code": "request", "cid": -1, "adr": adr})
+            code = payload.get("code")
+            data = payload.get("data")
+            val = data.get("value") if isinstance(data, dict) else data
+            return int(code or 0), val, dt
+        except Exception as exc:
+            return 0, "ERR %s" % str(exc)[:40], 0.0
+
+    known = []
+    for adr in ("/deviceinfo/productcode/getdata",
+                "/deviceinfo/serialnumber/getdata",
+                "/deviceinfo/applicationtag/getdata",
+                "/processdatamaster/temperature/getdata",
+                "/processdatamaster/current/getdata",
+                "/processdatamaster/voltage/getdata",
+                "/processdatamaster/supervisionstatus/getdata"):
+        known.append(adr)
+    for n in range(1, int(args.ports) + 1):
+        known.extend([
+            "/iolinkmaster/port[%d]/mode/getdata" % n,
+            "/iolinkmaster/port[%d]/pin2in/getdata" % n,
+            "/iolinkmaster/port[%d]/iolinkdevice/status/getdata" % n,
+            "/iolinkmaster/port[%d]/iolinkdevice/pdin/getdata" % n,
+            "/iolinkmaster/port[%d]/iolinkdevice/deviceid/getdata" % n,
+            "/iolinkmaster/port[%d]/iolinkdevice/productname/getdata" % n,
+            "/iolinkmaster/port[%d]/current/getdata" % n,
+        ])
+
+    hits = []
+    for adr in known:
+        code, val, dt = _probe(adr)
+        mark = "OK " if code == 200 else "   "
+        if code == 200:
+            hits.append({"adr": adr, "value": val})
+        _say("   %s%-56s %-5s %s" % (mark, adr[-56:], code,
+                                     str(val)[:28] if code == 200 else ""))
+    report["steps"]["known_addresses"] = {"probed": len(known), "ok": len(hits),
+                                          "hits": hits}
+    _say()
+    _say("   %d of %d documented addresses answered." % (len(hits), len(known)))
+    if hits:
+        _say("   THESE are the values this block can give over IoT Core.")
+    else:
+        _say("   None answered - this block does not serve process data over")
+        _say("   IoT Core, and it must be read over EtherNet/IP instead.")
 
     # ------------------------------------------------------------- 6. verdict
     _rule("6. Verdict")

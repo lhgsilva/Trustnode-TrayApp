@@ -3,9 +3,13 @@ import { Login } from "./components/Login/Login";
 import { DashboardDesigner } from "./components/Dashboard/DashboardDesigner";
 import IfmPortMapper from "./components/Gateways/IfmPortMapper";
 import EthernetIpMapper from "./components/Gateways/EthernetIpMapper";
+import PointIoMapper from "./components/Gateways/PointIoMapper";
 import ModbusMapper, { modbusTagNames } from "./components/Gateways/ModbusMapper";
 import DiagnosticsPage from "./components/Diagnostics/DiagnosticsPage";
+import DataExportPage from "./components/DataExport/DataExportPage";
 import { DASHBOARD_GRID_VERSION, migrateWidgetsToFinerGrid } from "./components/Dashboard/widgetRegistry";
+import { axisTick, gridProps, legendStyle, labelFontPx, CHART_BASE, CURVE_TYPES }
+  from "./components/Dashboard/chartStyle";
 import { registerDeclaredTagTypes } from "./components/Dashboard/tagTypes";
 import { ReportTemplateDesigner } from "./components/Reports/ReportTemplateDesigner";
 import { ScheduledReportsManager } from "./components/Reports/ScheduledReportsManager";
@@ -15,6 +19,9 @@ import { BatchesPage, BatchTypesPage, BatchAuditPage } from "./components/BatchM
 import OeeOverviewPage from "./components/OEE/OeeOverview";
 import OeeOperatorPage from "./components/OEE/OeeOperator";
 import OeeConfigurationPage from "./components/OEE/OeeConfiguration";
+import OeeMachineDetailPage from "./components/OEE/OeeMachineDetail";
+import OeePlanningCalendarPage from "./components/OEE/OeePlanningCalendar";
+import { defaultSelection as oeeDefaultSelection } from "./components/OEE/OeePeriod";
 // Batch Management v2 (clean rebuild) — spec-named pages. These replace the
 // three legacy menu items. Guide: docs/BATCH_MANAGEMENT_REDESIGN_2026-07-14.md
 import { BatchOverviewV2Page, BatchDefinitionsV2Page, BatchAnalysisV2Page } from "./components/BatchManagement/BatchManagementV2";
@@ -28,6 +35,11 @@ import {
   getBootProbe,
   getRuntimeSurface,
   isHostedWebClientRuntime,
+  exportOptions,
+  exportSources,
+  exportPreview,
+  exportServerSide,
+  exportClientSide,
   postBootProbe,
   setForceSqliteReads,
   getBackendTarget,
@@ -108,6 +120,7 @@ import {
   getPowerStatus,
   getPowerLatest,
   getPowerHistory,
+  getPowerSeries,
   getPowerDiagnostics,
   startPowerDevice,
   stopPowerDevice,
@@ -192,6 +205,10 @@ import {
   // updates and reinstalls. Backed by /api/workspace/* on the edge.
   exportWorkspace,
   importWorkspace,
+  // 2026-09-02: renews the session token before it expires. Without it a
+  // screen left open simply stopped working after four hours.
+  scheduleSessionRefresh,
+  applyCollectionTriggers,
 } from "./api";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, ComposedChart, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 // Operator 2026-06-30: TrustNode Intelligence module — sidebar menu +
@@ -225,7 +242,14 @@ function isPlcUnreachableError(msg) {
     m.includes("failed to open socket") ||
     m.includes("route attempts failed") ||
     m.includes("no connection could be made") ||
-    (m.includes("timed out") && (m.includes("read failed") || m.includes("every tag failed")))
+    (m.includes("timed out") && (m.includes("read failed") || m.includes("every tag failed"))) ||
+    // The worker's all-BAD streak message. Drivers that return a BAD reading
+    // per signal rather than raising (EtherNet/IP, and any future driver that
+    // degrades instead of throwing) never produce a connect-failure string, so
+    // none of the clauses above can see them - the ifm block sat unplugged
+    // behind a green status for hours. This phrase is the worker's, not a
+    // vendor library's, so matching it is stable.
+    m.includes("every tag is bad quality")
   );
 }
 
@@ -362,7 +386,7 @@ const NAV_SECTIONS = [
   {
     id: "oee",
     title: "OEE",
-    items: ["OEE Overview", "Operator Screen", "OEE Configuration"]
+    items: ["OEE Overview", "Operator Screen", "Planning Calendar", "OEE Configuration"]
   },
   {
     id: "collection_monitoring",
@@ -371,7 +395,7 @@ const NAV_SECTIONS = [
   },
   { id: "reporting", title: "Reporting", items: ["Reports", "Scheduled Reports", "Generated Reports"] },
   { id: "notifications", title: "Notifications", items: ["Alarms", "Email and Notifications"] },
-  { id: "data_log", title: "Data History", items: ["Historian", "Logs"] },
+  { id: "data_log", title: "Data History", items: ["Historian", "Data Export", "Logs"] },
   // Operator 2026-06-23: Batch Management & Traceability module. Each
   // item is license-gated through canOpenPage(); when the license
   // module is absent the items are filtered out and the whole group
@@ -411,10 +435,18 @@ const gatewayOptions = [
   // 2026-08-24: an ifm IO-Link master (AL13xx) read over its IoT port. Its
   // sensors become ordinary tags, so everything downstream treats them the
   // same as a PLC tag.
-  { value: "ifm_iolink", label: "IFM IO-Link master" },
+  // 2026-09-02: named for its TRANSPORT. This entry is the IoT-Core path
+  // (HTTP, port 80). A block wired to its FIELDBUS socket serves no IoT Core
+  // at all, so choosing this for one reads nothing - which is exactly what
+  // was reported, along with "it is taking port 80 instead of 44818".
+  { value: "ifm_iolink", label: "IFM IO-Link master - IoT Core (port 80)" },
+  // 1734-AENTR and friends. Read WITHOUT a PLC: each module is polled
+  // explicitly through the adapter backplane, so no implicit connection is
+  // opened and nothing on the rack is owned or driven.
+  { value: "point_io", label: "Allen-Bradley POINT I/O (1734-AENTR)" },
   // Any EtherNet/IP adapter, read by explicit CIP against its input assembly —
   // the edge is the originator, so no PLC is needed in between.
-  { value: "ethernet_ip", label: "EtherNet/IP device (EDS)" },
+  { value: "ethernet_ip", label: "EtherNet/IP device, incl. ifm on fieldbus (port 44818)" },
   // 2026-08-28: the widest-reach protocol in industry. VSDs, transmitters,
   // weighing controllers, and the gateway boxes that front every other
   // fieldbus all speak Modbus TCP.
@@ -437,6 +469,7 @@ function resolveFeaturePermission(perms, canonicalKey, legacyKey) {
 function pageId(label) {
   if (label.toLowerCase() === "database overview") return "database";
   if (label.toLowerCase() === "historian") return "historian";
+  if (label.toLowerCase() === "data export") return "data_export";
   if (label.toLowerCase() === "logs") return "logs";
   if (label.toLowerCase() === "reports") return "reporting";
   // OEE module pages. Explicit keys so the labels can be reworded without
@@ -444,6 +477,7 @@ function pageId(label) {
   if (label.toLowerCase() === "oee overview") return "oee_overview";
   if (label.toLowerCase() === "operator screen") return "oee_operator";
   if (label.toLowerCase() === "oee configuration") return "oee_configuration";
+  if (label.toLowerCase() === "planning calendar") return "oee_planning";
   // Batch Management module pages (v2 clean rebuild)
   if (label.toLowerCase() === "batch overview") return "batch_overview";
   if (label.toLowerCase() === "batch definitions") return "batch_definitions";
@@ -469,6 +503,7 @@ function dbStatusInfo(c) {
 function pageTitle(page) {
   if (page === "database") return "Database Overview";
   if (page === "historian") return "Historian";
+  if (page === "data_export") return "Data Export";
   if (page === "logs") return "Logs";
   if (page === "database_overview") return "Database Overview";
   if (page === "database_inspector") return "Database Inspector";
@@ -492,6 +527,12 @@ function pageTitle(page) {
   if (page === "mqtt") return "MQTT";
   if (page === "lan_sharing") return "Remote Access";
   if (page === "directories") return "Directories";
+  // Without these the fallback title-cases the page key into "Oee Planning".
+  if (page === "oee_planning") return "Planning Calendar";
+  if (page === "oee_machine_detail") return "Machine Detail";
+  if (page === "oee_overview") return "OEE Overview";
+  if (page === "oee_operator") return "Operator Screen";
+  if (page === "oee_configuration") return "OEE Configuration";
   return page.replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
 }
 
@@ -908,6 +949,29 @@ const POWER_PERIOD_OPTIONS = [
   { value: "month", label: "This month (since 1st)", ms: 31 * 24 * 60 * 60 * 1000 },
   { value: "year", label: "This year (since Jan 1)", ms: 365 * 24 * 60 * 60 * 1000 },
 ];
+/* The window a period actually means, computed from `nowMs`.
+ *
+ * Calendar periods are anchors: "Today" is midnight-to-now and grows through
+ * the day, which is what makes the totals cumulative. Rolling periods are
+ * durations and slide, which is what they are for. Treating the first as the
+ * second is why "Today" behaved as "the last 24 hours" and the insights reset
+ * on every refresh. */
+function powerPeriodWindow(period, nowMs) {
+  const now = new Date(nowMs);
+  if (period === "day") {
+    return { fromMs: new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime(), toMs: nowMs };
+  }
+  if (period === "month") {
+    return { fromMs: new Date(now.getFullYear(), now.getMonth(), 1).getTime(), toMs: nowMs };
+  }
+  if (period === "year") {
+    return { fromMs: new Date(now.getFullYear(), 0, 1).getTime(), toMs: nowMs };
+  }
+  const match = POWER_PERIOD_OPTIONS.find((p) => p.value === period);
+  const ms = match?.ms || 60 * 60 * 1000;
+  return { fromMs: nowMs - ms, toMs: nowMs };
+}
+
 const POWER_AGG_OPTIONS = ["avg", "max", "min", "sum"];
 const POWER_INTERVAL_OPTIONS = [
   { value: "second", label: "Second", ms: 1000 },
@@ -1395,8 +1459,12 @@ function formatBytes(value) {
 }
 
 function parseSemicolonTags(raw) {
+  // ";" AND newlines. The Manual Tag Entry hint promises both, and a mapper
+  // that joined with "\n" (POINT I/O) collapsed twelve point names into one
+  // unmatchable tag, so the gateway collected nothing. Commas are deliberately
+  // NOT separators: array tags like Tag[1,2] contain them.
   return String(raw || "")
-    .split(";")
+    .split(/[;\r\n]+/)
     .map((s) => s.trim())
     .filter(Boolean);
 }
@@ -1638,6 +1706,8 @@ function MenuIcon({ page }) {
       return <svg {...common}><rect x="4" y="3" width="16" height="18" rx="2" /><path d="M8 8h8M8 12h8M8 16h5" /></svg>;
     case "historian":
       return <svg {...common}><rect x="4" y="3" width="16" height="18" rx="2" /><path d="M8 8h8M8 12h8M8 16h5" /></svg>;
+    case "data_export":
+      return <svg {...common}><rect x="4" y="3" width="12" height="18" rx="2" /><path d="M8 8h5M8 12h5" /><path d="M17 12h5M19 9l3 3-3 3" /></svg>;
     case "logs":
       return <svg {...common}><path d="M4 4h16v12H4z" /><path d="M8 20h8" /><path d="M9 8h6M9 12h6" /></svg>;
     case "gateway_configuration":
@@ -2190,6 +2260,10 @@ const MODULE_KEY_BY_PAGE = {
   oee_overview: "oee",
   oee_operator: "oee",
   oee_configuration: "oee",
+  // Machine Detail is opened from the Overview and Planning is its own page;
+  // both are the same licensed module.
+  oee_machine_detail: "oee",
+  oee_planning: "oee",
   connections_overview: "lan_access",
   lan_sharing: "lan_access",
   opc_ua: "opcua",
@@ -3757,6 +3831,20 @@ function AppShell() {
   // localStorage so a refresh / restart doesn't immediately re-pop
   // the message the operator just dismissed. Re-shows if backlog
   // jumps OR a new lastDataError appears.
+  // 2026-09-02: a session that ended looked exactly like a frozen app - the
+  // charts holding their last value, every save reporting "Token expired" -
+  // because nothing renewed the token and nothing handled a 401. api.js now
+  // renews it well before expiry; this is the case where renewal itself was
+  // refused, which is the only one the operator should ever have to see.
+  const [sessionEnded, setSessionEnded] = useState(false);
+
+  useEffect(() => {
+    scheduleSessionRefresh();
+    const onExpired = () => setSessionEnded(true);
+    window.addEventListener("trustnode:session-expired", onExpired);
+    return () => window.removeEventListener("trustnode:session-expired", onExpired);
+  }, []);
+
   const [historianSyncBannerDismissedUntil, setHistorianSyncBannerDismissedUntil] = useState(0);
   const [historianSyncBannerDismissedBacklog, setHistorianSyncBannerDismissedBacklog] = useState(0);
   const [historianSyncBannerDismissedError, setHistorianSyncBannerDismissedError] = useState("");
@@ -3896,6 +3984,8 @@ function AppShell() {
     ifm_ports: [],
     ifm_variant: "auto",
     ifm_datapoints: [],
+    point_io_modules: [],
+    point_io_points: [],
     // Generic EtherNet/IP (2026-08-24); ignored unless the type is ethernet_ip.
     eip_input_assembly: 0,
     eip_output_assembly: 0,
@@ -3930,6 +4020,12 @@ function AppShell() {
     return false;
   }, [gatewayForm.gateway_type, gatewayForm.ifm_datapoints, gatewayForm.eip_signals,
       gatewayForm.eip_parameters, gatewayForm.modbus_registers]);
+  // OEE module: ONE selection shared by Overview and Machine Detail. Picking
+  // Shift 2 on a date and clicking a machine must open THAT machine for THAT
+  // shift - a second copy of this state is how the two pages would drift.
+  const [oeeSelection, setOeeSelection] = useState(() => oeeDefaultSelection());
+  const [oeeMachine, setOeeMachine] = useState(null);
+
   const [showDbModal, setShowDbModal] = useState(false);
   const [editingDbId, setEditingDbId] = useState(null);
   const [dbModalPresetScope, setDbModalPresetScope] = useState("gateway");
@@ -4284,6 +4380,10 @@ function AppShell() {
   });
   const [powerSample, setPowerSample] = useState(null);
   const [powerHistoryRows, setPowerHistoryRows] = useState([]);
+  // Which grain the SERVER chose for the current window, so the chart can
+  // say so - an hourly average must never be read as a live reading.
+  const powerSeriesBucketRef = useRef("");
+  const [powerSeriesBucket, setPowerSeriesBucket] = useState("");
   const [powerRegisterTests, setPowerRegisterTests] = useState({});
   const [powerBusy, setPowerBusy] = useState(false);
   const [powerResult, setPowerResult] = useState("");
@@ -4463,6 +4563,24 @@ function AppShell() {
       energy_delivered_total_wh: 1,
     },
   });
+
+  /* Whether THIS meter is wired through external current transformers.
+   *
+   * 2026-09-02: the live EM122 had ct_connected=true with an 80/5 ratio
+   * filled in, on a meter that takes no CTs at all. Nothing multiplies by
+   * that ratio - modern meters report primary-side values themselves and
+   * power_manager deliberately does not apply it - so the numbers were
+   * decoration that read like configuration. Keyed on the meter model in the
+   * profile id rather than a hard-coded device list, so a new direct-measuring
+   * model needs one entry here and nothing else.
+   */
+  const DIRECT_MEASURING_MODELS = ["em122"];
+  const powerMeterUsesCts = useMemo(() => {
+    const hay = `${powerDeviceForm?.register_profile || ""} ${powerDeviceForm?.type || ""}`
+      .toLowerCase();
+    return !DIRECT_MEASURING_MODELS.some((m) => hay.includes(m));
+  }, [powerDeviceForm?.register_profile, powerDeviceForm?.type]);
+
   // Register assistant (2026-08-27). Adding an EM122 with the EM525 map read
   // 0.0000 for every value, and retyping 33 datasheet rows by hand is where
   // wrong addresses come from. Two ways in: pick a known model, or paste the
@@ -5047,6 +5165,22 @@ function AppShell() {
   // saved configs (database_configurations, gateway_configurations,
   // triggers_limits, alarms_setup, ...) with React's initial [].
   const appStorePayloadEverHydratedRef = useRef(false);
+  //: Per-domain version last READ from the backend. Echoed back on every save
+  //: so the server can tell an informed write from a blind one; updated from
+  //: each save's response so consecutive edits keep working without a reload.
+  const domainVersionsRef = useRef({});
+  // Did a bootstrap READ actually succeed this session? Drives the banner and
+  // the edit lock. The ref above is the same fact for non-rendering code
+  // paths; this is the rendering half.
+  //: Banners the operator has dismissed this session, keyed by content. Keying
+  //: on the TEXT (not the banner) means a banner naming different gateways is
+  //: treated as a new message and shown again - dismissing "gw-A is
+  //: unreachable" must not hide "gw-B is unreachable".
+  const [dismissedBanners, setDismissedBanners] = useState({});
+  const dismissBanner = (key) => setDismissedBanners((p) => ({ ...p, [key]: true }));
+  const bannerDismissed = (key) => Boolean(dismissedBanners[key]);
+  const [configReadOk, setConfigReadOk] = useState(false);
+  const [configReadError, setConfigReadError] = useState("");
   // Wall-clock ms when the user (or this client) intentionally stopped a
   // gateway. While this is recent the debounce in refreshGatewayRuntimes is
   // bypassed so the UI doesn't keep showing RUNNING for ~20 s because the
@@ -5067,6 +5201,9 @@ function AppShell() {
   // this, a slow query (~1s for 24 h) can be re-issued by the next
   // 1 Hz poll tick, piling up duplicate work and choking the UI.
   const powerHistoryFetchInflightRef = useRef(false);
+  // How long the last power-history fetch took. Paces the refetch: a cheap
+  // query refreshes at 1 Hz, an expensive one backs off in proportion.
+  const powerHistoryLastCostMsRef = useRef(0);
   // Identity ref for the last applied row set — if a poll comes
   // back with the same length AND newest row id, we skip the
   // setState so React doesn't refire every memo over the chart
@@ -5229,12 +5366,41 @@ function AppShell() {
     }
   });
 
+  // Re-read the stored configuration and adopt it, including the version map.
+  // Used after a 409: the client was working from a version that is no longer
+  // current, so the honest recovery is to show what IS current.
+  const reloadAppStoreConfig = async () => {
+    try {
+      const res = await getAppStoreBootstrap();
+      if (!res?.ok) return;
+      if (res.versions && typeof res.versions === "object") {
+        domainVersionsRef.current = { ...res.versions };
+      }
+      if (res.data && Object.keys(res.data).length) applyAppStorePayload(res.data);
+      appStorePayloadEverHydratedRef.current = true;
+      setConfigReadOk(true);
+    } catch (err) {
+      addAppLog({ level: "error", category: "config",
+                  message: `Could not reload configuration: ${String(err?.message || err)}` });
+    }
+  };
+
   const applyAppStorePayload = (data) => {
     if (!data || typeof data !== "object") return;
     // Bug A guard: backend returned a real payload. Mark hydrated so
     // the per-domain save effects know an empty list is now a real
     // empty (not React's initial state).
     appStorePayloadEverHydratedRef.current = true;
+    setConfigReadOk(true);
+    // Keep the version map in step with whatever payload we just adopted;
+    // saving against a version we did not read is exactly what 409 exists to
+    // stop, and it would look like a bug to the operator.
+    try {
+      if (data && typeof data === "object" && data.__versions
+          && typeof data.__versions === "object") {
+        domainVersionsRef.current = { ...data.__versions };
+      }
+    } catch (_) { /* versions are an optimisation, never a hard dependency */ }
     const appSettings = data.app_settings || {};
     const usersAccess = data.users_access || {};
     const triggers = data.triggers_limits || {};
@@ -5423,7 +5589,16 @@ function AppShell() {
         ];
       });
     }
-    if (Array.isArray(triggers.collection_triggers)) setCollectionTriggers(triggers.collection_triggers);
+    if (Array.isArray(triggers.collection_triggers)) {
+      setCollectionTriggers(triggers.collection_triggers);
+      // Make them effective NOW. Without this the rules are only applied when
+      // somebody edits one, so after a restart they sit on disk gating
+      // nothing - and on a meter-only site they never gated at all.
+      if (triggers.collection_triggers.length) {
+        applyCollectionTriggers(triggers.collection_triggers,
+                                triggers.collection_trigger_mode).catch(() => {});
+      }
+    }
     if (triggers.collection_trigger_mode === "any" || triggers.collection_trigger_mode === "all") {
       setCollectionTriggerMode(triggers.collection_trigger_mode);
     }
@@ -5647,7 +5822,17 @@ function AppShell() {
         next[id] = {
           ...cur,
           gateway_id: id,
-          running: Boolean(running),
+          // `running` is deliberately NOT set here. The press is a REQUEST;
+          // the poll owns the outcome. Setting it made the pill assert the
+          // final state instantly - a start read RUNNING before anything was
+          // collected, a stop read STOPPED while the worker was unwinding.
+          // The press is a REQUEST, not the outcome. Marking it pending lets
+          // the pill say STARTING / STOPPING until the poll confirms, instead
+          // of asserting a final state that has not happened yet - which is
+          // how a start could read RUNNING with nothing collected, and a stop
+          // could read STOPPED while the worker was still unwinding.
+          __pending: running ? "start" : "stop",
+          __pending_at: Date.now(),
           last_error: running ? null : cur.last_error,
           db_last_error: running ? null : cur.db_last_error
         };
@@ -6545,6 +6730,19 @@ function AppShell() {
         if (res?.ok && res?.data && Object.keys(res.data).length) {
           applyAppStorePayload(res.data);
         }
+        // A SUCCESSFUL read is what licenses writing - not a non-empty one. A
+        // fresh install legitimately has nothing stored, and it must still be
+        // able to save. What must never happen is writing after a read that
+        // FAILED, which is how a configured rack gets overwritten by an empty
+        // page.
+        if (res?.ok) {
+          appStorePayloadEverHydratedRef.current = true;
+          if (res.versions && typeof res.versions === "object") {
+            domainVersionsRef.current = { ...res.versions };
+          }
+          setConfigReadOk(true);
+          setConfigReadError("");
+        }
         // Data Continuity (operator 2026-06-19): pull the prior-tenant
         // summary so the banner can render before any user interaction.
         if (res?.data_continuity && typeof res.data_continuity === "object") {
@@ -6558,8 +6756,15 @@ function AppShell() {
           });
           setDataContinuityDismissed(false);
         }
-      } catch (_) {
-        // Keep localStorage fallback behavior when app-store is unavailable.
+      } catch (err) {
+        // Keep localStorage fallback behavior when app-store is unavailable -
+        // but SAY so. Until a read succeeds every saver stays shut, so the
+        // stored configuration cannot be overwritten by a page that never
+        // loaded it. Silence here is what made the loss look like magic.
+        if (!cancelled) {
+          setConfigReadOk(false);
+          setConfigReadError(String(err?.message || err || "unknown error"));
+        }
       } finally {
         if (!cancelled) setAppStoreHydrated(true);
       }
@@ -7190,6 +7395,12 @@ function AppShell() {
       // Bug A guard: refuse to PUT an empty widgets list if backend
       // hydration has never confirmed (wedged-backend → React initial []
       // would otherwise clobber the customer's saved widgets).
+      // Never write a document we never read. A page whose bootstrap
+      // failed or has not landed yet holds React's initial state, not
+      // the operator's configuration - saving from it DESTROYS the
+      // stored setup (2026-08-30: a PLC and its 49 tags). Emptiness was
+      // never the right question; "did we load this?" is.
+      if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload.widgets) || payload.widgets.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === dashboardDomainLastPersistSignatureRef.current) return;
       // An empty widget list is only persisted when the operator actually
@@ -7241,6 +7452,12 @@ function AppShell() {
       const signature = JSON.stringify(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       // Bug A guard: see dashboard_configurations note above.
+      // Never write a document we never read. A page whose bootstrap
+      // failed or has not landed yet holds React's initial state, not
+      // the operator's configuration - saving from it DESTROYS the
+      // stored setup (2026-08-30: a PLC and its 49 tags). Emptiness was
+      // never the right question; "did we load this?" is.
+      if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload.alarms) || payload.alarms.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === alarmsDomainLastPersistSignatureRef.current) return;
       alarmsDomainPersistInFlightRef.current = true;
@@ -7345,13 +7562,45 @@ function AppShell() {
       // trip — preferable to silently losing user edits).
       // Bug A guard: refuse to PUT an empty gateway list if backend
       // hydration has never confirmed.
+      // Never write a document we never read. A page whose bootstrap
+      // failed or has not landed yet holds React's initial state, not
+      // the operator's configuration - saving from it DESTROYS the
+      // stored setup (2026-08-30: a PLC and its 49 tags). Emptiness was
+      // never the right question; "did we load this?" is.
+      if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload) || payload.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === gatewayConfigsLastPersistSignatureRef.current) return;
       gatewayConfigsPersistInFlightRef.current = true;
       try {
-        await saveAppStoreDomain("gateway_configurations", payload, currentUser?.username || "system");
+        const _res = await saveAppStoreDomain(
+          "gateway_configurations", payload, currentUser?.username || "system",
+          { baseVersion: domainVersionsRef.current?.["gateway_configurations"] });
+        const _v = Number(_res?.result?.version);
+        if (Number.isFinite(_v)) {
+          domainVersionsRef.current = {
+            ...domainVersionsRef.current, "gateway_configurations": _v };
+        }
         gatewayConfigsLastPersistSignatureRef.current = signature;
-      } catch (_) {}
+      } catch (err) {
+        // Surfaced, not swallowed. A save that fails silently is
+        // indistinguishable from one that worked - which is how a
+        // configured gateway can simply never exist. Still no throw:
+        // the app stays responsive on a transient backend failure.
+        const why = String(err?.message || err || "unknown error");
+        addAppLog({ level: "error", category: "config",
+                    message: `Gateway configuration was NOT saved: ${why}` });
+        if (/HTTP 409/.test(why)) {
+          // Someone or something changed this domain since we read it. Nothing
+          // was written. Re-read so the screen shows what is actually stored,
+          // rather than leaving the operator editing a version that no longer
+          // exists.
+          setError(`Gateway configuration was not saved because it changed elsewhere. `
+            + `Reloading the current configuration — please redo your change.`);
+          reloadAppStoreConfig();
+        } else {
+          setError(`Gateway configuration could not be saved: ${why}`);
+        }
+      }
       finally { gatewayConfigsPersistInFlightRef.current = false; }
     }, 700);
     return () => {
@@ -7374,13 +7623,45 @@ function AppShell() {
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       // Bug A guard: refuse to PUT an empty devices list if backend
       // hydration has never confirmed.
+      // Never write a document we never read. A page whose bootstrap
+      // failed or has not landed yet holds React's initial state, not
+      // the operator's configuration - saving from it DESTROYS the
+      // stored setup (2026-08-30: a PLC and its 49 tags). Emptiness was
+      // never the right question; "did we load this?" is.
+      if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload) || payload.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === devicesLastPersistSignatureRef.current) return;
       devicesPersistInFlightRef.current = true;
       try {
-        await saveAppStoreDomain("devices", payload, currentUser?.username || "system");
+        const _res = await saveAppStoreDomain(
+          "devices", payload, currentUser?.username || "system",
+          { baseVersion: domainVersionsRef.current?.["devices"] });
+        const _v = Number(_res?.result?.version);
+        if (Number.isFinite(_v)) {
+          domainVersionsRef.current = {
+            ...domainVersionsRef.current, "devices": _v };
+        }
         devicesLastPersistSignatureRef.current = signature;
-      } catch (_) {}
+      } catch (err) {
+        // Surfaced, not swallowed. A save that fails silently is
+        // indistinguishable from one that worked - which is how a
+        // configured gateway can simply never exist. Still no throw:
+        // the app stays responsive on a transient backend failure.
+        const why = String(err?.message || err || "unknown error");
+        addAppLog({ level: "error", category: "config",
+                    message: `Devices was NOT saved: ${why}` });
+        if (/HTTP 409/.test(why)) {
+          // Someone or something changed this domain since we read it. Nothing
+          // was written. Re-read so the screen shows what is actually stored,
+          // rather than leaving the operator editing a version that no longer
+          // exists.
+          setError(`Devices was not saved because it changed elsewhere. `
+            + `Reloading the current configuration — please redo your change.`);
+          reloadAppStoreConfig();
+        } else {
+          setError(`Devices could not be saved: ${why}`);
+        }
+      }
       finally { devicesPersistInFlightRef.current = false; }
     }, 700);
     return () => {
@@ -7405,13 +7686,45 @@ function AppShell() {
       // edge reactivation — empty React state PUT before bootstrap
       // returned, then cloud_pull picked up the empty mirror later.
       // Refuse PUT until applyAppStorePayload has run at least once.
+      // Never write a document we never read. A page whose bootstrap
+      // failed or has not landed yet holds React's initial state, not
+      // the operator's configuration - saving from it DESTROYS the
+      // stored setup (2026-08-30: a PLC and its 49 tags). Emptiness was
+      // never the right question; "did we load this?" is.
+      if (!appStorePayloadEverHydratedRef.current) return;
       if ((!Array.isArray(payload) || payload.length === 0) && !appStorePayloadEverHydratedRef.current) return;
       if (signature === dbConnectionsLastPersistSignatureRef.current) return;
       dbConnectionsPersistInFlightRef.current = true;
       try {
-        await saveAppStoreDomain("database_configurations", payload, currentUser?.username || "system");
+        const _res = await saveAppStoreDomain(
+          "database_configurations", payload, currentUser?.username || "system",
+          { baseVersion: domainVersionsRef.current?.["database_configurations"] });
+        const _v = Number(_res?.result?.version);
+        if (Number.isFinite(_v)) {
+          domainVersionsRef.current = {
+            ...domainVersionsRef.current, "database_configurations": _v };
+        }
         dbConnectionsLastPersistSignatureRef.current = signature;
-      } catch (_) {}
+      } catch (err) {
+        // Surfaced, not swallowed. A save that fails silently is
+        // indistinguishable from one that worked - which is how a
+        // configured gateway can simply never exist. Still no throw:
+        // the app stays responsive on a transient backend failure.
+        const why = String(err?.message || err || "unknown error");
+        addAppLog({ level: "error", category: "config",
+                    message: `Database connections was NOT saved: ${why}` });
+        if (/HTTP 409/.test(why)) {
+          // Someone or something changed this domain since we read it. Nothing
+          // was written. Re-read so the screen shows what is actually stored,
+          // rather than leaving the operator editing a version that no longer
+          // exists.
+          setError(`Database connections was not saved because it changed elsewhere. `
+            + `Reloading the current configuration — please redo your change.`);
+          reloadAppStoreConfig();
+        } else {
+          setError(`Database connections could not be saved: ${why}`);
+        }
+      }
       finally { dbConnectionsPersistInFlightRef.current = false; }
     }, 700);
     return () => {
@@ -7433,13 +7746,45 @@ function AppShell() {
       const signature = JSON.stringify(payload);
       // Operator 2026-06-25: skip-first-run guard removed (see gatewayConfigsSave note).
       // Bug A guard: empty object before hydration is React initial state.
+      // Never write a document we never read. A page whose bootstrap
+      // failed or has not landed yet holds React's initial state, not
+      // the operator's configuration - saving from it DESTROYS the
+      // stored setup (2026-08-30: a PLC and its 49 tags). Emptiness was
+      // never the right question; "did we load this?" is.
+      if (!appStorePayloadEverHydratedRef.current) return;
       if (signature === "{}" && !appStorePayloadEverHydratedRef.current) return;
       if (signature === powerConfigLastPersistSignatureRef.current) return;
       powerConfigPersistInFlightRef.current = true;
       try {
-        await saveAppStoreDomain("power_management_config", payload, currentUser?.username || "system");
+        const _res = await saveAppStoreDomain(
+          "power_management_config", payload, currentUser?.username || "system",
+          { baseVersion: domainVersionsRef.current?.["power_management_config"] });
+        const _v = Number(_res?.result?.version);
+        if (Number.isFinite(_v)) {
+          domainVersionsRef.current = {
+            ...domainVersionsRef.current, "power_management_config": _v };
+        }
         powerConfigLastPersistSignatureRef.current = signature;
-      } catch (_) {}
+      } catch (err) {
+        // Surfaced, not swallowed. A save that fails silently is
+        // indistinguishable from one that worked - which is how a
+        // configured gateway can simply never exist. Still no throw:
+        // the app stays responsive on a transient backend failure.
+        const why = String(err?.message || err || "unknown error");
+        addAppLog({ level: "error", category: "config",
+                    message: `Power configuration was NOT saved: ${why}` });
+        if (/HTTP 409/.test(why)) {
+          // Someone or something changed this domain since we read it. Nothing
+          // was written. Re-read so the screen shows what is actually stored,
+          // rather than leaving the operator editing a version that no longer
+          // exists.
+          setError(`Power configuration was not saved because it changed elsewhere. `
+            + `Reloading the current configuration — please redo your change.`);
+          reloadAppStoreConfig();
+        } else {
+          setError(`Power configuration could not be saved: ${why}`);
+        }
+      }
       finally { powerConfigPersistInFlightRef.current = false; }
     }, 700);
     return () => {
@@ -9229,99 +9574,82 @@ function AppShell() {
             // tracks the meter's 1Hz cadence. Wide windows stay
             // longer so we don't issue large fetches at 1Hz. Idle
             // (no meter connected) backs off to 30s.
+            // Pace off the MEASURED cost of the last fetch, not the window
+            // width. The old table charged 15 s for any window over six hours
+            // - so the default 24-hour view repainted four times a minute
+            // while the meter logged at 1 Hz. Width was only ever a proxy for
+            // cost, and a poor one: cost depends on the store, the tag count
+            // and the grain. Three times the last duration leaves the backend
+            // ~75% idle whatever the query turns out to cost.
+            const lastCostMs = Number(powerHistoryLastCostMsRef.current || 0);
+            // The operator's configured interval is the TARGET; measured cost
+            // is only a floor under it. The old rule capped at 15 s, so a
+            // 1 Hz meter repainted four times a minute however cheap the
+            // query was - "not updating as set in the gateway interval".
+            const meterIntervalMs = (() => {
+              const cfg = powerConfigRef.current || powerConfig || {};
+              const devices = Array.isArray(cfg?.devices) ? cfg.devices : [];
+              const selId = String(cfg?.selected_device_id || "");
+              const dev = devices.find((d) => String(d?.id || "") === selId) || devices[0];
+              const ms = Number(dev?.poll_interval_ms || 0);
+              return Number.isFinite(ms) && ms > 0 ? ms : 1000;
+            })();
+            // Never spend more than half the time querying: a query that costs
+            // 4 s paces to 8 s instead of stacking requests the backend cannot
+            // answer. Below that, the meter's interval wins.
+            const sustainableMs = Math.max(250, Math.round(lastCostMs * 2));
             const throttleMs = idle
               ? 30000
-              : periodMsLocal <= 5 * 60 * 1000 ? 1000
-                              : periodMsLocal <= 60 * 60 * 1000 ? 3000
-                              : periodMsLocal <= 6 * 60 * 60 * 1000 ? 8000
-                              : 15000;
+              : Math.max(meterIntervalMs, sustainableMs);
             if (nowMs - Number(powerHistoryLastFetchMsRef.current || 0) >= throttleMs) {
               powerHistoryLastFetchMsRef.current = nowMs;
               powerHistoryFetchInflightRef.current = true;
-              if (periodMsLocal > 15 * 60 * 1000) {
-                // Operator 2026-06-17: wide-period fetches now use the
-                // pre-aggregated `historian_agg_<bucket>` tables when
-                // the period is wide enough for minute/hour buckets to
-                // give plenty of resolution. A 24 h × Minute view
-                // returns ~1 440 rows instead of ~17 000 — ~12× less
-                // JSON, ~12× less browser work in every memo. Raw
-                // fetch is kept as the fallback for tags the agg
-                // tables don't carry (e.g. brand-new tags before
-                // first rollup).
+              const fetchStartedMs = Date.now();
+              // ONE path for every window. This used to branch: wide windows
+              // read the `historian_agg_*` rollup tables and, when those were
+              // empty, fell back to a capped raw pull with toISOString()
+              // bounds ('T'-separated text against space-separated rows). An
+              // edge with no retention policy has NO rollups at all, so the
+              // default "Last 24 hours" view depended entirely on that
+              // fallback and came up blank.
+              //
+              // /api/power/series needs no rollups: it buckets in SQL, picks
+              // the grain from the span, and normalises both timestamp
+              // encodings. Deleting the branch is the fix - a second path is a
+              // second thing to keep correct.
+              try {
+                const res = await getPowerSeries({
+                  minutes: Math.max(1, Math.round(periodMsLocal / 60000)),
+                  bucket: "auto",
+                  maxPoints: 1500,
+                  // Narrow the tags in SQL. Without this the meter's 87
+                  // registers all come back: 15 minutes at 1 s was 73 229 rows
+                  // and ~6 s, to draw six lines.
+                  // The metric being DRAWN, plus the two the rest of the page
+                  // lives on. Asking only for the chart's selection is why
+                  // choosing "A" left the insights, Total Consumption and the
+                  // tariff panels with nothing to show.
+                  metric: Array.from(new Set([
+                    String(powerMainMetricRef.current || "power_kw"),
+                    "power_kw",
+                    "energy_kwh",
+                  ])).join(","),
+                });
+                if (res?.ok && Array.isArray(res.rows)) {
+                  powerSeriesBucketRef.current = String(res.bucket || "");
+                  setPowerSeriesBucket(String(res.bucket || ""));
+                  applyPowerHistoryRows(res.rows);
+                }
+              } catch (_) {
+                // The old row-limited endpoint stays as the fallback so an
+                // edge that has not restarted into this build still charts.
                 try {
-                  const fromUtc = new Date(nowMs - periodMsLocal).toISOString();
-                  const toUtc = new Date(nowMs + 60_000).toISOString();
-                  const metric = String(powerMainMetricRef.current || "power_kw");
-                  const tagPattern = metric === "voltage_v" ? "voltage"
-                    : metric === "current_a" ? "current"
-                    : metric === "energy_kwh" ? "energy_"
-                    : "active_power";
-                  // Pick a bucket grain proportional to the window so
-                  // the chart never gets more than ~1500 points per
-                  // tag. > 7 days → day; > 36 h → hour; otherwise minute.
-                  const aggBucket = periodMsLocal > 7 * 24 * 3600_000 ? "day"
-                    : periodMsLocal > 36 * 3600_000 ? "hour"
-                    : "minute";
-                  const aggLim = Math.min(15000, Math.max(500, Math.ceil(periodMsLocal / (
-                    aggBucket === "day" ? 86400_000 : aggBucket === "hour" ? 3600_000 : 60_000
-                  )) * 6));
-                  // Two parallel pulls: chart-metric tag (LIKE) +
-                  // insight.* (LIKE), both pre-bucketed.
-                  const fetchAgg = async (pattern) => {
-                    try {
-                      const res = await getAppStoreHistorianAgg({
-                        bucket: aggBucket, fromUtc, toUtc, tag: pattern,
-                        limit: aggLim, source: "power_modbus,power_insight",
-                      });
-                      return Array.isArray(res?.rows) ? res.rows : [];
-                    } catch { return []; }
-                  };
-                  const [metricRows, insightRows] = await Promise.all([
-                    fetchAgg(tagPattern),
-                    fetchAgg("insight."),
-                  ]);
-                  // Fallback: if the agg tables don't have rows for
-                  // this window yet (retention hasn't rolled them up),
-                  // pull a small raw window so the chart isn't empty.
-                  if (metricRows.length === 0 && insightRows.length === 0) {
-                    // perf: 20000→8000 cap; this is a one-shot fallback
-                    // when the agg tables haven't rolled up yet — the
-                    // chart down-samples anyway.
-                    const lim = Math.min(8000, Math.max(1500, Math.ceil(periodMsLocal / 60000) * 12));
-                    const fetchRaw = async (pattern) => {
-                      try {
-                        const res = await getAppStoreHistorianRange({
-                          fromUtc, toUtc, limit: lim, offset: 0, tag: pattern,
-                        });
-                        return Array.isArray(res?.rows) ? res.rows : [];
-                      } catch { return []; }
-                    };
-                    const [rawMetric, rawInsight] = await Promise.all([
-                      fetchRaw(tagPattern),
-                      fetchRaw("insight."),
-                    ]);
-                    applyPowerHistoryRows([...rawMetric, ...rawInsight]);
-                  } else {
-                    applyPowerHistoryRows([...metricRows, ...insightRows]);
-                  }
-                } catch (_) { /* fall through */ }
-              } else {
-                // Short windows: lighter row-count endpoint.
-                // Operator 2026-06-19 (perf): clamped the upper limit
-                // from 50000 → 10000. 50k rows × 9 insight tags = 450k
-                // rows per poll, parsed every 1-3 s. The chart cannot
-                // render that density anyway — recharts down-samples
-                // visually. 10k caps the JSON payload + SQL scan + UI
-                // memo cost while still giving > 1 row per second for
-                // the widest 6-hour short window.
-                const tagsPerSec = 25;
-                const desired = Math.max(1500, Math.ceil(periodMsLocal / 1000) * tagsPerSec);
-                const lim = Math.min(10000, desired);
-                try {
+                  const lim = Math.min(10000, Math.max(1500, Math.ceil(periodMsLocal / 1000) * 25));
                   const histRes = await getPowerHistory(lim, "");
                   if (histRes?.ok && Array.isArray(histRes.rows)) applyPowerHistoryRows(histRes.rows);
-                } catch (_) {}
+                } catch (__) {}
               }
+              powerHistoryLastCostMsRef.current = Date.now() - fetchStartedMs;
               powerHistoryFetchInflightRef.current = false;
             }
           }
@@ -9577,23 +9905,22 @@ function AppShell() {
   // Operator 2026-06-16: Period and Interval are independent.
   // Period = time range ending at "now". Interval = X-axis bucket
   // grain. The chart renders ceil(periodMs / intervalMs) buckets.
-  const periodMs = useMemo(() => {
-    const now = new Date();
-    if (powerPeriod === "day") {
-      const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      return Math.max(60 * 60 * 1000, now.getTime() - start.getTime());
-    }
-    if (powerPeriod === "month") {
-      const start = new Date(now.getFullYear(), now.getMonth(), 1);
-      return Math.max(24 * 60 * 60 * 1000, now.getTime() - start.getTime());
-    }
-    if (powerPeriod === "year") {
-      const start = new Date(now.getFullYear(), 0, 1);
-      return Math.max(31 * 24 * 60 * 60 * 1000, now.getTime() - start.getTime());
-    }
-    const match = POWER_PERIOD_OPTIONS.find((p) => p.value === powerPeriod);
-    return match?.ms || 60 * 60 * 1000;
-  }, [powerPeriod]);
+  // A calendar period grows, so the span has to be recomputed as time passes.
+  // Frozen at selection, "Today" stopped meaning midnight within the hour.
+  const [powerNowTick, setPowerNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setPowerNowTick(Date.now()), 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  const powerWindow = useMemo(
+    () => powerPeriodWindow(powerPeriod, powerNowTick),
+    [powerPeriod, powerNowTick],
+  );
+  const periodMs = useMemo(
+    () => Math.max(60 * 1000, powerWindow.toMs - powerWindow.fromMs),
+    [powerWindow],
+  );
 
   const effectiveInterval = useMemo(() => powerInterval, [powerInterval]);
 
@@ -9792,9 +10119,11 @@ function AppShell() {
       fromMs = powerHistoricalRange.fromMs;
       toMs = powerHistoricalRange.toMs;
     } else {
-      const nowMs = Date.now();
-      fromMs = nowMs - periodMs;
-      toMs = nowMs + 60000;
+      // The anchored window: for "Today" this stays midnight all day instead
+      // of sliding forward and dropping the morning.
+      const w = powerPeriodWindow(powerPeriod, Date.now());
+      fromMs = w.fromMs;
+      toMs = w.toMs + 60000;
     }
     const rows = (powerHistoryRows || []).filter((r) => {
       const ts = parseTimestampMs(r?.ts || r?.ts_utc || "");
@@ -9805,7 +10134,8 @@ function AppShell() {
       return true;
     });
     return rows;
-  }, [powerHistoryRows, periodMs, selectedPowerChartMeters, powerFilterMeterId, powerViewMode, powerHistoricalRange]);
+  }, [powerHistoryRows, periodMs, powerPeriod, powerNowTick, selectedPowerChartMeters,
+      powerFilterMeterId, powerViewMode, powerHistoricalRange]);
 
   const powerTrendData = useMemo(() => {
     const meterIds = (powerConfig?.devices || []).map((d) => String(d?.id || "")).filter(Boolean);
@@ -9846,21 +10176,42 @@ function AppShell() {
     return out;
   }, [powerRowsFiltered, powerInterval, effectiveInterval, powerAggregation, powerConfig, powerCostPerKwh, displayTimeZone]);
 
+  /* "L1" / "L2" / "L3" / the meter's name. An electrician reads phases, not
+     tag names, and "voltage_l2_v" in a legend is noise. */
+  const powerSeriesLabel = useCallback((sr) => {
+    const tag = String(sr?.tag || "");
+    const phase = /_l1_/.test(tag) ? "L1" : /_l2_/.test(tag) ? "L2" : /_l3_/.test(tag) ? "L3" : "";
+    const dev = (powerConfig?.devices || []).find((d) => String(d?.id || "") === String(sr?.meterId || ""));
+    const meterName = String(dev?.name || sr?.meterId || "");
+    if (phase && meterName) return `${meterName} · ${phase}`;
+    if (phase) return phase;
+    return meterName || "Total";
+  }, [powerConfig]);
+
   const powerMainChartData = useMemo(() => {
     const meterIds = (powerConfig?.devices || [])
       .map((d) => String(d?.id || ""))
       .filter((id) => !selectedPowerChartMeters.length || selectedPowerChartMeters.includes(id));
     const bucketKey = (tsMs) => bucketKeyForInterval(tsMs, effectiveInterval, displayTimeZone);
+    // Kept in step with _METRIC_TAGS in routers/power.py - the pairing is
+    // asserted by test_power_series_window.py, because a tag fetched but not
+    // drawn is wasted rows and a tag drawn but not fetched is an empty line.
     const metricTagPriority =
       powerMainMetric === "voltage_v"
-        ? ["voltage_v", "voltage_l1_v"]
+        ? ["voltage_v", "voltage_l1_v", "voltage_l2_v", "voltage_l3_v"]
         : powerMainMetric === "current_a"
-          ? ["current_a", "current_l1_a"]
+          ? ["current_a", "current_l1_a", "current_l2_a", "current_l3_a"]
           : powerMainMetric === "energy_kwh"
             ? ["energy_total_wh", "energy_wh"]
-            : ["active_power_total_w", "active_power_w"];
+            : ["active_power_total_w", "active_power_w",
+               "active_power_l1_w", "active_power_l2_w", "active_power_l3_w"];
     const scale = powerMainMetric === "power_kw" || powerMainMetric === "energy_kwh" ? 1 / 1000.0 : 1;
     const buckets = new Map();
+    // A series is a meter's phase. With one meter the key is just the tag, so
+    // existing per-meter colour and visibility settings keep their meaning
+    // where a meter publishes a single total.
+    const seriesKeyFor = (gid, tag) => (meterIds.length > 1 ? `${gid}::${tag}` : tag);
+    const seriesSeen = new Map();
     for (const row of powerRowsFiltered || []) {
       const gid = String(row?.gateway_id || "");
       if (meterIds.length && !meterIds.includes(gid)) continue;
@@ -9873,8 +10224,14 @@ function AppShell() {
       const key = bucketKey(tsMs);
       if (!buckets.has(key)) buckets.set(key, { ts: key, meterBuckets: {} });
       const b = buckets.get(key);
-      if (!b.meterBuckets[gid]) b.meterBuckets[gid] = [];
-      b.meterBuckets[gid].push(raw * scale);
+      // One bucket per SERIES, where a series is a meter's phase. Bucketing by
+      // meter alone averaged L1, L2 and L3 into a single line.
+      const seriesKey = seriesKeyFor(gid, tag);
+      if (!b.meterBuckets[seriesKey]) b.meterBuckets[seriesKey] = [];
+      b.meterBuckets[seriesKey].push(raw * scale);
+      if (!seriesSeen.has(seriesKey)) {
+        seriesSeen.set(seriesKey, { key: seriesKey, meterId: gid, tag });
+      }
     }
     // Operator 2026-06-16: return null (NOT 0) for empty buckets
     // so Recharts treats the trailing edge as "no data yet" instead
@@ -9918,13 +10275,26 @@ function AppShell() {
         if (String(k) < String(minKey)) buckets.delete(k);
       }
     }
+    // Order: the meter's own total first, then L1, L2, L3 - the order an
+    // electrician reads them in.
+    const seriesList = Array.from(seriesSeen.values()).sort((x, y) => {
+      const rank = (t) => (/_l1_/.test(t) ? 1 : /_l2_/.test(t) ? 2 : /_l3_/.test(t) ? 3 : 0);
+      return rank(x.tag) - rank(y.tag) || String(x.key).localeCompare(String(y.key));
+    });
+    const seriesKeys = seriesList.map((x) => x.key);
     const rows = Array.from(buckets.values()).map((b) => {
       const row = { ts: b.ts };
+      for (const sk of seriesKeys) {
+        row[sk] = aggFn(b.meterBuckets[sk] || []);
+      }
+      // "Total" means the meter's own total register when it publishes one;
+      // summing the phases as well would double it.
+      const totalKeys = seriesList.filter((x) => !/_l[123]_/.test(x.tag)).map((x) => x.key);
+      const useKeys = totalKeys.length ? totalKeys : seriesKeys;
       let totalAny = false;
       let totalSum = 0;
-      for (const gid of meterIds) {
-        const v = aggFn(b.meterBuckets[gid] || []);
-        row[gid] = v;
+      for (const sk of useKeys) {
+        const v = row[sk];
         if (v != null && Number.isFinite(v)) {
           totalAny = true;
           totalSum += v;
@@ -9934,19 +10304,38 @@ function AppShell() {
       return row;
     });
     rows.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
-    return { rows, meterIds };
+    // `meterIds` is kept for callers that still think in meters; `series` is
+    // what the chart draws.
+    return { rows, meterIds, series: seriesList, seriesKeys };
   }, [powerConfig, powerRowsFiltered, powerInterval, effectiveInterval, powerMainMetric, powerAggregation, selectedPowerChartMeters, displayTimeZone, powerViewMode, powerHistoricalRange, periodMs]);
 
   const powerMainYDomain = useMemo(() => {
-    const keys = ["total", ...powerMainChartData.meterIds];
+    const keys = ["total", ...(powerMainChartData.seriesKeys || powerMainChartData.meterIds)];
     const auto = computeMultiSeriesDomain(powerMainChartData.rows, keys, true);
     const yMin = Number(powerChartSettings.main.y_min);
     const yMax = Number(powerChartSettings.main.y_max);
-    return [
-      Number.isFinite(yMin) ? yMin : auto[0],
-      Number.isFinite(yMax) ? yMax : auto[1],
-    ];
-  }, [powerMainChartData, powerChartSettings]);
+    // An AREA fills from the axis floor up to the line. `computeMultiSeriesDomain`
+    // pads around the data and only clamps at zero, so a meter sitting at
+    // 200-250 W produced a floor near 184 and the fill became a thin band
+    // floating above the baseline - reported as "the area chart is wrong, it
+    // should be under the line".
+    //
+    // The floor must INCLUDE zero, not BE zero: this meter reads negative
+    // active power (a reversed CT, or genuine export), and a hard zero floor
+    // would put the whole trace under the axis and show an empty chart. So
+    // take the unclamped minimum and extend it to zero if it does not already
+    // reach it.
+    let floor;
+    if (Number.isFinite(yMin)) {
+      floor = yMin;
+    } else if (powerMainChartType === "area") {
+      const signed = computeMultiSeriesDomain(powerMainChartData.rows, keys, false);
+      floor = Math.min(0, Number(signed[0]) || 0);
+    } else {
+      floor = auto[0];
+    }
+    return [floor, Number.isFinite(yMax) ? yMax : auto[1]];
+  }, [powerMainChartData, powerChartSettings, powerMainChartType]);
   const powerMainXAxisTicks = useMemo(() => {
     const labels = Array.from(
       new Set((powerMainChartData?.rows || []).map((r) => String(r?.ts || "").trim()).filter(Boolean))
@@ -11324,6 +11713,9 @@ function AppShell() {
       if (page === "dashboard") return Boolean(perms.dashboard ?? perms.data_log ?? true);
       if (page === "power_overview") return Boolean(perms.power_overview ?? perms.database ?? false);
       if (page === "historian") return Boolean(perms.historian ?? perms.data_log ?? true);
+      // Data Export reads the same rows the Historian does, so it carries the
+      // same grant - a separate key would let someone hold one and not the other.
+      if (page === "data_export") return Boolean(perms.historian ?? perms.data_log ?? true);
       // Phase C R2 2026-08-22: the legacy-first order below works correctly now
       // because buildRolePermissions(viewer) no longer writes an explicit `false`
       // for client_module_alarms/reporting/interface. Before this fix, the viewer
@@ -13674,6 +14066,22 @@ const getGatewayHealth = (gateway) => {
     },
     [gatewayConfigsView, powerGatewayDescriptors, isGatewayRunning, unknownRunningGateways]
   );
+  /* Running, but writing nothing because a collection trigger says so.
+   *
+   * 2026-09-02: a paused gateway looked identical to a healthy one - the FAB
+   * said "Running" while no row reached the database. That is the worst of
+   * both readings: an operator watching a flat chart has no way to tell a
+   * trigger from a fault. Distinct from stopped, because the gateway IS up
+   * and will resume by itself the moment the condition is met.
+   */
+  const gatewayCollectionPaused = useMemo(() => {
+    const blocked = Object.values(gatewayRuntimeStatuses || {})
+      .filter((rt) => rt && rt.running === true && rt.collection_blocked === true);
+    if (!blocked.length) return null;
+    const reason = String(blocked[0]?.collection_block_reason || "").trim();
+    return { count: blocked.length, reason };
+  }, [gatewayRuntimeStatuses]);
+
   // Keep dashboard/content layout stable when gateway footer is expanded.
   // Footer behaves as an overlay and should not reflow page content.
   const contentBottomPad = 16;
@@ -14807,9 +15215,18 @@ const getGatewayHealth = (gateway) => {
           .filter((t) => t.enabled !== false)
           .map((t) => ({
             gateway_id: String(t.gateway_id || ""),
+            // Anything added to a trigger must be added HERE too - this
+            // payload is a hand-written allowlist, and a field it forgets is
+            // a rule the worker never sees.
+            kind: String(t.kind || "tag"),
             tag_name: String(t.tag_name || ""),
             operator: String(t.operator || ">="),
-            value: Number(t.value),
+            value: Number(t.value || 0),
+            schedule_interval: String(t.schedule_interval || ""),
+            schedule_start: String(t.schedule_start || ""),
+            schedule_stop: String(t.schedule_stop || ""),
+            schedule_day_of_month: Number(t.schedule_day_of_month || 0),
+            schedule_date: String(t.schedule_date || ""),
             trigger_type: t.trigger_type === "one_time" ? "one_time" : "continuous",
             enabled: t.enabled !== false
           })),
@@ -14851,7 +15268,14 @@ const getGatewayHealth = (gateway) => {
         ifm_port_count: Number(gateway.ifm_port_count || 8),
         ifm_variant: String(gateway.ifm_variant || "auto"),
         ifm_ports: Array.isArray(gateway.ifm_ports) ? gateway.ifm_ports : [],
-        ifm_datapoints: Array.isArray(gateway.ifm_datapoints) ? gateway.ifm_datapoints : []
+        ifm_datapoints: Array.isArray(gateway.ifm_datapoints) ? gateway.ifm_datapoints : [],
+        // POINT I/O: which slots hold which modules, and how each is read.
+        // Without it the worker cannot address a single point - the same
+        // failure mode as sending an ifm gateway without its datapoints.
+        point_io_modules: Array.isArray(gateway.point_io_modules) ? gateway.point_io_modules : [],
+        // Names, collect ticks and scaling. Without it the worker falls back
+        // to raw counts under Slot<N>_Pt<M> names.
+        point_io_points: Array.isArray(gateway.point_io_points) ? gateway.point_io_points : []
       },
       db_sink: primarySink,
       db_sinks: [primarySink, ...parallelSinks]
@@ -15503,20 +15927,39 @@ const getGatewayHealth = (gateway) => {
     const tagName = String(collectionTriggerForm.tag_name || "").trim();
     const valueRaw = String(collectionTriggerForm.value ?? "").trim();
     const valueNum = Number(valueRaw);
-    if (!gatewayId || !tagName) {
-      setError("Trigger condition requires gateway and tag.");
+    // 2026-09-02: a SCHEDULE trigger has no tag and no threshold - it asks
+    // the clock. Demanding both of it rejected every schedule rule.
+    const kind = String(collectionTriggerForm.kind || "tag");
+    const isSchedule = kind === "schedule";
+    if (!gatewayId) {
+      setError("Pick a gateway, or All gateways.");
       return;
     }
-    if (!valueRaw || Number.isNaN(valueNum)) {
+    if (!isSchedule && !tagName) {
+      setError("A tag trigger needs a tag.");
+      return;
+    }
+    if (!isSchedule && (!valueRaw || Number.isNaN(valueNum))) {
       setError("Trigger condition value must be numeric.");
+      return;
+    }
+    if (isSchedule && collectionTriggerForm.schedule_interval === "one_time"
+        && !String(collectionTriggerForm.schedule_date || "").trim()) {
+      setError("A one-time schedule needs a date.");
       return;
     }
     const payload = {
       id: editingCollectionTriggerId || `ctrg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       gateway_id: gatewayId,
-      tag_name: tagName,
+      kind,
+      tag_name: isSchedule ? "" : tagName,
       operator: collectionTriggerForm.operator || ">=",
-      value: valueNum,
+      value: isSchedule ? 0 : valueNum,
+      schedule_interval: isSchedule ? String(collectionTriggerForm.schedule_interval || "daily") : "",
+      schedule_start: isSchedule ? String(collectionTriggerForm.schedule_start || "08:00") : "",
+      schedule_stop: isSchedule ? String(collectionTriggerForm.schedule_stop || "18:00") : "",
+      schedule_day_of_month: isSchedule ? Number(collectionTriggerForm.schedule_day_of_month || 1) : 0,
+      schedule_date: isSchedule ? String(collectionTriggerForm.schedule_date || "") : "",
       trigger_type: collectionTriggerForm.trigger_type === "one_time" ? "one_time" : "continuous",
       enabled: Boolean(collectionTriggerForm.enabled),
       updated_at: tsNow()
@@ -15682,6 +16125,8 @@ const getGatewayHealth = (gateway) => {
       // tags from its OWN device.
       tags_text: "",
       ifm_datapoints: [],
+      point_io_modules: [],
+      point_io_points: [],
       eip_signals: [],
       ifm_ports: [],
     });
@@ -15943,6 +16388,12 @@ const getGatewayHealth = (gateway) => {
       eip_signals: Array.isArray(gatewayForm.eip_signals) ? gatewayForm.eip_signals : [],
       eip_parameters: Array.isArray(gatewayForm.eip_parameters) ? gatewayForm.eip_parameters : [],
       eip_device_info: gatewayForm.eip_device_info || {},
+      // POINT I/O rack mapping. Absent from this list until 2026-08-30, so a
+      // scanned rack was discarded by the save that was meant to keep it: the
+      // gateway stored no modules and no points, and the operator got "this
+      // POINT I/O gateway has no modules" on a rack they had just scanned.
+      point_io_modules: Array.isArray(gatewayForm.point_io_modules) ? gatewayForm.point_io_modules : [],
+      point_io_points: Array.isArray(gatewayForm.point_io_points) ? gatewayForm.point_io_points : [],
       // Operator 2026-06-21: opt-in auto-resume per gateway. Default
       // false — the worker only comes back after a backend restart if
       // the operator explicitly checked "Resume on restart" in Edit.
@@ -16281,16 +16732,70 @@ const getGatewayHealth = (gateway) => {
   // client-side. For Excel we POST to the backend which can also
   // honor an uploaded .xlsx template with {{tag}} / {{value}} /
   // {{ts}} / {{#each}} / {{/each}} placeholders for fancy layouts.
-  const buildHistorianExportRows = useCallback(() => {
+  //: One request's worth. The backend clamps at 50 000; 20 000 keeps each
+  //: round trip quick enough that progress moves visibly.
+  const EXPORT_PAGE_ROWS = 20000;
+  //: A ceiling the operator is TOLD about. At ~108 rows/s a day is ~9.3 M
+  //: rows, so a whole-history export has to stop somewhere - but it must say
+  //: where, not truncate in silence like the old 20 000-row single request.
+  const EXPORT_MAX_ROWS = 2000000;
+
+  // Fetch every historian row in the selected range, page by page. The export
+  // used to write whatever the preview happened to hold - or, worse, the live
+  // tab's in-memory buffer - which is why a day's data came out as a few
+  // hundred lines.
+  const fetchAllHistorianRowsForExport = useCallback(async (onProgress) => {
+    const toIso = (txt) => {
+      const t = String(txt || "").trim();
+      if (!t) return "";
+      const ms = new Date(t).getTime();
+      return Number.isFinite(ms) ? new Date(ms).toISOString() : "";
+    };
+    const filters = historianExportFilters || {};
+    const fromUtc = toIso(filters.from);
+    const toUtc = toIso(filters.to);
+    const gateway = String(filters.gatewayId || "");
+    const tag = String(filters.tag || "");
+    const out = [];
+    let offset = 0;
+    let truncated = false;
+    for (;;) {
+      const res = await getAppStoreHistorianRange({
+        fromUtc,
+        toUtc,
+        limit: EXPORT_PAGE_ROWS,
+        offset,
+        gateway,
+        tag,
+        timeoutMs: 120000,
+        maxAttempts: 2,
+      });
+      const page = Array.isArray(res?.rows) ? res.rows : [];
+      out.push(...page);
+      if (typeof onProgress === "function") onProgress(out.length);
+      // A short page means the range is exhausted.
+      if (page.length < EXPORT_PAGE_ROWS) break;
+      offset += page.length;
+      if (out.length >= EXPORT_MAX_ROWS) {
+        truncated = true;
+        break;
+      }
+    }
+    return { rows: out, truncated };
+  }, [historianExportFilters]);
+
+  const buildHistorianExportRows = useCallback((overrideRows) => {
     const enabledCols = (historianExportColumns || []).filter((c) => c.enabled !== false);
-    // Export reads from the Export tab's filtered server set so
-    // the preview the operator sees matches the bytes that go to
-    // the file. When the operator hasn't loaded anything we fall
-    // back to the live tab's rows (so an export from the Live tab
-    // still works during transition).
-    const sourceRows = (Array.isArray(historianExportRowsPreview) && historianExportRowsPreview.length)
-      ? historianExportRowsPreview
-      : historianRows;
+    // The caller passes the rows to write. The export fetches the WHOLE
+    // selected range itself (fetchAllHistorianRowsForExport) rather than
+    // reusing the capped preview - and it no longer falls back to the live
+    // tab's in-memory buffer, which silently substituted a few hundred recent
+    // readings for the historian the operator asked for.
+    const sourceRows = Array.isArray(overrideRows) && overrideRows.length
+      ? overrideRows
+      : ((Array.isArray(historianExportRowsPreview) && historianExportRowsPreview.length)
+        ? historianExportRowsPreview
+        : []);
 
     // ─── PIVOT (wide) mode ────────────────────────────────────────
     // Reshape from one-row-per-sample to one-row-per-timestamp,
@@ -16382,7 +16887,24 @@ const getGatewayHealth = (gateway) => {
   const runHistorianExport = useCallback(async () => {
     setHistorianExportBusy(true);
     try {
-      const rows = buildHistorianExportRows();
+      // Fetch the full range for the file. The preview stays capped for
+      // responsiveness; the FILE is what the operator asked for.
+      setHistorianLoadError("");
+      const { rows: allRows, truncated } = await fetchAllHistorianRowsForExport(
+        (n) => setHistorianLoadError(`Exporting… ${n.toLocaleString()} row(s) fetched`));
+      if (!allRows.length) {
+        setHistorianLoadError("");
+        setError("Nothing to export: no historian rows in the selected range. "
+          + "Check the From/To dates and any gateway or tag filter.");
+        setHistorianExportBusy(false);
+        return;
+      }
+      const rows = buildHistorianExportRows(allRows.map(decorateHistorianRow));
+      setHistorianLoadError(truncated
+        ? `Exported the first ${rows.length.toLocaleString()} row(s) — the range `
+          + `holds more than the ${EXPORT_MAX_ROWS.toLocaleString()}-row export limit. `
+          + `Narrow the dates, gateway or tag to get the rest.`
+        : "");
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
       const fmt = String(historianExportFormat || "csv").toLowerCase();
       if (fmt === "csv") {
@@ -16439,8 +16961,11 @@ const getGatewayHealth = (gateway) => {
     }
   }, [
     buildHistorianExportRows,
+    fetchAllHistorianRowsForExport,
+    decorateHistorianRow,
     historianExportFormat,
     historianExportColumns,
+    historianExportPivot,
     historianExportXlsxTemplate,
   ]);
 
@@ -20931,6 +21456,10 @@ const getGatewayHealth = (gateway) => {
             toggleTheme={toggleTheme}
             onLoginSuccess={(user) => {
               setCurrentUser(user);
+              setSessionEnded(false);
+              // The new token has a life; start counting it down now rather
+              // than discovering it ran out through failing pollers.
+              scheduleSessionRefresh();
               setActivePage("dashboard");
               // Backend flags must_change_password=true after an admin
               // issues a temporary password. Pop the change-password
@@ -21471,7 +22000,12 @@ const getGatewayHealth = (gateway) => {
         </aside>
 
         <main className="content">
-          <div className="content-scroll" style={{ paddingBottom: `${contentBottomPad}px` }}>
+          {/* data-page lets CSS lay a specific page out differently without
+              adding a wrapper element per page. The Interface and Edge
+              settings pages use it to sit their cards in columns on a wide
+              screen instead of one tall stack. */}
+          <div className="content-scroll" data-page={activePage}
+            style={{ paddingBottom: `${contentBottomPad}px` }}>
           {workspaceWarning ? (
             <div className="error workspace-warning" role="alert">
               <strong>You are looking at a different workspace — no data has been lost.</strong>
@@ -21593,6 +22127,31 @@ const getGatewayHealth = (gateway) => {
               </div>
             );
           })()}
+          {/* SESSION-ENDED banner (2026-09-02). A token lasts 4 h over the
+              network and 12 h on the desktop. api.js renews it long before
+              that, so this should be rare - a machine that slept past the
+              grace window, or a session an admin revoked. It exists because
+              the alternative is what was reported: charts holding their last
+              value with no explanation, and every save answering "Token
+              expired". Sits at the top of the banner stack: nothing else on
+              the page can be trusted while it is showing. */}
+          {sessionEnded ? (
+            <div className="error" style={{ marginBottom: 10 }}>
+              <strong>Your session has ended.</strong> The app is still running
+              and collecting - nothing has been lost - but this screen can no
+              longer read or save. Sign in again to carry on.
+              <button type="button" className="btn btn-secondary btn-sm"
+                      style={{ marginLeft: 10 }}
+                      onClick={() => {
+                        // Clear the dead token and return to the sign-in
+                        // screen; a reload alone would land right back here.
+                        try { localStorage.removeItem("trustnode_auth_token"); } catch (_) {}
+                        window.location.reload();
+                      }}>
+                Sign in again
+              </button>
+            </div>
+          ) : null}
           {/* PLC-UNREACHABLE banner (operator 2026-07-19): when a RUNNING
               gateway can't open a connection to its PLC (cable pulled, PLC
               powered down, network/VPN change), every read times out and no
@@ -21607,16 +22166,29 @@ const getGatewayHealth = (gateway) => {
             // whether it's still actively retrying (running) or the watchdog has
             // briefly paused retries (cooled down) — in both cases it will
             // auto-resume when the PLC returns, so the message stays accurate.
+            // The runtime status map outlives the configuration: a worker that
+            // is winding down, or whose gateway was just deleted, still
+            // carries its last error. Naming a gateway the operator cannot see
+            // - or that no longer exists - is noise, so only report gateways
+            // that are actually CONFIGURED.
+            const configuredIds = new Set(
+              (gatewayConfigsRef.current || [])
+                .map((g) => String(g?.id || "")).filter(Boolean));
+            if (configuredIds.size === 0) return null;
             const offline = Object.values(gatewayRuntimeStatuses || {})
-              .filter((rt) => rt && isPlcUnreachableError(rt.last_error));
+              .filter((rt) => rt && isPlcUnreachableError(rt.last_error))
+              .filter((rt) => configuredIds.has(String(rt.gateway_id || "")));
             if (offline.length === 0) return null;
             const names = offline.map((rt) => {
               const gid = String(rt.gateway_id || "");
               const cfg = (gatewayConfigsRef.current || []).find((g) => String(g?.id || "") === gid);
               return cfg?.name || gid || "?";
             }).join(", ");
+            const plcKey = `plc-unreachable:${names}`;
+            if (bannerDismissed(plcKey)) return null;
             return (
-              <div className="lock-note" style={{ marginBottom: 10, borderLeft: "3px solid var(--warning, #d97706)" }}>
+              <div className="lock-note" style={{ marginBottom: 10, borderLeft: "3px solid var(--warning, #d97706)", position: "relative", paddingRight: 34 }}>
+                <BannerDismiss onClick={() => dismissBanner(plcKey)} />
                 <strong>PLC unreachable — waiting to reconnect:</strong> {names}.
                 The gateway is still running and retrying every cycle, but it can't reach the PLC
                 (device offline, cable unplugged, or network change). Collection will
@@ -21625,11 +22197,40 @@ const getGatewayHealth = (gateway) => {
               </div>
             );
           })()}
-          {!isPortalOnly && activePage === "gateway_configuration" && appStoreHydrated && startupWarningsReady && unknownRunningGateways.length ? (
-            <div className="error">
-              Found running gateway workers not mapped in this page ({unknownRunningGateways.map((g) => g.gateway_id).join(", ")}).
-              Use "Stop All" to stop every worker.
+          {/* The stored configuration could not be read. Everything on screen
+              is therefore blank React state, NOT the operator's setup - and
+              saving from here would overwrite a rack nobody has seen. Writing
+              is already blocked; this says why, because an empty page that
+              quietly ignores saves is how a PLC vanished on 2026-08-30. */}
+          {!isPortalOnly && appStoreHydrated && !configReadOk ? (
+            <div className="error" style={{ marginBottom: 10 }}>
+              <strong>Configuration not loaded.</strong> The edge did not return your
+              stored setup{configReadError ? ` (${configReadError})` : ""}, so this page is
+              showing nothing rather than what is saved. Editing is disabled and no change
+              will be written — your stored gateways, devices and dashboards are untouched.
+              <button
+                className="btn btn-sm"
+                style={{ marginLeft: 10 }}
+                onClick={() => window.location.reload()}
+              >
+                Reload
+              </button>
             </div>
+          ) : null}
+          {!isPortalOnly && activePage === "gateway_configuration" && appStoreHydrated && startupWarningsReady && unknownRunningGateways.length ? (
+            (() => {
+              const ids = unknownRunningGateways.map((g) => g.gateway_id).join(", ");
+              const key = `unmapped-workers:${ids}`;
+              if (bannerDismissed(key)) return null;
+              return (
+                <div className="error" style={{ position: "relative", paddingRight: 34 }}>
+                  <BannerDismiss onClick={() => dismissBanner(key)} />
+                  Found running gateway workers not mapped in this page ({ids}).
+                  They stop automatically when their gateway is deleted; use "Stop All"
+                  to stop every worker now.
+                </div>
+              );
+            })()
           ) : null}
           {/* Data Continuity banner (operator 2026-06-19). Shows when the
               local historian has rows under tenant_ids OTHER than the
@@ -22223,6 +22824,39 @@ const getGatewayHealth = (gateway) => {
                         <button type="button" className={powerMainMetric === "energy_kwh" ? "active" : ""} onClick={() => setPowerMainMetric("energy_kwh")}>kWh</button>
                         <button type="button" className={powerMainMetric === "voltage_v" ? "active" : ""} onClick={() => setPowerMainMetric("voltage_v")}>V</button>
                       </div>
+                    {/* One chip per series the data produced - the meter's
+                        total and its phases. Clicking one hides or shows that
+                        line; the choice persists with the other chart
+                        settings. A three-phase meter draws three lines for A
+                        and V, and one for W, because the EM122 map has only a
+                        total power register. */}
+                    {(powerMainChartData.series || []).length > 1 ? (
+                      <div className="pwr-series-chips">
+                        {(powerMainChartData.series || []).map((sr, idx) => {
+                          const hidden = powerChartSettings.main.hidden_meters.includes(String(sr.key));
+                          const colour = (powerChartSettings.main.series_colors || {})[String(sr.key)]
+                            || getSeriesColor(idx);
+                          return (
+                            <button
+                              type="button"
+                              key={`pwr-chip-${sr.key}`}
+                              className={`pwr-series-chip${hidden ? " is-hidden" : ""}`}
+                              title={hidden ? "Show this series" : "Hide this series"}
+                              onClick={() => setPowerChartSettings((prev) => {
+                                const cur = prev.main.hidden_meters || [];
+                                const next = cur.includes(String(sr.key))
+                                  ? cur.filter((k) => k !== String(sr.key))
+                                  : [...cur, String(sr.key)];
+                                return { ...prev, main: { ...prev.main, hidden_meters: next } };
+                              })}
+                            >
+                              <span className="pwr-series-dot" style={{ background: colour }} />
+                              {powerSeriesLabel(sr)}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : null}
                       <button
                         type="button"
                         className="icon-btn table-action-btn pwr-chart-edit-btn"
@@ -22247,9 +22881,11 @@ const getGatewayHealth = (gateway) => {
                         {/* Same grid/legend styling as the dashboard chart widget
                             so Power Overview charts visually match the rest of
                             the app. */}
-                        <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                        <CartesianGrid {...gridProps()} />
                         <XAxis
                           dataKey="ts"
+                          angle={Number(powerChartSettings.main.chart_x_tick_angle) || 0}
+                          textAnchor={Number(powerChartSettings.main.chart_x_tick_angle) ? "end" : "middle"}
                           ticks={powerMainXAxisTicks}
                           minTickGap={22}
                           interval="preserveStartEnd"
@@ -22263,7 +22899,7 @@ const getGatewayHealth = (gateway) => {
                           height={30}
                           tickMargin={6}
                           tickFormatter={formatPowerMainXAxisTick}
-                          tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                          tick={axisTick(powerChartSettings.main, powerChartAxisColor)}
                           axisLine={{ stroke: powerChartAxisColor }}
                           tickLine={{ stroke: powerChartAxisColor }}
                         />
@@ -22282,10 +22918,10 @@ const getGatewayHealth = (gateway) => {
                             const unit = customUnit || defaultUnit;
                             return `${formatChartValue(v, 3)} ${unit}`;
                           }}
-                          tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                          tick={axisTick(powerChartSettings.main, powerChartAxisColor)}
                           axisLine={{ stroke: powerChartAxisColor }}
                           tickLine={{ stroke: powerChartAxisColor }}
-                          label={powerChartSettings.main.y_label ? { value: powerChartSettings.main.y_label, angle: -90, position: "insideLeft", style: { fontSize: 11, fill: powerChartAxisColor } } : undefined}
+                          label={powerChartSettings.main.y_label ? { value: powerChartSettings.main.y_label, angle: -90, position: "insideLeft", style: { fontSize: labelFontPx(powerChartSettings.main), fill: powerChartAxisColor } } : undefined}
                         />
                         {powerChartSettings.main.secondary_meters.length ? (
                           <YAxis
@@ -22297,10 +22933,10 @@ const getGatewayHealth = (gateway) => {
                               Number.isFinite(Number(powerChartSettings.main.y2_max)) ? Number(powerChartSettings.main.y2_max) : "auto",
                             ]}
                             tickFormatter={(v) => `${formatChartValue(v, 3)}${powerChartSettings.main.y2_unit ? " " + powerChartSettings.main.y2_unit : ""}`}
-                            tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                            tick={axisTick(powerChartSettings.main, powerChartAxisColor)}
                             axisLine={{ stroke: powerChartAxisColor }}
                             tickLine={{ stroke: powerChartAxisColor }}
-                            label={powerChartSettings.main.y2_label ? { value: powerChartSettings.main.y2_label, angle: 90, position: "insideRight", style: { fontSize: 11, fill: powerChartAxisColor } } : undefined}
+                            label={powerChartSettings.main.y2_label ? { value: powerChartSettings.main.y2_label, angle: 90, position: "insideRight", style: { fontSize: labelFontPx(powerChartSettings.main), fill: powerChartAxisColor } } : undefined}
                           />
                         ) : null}
                         <Tooltip formatter={(v) => formatChartValue(v, 3)} />
@@ -22310,15 +22946,15 @@ const getGatewayHealth = (gateway) => {
                             {powerChartSettings.main.show_total !== false ? (
                               <Bar yAxisId="left" dataKey="total" name="Total" fill="#16a34a" isAnimationActive={false} />
                             ) : null}
-                            {(powerConfig?.devices || [])
-                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
-                              .map((d, idx) => (
+                            {(powerMainChartData.series || [])
+                              .filter((sr) => !powerChartSettings.main.hidden_meters.includes(String(sr.key)))
+                              .map((sr, idx) => (
                                 <Bar
-                                  key={`pwr-bar-${d.id}`}
-                                  yAxisId={powerChartSettings.main.secondary_meters.includes(String(d.id)) ? "right" : "left"}
-                                  dataKey={String(d.id)}
-                                  name={String(d.name || d.id)}
-                                  fill={(powerChartSettings.main.series_colors || {})[String(d.id)] || getSeriesColor(idx)}
+                                  key={`pwr-bar-${sr.key}`}
+                                  yAxisId={powerChartSettings.main.secondary_meters.includes(String(sr.key)) ? "right" : "left"}
+                                  dataKey={String(sr.key)}
+                                  name={powerSeriesLabel(sr)}
+                                  fill={(powerChartSettings.main.series_colors || {})[String(sr.key)] || getSeriesColor(idx)}
                                   isAnimationActive={false}
                                 />
                               ))}
@@ -22328,28 +22964,29 @@ const getGatewayHealth = (gateway) => {
                             {powerChartSettings.main.show_total !== false ? (
                               <Area
                                 yAxisId="left"
+                                baseValue={0}
                                 type={powerChartSettings.main.interpolation || "stepAfter"}
                                 dataKey="total"
                                 name="Total"
                                 stroke="#16a34a"
                                 fill="#16a34a"
-                                fillOpacity={0.16}
-                                strokeWidth={2}
-                                dot={false}
+                                fillOpacity={CHART_BASE.area_fill_opacity}
+                                strokeWidth={Number(powerChartSettings.main.chart_line_width) || CHART_BASE.line_width}
+                                dot={Boolean(powerChartSettings.main.chart_line_dot)}
                                 isAnimationActive={false}
                               />
                             ) : null}
-                            {(powerConfig?.devices || [])
-                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
-                              .map((d, idx) => (
+                            {(powerMainChartData.series || [])
+                              .filter((sr) => !powerChartSettings.main.hidden_meters.includes(String(sr.key)))
+                              .map((sr, idx) => (
                                 <Area
-                                  key={`pwr-area-${d.id}`}
-                                  yAxisId={powerChartSettings.main.secondary_meters.includes(String(d.id)) ? "right" : "left"}
+                                  key={`pwr-area-${sr.key}`}
+                                  yAxisId={powerChartSettings.main.secondary_meters.includes(String(sr.key)) ? "right" : "left"}
                                   type={powerChartSettings.main.interpolation || "stepAfter"}
-                                  dataKey={String(d.id)}
-                                  name={String(d.name || d.id)}
-                                  stroke={(powerChartSettings.main.series_colors || {})[String(d.id)] || getSeriesColor(idx)}
-                                  fill={(powerChartSettings.main.series_colors || {})[String(d.id)] || getSeriesColor(idx)}
+                                  dataKey={String(sr.key)}
+                                  name={powerSeriesLabel(sr)}
+                                  stroke={(powerChartSettings.main.series_colors || {})[String(sr.key)] || getSeriesColor(idx)}
+                                  fill={(powerChartSettings.main.series_colors || {})[String(sr.key)] || getSeriesColor(idx)}
                                   fillOpacity={0.1}
                                   strokeWidth={1.6}
                                   dot={false}
@@ -22362,16 +22999,16 @@ const getGatewayHealth = (gateway) => {
                             {powerChartSettings.main.show_total !== false ? (
                               <Line yAxisId="left" type={powerChartSettings.main.interpolation || "stepAfter"} dataKey="total" name="Total" stroke="#16a34a" strokeWidth={2} dot={powerChartSettings.main.show_point_labels} isAnimationActive={false} />
                             ) : null}
-                            {(powerConfig?.devices || [])
-                              .filter((d) => powerMainChartData.meterIds.includes(String(d?.id || "")) && !powerChartSettings.main.hidden_meters.includes(String(d?.id || "")))
-                              .map((d, idx) => (
+                            {(powerMainChartData.series || [])
+                              .filter((sr) => !powerChartSettings.main.hidden_meters.includes(String(sr.key)))
+                              .map((sr, idx) => (
                                 <Line
-                                  key={`pwr-line-${d.id}`}
-                                  yAxisId={powerChartSettings.main.secondary_meters.includes(String(d.id)) ? "right" : "left"}
+                                  key={`pwr-line-${sr.key}`}
+                                  yAxisId={powerChartSettings.main.secondary_meters.includes(String(sr.key)) ? "right" : "left"}
                                   type={powerChartSettings.main.interpolation || "stepAfter"}
-                                  dataKey={String(d.id)}
-                                  name={String(d.name || d.id)}
-                                  stroke={(powerChartSettings.main.series_colors || {})[String(d.id)] || getSeriesColor(idx)}
+                                  dataKey={String(sr.key)}
+                                  name={powerSeriesLabel(sr)}
+                                  stroke={(powerChartSettings.main.series_colors || {})[String(sr.key)] || getSeriesColor(idx)}
                                   strokeWidth={1.6}
                                   dot={powerChartSettings.main.show_point_labels}
                                   isAnimationActive={false}
@@ -22423,7 +23060,7 @@ const getGatewayHealth = (gateway) => {
                         data={powerSideChartData.rows}
                         margin={{ top: 6, right: 8, left: 4, bottom: 8 }}
                       >
-                        <CartesianGrid stroke="var(--line, rgba(255,255,255,0.07))" strokeDasharray="3 3" />
+                        <CartesianGrid {...gridProps()} />
                         <XAxis
                           dataKey="ts"
                           ticks={powerSideXAxisTicks}
@@ -22437,7 +23074,7 @@ const getGatewayHealth = (gateway) => {
                           height={30}
                           tickMargin={6}
                           tickFormatter={formatPowerSideXAxisTick}
-                          tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                          tick={axisTick(powerChartSettings.main, powerChartAxisColor)}
                           axisLine={{ stroke: powerChartAxisColor }}
                           tickLine={{ stroke: powerChartAxisColor }}
                         />
@@ -22446,7 +23083,7 @@ const getGatewayHealth = (gateway) => {
                           domain={powerSideYDomain}
                           ticks={buildYAxisTicks(powerSideYDomain, 0.5, Math.max(4, Math.floor(Number(powerChartSettings.side.height || 280) / 55)))}
                           tickFormatter={(v) => `${formatChartValue(v, 3)} ${powerChartSettings.side.y_unit || "kWh"}`}
-                          tick={{ fontSize: 11, fill: powerChartAxisColor }}
+                          tick={axisTick(powerChartSettings.main, powerChartAxisColor)}
                           axisLine={{ stroke: powerChartAxisColor }}
                           tickLine={{ stroke: powerChartAxisColor }}
                         />
@@ -23300,7 +23937,15 @@ const getGatewayHealth = (gateway) => {
           {activePage === "gateway_configuration" ? (
             <>
               <section className="page-tools">
-                <button className="btn btn-primary icon-text-btn" onClick={openAddGatewayConfig} disabled={!canEditPage("gateway_configuration")}>
+                <button
+                  className="btn btn-primary icon-text-btn"
+                  onClick={openAddGatewayConfig}
+                  // Adding to a list that never loaded is what overwrote the
+                  // stored rack. Until the read succeeds there is nothing safe
+                  // to add to.
+                  disabled={!canEditPage("gateway_configuration") || !configReadOk}
+                  title={configReadOk ? "" : "Configuration has not loaded yet"}
+                >
                   <AddIcon />
                   <span>Add Gateway</span>
                 </button>
@@ -23339,8 +23984,16 @@ const getGatewayHealth = (gateway) => {
                     const running = enabledByOp;
                     const configuredIntervalMs = Number(d?.poll_interval_ms || 1000);
                     const hasError = enabledByOp && st?.last_error && !st?.connected;
-                    const statusKey = !enabledByOp ? "warning" : hasError ? "offline" : "online";
-                    const statusText = !enabledByOp ? "STOPPED" : hasError ? "ERROR" : "RUNNING";
+                    // A meter obeys collection triggers too (2026-09-02), so it
+                    // can be up and writing nothing. Same wording as a gateway
+                    // row - one vocabulary for one condition.
+                    const meterPaused = Boolean(enabledByOp && !hasError
+                      && st?.collection_blocked);
+                    const meterPauseReason = String(st?.collection_block_reason || "").trim();
+                    const statusKey = !enabledByOp ? "warning" : hasError ? "offline"
+                      : meterPaused ? "warning" : "online";
+                    const statusText = !enabledByOp ? "STOPPED" : hasError ? "ERROR"
+                      : meterPaused ? "COLLECTION PAUSED" : "RUNNING";
                     const tags = Object.keys(d?.registers || {}).filter((k) => !String(k).endsWith("_raw"));
                     return (
                       <div key={`gw-power-row-${did}`} className="trow">
@@ -23351,7 +24004,8 @@ const getGatewayHealth = (gateway) => {
                         <span>{dbName}</span>
                         <span>{`${configuredIntervalMs} ms`}</span>
                         <span>
-                          <div className={`status-pill status-${statusKey}`}>{statusText}</div>
+                          <div className={`status-pill status-${statusKey}`}
+                               title={meterPauseReason || undefined}>{statusText}</div>
                           <div className="muted status-sub">{String(st?.last_error || "").slice(0, 40)}</div>
                         </span>
                         <span className="tags-cell">
@@ -23428,8 +24082,38 @@ const getGatewayHealth = (gateway) => {
                     const pending = Number(runtimeStatus?.db_pending_count || 0);
                     const writes = Number(runtimeStatus?.db_write_count || 0);
                     const configuredIntervalMs = Number(g.interval_ms || 0);
-                    const statusKey = runtimeStatus?.db_last_error ? "offline" : running ? "online" : "warning";
-                    const statusText = running ? "RUNNING" : "STOPPED";
+                    // A press is pending until the poll agrees with it, and a
+                    // worker that has not produced readings yet is starting -
+                    // neither is RUNNING and neither is STOPPED.
+                    const pendingAct = String(runtimeStatus?.__pending || "");
+                    // Pending until the polled `running` agrees with what was
+                    // asked for, and no longer than 20 s so a failed start
+                    // cannot leave the row spinning forever.
+                    const pendingFresh = Boolean(pendingAct)
+                      && (Date.now() - Number(runtimeStatus?.__pending_at || 0)) < 20000
+                      && ((pendingAct === "start") !== running);
+                    const startingUp = Boolean(runtimeStatus?.starting);
+                    const transitional = pendingFresh || (running && startingUp);
+                    // 2026-09-02: RUNNING but writing nothing, because a
+                    // collection trigger's condition is not met. Shown apart
+                    // from RUNNING because a row that says RUNNING beside a
+                    // chart that has stopped moving is the reading an
+                    // operator cannot act on - they cannot tell a rule they
+                    // wrote from a PLC that has died. Not an error state
+                    // either: the gateway is up and resumes on its own.
+                    const collectionPaused = Boolean(running && !transitional
+                      && runtimeStatus?.collection_blocked);
+                    const pauseReason = String(runtimeStatus?.collection_block_reason || "").trim();
+                    const statusKey = runtimeStatus?.db_last_error
+                      ? "offline"
+                      : transitional ? "warning"
+                      : collectionPaused ? "warning"
+                      : running ? "online" : "warning";
+                    const statusText = pendingFresh
+                      ? (pendingAct === "start" ? "STARTING…" : "STOPPING…")
+                      : (running && startingUp) ? "STARTING…"
+                      : collectionPaused ? "COLLECTION PAUSED"
+                      : running ? "RUNNING" : "STOPPED";
                     return (
                       <div
                         key={g.id}
@@ -23444,7 +24128,10 @@ const getGatewayHealth = (gateway) => {
                         <span>{dbName}</span>
                         <span>{`${configuredIntervalMs} ms`}</span>
                         <span>
-                          <div className={`status-pill status-${statusKey}`}>{statusText}</div>
+                          <div className={`status-pill status-${statusKey}`}
+                               title={collectionPaused
+                                 ? (pauseReason || "A collection trigger condition is not met.")
+                                 : undefined}>{statusText}</div>
                           <div className="muted status-sub">
                             <span>W:{writes}</span>
                             {" "}
@@ -24964,7 +25651,33 @@ const getGatewayHealth = (gateway) => {
               configuration screens can offer the EXISTING collection records
               rather than inventing their own. */}
           {activePage === "oee_overview" ? (
-            <OeeOverviewPage canEdit={canEditPage("oee_configuration") || currentUser?.role === "admin"} />
+            <OeeOverviewPage
+              canEdit={canEditPage("oee_configuration") || currentUser?.role === "admin"}
+              selection={oeeSelection}
+              onSelectionChange={setOeeSelection}
+              onOpenMachine={(card) => { setOeeMachine(card); handleNavClick("oee_machine_detail"); }}
+            />
+          ) : null}
+          {activePage === "oee_machine_detail" ? (
+            <OeeMachineDetailPage
+              machine={oeeMachine}
+              selection={oeeSelection}
+              onSelectionChange={setOeeSelection}
+              /* The same expression the Operator Screen uses, because it is
+                 the same work against the same endpoints: classifying a stop
+                 and recording a count. canEditPage is an EDIT-rights check,
+                 so a viewer still gets none of it. Note this is a UI gate -
+                 /api/oee/operator/* does not call _require_write, so the
+                 buttons are hidden but the endpoints are not closed. */
+              canEdit={canEditPage("oee") || canEditPage("oee_configuration")
+                       || currentUser?.role === "admin"}
+              onBack={() => handleNavClick("oee_overview")}
+            />
+          ) : null}
+          {activePage === "oee_planning" ? (
+            <OeePlanningCalendarPage
+              canEdit={canEditPage("oee_planning") || currentUser?.role === "admin"}
+            />
           ) : null}
           {activePage === "oee_operator" ? (
             <OeeOperatorPage canEdit={canEditPage("oee") || canEditPage("oee_configuration") || currentUser?.role === "admin"} />
@@ -26397,6 +27110,24 @@ const getGatewayHealth = (gateway) => {
             </div>
           ) : null}
 
+          {activePage === "data_export" ? (
+            <DataExportPage
+              api={{
+                exportOptions,
+                exportSources,
+                exportPreview,
+                exportServerSide,
+                exportClientSide,
+              }}
+              // Local edge streams from SQLite; a cloud client pages it here.
+              // The operator's rule, 2026-08-31.
+              isCloudClient={Boolean(isHostedWebClient && endpointMode === "cloud")}
+              onError={(err) => addAppLog({
+                level: "error", category: "export",
+                message: `Data export: ${String(err?.message || err)}`,
+              })}
+            />
+          ) : null}
           {activePage === "logs" ? (
             <div className="page-fill">
               <section className="card">
@@ -28543,13 +29274,20 @@ const getGatewayHealth = (gateway) => {
           ) : null}
           {!isPortalOnly ? (
           <button
-            className={`footer-toggle-fab ${!gatewayRuntimeReady ? "checking" : (anyGatewayRunning ? "running" : "stopped")} ${footerCollapsed ? "is-collapsed" : "is-expanded"}`}
+            className={`footer-toggle-fab ${!gatewayRuntimeReady ? "checking" : (gatewayCollectionPaused ? "paused" : (anyGatewayRunning ? "running" : "stopped"))} ${footerCollapsed ? "is-collapsed" : "is-expanded"}`}
             onClick={() => setFooterCollapsed((v) => !v)}
             type="button"
-            title={footerCollapsed ? "Show footer" : "Hide footer"}
+            title={gatewayCollectionPaused
+              ? (gatewayCollectionPaused.reason
+                 || "A collection trigger condition is not met, so nothing is being written.")
+              : (footerCollapsed ? "Show footer" : "Hide footer")}
             style={{ bottom: footerCollapsed ? 12 : Math.max(12, footerHeight + 10) }}
           >
-            {!gatewayRuntimeReady ? "Checking…" : (anyGatewayRunning ? "Running" : "Stopped")}
+            {!gatewayRuntimeReady
+              ? "Checking…"
+              : (gatewayCollectionPaused
+                 ? "Collection Paused"
+                 : (anyGatewayRunning ? "Running" : "Stopped"))}
           </button>
           ) : null}
         </main>
@@ -29257,6 +29995,8 @@ const getGatewayHealth = (gateway) => {
                         ...(changed ? {
                           tags_text: "",
                           ifm_datapoints: [],
+                          point_io_modules: [],
+                          point_io_points: [],
                           eip_signals: [],
                           ifm_ports: [],
                         } : {}),
@@ -29494,6 +30234,13 @@ const getGatewayHealth = (gateway) => {
               </label>
               {gatewayForm.gateway_type === "ethernet_ip" ? (
                 <EthernetIpMapper
+                  form={gatewayForm}
+                  disabled={!canEditPage("gateway_configuration")}
+                  onChange={(patch) => setGatewayForm((prev) => ({ ...prev, ...patch }))}
+                />
+              ) : null}
+              {gatewayForm.gateway_type === "point_io" ? (
+                <PointIoMapper
                   form={gatewayForm}
                   disabled={!canEditPage("gateway_configuration")}
                   onChange={(patch) => setGatewayForm((prev) => ({ ...prev, ...patch }))}
@@ -30164,6 +30911,35 @@ const getGatewayHealth = (gateway) => {
                   disabled={!canEditPage("devices")}
                 />
               </label>
+              {deviceForm.gateway_type === "ifm_iolink" ? (
+                <label>
+                  Connected via
+                  <select
+                    value="iot"
+                    onChange={(e) => {
+                      if (e.target.value !== "fieldbus") return;
+                      // Fieldbus is EtherNet/IP on 44818, which is a different
+                      // driver - not an ifm setting. Switching the type here
+                      // is what stops the block being configured for a port
+                      // it does not serve.
+                      setDeviceForm({
+                        ...deviceForm,
+                        gateway_type: "ethernet_ip",
+                        ifm_http_port: 0,
+                      });
+                    }}
+                    disabled={!canEditPage("devices")}
+                  >
+                    <option value="iot">IoT Core - HTTP on port 80</option>
+                    <option value="fieldbus">Fieldbus - EtherNet/IP on port 44818</option>
+                  </select>
+                  <small className="hint">
+                    Which socket the block is cabled to. A block on its fieldbus
+                    socket serves no IoT Core, so it must be read over
+                    EtherNet/IP instead.
+                  </small>
+                </label>
+              ) : null}
               {deviceForm.gateway_type === "ifm_iolink" ? (
                 <label>
                   IoT Core Port
@@ -31617,10 +32393,30 @@ const getGatewayHealth = (gateway) => {
                 }}><option value="single_phase">Single Phase</option><option value="three_phase">Three Phase</option></select></label>
                 <div className="pwr-check-pair">
                   <label className="pwr-check"><input type="checkbox" checked={Boolean(powerDeviceForm.voltage_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, voltage_connected: e.target.checked })} /><span>Voltage connected</span></label>
-                  <label className="pwr-check"><input type="checkbox" checked={Boolean(powerDeviceForm.ct_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_connected: e.target.checked })} /><span>CT connected</span></label>
+                  {/* 2026-09-02: a meter with INTEGRATED measurement takes no
+                      external CTs, so offering a CT ratio invites somebody to
+                      fill in 80/5 on a meter that has none - which is exactly
+                      what was found on the live EM122. The meter reports
+                      primary-side values itself; nothing multiplies by this
+                      ratio, so a number typed here is quietly meaningless.
+                      Hidden rather than disabled: an input nobody may use is
+                      not information. */}
+                  {powerMeterUsesCts ? (
+                    <label className="pwr-check"><input type="checkbox" checked={Boolean(powerDeviceForm.ct_connected)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_connected: e.target.checked })} /><span>CT connected</span></label>
+                  ) : null}
                 </div>
-                <label><span>CT Primary (A)</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_primary ?? 80)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_primary: Number(e.target.value || 80) })} /></label>
-                <label><span>CT Secondary (A)</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_secondary ?? 5)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_secondary: Number(e.target.value || 5) })} /></label>
+                {powerMeterUsesCts ? (
+                  <>
+                    <label><span>CT Primary (A)</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_primary ?? 80)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_primary: Number(e.target.value || 80) })} /></label>
+                    <label><span>CT Secondary (A)</span><input type="number" step="0.1" value={Number(powerDeviceForm.ct_secondary ?? 5)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, ct_secondary: Number(e.target.value || 5) })} /></label>
+                  </>
+                ) : (
+                  <div className="info-note pwr-span-2" style={{ fontSize: 12 }}>
+                    This meter measures directly and takes no external current
+                    transformers, so there is no CT ratio to set. It reports
+                    primary-side values itself.
+                  </div>
+                )}
                 <label><span>VT Primary (V)</span><input type="number" step="0.1" value={Number(powerDeviceForm.vt_primary ?? 230)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_primary: Number(e.target.value || 230) })} /></label>
                 <label><span>VT Secondary (V)</span><input type="number" step="0.1" value={Number(powerDeviceForm.vt_secondary ?? 230)} onChange={(e) => setPowerDeviceForm({ ...powerDeviceForm, vt_secondary: Number(e.target.value || 230) })} /></label>
               </div>
@@ -32002,14 +32798,48 @@ const getGatewayHealth = (gateway) => {
                         <option value="bar">Bar</option>
                       </select>
                     </label>
-                    <label><span>Interpolation</span>
-                      <select value={current.interpolation || "stepAfter"} onChange={(e) => setField("interpolation", e.target.value)}>
-                        <option value="stepAfter">Step after</option>
-                        <option value="monotone">Monotone</option>
-                        <option value="linear">Linear</option>
-                        <option value="basis">Basis</option>
-                        <option value="natural">Natural</option>
+                    <label><span>Curve</span>
+                      <select value={current.interpolation || "stepAfter"}
+                        title={"How the line is drawn between samples. Step is the truthful "
+                          + "default for sampled process data: a 1 Hz reading is a value held "
+                          + "until the next sample, not a ramp between two readings."}
+                        onChange={(e) => setField("interpolation", e.target.value)}>
+                        {CURVE_TYPES.map(([v, label]) => (
+                          <option key={v} value={v}>{label}</option>
+                        ))}
                       </select>
+                    </label>
+                    {/* The same controls the dashboard chart widgets carry, so
+                        a chart looks the same on either page. */}
+                    <label><span>Line width</span>
+                      <input type="number" min="1" max="6" step="0.5"
+                        value={Number(current.chart_line_width) || 2}
+                        onChange={(e) => setField("chart_line_width",
+                          Math.max(1, Math.min(6, Number(e.target.value || 2))))} />
+                    </label>
+                    <label><span>X label angle</span>
+                      <input type="number" min="-90" max="90" step="15"
+                        value={Number(current.chart_x_tick_angle) || 0}
+                        onChange={(e) => setField("chart_x_tick_angle",
+                          Math.max(-90, Math.min(90, Number(e.target.value || 0))))} />
+                    </label>
+                    <label><span>Axis text size</span>
+                      <input type="number" min="0.3" max="4" step="0.1"
+                        value={Number(current.font_axis_scale) || 1}
+                        onChange={(e) => setField("font_axis_scale",
+                          Math.max(0.3, Math.min(4, Number(e.target.value || 1))))} />
+                    </label>
+                    <label><span>Label text size</span>
+                      <input type="number" min="0.3" max="4" step="0.1"
+                        value={Number(current.font_labels_scale) || 1}
+                        onChange={(e) => setField("font_labels_scale",
+                          Math.max(0.3, Math.min(4, Number(e.target.value || 1))))} />
+                    </label>
+                    <label><span>Legend text size</span>
+                      <input type="number" min="0.3" max="4" step="0.1"
+                        value={Number(current.font_legend_scale) || 1}
+                        onChange={(e) => setField("font_legend_scale",
+                          Math.max(0.3, Math.min(4, Number(e.target.value || 1))))} />
                     </label>
                     <label><span>Reading points</span>
                       <input type="number" min="10" max="2000" value={Number(current.readings_count || 200)} onChange={(e) => setField("readings_count", Math.max(10, Math.min(2000, Number(e.target.value || 200))))} />
@@ -32204,11 +33034,91 @@ const getGatewayHealth = (gateway) => {
                   disabled={!canEditPage("triggers_and_limits")}
                 >
                   <option value="">Select gateway</option>
+                  {/* 2026-09-02: a rule about the plant rather than one
+                      machine. Scope "*" gates every gateway - PLC, meter, ifm
+                      alike - which is what "all gateways" has to mean for a
+                      shift schedule. */}
+                  <option value="*">All gateways</option>
                   {allGatewayOptions.map((g) => (
                     <option key={g.id} value={g.id}>{g.power_meter ? `${g.name} (Power Meter)` : g.name}</option>
                   ))}
                 </select>
               </label>
+              <label>
+                Trigger on
+                <select
+                  value={collectionTriggerForm.kind || "tag"}
+                  onChange={(e) => setCollectionTriggerForm({ ...collectionTriggerForm, kind: e.target.value })}
+                  disabled={!canEditPage("triggers_and_limits")}
+                >
+                  <option value="tag">A tag value</option>
+                  <option value="schedule">A schedule</option>
+                </select>
+              </label>
+              {(collectionTriggerForm.kind || "tag") === "schedule" ? (
+                <>
+                  <label>
+                    Repeat
+                    <select
+                      value={collectionTriggerForm.schedule_interval || "daily"}
+                      onChange={(e) => setCollectionTriggerForm({ ...collectionTriggerForm, schedule_interval: e.target.value })}
+                      disabled={!canEditPage("triggers_and_limits")}
+                    >
+                      <option value="continuous">Continuous (no time limit)</option>
+                      <option value="hourly">Hourly</option>
+                      <option value="daily">Daily</option>
+                      <option value="monthly">Monthly</option>
+                      <option value="one_time">One time</option>
+                    </select>
+                  </label>
+                  {(collectionTriggerForm.schedule_interval || "daily") !== "continuous" ? (
+                    <>
+                      <label>
+                        {(collectionTriggerForm.schedule_interval === "hourly") ? "From (minute)" : "From"}
+                        <input
+                          type="time"
+                          value={collectionTriggerForm.schedule_start || "08:00"}
+                          onChange={(e) => setCollectionTriggerForm({ ...collectionTriggerForm, schedule_start: e.target.value })}
+                          disabled={!canEditPage("triggers_and_limits")}
+                        />
+                      </label>
+                      <label>
+                        {(collectionTriggerForm.schedule_interval === "hourly") ? "To (minute)" : "To"}
+                        <input
+                          type="time"
+                          value={collectionTriggerForm.schedule_stop || "18:00"}
+                          onChange={(e) => setCollectionTriggerForm({ ...collectionTriggerForm, schedule_stop: e.target.value })}
+                          disabled={!canEditPage("triggers_and_limits")}
+                        />
+                      </label>
+                    </>
+                  ) : null}
+                  {collectionTriggerForm.schedule_interval === "monthly" ? (
+                    <label>
+                      Day of month
+                      <input
+                        type="number" min="1" max="31"
+                        value={Number(collectionTriggerForm.schedule_day_of_month || 1)}
+                        onChange={(e) => setCollectionTriggerForm({ ...collectionTriggerForm, schedule_day_of_month: Number(e.target.value || 1) })}
+                        disabled={!canEditPage("triggers_and_limits")}
+                      />
+                      <small className="hint">A rule set for the 31st still runs in February - it lands on the last day.</small>
+                    </label>
+                  ) : null}
+                  {collectionTriggerForm.schedule_interval === "one_time" ? (
+                    <label>
+                      On date
+                      <input
+                        type="date"
+                        value={collectionTriggerForm.schedule_date || ""}
+                        onChange={(e) => setCollectionTriggerForm({ ...collectionTriggerForm, schedule_date: e.target.value })}
+                        disabled={!canEditPage("triggers_and_limits")}
+                      />
+                    </label>
+                  ) : null}
+                </>
+              ) : (
+                <>
               <label>
                 Tag
                 <select
@@ -32246,6 +33156,8 @@ const getGatewayHealth = (gateway) => {
                   placeholder="Value"
                 />
               </label>
+                </>
+              )}
               <label>
                 Trigger Type
                 <select
@@ -32935,6 +33847,27 @@ function CsvFormatSection({ dbForm, setDbForm, canEdit }) {
         </div>
       ) : null}
     </section>
+  );
+}
+
+// A small "dismiss" affordance for banners. Banners that cannot be dismissed
+// stop being read: the operator learns that the top of the screen is always
+// red and stops looking, which is how a real message gets missed.
+function BannerDismiss({ onClick }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title="Dismiss this message"
+      aria-label="Dismiss this message"
+      style={{
+        position: "absolute", top: 6, right: 8, lineHeight: 1,
+        background: "transparent", border: "none", cursor: "pointer",
+        fontSize: 16, opacity: 0.6, padding: "2px 6px", color: "inherit",
+      }}
+    >
+      ×
+    </button>
   );
 }
 

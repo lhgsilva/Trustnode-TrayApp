@@ -241,7 +241,120 @@ export function describeApiError(body) {
   try { return JSON.stringify(body); } catch { return String(body); }
 }
 
+/* --------------------------------------------------------------- session ---
+   The token is a JWT and carries its own expiry; reading it is what lets the
+   app renew before it dies rather than discover the fact through 22 failing
+   pollers. */
+let _sessionExpired = false;
+let _refreshInFlight = null;
+let _refreshTimer = null;
+
+function _tokenExpiryMs(token) {
+  try {
+    const body = String(token || "").split(".")[1];
+    if (!body) return 0;
+    const json = atob(body.replace(/-/g, "+").replace(/_/g, "/"));
+    const exp = Number(JSON.parse(json).exp || 0);
+    return Number.isFinite(exp) && exp > 0 ? exp * 1000 : 0;
+  } catch (_) {
+    return 0;                       // unreadable: treated as "cannot schedule"
+  }
+}
+
+export function sessionIsExpired() {
+  return _sessionExpired;
+}
+
+function _markSessionExpired(detail) {
+  if (_sessionExpired) return;
+  _sessionExpired = true;
+  if (_refreshTimer) {
+    clearTimeout(_refreshTimer);
+    _refreshTimer = null;
+  }
+  try {
+    window.dispatchEvent(new CustomEvent("trustnode:session-expired",
+                                         { detail: detail || {} }));
+  } catch (_) { /* not a browser: nothing to notify */ }
+}
+
+/* One renewal at a time. Twenty-two pollers hitting a 401 at the same instant
+   must produce ONE refresh, not twenty-two. */
+export function refreshSession() {
+  if (_refreshInFlight) return _refreshInFlight;
+  const token = localStorage.getItem(AUTH_TOKEN_KEY) || "";
+  if (!token) {
+    _markSessionExpired({ reason: "no token" });
+    return Promise.resolve(false);
+  }
+  const url = `${getControlApiBase()}/api/auth/refresh`;
+  _refreshInFlight = (async () => {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json",
+                   Authorization: `Bearer ${token}` },
+        credentials: "include",
+      });
+      if (!res.ok) {
+        _markSessionExpired({ reason: `refresh ${res.status}` });
+        return false;
+      }
+      const body = await res.json();
+      if (!body || !body.token) {
+        _markSessionExpired({ reason: "refresh returned no token" });
+        return false;
+      }
+      localStorage.setItem(AUTH_TOKEN_KEY, body.token);
+      _sessionExpired = false;
+      scheduleSessionRefresh();
+      return true;
+    } catch (err) {
+      // A network blip is NOT an expired session - the token may well still
+      // be good. Leave the session alone and let the timer try again.
+      return false;
+    } finally {
+      _refreshInFlight = null;
+    }
+  })();
+  return _refreshInFlight;
+}
+
+/* Renew at 70% of the remaining life. Early enough that a failed attempt has
+   room for another before the token actually dies. */
+export function scheduleSessionRefresh() {
+  if (_refreshTimer) {
+    clearTimeout(_refreshTimer);
+    _refreshTimer = null;
+  }
+  const token = localStorage.getItem(AUTH_TOKEN_KEY) || "";
+  const expMs = _tokenExpiryMs(token);
+  if (!expMs) return;
+  const remaining = expMs - Date.now();
+  if (remaining <= 0) return;
+  const delay = Math.max(60_000, Math.floor(remaining * 0.7));
+  _refreshTimer = setTimeout(() => { refreshSession(); }, delay);
+}
+
+/* A sleeping machine does not run timers. Coming back to the tab is the one
+   moment we know time has passed, so check the token then too. */
+if (typeof document !== "undefined" && typeof window !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible" || _sessionExpired) return;
+    const expMs = _tokenExpiryMs(localStorage.getItem(AUTH_TOKEN_KEY) || "");
+    if (expMs && expMs - Date.now() < 10 * 60_000) refreshSession();
+  });
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
+  // Once the session is over, stop touching the network. Twenty-two pollers
+  // queueing 12-second timeouts against a six-socket pool is what makes a
+  // logged-out window feel like a hung one.
+  if (_sessionExpired && !String(url || "").includes("/api/auth/")) {
+    const err = new Error("Session expired. Please sign in again.");
+    err.sessionExpired = true;
+    throw err;
+  }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -268,7 +381,19 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
     const finalOptions = hasCacheOption
       ? { ...options, headers, signal: controller.signal }
       : { ...options, headers, signal: controller.signal };
-    return await fetch(url, finalOptions);
+    const res = await fetch(url, finalOptions);
+
+    // A 401 on a call that carried a token means the token died under a
+    // screen somebody is still looking at. Renew once and replay - the
+    // caller never learns it happened. `_retry` stops this recursing.
+    if (res.status === 401 && token && !options.__tnRetry) {
+      const renewed = await refreshSession();
+      if (renewed) {
+        return await fetchWithTimeout(url, { ...options, __tnRetry: true },
+                                      timeoutMs);
+      }
+    }
+    return res;
   } finally {
     clearTimeout(timeout);
   }
@@ -974,6 +1099,25 @@ export async function deactivateCustomerDb() {
   return res.json();
 }
 
+// Ask a 1734-AENTR what is on its backplane. Returns the modules AND the
+// datapoints in the shape the gateway config stores, so the dialog needs one
+// round trip, not two.
+export async function scanPointIoRack(ip, maxSlots = 8) {
+  // fetchWithTimeout attaches the bearer token and bounds the wait; a rack
+  // scan walks up to 8 slots, so it gets longer than the default.
+  const res = await fetchWithTimeout(
+    `${getAppStoreApiBase()}/api/plc/pointio/scan`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ip, max_slots: maxSlots }),
+    },
+    30000
+  );
+  if (!res.ok) throw new Error("POINT I/O scan failed");
+  return res.json();
+}
+
 export async function saveAppStoreBootstrap(data, actor = "system") {
   const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store/bootstrap`, {
     method: "PUT",
@@ -985,15 +1129,46 @@ export async function saveAppStoreBootstrap(data, actor = "system") {
 }
 
 export async function saveAppStoreDomain(domain, payload, actor = "system", options = {}) {
+  // `baseVersion` is the version this client last READ for the domain.
+  // Sending it is what authorises the write: match and any change is
+  // honoured (including an empty list), miss and the server refuses with
+  // 409 and changes nothing. Omit it only from callers that genuinely
+  // have not read the domain.
   // `allowEmpty` must be set ONLY by a deliberate operator action that empties a
   // collection (removing the last widget, clearing a dashboard). The server
   // refuses to blank a saved collection otherwise — on 2026-08-22 a session that
   // rendered no widgets persisted an empty list over three saved ones.
-  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/app-store/domain`, {
+  // Retry, and wait longer than the 12 s default. Config PUTs are small, but
+  // they queue behind the polling traffic on a busy edge, and this call had a
+  // single shot: one abort and the operator's change was gone with nothing
+  // written and nothing said. 2026-08-30 the banner read "signal is aborted
+  // without reason" - that was this timeout firing.
+  const request = {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ domain, payload, actor, allow_empty: Boolean(options.allowEmpty) })
-  });
+    body: JSON.stringify({
+      domain, payload, actor,
+      allow_empty: Boolean(options.allowEmpty),
+      ...(Number.isFinite(Number(options.baseVersion))
+        ? { base_version: Number(options.baseVersion) } : {}),
+    })
+  };
+  let res = null;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      res = await fetchWithTimeout(
+        `${getAppStoreApiBase()}/api/app-store/domain`, request, 20000 + (attempt - 1) * 10000);
+      break;
+    } catch (err) {
+      lastErr = err;
+      // A refusal (HTTP 4xx) is an answer and never reaches here. Only a
+      // transport failure is worth retrying.
+      if (!isTransientFetchError(err) || attempt === 3) throw err;
+      await sleep(400 * attempt);
+    }
+  }
+  if (!res) throw lastErr || new Error("App store domain save failed");
   if (!res.ok) {
     let detail = "";
     try {
@@ -1859,11 +2034,30 @@ export async function getPowerProfiles() {
 }
 
 export async function updatePowerConfig(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/power/config`, {
+  // Retry + a longer timeout, matching saveAppStoreDomain. Pressing OK on a
+  // meter used to be a single 12 s shot: one aborted fetch and the operator
+  // was told the DEVICE failed, when what failed was saving it.
+  const request = {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  });
+  };
+  let res = null;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      res = await fetchWithTimeout(`${getApiBase()}/api/power/config`, request,
+        20000 + (attempt - 1) * 10000);
+      break;
+    } catch (err) {
+      lastErr = err;
+      // An HTTP error never reaches here - it is an answer, not a failure to
+      // deliver. Only a transport problem is worth repeating.
+      if (!isTransientFetchError(err) || attempt === 3) throw err;
+      await sleep(400 * attempt);
+    }
+  }
+  if (!res) throw lastErr || new Error("Power config update failed");
   if (!res.ok) {
     // Surface the backend reason so operators can see WHICH field rejected
     // (Pydantic / power_manager normalization errors land here). Without this
@@ -1888,12 +2082,23 @@ export async function updatePowerConfig(payload) {
 }
 
 export async function testPowerConnection(payload) {
-  const res = await fetchWithTimeout(`${getApiBase()}/api/power/test-connection`, {
+  const req = {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  }, 15000);
-  if (!res.ok) throw new Error("Power meter connection test failed");
+  };
+  let res = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      res = await fetchWithTimeout(
+        `${getApiBase()}/api/power/test-connection`, req, 20000 + (attempt - 1) * 10000);
+      break;
+    } catch (err) {
+      if (!isTransientFetchError(err) || attempt === 2) throw err;
+      await sleep(400);
+    }
+  }
+  if (!res || !res.ok) throw new Error("Power meter connection test failed");
   return res.json();
 }
 
@@ -1909,6 +2114,31 @@ export async function getPowerLatest(deviceId = "") {
   const suffix = params.toString() ? `?${params.toString()}` : "";
   const res = await fetchWithTimeout(`${getApiBase()}/api/power/latest${suffix}`);
   if (!res.ok) throw new Error("Power latest fetch failed");
+  return res.json();
+}
+
+/* Bucketed power series for a TIME WINDOW.
+
+   Prefer this over getPowerHistory for charting: /history takes a row limit
+   and no window at all, so with 87 registers per sample it returned about 90
+   seconds of data regardless of the period selected. `bucket: "auto"` lets the
+   server choose the grain - seconds for a live view, minutes for a day, hours
+   for a quarter - so the same chart moves from seconds to days without the
+   browser ever parsing more than it can draw. */
+export async function getPowerSeries({ minutes, fromUtc, toUtc, bucket = "auto",
+                                       deviceId = "", metric = "",
+                                       maxPoints = 1500 } = {}) {
+  const params = new URLSearchParams();
+  if (fromUtc) params.set("from_utc", String(fromUtc));
+  if (toUtc) params.set("to_utc", String(toUtc));
+  if (minutes) params.set("minutes", String(minutes));
+  if (bucket) params.set("bucket", String(bucket));
+  if (deviceId) params.set("device_id", String(deviceId));
+  if (metric) params.set("metric", String(metric));
+  params.set("max_points", String(maxPoints));
+  const res = await fetchWithTimeout(
+    `${getApiBase()}/api/power/series?${params.toString()}`, {}, 30000);
+  if (!res.ok) throw new Error("Power series fetch failed");
   return res.json();
 }
 
@@ -4095,6 +4325,26 @@ async function _oeeReq(path, { method = "GET", body } = {}) {
   return res.json();
 }
 
+/* Re-apply the trigger rules this client hydrated to the running managers.
+ *
+ * 2026-09-02: after a restart the manager holds no trigger set until somebody
+ * edits a trigger, so the rules gate nothing. The server cannot safely read
+ * them itself - the store keeps a document per scope and guessing which one
+ * would risk applying another customer's rules - but this client already
+ * resolved its own scope to load them, so it hands them back. */
+export async function applyCollectionTriggers(triggers, mode) {
+  const res = await fetchWithTimeout(`${getControlApiBase()}/api/plc/collection-triggers/apply`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      collection_triggers: Array.isArray(triggers) ? triggers : [],
+      collection_trigger_mode: mode === "all" ? "all" : "any",
+    }),
+  });
+  if (!res.ok) throw new Error(`apply triggers failed (HTTP ${res.status})`);
+  return res.json();
+}
+
 export async function oeeMeta() { return _oeeReq("/meta"); }
 export async function oeeHealth() { return _oeeReq("/health"); }
 
@@ -4114,6 +4364,7 @@ export async function oeeOverview(params = {}) {
   Object.entries(params).forEach(([k, v]) => {
     if (v !== undefined && v !== null && v !== "") q.set(k, String(v));
   });
+  if (params.compare) q.set("compare", "1");
   return _oeeReq(`/overview${q.toString() ? `?${q}` : ""}`);
 }
 export async function oeeTrend(params = {}) {
@@ -4123,6 +4374,36 @@ export async function oeeTrend(params = {}) {
   });
   return _oeeReq(`/trend${q.toString() ? `?${q}` : ""}`);
 }
+/* Dashboard aggregates (2026-08-29). Every OEE page and widget reads one of
+   these; none of them re-implements an OEE formula, because two
+   implementations will disagree and the one on screen is the one nobody can
+   trace back to a number. */
+function _oeeQuery(params) {
+  const q = new URLSearchParams();
+  Object.entries(params || {}).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== "") q.set(k, String(v));
+  });
+  return q.toString() ? `?${q}` : "";
+}
+
+export async function oeeTimeline(params = {}) {
+  return _oeeReq(`/dashboard/timeline${_oeeQuery(params)}`);
+}
+export async function oeeDowntimePareto(params = {}) {
+  // group_by and metric ride through _oeeQuery; the response reports which
+  // groupings the data can actually support.
+  return _oeeReq(`/dashboard/downtime-pareto${_oeeQuery(params)}`);
+}
+export async function oeeEnergySummary(params = {}) {
+  return _oeeReq(`/dashboard/energy${_oeeQuery(params)}`);
+}
+export async function oeeShiftPerformance(params = {}) {
+  return _oeeReq(`/dashboard/shifts${_oeeQuery(params)}`);
+}
+export async function oeePlanning(params = {}) {
+  return _oeeReq(`/planning${_oeeQuery(params)}`);
+}
+
 export async function oeeMachinesLive() { return _oeeReq("/machines/live"); }
 export async function oeeMachineResult(id, params = {}) {
   const q = new URLSearchParams(params);
@@ -4139,3 +4420,123 @@ export async function oeeAddCount(payload) { return _oeeReq("/operator/count", {
 export async function oeeAddQuality(payload) { return _oeeReq("/operator/quality", { method: "POST", body: payload }); }
 export async function oeeConfirmDowntime(payload) { return _oeeReq("/operator/downtime", { method: "POST", body: payload }); }
 export async function oeeSetState(payload) { return _oeeReq("/operator/state", { method: "POST", body: payload }); }
+
+// ---------------------------------------------------------------- data export
+// A read-only query surface with its own router, so the assistant cannot slow
+// the historian read path every chart shares.
+
+export async function exportOptions() {
+  const res = await fetchWithTimeout(withNoCache(`${getAppStoreApiBase()}/api/data-export/options`));
+  if (!res.ok) throw new Error("Export options fetch failed");
+  return res.json();
+}
+
+export async function exportSources() {
+  // DISTINCT over the historian: this can take a moment on a large store, and
+  // it is worth waiting for - the pickers are built from what was actually
+  // recorded, including gateways that have since been deleted.
+  const res = await fetchWithTimeout(
+    withNoCache(`${getAppStoreApiBase()}/api/data-export/sources`), {}, 60000);
+  if (!res.ok) throw new Error("Export sources fetch failed");
+  return res.json();
+}
+
+export async function exportPreview(spec) {
+  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/data-export/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(spec || {}),
+  }, 120000);
+  if (!res.ok) throw new Error(`Export preview failed (HTTP ${res.status})`);
+  return res.json();
+}
+
+/* LOCAL path: the backend streams, the browser saves. Nothing is parsed here,
+   so the row count is bounded by disk rather than by JavaScript memory. */
+export async function exportServerSide(spec, format = "csv") {
+  const res = await fetchWithTimeout(`${getAppStoreApiBase()}/api/data-export/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(spec || {}),
+  }, 600000);
+  if (!res.ok) throw new Error(`Export failed (HTTP ${res.status})`);
+  const blob = await res.blob();
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const ext = format === "txt" ? "txt" : format === "json" ? "json" : "csv";
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `trustnode_export_${stamp}.${ext}`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  return { ok: true, message: `Export saved (${(blob.size / 1024).toFixed(0)} KB).` };
+}
+
+/* CLOUD path: page it here. Bounded, and it reports where it stopped rather
+   than truncating in silence. */
+export async function exportClientSide(spec, format = "csv", onProgress) {
+  const PAGE = 5000;
+  const MAX = 500000;
+  const all = [];
+  let columns = [];
+  let offset = 0;
+  let truncated = false;
+  for (;;) {
+    const page = await exportPreview({ ...(spec || {}), limit: PAGE, offset });
+    if (page?.ok === false) throw new Error(page.error || "preview failed");
+    const rows = page?.rows || [];
+    if (!columns.length) columns = page?.columns || [];
+    all.push(...rows);
+    if (typeof onProgress === "function") onProgress(all.length);
+    if (rows.length < PAGE) break;
+    offset += rows.length;
+    if (all.length >= MAX) { truncated = true; break; }
+  }
+  const esc = (v) => {
+    const t = v === null || v === undefined ? "" : String(v);
+    return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  let body = "";
+  if (format === "json") {
+    body = JSON.stringify(all, null, 2);
+  } else {
+    const sep = format === "txt" ? "\t" : ",";
+    const lines = [];
+    if (spec?.include_header !== false) lines.push(columns.join(sep));
+    for (const r of all) lines.push(columns.map((c) => esc(r[c])).join(sep));
+    body = lines.join("\n");
+  }
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const ext = format === "txt" ? "txt" : format === "json" ? "json" : "csv";
+  const blob = new Blob([body], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `trustnode_export_${stamp}.${ext}`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  return {
+    ok: true,
+    message: truncated
+      ? `Exported the first ${all.length.toLocaleString()} rows — the cloud client caps at `
+        + `${MAX.toLocaleString()}. Narrow the range to get the rest.`
+      : `Export saved (${all.length.toLocaleString()} rows).`,
+  };
+}
+
+/* Local and cloud database sizes, with the big tables and whether automatic
+   cleanup is on. Read-only; the cloud half is individually guarded so an
+   unreachable Supabase still lets the local numbers render. */
+export async function getStorageStatus() {
+  // The retention router is mounted under /api/app-store, like every other
+  // call in this family (_retentionCall). Using getApiBase() + /api/retention
+  // gave a 404 that would have read as "the size card is broken".
+  const res = await fetchWithTimeout(
+    withNoCache(`${getAppStoreApiBase()}/api/app-store/retention/v2/storage`), {}, 60000);
+  if (!res.ok) throw new Error(`Storage status failed (HTTP ${res.status})`);
+  return res.json();
+}

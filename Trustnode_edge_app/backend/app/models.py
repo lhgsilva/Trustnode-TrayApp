@@ -7,11 +7,20 @@ from pydantic import BaseModel, Field
 # Core HTTP/JSON port. Widening this union cannot affect the existing four —
 # nothing dispatches on it until a gateway is actually saved with that type.
 GatewayType = Literal["allen_bradley", "siemens_snap7", "siemens_opcua", "boston",
-                      "ifm_iolink", "ethernet_ip", "modbus_tcp"]
+                      "ifm_iolink", "ethernet_ip", "modbus_tcp", "point_io"]
 
 
 class GatewayConfig(BaseModel):
     gateway_type: GatewayType = "allen_bradley"
+    # POINT I/O (1734-AENTR and friends): the modules found on the backplane,
+    # each {slot, name, mode, cls, inst, points, kind}. Produced by discovery;
+    # the worker needs it to know what to read and cannot invent it.
+    point_io_modules: list[dict] = []
+    # Per-point configuration for POINT I/O: the operator's tag name, whether
+    # it is collected, and the engineering scale applied before storage. Keyed
+    # back to the terminal by `address` (Slot<N>_Pt<M>), which never changes
+    # even when the name does.
+    point_io_points: list[dict] = []
     # Display identity (2026-07-26): the operator-facing gateway name and the
     # resolved device name. The frontend sends them in the start payload so
     # historian rows carry real names instead of raw IDs / empty strings.
@@ -136,6 +145,13 @@ class GatewayStatus(BaseModel):
     interval_ms: int
     tags: List[str]
     last_error: str | None = None
+    # 2026-08-29: consecutive cycles in which every tag came back BAD. Row
+    # counters cannot express this - a BAD row is still a row - so an
+    # unreachable device looked identical to a working one.
+    all_bad_cycles: int = 0
+    # True between "the worker was created" and "its first cycle produced
+    # readings". Neither RUNNING nor STOPPED is honest in that window.
+    starting: bool = False
     db_sink_engine: str | None = None
     db_write_count: int = 0
     db_last_write_utc: str | None = None

@@ -5,6 +5,25 @@ $backendRoot = Join-Path $projectRoot "backend"
 $specFile = Join-Path $backendRoot "trustnode-service.spec"
 
 Write-Host "Building backend executable from $backendRoot"
+
+# 2026-08-31: PyInstaller's analysis pass imports app.state, and importing it
+# constructs AppStore(), which runs _ensure_schema() - CREATE TABLE / ALTER
+# TABLE - against whatever workspace it resolves. With nothing set that is the
+# DEFAULT path: the operator's live ~/.trustnode_edge database. The build log
+# showed it being attempted and refused only because the running app held the
+# file read-only. A build must never touch the data it is being built for, so
+# the import side effects are pointed at a scratch workspace and the previous
+# values are restored afterwards.
+$buildWorkspace = Join-Path $env:TEMP ("trustnode-build-ws-" + [System.Guid]::NewGuid().ToString("N").Substring(0, 8))
+New-Item -ItemType Directory -Force $buildWorkspace | Out-Null
+$prevDataDir = $env:TRUSTNODE_DATA_DIR
+$prevStorePath = $env:TRUSTNODE_APP_STORE_PATH
+$prevSkipDotenv = $env:TRUSTNODE_SKIP_DOTENV
+$env:TRUSTNODE_DATA_DIR = $buildWorkspace
+$env:TRUSTNODE_APP_STORE_PATH = Join-Path $buildWorkspace "build_only.db"
+$env:TRUSTNODE_SKIP_DOTENV = "1"
+Write-Host "Import side effects isolated to $buildWorkspace"
+
 Push-Location $backendRoot
 
 try {
@@ -113,5 +132,12 @@ print('compile-check OK')
     Write-Host "Backend bundle created: $(Join-Path $backendRoot 'dist\trustnode-service')"
 }
 finally {
+    # Put the environment back, and take the scratch workspace with us.
+    $env:TRUSTNODE_DATA_DIR = $prevDataDir
+    $env:TRUSTNODE_APP_STORE_PATH = $prevStorePath
+    $env:TRUSTNODE_SKIP_DOTENV = $prevSkipDotenv
+    if ($buildWorkspace -and (Test-Path $buildWorkspace)) {
+        try { Remove-Item -Recurse -Force $buildWorkspace -ErrorAction Stop } catch {}
+    }
     Pop-Location
 }

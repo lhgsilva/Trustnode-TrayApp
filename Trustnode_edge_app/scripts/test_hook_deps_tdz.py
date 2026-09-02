@@ -50,8 +50,13 @@ def jsx_files():
     return sorted(out)
 
 
-# `}, [a, b, c]);` - the closing line of a hook with a dependency array
+# `}, [a, b, c]);` - the closing line of a hook with a BRACED body
 DEPS = re.compile(r"^\s*\}\s*,\s*\[([^\]]*)\]\s*\)\s*;")
+# `), [a, b]);` / `value, [a]);` - a hook whose arrow body has no braces. The
+# 2026-08-31 OEE regression looked like this, and DEPS above cannot see it.
+TAIL = re.compile(r",\s*\[([^\]]*)\]\s*\)\s*;\s*$")
+# the line that OPENS a hook call
+HOOK_OPEN = re.compile(r"(?:=\s*|^\s*)use[A-Z][A-Za-z]*\s*\(")
 # component-scope declarations we can locate reliably
 DECL = re.compile(
     r"^\s*const\s+(?:\[\s*(?P<destructured>[A-Za-z0-9_,\s]+?)\s*\]|(?P<plain>[A-Za-z_$][\w$]*))\s*="
@@ -103,10 +108,27 @@ for path in jsx_files():
             if n and IDENT.match(n) and (blk, n) not in declared_at:
                 declared_at[(blk, n)] = i
 
+    def opens_a_hook(idx):
+        """Is line `idx` the tail of a use*() call?
+
+        Walks back to the start of the statement - the previous line that
+        ended in `;` - and looks for the hook call on the way. Bounded, so a
+        plain function call whose last argument happens to be an array is not
+        reported.
+        """
+        for j in range(idx, max(-1, idx - 30), -1):
+            if HOOK_OPEN.search(lines[j]):
+                return True
+            if j < idx and lines[j].rstrip().endswith(";"):
+                return False        # previous statement: we have gone too far
+        return False
+
     for i, ln in enumerate(lines):
         m = DEPS.match(ln)
         if not m:
-            continue
+            m = TAIL.search(ln)
+            if not m or not opens_a_hook(i):
+                continue
         scanned += 1
         blk = block_of(i)[0]
         for raw in m.group(1).split(","):

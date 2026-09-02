@@ -205,6 +205,50 @@ CREATE TABLE IF NOT EXISTS oee_planned_stops (
 );
 CREATE INDEX IF NOT EXISTS idx_oee_pstops_machine ON oee_planned_stops(tenant_id, machine_id, enabled);
 
+/* ==================== 9b. Planning calendar (2026-08-29) ==============
+   Concrete, dated events an administrator schedules. Distinct from
+   oee_planned_stops, which models a REPEATING stop pattern: a planned event
+   here has real start/end timestamps, may carry a product/order/batch, and
+   states its own effect on the OEE denominator.
+
+   `exclude_from_oee` is the one field that changes a number rather than a
+   picture, so it is explicit per event and never inferred from the type. */
+CREATE TABLE IF NOT EXISTS oee_planned_events (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  name TEXT NOT NULL,
+  event_type TEXT NOT NULL DEFAULT 'planned_production',
+  machine_id TEXT NULL,                     -- NULL = the whole line
+  line TEXT NULL,
+  shift_id TEXT NULL,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT NOT NULL,
+  product_id TEXT NULL,
+  order_id TEXT NULL,
+  batch_ref TEXT NULL,
+  recipe_ref TEXT NULL,
+  -- How this window is treated by the calculation. "No production planned"
+  -- must NOT count as downtime; planned maintenance must not be mistaken for
+  -- an unplanned stop; a changeover is one or the other by customer policy.
+  exclude_from_oee INTEGER NOT NULL DEFAULT 0,
+  counts_as_planned_stop INTEGER NOT NULL DEFAULT 0,
+  expected_runtime_s INTEGER NULL,
+  expected_quantity REAL NULL,
+  expected_cycle_s REAL NULL,
+  repeat_rule TEXT NOT NULL DEFAULT 'none',  -- none|daily|weekdays|weekly
+  notes TEXT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_by TEXT NULL,
+  created_utc TEXT NOT NULL,
+  updated_utc TEXT NOT NULL
+);
+-- The calendar is always read as "this machine, this window", so the index
+-- leads with the tenant and machine and ends on the range column.
+CREATE INDEX IF NOT EXISTS idx_oee_planned_events_win
+  ON oee_planned_events(tenant_id, machine_id, start_utc);
+CREATE INDEX IF NOT EXISTS idx_oee_planned_events_range
+  ON oee_planned_events(tenant_id, start_utc, end_utc);
+
 /* ======================= 10. Downtime reasons ========================= */
 CREATE TABLE IF NOT EXISTS oee_downtime_reasons (
   id TEXT PRIMARY KEY,

@@ -83,10 +83,21 @@ FEATURES: List[Dict[str, Any]] = [
      "group": "Applications", "pages": ["batch_definitions"],
      "write_roles": ["admin", "super", "engineer"]},
 
+    # 2026-08-29: machine_detail joins the operational pages - it is the same
+    # data as the Overview, one machine at a time, so it carries the same
+    # permission rather than a new one nobody would remember to grant.
     {"key": "oee", "label": "OEE", "module": "oee", "group": "Applications",
-     "pages": ["oee_overview", "oee_operator"]},
+     "pages": ["oee_overview", "oee_operator", "oee_machine_detail"]},
     {"key": "oee_configuration", "label": "OEE configuration", "module": "oee",
      "group": "Applications", "pages": ["oee_configuration"],
+     "write_roles": ["admin", "super", "engineer"]},
+    # The planning calendar decides what counts as planned time, which changes
+    # every OEE number downstream - so editing it is a supervisor/admin act,
+    # separate from viewing the plan. A permission key with no entry here is
+    # always `undefined`, which is how the batch pages were accidentally
+    # admin-only for months; declaring it is what makes the checkbox exist.
+    {"key": "oee_planning", "label": "OEE planning calendar", "module": "oee",
+     "group": "Applications", "pages": ["oee_planning"],
      "write_roles": ["admin", "super", "engineer"]},
 
     # ---------------------------------------------------------------------- AI

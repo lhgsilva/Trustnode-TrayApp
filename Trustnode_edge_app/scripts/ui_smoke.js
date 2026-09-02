@@ -22,6 +22,14 @@ const PAGES = [
   // 2026-08-28: the new Diagnostics page. It renders psutil output and every
   // gateway's stamps, so it has more shapes to get wrong than most.
   ["SETTINGS", "diagnostics"],
+  // 2026-08-29: the OEE dashboards. Machine Detail is reached by clicking a
+  // machine, not from the menu, so it is exercised by the page's own render
+  // rather than by this walk.
+  ["OEE", "oee overview"],
+  ["OEE", "planning calendar"],
+  // 2026-08-29 UI review: the three pages the operator called out.
+  ["SETTINGS", "interface"],
+  ["POWER MANAGEMENT", "power configuration"],
 ];
 
 (async () => {
@@ -45,7 +53,63 @@ const PAGES = [
   page.on("pageerror", (e) => fatal.push(String(e).slice(0, 200)));
 
   await page.goto(`${API}/trustnode/full/app/?backendUrl=${encodeURIComponent(API)}`, { waitUntil: "domcontentloaded" });
-  await sleep(10000);
+  await sleep(8000);
+
+  // Two gates, both optional. The injected token above is no longer enough on
+  // its own: an unauthenticated visit redirects to /trustnode/login/, and the
+  // React app then renders a login view of its own. Skipped silently when a
+  // session already exists, so this still works against a live install.
+  const user = process.env.VAL_USER || "admin-mari";
+  const pass = process.env.VAL_PASS || "Limerick2019*";
+
+  // Idempotent, and called AGAIN after the reload below: the reload can land
+  // back on a login screen, and a walk that then reports sixteen missing nav
+  // items reads exactly like sixteen broken pages. Retrying costs a few
+  // seconds; a flaky check in the release gate costs trust in the gate.
+  const ensureSignedIn = async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (await page.$("#tn-user")) {
+        await page.fill("#tn-user", user);
+        await page.fill("#tn-pass", pass);
+        await page.click('button:has-text("Sign in")');
+        await sleep(9000);
+        continue;
+      }
+      if (await page.$('button:has-text("Sign in to TrustNode Edge")')) {
+        const fields = await page.$$("input");
+        if (fields.length < 2) return false;
+        await fields[0].fill(user);
+        await fields[1].fill(pass);
+        await page.click('button:has-text("Sign in to TrustNode Edge")');
+        await sleep(11000);
+        continue;
+      }
+      return true;
+    }
+    return false;
+  };
+
+  if (!(await ensureSignedIn())) {
+    console.log("  login                          : FAIL - still on a login screen");
+    console.log("UI SMOKE: FAIL (login)");
+    await browser.close();
+    process.exit(2);
+  }
+
+  // The sidebar defaults to collapsed, which reduces every menu entry to a
+  // two-letter stub - and a walk that clicks BY LABEL then finds nothing.
+  await page.evaluate(() => {
+    try { localStorage.setItem("trustnode_sidebar_collapsed_local", "false"); } catch (_) {}
+  });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await sleep(9000);
+
+  if (!(await ensureSignedIn())) {
+    console.log("  login                          : FAIL - lost the session on reload");
+    console.log("UI SMOKE: FAIL (login)");
+    await browser.close();
+    process.exit(2);
+  }
 
   let failures = 0;
   const boundary = async () => page.evaluate(() => document.body.innerText.includes("Frontend Error Recovered"));

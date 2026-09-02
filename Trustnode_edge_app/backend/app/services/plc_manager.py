@@ -208,6 +208,16 @@ class GatewayWorker:
         # so the operator can see WHICH tags are unhappy without losing
         # the rest of the cycle.
         self._last_partial_error: str = ""
+        # 2026-08-29: consecutive cycles in which EVERY tag came back BAD.
+        # The read "succeeds" in that the loop completes and rows are written,
+        # so nothing else in the worker notices - but the operator has a
+        # gateway that is producing nothing but nulls. Surfaced in last_error
+        # once it is a streak rather than a blip.
+        self._all_bad_cycles: int = 0
+        # Cycles that have produced readings. 0 means the worker exists but
+        # has not read anything yet - reported as `starting`, so the UI can
+        # say "starting" instead of claiming RUNNING or STOPPED.
+        self._cycles_with_readings: int = 0
         # Operator 2026-06-19 (L3b): bounded read-timeout. If a driver
         # call hangs indefinitely (e.g. half-open TCP after a NIC flap),
         # the worker would silently stop collecting forever. We wrap the
@@ -491,6 +501,8 @@ class GatewayWorker:
             interval_ms=self.config.interval_ms,
             tags=self.config.tags,
             last_error=last_error,
+            all_bad_cycles=int(getattr(self, "_all_bad_cycles", 0) or 0),
+            starting=bool(self.running and int(getattr(self, "_cycles_with_readings", 0) or 0) == 0),
             db_sink_engine=(self.db_sink or {}).get("engine"),
             db_write_count=self.db_write_count,
             db_last_write_utc=self.db_last_write_utc,
@@ -701,7 +713,46 @@ class GatewayWorker:
                 # this in the gateway status footer; the historian still
                 # records all readings (GOOD + BAD quality).
                 partial = getattr(self, "_last_partial_error", "") or ""
-                self.last_error = partial or None
+
+                # Every tag BAD, cycle after cycle, means the device is not
+                # answering - even though the loop is running and rows are
+                # being written. Counting ROWS cannot see this: a BAD row is
+                # still a row, which is why historian_write_count climbed past
+                # 97 000 on a gateway whose block was physically unplugged.
+                if readings:
+                    self._cycles_with_readings += 1
+                    _good = sum(1 for r in readings
+                                if int(getattr(r, "quality", 0) or 0) >= 192)
+                    if _good == 0:
+                        self._all_bad_cycles += 1
+                    else:
+                        self._all_bad_cycles = 0
+                else:
+                    self._all_bad_cycles = 0
+
+                # One bad cycle is a blip - a reboot, a nudged cable, a single
+                # timeout. Three in a row is a fault worth naming.
+                all_bad_msg = ""
+                if self._all_bad_cycles >= 3:
+                    _secs = (self._all_bad_cycles
+                             * max(0.2, float(self.config.interval_ms or 1000) / 1000.0))
+                    _why = ""
+                    for r in readings or []:
+                        _txt = str(getattr(r, "value_text", "") or "").strip()
+                        if _txt:
+                            _why = _txt
+                            break
+                    all_bad_msg = (
+                        f"No value read from {self.config.plc_ip or 'the device'} "
+                        f"for {self._all_bad_cycles} cycles (~{_secs:.0f}s): every tag is "
+                        f"BAD quality. The device may be unreachable - check power, "
+                        f"cabling and the network."
+                        + (f" Last reason: {_why}" if _why else "")
+                    )
+
+                # The all-BAD message wins: "nothing is being read at all" is a
+                # bigger fact than "some tags are unhappy".
+                self.last_error = all_bad_msg or partial or None
                 persisted_local = False
                 persisted_edge_record_id: str | None = None
                 if self._collection_gate_cb:
@@ -914,7 +965,18 @@ class GatewayWorker:
                 # Surface a cadence-warning. Doesn't override a real error;
                 # the run loop's `last_error` may already carry a partial
                 # tag failure, in which case we leave it alone.
-                if not self.last_error or "cadence" not in self.last_error.lower():
+                #
+                # 2026-08-29: this read `"cadence" not in ...`, which did the
+                # exact opposite of the line above it - it overwrote anything
+                # that was NOT already a cadence warning, i.e. every real
+                # error. A device that has stopped answering makes each read
+                # sit until it times out, so the cycle always overruns and this
+                # always fired, burying "no value read from <ip>" under "raise
+                # the interval or reduce tag count". No interval fixes an
+                # unplugged cable. The `in` form keeps the reason for the
+                # condition - an existing cadence warning is refreshed with the
+                # current measurement - without swallowing faults.
+                if not self.last_error or "cadence" in self.last_error.lower():
                     self.last_error = (
                         f"Cadence warning: configured {configured_ms} ms, actual "
                         f"{elapsed_s*1000:.0f} ms — collection is running as fast as "
@@ -1009,6 +1071,8 @@ class GatewayWorker:
             readings = self._read_from_modbus_tcp()
         elif gateway_type == "ethernet_ip":
             readings = self._read_from_ethernet_ip()
+        elif gateway_type == "point_io":
+            readings = self._read_from_point_io()
         else:
             raise RuntimeError(f"Gateway type '{self.config.gateway_type}' is not implemented for real-time reads.")
         # AUTOMATED string identification (2026-07-26): when a driver didn't
@@ -1722,6 +1786,107 @@ class GatewayWorker:
                     ts_utc=ts, tag_name=name, value=None,
                     value_text=str(row.get("error") or "read failed"),
                     data_type="", quality=0, quality_label="BAD", **common))
+        return out
+
+    def _read_from_point_io(self) -> List[GatewayReading]:
+        """One cycle against a POINT I/O rack behind a 1734-AENTR.
+
+        No PLC and no implicit connection: each module is read explicitly,
+        routed through the adapter backplane. The protocol lives in
+        app/drivers/point_io.py; this is only the adapter to GatewayReading.
+
+        A module that fails yields BAD readings for ITS OWN points and nothing
+        else - one dead card must not take the rack down, the same rule the
+        ifm driver follows.
+        """
+        from app.drivers.point_io import PointIoClient, PointIoError, tag_name
+
+        host = (self.config.plc_ip or "").strip()
+        modules = list(self.config.point_io_modules or [])
+        if not modules:
+            raise RuntimeError(
+                "POINT I/O gateway has no modules - run discovery on the "
+                "adapter so it knows which slots to read")
+
+        # The client holds its TCP session between cycles: re-registering per
+        # cycle costs more than the reads themselves (a whole module is ~4 ms).
+        cli = getattr(self, "_point_io_client", None)
+        if cli is None or getattr(cli, "host", "") != host:
+            if cli is not None:
+                try:
+                    cli.close()
+                except Exception:
+                    pass
+            cli = PointIoClient(host, timeout_s=3.0)
+            self._point_io_client = cli
+
+        # Same canonical stamp every other read path uses -
+        # "YYYY-MM-DD HH:MM:SS.mmm", UTC. One format across the historian.
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        wanted = set(self.config.tags or [])
+
+        # Per-point configuration, keyed by ADDRESS (Slot<N>_Pt<M>). The
+        # terminal never moves even when the operator renames the tag, so the
+        # address is what the config is matched on - never the display name.
+        cfg_by_addr = {}
+        for _p in (self.config.point_io_points or []):
+            _a = str(_p.get("address") or _p.get("name") or "").strip()
+            if _a:
+                cfg_by_addr[_a] = _p
+
+        out: List[GatewayReading] = []
+        errors: list[str] = []
+        for mod in modules:
+            slot = int(mod.get("slot") or 0)
+            addrs = [tag_name(slot, i) for i in range(1, int(mod.get("points") or 0) + 1)]
+            try:
+                bits = cli.read_module(mod)
+            except PointIoError as exc:
+                errors.append("slot %d: %s" % (slot, exc))
+                bits = None
+            for idx, addr in enumerate(addrs):
+                pcfg = cfg_by_addr.get(addr) or {}
+                # An unticked point produces no row at all - that is the whole
+                # point of the tick: it must cost nothing downstream.
+                if pcfg and not bool(pcfg.get("enabled", True)):
+                    continue
+                tag = str(pcfg.get("name") or addr).strip() or addr
+                if wanted and tag not in wanted and addr not in wanted:
+                    continue
+                analog = str(mod.get("data")) == "analog"
+                dtype = "REAL" if analog else "BOOL"
+                if bits is None or idx >= len(bits):
+                    quality, label = self._normalize_quality(self.config.gateway_type, raw_quality=0)
+                    out.append(GatewayReading(
+                        ts_utc=ts, tag_name=tag, value=None,
+                        value_text=("slot %d did not answer" % slot),
+                        data_type=dtype, quality=quality, quality_label=label,
+                        source=self.config.gateway_type, site=self.config.site,
+                        area=self.config.area, equipment=self.config.equipment))
+                    continue
+                # Scale HERE, so the ENGINEERING value is what reaches the
+                # historian and therefore the charts. Storing a raw count would
+                # make every consumer learn the module's data format; storing
+                # 10.0 mA means none of them have to.
+                raw = float(bits[idx])
+                try:
+                    scale = float(pcfg.get("scale", 1.0) or 1.0)
+                    offset = float(pcfg.get("offset", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    scale, offset = 1.0, 0.0
+                value = (raw * scale + offset) if analog else raw
+                quality, label = self._normalize_quality(self.config.gateway_type, raw_quality=192)
+                out.append(GatewayReading(
+                    ts_utc=ts, tag_name=tag, value=value,
+                    data_type=dtype, quality=quality, quality_label=label,
+                    source=self.config.gateway_type, site=self.config.site,
+                    area=self.config.area, equipment=self.config.equipment))
+        if errors:
+            self._last_partial_error = "; ".join(errors[:4])
+        elif getattr(self, "_last_partial_error", ""):
+            self._last_partial_error = ""
+        if not out:
+            raise RuntimeError("no POINT I/O tags selected for collection")
         return out
 
     def _read_from_ifm_iolink(self) -> List[GatewayReading]:
@@ -3151,7 +3316,17 @@ class GatewayWorker:
         """
         tag_filters = sink.get("tag_filters")
         gateway_filters = sink.get("gateway_filters")
-        gateway_id = getattr(self.config, "gateway_id", None) or getattr(self.config, "id", "")
+        # The worker knows its own id; GatewayConfig does NOT carry one. This
+        # read `self.config.gateway_id or self.config.id`, and GatewayConfig has
+        # neither field - so it was always "" and a sink with a gateway filter
+        # could never match it, returning [] and writing nothing at all. A CSV
+        # or TXT export scoped to its own gateway therefore produced an empty
+        # file with no error anywhere. Prefer the worker's id and keep the
+        # config lookups as a fallback for any caller that does set them.
+        gateway_id = (getattr(self, "gateway_id", "")
+                      or getattr(self.config, "gateway_id", None)
+                      or getattr(self.config, "id", "")
+                      or "")
         if gateway_filters:
             allowed_gws = {str(g or "").strip() for g in gateway_filters if g}
             if allowed_gws and str(gateway_id or "") not in allowed_gws:
@@ -3180,6 +3355,28 @@ class GatewayWorker:
             "area": str(r.area or ""),
             "equipment": str(r.equipment or ""),
         }
+
+    #: What a file sink writes when the operator has not said otherwise.
+    #: Deliberately WITHOUT site/area/equipment: plant taxonomy in every row of
+    #: an export nobody asked it for is the "hardcoded metadata" an operator
+    #: objected to on 2026-08-31.
+    DEFAULT_SINK_COLUMNS = ("ts_local", "tag_name", "value", "quality_label")
+
+    def _sink_columns(self, sink: Dict[str, Any]) -> list[str]:
+        """The columns this sink writes, in order.
+
+        An explicit list wins; otherwise the minimal default. Unknown names are
+        kept rather than dropped - they render empty, which is visible in the
+        file, where silently discarding a column the operator asked for is not.
+        """
+        raw = (sink or {}).get("csv_columns")
+        if isinstance(raw, str):
+            raw = [c.strip() for c in raw.replace("\n", ",").split(",")]
+        if isinstance(raw, (list, tuple)):
+            cols = [str(c).strip().lstrip("{").rstrip("}") for c in raw if str(c).strip()]
+            if cols:
+                return cols
+        return list(self.DEFAULT_SINK_COLUMNS)
 
     def _format_csv_row(self, fmt: str, r: "GatewayReading") -> str:
         """Apply a user-supplied format string with {placeholder} tokens.
@@ -3218,23 +3415,17 @@ class GatewayWorker:
                     for r in filtered:
                         f.write(self._format_csv_row(custom_format, r) + "\n")
                 else:
+                    # The operator's chosen columns, or the minimal default.
+                    # A header only when one was explicitly set - an export
+                    # feeding another system should not gain a header row
+                    # nobody asked for.
+                    cols = self._sink_columns(sink)
                     writer = csv.writer(f)
-                    if write_header:
-                        writer.writerow(["ts_local", "ts_utc", "tag_name", "value", "value_text", "quality", "quality_label", "source", "site", "area", "equipment"])
+                    if write_header and custom_header:
+                        f.write(custom_header.rstrip("\r\n") + "\n")
                     for r in filtered:
-                        writer.writerow([
-                            _utc_str_to_local_iso(r.ts_utc),
-                            r.ts_utc,
-                            r.tag_name,
-                            r.value,
-                            getattr(r, "value_text", "") or "",
-                            r.quality,
-                            r.quality_label,
-                            r.source,
-                            r.site,
-                            r.area,
-                            r.equipment,
-                        ])
+                        ph = self._reading_placeholders(r)
+                        writer.writerow([ph.get(c, "") for c in cols])
             return True
         except Exception as exc:
             # Bare `except: return False` here was hiding the actual
@@ -3260,13 +3451,24 @@ class GatewayWorker:
         sink_label = str((sink or {}).get("name") or (sink or {}).get("id") or "txt_file")
         try:
             file_path = self._resolve_output_file_path((sink or {}).get("file_path") or "", "trustnode_log.txt")
+            # Same rule as the CSV sink: a row template wins, then the
+            # chosen columns, then a minimal default. The eleven fields
+            # hardcoded here carried site/area/equipment in every line of
+            # an export nobody asked to carry them.
+            custom_format = str((sink or {}).get("csv_format") or "").strip()
+            custom_header = str((sink or {}).get("csv_header") or "").strip()
+            cols = self._sink_columns(sink)
+            sep = str((sink or {}).get("txt_separator") or "|")
+            write_header = (not os.path.exists(file_path)) or os.path.getsize(file_path) == 0
             with open(file_path, "a", encoding="utf-8") as f:
+                if write_header and custom_header:
+                    f.write(custom_header.rstrip("\r\n") + "\n")
                 for r in filtered:
-                    txt = getattr(r, "value_text", "") or ""
-                    f.write(
-                        f"{_utc_str_to_local_iso(r.ts_utc)}|{r.ts_utc}|{r.tag_name}|{r.value}|{txt}|"
-                        f"{r.quality}|{r.quality_label}|{r.source}|{r.site}|{r.area}|{r.equipment}\n"
-                    )
+                    if custom_format:
+                        f.write(self._format_csv_row(custom_format, r) + "\n")
+                    else:
+                        ph = self._reading_placeholders(r)
+                        f.write(sep.join(str(ph.get(c, "")) for c in cols) + "\n")
             return True
         except Exception as exc:
             self._mark_db_write_error(
@@ -4108,6 +4310,17 @@ class PLCManager:
         # Event-loop handle for thread-safe WS fanout (V2 readers). Captured
         # lazily the first time a gateway starts on the loop.
         self._loop: asyncio.AbstractEventLoop | None = None
+        # 2026-09-02: the trigger set the operator saved, held HERE.
+        #
+        # _refresh_global_triggers() used to rebuild the set purely by walking
+        # self.workers, and apply_collection_triggers() wrote the rules onto
+        # each worker and then read them back from those same workers. On a
+        # site with a power meter and NO PLC gateway there are no workers, so
+        # the rules were written nowhere and read back as nothing - the gate
+        # saw an empty set, "empty" means "no gating", and the meter wrote
+        # 1600 rows in 20 seconds with its trigger condition false.
+        self.applied_collection_triggers: List[Dict[str, Any]] = []
+        self.applied_collection_trigger_mode: str = "any"
         self.global_collection_triggers: List[Dict[str, Any]] = []
         self.global_collection_trigger_mode: str = "any"
         self.global_live_values: Dict[str, Dict[str, Any]] = {}
@@ -4153,6 +4366,10 @@ class PLCManager:
         # `_last_supervisor_action_mono` rate-limits supervisor
         # actions so a flapping start/stop loop can't hammer the PLC.
         self._user_stopped: Set[str] = set()
+        #: Gateway ids the operator DELETED from the configuration. Filled by
+        #: the config save (which is the only place that knows exactly what was
+        #: removed) and drained by the supervisor, which can await a stop.
+        self.deleted_gateway_ids: set[str] = set()
         self._last_supervisor_action_mono: Dict[str, float] = {}
         self._supervisor_min_interval_s: float = 30.0
         # Operator 2026-06-23 (Item 1 / no-data-loss): in-memory
@@ -4188,22 +4405,139 @@ class PLCManager:
             return value >= threshold
         return False
 
+    def note_external_readings(self, source_id: str,
+                               values: Dict[str, Any],
+                               interval_ms: int = 1000) -> None:
+        """Feed a non-worker source's values into the trigger gate.
+
+        The power meter has its own poll loop and is not a GatewayWorker, so
+        its tags were invisible to the gate - a trigger written against a
+        meter tag could never evaluate. Publishing them here makes a meter
+        usable as a trigger SOURCE, the same as any PLC tag.
+        """
+        now_epoch = time.time()
+        sid = str(source_id or "power").strip() or "power"
+        for tag, value in (values or {}).items():
+            key = self._normalize_tag(tag)
+            if not key or value is None:
+                continue
+            try:
+                fval = float(value)
+            except (TypeError, ValueError):
+                continue
+            self.global_live_values[f"{sid}::{key}"] = {
+                "value": fval, "ts_epoch": now_epoch,
+                # A meter polling every 5 s must not be judged stale against a
+                # PLC's 1 s assumption, so it declares its own cadence.
+                "interval_ms": max(200, int(interval_ms or 1000)),
+            }
+
+    def _load_saved_triggers_once(self) -> None:
+        """Deliberately does nothing on the server side.
+
+        A restart leaves this manager with no trigger set until something
+        applies one, so it is tempting to read `triggers_limits` from the
+        store here. It is the wrong place: the store keeps a document PER
+        SCOPE (this machine has seven), `get_domain_fast` reads the unscoped
+        legacy row - which is empty - and picking "the most recently updated
+        scoped row" would happily apply another customer's rules to this
+        edge. That is the cross-customer leak class this product has already
+        been bitten by once.
+
+        The client knows its own scope, so the client re-applies the rules it
+        hydrated, through /api/plc/collection-triggers/apply. This method
+        stays as the place that explains why.
+        """
+        return
+
+    def collection_allowed_now(self, source_id: str = "") -> tuple[bool, str | None]:
+        """The current gate, for a writer that is not a GatewayWorker.
+
+        2026-09-02: the energy meter kept collecting with the trigger
+        condition false, because the gate lived inside the worker loop and the
+        meter has no worker. Same rule, asked from outside.
+        """
+        self._load_saved_triggers_once()
+        if not [t for t in self.global_collection_triggers
+                if bool(t.get("enabled", True))]:
+            return True, None
+        # Evaluate for THIS source. Reading the cached global flags was wrong:
+        # a rule scoped to one gateway deliberately does not touch them, so a
+        # meter asking "may I write?" got a verdict about somebody else - and
+        # once that cached value went false it never came back, so collection
+        # never resumed when the condition was met again.
+        if source_id:
+            return self._evaluate_global_collection_gate(str(source_id), [])
+        return bool(self.global_collection_allowed), self.global_collection_reason
+
+    def apply_collection_triggers(self, triggers: Any, mode: str = "any") -> int:
+        """Push a changed trigger set onto workers that are ALREADY running.
+
+        2026-09-02, reported: "we have a trigger to collect the signals but it
+        still collects even when the condition was not made."
+
+        A worker holds the configuration it was started with, and
+        _refresh_global_triggers() only ever ran on start, stop and stop-all.
+        So a trigger added while gateways were running reached nobody: the
+        global trigger set stayed EMPTY, and an empty set means "no gating" -
+        every reading was written exactly as if no trigger existed. The
+        operator had to stop and start every gateway for their own rule to
+        take effect, with nothing on screen saying so.
+
+        Called from the app-store save, so it works for the desktop app and a
+        browser session alike, and returns how many workers were updated.
+        """
+        rows = [t for t in (triggers or []) if isinstance(t, dict)]
+        m = str(mode or "any").strip().lower()
+        if m not in ("any", "all"):
+            m = "any"
+        # Stored before the workers are touched, so a site with no workers at
+        # all still has its rules.
+        self.applied_collection_triggers = [dict(t) for t in rows]
+        self.applied_collection_trigger_mode = m
+        touched = 0
+        for gid, w in list(self.workers.items()):
+            try:
+                # The whole set goes to every worker, exactly as Start does -
+                # each trigger carries its own gateway_id and the gate resolves
+                # it against live values from all gateways.
+                w.config.collection_triggers = [dict(t) for t in rows]
+                w.config.collection_trigger_mode = m
+                touched += 1
+            except Exception:
+                continue
+        self._refresh_global_triggers()
+        return touched
+
     def _refresh_global_triggers(self) -> None:
         merged: List[Dict[str, Any]] = []
         seen: Set[str] = set()
         keep_latches: Set[str] = set()
         mode = "any"
-        for gid, w in self.workers.items():
-            m = str(getattr(w.config, "collection_trigger_mode", "any") or "any").strip().lower()
+        # The operator's own set comes first and does not depend on a worker
+        # existing. Worker-held rules are merged after it, so a gateway started
+        # with rules baked into its start-time config still contributes.
+        sources: List[tuple] = [("", self.applied_collection_triggers,
+                                 self.applied_collection_trigger_mode)]
+        for _gid, _w in self.workers.items():
+            sources.append((_gid,
+                            list(getattr(_w.config, "collection_triggers", None) or []),
+                            str(getattr(_w.config, "collection_trigger_mode", "any") or "any")))
+        for gid, _rows, _mode in sources:
+            m = str(_mode or "any").strip().lower()
             if m in ("any", "all"):
                 mode = m
-            for tr in (w.config.collection_triggers or []):
+            for tr in (_rows or []):
                 if not bool(tr.get("enabled", True)):
                     continue
+                kind = str(tr.get("kind") or "tag").strip().lower()
                 tag = self._normalize_tag(str(tr.get("tag_name") or ""))
-                if not tag:
+                if kind != "schedule" and not tag:
                     continue
-                trig_gid = str(tr.get("gateway_id") or gid)
+                # An "all gateways" rule keeps its empty/star scope rather than
+                # inheriting the worker it happened to be attached to.
+                _scope = str(tr.get("gateway_id") or "").strip()
+                trig_gid = _scope if _scope else gid
                 op = str(tr.get("operator") or ">=").strip()
                 try:
                     val = float(tr.get("value"))
@@ -4212,7 +4546,7 @@ class PLCManager:
                 trigger_type = str(tr.get("trigger_type") or "continuous").strip().lower()
                 if trigger_type not in ("continuous", "one_time"):
                     trigger_type = "continuous"
-                key = f"{trig_gid}|{tag}|{op}|{val}|{trigger_type}"
+                key = f"{trig_gid}|{kind}|{tag}|{op}|{val}|{trigger_type}"
                 if key in seen:
                     continue
                 seen.add(key)
@@ -4220,9 +4554,18 @@ class PLCManager:
                 merged.append(
                     {
                         "gateway_id": trig_gid,
+                        # Carried through, or a schedule rule arrives here as
+                        # a tag rule with no tag and is skipped forever. This
+                        # dict is another hand-written allowlist.
+                        "kind": kind,
                         "tag_name": tag,
                         "operator": op,
                         "value": val,
+                        "schedule_interval": str(tr.get("schedule_interval") or ""),
+                        "schedule_start": str(tr.get("schedule_start") or ""),
+                        "schedule_stop": str(tr.get("schedule_stop") or ""),
+                        "schedule_day_of_month": tr.get("schedule_day_of_month"),
+                        "schedule_date": str(tr.get("schedule_date") or ""),
                         "trigger_type": trigger_type,
                         "trigger_key": key,
                         "enabled": True,
@@ -4257,10 +4600,27 @@ class PLCManager:
                 continue
             self.global_live_values[f"{gateway_id}::{tag}"] = {"value": float(r.value), "ts_epoch": now_epoch}
 
-        triggers = [t for t in self.global_collection_triggers if bool(t.get("enabled", True))]
+        all_triggers = [t for t in self.global_collection_triggers
+                        if bool(t.get("enabled", True))]
+
+        # 2026-09-02: only the rules that are ABOUT this gateway.
+        #
+        # The verdict used to be one global yes/no, so a trigger written for
+        # one machine paused every gateway on the site - including meters that
+        # had nothing to do with it. A rule scoped to a gateway now gates that
+        # gateway; a rule scoped to "all gateways" (empty scope, or "*") gates
+        # everything, which is what an operator picks for a plant-wide rule.
+        from app.services.collection_schedule import (
+            applies_to_gateway, schedule_allows)
+        gid = str(gateway_id or "").strip()
+        triggers = [t for t in all_triggers
+                    if (not gid) or applies_to_gateway(t, gid)]
         if not triggers:
-            self.global_collection_allowed = True
-            self.global_collection_reason = None
+            # No rule concerns this gateway, so nothing is gating it. Note the
+            # GLOBAL flags stay describing the whole site for the footer.
+            if not all_triggers:
+                self.global_collection_allowed = True
+                self.global_collection_reason = None
             return True, None
 
         mode = str(self.global_collection_trigger_mode or "any").lower()
@@ -4268,8 +4628,24 @@ class PLCManager:
             mode = "any"
         evaluated = 0
         satisfied = 0
+        schedule_reasons: List[str] = []
         for tr in triggers:
             trig_gid = str(tr.get("gateway_id") or "").strip()
+
+            # A SCHEDULE rule needs no tag and no live value - it asks the
+            # clock. Evaluated through the same gate as a tag rule so both
+            # combine under the same ANY/ALL mode; building a second scheduler
+            # would mean two systems that can disagree about when a gateway
+            # collects.
+            if str(tr.get("kind") or "tag").strip().lower() == "schedule":
+                evaluated += 1
+                ok_now, why = schedule_allows(tr)
+                if ok_now:
+                    satisfied += 1
+                else:
+                    schedule_reasons.append(why)
+                continue
+
             tag = self._normalize_tag(str(tr.get("tag_name") or ""))
             if not tag:
                 continue
@@ -4309,19 +4685,30 @@ class PLCManager:
 
         if evaluated == 0:
             self.global_collection_allowed = False
-            self.global_collection_reason = "Global trigger tags not yet available (collection/write paused)."
+            self.global_collection_reason = "Trigger tags not yet available (collection/write paused)."
             return False, self.global_collection_reason
 
         if mode == "all":
             allowed = satisfied == evaluated
-            reason = None if allowed else f"Global trigger mode ALL not satisfied ({satisfied}/{evaluated})."
+            reason = None if allowed else f"Trigger mode ALL not satisfied ({satisfied}/{evaluated})."
         else:
             allowed = satisfied > 0
-            reason = None if allowed else f"Global trigger mode ANY not satisfied (0/{evaluated})."
+            reason = None if allowed else f"Trigger mode ANY not satisfied (0/{evaluated})."
+        # A schedule that is simply outside its window is the ordinary case,
+        # not a fault - say WHICH window, so the operator is not left deciding
+        # whether the gateway is broken.
+        if not allowed and schedule_reasons:
+            reason = "%s %s" % (reason or "", schedule_reasons[0])
 
-        self.global_collection_allowed = allowed
-        self.global_collection_reason = reason if not allowed else None
-        return allowed, self.global_collection_reason
+        # The GLOBAL flags describe the whole site (the footer reads them), so
+        # only a rule that gates everything may set them. A rule scoped to one
+        # gateway must not make the footer claim the site is paused.
+        if not gid or any(not str(t.get("gateway_id") or "").strip()
+                          or str(t.get("gateway_id")).strip() in ("*", "all", "ALL")
+                          for t in triggers):
+            self.global_collection_allowed = allowed
+            self.global_collection_reason = reason if not allowed else None
+        return allowed, (reason if not allowed else None)
 
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=200)
@@ -4982,6 +5369,35 @@ class PLCManager:
             return
 
         db_by_id = {str(d.get("id") or ""): d for d in db_rows if isinstance(d, dict)}
+
+        # --- a DELETED gateway must stop collecting ---
+        # The list comes from the config save, which knows precisely which ids
+        # it removed. Absence from gw_rows is NOT used: a gateway started
+        # through the API was never in the configuration and must keep running.
+        try:
+            deleted = set(self.deleted_gateway_ids)
+            self.deleted_gateway_ids -= deleted
+            for _gid in [k for k in list(self.workers.keys())
+                         if str(k).strip() and str(k).strip() in deleted]:
+                try:
+                    # user-stopped FIRST: otherwise baseline auto-recover
+                    # resurrects it on the next scan.
+                    self._user_stopped.add(_gid)
+                except Exception:
+                    pass
+                try:
+                    from app.state import telemetry_service as _ts2
+                    await asyncio.to_thread(_ts2.mark_gateway_running, _gid, False)
+                except Exception:
+                    pass
+                try:
+                    await self.stop_gateway(_gid)
+                    _GW_LOG.info("stopped worker %s - its gateway was deleted "
+                                 "from the configuration", _gid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         def _hhmm_to_minutes(text: str, default: int) -> int:
             try:

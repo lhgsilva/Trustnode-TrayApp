@@ -166,10 +166,15 @@ def _build_scope_key(request: Request, bootstrap_hint: Dict[str, Any] | None = N
     # Shared domains drop the user segment so every operator on the edge
     # reads/writes the same row.
     if domain and str(domain).lower() in _SHARED_EDGE_DOMAINS:
-        return f"{tenant_id}|{customer_id or '-'}|{edge_id}"
+        # Canonicalised so a moving tenant segment cannot split this install's
+        # configuration across two documents - one written, the other read.
+        return app_store.canonical_scope_key(f"{tenant_id}|{customer_id or '-'}|{edge_id}")
     if not username:
         return ""
-    return f"{tenant_id}|{customer_id or '-'}|{edge_id}|{username}"
+    # Same canonicalisation for the per-user scope: app_settings (theme, last
+    # profile) suffered the identical split.
+    return app_store.canonical_scope_key(
+        f"{tenant_id}|{customer_id or '-'}|{edge_id}|{username}")
 
 
 def shared_edge_scope_key() -> str:
@@ -246,6 +251,16 @@ class DomainSaveRequest(BaseModel):
     # collection (deleting the last widget, clearing a dashboard). Without it
     # the server refuses to blank a saved collection — see _guard_not_blanking.
     allow_empty: bool = False
+    # 2026-08-30: set ONLY by a deliberate restore/import. The destructive-write
+    # guard refuses a write that drops several configured items or that shares
+    # no ids with what is stored - exactly the shape of a restore, so a restore
+    # has to be able to say "yes, I mean it". The ordinary savers never send it.
+    allow_replace: bool = False
+    #: The version this client last READ for this domain. When present it is
+    #: the whole authorisation: match it and any change is honoured, including
+    #: an empty list; miss it and nothing is written. None means a caller that
+    #: cannot supply one (cloud sync, scripts) and keeps the legacy checks.
+    base_version: int | None = None
 
 
 class BootstrapSaveRequest(BaseModel):
@@ -371,7 +386,10 @@ def get_bootstrap(request: Request) -> dict:
     data_continuity: Dict[str, Any] = {}
     try:
         current = get_current_tenant()
-        inventory = app_store.list_historian_tenant_inventory() or []
+        # PEEK, never scan: this runs on every application start. The full
+        # query is a whole-historian scan (16 s live, growing) and holding
+        # boot on it is what let the UI open with no configuration loaded.
+        inventory = app_store.peek_historian_tenant_inventory() or []
         prior = [
             row for row in inventory
             if str(row.get("tenant_id") or "").strip().lower() != str(current or "").strip().lower()
@@ -400,12 +418,25 @@ def get_bootstrap(request: Request) -> dict:
     except Exception:
         # Never let the continuity scan break bootstrap.
         data_continuity = {}
+    # The version of each domain, taken from the scope that domain is WRITTEN
+    # to - shared-edge domains live in the shared scope, personal ones in the
+    # user scope. The client echoes these back as base_version, which is how a
+    # save proves it is editing current state.
+    versions: Dict[str, Any] = {}
+    try:
+        for _dom in list(data.keys()):
+            _target = shared_scope if str(_dom).strip().lower() in _SHARED_EDGE_DOMAINS else user_scope
+            if _target:
+                versions[str(_dom)] = app_store.get_scoped_domain_version(_target, str(_dom))
+    except Exception:
+        versions = {}
     return {
         "ok": True,
         "tenant_id": get_current_tenant(),
         "scope_key": user_scope,
         "shared_scope_key": shared_scope,
         "data": data,
+        "versions": versions,
         "data_continuity": data_continuity,
     }
 
@@ -741,15 +772,100 @@ def save_domain(payload: DomainSaveRequest, request: Request) -> dict:
     _guard_admin_only_domain(request, str(payload.domain or "").strip(), payload.payload)
     _guard_shared_write_permission(request, str(payload.domain or "").strip())
     scope_key = _build_scope_key(request, domain=payload.domain)
-    _guard_not_blanking(scope_key, str(payload.domain or "").strip(), payload.payload,
-                        str(payload.actor or ""), bool(payload.allow_empty))
+    _domain_name = str(payload.domain or "").strip()
+    _base = payload.base_version
+    if _base is not None and scope_key:
+        stored = app_store.get_scoped_domain_version(scope_key, _domain_name)
+        if stored < 0:
+            # Could not read the version - refuse rather than approve on
+            # information we do not have.
+            raise _HTTPException_rs(
+                status_code=409,
+                detail=("Could not read the stored version of %r, so this save was "
+                        "not applied. Nothing has been changed - reload and try "
+                        "again." % _domain_name))
+        if int(_base) != int(stored):
+            raise _HTTPException_rs(
+                status_code=409,
+                detail=("This page was editing version %d of %r but version %d is "
+                        "stored, so someone or something else changed it first. "
+                        "Nothing has been changed - reload to get the current "
+                        "configuration, then redo your edit."
+                        % (int(_base), _domain_name, int(stored))))
+    # A client that proved it holds the current version may make ANY change,
+    # including emptying the collection. Only unversioned callers still face
+    # the blank-write check.
+    if _base is None:
+        _guard_not_blanking(scope_key, _domain_name, payload.payload,
+                            str(payload.actor or ""), bool(payload.allow_empty))
+    # Captured before the write, so the deleted-gateway comparison below sees
+    # what was actually replaced.
+    _prev_gateway_payload = (
+        app_store.get_scoped_domain_payload(scope_key, _domain_name)
+        if _domain_name == "gateway_configurations" and scope_key else None)
     payload.payload = _preserve_omitted_keys(scope_key, str(payload.domain or "").strip(), payload.payload)
     payload.payload = _restore_domain_secrets(scope_key, str(payload.domain or "").strip(), payload.payload)
-    result = (
-        app_store.upsert_domain_scoped(scope_key, payload.domain, payload.payload, actor=payload.actor)
-        if scope_key
-        else app_store.upsert_domain(payload.domain, payload.payload, actor=payload.actor)
-    )
+    try:
+        result = (
+            app_store.upsert_domain_scoped(scope_key, payload.domain, payload.payload, actor=payload.actor,
+                                           allow_replace=bool(payload.allow_replace))
+            if scope_key
+            else app_store.upsert_domain(payload.domain, payload.payload, actor=payload.actor)
+        )
+    except ValueError as exc:
+        # The destructive-write guard refused: a save that would have dropped
+        # several configured items at once. 409, not 500 - the request was
+        # understood and deliberately declined, and the operator needs to SEE
+        # that rather than have a silent failure look like a save.
+        # HTTPException is imported under an alias in this module.
+        raise _HTTPException_rs(status_code=409, detail=str(exc)) from exc
+    # Deleting a gateway is a complete instruction: the worker must stop too.
+    # Without this the operator deletes a gateway and is then told "Found
+    # running gateway workers not mapped in this page" and "PLC unreachable -
+    # waiting to reconnect" about the thing they just removed, and asked to
+    # press "Stop All". Only ids that were stored and are now absent qualify,
+    # so a gateway started ad-hoc through the API is never touched.
+    if _domain_name == "gateway_configurations":
+        try:
+            _before = _prev_gateway_payload if isinstance(_prev_gateway_payload, list) else []
+            _before_ids = {str(g.get("id") or "").strip() for g in _before
+                           if isinstance(g, dict) and str(g.get("id") or "").strip()}
+            _after_ids = {str(g.get("id") or "").strip() for g in (payload.payload or [])
+                          if isinstance(g, dict) and str(g.get("id") or "").strip()}
+            _removed = _before_ids - _after_ids
+            if _removed:
+                from app.state import plc_manager as _pm
+                _pm.deleted_gateway_ids |= _removed
+                print("[trustnode][config] %d gateway(s) deleted; their workers will "
+                      "stop: %s" % (len(_removed), ", ".join(sorted(_removed))), flush=True)
+        except Exception:
+            pass
+
+    # 2026-09-02: a collection trigger is an instruction about what may be
+    # WRITTEN, so it has to reach the workers that are doing the writing. A
+    # worker holds its start-time configuration and nothing refreshed it, so a
+    # trigger added while gateways were running gated nothing at all - the
+    # operator's rule was saved, displayed, and ignored. Same shape as the
+    # gateway-delete and users_access hooks above: the save is the event.
+    if _domain_name == "triggers_limits":
+        try:
+            from app.state import plc_manager as _pm_tr
+            _body = payload.payload if isinstance(payload.payload, dict) else {}
+            _rows = _body.get("collection_triggers") or []
+            _mode = str(_body.get("collection_trigger_mode") or "any")
+            _n = _pm_tr.apply_collection_triggers(_rows, _mode)
+            if _n:
+                _enabled = [t for t in _rows if isinstance(t, dict)
+                            and t.get("enabled", True)]
+                print("[trustnode][config] collection triggers updated: %d rule(s), "
+                      "mode=%s, applied to %d running gateway(s)"
+                      % (len(_enabled), _mode, _n), flush=True)
+        except Exception as _exc:
+            # Never let this block the save - the rule is stored either way,
+            # and it will be picked up at the next gateway start.
+            print("[trustnode][config] could not apply triggers to running "
+                  "workers: %r" % (_exc,), flush=True)
+
     # Operator 2026-06-18: mirror users_access changes into AuthStore so
     # users created/edited via the "Users and Access Control" UI can log
     # in immediately. AuthStore is the auth hot path; without this hook

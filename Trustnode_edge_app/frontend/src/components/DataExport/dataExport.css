@@ -1,0 +1,176 @@
+/* Data Export layout.
+ *
+ * 2026-08-31, after review: "all the configuration on the top of the page...
+ * should be only one card on the top, then texts in subgroups better
+ * arranged... using width space and action button on the right... then a
+ * second card to show the data previewed below, expanding with the data."
+ *
+ * One control card that uses the full width, actions right-aligned, and a
+ * preview card that only exists once there is something in it and then takes
+ * the remaining height. */
+
+.dexp-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  /* The preview grows into whatever is left rather than pushing the page. */
+  min-height: 0;
+  flex: 1;
+}
+
+.dexp-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Fields flow across the full width and wrap; the action group is pushed to
+   the right edge by margin-left:auto so it stays there at any width. */
+.dexp-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.dexp-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 150px;
+  flex: 1 1 150px;
+}
+
+.dexp-field-wide {
+  flex: 1 1 280px;
+  min-width: 240px;
+}
+
+.dexp-field > span {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
+.dexp-field select,
+.dexp-field input {
+  width: 100%;
+}
+
+.dexp-actions {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  /* Right edge, whatever the wrap. */
+  margin-left: auto;
+}
+
+/* Subgroups: a hairline and a small caption, so the card reads as sections
+   rather than one long strip of inputs. */
+.dexp-subgroup {
+  border-top: 1px solid var(--line, rgba(255, 255, 255, 0.08));
+  padding-top: 10px;
+}
+
+.dexp-subgroup-title {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  margin-bottom: 6px;
+}
+
+.dexp-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.dexp-condition {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.dexp-condition input {
+  max-width: 140px;
+}
+
+.dexp-hint,
+.dexp-status {
+  font-size: 12px;
+  opacity: 0.75;
+  margin: 4px 0 0;
+}
+
+/* The preview card takes the rest of the height and scrolls inside itself, so
+   a large result never makes the page scroll horizontally. */
+.dexp-preview {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.dexp-preview-scroll {
+  overflow: auto;
+  min-height: 0;
+  flex: 1;
+}
+
+.dexp-preview-scroll table {
+  width: 100%;
+}
+
+.dexp-preview-scroll th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--card, #fff);
+}
+
+/* Filter row: three cells of identical shape.
+ *
+ * 2026-08-31: "arrange the elements of the filter to be aligned same height
+ * and distributed nicely... using the rows width properly". They were built
+ * three different ways - a plain input, and two captions with buttons glued
+ * inside them - so they sat at three heights and left a third of the row
+ * empty. */
+.dexp-row-filter {
+  align-items: stretch;
+}
+
+.dexp-row-filter > .dexp-field {
+  /* Equal share of the row, and they grow together rather than one taking
+     the slack. */
+  flex: 1 1 0;
+  min-width: 200px;
+}
+
+/* A button used AS a field control matches the inputs beside it, instead of
+   being a small button floating next to a tall box. */
+.dexp-control {
+  width: 100%;
+  min-height: 34px;
+  text-align: left;
+}
+
+/* Conditions live below the aligned row, so opening them cannot push the
+   cells out of line. */
+.dexp-conditions {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dexp-conditions .dexp-condition select,
+.dexp-conditions .dexp-condition input {
+  min-height: 32px;
+}

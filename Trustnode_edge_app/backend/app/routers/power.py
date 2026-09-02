@@ -287,6 +287,155 @@ def get_power_history(request: Request, limit: int = 300, device_id: str = "") -
     return {"ok": True, "rows": rows}
 
 
+# Grain thresholds. Chosen so a chart never receives more than ~1500 points
+# per tag: at 1 Hz that is 25 minutes of seconds, 25 hours of minutes, and so
+# on. The operator picks a PERIOD; the server picks the resolution that fits.
+_POWER_GRAINS = (
+    #  window <= ,        bucket,    approx seconds per bucket
+    (30 * 60,            "second",   1),
+    (36 * 3600,          "minute",   60),
+    (90 * 24 * 3600,     "hour",     3600),
+    (float("inf"),       "day",      86400),
+)
+
+
+def _pick_power_bucket(span_s: float, max_points: int = 1500) -> str:
+    """The finest grain that keeps a single tag under `max_points`."""
+    for limit_s, bucket, secs in _POWER_GRAINS:
+        if span_s <= limit_s and (span_s / secs) <= max_points:
+            return bucket
+    return "day"
+
+
+# EXACTLY the tags powerMainChartData draws for each metric. It filters the
+# response through this same priority list and discards everything else, so
+# anything extra here is rows read, bucketed and serialised for nothing - that
+# waste is what made the default 24-hour view take 38 seconds.
+#
+# Keep in step with `metricTagPriority` in App.jsx; the pairing is asserted by
+# scripts/test_power_series_window.py.
+_METRIC_TAGS = {
+    # Total first, then each phase. A meter that writes only some of these
+    # returns rows only for those; an absent tag is not an error.
+    #
+    # Note on power: the EM122 three-phase register map has
+    # active_power_total_w and NO per-phase power, so W charts as one line on
+    # that meter. The per-phase names are listed for meters that do publish
+    # them rather than pretending every meter is the same.
+    "power_kw":   ["active_power_total_w", "active_power_w",
+                   "active_power_l1_w", "active_power_l2_w", "active_power_l3_w"],
+    "voltage_v":  ["voltage_v", "voltage_l1_v", "voltage_l2_v", "voltage_l3_v"],
+    "current_a":  ["current_a", "current_l1_a", "current_l2_a", "current_l3_a"],
+    "energy_kwh": ["energy_total_wh", "energy_wh"],
+}
+
+
+def _tags_for_metric(metric: str) -> list[str]:
+    """Tags for one metric, or for a comma-separated list of them.
+
+    The page draws one metric but needs several: the totals and the tariff
+    maths are computed from power_kw and energy_kwh whatever the chart happens
+    to be showing. Returning the union keeps that a single query.
+    """
+    raw = str(metric or "").strip().lower()
+    if not raw:
+        return []
+    out: list[str] = []
+    for part in raw.split(","):
+        for tag in _METRIC_TAGS.get(part.strip(), []):
+            if tag not in out:
+                out.append(tag)
+    return out
+
+
+@router.get("/series")
+def get_power_series(request: Request, from_utc: str = "", to_utc: str = "",
+                     minutes: float = 0.0, bucket: str = "auto",
+                     device_id: str = "", tag: str = "", metric: str = "",
+                     max_points: int = 1500) -> dict:
+    """Bucketed power series for a TIME WINDOW.
+
+    Replaces the row-limited `/history` for charting. `/history` returned the
+    last N rows with no window at all; with 87 registers per sample that was
+    about 90 seconds of data whatever period the operator selected.
+
+    `bucket=auto` picks the grain from the window so the payload stays bounded
+    - seconds for a live view, minutes for a day, hours for a quarter - which
+    is what lets the same page move from seconds to days without falling over.
+    """
+    from datetime import datetime, timedelta, timezone as _tz
+
+    def _stamp(dt) -> str:
+        return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
+
+    now = datetime.now(_tz.utc)
+    to_txt = str(to_utc or "").strip() or _stamp(now)
+    if str(from_utc or "").strip():
+        from_txt = str(from_utc).strip()
+    else:
+        # Anchor the window on `to`, NOT on the wall clock. Asking for "the 2
+        # minutes ending at 12:14:49" while the clock says 12:16 must return
+        # 12:12:49-12:14:49, not 12:14:00-12:14:49.
+        mins = float(minutes or 0.0) or 60.0
+        try:
+            anchor = datetime.strptime(
+                str(to_txt).strip().replace("T", " ")[:19], "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=_tz.utc)
+        except Exception:
+            anchor = now
+        from_txt = _stamp(anchor - timedelta(minutes=mins))
+
+    # Span in seconds, from the two bounds as written.
+    def _parse(txt: str) -> datetime:
+        t = str(txt or "").strip().replace("T", " ")[:19]
+        return datetime.strptime(t, "%Y-%m-%d %H:%M:%S").replace(tzinfo=_tz.utc)
+
+    try:
+        span_s = max(1.0, (_parse(to_txt) - _parse(from_txt)).total_seconds())
+    except Exception:
+        span_s = 3600.0
+
+    grain = str(bucket or "auto").strip().lower()
+    if grain in ("", "auto"):
+        grain = _pick_power_bucket(span_s, max(50, min(int(max_points or 1500), 5000)))
+
+    # The chart draws a handful of series; the meter writes 87 registers. A
+    # 15-minute window at 1 s across all of them is 73 229 rows and ~6 s, to
+    # render six lines. Narrow it in SQL - `max_points` bounds points PER TAG,
+    # which does nothing when the row count is points x tags.
+    tag_filter = str(tag or "").strip()
+    tag_list: list[str] = []
+    if not tag_filter:
+        tag_list = _tags_for_metric(metric)
+
+    rows = app_store.bucket_raw_historian_rows(
+        bucket=grain,
+        from_utc=from_txt,
+        to_utc=to_txt,
+        gateway=str(device_id or "").strip(),
+        tag=tag_filter,
+        tags=tag_list,
+        # One tag's worth of points times a generous tag count. The SQL GROUP BY
+        # has already collapsed the raw rows, so this bounds the RESULT, not the
+        # scan.
+        limit=min(100000, max(1000, int(max_points or 1500) * 120)),
+        source="power_modbus,power_insight",
+    )
+    return {
+        "ok": True,
+        "rows": rows,
+        "bucket": grain,
+        "from_utc": from_txt,
+        "to_utc": to_txt,
+        "span_seconds": span_s,
+        # The chart shows the grain, so nobody mistakes an hourly average for a
+        # live reading.
+        "auto_bucket": str(bucket or "auto").strip().lower() in ("", "auto"),
+        "tag_filter": tag_filter,
+        "tags": tag_list,
+    }
+
+
 @router.get("/diagnostics")
 def get_power_diagnostics() -> dict:
     return {"ok": True, "diagnostics": power_manager.get_diagnostics()}

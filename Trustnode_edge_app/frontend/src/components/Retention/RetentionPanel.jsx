@@ -16,7 +16,7 @@ import {
   deleteRetentionPolicy, estimateRetentionPolicy, runRetentionV2, getRetentionRunsV2,
   compactDatabase, cancelDatabaseCompaction,
   listBackupsV2, createBackupV2, restoreBackupV2, cancelBackupRestore,
-  deleteBackupV2, backupDownloadUrl,
+  deleteBackupV2, backupDownloadUrl, getStorageStatus,
 } from "../../api";
 
 /* ------------------------------------------------------------------ utils */
@@ -84,7 +84,8 @@ function blankPolicy() {
       { keep: "1y", resolution: "15m", aggregate: "avg" },
     ],
     text_tags: { keep: "1y" },
-    maintenance: { window_local: "", catch_up_outside_window: true, max_run_minutes: 30, pace_ms_per_batch: 20, archive_before_prune: false, archive_location: "" },
+    maintenance: { window_local: "", catch_up_outside_window: true, max_run_minutes: 30, pace_ms_per_batch: 20, archive_before_prune: false, archive_location: "", auto_compact: true, auto_compact_free_pct: 25, auto_compact_min_free_gb: 2 },
+    cloud: { enabled: false, keep: "365d" },
     other_data: {},
     backups: { enabled: true, config_daily_keep: 14, historian_weekly_keep: 0, location: "" },
   };
@@ -106,6 +107,91 @@ function describePolicyPlain(policy) {
 }
 
 /* ------------------------------------------------------------------ panel */
+
+/* What the databases actually weigh. Kept deliberately blunt: a size, how much
+   of it is dead space, and whether anything is cleaning up on its own. */
+function StorageStatusCard({ status, onRefresh, busy }) {
+  const gb = (n) => {
+    const v = Number(n || 0);
+    if (!Number.isFinite(v) || v <= 0) return "0 MB";
+    return v >= 1e9 ? `${(v / 1e9).toFixed(2)} GB` : `${Math.round(v / 1e6)} MB`;
+  };
+  const local = status?.local || {};
+  const cloud = status?.cloud || {};
+  const ret = status?.retention || {};
+  const deadPct = Number(local.dead_pct || 0);
+  return (
+    <section className="card" style={{ marginBottom: 12 }}>
+      <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+        <h4 className="wcfg-card-title" style={{ margin: 0 }}>Database size</h4>
+        <button type="button" className="btn btn-sm" onClick={onRefresh} disabled={busy}>
+          {busy ? "Checking…" : "Refresh"}
+        </button>
+      </div>
+
+      <div className="trigger-form-grid" style={{ marginTop: 8 }}>
+        <div>
+          <strong>This edge</strong>
+          <div>{local.error ? local.error : gb(local.file_bytes)}</div>
+          {local.error ? null : (
+            <div className="dashboard-query-hint">
+              {Number(local.historian_rows || 0).toLocaleString()} readings
+              {local.oldest ? ` · from ${String(local.oldest).slice(0, 16)}` : ""}
+            </div>
+          )}
+        </div>
+        <div>
+          <strong>Dead space</strong>
+          <div style={deadPct >= 25 ? { color: "var(--warning, #d97706)" } : undefined}>
+            {gb(local.dead_bytes)} ({deadPct}%)
+          </div>
+          <div className="dashboard-query-hint">
+            {deadPct >= 25
+              ? "A compact would return this to the disk."
+              : "Deleted pages SQLite reuses; nothing to reclaim yet."}
+          </div>
+        </div>
+        <div>
+          <strong>Cloud database</strong>
+          <div>
+            {cloud.configured === false ? "not configured"
+              : cloud.error ? cloud.error : gb(cloud.database_bytes)}
+          </div>
+          {cloud.configured && !cloud.error ? (
+            <div className="dashboard-query-hint">
+              {Number(cloud.historian_rows || 0).toLocaleString()} readings in the historian
+            </div>
+          ) : null}
+        </div>
+        <div>
+          <strong>Automatic cleanup</strong>
+          <div>{ret.active ? (ret.raw_keep ? `keeps ${ret.raw_keep}` : "on") : "no policy"}</div>
+          <div className="dashboard-query-hint">
+            {ret.auto_compact ? "reclaims disk" : "disk reclaim OFF"}
+            {" · "}
+            {ret.cloud_enabled ? `cloud keeps ${ret.cloud_keep || "?"}` : "cloud never pruned"}
+          </div>
+        </div>
+      </div>
+
+      {/* The historian is the usual culprit but not always: on 2026-08-31 the
+          cloud database was still 20 GB with the historian emptied. */}
+      {Array.isArray(cloud.tables) && cloud.tables.length ? (
+        <div style={{ marginTop: 8 }}>
+          <div className="dashboard-query-hint">Largest cloud tables</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 4 }}>
+            {cloud.tables.slice(0, 6).map((t) => (
+              <span key={t.name} className="pill" title={t.name}>
+                {t.name}: {gb(t.bytes)}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
   const editable = Boolean(canEdit && isAdmin);
 
@@ -119,11 +205,31 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
   const [editor, setEditor] = useState(null);       // policy draft or null
   const [estimate, setEstimate] = useState(null);
   const [estimateError, setEstimateError] = useState("");
+  //: Local and cloud sizes. Loaded once on open and on demand - it is a
+  //: COUNT over the historian plus a cloud round trip, so it does not
+  //: belong on a poll.
+  const [storage, setStorage] = useState(null);
+  const [storageBusy, setStorageBusy] = useState(false);
   const [confirm, setConfirm] = useState(null);     // {title, message, onConfirm}
   const estimateTimer = useRef(null);
   const mounted = useRef(true);
 
   useEffect(() => () => { mounted.current = false; if (estimateTimer.current) clearTimeout(estimateTimer.current); }, []);
+
+  const loadStorage = useCallback(async () => {
+    setStorageBusy(true);
+    try {
+      const res = await getStorageStatus();
+      if (mounted.current) setStorage(res || null);
+    } catch (err) {
+      // A size panel that cannot load must not take the page with it.
+      if (mounted.current) setStorage({ error: String(err?.message || err) });
+    } finally {
+      if (mounted.current) setStorageBusy(false);
+    }
+  }, []);
+
+  useEffect(() => { loadStorage(); }, [loadStorage]);
 
   const flash = useCallback((tone, text) => {
     if (!mounted.current) return;
@@ -272,6 +378,9 @@ export default function RetentionPanel({ canEdit = false, isAdmin = false }) {
   /* ------------------------------------------------------------ render */
   return (
     <>
+      {/* The sizes, above the settings that control them: "your database is
+          large" and "here is the switch that keeps it small" belong together. */}
+      <StorageStatusCard status={storage} onRefresh={loadStorage} busy={storageBusy} />
       {/* ---------------------------------------------------- 1. STORAGE */}
       <section className="card">
         <div className="row backup-card-header">
@@ -853,6 +962,40 @@ function PolicyEditor({ draft, options, estimate, estimateError, busy, onPatch, 
               <input placeholder="e.g. 01:00-05:00 — leave empty for any time"
                 value={draft.maintenance?.window_local || ""}
                 onChange={(e) => onPatch((d) => { d.maintenance = { ...(d.maintenance || {}), window_local: e.target.value }; })} />
+            </label>
+            {/* Deleting the CLOUD copy is a separate decision from deleting
+                the local one: local retention already refuses to remove
+                anything the cloud has not received, treating the cloud as the
+                durable copy. So this is off until somebody turns it on. */}
+            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <input type="checkbox" style={{ width: "auto" }}
+                checked={Boolean(draft.cloud?.enabled)}
+                onChange={(e) => onPatch((d) => { d.cloud = { ...(d.cloud || {}), enabled: e.target.checked }; })} />
+              Also delete old data from the cloud database
+            </label>
+            <label>
+              Cloud — keep for
+              <input value={draft.cloud?.keep || ""} placeholder="365d"
+                disabled={!draft.cloud?.enabled}
+                title={draft.cloud?.enabled
+                  ? "Cloud rows older than this are deleted, in batches, for this edge's tenant only."
+                  : "Turn on cloud deletion first."}
+                onChange={(e) => onPatch((d) => { d.cloud = { ...(d.cloud || {}), keep: e.target.value }; })} />
+            </label>
+            {/* Deletes nothing - returns space retention already freed. */}
+            <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <input type="checkbox" style={{ width: "auto" }}
+                checked={draft.maintenance?.auto_compact !== false}
+                onChange={(e) => onPatch((d) => { d.maintenance = { ...(d.maintenance || {}), auto_compact: e.target.checked }; })} />
+              Reclaim disk automatically after cleanup
+            </label>
+            <label>
+              Reclaim when this % of the file is dead space
+              <input type="number" min="5" max="90"
+                value={draft.maintenance?.auto_compact_free_pct ?? 25}
+                disabled={draft.maintenance?.auto_compact === false}
+                title="Deleted rows leave free pages behind; SQLite reuses them but never shrinks the file. Compacting is what returns the disk."
+                onChange={(e) => onPatch((d) => { d.maintenance = { ...(d.maintenance || {}), auto_compact_free_pct: Number(e.target.value) }; })} />
             </label>
             <label>
               Application log — keep for

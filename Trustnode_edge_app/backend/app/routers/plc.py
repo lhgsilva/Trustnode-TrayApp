@@ -988,6 +988,29 @@ class IfmFieldbusAutoRequest(BaseModel):
 IFM_ASSEMBLY_CANDIDATES = (100, 101, 102, 103, 104, 150, 151, 152, 199)
 
 
+class CollectionTriggersApplyRequest(BaseModel):
+    """The trigger set a client hydrated, re-applied to the running managers."""
+    collection_triggers: list = []
+    collection_trigger_mode: str = "any"
+
+
+@router.post("/collection-triggers/apply")
+def apply_collection_triggers(payload: CollectionTriggersApplyRequest) -> dict:
+    """Make the saved trigger rules effective without editing them.
+
+    2026-09-02: a restart left the manager with no trigger set until somebody
+    edited a trigger, so the rules sat on disk gating nothing - and on a site
+    with a power meter and no PLC gateway they gated nothing ever, because the
+    set was rebuilt purely from running workers. The client hydrates the rules
+    with its own scope already resolved, so it is the right thing to hand them
+    back; the server must not guess which scope's document to read.
+    """
+    from app.state import plc_manager as _pm
+    rows = [t for t in (payload.collection_triggers or []) if isinstance(t, dict)]
+    n = _pm.apply_collection_triggers(rows, str(payload.collection_trigger_mode or "any"))
+    return {"ok": True, "rules": len(rows), "gateways_updated": n}
+
+
 @router.post("/eip/ifm-fieldbus-autoconfig")
 def eip_ifm_fieldbus_autoconfig(payload: IfmFieldbusAutoRequest) -> dict:
     """One call: identify the block, find its input assembly, build the tags.
@@ -999,7 +1022,7 @@ def eip_ifm_fieldbus_autoconfig(payload: IfmFieldbusAutoRequest) -> dict:
     a gateway configuration ready to save.
     """
     from app.drivers.ethernet_ip import (
-        EipDeviceClient, EipSignal, decode_signal, ifm_pin_signals)
+        EipDeviceClient, EipSignal, decode_signal, ifm_master_signals)
 
     host = (payload.plc_ip or "").strip()
     if not host:
@@ -1044,7 +1067,12 @@ def eip_ifm_fieldbus_autoconfig(payload: IfmFieldbusAutoRequest) -> dict:
         found, key=lambda f: f["size_bytes"])
     instance = int(chosen["instance"])
 
-    signals = ifm_pin_signals(port_count=int(payload.port_count or 8))
+    # 2026-09-02: was ifm_pin_signals, which mapped bytes 0-1 only - the
+    # digital inputs and nothing else. The block also publishes each port's
+    # IO-Link identity and its process data further into the same assembly,
+    # so a fieldbus gateway offered neither until now.
+    signals = ifm_master_signals(port_count=int(payload.port_count or 8),
+                                 assembly_size=int(chosen["size_bytes"] or 446))
     values = []
     try:
         data = client.read_assembly(instance)
@@ -2029,11 +2057,82 @@ def browse_opcua_nodes(payload: OpcUaBrowseRequest) -> OpcUaBrowseResult:
     return _browse_opcua_nodes(payload)
 
 
+@router.post("/pointio/scan")
+def scan_point_io(payload: dict) -> dict:
+    """Ask a 1734-AENTR what is on its backplane, and what we can read.
+
+    Returns the modules AND the datapoints in the shape the gateway config
+    stores, so the dialog can offer tags without a second round trip.
+    """
+    from app.drivers.point_io import PointIoClient, PointIoError, datapoints_from_scan
+
+    host = str((payload or {}).get("ip") or (payload or {}).get("host") or "").strip()
+    if not host:
+        return {"ok": False, "message": "adapter IP is required", "modules": [], "datapoints": []}
+    slots = int((payload or {}).get("max_slots") or 8)
+    cli = PointIoClient(host, timeout_s=float((payload or {}).get("timeout_s") or 3.0))
+    try:
+        modules = cli.scan(max_slots=slots)
+    except PointIoError as exc:
+        return {"ok": False, "message": str(exc), "modules": [], "datapoints": []}
+    except Exception as exc:  # noqa: BLE001 - the dialog shows this verbatim
+        return {"ok": False, "message": "scan failed: %s" % exc, "modules": [], "datapoints": []}
+    finally:
+        cli.close()                          # scan_error survives close()
+    if not modules:
+        return {"ok": False, "modules": [], "datapoints": [],
+                "message": ("The adapter answered but reported no modules. Check the "
+                            "rack is powered and, after changing modules, power-cycle "
+                            "the adapter - it only rescans its backplane at boot.")}
+    points = datapoints_from_scan(modules)
+    msg = "%d module(s), %d point(s)" % (len(modules), len(points))
+    # A walk that stopped early lists SOME of the rack. Presenting that as the
+    # whole rack invites an operator to tick a partial configuration.
+    if getattr(cli, "scan_error", ""):
+        msg += (" - the walk stopped early (%s), so this list may be "
+                "incomplete. Re-scan before saving." % cli.scan_error)
+    return {"ok": True, "modules": modules, "datapoints": points, "message": msg,
+            "partial": bool(getattr(cli, "scan_error", ""))}
+
+
 @router.post("/gateways/start")
 async def start_gateway_runtime(payload: GatewayRuntimeStartRequest) -> dict[str, str | bool]:
     gateway_id = payload.gateway_id.strip()
     if not gateway_id:
         return {"started": False, "message": "gateway_id is required"}
+
+    # A gateway must be able to ADDRESS its values, not just name them.
+    _gt = str(getattr(payload.config, "gateway_type", "") or "").strip().lower()
+    if _gt == "ifm_iolink" and not list(getattr(payload.config, "ifm_datapoints", None) or []):
+        return {
+            "started": False,
+            "message": (
+                "This ifm gateway has no datapoints. Tag names alone do not tell "
+                "the driver where to read them - open the gateway and use "
+                "\"Search Available Tags\" so the block can list what it offers, "
+                "then save and start. (Nothing was started; a gateway that cannot "
+                "read must not report RUNNING.)"
+            ),
+        }
+    if _gt == "point_io" and not list(getattr(payload.config, "point_io_modules", None) or []):
+        return {
+            "started": False,
+            "message": (
+                "This POINT I/O gateway has no modules. Open the gateway and use "
+                "\"Scan rack\" so the adapter can report which slots are populated, "
+                "then save and start."
+            ),
+        }
+    if _gt == "ethernet_ip" and not list(getattr(payload.config, "eip_signals", None) or [])             and not int(getattr(payload.config, "eip_input_assembly", 0) or 0):
+        return {
+            "started": False,
+            "message": (
+                "This EtherNet/IP gateway has no input assembly and no signals, so "
+                "there is nothing for it to read. Open the gateway and map the "
+                "assembly (the block's pins are discovered for you), then save "
+                "and start."
+            ),
+        }
     # Operator 2026-06-23: enforce license limits on the canonical
     # operation that activates collection. Failing OPEN: if the
     # license helper can't be reached, we let the start through.

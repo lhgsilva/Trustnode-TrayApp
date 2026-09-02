@@ -5,6 +5,11 @@
      rendering with a dark background. Lock the form-control palette
      to the active app theme. */
   color-scheme: light;
+  /* ONE family for prose, ONE for figures. Four different monospace stacks
+     were in use, so a register address and a tag value could be set in
+     different faces on the same screen. Everything references these. */
+  --font-sans: "Segoe UI", "Trebuchet MS", system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Consolas, "Courier New", monospace;
   --bg: #fcfcfc;
   --header: #ffffff;
   --header-text: #111111;
@@ -73,7 +78,7 @@ body,
 
 body {
   margin: 0;
-  font-family: "Segoe UI", "Trebuchet MS", sans-serif;
+  font-family: var(--font-sans);
   background: var(--bg);
   color: var(--text);
   overflow: hidden;
@@ -1051,6 +1056,17 @@ body {
   color: #ffffff;
 }
 
+/* 2026-09-02: RUNNING but writing nothing, because a collection trigger's
+   condition is not met. Amber deliberately - it is neither healthy green nor
+   fault red: the gateway is up and will resume by itself. Showing this as
+   "Running" left an operator watching a flat chart with no way to tell a
+   trigger from a broken PLC. */
+.footer-toggle-fab.paused {
+  background: #d97706;
+  border-color: #b45309;
+  color: #ffffff;
+}
+
 /* Boot "not resolved yet" state — neutral slate, consistent with status-warning
    pill tone but opaque enough to read on the fixed overlay background. */
 .footer-toggle-fab.checking {
@@ -1130,7 +1146,7 @@ body {
 }
 
 .interface-color-inputs input[type="text"] {
-  font-family: Consolas, "Courier New", monospace;
+  font-family: var(--font-mono);
   text-transform: uppercase;
 }
 
@@ -2484,16 +2500,11 @@ body {
 /* Squeeze the Actions column on every portal table grid. Each grid
    already declares N columns ending with a fixed pixel width — we
    simply override that last track to 84-120 px (2 icons / 3 icons). */
-.cp-customers-table .thead,
-.cp-customers-table .trow { grid-template-columns: 40px 1fr 1fr 1.2fr 1fr .7fr 84px; }
-.cp-licenses-table .thead,
-.cp-licenses-table .trow { grid-template-columns: 40px 1fr .95fr .9fr .9fr 1.35fr .7fr 84px; }
-.cp-edges-table .thead,
-.cp-edges-table .trow { grid-template-columns: 40px 1fr 1fr .95fr 1.4fr .65fr .75fr 84px; }
-.cp-activation-table .thead,
-.cp-activation-table .trow { grid-template-columns: 40px .45fr 1.2fr .8fr .85fr .85fr .65fr .95fr .95fr 120px; }
-.cp-workspace-table .thead,
-.cp-workspace-table .trow { grid-template-columns: 1.2fr 1.2fr .8fr .7fr 84px; }
+/* 2026-08-29: these five tables were ALSO defined further down with a wider
+   Actions column, and the later rule wins. Identical track counts, so nothing
+   looked wrong - but it is the same trap that wrapped the register rows when
+   a column was added to the definition that loses. One definition each; the
+   surviving ones are below with the wider Actions column. */
 .cp-dashboard-profiles-table .thead,
 .cp-dashboard-profiles-table .trow { grid-template-columns: 1fr 2.2fr .55fr .55fr 1fr 56px; }
 .cp-dashboard-profiles-table.without-tenant .thead,
@@ -2575,7 +2586,7 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -2624,7 +2635,7 @@ body {
 }
 .portal-activation-edit-row input {
   width: 100%;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 12.5px;
 }
 .portal-activation-edit-label { color: var(--muted); }
@@ -4396,7 +4407,8 @@ input[type="checkbox"] {
   margin-bottom: 12px;
 }
 
-.power-top-tab {
+.power-top-tab,
+.oee-tab {
   min-width: 120px;
   height: 36px;
   border-radius: 10px;
@@ -4407,7 +4419,8 @@ input[type="checkbox"] {
   cursor: pointer;
 }
 
-.power-top-tab.active {
+.power-top-tab.active,
+.oee-tab.active {
   border-color: rgba(26, 170, 159, 0.55);
   color: var(--text);
   box-shadow: 0 0 0 1px rgba(26, 170, 159, 0.18) inset;
@@ -4460,6 +4473,17 @@ input[type="checkbox"] {
   gap: 2px 4px;
   row-gap: 0;
 }
+/* 2026-08-31: the OEE Overview reuses this strip, but an OEE KPI card has
+   five children - title, value, delta, sparkline, maturity - and the grid
+   above names areas for only three. The extra two were auto-placed into
+   whatever cells were free, which put the sparkline beside the delta and the
+   maturity badge beside the sparkline. These cards stack; that is how the
+   same component renders on Machine Detail, where no area grid applies. */
+.power-kpi-grid .stat-card.oee-kpi {
+  display: block;
+  padding: 8px 10px;
+}
+
 .power-kpi-grid .stat-card .stat-title {
   grid-area: title;
   font-size: 10.5px;
@@ -4975,7 +4999,7 @@ input[type="checkbox"] {
 
 .power-meter-table .thead,
 .power-meter-table .trow {
-  min-width: 1240px;
+  min-width: 960px;
   /* Added Cost column (operator 2026-06-15). */
   grid-template-columns: minmax(120px, 1.1fr) minmax(180px, 1.4fr) minmax(170px, 1.3fr) minmax(100px, 0.8fr) minmax(100px, 0.8fr) minmax(100px, 0.8fr) minmax(130px, 1fr) minmax(130px, 1fr) minmax(110px, 0.9fr) minmax(130px, 0.9fr) minmax(120px, 0.9fr);
 }
@@ -4989,22 +5013,10 @@ input[type="checkbox"] {
   background: color-mix(in srgb, var(--card) 80%, var(--bg) 20%);
 }
 
-.power-register-table .thead,
-.power-register-table .trow {
-  min-width: 1300px;
-  /* Collect | Tag Key | Address | Scale | Description | Last Raw |
-     Last Scaled | Tested | Actions */
-  grid-template-columns:
-    64px
-    minmax(150px, 1.25fr)
-    minmax(110px, 0.9fr)
-    minmax(90px, 0.75fr)
-    minmax(220px, 1.5fr)
-    minmax(110px, 0.9fr)
-    minmax(110px, 0.9fr)
-    minmax(220px, 1.5fr)
-    96px;
-}
+/* The register table's columns are defined ONCE, further down, in the block
+   that also pins the Actions column. Defining them here as well is what made
+   the rows wrap on 2026-08-29: two rules with identical specificity, the later
+   one winning, and the Collect column added only to the earlier one. */
 
 .power-register-table.power-register-compact .thead {
   font-size: 12px;
@@ -5313,6 +5325,19 @@ input[type="checkbox"] {
 }
 
 @media (max-width: 1400px) {
+  /* 2026-09-01, measured at 1366x768: three columns turned eight KPIs into
+     THREE rows with a ragged two-card gap, 173px of the 704px first screen,
+     and pushed the Live Usage chart down to where only its top showed. Four
+     columns is two clean rows - the content width here is ~1044px, so each
+     card still gets ~253px, more than the widest title needs. The base rule
+     above still puts all eight in one row on a wide screen, which is what
+     the operator asked for in 2026-06. */
+  .power-kpi-grid {
+    grid-template-columns: repeat(4, minmax(150px, 1fr));
+  }
+}
+
+@media (max-width: 1100px) {
   .power-kpi-grid {
     grid-template-columns: repeat(3, minmax(150px, 1fr));
   }
@@ -5327,6 +5352,8 @@ input[type="checkbox"] {
     grid-template-columns: 1fr;
   }
 
+  /* Two columns is four rows of KPIs; the strip then costs more of the
+     screen than the chart it is introducing. */
   .power-kpi-grid {
     grid-template-columns: repeat(2, minmax(180px, 1fr));
   }
@@ -6650,7 +6677,7 @@ textarea {
 }
 .db-tag-checkbox-name {
   flex: 1 1 auto;
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-mono);
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -6669,7 +6696,7 @@ textarea {
   border-radius: 6px;
   padding: 8px;
   margin: 0 0 6px 0;
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-mono);
   font-size: 11px;
   white-space: pre-wrap;
   word-break: break-all;
@@ -6827,7 +6854,12 @@ textarea {
 
 .ifm-dp-head,
 .ifm-dp-row {
-  grid-template-columns: 62px minmax(140px, 1.3fr) 74px minmax(0, 1.8fr) 80px 78px;
+  /* Collect, name, channel, source, scale, OFFSET, unit. The offset column
+     was added 2026-09-02; a row with six columns of markup in a
+     five-column grid silently wraps, which is the trap this file has hit
+     before. */
+  grid-template-columns:
+    62px minmax(130px, 1.2fr) 70px minmax(0, 1.5fr) 74px 74px 72px;
 }
 
 /* The channel type an operator sorts on: DI, DO, IO-Link, Current,
@@ -7393,18 +7425,21 @@ textarea {
 
 .power-register-table .thead,
 .power-register-table .trow {
-  /* 1240 -> 980: Description and Tested each reserved 220px, and Tested holds
-     a date or a dash. The columns still grow with available width. */
-  min-width: 980px;
+  /* THE definition of this table's layout - there must not be a second one.
+     1240 -> 940: Description and Tested each reserved 220px, and Tested holds
+     a date or a dash. The columns still grow with available width, and 940
+     fits a 1280 laptop with the sidebar open (~980px of pane). */
+  min-width: 940px;
   grid-template-columns:
-    minmax(140px, 1.2fr)    /* tag key      */
-    minmax(100px, 0.8fr)    /* register     */
-    minmax(70px, 0.6fr)     /* scale        */
-    minmax(150px, 1.4fr)    /* description  */
-    minmax(100px, 0.8fr)    /* last raw     */
-    minmax(100px, 0.8fr)    /* last scaled  */
-    minmax(120px, 1fr)      /* tested       */
-    88px;                   /* actions      */
+    52px                    /* collect      */
+    minmax(120px, 1.2fr)    /* tag key      */
+    minmax(88px, 0.8fr)     /* register     */
+    minmax(64px, 0.5fr)     /* scale        */
+    minmax(130px, 1.4fr)    /* description  */
+    minmax(88px, 0.7fr)     /* last raw     */
+    minmax(88px, 0.7fr)     /* last scaled  */
+    minmax(110px, 1fr)      /* tested       */
+    84px;                   /* actions      */
 }
 
 /* Pinned so edit/delete are never scrolled out of reach. Needs an opaque
@@ -7568,7 +7603,12 @@ textarea {
 .oee-filter-row select { min-width: 140px; }
 
 /* --------------------------------------------------------------- KPIs --- */
-.oee-kpi-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); }
+.oee-kpi-grid {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+}
 .oee-kpi { min-width: 0; }
 .oee-kpi-sub { font-size: 10.5px; line-height: 1.3; margin-top: 2px; }
 /* A KPI with no value says so in words, smaller, so it reads as an
@@ -7793,7 +7833,7 @@ textarea {
   font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .pwr-import-text {
-  width: 100%; font-family: ui-monospace, Menlo, Consolas, monospace;
+  width: 100%; font-family: var(--font-mono);
   font-size: 11.5px; resize: vertical;
 }
 .pwr-import-preview { margin-top: 8px; max-height: 260px; overflow-y: auto; }
@@ -7978,4 +8018,1167 @@ textarea {
 .cipparam-row {
   grid-template-columns:
     62px minmax(140px, 1.4fr) 90px 90px 80px 70px minmax(90px, 1fr) 90px;
+}
+
+/* ============================================================ OEE dashboards
+   2026-08-29. Everything below uses the app's existing tokens (--card,
+   --stroke, --accent) so the module inherits dark and light mode rather than
+   carrying its own theme. Status colour is always accompanied by its label —
+   colour never carries the meaning on its own. */
+
+/* ---- period bar ---- */
+/* 2026-09-01: the bar used to be two rows - controls, then the resolved
+   window on a line of its own - and the OEE Overview stacked a filters card
+   above it as well. Measured at 1366x768, that chrome cost 167px before any
+   machine appeared. The window caption reads perfectly well at the end of the
+   control row, and the whole bar is now one line. */
+.oee-period-bar {
+  display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap; margin-bottom: 0;
+}
+.oee-period-window { font-size: 11.5px; white-space: nowrap; }
+/* Narrower than the 150px they were given: at ~1044px of content the row has
+   to hold a preset, two steppers, a shift, a line, two filters and the
+   refresh interval. */
+.oee-period-bar select { width: auto; min-width: 104px; max-width: 150px; }
+.oee-stepper { display: inline-flex; align-items: center; gap: 4px; }
+.oee-stepper-label { font-size: 11px; opacity: .7; min-width: 34px; text-align: center; }
+
+/* ---- gauge ---- */
+.oee-gauge { position: relative; display: inline-grid; place-items: center; }
+.oee-gauge svg { position: absolute; inset: 0; }
+.oee-gauge-track { fill: none; stroke: var(--stroke); stroke-width: 8; }
+.oee-gauge-fill {
+  fill: none; stroke: var(--accent, #14b8a6); stroke-width: 8;
+  stroke-linecap: round; transition: stroke-dasharray .45s ease;
+}
+.oee-gauge-good { stroke: #16a34a; }
+.oee-gauge-warn { stroke: #e0a458; }
+.oee-gauge-bad  { stroke: #ef4444; }
+.oee-gauge-centre { position: relative; text-align: center; line-height: 1.15; }
+.oee-gauge-value { font-size: 20px; font-weight: 700; }
+.oee-gauge-label { font-size: 10px; opacity: .7; text-transform: uppercase; letter-spacing: .04em; }
+.oee-tone-good { color: #16a34a; }
+.oee-tone-warn { color: #e0a458; }
+.oee-tone-bad  { color: #ef4444; }
+
+/* ---- A/P/Q bars ---- */
+.oee-apq { display: grid; gap: 4px; min-width: 132px; }
+.oee-apq-row { display: grid; grid-template-columns: 14px 1fr 42px; gap: 6px; align-items: center; }
+.oee-apq-key { font-size: 11px; font-weight: 700; opacity: .75; }
+.oee-apq-track { height: 6px; border-radius: 999px; background: var(--stroke); overflow: hidden; }
+.oee-apq-fill { display: block; height: 100%; background: var(--accent, #14b8a6); }
+.oee-apq-good { background: #16a34a; }
+.oee-apq-warn { background: #e0a458; }
+.oee-apq-bad  { background: #ef4444; }
+.oee-apq-val { font-size: 11px; text-align: right; }
+
+/* ---- maturity ---- */
+.oee-maturity {
+  /* A pill, and it has to STAY one. The KPI cards pass an assumption like
+     "2 of 3 machines have a complete figure", which wrapped to six lines and
+     shoved the sparkline out of the card. One line, ellipsis, full text in
+     the title attribute where it was always available. */
+  display: inline-block; font-size: 10.5px; font-weight: 700;
+  padding: 1px 7px; border-radius: 999px; border: 1px solid var(--stroke);
+  max-width: 100%; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; vertical-align: bottom;
+}
+.oee-maturity-partial { color: #e0a458; }
+.oee-maturity-full { color: #16a34a; }
+
+/* ---- machine card ---- */
+.oee-mc-clickable { cursor: pointer; }
+.oee-mc-clickable:hover { border-color: var(--accent, #14b8a6); }
+.oee-mc-clickable:focus-visible { outline: 2px solid var(--accent, #14b8a6); outline-offset: 2px; }
+.oee-mc-gauge-row { display: flex; gap: 12px; align-items: center; margin: 6px 0; }
+
+/* ---- timeline ---- */
+.oee-timeline { display: grid; gap: 4px; }
+.oee-tl-lane { display: grid; grid-template-columns: 150px 1fr; gap: 8px; align-items: center; }
+.oee-tl-name {
+  font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.oee-tl-track {
+  position: relative; background: var(--stroke); border-radius: 4px; overflow: hidden;
+}
+.oee-tl-block {
+  position: absolute; top: 0; bottom: 0; border: 0; padding: 0;
+  cursor: pointer; min-width: 1px;
+}
+.oee-tl-block:hover { filter: brightness(1.15); }
+.oee-tl-legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; opacity: .8; margin-top: 4px; }
+.oee-tl-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.oee-tl-legend-item i { width: 12px; height: 8px; border-radius: 2px; display: inline-block; }
+
+/* State colours. The label is always rendered beside these — see
+   StatusTimeline's legend and StatePill. */
+.oee-state-bg-running, .oee-state-bg-production { background: #16a34a; }
+.oee-state-bg-idle { background: #94a3b8; }
+.oee-state-bg-stopped { background: #ef4444; }
+.oee-state-bg-faulted { background: #b91c1c; }
+.oee-state-bg-planned_stop { background: #3b82f6; }
+.oee-state-bg-changeover, .oee-state-bg-setup { background: #a855f7; }
+.oee-state-bg-unknown { background: #64748b; }
+.oee-state-bg-signal_conflict { background: #e0a458; }
+.oee-state-dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
+
+/* ---- machine detail ---- */
+.oee-detail { display: grid; gap: 12px; }
+.oee-detail-head { display: grid; gap: 6px; margin-bottom: 10px; }
+.oee-detail-kpis {
+  display: grid; gap: 12px; align-items: center;
+  grid-template-columns: auto auto repeat(auto-fit, minmax(140px, 1fr));
+}
+.oee-detail-gauge { display: grid; gap: 6px; justify-items: center; }
+.oee-block-detail { display: grid; gap: 4px; margin: 8px 0; }
+.oee-block-detail > div { display: grid; grid-template-columns: 110px 1fr; gap: 8px; font-size: 12.5px; }
+/* Twelve columns inside the ~980px a laptop leaves once the sidebar is
+   open. The fixed columns hold values of known length (times, durations,
+   yes/no); Reason and Comment take what is left and ellipsis, because they
+   are the two that vary. No forced min-width: a table that makes the PAGE
+   scroll sideways is the thing audit_ui_consistency.py exists to stop -
+   overflow-x here is the fallback for a genuinely narrow panel, not the
+   normal case. */
+.oee-dt-table { display: block; overflow-x: auto; }
+.oee-dt-table .thead, .oee-dt-table .trow {
+  display: grid;
+  gap: 6px;
+  grid-template-columns:
+    58px 58px 62px 92px minmax(0, 1.4fr) 88px 74px 80px 72px 84px
+    minmax(0, 1fr) 132px;
+}
+.oee-dt-table .thead > span, .oee-dt-table .trow > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oee-dt-table .trow + .trow { margin-top: 6px; }
+/* A stop nobody has classified is the work this table exists to surface. */
+.oee-dt-table .trow.oee-dt-unknown {
+  box-shadow: inset 3px 0 0 var(--warn, #f59e0b);
+}
+.oee-needs-reason { color: var(--warn, #f59e0b); font-style: normal; }
+.oee-dt-actions { display: flex; gap: 4px; justify-content: flex-end; }
+.oee-dt-actions .btn { padding: 2px 8px; font-size: 11px; white-space: nowrap; }
+.oee-dt-comment { opacity: 0.8; }
+.oee-dt-form label.span-2 { grid-column: 1 / -1; }
+
+/* ---- planning ---- */
+.oee-planning { display: grid; gap: 12px; }
+.oee-plan-timeline .oee-tl-block { border-radius: 3px; }
+.oee-plan-label {
+  font-size: 10px; padding: 0 4px; color: #fff; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; display: block;
+}
+.oee-plan-planned_production { background: #16a34a; }
+.oee-plan-planned_stop, .oee-plan-break { background: #3b82f6; }
+.oee-plan-planned_maintenance, .oee-plan-cleaning { background: #a855f7; }
+.oee-plan-changeover, .oee-plan-setup { background: #8b5cf6; }
+.oee-plan-no_production { background: #64748b; }
+.oee-plan-trial, .oee-plan-batch_run, .oee-plan-recipe_run, .oee-plan-order_run { background: #0891b2; }
+.oee-plan-meeting { background: #94a3b8; }
+.oee-plan-table .thead, .oee-plan-table .trow {
+  grid-template-columns: minmax(140px,1.4fr) minmax(120px,1fr) minmax(120px,1fr) 110px 110px 120px 150px;
+}
+
+/* ---- dashboard widgets ---- */
+.oee-widget { display: grid; gap: 6px; height: 100%; align-content: start; }
+.oee-widget-title { font-size: 12px; font-weight: 700; opacity: .85; }
+.oee-widget-meta { font-size: 10.5px; }
+.oee-widget-kpi { display: grid; place-items: center; }
+.oee-widget-machine { display: flex; gap: 12px; align-items: center; }
+.oee-widget-facts { display: flex; gap: 10px; flex-wrap: wrap; font-size: 11.5px; }
+.oee-widget-states { display: grid; gap: 4px; }
+.oee-widget-state-row { display: grid; grid-template-columns: 12px 1fr auto auto; gap: 8px; align-items: center; font-size: 12px; }
+.oee-widget-state-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.oee-widget-state-label { font-size: 11px; opacity: .75; }
+.oee-widget-quality { display: grid; gap: 4px; }
+.oee-widget-quality-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.oee-widget-quality-count { font-weight: 700; }
+
+/* ===================================================== button variants
+   2026-08-29. Five classes were used across the app but defined nowhere:
+   btn-ghost (42 uses), btn-start, btn-stop, btn-add and btn-close. They
+   rendered as an unstyled default, which is what "the button colours are not
+   standardised" actually was. Defining them here is the fix; every one is
+   built from the same tokens as btn-primary/secondary so the set stays one
+   family rather than five opinions. */
+
+/* Quiet action: reads as a control, not as a call to action. Used for
+   toolbar and in-row actions where a filled button would shout. */
+.btn-ghost {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border-color: var(--stroke);
+}
+
+/* Start and stop are the two actions in this product that change what the
+   plant is doing, so they are deliberately the only green/red pair among the
+   controls - and they carry their own labels, never colour alone. */
+.btn-start {
+  background: var(--ok, #16a34a);
+  border-color: var(--ok, #16a34a);
+  color: #fff;
+}
+.btn-start:hover:not(:disabled) { filter: brightness(1.08); }
+.btn-stop {
+  background: var(--danger, #ef4444);
+  border-color: var(--danger, #ef4444);
+  color: #fff;
+}
+.btn-stop:hover:not(:disabled) { filter: brightness(1.08); }
+
+/* "Add" is a primary action in a secondary place: same accent, lighter weight
+   than btn-primary so a card can carry one without competing with the page. */
+.btn-add {
+  background: color-mix(in srgb, var(--brand-strong, #0e8479) 14%, transparent);
+  border-color: var(--brand-strong, #0e8479);
+  color: var(--brand-strong, #0e8479);
+}
+.btn-add:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--brand-strong, #0e8479) 24%, transparent);
+}
+
+/* A dismiss control: square, quiet, and the same size wherever it appears. */
+.btn-close {
+  background: transparent;
+  border: 1px solid var(--stroke);
+  color: var(--muted);
+  min-width: 28px;
+  padding: 0 8px;
+  line-height: 1;
+}
+.btn-close:hover:not(:disabled) { color: var(--text); }
+
+/* One spacing rule for grouped actions, so a toolbar in one page does not sit
+   at 4 px while the next sits at 12 px. */
+.row-actions,
+.modal-actions,
+.card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.modal-actions { justify-content: flex-end; }
+
+/* ================================================ the Add Widget picker
+   2026-08-29. `.dashboard-widget-modal` and `.dashboard-type-grid` carried NO
+   rules, so the dialog fell back to the 430 px base modal and listed every
+   widget in a single column. With the library now past forty entries that was
+   unusable. Wide card, and the types in responsive columns. */
+/* ======================================== widget Configure: three cards
+   2026-08-30. The Configure tab was one flat grid of ~25 controls in source
+   order. Now Style / Chart / Series, each spanning the dialog width, with the
+   setting's name on the left and its switch hard right so the switches line
+   up in a column instead of trailing the label text. */
+.wcfg-card {
+  grid-column: 1 / -1;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: var(--card-2, rgba(127, 127, 127, .05));
+  padding: 12px 14px 14px;
+  margin: 0 0 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px 14px;
+  align-items: start;
+}
+.wcfg-card-title {
+  grid-column: 1 / -1;
+  margin: 0 0 2px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  opacity: .72;
+}
+/* Anything that should own a whole row inside a card. */
+.wcfg-card > .dashboard-full-row,
+.wcfg-card > fieldset,
+.wcfg-card > .dashboard-slide-toggle { grid-column: 1 / -1; }
+
+/* Name left, switch right. The markup order is input, track, label, so the
+   label is re-ordered rather than moved - it is a <div role="switch"> whose
+   click handler covers the whole row. */
+.wcfg-card .dashboard-slide-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 7px 2px;
+  border-top: 1px solid var(--stroke);
+}
+.wcfg-card .dashboard-slide-toggle .slide-label {
+  order: 1;
+  flex: 1 1 auto;
+  font-size: 13px;
+}
+.wcfg-card .dashboard-slide-toggle .slide-track { order: 2; flex: 0 0 auto; }
+.wcfg-card fieldset { margin: 0; }
+/* Rows built from a plain <label class="row"> rather than the slide-toggle
+   component still have to line up with it. */
+.wcfg-card label.wcfg-row,
+.wcfg-card > .wcfg-row {
+  grid-column: 1 / -1;
+  /* display MUST be stated: the global `label { display: grid }` outranks
+     `.row`'s flex, which stacked the name above its switch and centred both.
+     The same trap is noted where the slide-toggle uses a <div> instead. */
+  display: flex !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 7px 2px;
+  border-top: 1px solid var(--stroke);
+}
+.wcfg-card .wcfg-row-name {
+  font-size: 13px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: inherit;
+  opacity: 1;
+}
+
+.modal-card.dashboard-widget-modal,
+.dashboard-widget-modal {
+  /* The picker is a browse surface and wants width; the Configure form is a
+     form and does not. 1320 made every card a very long line to scan. */
+  width: min(1040px, 96vw);
+}
+
+/* Category cards. Each is a bordered block with a clickable header, so the
+   groups read as separate things instead of one continuous wall of buttons. */
+.dashboard-type-group {
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: var(--card);
+  overflow: hidden;
+}
+.dashboard-type-group > .dashboard-type-grid {
+  padding: 10px;
+  padding-top: 0;
+}
+.dashboard-type-group.closed > .dashboard-type-grid { padding: 0; }
+
+.dashboard-type-groups {
+  display: grid;
+  gap: 14px;
+}
+/* The header is a <button> now (it toggles the card), so it has to be reset
+   out of the button look before it can be styled as a title. */
+.dashboard-type-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  opacity: .82;
+  cursor: pointer;
+  text-align: left;
+}
+.dashboard-type-group-title:hover { opacity: 1; }
+.dashboard-type-caret {
+  font-size: 10px;
+  opacity: .8;
+  width: 10px;
+}
+/* Count sits hard right so every card's number lines up down the column. */
+.dashboard-type-count {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--chip-bg, rgba(127, 127, 127, .16));
+  opacity: .85;
+}
+/* auto-fill, not auto-fit: a group holding two widgets keeps them at a normal
+   width instead of stretching each across the whole dialog. */
+.dashboard-type-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 8px;
+}
+/* The author `display: grid` above outranks the UA `[hidden] {display:none}`,
+   so a collapsed category kept rendering all of its buttons. Restate it. */
+.dashboard-type-grid[hidden] { display: none; }
+.dashboard-type-grid > button {
+  text-align: left;
+  padding: 8px 10px;
+  min-height: 38px;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  background: var(--card);
+}
+.dashboard-type-grid > button:hover:not(:disabled) {
+  border-color: var(--brand-strong, #0e8479);
+}
+
+/* ================================== settings pages: use the width available
+   2026-08-29, reported: "Settings/Interface is not well designed — minimum
+   spaces and more items on the screen across the width without scrolling."
+
+   These pages are a stack of small cards, each holding a handful of fields.
+   On a 1400 px screen that wastes two thirds of the width and makes the
+   operator scroll past six cards to reach the last setting. Columns instead,
+   and only once there is genuinely room: below 1180 px they stay stacked,
+   because two cramped columns are worse than one readable one. */
+@media (min-width: 1180px) {
+  .content-scroll[data-page="interface"],
+  .content-scroll[data-page="edge"],
+  .content-scroll[data-page="directories"] {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(430px, 1fr));
+    gap: var(--space-3, 10px);
+    align-items: start;
+  }
+  /* Full-width elements must not be dragged into a column: the page title,
+     any alert, and the workspace banner still span the whole page. */
+  .content-scroll[data-page="interface"] > .page-title-row,
+  .content-scroll[data-page="edge"] > .page-title-row,
+  .content-scroll[data-page="directories"] > .page-title-row,
+  .content-scroll[data-page="interface"] > .error,
+  .content-scroll[data-page="edge"] > .error,
+  .content-scroll[data-page="directories"] > .error,
+  .content-scroll[data-page="interface"] > .workspace-warning,
+  .content-scroll[data-page="edge"] > .workspace-warning,
+  .content-scroll[data-page="directories"] > .workspace-warning {
+    grid-column: 1 / -1;
+  }
+}
+
+/* A card on a settings page carries a title and a few fields; the default
+   card padding is tuned for data pages and leaves too much air here. */
+.content-scroll[data-page="interface"] .card,
+.content-scroll[data-page="edge"] .card {
+  padding: var(--space-3, 10px) var(--space-4, 14px);
+}
+.content-scroll[data-page="interface"] .card-title,
+.content-scroll[data-page="edge"] .card-title {
+  margin-bottom: 6px;
+}
+
+/* The resolution the SERVER chose for the current window. A chart of a month
+   is a series of daily averages, and reading it as live values is how a
+   30-second spike gets argued about. Say the grain, always. */
+.pwr-grain-badge {
+  align-self: end;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--stroke);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+
+/* ============================================================ I/O block card
+   2026-08-29. An ifm IO-Link master as one widget: supply strip, legend, and
+   a row per port with both pins.
+
+   The colour rule is the point of the whole card. `.fault` is used for a pin
+   whose reading came back BAD, and it renders as "—", never as OFF: the day
+   this was written a block had been unplugged for hours while every pin
+   showed a confident 0. "Input is low" and "we never heard back" must not
+   look the same. */
+.io-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 0;
+}
+.io-block-empty {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  font-size: 12px;
+  opacity: .7;
+  text-align: center;
+  padding: 10px;
+}
+/* The device header, on the body - power, link and freshness where the real
+   block carries its status LEDs. */
+.io-face-head {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--io-inset);
+}
+.io-face-name {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  color: var(--io-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.io-face-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 4px 10px;
+}
+.io-block-stat { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.io-block-stat-k {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--io-ink-2);
+}
+.io-block-stat-v {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--io-ink);
+  white-space: nowrap;
+}
+.io-block-table {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+}
+/* ONE definition of the columns. A second grid-template-columns rule on the
+   same selector silently wins by source order and wraps every row - that trap
+   cost an afternoon on the meter register table (2026-08-29). */
+.io-block-row {
+  display: grid;
+  grid-template-columns: 44px minmax(120px, 1.6fr) minmax(90px, 1fr) 44px;
+  align-items: center;
+  gap: 8px;
+  /* One row per tag means 19 rows on an 8-port master, not 8. Tight rows are
+     what let the whole block fit on screen without scrolling. */
+  padding: 2px 8px;
+  border-bottom: 1px solid var(--stroke);
+  font-size: 12px;
+}
+.io-block-row:last-child { border-bottom: 0; }
+.io-block-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--card);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  opacity: .7;
+}
+.io-block-port { font-weight: 700; font-variant-numeric: tabular-nums; }
+.io-block-mode { font-size: 11px; opacity: .8; }
+
+.io-block-tag {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.io-block-value {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.io-block-pin-sub { font-size: 10px; font-style: normal; opacity: .6; }
+/* Value styling still separates "input is low" from "nothing came back" -
+   the status BULLETS were dropped (2026-08-30), not the distinction. A BAD
+   reading renders "-" with "no read" in words, so it never reads as OFF. */
+.io-block-value.on    { color: #22c55e; }
+.io-block-value.off   { opacity: .7; }
+.io-block-value.num   { color: #38bdf8; }
+.io-block-value.fault { color: #ef4444; }
+.io-block-value.idle  { opacity: .5; }
+
+.io-block-act { display: flex; justify-content: flex-end; }
+.io-block-chart-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 19px;
+  padding: 0;
+  /* On the device body, so it takes its contrast from the body, not the
+     app surface - a --stroke border is invisible against orange. */
+  border: 1px solid var(--io-edge);
+  border-radius: 5px;
+  background: var(--io-inset-2);
+  color: var(--io-ink);
+  cursor: pointer;
+}
+.io-block-chart-btn:hover:not(:disabled) {
+  border-color: currentColor;
+  background: var(--io-inset);
+}
+.io-block-chart-btn:disabled { cursor: default; opacity: .3; }
+
+
+
+/* ===================================================== I/O block, front face
+   2026-08-30. The block's eight M12 sockets in two columns of four, the way
+   they sit on the hardware, so an operator at the panel matches screen to
+   device by position instead of by reading a table.
+
+   ifm orange is used deliberately and is NOT theme-swapped: it is how the
+   device is recognised on the wall. The lamps carry their own contrast so the
+   card stays readable in either theme. */
+.io-face {
+  /* Never shrink. As a flex child it was being squeezed by the tag list and
+     losing X7/X8 off the bottom - the two ports that were actually ON. The
+     list is the part that scrolls; the picture of the block is not. */
+  flex: 0 0 auto;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 10px;
+  background: var(--card-2, rgba(127, 127, 127, .06));
+  overflow-x: auto;
+}
+.io-face-body {
+  display: grid;
+  /* Two columns of four, and CAPPED - left to stretch, eight ports came out
+     as a wide flat band, the opposite proportion to the device it is meant to
+     look like. The cap is what keeps it portrait. Drops to one column only
+     when the widget is too narrow for two full tag lines. */
+  grid-template-columns: repeat(auto-fit, minmax(228px, 1fr));
+  max-width: 520px;
+  margin: 0 auto;
+  gap: 7px;
+  padding: 12px 10px;
+  border-radius: 14px;
+  /* The device body. Colour comes from the variant class below; everything
+     inside the face reads these tokens, so text contrast follows the body
+     instead of assuming it is always orange. */
+  background: var(--io-body);
+  color: var(--io-ink);
+  box-shadow: inset 0 1px 0 var(--io-edge);
+}
+/* ifm orange - the default, because it is how the device is recognised. */
+.io-face-body,
+.io-face-body.io-orange {
+  --io-body: linear-gradient(180deg, #e8721f 0%, #d9631a 100%);
+  --io-ink: rgba(255, 255, 255, .96);
+  --io-ink-2: rgba(255, 255, 255, .70);
+  --io-inset: rgba(0, 0, 0, .26);
+  --io-inset-2: rgba(0, 0, 0, .22);
+  --io-edge: rgba(255, 255, 255, .35);
+  --io-on: #7dfaa8;
+  --io-num: #9fd8ff;
+  --io-bad: #ffb3b3;
+}
+.io-face-body.io-grey {
+  --io-body: linear-gradient(180deg, #e2e5e9 0%, #cbcfd5 100%);
+  --io-ink: #14181d;
+  --io-ink-2: rgba(20, 24, 29, .66);
+  --io-inset: rgba(0, 0, 0, .10);
+  --io-inset-2: rgba(255, 255, 255, .58);
+  --io-edge: rgba(0, 0, 0, .26);
+  /* Darker than the on-dark set: pale green on light grey is unreadable. */
+  --io-on: #15803d;
+  --io-num: #0369a1;
+  --io-bad: #b91c1c;
+}
+.io-face-body.io-black {
+  --io-body: linear-gradient(180deg, #2b2f35 0%, #16181c 100%);
+  --io-ink: rgba(255, 255, 255, .95);
+  --io-ink-2: rgba(255, 255, 255, .62);
+  --io-inset: rgba(0, 0, 0, .38);
+  --io-inset-2: rgba(255, 255, 255, .06);
+  --io-edge: rgba(255, 255, 255, .26);
+  --io-on: #7dfaa8;
+  --io-num: #9fd8ff;
+  --io-bad: #ffb3b3;
+}
+/* auto: the base sheet is the light theme, so grey here and black under the
+   dark attribute - the card then changes with the app instead of staying a
+   bright panel on a dark dashboard. */
+.io-face-body.io-auto {
+  --io-body: linear-gradient(180deg, #e2e5e9 0%, #cbcfd5 100%);
+  --io-ink: #14181d;
+  --io-ink-2: rgba(20, 24, 29, .66);
+  --io-inset: rgba(0, 0, 0, .10);
+  --io-inset-2: rgba(255, 255, 255, .58);
+  --io-edge: rgba(0, 0, 0, .26);
+  --io-on: #15803d;
+  --io-num: #0369a1;
+  --io-bad: #b91c1c;
+}
+[data-theme="dark"] .io-face-body.io-auto {
+  --io-body: linear-gradient(180deg, #2b2f35 0%, #16181c 100%);
+  --io-ink: rgba(255, 255, 255, .95);
+  --io-ink-2: rgba(255, 255, 255, .62);
+  --io-inset: rgba(0, 0, 0, .38);
+  --io-inset-2: rgba(255, 255, 255, .06);
+  --io-edge: rgba(255, 255, 255, .26);
+  --io-on: #7dfaa8;
+  --io-num: #9fd8ff;
+  --io-bad: #ffb3b3;
+}
+.io-port {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 4px 7px;
+  padding: 7px;
+  border-radius: 8px;
+  background: var(--io-inset);
+}
+.io-port-head {
+  grid-column: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.io-port-pins {
+  grid-column: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+/* One tag, on its port: lamp, name, value, chart. */
+.io-pin {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 5px;
+  padding: 4px;
+  border-radius: 6px;
+  background: var(--io-inset-2);
+}
+.io-pin-tag {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--io-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.io-pin-val {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--io-ink);
+  justify-self: end;
+}
+.io-pin-val.on    { color: var(--io-on); }
+.io-pin-val.off   { color: var(--io-ink-2); }
+.io-pin-val.num   { color: var(--io-num); }
+.io-pin-val.fault { color: var(--io-bad); }
+.io-pin-val.idle  { color: var(--io-ink-2); }
+.io-port-mode {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .03em;
+  color: var(--io-ink-2);
+}
+/* Device-level tags (supply, temperature) keep their names and buttons. */
+.io-face-device {
+  /* Full width of the device body, under the ports, all on ONE row. With
+     auto-fit these wrapped - two on the first line and the third alone on the
+     second - which read as a layout accident next to the tidy port columns.
+     auto-flow: column keeps them in a single aligned row whatever the count;
+     the tag names ellipsize rather than pushing the row apart. */
+  grid-column: 1 / -1;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  gap: 4px 10px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--io-inset);
+}
+.io-pin-device {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 4px;
+  padding: 2px;
+  background: transparent;
+}
+.io-pin-device .io-pin-tag { font-size: 9.5px; }
+/* The M12 socket: a dark ring with five gold pins, drawn from one element. */
+.io-port-socket {
+  /* No grid-area here. It was left from the first layout, which used
+     grid-template-areas; .io-port-head is flex now so it was inert there -
+     but inside the .io-conn grid a name that matches no area creates an
+     implicit track, which is what threw the connector sockets to the far
+     corner of their cells. */
+  position: relative;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 40%, #4a4a4a 0%, #1c1c1c 70%);
+  border: 2px solid #9a9a9a;
+  display: inline-block;
+  flex: 0 0 auto;
+}
+.io-port-socket > i {
+  position: absolute;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #d8b45a;
+}
+.io-port-socket > i:nth-child(1) { top: 5px;  left: 13px; }
+.io-port-socket > i:nth-child(2) { top: 12px; left: 6px; }
+.io-port-socket > i:nth-child(3) { top: 12px; left: 20px; }
+.io-port-socket > i:nth-child(4) { top: 19px; left: 9px; }
+.io-port-socket > i:nth-child(5) { top: 19px; left: 17px; }
+
+.io-port-label {
+  grid-area: label;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: var(--io-ink);
+}
+.io-port-lamps { grid-area: lamps; display: flex; gap: 6px; }
+
+.io-lamp {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 4px 1px 2px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--io-inset-2);
+  color: var(--io-ink);
+  font: inherit;
+  cursor: pointer;
+}
+.io-lamp:hover:not(:disabled) { border-color: var(--io-edge); }
+.io-lamp:disabled { cursor: default; }
+.io-lamp-pin { font-size: 9px; font-weight: 700; opacity: .85; }
+.io-lamp-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  background: #2a2a2a;
+  border: 1px solid rgba(0, 0, 0, .5);
+}
+/* Lit. The glow is what reads as "on" from a metre away. */
+.io-lamp.on .io-lamp-dot {
+  background: #2ee56a;
+  border-color: #14833c;
+  box-shadow: 0 0 6px 1px rgba(46, 229, 106, .85);
+}
+.io-lamp.off .io-lamp-dot { background: #243024; border-color: rgba(0, 0, 0, .55); }
+/* Never read. A hollow red ring, unlike BOTH lit and unlit - an input that is
+   low and an input we could not read must not look the same. */
+.io-lamp.unread .io-lamp-dot {
+  background: transparent;
+  border: 2px solid #ff5b5b;
+  box-shadow: 0 0 5px rgba(255, 91, 91, .7);
+}
+.io-lamp.none .io-lamp-dot { background: transparent; border-style: dashed; border-color: var(--io-edge); }
+
+
+/* The block's own four M12s - X21/X22 fieldbus, X23 IoT, X31 power - above
+   the I/O ports, as on the device. */
+.io-face-conns {
+  grid-column: 1 / -1;
+  display: grid;
+  /* Two columns, matching the port grid below. Four across made the face a
+     wide band and fought the portrait proportion of the device. */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding: 6px;
+  border-radius: 8px;
+  background: var(--io-inset);
+}
+.io-conn {
+  display: grid;
+  /* socket, lamp, text, actions - the lamp sits right after the socket so it
+     lands in the same place as the port pin lamps below. */
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 5px;
+  border-radius: 6px;
+  background: var(--io-inset-2);
+  min-width: 0;
+}
+.io-conn-socket {
+  width: 20px;
+  height: 20px;
+  border-width: 1px;
+}
+/* The four-pin D-coded sockets carry one fewer pin than the I/O ports, and
+   the power socket is L-coded with five. Re-place the dots for the smaller
+   face rather than letting the port positions spill outside it. */
+.io-conn-socket > i { width: 3px; height: 3px; }
+.io-conn-socket.p4 > i:nth-child(1) { top: 4px;  left: 8px; }
+.io-conn-socket.p4 > i:nth-child(2) { top: 8px;  left: 4px; }
+.io-conn-socket.p4 > i:nth-child(3) { top: 8px;  left: 12px; }
+.io-conn-socket.p4 > i:nth-child(4) { top: 12px; left: 8px; }
+.io-conn-socket.p5 > i:nth-child(1) { top: 3px;  left: 8px; }
+.io-conn-socket.p5 > i:nth-child(2) { top: 8px;  left: 3px; }
+.io-conn-socket.p5 > i:nth-child(3) { top: 8px;  left: 13px; }
+.io-conn-socket.p5 > i:nth-child(4) { top: 13px; left: 5px; }
+.io-conn-socket.p5 > i:nth-child(5) { top: 13px; left: 11px; }
+.io-conn-text { display: flex; flex-direction: column; min-width: 0; }
+.io-conn-id {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .03em;
+  color: var(--io-ink);
+}
+.io-conn-kind {
+  font-size: 8.5px;
+  color: var(--io-ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.io-conn-lamp { width: 8px; height: 8px; }
+.io-conn.on .io-conn-lamp {
+  background: #2ee56a;
+  border-color: #14833c;
+  box-shadow: 0 0 5px 1px rgba(46, 229, 106, .8);
+}
+.io-conn.unread .io-conn-lamp {
+  background: transparent;
+  border: 2px solid #ff5b5b;
+  box-shadow: 0 0 4px rgba(255, 91, 91, .7);
+}
+/* Not collected: dashed and unlit, never a confident dark "off" - we have no
+   link tag for this socket and must not imply we checked it. */
+.io-conn.none .io-conn-lamp {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--io-edge);
+}
+.io-conn.none { opacity: .72; }
+
+/* The supply's chart buttons, on the power connector. */
+.io-conn-acts { display: inline-flex; gap: 3px; }
+
+/* "N tags not currently collected are hidden" - on the device body. */
+.io-face-note {
+  grid-column: 1 / -1;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, .2);
+  color: var(--io-ink-2);
+  font-size: 10px;
+}
+
+/* Chart text is the app font, everywhere.
+   2026-08-31: "power overview page should have same chart libraries, text
+   fonts used on the dashboard page". Both pages already render with Recharts
+   and share chartStyle.js for sizes, grid and ticks - but SVG <text> does not
+   inherit font-family identically across engines, so the two could drift on
+   the operator's machine while looking the same on ours. Stating it once, for
+   every chart in the app, removes the possibility. */
+.recharts-wrapper text,
+.recharts-text,
+.recharts-cartesian-axis-tick-value {
+  font-family: var(--font-sans);
+}
+
+/* Live Usage series chips.
+   2026-08-31: "show data for the 3 phases, for A and V and W and total,
+   selecting on the series button to show or hide". A hidden series stays
+   visible as a control - greyed, not removed - so it can be brought back. */
+.pwr-series-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: 8px;
+}
+.pwr-series-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line, rgba(255,255,255,0.14));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.pwr-series-chip.is-hidden {
+  opacity: 0.42;
+  text-decoration: line-through;
+}
+.pwr-series-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+/* OEE Overview additions (2026-08-31): KPI comparison and sparkline, trend
+   legend toggles, Pareto controls, refresh interval. Every other .oee-* rule
+   already lives in this file, so these do too - one stylesheet to search
+   beats two that each hold half the answer. */
+.oee-kpi-delta { font-size: 11px; margin-top: 2px; }
+.oee-kpi-delta.is-up { color: var(--ok, #22c55e); }
+.oee-kpi-delta.is-down { color: var(--danger, #ef4444); }
+.oee-kpi-delta.is-none { opacity: 0.5; }
+.oee-kpi-unit { font-size: 0.6em; opacity: 0.7; margin-left: 2px; }
+.oee-kpi-spark { margin-top: 2px; opacity: 0.65; line-height: 0; }
+.oee-kpi-spark .recharts-wrapper { height: 18px !important; }
+.oee-kpi-maturity { margin-top: 4px; min-width: 0; max-width: 100%; }
+
+.oee-period-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* No `margin-left: auto` here. Measured at 1366px: it computed to 919px,
+   consumed every pixel of free space in the wrapping row and GUARANTEED the
+   control wrapped onto a line of its own - the row was 1086px of children in
+   1066px, over by twenty, and the auto margin turned that into a 75px second
+   row. It sits after the Filters button instead, and wraps only when it
+   genuinely has to. */
+.oee-refresh { display: flex; align-items: center; gap: 8px; }
+/* Explicit row: the global `label { display: grid }` and several page-level
+   `label { flex-direction: column }` rules are all trying to stack this, and
+   a stacked caption doubles the height of the toolbar. */
+.oee-toolbar-field {
+  display: flex; flex-direction: row; align-items: center;
+  gap: 6px; font-size: 11px;
+}
+.oee-toolbar-field > span {
+  opacity: 0.7; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.oee-live { font-size: 11px; opacity: 0.75; display: inline-flex; align-items: center; gap: 6px; }
+.oee-live-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--ok, #22c55e); display: inline-block;
+}
+
+/* Trend legend: checkboxes, so a line can be taken off the chart. */
+.oee-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 6px; }
+.oee-legend-item {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 11px; cursor: pointer;
+}
+.oee-legend-dot { width: 10px; height: 3px; border-radius: 2px; display: inline-block; }
+
+.oee-tooltip {
+  background: var(--card, #111); border: 1px solid var(--line, rgba(255, 255, 255, 0.15));
+  border-radius: 6px; padding: 8px 10px; font-size: 11px; min-width: 170px;
+}
+.oee-tt-time { font-weight: 700; margin-bottom: 4px; opacity: 0.8; }
+.oee-tt-row { display: flex; justify-content: space-between; gap: 14px; }
+
+/* A two-way toggle. Built from the same tokens as .oee-tab so Duration/Stops
+   reads as a choice, not as one wide button - it had no rule at all and the
+   two labels ran together. */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.seg button {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  cursor: pointer;
+}
+.seg button + button { border-left: 1px solid var(--stroke); }
+.seg button:hover { color: var(--text); }
+.seg button.active {
+  color: var(--text);
+  background: rgba(26, 170, 159, 0.16);
+  box-shadow: 0 0 0 1px rgba(26, 170, 159, 0.28) inset;
+}
+
+.oee-pareto-controls {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 6px; flex-wrap: wrap;
+}
+
+
+/* ============================ OEE Machine Detail (2026-08-31) ==========
+   The header, context strip, quick-actions menu and two-up content rows.
+   Colours come from the theme tokens, so light and dark both follow the
+   app rather than this page. */
+.oee-breadcrumb {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--muted);
+}
+.oee-breadcrumb [aria-current="page"] { color: var(--text); }
+.linkish {
+  background: none; border: 0; padding: 0; cursor: pointer;
+  color: var(--muted); font: inherit;
+}
+.linkish:hover { color: var(--text); text-decoration: underline; }
+
+.oee-detail-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.oee-detail-title h3 { margin: 0; }
+.oee-head-spacer { margin-left: auto; }
+
+.oee-ctx-row {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  font-size: 12px;
+}
+.oee-ctx-item { display: inline-flex; align-items: baseline; gap: 5px; }
+.oee-ctx-label { color: var(--muted); }
+.oee-ctx-value { color: var(--text); font-weight: 600; }
+
+/* Quick actions. A menu, not a row of buttons: eight actions on the title
+   line would crowd out the machine's name. */
+.oee-quick { position: relative; }
+.oee-quick-menu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 40;
+  min-width: 240px; padding: 4px;
+  background: var(--panel, var(--card)); color: var(--text);
+  border: 1px solid var(--stroke); border-radius: 10px;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.28);
+}
+.oee-quick-menu button {
+  display: block; width: 100%; text-align: left;
+  background: none; border: 0; color: inherit; font: inherit;
+  padding: 7px 10px; border-radius: 7px; cursor: pointer;
+}
+.oee-quick-menu button:hover { background: var(--table-row); }
+.oee-quick-note {
+  padding: 6px 10px; font-size: 11px; color: var(--muted);
+  border-top: 1px solid var(--stroke); margin-top: 4px;
+}
+.oee-quick-none { font-size: 12px; }
+
+/* Two cards side by side, stacking on a narrow panel. */
+.oee-detail-row {
+  display: grid; gap: 12px; margin-bottom: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+}
+.oee-detail-tabs { display: flex; gap: 6px; margin: 4px 0 12px; }
+.oee-filter-extra {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 8px 10px; margin-bottom: 10px;
+  border: 1px solid var(--stroke); border-radius: 10px;
 }

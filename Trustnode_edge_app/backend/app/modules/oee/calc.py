@@ -99,6 +99,38 @@ class OeeResult:
     # Why a factor is missing, so the UI can say something better than "-".
     notes: List[str] = field(default_factory=list)
 
+    # 2026-08-31: which of the three factors this result actually measured.
+    # The UI has carried maturity labels since the module was written, but
+    # nothing ever filled them in, so every badge rendered as nothing. The
+    # answer belongs here, next to the code that decides a factor is None -
+    # anywhere else it would be a second opinion about the same numbers.
+    @property
+    def missing_factors(self) -> List[str]:
+        return [n for n, v in (("availability", self.availability),
+                               ("performance", self.performance),
+                               ("quality", self.quality)) if v is None]
+
+    @property
+    def stage(self) -> str:
+        """How complete this OEE figure is, in the UI's own vocabulary.
+
+        Deliberately NOT a quality score: a machine measuring only availability
+        is not a worse machine, it is a less completely instrumented one, and
+        an operator reading 62% needs to know which of the two they are looking
+        at before they act on it.
+        """
+        missing = set(self.missing_factors)
+        if not missing:
+            return "full"
+        if "availability" in missing:
+            # No planned time means there is nothing to be available for.
+            return "not_enough_data"
+        if missing == {"performance", "quality"}:
+            return "availability_only"
+        if missing == {"performance"}:
+            return "no_performance"
+        return "no_quality"
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "availability": self.availability,
@@ -113,6 +145,8 @@ class OeeResult:
             "good_count": self.good_count,
             "reject_count": self.reject_count,
             "notes": list(self.notes),
+            "stage": self.stage,
+            "missing_factors": self.missing_factors,
         }
 
 
@@ -281,6 +315,7 @@ def downtime_pareto(events: Iterable[Dict[str, Any]],
     ignore.
     """
     totals: Dict[Tuple[str, str], float] = {}
+    stops: Dict[Tuple[str, str], int] = {}
     for ev in events or []:
         state = str(ev.get("state") or "unknown")
         if state not in DOWNTIME_STATES:
@@ -295,8 +330,12 @@ def downtime_pareto(events: Iterable[Dict[str, Any]],
         reason = str(ev.get("downtime_reason") or "") or "Unknown"
         key = (category, reason)
         totals[key] = totals.get(key, 0.0) + secs
+        # One event is one stop. Fourteen two-minute stops and one 28-minute
+        # stop are the same bar by duration and completely different problems,
+        # which is why the page can rank by either.
+        stops[key] = stops.get(key, 0) + 1
 
-    rows = [{"category": c, "reason": r, "seconds": secs}
+    rows = [{"category": c, "reason": r, "seconds": secs, "stops": stops.get((c, r), 0)}
             for (c, r), secs in totals.items()]
     rows.sort(key=lambda x: x["seconds"], reverse=True)
     rows = rows[: max(1, int(top_n))]

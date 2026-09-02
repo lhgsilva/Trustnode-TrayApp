@@ -269,6 +269,11 @@ IFM_PIN2_BYTE = 1
 # Channel labels, matching app/drivers/ifm_iolink.py so both paths agree.
 CHANNEL_DI = "DI"
 CHANNEL_DO = "DO"
+# 2026-09-02: the fieldbus path now offers IO-Link identity and process data
+# too, so it needs the same two labels the IoT path uses - a tag must not be
+# filed under a different channel depending on which socket the block is in.
+CHANNEL_IOLINK = "IO-Link"
+CHANNEL_DIAGNOSTIC = "Diagnostic"
 
 
 def ifm_pin_signals(port_count: int = 8, pin4_byte: int = IFM_PIN4_BYTE,
@@ -301,6 +306,107 @@ def ifm_pin_signals(port_count: int = 8, pin4_byte: int = IFM_PIN4_BYTE,
         })
     out.sort(key=lambda sig: (int(sig["name"][4:sig["name"].index("_")]),
                               sig["name"]))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ifm master input assembly - the rest of the 446 bytes
+# ---------------------------------------------------------------------------
+# 2026-09-02. Until now only bytes 0-1 of the input image were mapped, so a
+# block on fieldbus could report its digital inputs and NOTHING else - no
+# IO-Link device, no process data. The operator's words: "it is not able to
+# read the digital inputs or IO-Link status".
+#
+# The layout below was derived from a real AL1326 ("IO-Link Master DL EIP 8P
+# IP67", vendor 322, product code 1007) by reading assembly 100 twice - once
+# with an SM9400 on port 8 and once without - and cross-checking every field
+# against the SAME block's IoT Core answers. It is not a guess:
+#
+#   * eight PORT STATUS records at 46 + (N-1)*18. In each, bytes +2..+3 are
+#     the IO-Link VENDOR id and +4..+5 the DEVICE id, both little-endian. An
+#     empty port reads 07 00. Every populated record carried vendor 0x0136 =
+#     310, which is ifm's IO-Link vendor id, and the device ids matched the
+#     IoT Core exactly:
+#         port 4  1e 04 -> 1054  DV2120
+#         port 5  66 02 ->  614  DP1223
+#         port 7  ba 04 -> 1210  PV8004
+#         port 8  87 01 ->  391  SM9400
+#     Unplugging port 8 turned its record into 07 00 and its IoT status from
+#     2 to 0, in the same capture.
+#
+#   * eight PROCESS DATA blocks of 32 bytes at 190 + (N-1)*32. 190 + 8*32 =
+#     446, which closes the assembly exactly. The bytes are WORD-SWAPPED
+#     against the IoT Core's pdin: port 7 read 03 11 02 00 0F 78 FE 00 over
+#     IoT, and byte-swapping each 16-bit word of the fieldbus block gives the
+#     same sequence apart from the two live measurement digits, which moved
+#     between the two captures.
+IFM_PORT_STATUS_BASE = 46
+IFM_PORT_STATUS_STRIDE = 18
+IFM_PORT_STATUS_VENDOR_OFFSET = 2
+IFM_PORT_STATUS_DEVICE_OFFSET = 4
+IFM_PDIN_BASE = 190
+IFM_PDIN_STRIDE = 32
+IFM_IOLINK_VENDOR_ID = 310          # ifm, as it appears INSIDE the IO-Link record
+
+
+def ifm_port_status_offset(port: int) -> int:
+    return IFM_PORT_STATUS_BASE + (int(port) - 1) * IFM_PORT_STATUS_STRIDE
+
+
+def ifm_pdin_offset(port: int) -> int:
+    return IFM_PDIN_BASE + (int(port) - 1) * IFM_PDIN_STRIDE
+
+
+def ifm_master_signals(port_count: int = 8, pdin_words: int = 4,
+                       assembly_size: int = 446) -> List[Dict[str, Any]]:
+    """Everything an ifm master publishes in its input assembly.
+
+    The digital inputs (which were already mapped), plus each port's IO-Link
+    identity and the first words of its process data. Names match the IoT Core
+    path, so a trend built on one transport keeps working on the other.
+
+    `pdin_words` is deliberately small by default. The full 32 bytes are there,
+    but a raw word is only meaningful once you know the sensor - decoding it
+    properly needs that device's IODD, exactly as on the IoT side. Offering
+    four readable words beats offering thirty-two that mean nothing.
+    """
+    n = max(1, min(16, int(port_count or 8)))
+    out: List[Dict[str, Any]] = list(ifm_pin_signals(port_count=n))
+    for port in range(1, n + 1):
+        base = ifm_port_status_offset(port)
+        if base + IFM_PORT_STATUS_DEVICE_OFFSET + 2 > int(assembly_size):
+            break
+        out.append({
+            "name": "Port%d_DeviceId" % port,
+            "byte_offset": base + IFM_PORT_STATUS_DEVICE_OFFSET, "bit": 0,
+            "kind": "UINT", "scale": 1.0, "offset": 0.0, "unit": "",
+            "channel": CHANNEL_DIAGNOSTIC,
+            "source": "port %d - IO-Link device id (0 = nothing plugged in)" % port,
+            "enabled": False,
+        })
+        out.append({
+            "name": "Port%d_VendorId" % port,
+            "byte_offset": base + IFM_PORT_STATUS_VENDOR_OFFSET, "bit": 0,
+            "kind": "UINT", "scale": 1.0, "offset": 0.0, "unit": "",
+            "channel": CHANNEL_DIAGNOSTIC,
+            "source": "port %d - IO-Link vendor id (310 = ifm)" % port,
+            "enabled": False,
+        })
+    for port in range(1, n + 1):
+        base = ifm_pdin_offset(port)
+        for w in range(max(0, int(pdin_words))):
+            off = base + w * 2
+            if off + 2 > int(assembly_size):
+                break
+            out.append({
+                "name": "Port%d_PDIN_W%d" % (port, w + 1),
+                "byte_offset": off, "bit": 0,
+                "kind": "UINT", "scale": 1.0, "offset": 0.0, "unit": "",
+                "channel": CHANNEL_IOLINK,
+                "source": ("port %d - IO-Link process data word %d. Byte order "
+                           "is swapped against the IoT Core's pdin." % (port, w + 1)),
+                "enabled": False,
+            })
     return out
 
 

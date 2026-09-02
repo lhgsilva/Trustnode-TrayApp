@@ -384,7 +384,7 @@ export default function IfmPortMapper({
           <div className="ifm-field-table">
             <div className="ifm-field-head ifm-dp-head">
               <span>Collect</span><span>Tag name</span><span>Type</span><span>Source</span>
-              <span>Scale</span><span>Unit</span>
+              <span>Scale</span><span>Offset</span><span>Unit</span>
             </div>
             {shownPoints.map(({ d, idx }) => (
               <div className="ifm-field-row ifm-dp-row" key={`dp-${d.name}-${idx}`}>
@@ -402,7 +402,14 @@ export default function IfmPortMapper({
                 </span>
                 <input type="number" step="any" value={d.scale ?? 1} disabled={disabled}
                   onChange={(e) => patchPoint(idx, { scale: Number(e.target.value || 1) })} />
-                <input value={d.unit || ""} disabled={disabled} placeholder=""
+                {/* 2026-09-02: scale without offset cannot express a sensor
+                    whose zero is not zero - "raw x 0.1 - 50" is an ordinary
+                    temperature range, and the field editor below always had
+                    this while this list did not. */}
+                <input type="number" step="any" value={d.offset ?? 0} disabled={disabled}
+                  title="Engineering value = raw x scale + offset"
+                  onChange={(e) => patchPoint(idx, { offset: Number(e.target.value || 0) })} />
+                <input value={d.unit || ""} disabled={disabled} placeholder="l/min"
                   onChange={(e) => patchPoint(idx, { unit: e.target.value })} />
               </div>
             ))}

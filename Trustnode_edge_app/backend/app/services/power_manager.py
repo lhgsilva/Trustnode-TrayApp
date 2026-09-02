@@ -72,6 +72,54 @@ except Exception:      # never let a profile import stop the power module
     pass
 
 
+def resolve_register_profile_id(raw_id: str) -> str:
+    """Map any spelling of a known profile onto its canonical id, or "".
+
+    The device catalogue and this module grew separate id styles for the same
+    meters (`weidmuller-em122-3ph` vs `weidmuller_em122_three_phase`). Rather
+    than force one side to migrate - and silently mis-read every meter saved
+    under the old spelling until it does - both are accepted here.
+
+    Returns "" when the id is not recognised. The caller must NOT substitute a
+    default: reading an EM122 with an EM525's addresses is how a meter came to
+    report 0.0 while claiming to be healthy.
+    """
+    txt = str(raw_id or "").strip().lower()
+    if not txt:
+        return ""
+    if txt in REGISTER_PROFILES:
+        return txt
+    norm = txt.replace("-", "_").replace(" ", "_")
+    while "__" in norm:
+        norm = norm.replace("__", "_")
+    if norm in REGISTER_PROFILES:
+        return norm
+    # Short forms: identify the model and the phase count, then rebuild.
+    model = ""
+    for candidate in ("em122", "em525"):
+        if candidate in norm:
+            model = candidate
+            break
+    if not model:
+        return ""
+    if "all" in norm:
+        phase = "all"
+    elif "3ph" in norm or "three" in norm or "3_phase" in norm:
+        phase = "three_phase"
+    elif "1ph" in norm or "single" in norm or "1_phase" in norm:
+        phase = "single_phase"
+    else:
+        return ""
+    for cand in (
+        "weidmuller_%s_%s" % (model, phase),
+        "weidmuller_%s_%s_basic" % (model, phase),
+        "weidmuller_%s_%s_extended" % (model, phase),
+    ):
+        if cand in REGISTER_PROFILES:
+            return cand
+    return ""
+
+
 PROFILE_BY_MODE: dict[str, str] = {
     "single_phase": "weidmuller_em525_single_phase_basic",
     "three_phase": "weidmuller_em525_three_phase_basic",
@@ -188,6 +236,12 @@ class PowerManager:
         self._last_samples: dict[str, dict[str, Any]] = {}
         self._status_by_device: dict[str, dict[str, Any]] = {}
         self._register_backoff_until: dict[str, dict[int, float]] = {}
+        # Rows withheld because a collection trigger said so. Kept apart from
+        # _dropped_rows: dropped means "we could not keep up", withheld means
+        # "we were told not to", and confusing the two would send someone
+        # tuning a queue that is working perfectly.
+        self._blocked_rows: int = 0
+        self._blocked_by_trigger: str = ""
         self._rows_queue: queue.Queue[list[dict[str, Any]]] = queue.Queue(
             maxsize=max(50, int(os.environ.get("TRUSTNODE_POWER_ROWS_QUEUE_MAX", "1000") or "1000"))
         )
@@ -226,21 +280,25 @@ class PowerManager:
             with self._lock:
                 return self._deep_copy(self._config)
 
-        # Apply the manual-start-safety policy (same logic that used to
-        # live in __init__). We only force-stop ONCE per process.
-        if str(os.environ.get("TRUSTNODE_POWER_AUTO_START", "0") or "0").strip().lower() not in {"1", "true", "yes", "on"}:
-            stopped = self._force_stopped_config(cfg)
-            # Only write when the policy actually changed something. A boot
-            # that changes nothing has no business writing to the store at all.
-            if stopped != cfg:
-                cfg = stopped
-                try:
-                    self._app_store.upsert_domain(
-                        "power_management_config", cfg, actor="system")
-                except Exception as exc:
-                    logger.warning("power: could not persist the stopped state: %s", exc)
-            else:
-                cfg = stopped
+        # 2026-08-30: boot no longer rewrites the stored configuration.
+        #
+        # This used to force-stop the meter AND persist that, turning the
+        # operator's `enabled: true` into `enabled: false` under actor
+        # "system". The meter then never resumed after a restart and the
+        # setting that said it should be running was gone - the same
+        # boot-policy-overwrites-configuration shape as the 2026-08-26 data
+        # loss, applied to a flag instead of the device list.
+        #
+        # The stored config is intent, and boot only READS it. A meter that
+        # was running when the app closed starts again, exactly as a gateway
+        # does. Set TRUSTNODE_POWER_AUTO_START=0 to keep the old "start
+        # nothing until a human asks" behaviour - and even then the stop is
+        # applied to the in-memory copy only, never written back.
+        _auto = str(os.environ.get("TRUSTNODE_POWER_AUTO_START", "1") or "1").strip().lower()
+        if _auto in {"0", "false", "no", "off"}:
+            cfg = self._force_stopped_config(cfg)
+            logger.info("power: auto-start disabled by TRUSTNODE_POWER_AUTO_START - "
+                        "meters stay stopped this run (stored config untouched)")
         with self._lock:
             self._config = cfg
             self._config_loaded = True
@@ -328,10 +386,27 @@ class PowerManager:
         if mode not in {"single_phase", "three_phase"}:
             mode = "single_phase"
         base["electrical_mode"] = mode
-        profile = str(raw.get("register_profile") or "").strip()
-        if profile not in REGISTER_PROFILES:
+        requested_profile = str(raw.get("register_profile") or "").strip()
+        profile_error = ""
+        if not requested_profile:
+            # Nothing chosen: the mode default is the right answer.
             profile = PROFILE_BY_MODE.get(mode, DEFAULT_PROFILE)
+        else:
+            profile = resolve_register_profile_id(requested_profile)
+            if not profile:
+                # Keep what the operator asked for and refuse to invent a
+                # substitute. Reading an EM122 at an EM525's addresses returns
+                # 0.0 from every register and looks exactly like a healthy
+                # meter measuring nothing.
+                profile = requested_profile
+                profile_error = (
+                    "Unknown register profile %r. Known profiles: %s. The meter "
+                    "will not be read until this is corrected - a different "
+                    "meter's register map would return zeroes that look real."
+                    % (requested_profile, ", ".join(sorted(REGISTER_PROFILES)))
+                )
         base["register_profile"] = profile
+        base["profile_error"] = profile_error
         base["wiring_type"] = mode
         base["voltage_connected"] = bool(raw.get("voltage_connected", True))
         base["ct_connected"] = bool(raw.get("ct_connected", True))
@@ -349,7 +424,88 @@ class PowerManager:
         # defaults, so removing a register would silently come back on
         # the next save. When use_custom_registers is True the user's
         # map is now authoritative — adds, edits, AND deletes survive.
-        if base["use_custom_registers"] and isinstance(regs, dict):
+        # 2026-09-02: a LIST of register names is a SELECTION, not a map.
+        #
+        # Found on a live EM122: the device had
+        #     registers: ["voltage_v", "current_a", "active_power_w", ...]
+        # which is a list, so it matched neither branch below and fell through
+        # to `else:` - loading the PROFILE default and discarding the
+        # operator's eight ticked registers in silence. The meter was polling
+        # the 33-register three-phase map on a single-phase installation, so
+        # voltage_l2/l3 and current_l2/l3 wrote a permanent 0.0 into the
+        # historian while the tags actually asked for (voltage_v, current_a,
+        # active_power_w) were never produced at all.
+        #
+        # A name only means something against a map, so resolve each one
+        # against the profile and say plainly which could not be resolved -
+        # silently substituting a different register set is what made this
+        # look like a meter fault for days.
+        selection_registers: dict[str, int] | None = None
+        if isinstance(regs, (list, tuple)) and regs:
+            profile_map = dict(REGISTER_PROFILES.get(base["register_profile"], {})
+                               or DEFAULT_REGISTERS)
+            wanted = [str(k or "").strip() for k in regs if str(k or "").strip()]
+            # A name not in the CHOSEN profile is usually in a sibling profile
+            # for the SAME meter - "voltage_v" belongs to the EM122's
+            # single-phase map while the device was left on the 3-phase "all"
+            # map. Resolving against the siblings collects what the operator
+            # asked for instead of dropping it, and the note below still tells
+            # them the profile does not match the wiring.
+            model_key = "_".join(str(base["register_profile"]).split("_")[:2])
+            sibling: dict[str, int] = {}
+            for pid, pmap in REGISTER_PROFILES.items():
+                if not str(pid).startswith(model_key):
+                    continue
+                inner = pmap.get("registers") if isinstance(pmap, dict) and "registers" in pmap else pmap
+                if isinstance(inner, dict):
+                    for k, v in inner.items():
+                        sibling.setdefault(str(k), v)
+            resolved: dict[str, int] = {}
+            missing: list[str] = []
+            borrowed: list[str] = []
+            for key in wanted:
+                if key in profile_map:
+                    resolved[key] = _to_int(profile_map[key], 0)
+                elif key in sibling:
+                    resolved[key] = _to_int(sibling[key], 0)
+                    borrowed.append(key)
+                else:
+                    missing.append(key)
+            if resolved:
+                # NOT an early return: the tail of this method still has to
+                # build the scale map, the enabled map, the descriptions and
+                # the database id. Returning here dropped all four.
+                selection_registers = resolved
+                notes = []
+                if borrowed:
+                    notes.append(
+                        "%d register(s) (%s) are not in profile '%s' but exist "
+                        "on another profile for this meter, so they ARE being "
+                        "collected. Switch to the profile that matches the "
+                        "wiring to clear this."
+                        % (len(borrowed), ", ".join(sorted(borrowed)[:6]),
+                           base["register_profile"]))
+                if missing:
+                    notes.append(
+                        "%d register(s) (%s) exist on no profile for this "
+                        "meter and are NOT being collected."
+                        % (len(missing), ", ".join(sorted(missing)[:6])))
+                if notes:
+                    base["profile_error"] = " ".join(notes)
+            else:
+                # Nothing resolved: the selection belongs to a different
+                # profile entirely. Fall through to the profile default, but
+                # SAY so rather than silently substituting a register set.
+                base["profile_error"] = (
+                "None of the %d selected register(s) exist in profile '%s' "
+                "(%s). The profile's own registers are being collected "
+                "instead - check the meter's wiring type."
+                % (len(wanted), base["register_profile"],
+                   ", ".join(sorted(wanted)[:5])))
+
+        if selection_registers is not None:
+            resolved_registers = selection_registers
+        elif base["use_custom_registers"] and isinstance(regs, dict):
             user_map: dict[str, int] = {}
             for k, v in regs.items():
                 key = str(k or "").strip()
@@ -373,9 +529,13 @@ class PowerManager:
                 resolved_registers = user_map
                 base["use_custom_registers"] = True
             else:
-                resolved_registers = dict(REGISTER_PROFILES.get(base["register_profile"], DEFAULT_REGISTERS))
+                resolved_registers = dict(REGISTER_PROFILES.get(base["register_profile"], {})
+                                          if profile_error else
+                                          REGISTER_PROFILES.get(base["register_profile"], DEFAULT_REGISTERS))
         else:
-            resolved_registers = dict(REGISTER_PROFILES.get(base["register_profile"], DEFAULT_REGISTERS))
+            resolved_registers = dict(REGISTER_PROFILES.get(base["register_profile"], {})
+                                      if profile_error else
+                                      REGISTER_PROFILES.get(base["register_profile"], DEFAULT_REGISTERS))
         base["registers"] = resolved_registers
         scale_map = {k: 1.0 for k in resolved_registers.keys()}
         raw_scales = raw.get("register_scales") if isinstance(raw, dict) else None
@@ -1244,6 +1404,20 @@ class PowerManager:
         # raw register tags ("gaps"). The operator's invariant is
         # explicit: "we should not have slow tags, fast tags for
         # meters, all of them should follow the gateways collection".
+        # 2026-09-02: the same six measurements, whatever this meter calls
+        # them. Power Overview used to get active power and current only, so a
+        # meter whose registers were named differently showed blanks on the
+        # rest of the strip - a naming difference reading as a broken meter.
+        # canonical_measurement() returns None (not 0.0) when a meter genuinely
+        # has no such register, so a missing value stays missing.
+        from app.services.meter_registers import canonical_measurement
+        canon = {}
+        for _name in ("voltage_v", "power_factor", "frequency_hz",
+                      "apparent_power_va", "reactive_power_var", "energy_wh"):
+            _v = canonical_measurement(values_scaled, _name)
+            if _v is not None:
+                canon[_name] = float(_v)
+
         rows = [
             _row("insight.live_kw", live_kw),
             _row("insight.active_power_kw", live_kw),       # alias for KPI strip
@@ -1257,6 +1431,10 @@ class PowerManager:
             _row("insight.downtime_cost_eur", downtime_cost),
             _row("insight.active_tariff_rate_eur_kwh", float(rate)),
         ]
+        # One name per measurement, so a dashboard or the Overview can bind to
+        # insight.voltage_v and get a value from an EM122 or an EM525 alike.
+        for _name, _val in canon.items():
+            rows.append(_row("insight.%s" % _name, _val))
         # Per-tariff totals — one pair of tags per configured tariff,
         # also written every poll so dashboards stay in lockstep.
         if True:
@@ -1283,6 +1461,19 @@ class PowerManager:
         """
         if not rows:
             return
+        # Publish this cycle into the trigger gate's live values, so a
+        # collection trigger can be written AGAINST a meter tag - "collect
+        # while the line is drawing more than 5 kW" is exactly the rule an
+        # operator wants, and the meter's tags were invisible to the gate.
+        try:
+            from app.state import plc_manager as _pm_live
+            note = getattr(_pm_live, "note_external_readings", None)
+            if callable(note):
+                note(str(device_id or "power"),
+                     {str(r.get("tag_name") or ""): r.get("value") for r in rows},
+                     interval_ms=int(self._interval_ms_for_gate()))
+        except Exception:
+            pass
         try:
             from app.state import plc_manager
             fan = getattr(plc_manager, "fanout_threadsafe", None)
@@ -1317,9 +1508,46 @@ class PowerManager:
         except Exception:
             pass
 
-    def _enqueue_rows(self, rows: list[dict[str, Any]]) -> None:
+    def _interval_ms_for_gate(self) -> int:
+        """This meter's poll cadence, for the gate's staleness window.
+
+        A meter on a 5 s interval judged against a PLC's 1 s assumption would
+        look permanently stale, and its trigger would never evaluate.
+        """
+        try:
+            return max(200, int(getattr(self, "_poll_interval_ms", 0) or 1000))
+        except Exception:
+            return 1000
+
+    def _enqueue_rows(self, rows: list[dict[str, Any]],
+                      device_id: str = "") -> None:
         if not rows:
             return
+
+        # 2026-09-02: the energy meter ignored collection triggers entirely.
+        # The gate lives in the gateway worker loop, and a power meter has no
+        # worker - it polls and writes on its own thread - so a rule that
+        # correctly paused every PLC gateway left the meter writing happily.
+        # Reported twice; the first fix covered plc_manager only.
+        #
+        # This is the one place every meter row passes through on its way to
+        # the historian, the cloud and any file sink, so gating here covers
+        # all three. Best-effort: if the gate cannot be consulted we WRITE,
+        # because losing readings is worse than writing some that a trigger
+        # would have withheld.
+        try:
+            from app.state import plc_manager as _pm
+            # Ask for THIS meter: a rule scoped to another
+            # gateway must not pause it, and its own rule must.
+            allowed, reason = _pm.collection_allowed_now(device_id)
+            if not allowed:
+                self._blocked_by_trigger = reason or "trigger condition is false"
+                self._blocked_rows += len(rows)
+                return
+            self._blocked_by_trigger = ""
+        except Exception:
+            pass
+
         try:
             self._rows_queue.put_nowait(rows)
         except queue.Full:
@@ -1674,7 +1902,7 @@ class PowerManager:
             skipped_cycles = 0
             try:
                 sample, rows, status = self._poll_device(device)
-                self._enqueue_rows(rows)
+                self._enqueue_rows(rows, device_id)
                 self._fanout_live(device_id, rows)
                 with self._lock:
                     self._last_samples[device_id] = sample
@@ -1722,6 +1950,14 @@ class PowerManager:
                     "skipped_cycles": int(skipped_cycles),
                     "writer_queue_depth": int(self._rows_queue.qsize()),
                     "writer_dropped_rows": int(self._dropped_rows),
+                    # 2026-09-02: a meter obeys collection triggers now, so it
+                    # can be connected, polling, and writing nothing. The
+                    # Meters row and the footer read these to say COLLECTION
+                    # PAUSED instead of RUNNING - without them a paused meter
+                    # is indistinguishable from a healthy one.
+                    "collection_blocked": bool(getattr(self, "_blocked_by_trigger", "")),
+                    "collection_block_reason": str(getattr(self, "_blocked_by_trigger", "") or ""),
+                    "blocked_rows": int(getattr(self, "_blocked_rows", 0) or 0),
                     "writer_batches": int(self._writer_batches),
                     "updated_utc": self._utc_now(),
                 }

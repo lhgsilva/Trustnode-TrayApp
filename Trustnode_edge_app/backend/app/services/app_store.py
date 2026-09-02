@@ -10,11 +10,58 @@ import time
 import socket
 import math
 from urllib.parse import quote_plus
+
+#: When this module was imported - i.e. roughly when the process started.
+#: time.monotonic() alone counts from SYSTEM boot, so it cannot distinguish a
+#: freshly-launched app from one running on a machine that has been up a week.
+_MODULE_LOAD_MONO = time.monotonic()
 from datetime import timedelta
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.tenant import get_current_tenant, normalize_tenant_id
+
+
+#: One SQLite connection per thread, per database path.
+#:
+#: Opening this store costs 1-3 s (15.9 GB, a large WAL), so a connection is
+#: opened once per thread and reused. Bounded by thread count, which is what
+#: closing-every-time was trying to achieve, without paying the open cost on
+#: every query.
+_CONN_TLS = threading.local()
+
+
+def _thread_connection(db_path: str, *, readonly: bool = False,
+                       timeout: float = 10.0) -> sqlite3.Connection:
+    """This thread's connection to `db_path`, opening it the first time.
+
+    A connection that has gone bad (closed elsewhere, database replaced) is
+    discarded and reopened rather than raising at the call site.
+    """
+    key = ("ro:" if readonly else "rw:") + str(db_path)
+    cache = getattr(_CONN_TLS, "conns", None)
+    if cache is None:
+        cache = {}
+        _CONN_TLS.conns = cache
+    conn = cache.get(key)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            cache.pop(key, None)
+    if readonly:
+        uri = "file:%s?mode=ro" % str(db_path).replace(chr(92), "/")
+        conn = sqlite3.connect(uri, uri=True, timeout=timeout, check_same_thread=False)
+    else:
+        conn = sqlite3.connect(db_path, timeout=timeout)
+    conn.row_factory = sqlite3.Row
+    cache[key] = conn
+    return conn
 
 
 class AppStore:
@@ -1014,7 +1061,14 @@ class AppStore:
     # that is an import-ORDER dependency, and an ordering that has to stay
     # right for a setting to work is one that will eventually be wrong. A
     # dict lookup is nothing beside opening a SQLite connection.
-    _CACHE_KB_DEFAULT = 131072
+    #: Page cache per connection, in KB. Was 131072 (128 MB): with connections
+    #: that were never explicitly closed and a 15.9 GB store, those caches
+    #: filled and the service grew ~700 MB/hour until the app froze. 32 MB is
+    #: still 16x SQLite's default; TRUSTNODE_SQLITE_CACHE_KB overrides it.
+    #: Page cache per connection, in KB. There is now ONE connection per
+    #: thread rather than one per operation, so this is multiplied by tens of
+    #: threads, not by nothing: 16 MB is a budget, 128 MB was not.
+    _CACHE_KB_DEFAULT = 16384
     # FULL (the SQLite default) fsyncs on every commit; at one commit per
     # collection cycle that is a disk sync every second. NORMAL, in WAL mode,
     # CANNOT corrupt the database - a power cut can lose only the most recent
@@ -1038,8 +1092,9 @@ class AppStore:
         return cache_kb, sync
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, timeout=10.0)
-        conn.row_factory = sqlite3.Row
+        # Reused for the life of this thread: opening costs seconds on a
+        # large store, and paying that per query is what wedged the app.
+        conn = _thread_connection(self._db_path, timeout=10.0)
         # PER-CONNECTION pragmas. Setting these in the schema bootstrap looked
         # like it configured the database; it configured one short-lived
         # connection. Only `journal_mode` persists in the file.
@@ -1065,8 +1120,7 @@ class AppStore:
         # connection is read-only at the driver level (no upgrade to
         # write lock possible).
         uri = f"file:{self._db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=3.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+        conn = _thread_connection(self._db_path, readonly=True, timeout=3.0)
         try:
             conn.execute("PRAGMA query_only=ON")
             conn.execute("PRAGMA busy_timeout=3000")
@@ -1852,6 +1906,61 @@ class AppStore:
             "schema": schema,
             "tls": sslmode != "disable",
         }
+
+    def prune_cloud_historian(self, before_utc: str, *, batch_rows: int = 20000,
+                              max_batches: int = 50) -> Dict[str, Any]:
+        """Delete cloud historian rows older than `before_utc` for THIS tenant.
+
+        Returns {ok, deleted, batches, message}. Never raises: retention must
+        not fail a maintenance pass because the cloud was briefly unreachable.
+
+        The tenant predicate is not optional. Several edges can share one
+        Supabase database, and a prune that forgot it would delete somebody
+        else's history.
+        """
+        out: Dict[str, Any] = {"ok": False, "deleted": 0, "batches": 0, "message": ""}
+        before = str(before_utc or "").strip()
+        if not before:
+            out["message"] = "no cutoff given"
+            return out
+        cloud = self._get_cloud_database_target()
+        if not cloud:
+            out["message"] = "no cloud database is configured"
+            return out
+        tenant = self._current_tenant_id()
+        schema = str(cloud.get("schema") or "public")
+        try:
+            from sqlalchemy import text  # type: ignore
+            engine, _ = self._get_or_create_cloud_engine(cloud, schema)
+        except Exception as exc:  # noqa: BLE001
+            out["message"] = "cloud engine unavailable: %s" % exc
+            return out
+
+        deleted = 0
+        batches = 0
+        try:
+            with engine.begin() as conn:
+                for _ in range(max(1, int(max_batches))):
+                    # ctid-limited delete: bounded work per statement, so a
+                    # multi-million-row prune never becomes one long lock.
+                    res = conn.execute(
+                        text('DELETE FROM "%s"."historian_readings" WHERE ctid IN ('
+                             'SELECT ctid FROM "%s"."historian_readings" '
+                             'WHERE tenant_id = :tenant AND ts_utc < :before '
+                             'LIMIT :batch)' % (schema, schema)),
+                        {"tenant": tenant, "before": before,
+                         "batch": max(1, int(batch_rows))},
+                    )
+                    n = int(getattr(res, "rowcount", 0) or 0)
+                    batches += 1
+                    deleted += max(0, n)
+                    if n <= 0:
+                        break
+            out.update(ok=True, deleted=deleted, batches=batches,
+                       message="deleted %d cloud row(s) older than %s" % (deleted, before))
+        except Exception as exc:  # noqa: BLE001
+            out["message"] = "cloud prune failed: %s: %s" % (type(exc).__name__, exc)
+        return out
 
     def _get_cloud_database_target(self) -> Dict[str, Any] | None:
         # Cache the resolved target for a few seconds. The function reads two
@@ -5394,6 +5503,24 @@ class AppStore:
                 )
                 return secret
 
+    def _checkpoint_wal_truncate(self) -> None:
+        """PRAGMA wal_checkpoint(TRUNCATE) - reset the WAL file to zero.
+
+        Only safe when nothing else is reading or writing, which is why this
+        is called from shutdown() and nowhere else. TRUNCATE waits for readers
+        to finish; during normal operation there is always another one, so it
+        would block. Best-effort: if it cannot run, the WAL simply stays as it
+        is and the data is durable regardless.
+        """
+        try:
+            con = sqlite3.connect(self._db_path, timeout=5.0)
+            try:
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                con.close()
+        except Exception:
+            pass
+
     def shutdown(self) -> None:
         self._stop_event.set()
         self._sync_wakeup_event.set()
@@ -5418,6 +5545,10 @@ class AppStore:
                 self._sync_thread.join(timeout=2.0)
         except Exception:
             pass
+        # Every writer thread is joined by now, so this is the one moment a
+        # TRUNCATE can actually succeed. A 1.6 GB WAL left behind is a slow
+        # next start-up for the operator.
+        self._checkpoint_wal_truncate()
         with self._cloud_engine_lock:
             for key, engine in list(self._cloud_engine_cache.items()):
                 if engine is None:
@@ -6089,7 +6220,19 @@ class AppStore:
             #    Read-only; richest scopes ranked first; current scope still
             #    overlays last so it wins when populated.
             extra_scores: list[tuple[float, str]] = []
-            for like in (f"%|%|{edge}", f"{tenant}|%|%"):
+            # A PLACEHOLDER tenant identifies nothing. "default|%|%" matches
+            # every legacy default-scoped document on the machine - including
+            # other customers' - and the richest of them then overlays the
+            # operator's own configuration. Measured on a live install
+            # 2026-08-31: a smoke-test scope under cust-09ab9941 was being
+            # served to cust-e5916328 as their gateway. The edge-id pattern
+            # stays: an edge id does identify one edge.
+            _tenant_is_identity = str(tenant or "").strip().lower() not in (
+                "", "-", "default", "none", "null")
+            _likes = [f"%|%|{edge}"]
+            if _tenant_is_identity:
+                _likes.append(f"{tenant}|%|%")
+            for like in _likes:
                 for r in conn.execute(
                     "SELECT scope_key, domain, length(payload_json) AS L "
                     "FROM config_documents_scoped WHERE scope_key LIKE ?",
@@ -7462,7 +7605,173 @@ class AppStore:
             out["reason"] = f"{type(exc).__name__}: {exc}"
         return out
 
-    def upsert_domain_scoped(self, scope_key: str, domain: str, payload: Any, actor: str = "system") -> Dict[str, Any]:
+
+    # ------------------------------------------------------------------ guard
+    #: Config documents that are LISTS of configured things. A write that drops
+    #: several of them at once is destructive and is refused - see
+    #: _refuse_bulk_removal.
+    _LIST_CONFIG_DOMAINS = ("gateway_configurations", "devices",
+                            "database_configurations")
+
+    @staticmethod
+    def _config_ids(payload: Any) -> set:
+        """The ids in a list-shaped config document."""
+        out = set()
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    ident = str(item.get("id") or item.get("gateway_id") or "").strip()
+                    if ident:
+                        out.add(ident)
+        return out
+
+    def _refuse_bulk_removal(self, domain: str, previous: Any, incoming: Any) -> None:
+        """Raise when a write would drop two or more configured items.
+
+        The 2026-08-30 incident: a save replaced a two-gateway document with a
+        single new gateway, destroying a PLC that had 49 tags. Nothing was
+        empty, so the blank-write guard never fired.
+
+        One removal is an ordinary delete. Two or more in a single write is a
+        page that did not know what it was overwriting.
+        """
+        if domain not in self._LIST_CONFIG_DOMAINS:
+            return
+        before = self._config_ids(previous)
+        after = self._config_ids(incoming)
+        if len(before) < 2:
+            return                      # nothing worth protecting yet
+        removed = before - after
+        if after and not (before & after):
+            # Not one id in common. An edit keeps the id it opened and an
+            # addition sends the existing entries back with it, so a fully
+            # disjoint list means the writer never saw what was stored. This
+            # is the 2026-08-30 shape: [PLC, IFM] -> [something-else].
+            raise ValueError(
+                "refusing to save %s: none of the %d incoming item(s) match the "
+                "%d already stored (%s). A page that has not loaded your "
+                "configuration cannot replace it. Reload and try again - "
+                "nothing has been changed."
+                % (domain, len(after), len(before), ", ".join(sorted(before))[:160])
+            )
+        if len(removed) < 2:
+            return                      # a normal one-at-a-time delete
+        raise ValueError(
+            "refusing to save %s: it would remove %d configured item(s) (%s) "
+            "in one write. Deleting one at a time is allowed; losing several "
+            "at once is what a partially-loaded page does. Reload the page and "
+            "try again - nothing has been changed."
+            % (domain, len(removed), ", ".join(sorted(removed))[:160])
+        )
+
+    #: Computed scope key -> the scope key that actually holds this install's
+    #: configuration. Resolved once per process; see canonical_scope_key.
+    _canonical_scope_cache: dict[str, str] | None = None
+
+    def canonical_scope_key(self, scope_key: str) -> str:
+        """The scope this install's configuration really lives under.
+
+        The tenant segment is not stable across runs (JWT tenant_id vs
+        get_current_tenant(), and the break-glass login has neither), so the
+        same edge can compute `default|cust|edge` today and
+        `tenant-cust|cust|edge` tomorrow. Writing to one while reading the
+        other is why deleted devices came back.
+
+        If the computed key already holds documents it is returned untouched.
+        Otherwise, a sibling with the SAME (customer, edge) and any tenant is
+        adopted - the newest one, if several exist. With no sibling (a genuine
+        fresh install) the computed key stands.
+
+        Read-only: nothing is moved, copied or rewritten.
+        """
+        skey = str(scope_key or "").strip()
+        if not skey:
+            return skey
+        if self._canonical_scope_cache is None:
+            self._canonical_scope_cache = {}
+        cached = self._canonical_scope_cache.get(skey)
+        if cached is not None:
+            return cached
+
+        resolved = skey
+        try:
+            parts = skey.split("|")
+            # 3 segments = shared-edge scope, 4 = per-user scope.
+            if len(parts) in (3, 4) and parts[1] and parts[2]:
+                customer, edge = parts[1], parts[2]
+                tail = "|" + parts[3] if len(parts) == 4 else ""
+                with self._connect() as conn:
+                    mine = conn.execute(
+                        "SELECT COUNT(*) AS n FROM config_documents_scoped "
+                        "WHERE scope_key = ?", (skey,)).fetchone()
+                    if not mine or int(mine["n"] or 0) == 0:
+                        like = "%|" + customer + "|" + edge + tail
+                        rows = conn.execute(
+                            "SELECT scope_key, COUNT(*) AS n, MAX(updated_utc) AS last "
+                            "FROM config_documents_scoped "
+                            "WHERE scope_key LIKE ? AND scope_key != ? "
+                            "GROUP BY scope_key ORDER BY last DESC", (like, skey)).fetchall()
+                        for r in rows:
+                            cand = str(r["scope_key"] or "")
+                            # Same shape only: a 3-segment scope must not adopt
+                            # a 4-segment (per-user) document or vice versa.
+                            if cand.count("|") == skey.count("|") and int(r["n"] or 0) > 0:
+                                resolved = cand
+                                print("[trustnode][config] scope %r is empty; adopting %r "
+                                      "(same customer and edge, %d document(s))"
+                                      % (skey, cand, int(r["n"] or 0)), flush=True)
+                                break
+        except Exception:
+            resolved = skey
+        self._canonical_scope_cache[skey] = resolved
+        return resolved
+
+    def get_scoped_domain_payload(self, scope_key: str, domain: str) -> Any:
+        """The payload currently stored for this exact (scope, domain), or None.
+
+        None means "nothing stored or could not read" - deliberately
+        indistinguishable, because both mean the caller must not draw
+        conclusions from it.
+        """
+        skey = str(scope_key or "").strip()
+        dom = str(domain or "").strip()
+        if not skey or not dom:
+            return None
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT payload_json FROM config_documents_scoped "
+                    "WHERE scope_key = ? AND domain = ?", (skey, dom)).fetchone()
+            if not row:
+                return None
+            return json.loads(row["payload_json"])
+        except Exception:
+            return None
+
+    def get_scoped_domain_version(self, scope_key: str, domain: str) -> int:
+        """The version currently stored for this exact (scope, domain).
+
+        This is the number a client must echo back to prove it is editing what
+        is actually saved. 0 means nothing is stored yet, which a first write
+        legitimately matches.
+        """
+        skey = str(scope_key or "").strip()
+        dom = str(domain or "").strip()
+        if not skey or not dom:
+            return 0
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT version FROM config_documents_scoped "
+                    "WHERE scope_key = ? AND domain = ?", (skey, dom)).fetchone()
+                return int(row["version"]) if row else 0
+        except Exception:
+            # Unknown is NOT zero: returning 0 here would let a stale client
+            # look current. Signal "cannot tell" with -1 so the caller skips
+            # the check rather than approving on bad information.
+            return -1
+
+    def upsert_domain_scoped(self, scope_key: str, domain: str, payload: Any, actor: str = "system", *, allow_replace: bool = False) -> Dict[str, Any]:
         skey = str(scope_key or "").strip()
         if not skey:
             return self.upsert_domain(domain, payload, actor=actor)
@@ -7504,6 +7813,17 @@ class AppStore:
                 )
             except Exception:
                 pass
+
+        # No destructive-write heuristics here any more. Whether a write is
+        # legitimate is decided by the CALLER matching the stored version
+        # (see get_scoped_domain_version and the router's base_version check):
+        # a client editing current state may make any change, including
+        # deleting everything. Guessing from the shape of the payload produced
+        # false refusals - "Refused to clear 1 saved item(s)" when an operator
+        # deliberately deleted their devices - and false confidence, because
+        # the 2026-08-30 loss removed only ONE gateway and passed every count.
+        # `allow_replace` is kept in the signature for callers that still pass
+        # it; it is now a no-op.
         payload_json = self._canonical_json(payload_to_store)
         with self._lock:
             with self._connect() as conn:
@@ -7905,10 +8225,61 @@ class AppStore:
                 )
         return {"ok": True}
 
+    #: Cached tenant inventory: (monotonic_stamp, rows). The query behind it
+    #: is a FULL historian scan - 17 s on a live install in 2026-08 - so it is
+    #: computed at most once per _TENANT_INVENTORY_TTL_S and never on a path a
+    #: user is waiting on. See peek_historian_tenant_inventory.
+    _TENANT_INVENTORY_TTL_S = 900.0
+    #: Do not scan during start-up. The scan is 17 s on a 16 M-row historian,
+    #: and start-up is when every other connection is being opened: a bootstrap
+    #: issued while it ran measured 20.57 s against 0.16 s once it finished.
+    _TENANT_INVENTORY_BOOT_QUIET_S = 240.0
+    _tenant_inventory_cache: tuple[float, list[dict[str, Any]]] | None = None
+    _tenant_inventory_refreshing = False
+
+    def peek_historian_tenant_inventory(self) -> list[dict[str, Any]]:
+        """The inventory if it is already known, else [] - never blocking.
+
+        Used by the bootstrap path. A missing or stale entry schedules a
+        background refresh, so the Data Continuity banner appears a moment
+        after start-up instead of delaying it by a full historian scan.
+        """
+        import threading
+        import time as _time
+
+        cached = self._tenant_inventory_cache
+        fresh = bool(cached and (_time.monotonic() - cached[0]) < self._TENANT_INVENTORY_TTL_S)
+        # How long has the PROCESS been up - not the machine.
+        booting = (_time.monotonic() - _MODULE_LOAD_MONO) < self._TENANT_INVENTORY_BOOT_QUIET_S
+        if not fresh and not booting and not self._tenant_inventory_refreshing:
+            self._tenant_inventory_refreshing = True
+
+            def _refresh() -> None:
+                try:
+                    self.list_historian_tenant_inventory()
+                except Exception:
+                    pass
+                finally:
+                    self._tenant_inventory_refreshing = False
+
+            try:
+                threading.Thread(target=_refresh, name="tenant-inventory",
+                                 daemon=True).start()
+            except Exception:
+                self._tenant_inventory_refreshing = False
+        # Serve a stale answer rather than none: an out-of-date row count is
+        # still a useful banner, and the refresh is already on its way.
+        return list(cached[1]) if cached else []
+
     def list_historian_tenant_inventory(self) -> list[dict[str, Any]]:
         """Per-tenant row count + ts range across the LOCAL historian.
         Used by /api/app-store/tenants/inventory and the Data Continuity
-        page. NOT tenant-scoped — explicitly returns every tenant_id."""
+        page. NOT tenant-scoped — explicitly returns every tenant_id.
+
+        This is a full scan of historian_readings. Callers that a user is
+        waiting on must use peek_historian_tenant_inventory() instead.
+        """
+        import time as _time
         out: list[dict[str, Any]] = []
         try:
             with self._connect() as conn:
@@ -7930,6 +8301,7 @@ class AppStore:
                         "min_ts": str(r["min_ts"] or ""),
                         "max_ts": str(r["max_ts"] or ""),
                     })
+            self._tenant_inventory_cache = (_time.monotonic(), list(out))
         except Exception:
             pass
         return out
@@ -8319,8 +8691,8 @@ class AppStore:
         from_utc: str = "",
         to_utc: str = "",
         gateway: str = "",
-        tag: str = "",
-        limit: int = 50000,
+                tag: str = "",
+        tags: "list[str] | None" = None, limit: int = 50000,
         source: str = "",
     ) -> list[dict[str, Any]]:
         """Bucket RAW historian rows on the fly, in the agg tables' shape.
@@ -8336,6 +8708,10 @@ class AppStore:
         a day at 1 Hz is 1440 points per tag out, not 86 400.
         """
         fmt = {
+            # 2026-08-29: a SECOND grain, for a 1 Hz meter over a short window.
+            # Without it the finest the power chart could ask for was a minute,
+            # so a chart of the last two minutes drew two points.
+            "second": "%Y-%m-%d %H:%M:%S",
             "minute": "%Y-%m-%d %H:%M:00",
             "hour": "%Y-%m-%d %H:00:00",
             "day": "%Y-%m-%d 00:00:00",
@@ -8362,7 +8738,18 @@ class AppStore:
             fn = _norm_bound(from_txt)
             where += f" AND {norm} >= :from_norm AND ts_utc >= :from_coarse"
             params["from_norm"] = fn
-            params["from_coarse"] = fn[:10]      # same date text in both encodings
+            # 2026-08-29: this was fn[:10] - a DATE. It kept the index seek
+            # legal for both timestamp encodings, but it made every short
+            # window scan the whole day: measured 4 648 ms for a 2-minute
+            # power chart on the 13.4 GB store, against 85 ms with the full
+            # bound. Same 10 527 rows. 55x.
+            #
+            # Full precision is still correct for both encodings, because 'T'
+            # (0x54) sorts AFTER ' ' (0x20): a T-encoded row on the same date
+            # always passes a space-encoded lower bound and is then filtered by
+            # the normalised predicate above. No T row can be wrongly excluded -
+            # at worst a few extra rows of that date are read and discarded.
+            params["from_coarse"] = fn
         to_txt = str(to_utc or "").strip()
         if to_txt:
             tn = _norm_bound(to_txt)
@@ -8378,10 +8765,24 @@ class AppStore:
         if gw_txt:
             where += " AND gateway_id = :gateway"
             params["gateway"] = gw_txt
-        tag_txt = str(tag or "").strip()
-        if tag_txt:
-            where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
-            params["tag_like"] = f"%{tag_txt}%"
+        # An EXACT list beats a substring on both counts: it says what the
+        # caller actually wants, and `tag_name IN (...)` can use
+        # idx_hist_tenant_tag_ts. The LIKE below wraps tag_name in LOWER() and
+        # COALESCE() behind a leading wildcard, which no index can serve - it
+        # cost 38 s on a 24-hour power window (2026-08-30).
+        tag_list = [str(t).strip() for t in (tags or []) if str(t or "").strip()]
+        if tag_list:
+            keys = []
+            for n, t in enumerate(tag_list[:200]):
+                k = f"tag_in_{n}"
+                keys.append(f":{k}")
+                params[k] = t
+            where += f" AND tag_name IN ({', '.join(keys)})"
+        else:
+            tag_txt = str(tag or "").strip()
+            if tag_txt:
+                where += " AND LOWER(COALESCE(tag_name,'')) LIKE LOWER(:tag_like)"
+                params["tag_like"] = f"%{tag_txt}%"
         src_txt = str(source or "").strip()
         if src_txt:
             # raw DOES carry `source`, so this filters exactly rather than

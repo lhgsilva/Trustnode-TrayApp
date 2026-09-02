@@ -47,6 +47,13 @@ import {
   toTsMs,
 } from "./dashboardAnalytics";
 import CloudSyncStatusWidget from "./CloudSyncStatusWidget";
+import {
+  OeeKpiWidget, OeeMachineCardWidget, OeeMachineStatusWidget, OeeTrendWidget,
+  OeeDowntimeParetoWidget, OeeStatusTimelineWidget, OeeRuntimeDowntimeWidget,
+  OeeEnergyWidget, OeeProductionCountWidget, OeeShiftPerformanceWidget,
+  OeeMachineComparisonWidget, OeeDataQualityWidget,
+} from "./OeeWidgets";
+import IoBlockWidget from "./IoBlockWidget";
 
 const LAST_WIDGET_DIRECT_STATS_CACHE = new Map();
 const LAST_WIDGET_RULE_STATS_CACHE = new Map();
@@ -285,6 +292,7 @@ function resolvePresetWindowMs(preset) {
     "15m": 15 * 60 * 1000,
     "1h": 60 * 60 * 1000,
     "6h": 6 * 60 * 60 * 1000,
+    "8h": 8 * 60 * 60 * 1000,
     "24h": 24 * 60 * 60 * 1000,
     "7d": 7 * 24 * 60 * 60 * 1000,
     "30d": 30 * 24 * 60 * 60 * 1000,
@@ -307,6 +315,13 @@ function resolveTimeFilterRange(cfg) {
     const toUtc = toIsoUtc(cfg?.query_time_filter_to);
     if (!fromUtc && !toUtc) return null;
     return { fromUtc, toUtc };
+  }
+  // "Current day" is midnight-to-now in LOCAL time, not a rolling window -
+  // an operator asking for today means today, not "the last 24 hours".
+  if (preset === "today") {
+    const now = new Date();
+    const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    return { fromUtc: midnight.toISOString(), toUtc: now.toISOString() };
   }
   const windowMs = resolvePresetWindowMs(preset);
   if (!windowMs) return null;
@@ -337,6 +352,12 @@ function applyWidgetTimeFilter(rows, cfg) {
   if (preset === "custom") {
     fromMs = toLocalInputMs(cfg?.query_time_filter_from);
     toMs = toLocalInputMs(cfg?.query_time_filter_to);
+  } else if (preset === "today") {
+    // Midnight of the ANCHOR's day, so a paused stream still shows "today"
+    // relative to the data rather than to the wall clock.
+    const anchor = new Date(anchorMs);
+    fromMs = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate()).getTime();
+    toMs = anchorMs;
   } else {
     const windowMs = resolvePresetWindowMs(preset);
     if (windowMs > 0) fromMs = anchorMs - windowMs;
@@ -840,6 +861,13 @@ function LiveTagChart({
         lineWidth: Number(s.line_width || 0),
         lineDot: String(s.line_dot || ""),
         barWidth: Number(s.bar_width || 0),
+        // Blank inherits the widget-wide interpolation - the same rule every
+        // other per-series field in the gear modal follows.
+        interpolation: (() => {
+          const t = String(s.interpolation || "").trim();
+          return ["linear", "monotone", "natural", "step", "stepBefore", "stepAfter"]
+            .includes(t) ? t : "";
+        })(),
       });
     });
     return out;
@@ -1809,7 +1837,7 @@ function LiveTagChart({
                 return (
                   <Area
                     {...common}
-                    type={interpolation}
+                    type={s.interpolation || interpolation}
                     fill={s.color + "33"}
                     strokeWidth={lineStrokeWidth}
                     dot={dotProp}
@@ -1820,7 +1848,7 @@ function LiveTagChart({
               return (
                 <Line
                   {...common}
-                  type={interpolation}
+                  type={s.interpolation || interpolation}
                   strokeWidth={lineStrokeWidth}
                   dot={dotProp}
                   label={labelProp}
@@ -1854,6 +1882,7 @@ function DashboardWidgetCardImpl({
   historicalFromLocal = "",
   historicalToLocal = "",
   onHistoricalPan = null,
+  onOpenTagMonitor = null,
 }) {
   // Drag-to-scroll: when the dashboard is in Historical mode, the chart
   // gets a "grab" cursor. Pressing and dragging horizontally pans the shared
@@ -4942,6 +4971,56 @@ function DashboardWidgetCardImpl({
       return <BatchTimelineWidget widget={widget} />;
     case "batch_input":
       return <BatchInputWidget widget={widget} />;
+    // OEE module widgets (2026-08-29). Same thin-dispatcher shape as Batch:
+    // each widget owns its own fetching and its loading/empty/error states,
+    // and none of them computes an OEE figure - they render what the module
+    // already calculated.
+    case "oee_kpi":
+      return <OeeKpiWidget widget={widget} metric="oee" />;
+    case "oee_availability_kpi":
+      return <OeeKpiWidget widget={widget} metric="availability" />;
+    case "oee_performance_kpi":
+      return <OeeKpiWidget widget={widget} metric="performance" />;
+    case "oee_quality_kpi":
+      return <OeeKpiWidget widget={widget} metric="quality" />;
+    case "oee_machine_card":
+      return <OeeMachineCardWidget widget={widget} />;
+    case "oee_machine_status":
+      return <OeeMachineStatusWidget widget={widget} />;
+    case "oee_trend":
+      return <OeeTrendWidget widget={widget} />;
+    case "oee_apq_trend":
+      return <OeeTrendWidget widget={widget} apq />;
+    case "oee_downtime_pareto":
+      return <OeeDowntimeParetoWidget widget={widget} />;
+    case "oee_status_timeline":
+      return <OeeStatusTimelineWidget widget={widget} />;
+    case "oee_runtime_downtime":
+      return <OeeRuntimeDowntimeWidget widget={widget} />;
+    case "oee_energy_usage":
+      return <OeeEnergyWidget widget={widget} />;
+    case "oee_energy_waste":
+      return <OeeEnergyWidget widget={widget} waste />;
+    case "oee_production_count":
+      return <OeeProductionCountWidget widget={widget} />;
+    case "oee_shift_performance":
+      return <OeeShiftPerformanceWidget widget={widget} />;
+    case "oee_machine_comparison":
+      return <OeeMachineComparisonWidget widget={widget} />;
+    case "oee_data_quality":
+      return <OeeDataQualityWidget widget={widget} />;
+    // I/O block (2026-08-29). Reads the same live rows every other widget
+    // reads; the tag-monitor hook is passed through so each pin can open its
+    // own chart without inventing a second charting path.
+    case "io_block_status":
+      return (
+        <IoBlockWidget
+          widget={widget}
+          tagRowsByGateway={tagRowsByGateway}
+          gatewaysIndex={gatewaysIndex}
+          onOpenTagMonitor={onOpenTagMonitor}
+        />
+      );
     default:
       return renderEmpty("Unsupported widget");
   }

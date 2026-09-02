@@ -356,10 +356,17 @@ check("the OEE styles reuse the app tokens, not their own theme",
 back = os.path.join(ROOT, "backend", "app")
 schema_src = io.open(os.path.join(back, "modules", "oee", "schema.py"),
                      encoding="utf-8").read()
+# The PROPERTY is the namespace, not a count. Pinning the count meant that
+# adding oee_planned_events - a table entirely inside the namespace - failed a
+# check whose own name says it is about the namespace. A test that fails when
+# the module legitimately grows is a test that gets edited without being read.
+_all_tables = _re_tables = __import__("re").findall(
+    r"CREATE TABLE IF NOT EXISTS ([A-Za-z_][A-Za-z0-9_]*)", schema_src)
+_outside = [t for t in _all_tables if not t.startswith("oee_")]
 check("the schema creates no table outside the oee_ namespace",
-      schema_src.count("CREATE TABLE IF NOT EXISTS") == 16
-      and schema_src.count("CREATE TABLE IF NOT EXISTS oee_") == 16,
-      schema_src.count("CREATE TABLE IF NOT EXISTS"))
+      not _outside,
+      "%d table(s), all oee_" % len(_all_tables) if not _outside
+      else "outside the namespace: %s" % _outside)
 # Look at the DDL, not the prose: the module docstring explains WHY there is
 # no "REFERENCES gateway(id)", and matching that sentence is not a failure.
 import re as _re

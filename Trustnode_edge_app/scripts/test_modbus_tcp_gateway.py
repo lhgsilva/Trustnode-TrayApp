@@ -30,9 +30,23 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "backend"))
-PORT = "8127"
+def _free_port() -> int:
+    """An ephemeral port the OS says is free right now.
+
+    2026-08-31: this test passed alone and failed inside the gate run, because
+    fixed ports (8127 here, 15020 for the simulator) were still held by the
+    previous test's shutting-down process. A flaky gate check is worse than no
+    check - it teaches people to re-run until green.
+    """
+    import socket as _s
+    with _s.socket(_s.AF_INET, _s.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+PORT = str(_free_port())
 API = "http://127.0.0.1:" + PORT
-MB_PORT = 15020
+MB_PORT = _free_port()
 GID = "gw-modbus-test"
 FAILS = []
 

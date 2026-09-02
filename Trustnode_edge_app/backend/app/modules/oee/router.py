@@ -105,10 +105,17 @@ class CyclePayload(BaseModel):
 
 
 class DowntimePayload(BaseModel):
+    """A partial edit of one downtime event.
+
+    Every field defaults to None, not "". The Machine Detail page offers
+    "add a comment" and "mark planned" as separate actions, and neither may
+    wipe the reason somebody walked to the machine to establish.
+    """
     event_id: str
-    downtime_reason_id: str = ""
-    downtime_category: str = ""
-    comment: str = ""
+    downtime_reason_id: Optional[str] = None
+    downtime_category: Optional[str] = None
+    comment: Optional[str] = None
+    is_planned: Optional[bool] = None
 
 
 class StatePayload(BaseModel):
@@ -159,7 +166,11 @@ def get_meta() -> dict:
 # ------------------------------------------------------------------- config
 _KINDS = ("machines", "signal_mappings", "power_meter_mappings",
           "power_state_rules", "products", "orders", "shifts",
-          "planned_stops", "downtime_reasons", "quality_reasons")
+          "planned_stops", "downtime_reasons", "quality_reasons",
+          # 2026-08-29: the planning calendar. This tuple is a SECOND list of
+          # sections beside store._CRUD_TABLES; a kind missing here answers 404
+          # while the table sits there working, so the two must move together.
+          "planned_events")
 
 
 @router.get("/config/{kind}")
@@ -270,10 +281,17 @@ def _validate_references(kind: str, data: Dict[str, Any],
 # ----------------------------------------------------------------- overview
 @router.get("/overview")
 def overview(from_utc: str = "", to_utc: str = "", hours: float = 24.0,
-             machine_ids: str = "", line: str = "") -> dict:
+             machine_ids: str = "", line: str = "", compare: int = 0) -> dict:
+    """The whole Overview page in one call.
+
+    `compare=1` adds the same totals for the equal-length window immediately
+    before this one, which is what the KPI cards' "vs previous" is measured
+    against. Off by default: it doubles the work, and not every caller wants it.
+    """
     a, b = _window(from_utc, to_utc, hours)
     ids = [x for x in str(machine_ids or "").split(",") if x.strip()]
-    return _service().overview(a, b, machine_ids=ids or None, line=line)
+    return _service().overview(a, b, machine_ids=ids or None, line=line,
+                               with_previous=bool(int(compare or 0)))
 
 
 @router.get("/trend")
@@ -282,6 +300,68 @@ def trend(from_utc: str = "", to_utc: str = "", hours: float = 24.0,
     a, b = _window(from_utc, to_utc, hours)
     ids = [x for x in str(machine_ids or "").split(",") if x.strip()]
     return {"ok": True, "buckets": _service().trend(ids, a, b, buckets)}
+
+
+# ==================== dashboard aggregates (2026-08-29) ====================
+# One endpoint per dashboard surface. Pages and widgets read these; none of
+# them re-implements an OEE formula, because two implementations of the same
+# formula will disagree and the one on screen is the one nobody can trace.
+
+
+@router.get("/dashboard/timeline")
+def dashboard_timeline(from_utc: str = "", to_utc: str = "", hours: float = 24.0,
+                       machine_ids: str = "", max_blocks: int = 2000) -> dict:
+    a, b = _window(from_utc, to_utc, hours)
+    ids = [x for x in str(machine_ids or "").split(",") if x.strip()]
+    return _service().status_timeline(ids or None, a, b,
+                                      max_blocks=max(50, min(int(max_blocks or 2000), 20000)))
+
+
+@router.get("/dashboard/downtime-pareto")
+def dashboard_downtime_pareto(from_utc: str = "", to_utc: str = "", hours: float = 24.0,
+                              machine_ids: str = "", limit: int = 12,
+                              group_by: str = "reason", metric: str = "duration") -> dict:
+    """Downtime ranked by duration or by number of stops.
+
+    `group_by` is one of the service's PARETO_GROUPS - reason, category,
+    machine, line. The response repeats which groupings are supported, so the
+    page offers exactly those: an event carries no product or order, and a
+    grouping the data cannot support should not appear in a menu.
+    """
+    a, b = _window(from_utc, to_utc, hours)
+    ids = [x for x in str(machine_ids or "").split(",") if x.strip()]
+    return _service().downtime_pareto(ids or None, a, b,
+                                      limit=max(1, min(int(limit or 12), 100)),
+                                      group_by=group_by, metric=metric)
+
+
+@router.get("/dashboard/energy")
+def dashboard_energy(from_utc: str = "", to_utc: str = "", hours: float = 24.0,
+                     machine_ids: str = "") -> dict:
+    a, b = _window(from_utc, to_utc, hours)
+    ids = [x for x in str(machine_ids or "").split(",") if x.strip()]
+    return _service().energy_summary(ids or None, a, b)
+
+
+@router.get("/dashboard/shifts")
+def dashboard_shifts(from_utc: str = "", to_utc: str = "", hours: float = 24.0,
+                     machine_ids: str = "") -> dict:
+    a, b = _window(from_utc, to_utc, hours)
+    ids = [x for x in str(machine_ids or "").split(",") if x.strip()]
+    return _service().shift_performance(ids or None, a, b)
+
+
+@router.get("/planning")
+def planning_events(from_utc: str = "", to_utc: str = "", hours: float = 168.0,
+                    machine_ids: str = "", line: str = "") -> dict:
+    """Planning-calendar events overlapping the window.
+
+    Default window is a week, because the calendar is read by week far more
+    often than by day.
+    """
+    a, b = _window(from_utc, to_utc, hours)
+    ids = [x for x in str(machine_ids or "").split(",") if x.strip()]
+    return _service().planned_events(a, b, machine_ids=ids or None, line=line)
 
 
 @router.get("/machines/live")
@@ -296,13 +376,21 @@ def machines_live() -> dict:
 
 @router.get("/machines/{machine_id}/result")
 def machine_result(machine_id: str, from_utc: str = "", to_utc: str = "",
-                   hours: float = 24.0) -> dict:
+                   hours: float = 24.0, compare: int = 0) -> dict:
     svc = _service()
     machine = svc.store.get_entity("machines", machine_id)
     if not machine:
         raise HTTPException(status_code=404, detail="Machine not found.")
     a, b = _window(from_utc, to_utc, hours)
-    return {"ok": True, "result": svc.machine_result(machine, a, b)}
+    out = {"ok": True, "result": svc.machine_result(machine, a, b)}
+    if compare:
+        # The equal-length window immediately before, through the SAME code
+        # path - so "vs previous shift" on a KPI card compares like with like
+        # instead of against a number the page worked out for itself.
+        pa, pb = svc._previous_window(a, b)
+        out["previous"] = {"from_utc": pa, "to_utc": pb,
+                           "result": svc.machine_result(machine, pa, pb)}
+    return out
 
 
 @router.get("/machines/{machine_id}/events")
@@ -369,7 +457,8 @@ def confirm_downtime(payload: DowntimePayload, request: Request) -> dict:
     """Attach a reason to a stop. No reason given stays Unknown, by design."""
     ev = _service().store.confirm_downtime(
         payload.event_id, payload.downtime_reason_id,
-        payload.downtime_category, payload.comment, _actor(request))
+        payload.downtime_category, payload.comment, _actor(request),
+        is_planned=payload.is_planned)
     if not ev:
         raise HTTPException(status_code=404, detail="Downtime event not found.")
     return {"ok": True, "event": ev}

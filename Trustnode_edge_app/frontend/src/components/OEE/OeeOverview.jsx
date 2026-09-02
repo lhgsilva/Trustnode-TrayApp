@@ -8,67 +8,118 @@ import {
   ResponsiveContainer, ComposedChart, LineChart, Line, Bar, BarChart,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, AreaChart, Area,
 } from "recharts";
-import { oeeOverview, oeeTrend, oeeList } from "../../api";
+import { oeeOverview, oeeTrend, oeeList, oeeTimeline, oeeDowntimePareto } from "../../api";
+import {
+  OeeKpiCard, OeeRefreshControl, OeeTrendChart, OeeDowntimePareto, KPI_HINTS,
+  TREND_SERIES,
+} from "./OeeOverviewParts";
+import OeePeriodBar, { resolveWindow } from "./OeePeriod";
+import { Gauge, ApqBars, MaturityBadge, StatusTimeline, DEFAULT_THRESHOLDS }
+  from "./OeeVisuals";
 import {
   KpiCard, StatePill, ConfidencePill, pct, duration, num, EmptyState,
   SOURCE_LABELS, usePoll,
 } from "./OeeShared";
-
-const RANGES = [
-  { id: "8", label: "Last 8 h", hours: 8, buckets: 16 },
-  { id: "24", label: "Last 24 h", hours: 24, buckets: 24 },
-  { id: "168", label: "Last 7 days", hours: 168, buckets: 28 },
-  { id: "720", label: "Last 30 days", hours: 720, buckets: 30 },
-];
 
 function chartTime(iso) {
   const t = String(iso || "").slice(5, 16).replace("T", " ");
   return t;
 }
 
-export default function OeeOverviewPage({ canEdit = false }) {
-  const [rangeId, setRangeId] = useState("24");
+export default function OeeOverviewPage({
+  canEdit = false, selection, onSelectionChange, onOpenMachine,
+  thresholds = DEFAULT_THRESHOLDS,
+}) {
   const [machineFilter, setMachineFilter] = useState("");
-  const [lineFilter, setLineFilter] = useState("");
   const [sourceFilter, setSourceFilter] = useState("");
+  const [showFilters, setShowFilters] = useState(false);
   const [data, setData] = useState(null);
   const [trend, setTrend] = useState([]);
   const [shifts, setShifts] = useState([]);
-  const [shiftFilter, setShiftFilter] = useState("");
+  const [lanes, setLanes] = useState([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  //: How often the page re-reads. "Manual" (0) is a real choice on a plant
+  //: screen that is being watched rather than driven.
+  const [refreshMs, setRefreshMs] = useState(10000);
+  const [lastUpdated, setLastUpdated] = useState("");
+  //: Which trend lines are drawn. Four overlapping percentage lines is a
+  //: picture of nothing, so only Overall OEE starts on.
+  const [trendVisible, setTrendVisible] = useState(() => {
+    const out = {};
+    TREND_SERIES.forEach((sr) => { out[sr.key] = sr.on; });
+    return out;
+  });
+  const [paretoMetric, setParetoMetric] = useState("duration");
+  const [paretoGroup, setParetoGroup] = useState("reason");
+  const [paretoData, setParetoData] = useState(null);
 
-  const range = useMemo(
-    () => RANGES.find((r) => r.id === rangeId) || RANGES[1], [rangeId]);
+  const win = useMemo(
+    () => (selection ? resolveWindow(selection, shifts) : null),
+    [selection, shifts]
+  );
+
+  // Trend resolution follows the window the user chose. It used to come from
+  // a separate "Range" dropdown that did not set the window, so the two could
+  // disagree and the dropdown was the one that looked authoritative.
+  const buckets = useMemo(() => {
+    if (!win) return 24;
+    const hours = (Date.parse(`${win.to}Z`) - Date.parse(`${win.from}Z`)) / 3600000;
+    if (!Number.isFinite(hours) || hours <= 0) return 24;
+    if (hours <= 8) return 16;
+    if (hours <= 24) return 24;
+    if (hours <= 168) return 28;
+    return 30;
+  }, [win]);
+
+  // The window comes from the SHARED selection when the page is given one, so
+  // the period survives navigation into Machine Detail and back. Falling back
+  // to the local range keeps the page usable if it is ever mounted alone.
 
   const load = useCallback(async () => {
     try {
-      const params = { hours: range.hours };
+      const params = win
+        ? { from_utc: win.from, to_utc: win.to }
+        : { hours: 24 };
+      const effLine = selection?.line || "";
       if (machineFilter) params.machine_ids = machineFilter;
-      if (lineFilter) params.line = lineFilter;
-      const [ov, tr] = await Promise.all([
-        oeeOverview(params),
-        oeeTrend({ hours: range.hours, buckets: range.buckets,
-                   ...(machineFilter ? { machine_ids: machineFilter } : {}) }),
+      if (effLine) params.line = effLine;
+      const [ov, tr, tl, pa] = await Promise.all([
+        // compare=1 brings the previous equal-length window, which is what the
+        // KPI deltas are measured against. The page does not compute it.
+        oeeOverview({ ...params, compare: 1 }),
+        oeeTrend({ ...params, buckets }),
+        oeeTimeline(params).catch(() => ({ lanes: [] })),
+        oeeDowntimePareto({ ...params, group_by: paretoGroup, metric: paretoMetric })
+          .catch(() => null),
       ]);
       setData(ov);
       setTrend(Array.isArray(tr?.buckets) ? tr.buckets : []);
+      setLanes(Array.isArray(tl?.lanes) ? tl.lanes : []);
+      setParetoData(pa);
+      setLastUpdated(new Date().toLocaleTimeString());
       setError("");
     } catch (e) {
       setError(String(e?.message || e));
     }
-  }, [range, machineFilter, lineFilter]);
+  }, [win, buckets, machineFilter, selection, paretoGroup, paretoMetric]);
 
   useEffect(() => { setBusy(true); load().finally(() => setBusy(false)); }, [load]);
   // The machine cards are live data; 10 s keeps them current without making
   // the page a poller (the heavy result maths is in the same call).
-  usePoll(load, 10000, [load]);
+  // 0 = manual. usePoll always re-arms, so a very long interval stands in for
+  // "do not poll" without teaching the hook a second mode.
+  usePoll(load, refreshMs > 0 ? refreshMs : 24 * 60 * 60 * 1000, [load, refreshMs]);
 
   useEffect(() => {
     oeeList("shifts").then((r) => setShifts(r.items || [])).catch(() => {});
   }, []);
 
   const totals = data?.totals || {};
+  //: The service computed this over the equal-length window before this one.
+  //: The page only subtracts; it does not recompute OEE.
+  const prevTotals = (data?.previous?.totals) || {};
+  const prevLabel = win?.shiftLabel ? "previous shift" : "previous period";
   const machines = useMemo(() => {
     let rows = data?.machines || [];
     if (sourceFilter) rows = rows.filter((m) => m.status_source === sourceFilter);
@@ -82,6 +133,18 @@ export default function OeeOverviewPage({ canEdit = false }) {
 
   const trendRows = useMemo(() => trend.map((b) => ({
     t: chartTime(b.bucket_start_utc),
+    // Lower-case keys drive the selectable lines and the rich tooltip; the
+    // capitalised ones remain for the other charts on this page.
+    oee: b.oee === null ? null : Number((b.oee * 100).toFixed(1)),
+    availability: b.availability === null ? null : Number((b.availability * 100).toFixed(1)),
+    performance: b.performance === null ? null : Number((b.performance * 100).toFixed(1)),
+    quality: b.quality === null ? null : Number((b.quality * 100).toFixed(1)),
+    runtime_s: b.runtime_s,
+    downtime_s: b.downtime_s,
+    total_count: b.total,
+    maturity: b.maturity || b.stage || "",
+    machines_counted: b.machines_counted,
+    machines_total: b.machines_total,
     OEE: b.oee === null ? null : Number((b.oee * 100).toFixed(1)),
     Availability: b.availability === null ? null : Number((b.availability * 100).toFixed(1)),
     Performance: b.performance === null ? null : Number((b.performance * 100).toFixed(1)),
@@ -94,70 +157,97 @@ export default function OeeOverviewPage({ canEdit = false }) {
     Rejects: Number(b.reject || 0),
   })), [trend]);
 
-  const pareto = useMemo(() => (data?.pareto || []).map((p) => ({
-    name: `${p.reason}`,
-    category: p.category,
-    Minutes: Number((p.seconds / 60).toFixed(1)),
-    Cumulative: Number((p.cumulative * 100).toFixed(1)),
-  })), [data]);
+  //: How complete the plant figure is - the service's own roll-up, not a
+  //: guess made here. A plant averaging four instrumented machines out of
+  //: nine must not present that average as if all nine reported.
+  //: A sparkline is the trend the page already has, not a second query.
+  const sparkOf = useCallback((key) => (trendRows || [])
+    .map((r) => r[key])
+    .filter((v) => v !== null && v !== undefined), [trendRows]);
+
+  const plantMaturity = useMemo(() => {
+    const t = data?.totals || {};
+    if (!t.stage) return null;
+    const counted = Number(t.machines_counted);
+    const all = Number(t.machines_total);
+    const short = Number.isFinite(counted) && Number.isFinite(all) && counted < all
+      ? `${counted} of ${all} machines have a complete figure`
+      : "";
+    return { stage: t.stage, missing: t.missing_factors || [], assumption: short };
+  }, [data]);
+
+  //: The dedicated endpoint answers with the chosen grouping and ranking, and
+  //: carries BOTH seconds and stops so the toggle needs no round trip. The
+  //: overview's own pareto is the fallback for an edge that has not restarted
+  //: into a build with the grouped endpoint.
+  const paretoRows = useMemo(() => {
+    const rows = paretoData?.rows;
+    if (Array.isArray(rows) && rows.length) return rows;
+    return (data?.pareto || []).map((p) => ({
+      label: p.reason, category: p.category, reason: p.reason,
+      seconds: p.seconds, stops: p.stops || 0,
+      share: p.share, cumulative: p.cumulative,
+    }));
+  }, [paretoData, data]);
 
   const noMachines = data && (data.machines || []).length === 0;
 
   return (
     <div className="oee-page">
-      {/* ------------------------------------------------------- filters */}
-      <section className="card oee-filters">
-        <div className="oee-filter-row">
-          <label>
-            Range
-            <select value={rangeId} onChange={(e) => setRangeId(e.target.value)}>
-              {RANGES.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}
-            </select>
-          </label>
-          <label>
-            Line
-            <select value={lineFilter} onChange={(e) => setLineFilter(e.target.value)}>
-              <option value="">All lines</option>
-              {lines.map((l) => <option key={l} value={l}>{l}</option>)}
-            </select>
-          </label>
-          <label>
-            Machine
-            <select value={machineFilter} onChange={(e) => setMachineFilter(e.target.value)}>
+      {/* --------------------------------------------------- one toolbar */}
+      {/* The period bar owns the window, the day, the shift and the line -
+          it is shared with Machine Detail, so it is the one that has to be
+          right. These two narrow the machine CARDS and are the only filters
+          the page ever really had. */}
+      <div className="oee-period-row">
+        <OeePeriodBar selection={selection} onChange={onSelectionChange}
+          shifts={shifts} machines={data?.machines || []} />
+        {/* The period bar alone fills the row at 1366px. Machine and Source
+            narrow the CARDS rather than the query, so they sit behind a
+            disclosure - the same pattern as Machine Detail - and the default
+            view spends one line on controls instead of two.
+            A dot marks the button when a filter is actually applied, so a
+            hidden filter can never quietly change what is on screen. */}
+        <button type="button"
+                className={`btn btn-secondary btn-sm${showFilters ? " active" : ""}`}
+                aria-expanded={showFilters}
+                onClick={() => setShowFilters((v) => !v)}>
+          Filters{(machineFilter || sourceFilter) ? " •" : ""}
+        </button>
+        <OeeRefreshControl refreshMs={refreshMs} onRefreshMs={setRefreshMs}
+                           lastUpdated={lastUpdated} busy={busy} />
+      </div>
+
+      {showFilters ? (
+        <div className="oee-filter-extra">
+          <label className="oee-toolbar-field">
+            <span>Machine</span>
+            <select value={machineFilter}
+                    onChange={(e) => setMachineFilter(e.target.value)}>
               <option value="">All machines</option>
               {(data?.machines || []).map((m) => (
                 <option key={m.machine_id} value={m.machine_id}>{m.name}</option>
               ))}
             </select>
           </label>
-          <label>
-            Shift
-            <select value={shiftFilter} onChange={(e) => setShiftFilter(e.target.value)}>
-              <option value="">All shifts</option>
-              {shifts.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-            </select>
-          </label>
-          <label>
-            Data source
-            <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)}>
+          <label className="oee-toolbar-field">
+            <span>Source</span>
+            <select value={sourceFilter}
+                    onChange={(e) => setSourceFilter(e.target.value)}>
               <option value="">Any source</option>
               {Object.entries(SOURCE_LABELS).map(([k, v]) => (
                 <option key={k} value={k}>{v}</option>
               ))}
             </select>
           </label>
-          <button type="button" className="btn btn-secondary btn-sm"
-                  onClick={load} disabled={busy}>
-            {busy ? "Refreshing…" : "Refresh"}
-          </button>
+          {(machineFilter || sourceFilter) ? (
+            <button type="button" className="btn btn-secondary btn-sm"
+                    onClick={() => { setMachineFilter(""); setSourceFilter(""); }}>
+              Clear
+            </button>
+          ) : null}
         </div>
-        {shiftFilter ? (
-          <div className="muted" style={{ fontSize: 11.5, marginTop: 4 }}>
-            Shift filtering narrows planned production time; machines outside the
-            shift show as “Not enough data”.
-          </div>
-        ) : null}
-      </section>
+      ) : null}
 
       {error ? <div className="error">{error}</div> : null}
 
@@ -174,16 +264,34 @@ export default function OeeOverviewPage({ canEdit = false }) {
       <section className="card">
         <h3 className="card-title">Overall</h3>
         <div className="power-kpi-grid oee-kpi-grid">
-          <KpiCard title="OEE" value={pct(totals.oee)} tone="primary"
-                   sub="Availability × Performance × Quality" />
-          <KpiCard title="Availability" value={pct(totals.availability)}
-                   sub="Runtime / planned time" />
-          <KpiCard title="Performance" value={pct(totals.performance)}
-                   sub="Ideal cycle × count / runtime" />
-          <KpiCard title="Quality" value={pct(totals.quality)}
-                   sub="Good / total" />
-          <KpiCard title="Runtime" value={duration(totals.runtime_s)} />
-          <KpiCard title="Downtime" value={duration(totals.downtime_s)} tone="warn" />
+          <OeeKpiCard title="Overall OEE" value={pct(totals.oee)} tone="primary"
+                      hint={KPI_HINTS.oee}
+                      current={totals.oee} previous={prevTotals.oee}
+                      previousLabel={prevLabel}
+                      spark={sparkOf("oee")} maturity={plantMaturity} />
+          <OeeKpiCard title="Availability" value={pct(totals.availability)}
+                      hint={KPI_HINTS.availability}
+                      current={totals.availability} previous={prevTotals.availability}
+                      previousLabel={prevLabel}
+                      spark={sparkOf("availability")} maturity={plantMaturity} />
+          <OeeKpiCard title="Performance" value={pct(totals.performance)}
+                      hint={KPI_HINTS.performance}
+                      current={totals.performance} previous={prevTotals.performance}
+                      previousLabel={prevLabel}
+                      spark={sparkOf("performance")} maturity={plantMaturity} />
+          <OeeKpiCard title="Quality" value={pct(totals.quality)}
+                      hint={KPI_HINTS.quality}
+                      current={totals.quality} previous={prevTotals.quality}
+                      previousLabel={prevLabel}
+                      spark={sparkOf("quality")} maturity={plantMaturity} />
+          <OeeKpiCard title="Runtime" value={duration(totals.runtime_s)}
+                      hint={KPI_HINTS.runtime}
+                      current={totals.runtime_s} previous={prevTotals.runtime_s}
+                      previousLabel={prevLabel} />
+          <OeeKpiCard title="Downtime" value={duration(totals.downtime_s)} tone="warn"
+                      hint={KPI_HINTS.downtime}
+                      current={totals.downtime_s} previous={prevTotals.downtime_s}
+                      previousLabel={prevLabel} />
           <KpiCard title="Total produced" value={num(totals.total_count)} />
           <KpiCard title="Good" value={num(totals.good_count)} />
           <KpiCard title="Rejects" value={num(totals.reject_count)} tone="warn" />
@@ -206,9 +314,23 @@ export default function OeeOverviewPage({ canEdit = false }) {
             {machines.map((m) => {
               const result = (data?.results || []).find(
                 (r) => r.machine_id === m.machine_id) || {};
+              const openable = typeof onOpenMachine === "function";
               return (
                 <div key={m.machine_id}
-                     className={`oee-machine-card oee-mc-${m.state}`}>
+                     className={`oee-machine-card oee-mc-${m.state}`
+                       + (openable ? " oee-mc-clickable" : "")}
+                     role={openable ? "button" : undefined}
+                     tabIndex={openable ? 0 : undefined}
+                     title={openable ? `Open ${m.name}` : undefined}
+                     onClick={openable ? () => onOpenMachine(m) : undefined}
+                     onKeyDown={openable ? (e) => {
+                       // A card that only responds to a mouse is unusable on a
+                       // control-room panel driven by keyboard or touch.
+                       if (e.key === "Enter" || e.key === " ") {
+                         e.preventDefault();
+                         onOpenMachine(m);
+                       }
+                     } : undefined}>
                   <div className="oee-mc-head">
                     <strong>{m.name}</strong>
                     <StatePill state={m.state} />
@@ -233,8 +355,18 @@ export default function OeeOverviewPage({ canEdit = false }) {
                     </div>
                   ) : null}
 
+                  <div className="oee-mc-gauge-row">
+                    <Gauge value={result.oee ?? null} size={84} label="OEE"
+                      thresholds={thresholds} />
+                    <ApqBars availability={result.availability}
+                      performance={result.performance} quality={result.quality}
+                      thresholds={thresholds} />
+                  </div>
+                  <MaturityBadge stage={result.stage || m.stage}
+                    missing={result.missing_factors || []}
+                    assumption={result.assumption || ""} />
+
                   <div className="oee-mc-grid">
-                    <div><span className="muted">OEE</span><strong>{pct(result.oee)}</strong></div>
                     <div><span className="muted">Runtime</span><strong>{duration(result.runtime_s)}</strong></div>
                     <div><span className="muted">Downtime</span><strong>{duration(result.downtime_s)}</strong></div>
                     <div><span className="muted">In this state</span><strong>{duration(m.current_state_seconds)}</strong></div>
@@ -262,21 +394,27 @@ export default function OeeOverviewPage({ canEdit = false }) {
         </section>
       ) : null}
 
+      {/* ------------------------------------------- status timeline (all) */}
+      {lanes.length ? (
+        <section className="card">
+          <h3 className="card-title">Machine status through the period</h3>
+          <StatusTimeline lanes={lanes} from={win?.from} to={win?.to} height={24} />
+        </section>
+      ) : null}
+
       {/* -------------------------------------------------------- charts */}
       <div className="oee-chart-grid">
         <section className="card">
           <h3 className="card-title">OEE trend</h3>
-          <ResponsiveContainer width="100%" height={230}>
-            <LineChart data={trendRows}>
-              <CartesianGrid strokeDasharray="3 3" opacity={0.25} />
-              <XAxis dataKey="t" tick={{ fontSize: 11 }} />
-              <YAxis domain={[0, 100]} unit="%" tick={{ fontSize: 11 }} />
-              <Tooltip />
-              <Legend />
-              <Line type="monotone" dataKey="OEE" stroke="#22c55e" dot={false}
-                    strokeWidth={2} connectNulls />
-            </LineChart>
-          </ResponsiveContainer>
+          {/* Selectable lines: Overall OEE on, the three factors available but
+              off, because four overlapping percentage lines is a picture of
+              nothing. The tooltip carries the whole bucket - runtime, count,
+              maturity, confidence - not just the number under the cursor. */}
+          <OeeTrendChart
+            rows={trendRows}
+            visible={trendVisible}
+            onToggle={(key) => setTrendVisible((p) => ({ ...p, [key]: !p[key] }))}
+          />
         </section>
 
         <section className="card">
@@ -312,22 +450,29 @@ export default function OeeOverviewPage({ canEdit = false }) {
 
         <section className="card">
           <h3 className="card-title">Downtime Pareto</h3>
-          {pareto.length ? (
-            <ResponsiveContainer width="100%" height={230}>
-              <ComposedChart data={pareto}>
-                <CartesianGrid strokeDasharray="3 3" opacity={0.25} />
-                <XAxis dataKey="name" tick={{ fontSize: 10 }} interval={0}
-                       angle={-18} textAnchor="end" height={60} />
-                <YAxis yAxisId="l" tick={{ fontSize: 11 }} unit="m" />
-                <YAxis yAxisId="r" orientation="right" domain={[0, 100]}
-                       unit="%" tick={{ fontSize: 11 }} />
-                <Tooltip />
-                <Legend />
-                <Bar yAxisId="l" dataKey="Minutes" fill="#ef4444" />
-                <Line yAxisId="r" type="monotone" dataKey="Cumulative"
-                      stroke="#f59e0b" dot={false} />
-              </ComposedChart>
-            </ResponsiveContainer>
+          {(paretoRows || []).length ? (
+            <OeeDowntimePareto
+              rows={paretoRows}
+              metric={paretoMetric}
+              onMetric={setParetoMetric}
+              groupBy={paretoGroup}
+              onGroupBy={setParetoGroup}
+              // Only the groupings the service says the data supports. An
+              // event has no product or order column, so those never appear.
+              groups={paretoData?.groups_supported || ["reason"]}
+              onBarClick={(row) => {
+                // Narrow the page to that reason's machine where the grouping
+                // makes that meaningful; otherwise leave the selection alone
+                // rather than pretend the click did something.
+                if (paretoGroup !== "machine" || !row?.label) return;
+                // onOpenMachine takes the whole card - the same object the
+                // machine grid hands it - not an id.
+                const hit = (data?.machines || []).find(
+                  (m) => String(m.name) === String(row.label)
+                      || String(m.machine_id) === String(row.label));
+                if (hit && onOpenMachine) onOpenMachine(hit);
+              }}
+            />
           ) : (
             <EmptyState title="No downtime recorded in this range">
               Stops appear here once machines report a non-running state.

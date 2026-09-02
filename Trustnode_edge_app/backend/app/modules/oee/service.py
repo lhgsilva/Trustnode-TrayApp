@@ -17,7 +17,7 @@ from .state_engine import (
     SignalReading, evaluate_power_state, evaluate_signal_state, extract_counts,
     extract_text, resolve_state, STATE_UNKNOWN,
 )
-from .store import OeeStore, epoch_of, utc_of
+from .store import OeeStore, epoch_of, utc_of, _now as _store_now
 
 _LOG = logging.getLogger("trustnode.oee")
 
@@ -405,8 +405,10 @@ class OeeService:
             avails: List[float] = []
             perfs: List[float] = []
             quals: List[float] = []
+            bucket_results: List[Dict[str, Any]] = []
             for m in machines.values():
                 r = self.machine_result(m, utc_of(bs), utc_of(be))
+                bucket_results.append(r)
                 agg["runtime_s"] += r["runtime_s"]
                 agg["downtime_s"] += r["downtime_s"]
                 agg["planned_time_s"] += r["planned_time_s"]
@@ -431,12 +433,72 @@ class OeeService:
                 "performance": (sum(perfs) / len(perfs)) if perfs else None,
                 "quality": (sum(quals) / len(quals)) if quals else None,
                 **agg,
+                **self._rollup_maturity(bucket_results),
+                # What the bucket COULD have made at the configured ideal
+                # cycle time. This is the target Performance is measured
+                # against, so the Production chart and the Performance KPI
+                # cannot disagree. None when no cycle time is configured -
+                # a dashed line at zero would read as "target: make nothing".
+                "target_count": self._target_count(bucket_results),
             })
         return out
 
+    def _previous_window(self, from_utc: str, to_utc: str) -> Tuple[str, str]:
+        """The equal-length window ending where this one begins.
+
+        `epoch_of` / `utc_of` are the module's own conversions, so the previous
+        window is expressed exactly like the current one - a comparison built
+        on a second date format is a comparison waiting to be wrong.
+        """
+        a = float(epoch_of(from_utc) or 0.0)
+        b = float(epoch_of(to_utc) or 0.0)
+        span = max(1.0, b - a)
+        return utc_of(a - span), utc_of(a)
+
+    @staticmethod
+    def _target_count(results: List[Dict[str, Any]]) -> Optional[float]:
+        """Pieces the configured ideal cycle time allows in this window."""
+        total = 0.0
+        seen = False
+        for r in results:
+            ict = r.get("ideal_cycle_time_s")
+            try:
+                ict = float(ict or 0.0)
+            except (TypeError, ValueError):
+                ict = 0.0
+            if ict <= 0:
+                continue
+            seen = True
+            total += float(r.get("planned_time_s") or 0.0) / ict
+        return round(total, 2) if seen else None
+
+    # Worst first: a roll-up must report the weakest measurement it contains,
+    # never the best one it can find.
+    _STAGE_ORDER = ("not_enough_data", "availability_only", "no_performance",
+                    "no_quality", "full")
+
+    def _rollup_maturity(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """One maturity label for a set of machine results."""
+        stages = [str(r.get("stage") or "not_enough_data") for r in results]
+        counted = sum(1 for r in results if r.get("oee") is not None)
+        missing: List[str] = []
+        for r in results:
+            for f in (r.get("missing_factors") or []):
+                if f not in missing:
+                    missing.append(f)
+        if not stages:
+            worst = "not_configured"
+        else:
+            worst = min(stages, key=lambda st: (self._STAGE_ORDER.index(st)
+                                                if st in self._STAGE_ORDER else 0))
+        return {"stage": worst,
+                "missing_factors": missing,
+                "machines_counted": counted,
+                "machines_total": len(results)}
+
     def overview(self, from_utc: str, to_utc: str,
                  machine_ids: Optional[List[str]] = None,
-                 line: str = "") -> Dict[str, Any]:
+                 line: str = "", with_previous: bool = False) -> Dict[str, Any]:
         """The whole Overview page in one call."""
         machines = self._machines()
         if machine_ids:
@@ -475,6 +537,12 @@ class OeeService:
             "power_kw_now": sum(float(c.get("power_kw") or 0.0) for c in cards),
             "machines": len(machines),
         }
+        # How complete the plant figure is. The average above already skips
+        # machines with no OEE, so the number itself is sound - but a plant
+        # where four of nine machines have no cycle time configured must not
+        # present its average with the same confidence as one where all nine
+        # report. The weakest stage present is the honest headline.
+        totals.update(self._rollup_maturity(results))
 
         # One Pareto for the whole selection.
         merged: Dict[Tuple[str, str], float] = {}
@@ -492,9 +560,267 @@ class OeeService:
             p["share"] = p["seconds"] / grand
             p["cumulative"] = run / grand
 
-        return {"ok": True, "from_utc": from_utc, "to_utc": to_utc,
-                "totals": totals, "machines": cards, "results": results,
-                "pareto": pareto[:12]}
+        out = {"ok": True, "from_utc": from_utc, "to_utc": to_utc,
+               "totals": totals, "machines": cards, "results": results,
+               "pareto": pareto[:12]}
+        if with_previous:
+            # The window immediately before this one, of equal length, through
+            # the SAME code path - so "vs previous" compares like with like
+            # rather than against a differently-computed number.
+            try:
+                prev_from, prev_to = self._previous_window(from_utc, to_utc)
+                prev = self.overview(prev_from, prev_to, machine_ids=machine_ids,
+                                     line=line, with_previous=False)
+                out["previous"] = {
+                    "from_utc": prev_from, "to_utc": prev_to,
+                    "totals": prev.get("totals") or {},
+                }
+            except Exception as exc:  # noqa: BLE001 - a comparison is a nicety
+                out["previous"] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+        return out
+
+
+    # ================================================================
+    # Dashboard aggregates (2026-08-29)
+    # ================================================================
+
+    def _meta(self, from_utc: str, to_utc: str, shift_id: str = "",
+              extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """The metadata every dashboard response carries.
+
+        A dashboard that shows a number without saying what window, which
+        shift, and how sure it is invites the reader to trust it more than the
+        data deserves.
+        """
+        out = {
+            "window": {"from_utc": from_utc, "to_utc": to_utc},
+            "shift_id": shift_id or "",
+            "timezone": "UTC",
+            "generated_utc": _store_now(),
+        }
+        if extra:
+            out.update(extra)
+        return out
+
+    def status_timeline(self, machine_ids: Optional[List[str]], from_utc: str,
+                        to_utc: str, max_blocks: int = 2000) -> Dict[str, Any]:
+        """State blocks per machine, for the timeline strip.
+
+        Merges consecutive identical states so a machine that sat Running for
+        six hours is one block, not 21 600. `max_blocks` is a hard cap and the
+        response SAYS when it truncated - a silently shortened timeline reads
+        as "nothing happened after lunch".
+        """
+        machines = self._machines()
+        if machine_ids:
+            wanted = set(machine_ids)
+            machines = [m for m in machines if str(m["id"]) in wanted]
+
+        lanes: List[Dict[str, Any]] = []
+        truncated = False
+        for m in machines:
+            events = self.store.list_events(machine_id=str(m["id"]),
+                                            from_utc=from_utc, to_utc=to_utc)
+            blocks: List[Dict[str, Any]] = []
+            for ev in events:
+                state = str(ev.get("state") or "unknown")
+                start = str(ev.get("start_utc") or "")
+                end = str(ev.get("end_utc") or "")
+                if not start:
+                    continue
+                if blocks and blocks[-1]["state"] == state and not blocks[-1]["end_utc"]:
+                    continue
+                if blocks and blocks[-1]["state"] == state:
+                    blocks[-1]["end_utc"] = end or blocks[-1]["end_utc"]
+                    continue
+                if len(blocks) >= max_blocks:
+                    truncated = True
+                    break
+                blocks.append({
+                    "state": state,
+                    "start_utc": start,
+                    "end_utc": end,
+                    "reason": str(ev.get("downtime_reason") or ev.get("reason") or ""),
+                    "category": str(ev.get("reason_category") or ev.get("category") or ""),
+                    "planned": bool(ev.get("planned")),
+                    "source": str(ev.get("source") or ""),
+                    "confidence": ev.get("confidence"),
+                    "comment": str(ev.get("comment") or ""),
+                })
+            lanes.append({"machine_id": str(m["id"]),
+                          "machine_name": str(m.get("name") or m["id"]),
+                          "line": str(m.get("line") or ""),
+                          "blocks": blocks})
+        return {"ok": True, "lanes": lanes, "truncated": truncated,
+                "max_blocks": max_blocks,
+                "meta": self._meta(from_utc, to_utc,
+                                   extra={"truncated": truncated})}
+
+    #: What the Pareto can honestly be grouped by. Product, order and shift are
+    #: absent on purpose: oee_machine_events has no product or order column, and
+    #: a grouping built on a join that does not exist would look authoritative
+    #: and be wrong.
+    PARETO_GROUPS = ("reason", "category", "machine", "line")
+
+    def downtime_pareto(self, machine_ids: Optional[List[str]], from_utc: str,
+                        to_utc: str, limit: int = 12,
+                        group_by: str = "reason",
+                        metric: str = "duration") -> Dict[str, Any]:
+        """Downtime ranked by duration or by number of stops.
+
+        `group_by` is one of PARETO_GROUPS. `metric` is "duration" or "stops" -
+        the ordering changes, both figures are always returned, so the UI can
+        toggle without another round trip.
+        """
+        group = str(group_by or "reason").strip().lower()
+        if group not in self.PARETO_GROUPS:
+            group = "reason"
+        rank_by_stops = str(metric or "duration").strip().lower() == "stops"
+
+        machines = self._machines()
+        if machine_ids:
+            wanted = set(machine_ids)
+            machines = [m for m in machines if str(m["id"]) in wanted]
+
+        merged: Dict[str, Dict[str, Any]] = {}
+        for m in machines:
+            res = self.machine_result(m, from_utc, to_utc)
+            for row in res.get("pareto") or []:
+                if group == "category":
+                    label = str(row.get("category") or "Unknown")
+                elif group == "machine":
+                    label = str(m.get("name") or m.get("id") or "Unknown")
+                elif group == "line":
+                    label = str(m.get("line") or "") or "No line"
+                else:
+                    label = str(row.get("reason") or "Unknown")
+                slot = merged.setdefault(label, {
+                    "label": label, "category": str(row.get("category") or "Unknown"),
+                    "reason": str(row.get("reason") or "Unknown"),
+                    "seconds": 0.0, "stops": 0,
+                })
+                slot["seconds"] += float(row.get("seconds") or 0.0)
+                slot["stops"] += int(row.get("stops") or 0)
+
+        rows = list(merged.values())
+        rows.sort(key=lambda x: (x["stops"] if rank_by_stops else x["seconds"]), reverse=True)
+        grand = sum(r["seconds"] for r in rows) or 1.0
+        grand_stops = sum(r["stops"] for r in rows) or 1
+        run = 0.0
+        run_stops = 0
+        for r in rows:
+            run += r["seconds"]
+            run_stops += r["stops"]
+            r["share"] = r["seconds"] / grand
+            r["cumulative"] = run / grand
+            r["stops_share"] = r["stops"] / grand_stops
+            r["stops_cumulative"] = run_stops / grand_stops
+        return {"ok": True, "rows": rows[:limit], "total_seconds": grand,
+                "total_stops": sum(r["stops"] for r in rows),
+                "reason_count": len(rows),
+                "group_by": group, "metric": "stops" if rank_by_stops else "duration",
+                "groups_supported": list(self.PARETO_GROUPS),
+                "meta": self._meta(from_utc, to_utc)}
+
+    def energy_summary(self, machine_ids: Optional[List[str]], from_utc: str,
+                       to_utc: str) -> Dict[str, Any]:
+        """Energy used and estimated waste, per machine."""
+        machines = self._machines()
+        if machine_ids:
+            wanted = set(machine_ids)
+            machines = [m for m in machines if str(m["id"]) in wanted]
+        rows, total, wasted = [], 0.0, 0.0
+        for m in machines:
+            res = self.machine_result(m, from_utc, to_utc)
+            e = res.get("energy") or {}
+            kwh = float(e.get("total_kwh") or 0.0)
+            waste = float(e.get("wasted_kwh") or 0.0)
+            total += kwh
+            wasted += waste
+            rows.append({"machine_id": str(m["id"]),
+                         "machine_name": str(m.get("name") or m["id"]),
+                         "line": str(m.get("line") or ""),
+                         "total_kwh": kwh, "wasted_kwh": waste,
+                         "waste_share": (waste / kwh) if kwh else None})
+        rows.sort(key=lambda r: r["wasted_kwh"], reverse=True)
+        return {"ok": True, "rows": rows, "total_kwh": total,
+                "wasted_kwh": wasted,
+                "waste_share": (wasted / total) if total else None,
+                "meta": self._meta(from_utc, to_utc)}
+
+    def shift_performance(self, machine_ids: Optional[List[str]],
+                          from_utc: str, to_utc: str) -> Dict[str, Any]:
+        """OEE per configured shift across the window.
+
+        `machine_result` has no shift argument - it takes a window - so each
+        shift is resolved to its own intervals and the machine is evaluated
+        over those. Reusing the same HH:MM / working-days / break arithmetic as
+        `planned_windows` rather than writing a second copy of it, because two
+        implementations of a shift boundary will disagree at midnight.
+        """
+        shifts = [s for s in self.store.list_entities("shifts") if s.get("enabled")]
+        machines = self._machines()
+        if machine_ids:
+            wanted = set(machine_ids)
+            machines = [m for m in machines if str(m["id"]) in wanted]
+        a, b = epoch_of(from_utc), epoch_of(to_utc)
+
+        rows = []
+        for sh in shifts:
+            spans: List[Tuple[float, float]] = []
+            day = _dt.datetime.fromtimestamp(a, _dt.timezone.utc).date()
+            last = _dt.datetime.fromtimestamp(b, _dt.timezone.utc).date()
+            while day <= last + _dt.timedelta(days=1):
+                days = {int(x) for x in str(sh.get("working_days") or "").split(",")
+                        if str(x).strip().isdigit()}
+                if not days or day.isoweekday() in days:
+                    start = _parse_hhmm(day, str(sh.get("start_time") or "00:00"))
+                    end = _parse_hhmm(day, str(sh.get("end_time") or "23:59"))
+                    if end <= start:
+                        end += _dt.timedelta(days=1)
+                    ws, we = start.timestamp(), end.timestamp()
+                    if we > a and ws < b:
+                        spans.append((max(ws, a), min(we, b)))
+                day += _dt.timedelta(days=1)
+
+            vals, run_s, down_s = [], 0.0, 0.0
+            for ws, we in spans:
+                w_from, w_to = utc_of(ws), utc_of(we)
+                for m in machines:
+                    res = self.machine_result(m, w_from, w_to)
+                    if res.get("oee") is not None:
+                        vals.append(res["oee"])
+                    run_s += float(res.get("runtime_s") or 0.0)
+                    down_s += float(res.get("downtime_s") or 0.0)
+            rows.append({"shift_id": str(sh.get("id") or ""),
+                         "shift_name": str(sh.get("name") or sh.get("id") or ""),
+                         "oee": (sum(vals) / len(vals)) if vals else None,
+                         "runtime_s": run_s, "downtime_s": down_s,
+                         "spans": len(spans),
+                         "machines_with_oee": len(vals)})
+        return {"ok": True, "rows": rows, "meta": self._meta(from_utc, to_utc)}
+
+    def planned_events(self, from_utc: str, to_utc: str,
+                       machine_ids: Optional[List[str]] = None,
+                       line: str = "") -> Dict[str, Any]:
+        """Planning-calendar events overlapping the window."""
+        rows = self.store.list_entities("planned_events", include_disabled=False)
+        wanted = set(machine_ids or [])
+        out = []
+        for r in rows:
+            start, end = str(r.get("start_utc") or ""), str(r.get("end_utc") or "")
+            if not start or not end:
+                continue
+            if to_utc and start > to_utc:
+                continue
+            if from_utc and end < from_utc:
+                continue
+            if wanted and str(r.get("machine_id") or "") not in wanted:
+                continue
+            if line and str(r.get("line") or "") != line:
+                continue
+            out.append(r)
+        return {"ok": True, "events": out, "meta": self._meta(from_utc, to_utc)}
 
 
 def _num(value: Any) -> Optional[float]:

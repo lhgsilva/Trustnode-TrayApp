@@ -96,7 +96,14 @@ def create_access_token(user: Dict[str, Any], expires_seconds: int = 12 * 3600) 
     return f"{part1}.{part2}.{_b64url_encode(sig)}"
 
 
-def decode_access_token(token: str) -> Dict[str, Any]:
+def decode_access_token(token: str, verify_exp: bool = True) -> Dict[str, Any]:
+    """Decode and verify a session token.
+
+    `verify_exp=False` skips ONLY the expiry check - the signature is still
+    verified, so a forged token is rejected exactly as before. It exists for
+    /api/auth/refresh, which has to read an expired token to decide whether
+    the session may be renewed. Nothing else may pass False.
+    """
     parts = str(token or "").split(".")
     if len(parts) != 3:
         raise ValueError("Invalid token format")
@@ -107,6 +114,6 @@ def decode_access_token(token: str) -> Dict[str, Any]:
     if not hmac.compare_digest(expected, got):
         raise ValueError("Invalid token signature")
     payload = json.loads(_b64url_decode(part2).decode("utf-8"))
-    if int(payload.get("exp", 0)) < int(time.time()):
+    if verify_exp and int(payload.get("exp", 0)) < int(time.time()):
         raise ValueError("Token expired")
     return payload

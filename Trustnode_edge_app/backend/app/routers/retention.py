@@ -75,6 +75,103 @@ class BackupNameIn(BaseModel):
 
 
 # ---------------------------------------------------------------- status
+@router.get("/retention/v2/storage")
+def retention_storage() -> dict:
+    """Size of the local store and the cloud database, with the big tables.
+
+    The question behind this is always the same - "why is it so big, and what
+    would cleaning up actually give me back" - so it reports dead space and
+    the largest tables rather than one total that cannot be acted on.
+    """
+    import os
+
+    from app.state import app_store as _store
+
+    out: dict = {"ok": True, "local": {}, "cloud": {}, "retention": {}}
+
+    # --- local -----------------------------------------------------------
+    try:
+        path = _store._db_path
+        file_bytes = 0
+        for suffix in ("", "-wal", "-shm"):
+            p = path + suffix
+            if os.path.exists(p):
+                file_bytes += os.path.getsize(p)
+        with _store._connect() as conn:
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+            hist_rows = int(conn.execute(
+                "SELECT COUNT(*) FROM historian_readings").fetchone()[0])
+            span = conn.execute(
+                "SELECT MIN(ts_utc), MAX(ts_utc) FROM historian_readings").fetchone()
+        dead = freelist * page_size
+        out["local"] = {
+            "path": path,
+            "file_bytes": file_bytes,
+            "wal_bytes": os.path.getsize(path + "-wal") if os.path.exists(path + "-wal") else 0,
+            "dead_bytes": dead,
+            "dead_pct": round((freelist / float(page_count)) * 100.0, 1) if page_count else 0.0,
+            "historian_rows": hist_rows,
+            "oldest": (span[0] if span else "") or "",
+            "newest": (span[1] if span else "") or "",
+            # What a compact would hand back right now.
+            "reclaimable_bytes": dead,
+        }
+    except Exception as exc:  # noqa: BLE001
+        out["local"] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+
+    # --- cloud -------------------------------------------------------------
+    try:
+        cloud = _store._get_cloud_database_target()
+        if not cloud:
+            out["cloud"] = {"configured": False}
+        else:
+            from sqlalchemy import text  # type: ignore
+            schema = str(cloud.get("schema") or "public")
+            engine, _ = _store._get_or_create_cloud_engine(cloud, schema)
+            with engine.connect() as c:
+                db_bytes = int(c.execute(text(
+                    "SELECT pg_database_size(current_database())")).scalar() or 0)
+                rows = c.execute(text(
+                    "SELECT relname, pg_total_relation_size(c.oid) AS bytes "
+                    "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = :s AND c.relkind = 'r' "
+                    "ORDER BY 2 DESC LIMIT 10"), {"s": schema}).fetchall()
+                hist = int(c.execute(text(
+                    'SELECT COUNT(*) FROM "%s"."historian_readings"' % schema)).scalar() or 0)
+            out["cloud"] = {
+                "configured": True,
+                "name": str(cloud.get("name") or ""),
+                "schema": schema,
+                "database_bytes": db_bytes,
+                "historian_rows": hist,
+                # The historian is usually the culprit, but not always: after it
+                # was emptied on 2026-08-31 the database was still 20 GB.
+                "tables": [{"name": str(r[0]), "bytes": int(r[1] or 0)} for r in rows],
+            }
+    except Exception as exc:  # noqa: BLE001
+        out["cloud"] = {"configured": True, "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    # --- is anything cleaning up on its own? -------------------------------
+    try:
+        pol = _engine().store.get_active_policy() or {}
+        maint = pol.get("maintenance") or {}
+        cloud_cfg = pol.get("cloud") or {}
+        out["retention"] = {
+            "active": bool(pol),
+            "name": str(pol.get("name") or ""),
+            "raw_keep": str((pol.get("raw") or {}).get("keep") or ""),
+            "auto_compact": bool(maint.get("auto_compact", True)),
+            "auto_compact_free_pct": int(maint.get("auto_compact_free_pct") or 25),
+            "cloud_enabled": bool(cloud_cfg.get("enabled")),
+            "cloud_keep": str(cloud_cfg.get("keep") or ""),
+        }
+    except Exception as exc:  # noqa: BLE001
+        out["retention"] = {"error": "%s: %s" % (type(exc).__name__, exc)}
+    return out
+
+
 @router.get("/retention/v2/status")
 def retention_status(request: Request) -> Dict[str, Any]:
     """Storage picture for the Backup & Retention page. Readable by any signed-in

@@ -1,4 +1,21 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+
+/* Stacking for dialogs opened FROM other dialogs.
+ *
+ * 2026-09-02, reported: "when opening new small popups after opening the first
+ * one to configure, it goes behind the main window and cannot be seen". The
+ * three dialogs here carried inline z-indexes of 60, 70 and 75 while the
+ * shared .modal-backdrop rule is 200 - so any popup raised from an ordinary
+ * dialog rendered UNDERNEATH it, and underneath the app header (60) too. The
+ * click still landed on the invisible dialog, which is why changes appeared to
+ * have no effect.
+ *
+ * The relative order they intended (60 < 70 < 75) is preserved; the whole
+ * ladder simply moves above the base. A dialog opened from `deep` needs a new
+ * rung here, NOT another bare number.
+ */
+const MODAL_Z = { base: 205, nested: 210, deep: 215 };
 import { DashboardWidgetCard } from "./DashboardWidgets";
 import {
   DASHBOARD_GRID_COLS,
@@ -117,7 +134,7 @@ function AxisConfigModal({ config, onChange, onClose, widgetValueFormat, widgetT
     </label>
   );
   return (
-    <div className="modal-backdrop" style={{ zIndex: 70 }} onClick={onClose}>
+    <div className="modal-backdrop" style={{ zIndex: MODAL_Z.nested }} onClick={onClose}>
       <div className="modal-card dashboard-query-modal dashboard-query-modal-wide"
         style={{ width: "min(1000px, 96vw)", maxHeight: "92vh", overflowY: "auto" }}
         onClick={(e) => e.stopPropagation()}>
@@ -218,7 +235,27 @@ function AxisConfigModal({ config, onChange, onClose, widgetValueFormat, widgetT
   );
 }
 
-const TYPE_GROUPS = ["Charts", "KPI", "Content", "Layout", "Media", "Reports", "System", "Batch"];
+// Preferred ORDER only - never the source of truth for which groups exist.
+// A group present in the registry but missing here still renders (appended,
+// alphabetically). The previous hard-coded list silently hid all seventeen
+// OEE widgets because the group was added to the registry and not to this
+// array; nothing failed, they were simply unreachable.
+const TYPE_GROUP_ORDER = [
+  "Charts", "KPI", "Content", "Layout", "Media",
+  "I/O", "Power", "Reports", "System", "Diagnostics", "Batch", "OEE",
+];
+// Groups that are optional modules or specialist areas: collapsed on open so
+// the everyday widgets are not buried under them.
+const TYPE_GROUPS_COLLAPSED_BY_DEFAULT = new Set([
+  "Reports", "System", "Diagnostics", "Batch", "OEE", "I/O", "Power",
+]);
+
+function orderedTypeGroups(types) {
+  const present = [...new Set((types || []).map((t) => String(t.group || "Other")))];
+  const known = TYPE_GROUP_ORDER.filter((g) => present.includes(g));
+  const rest = present.filter((g) => !TYPE_GROUP_ORDER.includes(g)).sort();
+  return [...known, ...rest];
+}
 const DASHBOARD_TIME_MODE_KEY = "trustnode_dashboard_time_mode";
 const DASHBOARD_TIME_RANGE_KEY = "trustnode_dashboard_time_range";
 const DASHBOARD_PROFILES_KEY = "trustnode_dashboard_profiles";
@@ -285,7 +322,9 @@ const QUERY_TIME_PRESET_OPTIONS = [
   { value: "15m", label: "Last 15 minutes" },
   { value: "1h", label: "Last 1 hour" },
   { value: "6h", label: "Last 6 hours" },
+  { value: "8h", label: "Last 8 hours" },
   { value: "24h", label: "Last 24 hours" },
+  { value: "today", label: "Current day (since midnight)" },
   { value: "7d", label: "Last 7 days" },
   { value: "30d", label: "Last 30 days" },
   { value: "custom", label: "Custom range" },
@@ -901,6 +940,9 @@ export function DashboardDesigner({
 }) {
   const [modalOpen, setModalOpen] = useState(false);
   const [tab, setTab] = useState("type");
+  // Which picker categories the operator has toggled. Absent = use the
+  // default for that group, so this only records deliberate choices.
+  const [typeGroupOpen, setTypeGroupOpen] = useState({});
   const [editingId, setEditingId] = useState(null);
   const [form, setForm] = useState(buildDefaultForm("line_chart"));
   const [draggingId, setDraggingId] = useState("");
@@ -1304,6 +1346,19 @@ export function DashboardDesigner({
             tag_name: tag,
             last_value: row?.value,
             last_ts: row?.ts || "",
+            // 2026-08-29: `quality` used to stop here. A widget that wants to
+            // tell "the input is low" from "the block never answered" had
+            // nothing to read, so an unplugged block looked like a block full
+            // of zeros. Value and ts are also carried under their own names
+            // so a consumer does not have to know this projection's aliases.
+            quality: row?.quality,
+            quality_label: row?.quality_label,
+            // Which driver produced the row - ethernet_ip, ifm_iolink,
+            // allen_bradley. The I/O block face uses it to light the
+            // interface the data actually came over.
+            source: row?.source,
+            value: row?.value,
+            ts: row?.ts || "",
           },
         });
       }
@@ -2051,6 +2106,14 @@ export function DashboardDesigner({
                 bar_pattern: ["solid", "stripes-diag", "stripes-vert", "dots"].includes(String(s.bar_pattern || ""))
                   ? String(s.bar_pattern)
                   : "solid",
+                // Per-series line shape. "" = inherit the widget setting.
+                // This allowlist is the reason the per-lane Y bounds above
+                // once vanished on save; a new field that is not listed here
+                // renders until reopen and is then silently gone.
+                interpolation: ["linear", "monotone", "natural", "step", "stepBefore", "stepAfter"]
+                  .includes(String(s.interpolation || ""))
+                  ? String(s.interpolation)
+                  : "",
                 limit_dash: ["dashed", "solid", "dotted"].includes(String(s.limit_dash || ""))
                   ? String(s.limit_dash)
                   : "dashed",
@@ -2672,6 +2735,7 @@ export function DashboardDesigner({
               historicalFromLocal={dashboardFrom}
               historicalToLocal={dashboardTo}
               onHistoricalPan={panHistoricalWindow}
+              onOpenTagMonitor={onOpenTagMonitor}
             />
             {canEdit ? (
               <button
@@ -2739,7 +2803,7 @@ export function DashboardDesigner({
 
             {tab === "type" ? (
               <div className="dashboard-type-groups">
-                {TYPE_GROUPS.map((group) => {
+                {orderedTypeGroups(WIDGET_TYPES).map((group) => {
                   // Operator 2026-06-23: hide license-locked widgets in
                   // the picker. The same registry still ships every
                   // widget so existing dashboards render correctly; we
@@ -2751,10 +2815,26 @@ export function DashboardDesigner({
                     return Boolean(isLicenseModuleEnabled(t.licenseModule));
                   });
                   if (!groupWidgets.length) return null;
+                  // Collapsed unless the operator opened it, this group holds
+                  // the widget being edited, or it is an everyday group.
+                  const holdsCurrent = groupWidgets.some((t) => t.key === form.type);
+                  const explicit = typeGroupOpen[group];
+                  const open = explicit === undefined
+                    ? (holdsCurrent || !TYPE_GROUPS_COLLAPSED_BY_DEFAULT.has(group))
+                    : Boolean(explicit);
                   return (
-                  <div key={group} className="dashboard-type-group">
-                    <div className="dashboard-type-group-title">{group}</div>
-                    <div className="dashboard-type-grid">
+                  <div key={group} className={`dashboard-type-group ${open ? "open" : "closed"}`}>
+                    <button
+                      type="button"
+                      className="dashboard-type-group-title"
+                      aria-expanded={open}
+                      onClick={() => setTypeGroupOpen((prev) => ({ ...prev, [group]: !open }))}
+                    >
+                      <span className="dashboard-type-caret" aria-hidden="true">{open ? "▾" : "▸"}</span>
+                      <span>{group}</span>
+                      <span className="dashboard-type-count">{groupWidgets.length}</span>
+                    </button>
+                    <div className="dashboard-type-grid" hidden={!open}>
                       {groupWidgets.map((t) => (
                         <button
                           key={t.key}
@@ -2791,6 +2871,8 @@ export function DashboardDesigner({
               </div>
             ) : (
               <div className="form-grid dashboard-form-grid">
+                <section className="wcfg-card">
+                  <h4 className="wcfg-card-title">Style</h4>
                 <label>
                   Title
                   <input value={form.title} onChange={(e) => setForm((p) => ({ ...p, title: e.target.value }))} />
@@ -2891,21 +2973,6 @@ export function DashboardDesigner({
                     />
                   </label>
                 ) : null}
-                {["line_chart", "line_area_chart", "stacked_trend"].includes(form.type) ? (
-                  <label>
-                    Interpolation
-                    <select
-                      value={form.config.interpolation || "stepAfter"}
-                      onChange={(e) => setForm((p) => ({ ...p, config: { ...p.config, interpolation: e.target.value } }))}
-                    >
-                      {CHART_INTERPOLATION_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                ) : null}
                 {/* Operator 2026-06-20: gap visibility toggle. When ON
                     (default), every period where the gateway wasn't
                     collecting renders as a visible break in the line —
@@ -2914,9 +2981,12 @@ export function DashboardDesigner({
                     showing only the actual collected samples connected
                     chronologically. Useful for batch processes where the
                     operator only cares about "when collection was on". */}
+                {/* A div, not a label: the sheet's `label { display: grid }`
+                    fights any flex row inside one - the same reason the
+                    slide-toggle above uses a div. */}
                 {["line_chart", "line_area_chart", "stacked_trend"].includes(form.type) ? (
-                  <label className="row" style={{ alignItems: "center", gap: 12, justifyContent: "space-between" }}>
-                    <span>Show Disconnected Periods</span>
+                  <div className="wcfg-row">
+                    <span className="wcfg-row-name">Show gaps</span>
                     <span
                       role="switch"
                       aria-checked={form.config.show_gaps !== false}
@@ -2955,23 +3025,21 @@ export function DashboardDesigner({
                           }}
                         />
                       </span>
-                      <span style={{ fontSize: 12 }}>
-                        {form.config.show_gaps !== false ? "Show gaps" : "Hide gaps"}
-                      </span>
                     </span>
-                  </label>
+                  </div>
                 ) : null}
                 {/* Width / Height inputs removed: the widget is resized
                     by dragging the corner handle directly on the grid,
                     so a redundant numeric input cluttered the dialog
                     without providing extra capability. The grid state
                     (form.w / form.h) is still persisted on save. */}
+                </section>
+
+                <section className="wcfg-card">
+                  <h4 className="wcfg-card-title">Chart</h4>
                 {["line_chart", "line_area_chart", "bar_chart", "stacked_trend", "pie_chart", "meter_chart"].includes(form.type) ? (
                   <fieldset className="dashboard-query-fieldset">
                     <legend>Text sizes</legend>
-                    <p className="dashboard-query-hint" style={{ marginTop: 0 }}>
-                      Scale each text family (1 = default, free range 0.3–4). Type any value or use the arrows.
-                    </p>
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(90px, 1fr))", gap: 8 }}>
                       {[
                         ["font_axis_scale", "Axis"],
@@ -3055,7 +3123,23 @@ export function DashboardDesigner({
                     ) : null}
                   </>
                 ) : null}
-                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend", "meter_chart", "text_kpi", "value_kpi", "pie_chart", "table_list", "energy_tariffs"].includes(form.type) ? (
+                {form.type === "io_block_status" ? (
+                  <label>
+                    Block colour
+                    <select
+                      value={String(form?.config?.io_block_color || "orange")}
+                      onChange={(e) => setForm((p) => ({
+                        ...p, config: { ...p.config, io_block_color: e.target.value },
+                      }))}
+                    >
+                      <option value="orange">ifm orange</option>
+                      <option value="grey">Light grey</option>
+                      <option value="black">Black</option>
+                      <option value="auto">Auto (follow app theme)</option>
+                    </select>
+                  </label>
+                ) : null}
+                {["meter_chart", "text_kpi", "value_kpi", "pie_chart", "table_list", "energy_tariffs", "io_block_status"].includes(form.type) ? (
                   <>
                     <label>
                       Gateway
@@ -3080,12 +3164,6 @@ export function DashboardDesigner({
                         ))}
                       </select>
                     </label>
-                    {CHART_SERIES_TYPES.includes(form.type) ? (
-                      <p className="dashboard-query-hint" style={{ margin: "4px 0" }}>
-                        Data series for this chart are configured in <b>Series &amp; Axes</b> (the Series editor) —
-                        one place for every tag, including the first one. The gateway above is the widget's default.
-                      </p>
-                    ) : null}
                     {[
                       "meter_chart",
                       "text_kpi",
@@ -3153,6 +3231,31 @@ export function DashboardDesigner({
                   </>
                 ) : null}
 
+                {/* How much data the chart shows. "Reading points" caps the
+                    number of samples; "Time range" bounds the window they are
+                    drawn from. They compose: 500 points over the last 8 hours
+                    is a different chart from 500 points over the last hour.
+                    The range selector also lives in the Data Query modal; it is
+                    repeated here because this is where operators look for it. */}
+                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (
+                  <label>
+                    Time range
+                    <select
+                      value={form.config.query_time_filter_preset || "none"}
+                      onChange={(e) =>
+                        setForm((p) => ({
+                          ...p,
+                          config: { ...p.config, query_time_filter_preset: e.target.value },
+                        }))
+                      }
+                    >
+                      {QUERY_TIME_PRESET_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
+
                 {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (
                   <label>
                     Reading points
@@ -3208,7 +3311,7 @@ export function DashboardDesigner({
                       Row 2: Left axis  | min | max | tick step
                       Row 3: Right axis | min | max | tick step (only
                               when a right axis series exists). */}
-                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (() => {
+                {false ? (() => {
                   const manualOn = String(form.config?.y_axis_mode || "auto").toLowerCase() === "manual";
                   const hasRightAxis = Array.isArray(form.config?.series_extra)
                     && form.config.series_extra.some((s) => String(s?.axis || "left").toLowerCase() === "right");
@@ -3290,7 +3393,7 @@ export function DashboardDesigner({
                   );
                 })() : null}
 
-                {["line_chart", "line_area_chart", "bar_chart", "stacked_trend", "pie_chart", "meter_chart"].includes(form.type) ? (
+                {["pie_chart", "meter_chart"].includes(form.type) ? (
                   <label>
                     Chart colors
                     <select
@@ -3342,11 +3445,10 @@ export function DashboardDesigner({
                     </button>
                   </div>
                 ) : null}
-                {/* Trend widgets (line/area/bar) don't use the full Data Query
-                    Builder, but they DO need access to the multi-series and
-                    dual-axis editor that lives inside it. Surface a direct
-                    button here so the option isn't hidden behind a modal
-                    that's named for a different workflow. */}
+                </section>
+
+                <section className="wcfg-card">
+                  <h4 className="wcfg-card-title">Series</h4>
                 {["line_chart", "line_area_chart", "bar_chart", "stacked_trend"].includes(form.type) ? (
                   <div className="dashboard-full-row">
                     <button
@@ -3355,7 +3457,7 @@ export function DashboardDesigner({
                       onClick={() => setQueryModalOpen(true)}
                       title="Plot multiple tags on the same chart with their own units and axes"
                     >
-                      Series & Axes (multi-tag, dual axis, units)
+                      Series & Axis
                     </button>
                     {/* Axis settings are reachable WITHOUT opening the series
                         modal — the common single-series case. */}
@@ -3366,7 +3468,7 @@ export function DashboardDesigner({
                       onClick={() => setAxisModalOpen(true)}
                       title="Label, prefix, unit, suffix, decimals, data format and scale for each Y axis in use"
                     >
-                      Axis configuration (units, scale, decimals)
+                      Axis configuration
                     </button>
                     {Array.isArray(form.config?.series_extra) && form.config.series_extra.length ? (
                       <div className="muted" style={{ marginTop: 4, fontSize: 12 }}>
@@ -3694,6 +3796,7 @@ export function DashboardDesigner({
                     </label>
                   </>
                 ) : null}
+                </section>
               </div>
             )}
 
@@ -3911,7 +4014,7 @@ export function DashboardDesigner({
       ) : null}
 
       {profilePromptOpen ? (
-        <div className="modal-backdrop" style={{ zIndex: 60 }}>
+        <div className="modal-backdrop" style={{ zIndex: MODAL_Z.base }}>
           <div className="modal-card" style={{ width: "min(420px, 92vw)" }}>
             <h3 style={{ marginTop: 0 }}>Profile name</h3>
             <p className="dashboard-config-hint">
@@ -3967,7 +4070,7 @@ export function DashboardDesigner({
         });
         const rowLabel = String(row.label || row.tag_name || `Series ${seriesValueCfgIdx + 1}`);
         return (
-          <div className="modal-backdrop" style={{ zIndex: 75 }} onClick={() => setSeriesValueCfgIdx(null)}>
+          <div className="modal-backdrop" style={{ zIndex: MODAL_Z.deep }} onClick={() => setSeriesValueCfgIdx(null)}>
             <div className="modal-card dashboard-query-modal" style={{ width: "min(560px, 94vw)" }}
               onClick={(e) => e.stopPropagation()}>
               <div className="row" style={{ justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
@@ -3979,6 +4082,18 @@ export function DashboardDesigner({
                 lane readouts). Blank fields inherit the widget-wide settings.
               </p>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <label className="dashboard-query-field">
+                  <span>Interpolation</span>
+                  <select
+                    value={String(row.interpolation || "")}
+                    onChange={(e) => patchRow({ interpolation: e.target.value })}
+                  >
+                    <option value="">Inherit from widget</option>
+                    {CHART_INTERPOLATION_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>{opt.label}</option>
+                    ))}
+                  </select>
+                </label>
                 <label className="dashboard-query-field">
                   <span>Unit</span>
                   <input value={row.unit || ""} placeholder="e.g. °C, %, bar"
@@ -4346,6 +4461,24 @@ export function DashboardDesigner({
                       it without scrolling up through the modal. */}
                   {["line_chart", "line_area_chart", "stacked_trend"].includes(form.type) ? (
                     <div className="dashboard-query-grid" style={{ marginTop: 6 }}>
+                      <label className="dashboard-query-field">
+                        <span>Interpolation</span>
+                        <select
+                          value={form.config.interpolation || "stepAfter"}
+                          onChange={(e) =>
+                            setForm((p) => ({
+                              ...p,
+                              config: { ...p.config, interpolation: e.target.value },
+                            }))
+                          }
+                          title="How the line is drawn between samples. Step after is
+                                 honest about held values; monotone smooths."
+                        >
+                          {CHART_INTERPOLATION_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                          ))}
+                        </select>
+                      </label>
                       <label className="dashboard-query-field">
                         <span>Line thickness (1–8 px)</span>
                         <input

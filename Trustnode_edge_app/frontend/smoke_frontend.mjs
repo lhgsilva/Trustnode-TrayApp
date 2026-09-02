@@ -129,7 +129,15 @@ check("nothing else threw during first render", fatal.length === 0, fatal.slice(
 
 const root = window.document.getElementById("root") || window.document.body;
 const html = root.innerHTML || "";
-check("something was actually rendered into #root", html.length > 200, `${html.length} chars`);
+// 2026-08-31: this threshold was 200, and a patch that accidentally moved
+// `export default` onto a 12-line helper component still passed - the app
+// rendered ONE BUTTON (284 chars) and the gate called it a success. The real
+// shell is ~2 000 characters, so anything under 1 200 means the app did not
+// render, whatever else evaluated cleanly.
+check("something was actually rendered into #root", html.length > 1200,
+  `${html.length} chars` + (html.length <= 1200
+    ? ` — expected the app shell (~2 000). Rendered: ${html.slice(0, 160)}`
+    : ""));
 
 // The app's own error boundary renders this when a render throws. If it is on
 // screen the app "loaded" but the operator sees a dead page - the exact

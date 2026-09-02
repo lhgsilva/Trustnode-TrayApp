@@ -341,3 +341,91 @@ def parse_supplier_table(text: str, max_rows: int = 400) -> Dict[str, Any]:
                     f"Addresses are datasheet numbering and are converted to "
                     f"wire offsets automatically."),
     }
+
+
+# ---------------------------------------------------------------------------
+# What the Power module actually needs, whatever the meter calls it
+# ---------------------------------------------------------------------------
+# 2026-09-02. Six profiles spell the same six measurements five different ways:
+#
+#     energy    energy_wh | energy_total_wh | energy_import_wh
+#     voltage   voltage_v | voltage_l1_v    | voltage_avg_v
+#     current   current_a | current_l1_a    | current_avg_a | current_sum_a
+#     power     active_power_w | active_power_total_w | active_power_l1_w...
+#     p.f.      power_factor   | power_factor_total   | power_factor_l1...
+#
+# Power Overview therefore worked on one meter and showed gaps on another,
+# which is not a meter difference - it is a naming difference. This table is
+# the single place that reconciles them, so a new model needs one entry here
+# and the Overview keeps working.
+#
+# Each entry is (exact names in priority order, per-phase names, how to combine
+# the phases). Current and voltage are AVERAGED across phases because summing
+# them has no physical meaning; power is summed.
+CANONICAL_MEASUREMENTS: Dict[str, Any] = {
+    # NB: the per-phase names are deliberately NOT in the exact list. A
+    # three-phase meter must report the AVERAGE of the phases it has, not
+    # whatever L1 happens to be - listing voltage_l1_v as an exact match made
+    # a 3-phase meter answer with one phase and call it the voltage.
+    "voltage_v": (
+        ("voltage_v", "voltage_avg_v"),
+        ("voltage_l1_v", "voltage_l2_v", "voltage_l3_v"), "avg"),
+    "current_a": (
+        ("current_a", "current_avg_a"),
+        ("current_l1_a", "current_l2_a", "current_l3_a"), "avg"),
+    "active_power_w": (
+        ("active_power_total_w", "active_power_w"),
+        ("active_power_l1_w", "active_power_l2_w", "active_power_l3_w"), "sum"),
+    "apparent_power_va": (
+        ("apparent_power_total_va", "apparent_power_va"),
+        ("apparent_power_l1_va", "apparent_power_l2_va",
+         "apparent_power_l3_va"), "sum"),
+    "reactive_power_var": (
+        ("reactive_power_total_var", "reactive_power_var"),
+        ("reactive_power_l1_var", "reactive_power_l2_var",
+         "reactive_power_l3_var"), "sum"),
+    "power_factor": (
+        ("power_factor", "power_factor_total"),
+        ("power_factor_l1", "power_factor_l2", "power_factor_l3"), "avg"),
+    "frequency_hz": (("frequency_hz",), (), "avg"),
+    "energy_wh": (
+        ("energy_wh", "energy_total_wh", "energy_import_wh",
+         "energy_active_wh"), (), "sum"),
+}
+
+
+def canonical_measurement(values: Dict[str, Any], name: str) -> Optional[float]:
+    """One canonical measurement out of whatever this meter published.
+
+    Returns None when the meter genuinely does not report it - NOT 0.0. A zero
+    and "this meter has no such register" look identical on a KPI card, and
+    only one of them is a fact.
+    """
+    spec = CANONICAL_MEASUREMENTS.get(str(name))
+    if not spec:
+        return None
+    exact, phases, combine = spec
+
+    def _num(key: str) -> Optional[float]:
+        raw = values.get(key)
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    for key in exact:
+        got = _num(key)
+        if got is not None:
+            return got
+    parts = [p for p in (_num(k) for k in phases) if p is not None]
+    if not parts:
+        return None
+    return (sum(parts) / len(parts)) if combine == "avg" else sum(parts)
+
+
+def canonical_snapshot(values: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """Every canonical measurement this meter can supply."""
+    return {name: canonical_measurement(values, name)
+            for name in CANONICAL_MEASUREMENTS}

@@ -187,6 +187,25 @@ DEFAULT_MAINTENANCE = {
     "pace_ms_per_batch": 20,
     "archive_before_prune": False,
     "archive_location": "",
+    #: SQLite never returns pages to the OS on DELETE - they go on a freelist
+    #: and are reused. Steady state that is fine; after a big cleanup it is
+    #: 7 GB of dead space in a 16 GB file, and every connection open pays for
+    #: the size. Compact when the waste is worth the work.
+    "auto_compact": True,
+    "auto_compact_free_pct": 25,
+    "auto_compact_min_free_gb": 2,
+}
+
+#: Cloud retention. OFF by default and deliberately so: local retention exists
+#: to save this machine's disk, and it already refuses to delete anything the
+#: cloud has not received. Deleting the customer's CLOUD copy is a different
+#: decision, and it has to be made explicitly.
+DEFAULT_CLOUD = {
+    "enabled": False,
+    "keep": "365d",
+    "keep_s": 365 * 86400,
+    "batch_rows": 20000,
+    "max_batches_per_run": 50,
 }
 
 DEFAULT_BACKUPS = {
@@ -293,9 +312,24 @@ def validate_policy(raw: Dict[str, Any]) -> Dict[str, Any]:
         "pace_ms_per_batch": _norm_int(maint_in.get("pace_ms_per_batch"), 20, 0, 5000),
         "archive_before_prune": bool(maint_in.get("archive_before_prune", False)),
         "archive_location": str(maint_in.get("archive_location") or "").strip(),
+        "auto_compact": bool(maint_in.get("auto_compact", True)),
+        "auto_compact_free_pct": _norm_int(maint_in.get("auto_compact_free_pct"), 25, 5, 90),
+        "auto_compact_min_free_gb": _norm_int(maint_in.get("auto_compact_min_free_gb"), 2, 0, 512),
     })
     if maintenance["archive_before_prune"] and not maintenance["archive_location"]:
         raise PolicyError("Archive before delete is on — choose a folder to write archives to.")
+
+    cloud_in = raw.get("cloud") if isinstance(raw.get("cloud"), dict) else {}
+    cloud_cfg = dict(DEFAULT_CLOUD)
+    cloud_cfg["enabled"] = bool(cloud_in.get("enabled", False))
+    if cloud_in.get("keep"):
+        cloud_cfg["keep"] = str(cloud_in.get("keep"))
+        cloud_cfg["keep_s"] = parse_duration(str(cloud_in.get("keep")))
+    cloud_cfg["batch_rows"] = _norm_int(cloud_in.get("batch_rows"), 20000, 1000, 200000)
+    cloud_cfg["max_batches_per_run"] = _norm_int(
+        cloud_in.get("max_batches_per_run"), 50, 1, 1000)
+    if cloud_cfg["enabled"] and int(cloud_cfg["keep_s"] or 0) <= 0:
+        raise PolicyError("Cloud retention is on — choose how long to keep cloud data.")
 
     other_in = raw.get("other_data") if isinstance(raw.get("other_data"), dict) else {}
     other: Dict[str, Any] = {}
@@ -322,6 +356,7 @@ def validate_policy(raw: Dict[str, Any]) -> Dict[str, Any]:
         "tiers": tiers,
         "text_tags": {"keep": format_duration(text_keep), "keep_s": text_keep},
         "maintenance": maintenance,
+        "cloud": cloud_cfg,
         "other_data": other,
         "backups": backups,
     }
@@ -1429,6 +1464,60 @@ class RetentionEngine:
                 self._incremental_vacuum()
                 summary["backups"] = self._maybe_backup(policy)
 
+            # --- cloud retention (opt-in) --------------------------------
+            # Local retention refuses to delete anything the cloud has not yet
+            # received, so the cloud is the durable copy and grows without
+            # limit. This is the other half, and it only runs when the operator
+            # has explicitly turned it on.
+            cloud_cfg = (policy or {}).get("cloud") or {}
+            if bool(cloud_cfg.get("enabled")) and not dry_run:
+                keep_s = int(cloud_cfg.get("keep_s") or 0)
+                if keep_s > 0:
+                    cutoff = _ms_to_sql(_now_ms() - keep_s * 1000)
+                    try:
+                        # Imported here, not at module scope: the retention
+                        # engine is constructed during boot, before app.state
+                        # has finished wiring, and a top-level import would
+                        # make that ordering load-bearing.
+                        from app.state import app_store as _app_store
+                        res = _app_store.prune_cloud_historian(
+                            cutoff,
+                            batch_rows=int(cloud_cfg.get("batch_rows") or 20000),
+                            max_batches=int(cloud_cfg.get("max_batches_per_run") or 50),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        res = {"ok": False, "message": "%s: %s" % (type(exc).__name__, exc)}
+                    summary["cloud"] = res
+                    if res.get("message"):
+                        summary["notes"].append("cloud retention: %s" % res["message"])
+            elif bool(cloud_cfg.get("enabled")) and dry_run:
+                summary["notes"].append("cloud retention: skipped on a dry run")
+
+            # --- reclaim the disk the deletes freed -----------------------
+            # SQLite keeps deleted pages on a freelist and reuses them, so the
+            # file never shrinks on its own. After a real cleanup that is dead
+            # space every connection open pays for.
+            maint_cfg = (policy or {}).get("maintenance") or {}
+            if bool(maint_cfg.get("auto_compact", True)) and not dry_run:
+                try:
+                    waste = self._compact_waste()
+                    need_pct = float(maint_cfg.get("auto_compact_free_pct") or 25)
+                    need_gb = float(maint_cfg.get("auto_compact_min_free_gb") or 2)
+                    if (waste.get("free_pct", 0.0) >= need_pct
+                            and waste.get("free_gb", 0.0) >= need_gb):
+                        summary["notes"].append(
+                            "compacting: %.0f%% of the file (%.1f GB) is free space"
+                            % (waste["free_pct"], waste["free_gb"]))
+                        summary["compact"] = self.compact()
+                    else:
+                        summary["compact"] = {
+                            "ok": True, "skipped": "only %.0f%% (%.1f GB) free - below the "
+                            "%.0f%% / %.0f GB threshold"
+                            % (waste.get("free_pct", 0.0), waste.get("free_gb", 0.0),
+                               need_pct, need_gb)}
+                except Exception as exc:  # noqa: BLE001
+                    summary["notes"].append("auto-compact check failed: %s" % exc)
+
             summary["took_s"] = round(time.time() - started, 2)
             summary["finished_utc"] = _utc_now_text()
             self._last_tick = summary
@@ -1942,6 +2031,27 @@ class RetentionEngine:
         return status
 
     # -- compaction -------------------------------------------------------
+    def _compact_waste(self) -> Dict[str, float]:
+        """How much of the SQLite file is free pages, as a percentage and in GB.
+
+        freelist_count / page_count is exactly the "deleted but not returned"
+        space. On the 2026-08-31 install that was 1 743 253 of 4 083 432 pages -
+        7.1 GB of a 16 GB file, all of it already deleted by retention.
+        """
+        try:
+            with self.store.connect(readonly=True) as conn:
+                page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+                page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+                freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+        except Exception:
+            return {"free_pct": 0.0, "free_gb": 0.0}
+        if page_count <= 0:
+            return {"free_pct": 0.0, "free_gb": 0.0}
+        return {
+            "free_pct": (freelist / float(page_count)) * 100.0,
+            "free_gb": (freelist * page_size) / 1e9,
+        }
+
     def compact(self) -> Dict[str, Any]:
         """`VACUUM INTO` a fresh file (online — writers keep running), switch it to
         incremental auto-vacuum, and stage it for the next start.

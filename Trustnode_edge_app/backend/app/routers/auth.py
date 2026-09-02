@@ -134,6 +134,21 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+def _refresh_grace_seconds() -> int:
+    """How long after expiry a session may still be renewed.
+
+    Covers a laptop that slept or a panel that lost the network for a while.
+    Long enough to be useful, short enough that a token recovered from an old
+    log or backup is already dead. Tunable for sites that want it stricter.
+    """
+    import os as _os
+    try:
+        return max(0, int(_os.environ.get("TRUSTNODE_SESSION_REFRESH_GRACE_S", "")
+                          or 30 * 60))
+    except ValueError:
+        return 30 * 60
+
+
 def _public_user(user_row: Dict[str, Any]) -> Dict[str, Any]:
     """Project an AuthStore user row (or master-admin synthetic row)
     into the JWT-signing shape. Admin role gets the full permission set
@@ -400,6 +415,75 @@ def me(request: Request) -> Dict[str, Any]:
             "tenant_id": normalize_tenant_id(str(payload.get("tenant_id") or get_current_tenant())),
         },
     }
+
+
+@router.post("/refresh")
+def refresh(request: Request, response: Response) -> Dict[str, Any]:
+    """Renew a session that is already authenticated.
+
+    Called by the frontend well before expiry, and again on the first 401 it
+    sees. Without it a token simply runs out under a screen that is still
+    being watched.
+    """
+    auth = request.headers.get("Authorization", "")
+    token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        token = str(request.cookies.get(_access.SESSION_COOKIE) or "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    # Signature first, and always. verify_exp=False only defers the expiry
+    # decision to the grace check below - it does not weaken verification.
+    try:
+        payload = decode_access_token(token, verify_exp=False)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}") from exc
+
+    now = int(time.time())
+    exp = int(payload.get("exp") or 0)
+    grace = _refresh_grace_seconds()
+    if exp and exp + grace < now:
+        # Long dead. Renewing this would turn any old token into a permanent
+        # key, so the operator signs in again.
+        raise HTTPException(status_code=401,
+                            detail="Session expired. Please sign in again.")
+
+    username = str(payload.get("sub") or "")
+    if not username:
+        raise HTTPException(status_code=401, detail="Invalid token: no subject")
+
+    # Revocation must survive a refresh, or "Revoke" would only last until the
+    # revoked screen renewed itself.
+    try:
+        from app.state import auth_store as _as_tv
+        current_tv = int(_as_tv.get_token_version(username))
+        if int(payload.get("tv") or 0) != current_tv:
+            raise HTTPException(status_code=401,
+                                detail="Session was revoked. Please sign in again.")
+    except HTTPException:
+        raise
+    except Exception:
+        # The token-version store is not reachable; refusing every refresh
+        # would strand every open screen, so the signature and grace checks
+        # above carry this one.
+        pass
+
+    user_public = {
+        "username": username,
+        "role": payload.get("role") or "viewer",
+        "permissions": payload.get("permissions") or {},
+        "modules": payload.get("modules") or [],
+        "tenant_id": payload.get("tenant_id") or get_current_tenant(),
+    }
+    client_host = str(getattr(request.client, "host", "") or "unknown")
+    _ttl = 4 * 3600 if _client_is_remote(client_host) else 12 * 3600
+    fresh = create_access_token(user_public, expires_seconds=_ttl)
+    try:
+        response.set_cookie(_access.SESSION_COOKIE, fresh,
+                            **_access.cookie_kwargs(request, _ttl))
+    except Exception:
+        pass
+    return {"ok": True, "token": fresh, "expires_in": _ttl, "user": user_public}
 
 
 @router.post("/change-password")
